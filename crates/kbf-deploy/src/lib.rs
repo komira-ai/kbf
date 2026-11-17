@@ -40,8 +40,8 @@
 //!   `kbf.toml` (`job-service agent-egress`; read-only).
 //! - [`cutover`]: what switching a frontend's executor onto the job service sets in its
 //!   `kbf.toml` (`job-service plan`; read-only); [`cutover_edit`], the edit of that file and
-//!   its backup; [`cutover_apply`], the switch and its back-out through the frontend's drain
-//!   and `kbf-host-install`'s restart (`job-service apply`, `back-out`; dry runs without
+//!   its backup; [`cutover_apply`], the switch through the frontend's drain
+//!   and `kbf-host-install`'s restart (`job-service apply`; a dry run without
 //!   `--apply`); [`canary`], the one job run through the service after the switch.
 //! - [`pilot`]: a pilot kbf-server run as a systemd user service by the operator's own
 //!   user (`pilot server-install`), and the buck2 overlay that points one linked

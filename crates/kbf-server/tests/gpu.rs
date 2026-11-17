@@ -7,7 +7,7 @@ use kbf_proto::worker::{Capability, Hello};
 use kbf_server::HostFloor;
 use kbf_server::worker::capacity;
 use kbf_types::Resources;
-use support::{FakeDaemon, Job, done, hello, output, ran};
+use support::{Job, done, hello, output, ran};
 
 const GIB: u64 = 1 << 30;
 
@@ -55,7 +55,8 @@ async fn a_gpu_serves_one_lease_at_a_time() {
     // Name order puts the CPU-only node first, and nothing is booked on it: a placement
     // that ignored the GPU would pick it.
     let mut cpu_only = cell.daemon("node-a", 4, 8).await;
-    let mut gpu_node = FakeDaemon::connect(cell.worker_addr, hello_with_gpus("node-g", "1"))
+    let mut gpu_node = cell
+        .daemon_hello(hello_with_gpus("node-g", "1"))
         .await
         .expect("registered");
 

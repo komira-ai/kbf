@@ -37,7 +37,7 @@ use kbf_storage::StorageError;
 use kbf_storage::legacy::LegacyReads;
 use kbf_storage::repair::{JournalError, NoLedger, Options, RepairConfig, RepairWorker, Repairs};
 use kbf_storage::replicate::{Chain, ChainConfig, MapSource, Peers};
-use kbf_storage::service::{CatchUp, InProcess, OpenWrites, StorageService};
+use kbf_storage::service::{CatchUp, OpenWrites, StorageService};
 use kbf_store::StdFs;
 use tonic::transport::ClientTlsConfig;
 
@@ -152,7 +152,6 @@ type Serving = Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>;
 pub(crate) struct Node {
     pub addr: SocketAddr,
     pub serving: Serving,
-    pub in_process: InProcess,
     pub maps: Arc<MapHolder>,
     pub repairs: Option<Arc<Repairs>>,
     pub joiner: Option<AbortOnDrop>,
@@ -216,7 +215,7 @@ pub(crate) fn bind_node(
     } else {
         (service, None, None)
     };
-    let (bound, in_process) = serve_service(service, socket, listener.tls, shutdown)?;
+    let bound = serve_service(service, socket, listener.tls, shutdown)?;
     let addr = bound.addr;
     // The registration reports what the node counts: its open writes, and its repair journal's
     // debts when it keeps one (a node that copies nothing keeps none, and says it cannot say).
@@ -232,7 +231,6 @@ pub(crate) fn bind_node(
     Ok(Node {
         addr,
         serving: Box::pin(bound.serving),
-        in_process,
         maps,
         repairs,
         joiner,

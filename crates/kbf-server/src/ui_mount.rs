@@ -50,7 +50,6 @@ use axum::routing::get;
 use http_body_util::{BodyExt, Limited};
 use kbf_auth::{AllowAuthorizer, Authorizer, Policy};
 use kbf_front::{Cache, MetaLog, Recorder};
-use kbf_mapsync::MapSource;
 use kbf_objstore::ObjectStore;
 use kbf_ui::{Fetched, Source, SourceError};
 use tower_service::Service;
@@ -67,8 +66,7 @@ use crate::state_store::StateStore;
 /// [`bind_server_with_policy`](crate::bind_server_with_policy) with all of its options: the
 /// scheduler's state in `state` ([`crate::bind_server_with_state`]), the client's CAS,
 /// ByteStream and action-cache calls proxied to a `storage` node
-/// ([`crate::bind_server_with_storage`]), the storage map `map` sent to daemons
-/// ([`crate::bind_server_with_map`]), and a TLS-terminating `proxy` in front of every
+/// ([`crate::bind_server_with_storage`]), and a TLS-terminating `proxy` in front of every
 /// listener (`--proxy-auth-file`, [`crate::proxy_auth`]; `None`: the server is reached
 /// directly). The web UI is on ([`bind_server_with_ui`] turns it off).
 ///
@@ -85,7 +83,6 @@ pub fn bind_server_with_options<M, O>(
     policy: Policy,
     state: Option<StateStore>,
     storage: Option<tonic::transport::Endpoint>,
-    map: Option<Arc<dyn MapSource>>,
     proxy: Option<Behind>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
@@ -94,15 +91,14 @@ where
     O: ObjectStore + 'static,
 {
     bind_server_with_ui(
-        cache, listeners, api, policy, state, storage, map, proxy, true, shutdown,
+        cache, listeners, api, policy, state, storage, proxy, true, shutdown,
     )
 }
 
 /// [`bind_server_with_policy`](crate::bind_server_with_policy) with all of its options: the
 /// scheduler's state in `state` ([`crate::bind_server_with_state`]), the client's CAS,
 /// ByteStream and action-cache calls proxied to a `storage` node
-/// ([`crate::bind_server_with_storage`]), and the storage map `map` sent to daemons
-/// ([`crate::bind_server_with_map`]), and a TLS-terminating `proxy` in front of every
+/// ([`crate::bind_server_with_storage`]), and a TLS-terminating `proxy` in front of every
 /// listener (`--proxy-auth-file`, [`crate::proxy_auth`]; `None`: the server is reached
 /// directly), and the web UI under `/ui` on the operator API (this module) when `ui` is
 /// given and the operator API listens ([`bind_server_with_options`] is this with the UI on).
@@ -120,7 +116,6 @@ pub fn bind_server_with_ui<M, O>(
     policy: Policy,
     state: Option<StateStore>,
     storage: Option<tonic::transport::Endpoint>,
-    map: Option<Arc<dyn MapSource>>,
     proxy: Option<Behind>,
     ui: bool,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -137,7 +132,6 @@ where
         policy,
         state,
         storage,
-        map,
         proxy,
         ui,
         shutdown,
@@ -165,7 +159,6 @@ pub fn bind_server_holding<M, O>(
     policy: Policy,
     state: Option<StateStore>,
     storage: Option<tonic::transport::Endpoint>,
-    map: Option<Arc<dyn MapSource>>,
     proxy: Option<Behind>,
     ui: bool,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -183,7 +176,6 @@ where
         policy,
         state,
         storage,
-        map,
         proxy,
         ui,
         shutdown,

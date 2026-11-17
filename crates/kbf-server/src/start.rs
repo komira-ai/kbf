@@ -2,8 +2,7 @@
 //! flags name, attaches the write tier, starts the start-up pass over a `file://` cold
 //! store in the background (`crate::startup_pass`) and binds the listeners, and returns
 //! a [`ServerHandle`] that serves. The `kbf-server` binary is `start`, a print and
-//! `serve`; a process that runs the server beside the worker daemon calls the same
-//! function.
+//! `serve`.
 //!
 //! [`serve_with`] is the seam under it: the same assembly over a Raft metadata log and
 //! object store the caller opened, for a store kind the flags do not name.
@@ -14,27 +13,24 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use kbf_front::Cache;
 use kbf_front::store_metrics::{Counted, StoreMetrics};
-use kbf_front::{Cache, MetaLog};
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
 use kbf_objstore::{
     Floor, FsStore, FsStoreError, KeyPrefix, ObjectStore, objects_source, statvfs_source,
 };
 use kbf_pack_index::PackIndex;
-use kbf_storage::local_cache::{HeldBytes, LocalCache};
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
-use kbf_tier::WriteTier;
 
 use crate::config::ConfigError;
 use crate::drain::Drain;
 use crate::key_file::cold_s3_store;
-use crate::local::LocalStore;
 use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
@@ -90,7 +86,6 @@ pub struct ServerHandle {
     pub worker: SocketAddr,
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
-    local: LocalStore,
     drain: Arc<Drain>,
     /// Completes on the second stop signal ([`start_interruptible`]); [`serve`] then
     /// calls [`Drain::close`].
@@ -103,6 +98,10 @@ pub struct ServerHandle {
     _pass: Option<AbortOnDrop>,
     /// The pack index `--pack-index` opened, if the flag was given.
     pack_index: Option<Arc<dyn PackIndex>>,
+    /// The farm the serving future ticks, not owned here (it goes when serving ends): tests
+    /// register nodes with it in-process, as the executor's virtual workers register.
+    #[doc(hidden)]
+    pub farm: std::sync::Weak<crate::farm::Farm>,
 }
 
 impl ServerHandle {
@@ -120,29 +119,12 @@ impl ServerHandle {
         &self.start_line
     }
 
-    /// The server's cache as calls in this process: what a daemon run beside the server
-    /// in one process reads and writes blobs through.
-    #[must_use]
-    pub fn local(&self) -> LocalStore {
-        self.local.clone()
-    }
-
     /// The frontend's drain ([`Drain`]): `POST /v1/frontend/drain` begins it, and the
     /// shutdown future given to [`start`] does. [`Drain::close`] ends the open streams
     /// now.
     #[must_use]
     pub fn drain(&self) -> Arc<Drain> {
         Arc::clone(&self.drain)
-    }
-
-    /// This handle with `second` as its escalation: when it completes while the handle
-    /// serves, [`ServerHandle::serve`] calls [`Drain::close`], as the second stop signal of
-    /// [`start_interruptible`] does. For a process that reads the stop signals itself, to
-    /// hand them to a daemon beside the server as well, and passes the first to [`start`].
-    #[must_use]
-    pub fn escalate_on(mut self, second: impl Future<Output = ()> + Send + 'static) -> Self {
-        self.escalation = Some(Box::pin(second));
-        self
     }
 
     /// Serves every listener until the shutdown future ends and its connections close
@@ -312,6 +294,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     args.retired_release.warn();
+    args.retired_worker.warn();
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
     let pack_index = args.open_pack_index()?;
@@ -334,11 +317,8 @@ where
         .with_write_pool(args.write_pool_config())
         .with_durable_wait(args.durable_wait())
         .with_input_trees(args.input_tree_config());
-    let local = args.local_cache.as_ref();
-    let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
+    let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
-    share_storage(local, tier_bytes(Arc::downgrade(&cache)));
-    let local = LocalStore::new(Arc::clone(&cache), listeners.segments);
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
@@ -349,15 +329,15 @@ where
     let storage = args.storage()?;
     let proxy = args.proxy()?;
     let bound = bind_server_with_ui(
-        cache, listeners, api, policy, state, storage, None, proxy, args.ui, shutdown,
+        cache, listeners, api, policy, state, storage, proxy, args.ui, shutdown,
     )?;
     let plain = args.plain_text_off_loopback();
     Ok(ServerHandle {
         reapi: bound.reapi,
         worker: bound.worker,
         api: bound.api,
-        local,
         drain: bound.drain,
+        farm: bound.farm.clone(),
         escalation: None,
         start_line: start_line(
             bound.reapi,
@@ -372,33 +352,6 @@ where
         _pass,
         pack_index,
     })
-}
-
-/// Reports local storage's `bytes` to the node's one cache, if the process has one.
-/// Not generic, so it is compiled once whatever the store.
-pub(crate) fn share_storage(local: Option<&Arc<LocalCache>>, bytes: HeldBytes) {
-    if let Some(local) = local {
-        local.attach_storage(bytes);
-    }
-}
-
-/// What `cache`'s write tier holds on its disk now: its blocks, and any flushed copies
-/// it keeps; 0 without a tier or once the server is gone (a weak handle, as the input
-/// cache's side is: the one cache keeps neither half alive).
-pub(crate) fn tier_bytes<M: MetaLog, O: ObjectStore + 'static>(
-    cache: Weak<Cache<M, O>>,
-) -> HeldBytes {
-    Box::new(move || {
-        cache
-            .upgrade()
-            .map_or(0, |cache| cache.write_tier().map_or(0, held))
-    })
-}
-
-/// What `tier` holds on its disk.
-fn held(tier: &dyn WriteTier) -> u64 {
-    let usage = tier.usage();
-    usage.used.saturating_add(usage.flushed)
 }
 
 /// Aborts a task when dropped: the flusher and the start-up pass stop with the server.

@@ -1,6 +1,5 @@
-//! `kbf storage-and-daemon`'s storage half (`kbf_server::storage_half`): the storage
-//! node `kbf storage` starts, with the storage it serves handed to the caller and the
-//! node's one cache honoured.
+//! The storage half (`kbf_server::storage_half`): the storage node `kbf storage` starts,
+//! with the storage it serves handed to the caller.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,7 +13,6 @@ use kbf_server::storage_half::start;
 use kbf_server::storage_node::{StorageFlags, command, parse};
 use kbf_server::{BoundStorage, StorageListener, bind_storage};
 use kbf_storage::Storage as _;
-use kbf_storage::local_cache::LocalCache;
 use kbf_storage::service::RemoteStorage;
 use sha2::Digest as _;
 
@@ -96,23 +94,6 @@ async fn the_handle_is_the_storage_the_listener_serves() {
     let there = Bytes::from_static(b"put over gRPC, read in-process");
     let digest = remote.put(there.clone()).await.expect("put");
     assert_eq!(storage.read_blob(&digest).await.expect("read"), there);
-}
-
-/// Catches the node's one cache not given the storage half's bytes (its budget would
-/// leave the hot store out): with `local_cache` set, the half attaches to it at start,
-/// so a second attach is refused; without one there is nothing to attach to.
-#[tokio::test]
-async fn the_one_cache_counts_the_storage_halfs_bytes() {
-    let dir = dir("one-cache");
-    let mut shared = flags(&file_stores(&dir));
-    let local = Arc::new(LocalCache::new());
-    shared.server.local_cache = Some(Arc::clone(&local));
-    let half = start(&shared, never).await.expect("starts");
-    assert!(
-        !local.attach_storage(Box::new(|| 0)),
-        "the half did not attach"
-    );
-    drop(half);
 }
 
 /// Catches a half that serves past its shutdown future, or never starts serving.

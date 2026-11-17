@@ -1,7 +1,6 @@
 //! The storage map the frontend routes its own storage calls by: the members' map
 //! ([`Members`]) as the routing library's map source (`docs/design/architecture-v2.md`,
-//! section 7). Daemons are sent the same map over their sessions; this is the frontend
-//! holding it for itself.
+//! section 7).
 
 use std::sync::Arc;
 

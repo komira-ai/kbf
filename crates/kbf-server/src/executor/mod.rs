@@ -1,5 +1,4 @@
-//! The host executor: running a placed action as a job of the job service instead of on a
-//! `kbf-daemon`.
+//! The host executor: running a placed action as a job of the job service.
 //!
 //! # How it sits in the server
 //!
@@ -15,8 +14,7 @@
 //! result is reported the way a daemon reports one. A `Cancel` is a cancel of the job. The
 //! executor holds no capacity, renews nothing and never sees where a job runs. `worker.rs`, the
 //! scheduler core and the sched crates are untouched, and a server that never builds an
-//! [`Executor`] never opens a connection to a job service: [`ExecutorKind::KbfDaemon`] is the
-//! path every server runs by default.
+//! [`Executor`] never opens a connection to a job service.
 //!
 //! The executor runs on exactly one frontend: it labels its jobs with its frontend id and an id
 //! of the process that made them, and on start cancels every live job an earlier process left
@@ -85,17 +83,6 @@ pub use traits::{
     ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
     ReadGrant, RejectReason, UntrustedLimits,
 };
-
-/// Which executor a server runs placed actions on.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ExecutorKind {
-    /// The `kbf-daemon` of each node, over `kbf.worker.v1`: the default path, and the
-    /// rollback.
-    #[default]
-    KbfDaemon,
-    /// Jobs of the job service, run by [`Executor`].
-    JsAgent,
-}
 
 /// What the executor is built over.
 #[derive(Clone)]

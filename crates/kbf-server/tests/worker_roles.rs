@@ -1,12 +1,11 @@
 //! The worker listener's per-method role table (`kbf_server::worker_roles`): the table
 //! and `admit` without a network, the layer over a stand-in service, then a frontend
 //! with a state store (so `kbf.map.v1.Membership` is served there) under mutual TLS. A
-//! storage certificate registers and heartbeats and a daemon certificate opens its
-//! session, side by side; each is refused every method of the other; a frontend
-//! certificate is refused every method; and a method not in the table is refused for
-//! every certificate and in plain text. Past the role, a storage certificate registers
-//! and beats only for the names it carries, and the worker listener's deny list applies
-//! to it as it does to a daemon's.
+//! storage certificate registers and heartbeats; a daemon certificate is refused every
+//! method; a frontend certificate is refused every method; and a method not in the table
+//! (the worker session and the blob calls among them) is refused for every certificate and
+//! in plain text. Past the role, a storage certificate registers and beats only for the
+//! names it carries, and the worker listener's deny list applies to it.
 
 #[path = "support/hooked.rs"]
 mod hooked;
@@ -19,18 +18,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures::channel::mpsc::unbounded;
 use hooked::Hooked;
 use kbf_front::Cache;
 use kbf_map::{MemberId, MemberState};
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
-use kbf_proto::reapi::FindMissingBlobsRequest;
-use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
-use kbf_proto::worker::{
-    Capability, DaemonMessage, Hello, ServerMessage, daemon_message, server_message,
-    worker_client::WorkerClient,
-};
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
 use kbf_server::worker_roles::{WORKER_LISTENER_ROLES, WorkerRolesLayer, admit, roles_for};
 use kbf_server::{DenyList, EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
@@ -57,62 +49,16 @@ const GET_STORE_CONFIG: &str = "/kbf.enroll.v1.ColdStore/GetStoreConfig";
 
 /// Every method the worker listener serves and the one role that may call it, spelled
 /// out here and not read from the table.
-const EXPECTED: [(&str, PeerRole); 22] = {
-    use PeerRole::{Daemon, Storage};
-    [
-        (SESSION, Daemon),
-        ("/google.bytestream.ByteStream/Read", Daemon),
-        ("/google.bytestream.ByteStream/Write", Daemon),
-        ("/google.bytestream.ByteStream/QueryWriteStatus", Daemon),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchUpdateBlobs",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchReadBlobs",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/GetTree",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/SplitBlob",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/SpliceBlob",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/GetChunkMapping",
-            Daemon,
-        ),
-        (
-            "/build.bazel.remote.execution.v2.ContentAddressableStorage/RegisterChunkMapping",
-            Daemon,
-        ),
-        ("/kbf.worker.v1.Segments/Begin", Daemon),
-        ("/kbf.worker.v1.Segments/PutRange", Daemon),
-        ("/kbf.worker.v1.Segments/Commit", Daemon),
-        ("/kbf.worker.v1.Segments/Locate", Daemon),
-        ("/kbf.worker.v1.Segments/ReadRange", Daemon),
-        ("/kbf.worker.v1.PackIndex/Locate", Daemon),
-        ("/kbf.worker.v1.PackIndex/CommitPack", Daemon),
-        (REGISTER, Storage),
-        (HEARTBEAT, Storage),
-        (GET_STORE_CONFIG, Storage),
-    ]
-};
+const EXPECTED: [(&str, PeerRole); 3] = [
+    (REGISTER, PeerRole::Storage),
+    (HEARTBEAT, PeerRole::Storage),
+    (GET_STORE_CONFIG, PeerRole::Storage),
+];
 
 /// Methods the worker listener does not serve: REAPI's others, health, a method of a
 /// served service that does not exist, a served one in another case or with a slash
 /// after it, and no path.
-const UNLISTED: [&str; 10] = [
+const UNLISTED: [&str; 14] = [
     "/build.bazel.remote.execution.v2.Execution/Execute",
     "/build.bazel.remote.execution.v2.ActionCache/GetActionResult",
     "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities",
@@ -125,6 +71,11 @@ const UNLISTED: [&str; 10] = [
     // The release service the frontend served until the release store was removed.
     "/kbf.update.v1.ReleaseService/Fetch",
     "/kbf.update.v1.ReleaseService/Describe",
+    // What a daemon called until the worker session and its blob path were removed.
+    SESSION,
+    "/google.bytestream.ByteStream/Read",
+    "/build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs",
+    "/kbf.worker.v1.PackIndex/Locate",
 ];
 
 fn role(name: &str) -> SanType {
@@ -157,7 +108,7 @@ fn refusal(who: PeerRole, path: &str, takes: PeerRole) -> String {
 }
 
 /// Catches a row of the table changed, added or dropped (the Membership calls taken
-/// from a daemon, a blob call or the session from a storage node, any call from a
+/// from a daemon, a daemon's session or blob call served again, any call from a
 /// frontend), and `admit` reading it other than it says: each row admits its role's
 /// certificate and refuses the other two PERMISSION_DENIED, saying which role it takes.
 ///
@@ -222,12 +173,12 @@ fn a_method_missing_from_the_table_is_refused_whatever_the_caller() {
 /// whatever the certificate, as it has no identity to read.
 #[test]
 fn a_certified_call_needs_exactly_one_role_in_its_certificate() {
-    let none = admit(Admission::Certified, SESSION, None).expect_err("none");
+    let none = admit(Admission::Certified, REGISTER, None).expect_err("none");
     assert_eq!(
         (none.code(), none.message()),
         (Code::Unauthenticated, "no client certificate")
     );
-    let junk = admit(Admission::Certified, SESSION, Some(b"junk")).expect_err("junk");
+    let junk = admit(Admission::Certified, REGISTER, Some(b"junk")).expect_err("junk");
     assert_eq!(junk.code(), Code::Unauthenticated);
     let uri = |text: &str| SanType::URI(text.try_into().expect("IA5"));
     let dns = |text: &str| SanType::DnsName(text.try_into().expect("IA5"));
@@ -240,14 +191,14 @@ fn a_certified_call_needs_exactly_one_role_in_its_certificate() {
         (vec![dns("urn:kbf:role:daemon")], "it names 0"),
     ] {
         let cert = der(sans.clone());
-        let refused = admit(Admission::Certified, SESSION, Some(&cert)).expect_err("refused");
+        let refused = admit(Admission::Certified, REGISTER, Some(&cert)).expect_err("refused");
         assert_eq!(refused.code(), Code::PermissionDenied, "{sans:?}");
         assert!(
             refused.message().contains(why),
             "{sans:?}: {}",
             refused.message()
         );
-        assert!(admit(Admission::Open, SESSION, Some(&cert)).is_ok());
+        assert!(admit(Admission::Open, REGISTER, Some(&cert)).is_ok());
     }
     assert!(admit(Admission::Open, REGISTER, None).is_ok());
 }
@@ -297,7 +248,7 @@ async fn the_layer_answers_a_refusal_itself_and_passes_an_admitted_call_on() {
     assert_eq!(inner.0.load(Ordering::SeqCst), 0);
 
     let certified = WorkerRolesLayer::new(Admission::Certified);
-    let refused = through(certified, &inner, SESSION).await;
+    let refused = through(certified, &inner, REGISTER).await;
     let status = Status::from_header_map(refused.headers()).expect("a gRPC status");
     assert_eq!(status.code(), Code::Unauthenticated);
     assert_eq!(inner.0.load(Ordering::SeqCst), 0);
@@ -483,15 +434,12 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls,
-        heartbeat_interval: Duration::from_secs(5),
-        hello_wait: Duration::from_secs(10),
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         memory_climb: true,
-        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         exclusive_actions: false,
         placement_load: kbf_server::PlacementLoad::Off,
@@ -502,7 +450,6 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
-        segments: kbf_front::SegmentsConfig::DEFAULT,
         streams: kbf_server::StreamTiming::default(),
         stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
@@ -568,45 +515,6 @@ fn state_of(store: &Arc<Hooked>, id: u64) -> MemberState {
     map.member(MemberId(id)).expect("the member").state
 }
 
-/// Opens a worker session for node-a on `channel` and waits for its `Welcome`, or the
-/// status the server refused it with.
-async fn session(channel: &Channel) -> Result<(), Status> {
-    let entry = |key: &str, value: &str| Capability {
-        key: key.to_owned(),
-        value: value.to_owned(),
-    };
-    let hello = daemon_message::Message::Hello(Hello {
-        protocol_version: 1,
-        node_id: "node-a".to_owned(),
-        capabilities: vec![
-            entry("arch", "x86_64"),
-            entry("cpus", "1"),
-            entry("mem_gib", "1"),
-            entry("drivers", "fake"),
-        ],
-        ..Hello::default()
-    });
-    let (tx, rx) = unbounded();
-    tx.unbounded_send(DaemonMessage {
-        message: Some(hello),
-    })
-    .expect("open");
-    let mut client = WorkerClient::new(channel.clone());
-    let mut inbound = tokio::time::timeout(PROMPT, client.session(rx))
-        .await
-        .expect("an answer in time")?
-        .into_inner();
-    let first = tokio::time::timeout(PROMPT, inbound.message())
-        .await
-        .expect("an answer in time")?;
-    match first {
-        Some(ServerMessage {
-            message: Some(server_message::Message::Welcome(_)),
-        }) => Ok(()),
-        other => panic!("expected Welcome or an error, got {other:?}"),
-    }
-}
-
 /// Calls `path` on `channel` with an empty message, as no generated client would, and
 /// returns the answer's status (OK if it was answered).
 async fn raw(channel: &Channel, path: &'static str) -> Status {
@@ -637,12 +545,10 @@ async fn refused_by_the_table(channel: &Channel, who: PeerRole) {
     }
 }
 
-/// Catches a storage node and a daemon that cannot both be served: one node's two
-/// certificates, one per connection, on one frontend at the same time. The storage
-/// certificate registers and heartbeats; the daemon certificate opens its session and
-/// finds blobs; the storage connection heartbeats again after.
+/// Catches a storage certificate that cannot register and heartbeat on the worker listener
+/// under mutual TLS.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn each_half_of_a_node_is_served_on_its_own_certificate() {
+async fn a_storage_certificate_registers_and_heartbeats() {
     let pki = Pki::new();
     let worker = frontend(Some(pki.worker_tls()));
     let mut membership = MembershipClient::new(pki.channel(worker, PeerRole::Storage).await);
@@ -657,20 +563,9 @@ async fn each_half_of_a_node_is_served_on_its_own_certificate() {
         ..pb::HeartbeatRequest::default()
     };
     membership
-        .heartbeat(beat.clone())
-        .await
-        .expect("a storage certificate heartbeats");
-
-    let daemon = pki.channel(worker, PeerRole::Daemon).await;
-    session(&daemon).await.expect("a daemon opens its session");
-    ContentAddressableStorageClient::new(daemon)
-        .find_missing_blobs(FindMissingBlobsRequest::default())
-        .await
-        .expect("a daemon finds blobs");
-    membership
         .heartbeat(beat)
         .await
-        .expect("the storage connection is still served");
+        .expect("a storage certificate heartbeats");
 }
 
 /// Catches the Membership calls taken from a daemon's certificate on the worker
@@ -704,26 +599,6 @@ async fn a_daemon_certificate_may_not_register_or_heartbeat() {
         assert_eq!(status.message(), want);
     }
     refused_by_the_table(&channel, PeerRole::Daemon).await;
-}
-
-/// Catches the worker session or a blob call taken from a storage node's certificate
-/// (naming node-a, as a daemon's would, so nothing but the role tells them apart): its
-/// session is refused PERMISSION_DENIED, and every daemon row is refused by the table.
-///
-/// Catches: the layer left off the worker listener (`worker_peers` without
-/// `.layer`): the session is welcomed and FindMissingBlobs answered.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_storage_certificate_opens_no_session_and_makes_no_blob_call() {
-    let pki = Pki::new();
-    let worker = frontend(Some(pki.worker_tls()));
-    let channel = pki.channel(worker, PeerRole::Storage).await;
-    let status = session(&channel).await.expect_err("refused");
-    assert_eq!(status.code(), Code::PermissionDenied);
-    assert_eq!(
-        status.message(),
-        refusal(PeerRole::Storage, SESSION, PeerRole::Daemon)
-    );
-    refused_by_the_table(&channel, PeerRole::Storage).await;
 }
 
 /// Catches a frontend's certificate (same CA) taken for anything on the worker

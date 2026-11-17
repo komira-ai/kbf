@@ -1,6 +1,6 @@
 //! `kbf frontend`: the REAPI front end (`docs/design/architecture-v2.md`, sections 2, 7
 //! and 9). It serves REAPI (Execute, the scheduler, operations), the operator API and
-//! the worker listener's work streams, and holds no blob cache: a client's CAS,
+//! the worker listener, and holds no blob cache: a client's CAS,
 //! ByteStream and action-cache calls are proxied to a storage node ([`kbf_front::Proxy`],
 //! ByteStream passed through without holding a blob), and Execute and the scheduler
 //! read and write the node through [`kbf_front::Backend::routed`] (the action cache,
@@ -12,8 +12,8 @@
 //! the object `cas/l/<sha256>`), recorded in the pack index, and the action cache as the
 //! `action_result` table beside it, in the Postgres state store ([`kbf_front::Stored`],
 //! [`kbf_front::Backend::stored`]; [`kbf_front::routes_stored`] serves the client's calls).
-//! [`parse`] refuses the start unless it has `--executor js-agent` (a daemon's blob traffic
-//! is a node's, so `--executor kbf-daemon` is refused by name), `--pack-index` and the pack
+//! [`parse`] refuses the start unless it has `--executor js-agent` (blob traffic
+//! is a node's, so a frontend with no executor is refused), `--pack-index` and the pack
 //! store flags, and refuses the three TLS flags toward a node. Nothing is dialed: no storage
 //! channel, no storage map, no storage health route. `/readyz` and the health service
 //! (`stored::stored_checks`) ask the state store and the job service (the executor's one read of a
@@ -22,7 +22,7 @@
 //! **Storage is routed by the map.** With a state store the frontend keeps the members
 //! and so the map, and with the TLS flags it can dial each member: every storage call it
 //! makes is then routed by that map ([`kbf_front::Routed`] over [`crate::front_maps`]),
-//! once the map has two members, to the members the daemons place a blob on. Before that
+//! once the map has two members, to the members the map places a blob on. Before that
 //! (no member has registered, or one has), and without a state store or without the TLS
 //! flags, every call goes to the one node `--storage` names. `--storage` is the bootstrap
 //! and the farm of one, never one of several: blobs written to it before the map had two
@@ -59,15 +59,11 @@
 //! that uses the window up exits 1, every refusal exits 2.
 //!
 //! **The pack index** is off unless `--pack-index` is given (the flag's help has its rules).
-//! The started frontend carries it ([`FrontendHandle::pack_index`]) and its worker listener
-//! answers daemons' `kbf.worker.v1.PackIndex/Locate` from it ([`crate::pack_locate`]); without
-//! the flag that service is not registered.
+//! The started frontend carries it ([`FrontendHandle::pack_index`]).
 //!
 //! **Packs** are off unless `--pack-store-endpoint` is given (`pack_flags` has the flags and
 //! what they need): client uploads are then kept in packs ([`kbf_front::Packs`]); without it
-//! no object store is built or contacted and the frontend serves exactly as it did. With the
-//! pack index too, the frontend takes a daemon's `CommitPack` (it must read the pack to check it)
-//! and says so in `Welcome.pack_commit`.
+//! no object store is built or contacted and the frontend serves exactly as it did.
 //!
 //! **The executor** is off unless `--executor js-agent` is given (`executor_flags` has the flags):
 //! the farm then runs each action it places as a job of the job scheduler's job service
@@ -75,7 +71,7 @@
 //! cancels its jobs when the frontend stops. It needs the packs and the preparation of task
 //! runs (below, with the `--job-*` listener its read grants point at): `--executor js-agent` is
 //! refused when the flags are parsed without them, and where its settings disagree with them
-//! (`executor_bind` lists the checks). By default, `--executor kbf-daemon`, nothing is built and
+//! (`executor_bind` lists the checks). Without `--executor`, nothing is built and
 //! no job service is contacted. The start of `FrontendHandle::serve` first publishes the release's
 //! kbf base tree to the packs' store from `--executor-base-tree` (`base_tree`).
 //!
@@ -108,7 +104,9 @@
 //! frontends of the store carry on. The flags of the removed handover and admin port
 //! (`--handover-*`, `--instance`, `--envoy-*`, `--admin-listen`, `--await-takeover`) are
 //! still accepted so a unit or `kbf.toml` written before the removal starts; they do
-//! nothing, each one given logs a warning ([`RetiredHandoverFlags`]).
+//! nothing, each one given logs a warning ([`RetiredHandoverFlags`]). So are the flags of the
+//! removed worker session (`--heartbeat-interval-ms`, `--vm-host-floor-*`,
+//! `--pack-commit-sample`; [`crate::retired::RetiredWorkerFlags`]).
 //!
 //! **Draining.** A frontend over a state store is taken out of any load balancer by the
 //! drain sequence of [`crate::sequence`], which `POST /v1/frontend/drain` and a stop signal
@@ -117,11 +115,9 @@
 //! the open executions run until they are done or `--drain-deadline`, and the process exits
 //! 0. Without a state store (tests) the drain is the plain one of [`crate::drain`].
 //!
-//! **Not served here:** the worker listener's `ByteStream`, CAS and `Segments` (a
-//! daemon's blob traffic; daemons reach storage directly once the map reaches them,
-//! av2-08), the build pages and the blob route of the operator API (they read a local
-//! cache), and the input-tree memory of the cache (the walk of an Execute's inputs reads
-//! the node's directories each time).
+//! **Not served here:** the build pages and the blob route of the operator API (they read a
+//! local cache), and the input-tree memory of the cache (the walk of an Execute's inputs
+//! reads the node's directories each time).
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -142,13 +138,11 @@ use futures::future::{AbortHandle, Abortable, BoxFuture};
 use kbf_auth::AuthenticateLayer;
 use kbf_front::prepare_run::PutDirPrep;
 use kbf_front::{
-    Backend, MAX_MESSAGE_BYTES, Owner, Owners, Packs, Proxy, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer, Routed,
+    Backend, Owner, Owners, Packs, Proxy, RECORDER_CHANNEL, Recorder, RequestMetadataLayer, Routed,
 };
 use kbf_pack_index::PackIndex;
 use kbf_pack_index::action::ActionStore;
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
-use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_route::{DEFAULT_HOLD, Hold, TlsNodes};
 use kbf_storage::Storage;
 use kbf_storage::service::RemoteStorage;
@@ -181,7 +175,7 @@ use crate::retire::Retire;
 use crate::retired::RetiredHandoverFlags;
 use crate::sequence::{DrainTiming, Sequence, stopped};
 use crate::serve::{
-    AbortOnDrop, ServeError, cold_store, flow_control, keepalive, log_state, map_of, members_of,
+    AbortOnDrop, ServeError, cold_store, flow_control, keepalive, log_state, members_of,
     membership, serve_api_goaway, stop_api, sweeping, worker_peers,
 };
 use crate::stand::{QUIESCE_WAIT, Stand};
@@ -189,7 +183,6 @@ use crate::start::{Escalation, escalating, interruptions};
 use crate::state_store::Indexes;
 use crate::stop::Stop;
 use crate::store_config::acks::Acks;
-use crate::worker::WorkerService;
 use crate::{Args, ConfigError, SERVER_VERSION, sizes_on};
 
 /// The flags of [`Args`] a frontend takes, besides the thread flags
@@ -213,6 +206,7 @@ pub const ALLOWED: &[&str] = &[
     "worker_deny_list",
     "proxy_auth_file",
     "heartbeat_interval_ms",
+    "pack_commit_sample",
     "progress_interval_secs",
     "http2_keepalive_interval_secs",
     "http2_keepalive_timeout_secs",
@@ -549,6 +543,10 @@ pub struct FrontendHandle {
     put_dir_prep: Option<Arc<PutDirPrep>>,
     /// The count of intake polls the farm has run to the end ([`Farm::intake_polls`]).
     intake_polls: tokio::sync::watch::Receiver<u64>,
+    /// The farm the serving future ticks, not owned here (it goes when serving ends): tests
+    /// register nodes with it in-process, as the executor's virtual workers do.
+    #[doc(hidden)]
+    pub farm: std::sync::Weak<Farm>,
     /// The count of sweeps the janitor of `cas/b/` has finished, if `--task-janitor-key-file`
     /// was given.
     janitor_sweeps: Option<tokio::sync::watch::Receiver<u64>>,
@@ -728,7 +726,7 @@ where
 
 /// [`start_frontend`] with the preparation of runs given to `--executor js-agent` instead of the
 /// frontend's own ([`RunSource`]): the key mint and the preparation of a run's put directory, for
-/// a test that prepares them its own way. A frontend of `--executor kbf-daemon`
+/// a test that prepares them its own way. A frontend with no executor
 /// takes none and ignores it.
 ///
 /// # Errors
@@ -831,6 +829,7 @@ impl<'a> Prepared<'a> {
         let args = &flags.server;
         args.check_scheduler_core()?;
         args.retired_release.warn();
+        args.retired_worker.warn();
         flags.retired.warn();
         let listeners = args.listeners()?;
         let proxy = args.proxy()?;
@@ -910,7 +909,6 @@ impl<'a> Prepared<'a> {
         let state = crate::history::with_history_waiting(state, &args.history)?;
         let (state, history) = crate::history::take(state);
         let members = members_of(state.as_ref(), flags.handoff);
-        let map = map_of(None, members.as_ref())?;
         let readiness = Arc::new(Readiness::default());
         let timeout = listeners.store_probe_timeout;
         let state_store = store_of(state.as_ref());
@@ -962,9 +960,7 @@ impl<'a> Prepared<'a> {
             exclusive_actions: listeners.exclusive_actions,
         };
         let durable = state.is_some();
-        let farm = Farm::from_listeners(backend.clone(), &listeners)
-            .recording(recorder.clone())
-            .with_executor(flags.executor.kind);
+        let farm = Farm::from_listeners(backend.clone(), &listeners).recording(recorder.clone());
         crate::serve::log_core(&farm);
         crate::serve::log_exclusive(listeners.exclusive_actions);
         let farm = Arc::new(farm.with_state(state)?);
@@ -1140,26 +1136,6 @@ impl<'a> Prepared<'a> {
             peers.clone(),
         );
         let cold_store = cold_store(members.clone(), &peers, delivery.as_ref());
-        // Only with `--pack-index`: otherwise a daemon's Locate is UNIMPLEMENTED; and its
-        // CommitPack too is UNIMPLEMENTED without the pack store, which checks the pack.
-        let commits = pack_flags::commits(packs.as_ref(), flags.packs.as_ref());
-        let committing = crate::pack_locate::commit_served(pack_index.as_ref(), commits.as_ref());
-        let locate = crate::pack_locate::service(pack_index.as_ref(), &peers, commits);
-        let sessions = WorkerService::new(
-            Arc::clone(&farm),
-            peers,
-            listeners.heartbeat_interval,
-            listeners.hello_wait,
-        )
-        .with_host_floor(listeners.vm_host_floor)
-        .with_pack_commit(committing)
-        .with_placement_load(listeners.placement_load);
-        // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
-        let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
-        let worker_service = WorkerServer::new(sessions)
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_MESSAGE_BYTES);
-
         let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
         let authorizers = Arc::new(policy.authorizers);
         let streams = kbf_front::OpenStreams { closing, progress };
@@ -1226,6 +1202,7 @@ impl<'a> Prepared<'a> {
         background.extend(janitor.map(|janitor| janitor.run().boxed()));
 
         let intake_polls = farm.intake_polls();
+        let farm_handle = Arc::downgrade(&farm);
         let shutdown = shutdown()?;
         let stopper = Arc::clone(&drain);
         let serving = async move {
@@ -1252,10 +1229,8 @@ impl<'a> Prepared<'a> {
                     Some(incoming) => {
                         worker_server
                             .add_routes(node_calls)
-                            .add_service(worker_service)
                             .add_optional_service(membership)
                             .add_optional_service(cold_store)
-                            .add_optional_service(locate)
                             .serve_with_incoming_shutdown(incoming, worker_stopped)
                             .await
                     }
@@ -1357,6 +1332,7 @@ impl<'a> Prepared<'a> {
             janitor_sweeps,
             executor: executor.map(|built| built.executor),
             base_tree,
+            farm: farm_handle,
         })
     }
 }

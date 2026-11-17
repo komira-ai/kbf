@@ -1,94 +1,15 @@
-//! The server side of `kbf.worker.v1` sessions: registration, the session boundary of
-//! issue #25, heartbeats, and what the server refuses.
+//! A node registered with the farm: the session boundary of issue #25, heartbeats, and the
+//! leases a node keeps or loses across its streams.
 
 mod support;
 
-use std::sync::Arc;
-
-use futures::channel::mpsc::unbounded;
-use kbf_map::{Map, Member, MemberId, MemberState, Rule};
-use kbf_mapsync::{FakeMapSource, MapSource};
-use kbf_proto::worker::worker_client::WorkerClient;
-use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, LeaseId, MapRequest, Offer, daemon_message,
-    server_message,
-};
-use support::{
-    Blob, Cell, FakeDaemon, Job, PROMPT, done, done_within_quiet, failed, hello, output, ran,
-    response,
-};
+use kbf_proto::worker::{Heartbeat, LeaseId, daemon_message, server_message};
+use support::{Blob, Cell, Job, done, done_within_quiet, failed, hello, output, ran, response};
 use tonic::Code;
-use tonic::transport::Endpoint;
-
-async fn refused(cell: &Cell, first: daemon_message::Message) -> Code {
-    match FakeDaemon::open(cell.worker_addr, first).await {
-        Err(status) => status.code(),
-        Ok(_) => panic!("the stream was accepted"),
-    }
-}
-
-/// Catches: a session opened by something other than `Hello`, a protocol version below
-/// the oldest (a newer one is welcomed: `worker_welcome.rs`), a Hello without a node id,
-/// or one whose node report lacks (or garbles) the capacity entries placement needs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_bad_first_message_is_refused() {
-    let cell = Cell::start().await;
-    let beat = daemon_message::Message::Offer(Offer::default());
-    assert_eq!(refused(&cell, beat).await, Code::InvalidArgument);
-    let mut older = hello("node-a", 4, 8);
-    older.protocol_version = 0;
-    assert_eq!(
-        refused(&cell, daemon_message::Message::Hello(older)).await,
-        Code::FailedPrecondition
-    );
-    let nameless = hello("", 4, 8);
-    assert_eq!(
-        refused(&cell, daemon_message::Message::Hello(nameless)).await,
-        Code::InvalidArgument
-    );
-    let mut no_cpus = hello("node-a", 4, 8);
-    no_cpus.capabilities.retain(|c| c.key != "cpus");
-    let mut twice = hello("node-a", 4, 8);
-    twice.capabilities.push(Capability {
-        key: "mem_gib".to_owned(),
-        value: "9".to_owned(),
-    });
-    let mut garbled = hello("node-a", 4, 8);
-    garbled.capabilities[1].value = "lots".to_owned();
-    for bad in [no_cpus, twice, garbled] {
-        assert_eq!(
-            refused(&cell, daemon_message::Message::Hello(bad)).await,
-            Code::InvalidArgument
-        );
-    }
-}
-
-/// Catches: a stream that never says Hello held open forever (a slot for every
-/// half-open connection), and one that ends before its Hello taken for a session.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stream_without_hello_is_ended() {
-    let cell = Cell::start().await;
-    let channel = Endpoint::from_shared(format!("http://{}", cell.worker_addr))
-        .expect("endpoint")
-        .connect()
-        .await
-        .expect("connect");
-    let (tx, rx) = unbounded::<DaemonMessage>();
-    let silent = WorkerClient::new(channel.clone()).session(rx).await;
-    assert_eq!(silent.expect_err("no Hello").code(), Code::DeadlineExceeded);
-    drop(tx);
-
-    let (tx, rx) = unbounded::<DaemonMessage>();
-    drop(tx);
-    let ended = WorkerClient::new(channel).session(rx).await;
-    assert_eq!(ended.expect_err("no Hello").code(), Code::InvalidArgument);
-}
 
 /// Catches (issue #25): a resent `Hello` treated as a new registration (an in-flight
 /// lease the next heartbeat has not listed yet would be requeued at once and run
-/// twice); a resent `Hello` whose new capacity placement does not see; a garbled
-/// resend that ends the session; and messages without content, or an update status (not
-/// read yet), that do.
+/// twice); and a resent `Hello` whose new capacity placement does not see.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resent_hello_changes_capacity_only() {
     let cell = Cell::start().await;
@@ -102,14 +23,6 @@ async fn a_resent_hello_changes_capacity_only() {
     let _second_ops = cell.execute(&second.action).await;
     daemon.no_work().await;
 
-    daemon.send_empty();
-    daemon.send(daemon_message::Message::Offer(Offer::default()));
-    daemon.send(daemon_message::Message::UpdateStatus(
-        kbf_proto::update::UpdateStatus::default(),
-    ));
-    let mut garbled = hello("node-a", 2, 8);
-    garbled.capabilities.clear();
-    daemon.send(daemon_message::Message::Hello(garbled));
     daemon.send(daemon_message::Message::Hello(hello("node-a", 2, 8)));
     let placed = daemon.start().await;
     assert_ne!(placed.lease_id, running.lease_id);
@@ -120,31 +33,6 @@ async fn a_resent_hello_changes_capacity_only() {
     let result = output(&cell, "first", 0).await;
     assert!(daemon.report(ran(running.lease_id, &result)).await.accepted);
     done(&mut first_ops).await;
-}
-
-/// Catches (issue #79): a resent `Hello` whose `node_id` is not the stream's node read
-/// for its capacity only (its `node_id` never compared), which would let a stream speak
-/// for a node it did not register as; and one that is refused but leaves the stream
-/// open. The node itself is not punished: its next stream registers and gets work.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_resent_hello_naming_another_node_ends_the_stream() {
-    let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 1, 8).await;
-    assert!(daemon.heartbeat(&[]).await);
-    daemon.send(daemon_message::Message::Hello(hello("node-b", 4, 8)));
-    let ended = daemon.ended().await;
-    assert_eq!(ended.code(), Code::PermissionDenied);
-    assert!(
-        ended.message().contains("\"node-b\"") && ended.message().contains("node-a"),
-        "{}",
-        ended.message()
-    );
-
-    let mut back = cell.daemon("node-a", 1, 8).await;
-    let job = Job::new("after", &[]);
-    cell.upload(&job.blobs()).await;
-    let _ops = cell.execute(&job.action).await;
-    back.start().await;
 }
 
 /// Catches (issue #25): heartbeats from a stream that a newer stream of the same node
@@ -420,28 +308,4 @@ async fn a_listed_lease_the_server_gave_up_is_cancelled() {
     let result = output(&cell, "from the retry", 0).await;
     assert!(back.report(ran(Some(retry), &result)).await.accepted);
     assert_eq!(response(&done(&mut ops).await).result, Some(result));
-}
-
-/// Catches a session that does not answer a `MapRequest` with the map the server holds:
-/// the session handler of this binary's cell is the instantiation of the generic server
-/// code that every other arm of the handler is covered in, so the request is asked here
-/// too.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_map_request_is_answered_with_the_map_held() {
-    let member = Member {
-        id: MemberId(1),
-        addr: "127.0.0.1:1".to_owned(),
-        zone: String::new(),
-        weight: 1,
-        state: MemberState::Active,
-        boot: 0,
-    };
-    let held = Map::new(3, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("a map");
-    let source = Arc::new(FakeMapSource::new(held));
-    let cell = Cell::start_with_map(source as Arc<dyn MapSource>).await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    daemon.send(daemon_message::Message::MapRequest(MapRequest {
-        at_least: 9,
-    }));
-    assert_eq!(daemon.map_update_within(PROMPT).await, Some(3));
 }

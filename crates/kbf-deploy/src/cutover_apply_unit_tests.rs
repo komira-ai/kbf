@@ -1,4 +1,4 @@
-//! The small parts of `job-service apply` and `back-out`, each alone: the names the restart
+//! The small parts of `job-service apply`, each alone: the names the restart
 //! takes, the canary made from the file, kbf-host-install's answer, the asks of a deadline,
 //! and the real host's seam.
 

@@ -82,40 +82,52 @@ fn refused(more: &[&str]) -> String {
     js_with(more).expect_err("refused")
 }
 
-/// Catches a default that builds an executor: a frontend given no `--executor` runs placed
-/// actions on daemons, as it always has, and has no settings of the executor.
+/// Catches a default that builds an executor: a frontend given no `--executor` has no settings
+/// of the executor.
 #[test]
-fn a_frontend_with_no_executor_flag_runs_on_daemons_and_holds_no_settings() {
+fn a_frontend_with_no_executor_flag_holds_no_settings() {
     let flags = parsed(argv(&[])).expect("flags");
-    assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
     assert!(flags.executor.js.is_none());
 }
 
-/// Catches the rollback losing its settings or tripping on them: with `--executor kbf-daemon`
-/// (or none) every setting of the job service may stay in the unit or `kbf.toml`, the one that
-/// lets secrets travel as arguments too, and none is read. Flipping the one flag is the
-/// rollback: a frontend that refused to start over a setting nothing reads would need a second
-/// edit in an incident.
+/// Catches the deleted daemon executor still being accepted, or an unknown one: `--executor
+/// kbf-daemon` is refused at start with a message that says kbf-daemon was deleted and names
+/// `--executor js-agent`, another value is refused naming the flag and the only executor, and
+/// `js-agent` still parses.
 #[test]
-fn the_daemon_executor_keeps_the_job_services_settings_unread() {
+fn the_deleted_daemon_executor_and_unknown_ones_are_refused_naming_why() {
+    let why = parsed(argv(&["--executor=kbf-daemon"])).expect_err("refused");
+    assert!(
+        why.contains(
+            "--executor kbf-daemon is gone: kbf-daemon was deleted, and placed actions run as \
+             jobs of the job service, with --executor js-agent"
+        ),
+        "{why}"
+    );
+    let why = parsed(argv(&["--executor=lease"])).expect_err("refused");
+    assert!(
+        why.contains("--executor lease: the only executor is js-agent"),
+        "{why}"
+    );
+    js_with(&[]).expect("js-agent parses");
+}
+
+/// Catches settings tripping a frontend with no executor: with no `--executor` every setting of
+/// the job service may stay in `kbf.toml`, the one that lets secrets travel as arguments too,
+/// and none is read.
+#[test]
+fn no_executor_keeps_the_job_services_settings_unread() {
     // The warning is made (its arguments are only evaluated under a subscriber).
     let _logged =
         tracing::subscriber::set_default(tracing_subscriber::fmt().with_test_writer().finish());
-    for executor in ["--executor=kbf-daemon", ""] {
-        let mut all: Vec<&str> = JS.to_vec();
-        if executor.is_empty() {
-            all.remove(0);
-        } else {
-            all[0] = executor;
-        }
-        assert!(all.contains(&"--executor-insecure-argv-secrets"));
-        // A tag, which the js-agent parse refuses: the daemon executor must never read it.
-        all.retain(|flag| !flag.starts_with("--executor-base-image"));
-        all.push("--executor-base-image=registry.test/base:22.04");
-        let flags = parsed(argv(&all)).expect("flags");
-        assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
-        assert!(flags.executor.js.is_none());
-    }
+    let mut all: Vec<&str> = JS.to_vec();
+    all.remove(0);
+    assert!(all.contains(&"--executor-insecure-argv-secrets"));
+    // A tag, which the js-agent parse refuses: with no executor it must never be read.
+    all.retain(|flag| !flag.starts_with("--executor-base-image"));
+    all.push("--executor-base-image=registry.test/base:22.04");
+    let flags = parsed(argv(&all)).expect("flags");
+    assert!(flags.executor.js.is_none());
 }
 
 /// Catches an executor started with what it cannot do without left out: each missing flag is
@@ -225,7 +237,6 @@ fn js_agent_settings_become_the_executors_config() {
     .expect("flags");
     let js = flags.executor.js.expect("js-agent");
     let config = &js.config;
-    assert_eq!(flags.executor.kind, ExecutorKind::JsAgent);
     assert_eq!(js.job_url, "http://127.0.0.1:7");
     assert_eq!(js.token_file, Path::new("/etc/token"));
     assert!(js.ca_file.is_none());
@@ -261,15 +272,15 @@ fn executor_locate_is_off_unless_given_and_becomes_the_config() {
     assert!(on.executor.js.expect("js-agent").config.locate);
 }
 
-/// Catches `--executor-locate` accepted where nothing reads it: daemons build no task command
-/// line, so with `--executor kbf-daemon` (the default) it would do nothing and is refused when
-/// the flags are read, naming both flags.
+/// Catches `--executor-locate` accepted where nothing reads it: with no executor no task command
+/// line is built, so it would do nothing and is refused when the flags are read, naming both
+/// flags.
 #[test]
-fn locate_with_kbf_daemon_is_refused_at_start() {
+fn locate_with_no_executor_is_refused_at_start() {
     let why = parsed(argv(&["--executor-locate"])).expect_err("refused");
     assert!(why.contains("--executor-locate"), "{why}");
     assert!(why.contains("--executor js-agent"), "{why}");
-    parsed(argv(&[])).expect("daemons without the flag still parse");
+    parsed(argv(&[])).expect("no executor without the flag still parses");
 }
 
 /// Catches a flag default that has drifted from the executor's own: the defaults are written
@@ -414,11 +425,11 @@ fn settings_that_break_a_rule_of_the_executor_are_refused() {
 
 /// Asserts that `--executor-base-tree` is the directory the executor's flags carry, as given and
 /// not looked at (nothing is read before the start), that it is the one path flag of the
-/// executor with a `DIR` value name, and that `--executor kbf-daemon` takes any value of it
+/// executor with a `DIR` value name, and that with no executor any value of it is taken
 /// without reading it. Catches: a path that is made absolute or checked at parse time, so a
 /// unit whose directory the release's installer makes after the config is read would not parse.
 #[test]
-fn the_base_tree_flag_is_the_directory_of_the_bundles_and_unread_with_daemons() {
+fn the_base_tree_flag_is_the_directory_of_the_bundles_and_unread_with_no_executor() {
     let flags = js_with(&["--executor-base-tree=relative/base-tree"]).expect("flags");
     let js = flags.executor.js.expect("js-agent");
     assert_eq!(js.base_tree, std::path::PathBuf::from("relative/base-tree"));
@@ -429,8 +440,8 @@ fn the_base_tree_flag_is_the_directory_of_the_bundles_and_unread_with_daemons() 
     assert!(help.contains("--executor-base-tree <DIR>"), "{help}");
 
     let mut all = JS.to_vec();
-    all[0] = "--executor=kbf-daemon";
-    all[9] = "--executor-base-tree=/does/not/exist";
+    all.remove(0);
+    all[8] = "--executor-base-tree=/does/not/exist";
     let flags = parsed(argv(&all)).expect("flags");
     assert!(flags.executor.js.is_none());
 }
@@ -558,21 +569,20 @@ fn an_unknown_delivery_is_refused() {
     assert!(why.contains("--executor-secret-delivery"), "{why}");
 }
 
-/// Catches a delivery that would do nothing being accepted: with `--executor kbf-daemon` no
+/// Catches a delivery that would do nothing being accepted: with no executor no
 /// task command line is built, so `files` is refused, naming the flag; the default `argv`
 /// stays accepted (it is what every unit that names nothing has).
 #[test]
-fn the_daemon_executor_refuses_the_files_delivery() {
+fn no_executor_refuses_the_files_delivery() {
     let why = parsed(argv(&["--executor-secret-delivery=files"])).expect_err("refused");
     assert!(why.contains("--executor-secret-delivery"), "{why}");
     let flags = parsed(argv(&["--executor-secret-delivery=argv"])).expect("flags");
-    assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
+    assert!(flags.executor.js.is_none());
 }
 
 /// Catches `--executor-output-disk-bytes` still being read: a job books no disk, so the flag
 /// that sized its scratch is gone, and a frontend given it, as `--flag=value` or as
-/// `--flag value`, with `--executor js-agent` or with the default `kbf-daemon` (a rollback keeps
-/// the unit's flags), is refused when the command line is parsed, with clap's unknown-argument
+/// `--flag value`, with `--executor js-agent` or with no executor, is refused when the command line is parsed, with clap's unknown-argument
 /// error naming the flag; with every value it once took (the old default, the smallest and a
 /// zero it refused) the same. The same command line without it parses, so the refusal is the
 /// flag's.
@@ -585,22 +595,22 @@ fn the_output_disk_flag_is_refused_naming_it() {
             let why = refused(&given);
             assert!(why.contains("unexpected argument"), "{given:?}: {why}");
             assert!(why.contains(&format!("'{FLAG}'")), "{given:?}: {why}");
-            let mut daemons = argv(&[]);
-            daemons.extend(given.iter().map(ToString::to_string));
-            let why = parsed(daemons).expect_err("refused with daemons");
+            let mut bare = argv(&[]);
+            bare.extend(given.iter().map(ToString::to_string));
+            let why = parsed(bare).expect_err("refused with no executor");
             assert!(why.contains("unexpected argument"), "{given:?}: {why}");
             assert!(why.contains(&format!("'{FLAG}'")), "{given:?}: {why}");
         }
     }
     js_with(&[]).expect("js-agent without the flag parses");
-    parsed(argv(&[])).expect("daemons without the flag parse");
+    parsed(argv(&[])).expect("no executor without the flag parses");
 }
 
 /// Catches the lease server's flags still being read, or the job service's being optional: each
 /// removed flag is refused when the command line is parsed, with an error naming it, so a unit
 /// that still has one fails at start and never runs on the wrong protocol; each flag that
-/// replaced them is named, in the order of `REQUIRED`, when it is missing; and daemons, given
-/// none of them, build no executor and no client.
+/// replaced them is named, in the order of `REQUIRED`, when it is missing; and a frontend with no executor, given
+/// none of them, builds no executor and no client.
 #[test]
 fn old_lease_flags_are_refused_and_job_flags_are_required() {
     for removed in [
@@ -613,7 +623,7 @@ fn old_lease_flags_are_refused_and_job_flags_are_required() {
         let why = refused(&[removed]);
         assert!(why.contains(name(removed)), "{removed}: {why}");
         assert!(why.contains("unexpected argument"), "{removed}: {why}");
-        // The same with daemons: the rollback keeps the job flags, not the removed ones.
+        // The same with no executor: the unit keeps the job flags, not the removed ones.
         let why = parsed(argv(&[removed])).expect_err("refused");
         assert!(why.contains(name(removed)), "{removed}: {why}");
     }
@@ -643,11 +653,9 @@ fn old_lease_flags_are_refused_and_job_flags_are_required() {
         assert!(first.ends_with(&one), "{one} in {why}");
     }
 
-    let flags = parsed(argv(&["--executor=kbf-daemon"])).expect("flags");
-    assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
+    let flags = parsed(argv(&[])).expect("flags");
     assert!(flags.executor.js.is_none(), "no executor, so no client");
     let none = ExecutorFlags::default();
-    assert_eq!(none.kind, ExecutorKind::KbfDaemon);
     assert!(none.js.is_none());
 }
 
@@ -655,7 +663,7 @@ fn old_lease_flags_are_refused_and_job_flags_are_required() {
 /// one flag, or a stray opt-in: each level names its network; `open` alone is refused when the
 /// flags are read, the message naming both flags; `open` with `--executor-allow-open-network`
 /// is accepted; the opt-in with another level is refused naming it; a level that is not one is
-/// refused naming the flag; and with `--executor kbf-daemon` neither flag is read.
+/// refused naming the flag; and with no executor neither flag is read.
 #[test]
 fn executor_network_is_the_jobs_network_and_open_needs_its_opt_in() {
     let network = |more: &[&str]| {
@@ -697,8 +705,8 @@ fn executor_network_is_the_jobs_network_and_open_needs_its_opt_in() {
     );
     let why = refused(&["--executor-network=wide"]);
     assert!(why.contains("--executor-network"), "{why}");
-    let daemons = parsed(argv(&["--executor-network=open"])).expect("ignored with daemons");
-    assert!(daemons.executor.js.is_none());
+    let bare = parsed(argv(&["--executor-network=open"])).expect("ignored with no executor");
+    assert!(bare.executor.js.is_none());
 }
 
 /// Catches an open job network taken without a line in the log: the network every job gets is

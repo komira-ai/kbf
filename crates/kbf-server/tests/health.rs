@@ -27,7 +27,7 @@ use kbf_server::{
     Api, Args, BUILD_COMMIT, Listeners, Readiness, SERVER_VERSION, bind_server_with_api,
 };
 use serde_json::{Value, json};
-use support::{HELLO_WAIT, INTERVAL, PROMPT};
+use support::PROMPT;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -155,15 +155,12 @@ fn start_with_prefix(prefix: &str) -> Server {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        heartbeat_interval: INTERVAL,
-        hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         memory_climb: true,
-        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         exclusive_actions: false,
         placement_load: kbf_server::PlacementLoad::Off,
@@ -175,7 +172,6 @@ fn start_with_prefix(prefix: &str) -> Server {
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
-        segments: kbf_front::SegmentsConfig::DEFAULT,
         stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     start_on(prefix, listeners)
@@ -201,7 +197,6 @@ fn start_on(prefix: &str, listeners: Listeners) -> Server {
     let api = Api {
         listen: loopback,
         token: None,
-        local_cache: None,
     };
     let (stop, stopped) = oneshot::channel::<()>();
     let shutdown = async move {

@@ -275,21 +275,12 @@ async fn the_scrape_counts_the_reads_over_the_wire_and_the_daemon_halfs() {
         [1, 0, 1, 0, 0]
     );
 
-    // The daemon half of a node without a frontend reads through a `LocalStore` over it.
-    let local = kbf_server::LocalStore::over(std::sync::Arc::clone(&storage));
-    assert_eq!(local.read_blob(&digest).await.expect("read"), body.to_vec());
-    assert_eq!(
-        legacy_rows(&get(metrics, "/metrics").await.2),
-        [1, 0, 2, 0, 0]
-    );
-
     let absent = kbf_segments::sha256(b"a blob nobody put");
     assert!(remote.read_blob(&absent).await.is_err());
     assert!(storage.read_blob(&absent).await.is_err());
-    assert!(local.read_blob(&absent).await.is_err());
     assert_eq!(
         legacy_rows(&get(metrics, "/metrics").await.2),
-        [1, 0, 2, 0, 0]
+        [1, 0, 1, 0, 0]
     );
 }
 

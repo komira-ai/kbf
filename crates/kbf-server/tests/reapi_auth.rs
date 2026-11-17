@@ -12,17 +12,17 @@ use clap::Parser;
 use futures::future::BoxFuture;
 use kbf_auth::{AuthenticationMetadata, Authorizer, Authorizers, Policy};
 use kbf_front::Cache;
-use kbf_proto::google::bytestream::ReadRequest;
-use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::longrunning::GetOperationRequest;
 use kbf_proto::google::longrunning::operations_client::OperationsClient;
 use kbf_proto::grpc::health::v1::HealthCheckRequest;
 use kbf_proto::grpc::health::v1::health_check_response::ServingStatus;
 use kbf_proto::grpc::health::v1::health_client::HealthClient;
+use kbf_proto::kbf::map::v1::RegisterRequest;
+use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
 use kbf_proto::reapi::{GetCapabilitiesRequest, WaitExecutionRequest};
 use kbf_server::{Args, Bound, ConfigError, bind_server_with_policy};
-use support::{Client, FakeDaemon, Job, hello};
+use support::{Client, Job};
 use tonic::{Code, Status};
 
 /// A policy file in a directory of its own, removed with it when this drops.
@@ -96,9 +96,8 @@ async fn capabilities(reapi: std::net::SocketAddr) -> Result<(), Status> {
 }
 
 /// Catches: a `--reapi-auth-policy` file that is read but not run on the REAPI
-/// listener, and a REAPI policy that reaches the worker listener (its streams and its
-/// blob calls answer by the worker listener's own rules, whatever the REAPI policy
-/// says).
+/// listener, and a REAPI policy that reaches the worker listener (its calls answer by the
+/// worker listener's own rules, whatever the REAPI policy says).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_policy_file_runs_on_the_reapi_listener_alone() {
     let path = policy_file(
@@ -115,22 +114,17 @@ async fn the_policy_file_runs_on_the_reapi_listener_alone() {
         (Code::Unauthenticated, "no REAPI callers today")
     );
 
-    // A daemon still registers on the plain-text worker listener...
-    FakeDaemon::connect(worker, hello("node-a", 4, 8))
-        .await
-        .expect("a daemon is welcomed");
-    // ...and its blob calls are refused by the worker listener's rule, not the policy.
-    let e = ByteStreamClient::connect(format!("http://{worker}"))
+    // The worker listener answers by its own rules: a plain-text call to a method it lists
+    // reaches the service behind it (none is served here without a state store), and is
+    // not refused by the REAPI policy.
+    let e = MembershipClient::connect(format!("http://{worker}"))
         .await
         .expect("connect")
-        .read(ReadRequest {
-            resource_name: format!("blobs/{}/0", "0".repeat(64)),
-            ..Default::default()
-        })
+        .register(RegisterRequest::default())
         .await
-        .expect_err("plain text refuses blob calls");
-    assert_eq!(e.code(), Code::Unauthenticated);
-    assert!(e.message().contains("mutual TLS"), "{e:?}");
+        .expect_err("no membership service without a state store");
+    assert_eq!(e.code(), Code::Unimplemented, "{e:?}");
+    assert!(!e.message().contains("no REAPI callers today"), "{e:?}");
 }
 
 /// Catches: a policy that blocks the REAPI listener's health service (a proxy's

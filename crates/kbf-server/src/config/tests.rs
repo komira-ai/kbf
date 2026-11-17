@@ -174,26 +174,21 @@ fn cpu_threads_reaches_the_hashing_pool() {
     }
 }
 
-/// Catches a `--segment-upload-*` flag that does not reach the listeners, a default
-/// other than the design's (33 MiB, 60 s), and a cap below it accepted (a daemon's
-/// upload of small files would be refused for good).
+/// Catches a `--segment-upload-*` flag that is not read, a default other than the design's
+/// (33 MiB, 60 s), and a cap below it accepted (an upload of small files would be refused
+/// for good).
 #[test]
-fn segment_upload_flags_reach_the_listeners() {
-    let defaults = Args::parse_from(["kbf-server"])
-        .listeners()
-        .expect("listeners");
-    assert_eq!(defaults.segments, kbf_front::SegmentsConfig::DEFAULT);
-    assert_eq!(defaults.segments.max_bytes, 33 << 20);
-    assert_eq!(defaults.segments.idle, std::time::Duration::from_secs(60));
+fn segment_upload_flags_are_read_with_the_designs_defaults() {
+    let defaults = Args::parse_from(["kbf-server"]);
+    assert_eq!(defaults.segment_upload_max_bytes, 33 << 20);
+    assert_eq!(defaults.segment_upload_idle_secs, 60);
     let set = Args::parse_from([
         "kbf-server",
         "--segment-upload-max-bytes=1073741824",
         "--segment-upload-idle-secs=5",
-    ])
-    .listeners()
-    .expect("listeners");
-    assert_eq!(set.segments.max_bytes, 1 << 30);
-    assert_eq!(set.segments.idle, std::time::Duration::from_secs(5));
+    ]);
+    assert_eq!(set.segment_upload_max_bytes, 1 << 30);
+    assert_eq!(set.segment_upload_idle_secs, 5);
     let below = format!("--segment-upload-max-bytes={}", (33u64 << 20) - 1);
     for refused in [below.as_str(), "--segment-upload-idle-secs=0"] {
         assert!(

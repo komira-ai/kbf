@@ -23,7 +23,7 @@ use kbf_server::{
 };
 use kbf_types::{Resources, WorkerId};
 use serde_json::{Value, json};
-use support::{Client, FakeDaemon, HELLO_WAIT, INTERVAL, Job, PROMPT, done, hello, output, ran};
+use support::{Client, FakeDaemon, Job, PROMPT, done, hello, output, ran};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -43,6 +43,7 @@ struct Server {
     reapi: SocketAddr,
     worker: SocketAddr,
     api: SocketAddr,
+    farm: std::sync::Weak<kbf_server::farm::Farm>,
     stop: tokio::sync::oneshot::Sender<()>,
     serving: tokio::task::JoinHandle<()>,
 }
@@ -83,15 +84,12 @@ fn listeners() -> Listeners {
         worker: loopback(),
         reapi_tls: None,
         worker_tls: None,
-        heartbeat_interval: INTERVAL,
-        hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         memory_climb: true,
-        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         exclusive_actions: false,
         placement_load: kbf_server::PlacementLoad::Off,
@@ -103,7 +101,6 @@ fn listeners() -> Listeners {
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
-        segments: kbf_front::SegmentsConfig::DEFAULT,
         stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
@@ -117,7 +114,6 @@ fn start_with(token: Option<ApiToken>) -> Server {
     let api = Api {
         listen: loopback(),
         token,
-        local_cache: None,
     };
     let bound = bind_server_with_api(cache(), listeners, Some(api), shutdown).expect("bind");
     let (reapi, worker, api) = (
@@ -125,11 +121,13 @@ fn start_with(token: Option<ApiToken>) -> Server {
         bound.worker,
         bound.api.expect("an API address"),
     );
+    let farm = bound.farm.clone();
     let serving = tokio::spawn(async move { bound.serving.await.expect("serve") });
     Server {
         reapi,
         worker,
         api,
+        farm,
         stop,
         serving,
     }
@@ -267,7 +265,7 @@ const NOT_READY: &str = "Xcode 16B40 (/Applications/Xcode_16.1.app) installed bu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_nodes_lists_each_nodes_newest_software() {
     let server = start();
-    let (worker, api) = (server.worker, server.api);
+    let api = server.api;
     let this_build = json!({ "version": SERVER_VERSION, "commit": BUILD_COMMIT });
     assert_eq!(
         SERVER_VERSION,
@@ -280,19 +278,19 @@ async fn get_nodes_lists_each_nodes_newest_software() {
     );
 
     let before = now_ms();
-    let linux = FakeDaemon::connect_without_status(worker, hello("linux-1", 8, 16))
+    let linux = FakeDaemon::connect_without_status(server.farm.clone(), hello("linux-1", 8, 16))
         .await
         .expect("registered");
     linux.send(daemon_message::Message::NodeStatus(NodeStatus {
         container_images: vec![LINUX_IMAGE.to_owned()],
         ..linux_status("6.8.0-45-generic")
     }));
-    let mac = FakeDaemon::connect_without_status(worker, hello("mac-1", 8, 16))
+    let mac = FakeDaemon::connect_without_status(server.farm.clone(), hello("mac-1", 8, 16))
         .await
         .expect("registered");
     mac.send(daemon_message::Message::NodeStatus(mac_status()));
     // A daemon that predates NodeStatus.
-    let old = FakeDaemon::connect_without_status(worker, hello("old-1", 8, 16))
+    let old = FakeDaemon::connect_without_status(server.farm.clone(), hello("old-1", 8, 16))
         .await
         .expect("registered");
 
@@ -369,15 +367,12 @@ async fn an_api_address_in_use_is_refused() {
         worker: loopback(),
         reapi_tls: None,
         worker_tls: None,
-        heartbeat_interval: INTERVAL,
-        hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         memory_climb: true,
-        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         exclusive_actions: false,
         placement_load: kbf_server::PlacementLoad::Off,
@@ -389,13 +384,11 @@ async fn an_api_address_in_use_is_refused() {
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
-        segments: kbf_front::SegmentsConfig::DEFAULT,
         stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let api = Api {
         listen: addr,
         token: None,
-        local_cache: None,
     };
     let refused = bind_server_with_api(cache(), listeners, Some(api), std::future::pending());
     let Err(ServeError::Bind { addr: at, .. }) = refused else {
@@ -646,7 +639,7 @@ async fn cordon_drain_and_uncordon_over_http() {
     let server = start();
     let api = server.api;
     let cell = Client::connect(server.reapi, server.worker).await;
-    let mut node = FakeDaemon::connect(server.worker, hello("linux-1", 8, 16))
+    let mut node = FakeDaemon::connect(server.farm.clone(), hello("linux-1", 8, 16))
         .await
         .expect("registered");
 
@@ -747,7 +740,7 @@ async fn a_drain_with_an_empty_body_has_no_deadline() {
     let server = start();
     let api = server.api;
     let cell = Client::connect(server.reapi, server.worker).await;
-    let mut node = FakeDaemon::connect(server.worker, hello("linux-1", 8, 16))
+    let mut node = FakeDaemon::connect(server.farm.clone(), hello("linux-1", 8, 16))
         .await
         .expect("registered");
     let job = Job::new("first", &[]);
@@ -947,7 +940,7 @@ fn a_write_passes_every_gate_or_is_refused() {
 async fn writes_over_http_need_the_token_no_origin_and_json() {
     let server = start();
     let api = server.api;
-    let node = FakeDaemon::connect(server.worker, hello("linux-1", 8, 16))
+    let node = FakeDaemon::connect(server.farm.clone(), hello("linux-1", 8, 16))
         .await
         .expect("registered");
     let bearer = format!("Authorization: Bearer {TOKEN}\r\n");

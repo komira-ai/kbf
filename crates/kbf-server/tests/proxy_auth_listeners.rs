@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::channel::mpsc::unbounded;
 use hooked::Hooked;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_objstore::MemoryStore;
@@ -21,10 +20,6 @@ use kbf_proto::google::bytestream::ReadRequest;
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
-use kbf_proto::worker::{
-    Capability, DaemonMessage, Hello, ServerMessage, daemon_message, server_message,
-    worker_client::WorkerClient,
-};
 use kbf_server::identity::Presented;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
 use kbf_server::members_rpc::MembershipService;
@@ -112,15 +107,12 @@ fn start_denying(with_proxy: bool, deny_list: Option<DenyList>) -> Server_ {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        heartbeat_interval: Duration::from_millis(100),
-        hello_wait: Duration::from_millis(300),
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         memory_climb: true,
-        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         exclusive_actions: false,
         placement_load: kbf_server::PlacementLoad::Off,
@@ -132,14 +124,12 @@ fn start_denying(with_proxy: bool, deny_list: Option<DenyList>) -> Server_ {
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
-        segments: kbf_front::SegmentsConfig::DEFAULT,
         stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let api = Api {
         listen: loopback,
         token: Some(token()),
-        local_cache: None,
     };
     let cache: Arc<MemoryCache> = Arc::new(Cache::memory());
     let proxy = with_proxy.then(|| Behind {
@@ -151,7 +141,6 @@ fn start_denying(with_proxy: bool, deny_list: Option<DenyList>) -> Server_ {
         listeners,
         Some(api),
         kbf_auth::Policy::allow_all(),
-        None,
         None,
         None,
         proxy,
@@ -182,24 +171,6 @@ async fn channel(to: SocketAddr) -> Channel {
         .expect("connect")
 }
 
-fn hello(node: &str) -> Hello {
-    let entry = |key: &str, value: &str| Capability {
-        key: key.to_owned(),
-        value: value.to_owned(),
-    };
-    Hello {
-        protocol_version: 1,
-        node_id: node.to_owned(),
-        capabilities: vec![
-            entry("arch", "x86_64"),
-            entry("cpus", "1"),
-            entry("mem_gib", "1"),
-            entry("drivers", "fake"),
-        ],
-        ..Hello::default()
-    }
-}
-
 /// Sets the request header `name` to `value`.
 fn put<T>(request: &mut tonic::Request<T>, name: &str, value: &str) {
     let key = tonic::metadata::MetadataKey::from_bytes(name.as_bytes()).expect("a key");
@@ -207,31 +178,22 @@ fn put<T>(request: &mut tonic::Request<T>, name: &str, value: &str) {
     request.metadata_mut().insert(key, value);
 }
 
-/// Opens a worker session whose `Hello` names `node`, with `claims` as request headers,
-/// and waits for `Welcome` or the status the server refused it with.
-async fn session(to: SocketAddr, node: &str, claims: &[(&str, &str)]) -> Result<(), Status> {
-    let (tx, rx) = unbounded();
-    tx.unbounded_send(DaemonMessage {
-        message: Some(daemon_message::Message::Hello(hello(node))),
-    })
-    .expect("open");
-    let mut request = tonic::Request::new(rx);
+/// Calls `Membership/Register` on the worker listener with `claims` as request headers. A
+/// server with no state store serves no membership, so UNIMPLEMENTED is the answer of a call
+/// the proxy layer and the table of roles let through: `Ok`.
+async fn session(to: SocketAddr, claims: &[(&str, &str)]) -> Result<(), Status> {
+    let mut request = tonic::Request::new(pb::RegisterRequest::default());
     for (name, value) in claims {
         put(&mut request, name, value);
     }
-    let mut client = WorkerClient::new(channel(to).await);
-    let mut inbound = tokio::time::timeout(PROMPT, client.session(request))
+    let mut client = MembershipClient::new(channel(to).await);
+    match tokio::time::timeout(PROMPT, client.register(request))
         .await
-        .expect("an answer in time")?
-        .into_inner();
-    let first = tokio::time::timeout(PROMPT, inbound.message())
-        .await
-        .expect("an answer in time")?;
-    match first {
-        Some(ServerMessage {
-            message: Some(server_message::Message::Welcome(_)),
-        }) => Ok(()),
-        other => panic!("expected Welcome or an error, got {other:?}"),
+        .expect("an answer in time")
+    {
+        Err(status) if status.code() == Code::Unimplemented => Ok(()),
+        Err(status) => Err(status),
+        Ok(other) => panic!("expected an error, got {other:?}"),
     }
 }
 
@@ -244,33 +206,32 @@ fn forwarded(node: &str, role: &str) -> Vec<(String, String)> {
     ]
 }
 
-async fn session_as(to: SocketAddr, node: &str, claims: &[(String, String)]) -> Result<(), Status> {
+async fn session_as(to: SocketAddr, claims: &[(String, String)]) -> Result<(), Status> {
     let borrowed: Vec<(&str, &str)> = claims
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    session(to, node, &borrowed).await
+    session(to, &borrowed).await
 }
 
 /// Catches, over a real listener with no TLS (the proxy terminates it): the worker listener
 /// believing identity headers that do not carry the secret (it must stay anonymous, and an
 /// anonymous call is UNAUTHENTICATED, not a node), believing a wrong secret, believing the
-/// role of a caller the proxy vouched for as a frontend, and a proxied daemon that is not
-/// admitted at all.
+/// role of a caller the proxy vouched for as a frontend.
 ///
 /// Catches: the headers accepted without the secret check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_worker_session_needs_the_proxys_word() {
+async fn a_worker_call_needs_the_proxys_word() {
     let server = start(true);
     let none: [(&str, &str); 0] = [];
-    let anonymous = session(server.worker, "node-a", &none).await;
+    let anonymous = session(server.worker, &none).await;
     assert_eq!(
         anonymous.expect_err("anonymous").code(),
         Code::Unauthenticated
     );
 
-    let without_secret = [(NODE_ID, "node-a"), (ROLE, "daemon")];
-    let refused = session(server.worker, "node-a", &without_secret).await;
+    let without_secret = [(NODE_ID, "node-a"), (ROLE, "storage")];
+    let refused = session(server.worker, &without_secret).await;
     assert_eq!(
         refused.expect_err("no secret").code(),
         Code::Unauthenticated
@@ -282,30 +243,25 @@ async fn a_worker_session_needs_the_proxys_word() {
             "0000000000000000000000000000000000000000000000000000000000000000",
         ),
         (NODE_ID, "node-a"),
-        (ROLE, "daemon"),
+        (ROLE, "storage"),
     ];
-    let refused = session(server.worker, "node-a", &wrong).await;
+    let refused = session(server.worker, &wrong).await;
     assert_eq!(refused.expect_err("wrong").code(), Code::Unauthenticated);
 
-    session_as(server.worker, "node-a", &forwarded("node-a", "daemon"))
+    session_as(server.worker, &forwarded("node-a", "storage"))
         .await
         .expect("the proxy vouched for node-a");
 
-    let frontend = session_as(server.worker, "node-a", &forwarded("node-a", "frontend")).await;
+    let frontend = session_as(server.worker, &forwarded("node-a", "frontend")).await;
     assert_eq!(
         frontend.expect_err("frontend").code(),
         Code::PermissionDenied
     );
 
-    let mut no_role = forwarded("node-a", "daemon");
+    let mut no_role = forwarded("node-a", "storage");
     no_role.pop();
-    let refused = session_as(server.worker, "node-a", &no_role).await;
+    let refused = session_as(server.worker, &no_role).await;
     assert_eq!(refused.expect_err("no role").code(), Code::Unauthenticated);
-
-    let mut no_node = forwarded("node-a", "daemon");
-    no_node.remove(1);
-    let refused = session_as(server.worker, "node-a", &no_node).await;
-    assert_eq!(refused.expect_err("no node").code(), Code::Unauthenticated);
 }
 
 /// Catches: the REAPI listener built without the proxy's secret: a call presenting the
@@ -348,94 +304,6 @@ async fn the_reapi_listener_is_behind_the_proxy() {
                 .is_err_and(|s| s.code() != Code::PermissionDenied),
         "{passed:?}"
     );
-}
-
-/// Catches: `Hello.node_id` not bound to the node the proxy named: a daemon vouched for as
-/// `node-a` that says `node-b` in its `Hello` takes over another node's session.
-///
-/// Catches: the `Hello.node_id` binding skipped.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_forged_node_id_is_refused() {
-    let server = start(true);
-    let forged = session_as(server.worker, "node-b", &forwarded("node-a", "daemon")).await;
-    let refused = forged.expect_err("forged");
-    assert_eq!(refused.code(), Code::PermissionDenied);
-    assert!(
-        refused.message().contains("node-a"),
-        "{}",
-        refused.message()
-    );
-    session_as(server.worker, "node-b", &forwarded("node-b", "daemon"))
-        .await
-        .expect("node-b's own");
-}
-
-/// Catches: the deny list not applied to the node a proxy names (a denied node admitted),
-/// or applied to every node.
-///
-/// Catches: `Behind::deny_list` dropped when the listener has no TLS.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_denied_node_is_refused_behind_the_proxy() {
-    // Bound: the list is read again at every call, so its file outlives the server.
-    let list_file = file(b"node mac-07\n", 0o600);
-    let list = DenyList::open(&list_file).expect("a deny list");
-    let server = start_denying(true, Some(list));
-    let denied = session_as(server.worker, "mac-07", &forwarded("mac-07", "daemon")).await;
-    let refused = denied.expect_err("denied");
-    assert_eq!(refused.code(), Code::PermissionDenied);
-    assert!(
-        refused.message().contains("mac-07"),
-        "{}",
-        refused.message()
-    );
-    session_as(server.worker, "mac-08", &forwarded("mac-08", "daemon"))
-        .await
-        .expect("not listed");
-}
-
-/// Catches: the blob calls of the worker listener not using the proxy's identity: a call
-/// the proxy vouched for as a daemon with a node passes admission (the blob is simply
-/// absent), one with no node is UNAUTHENTICATED, a storage role PERMISSION_DENIED, and one
-/// without the secret UNAUTHENTICATED.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn blob_calls_take_the_proxys_identity() {
-    let server = start(true);
-    let channel = channel(server.worker).await;
-    let read = |claims: Vec<(String, String)>| {
-        let channel = channel.clone();
-        async move {
-            let mut request = tonic::Request::new(ReadRequest {
-                resource_name: format!("blobs/{}/0", "0".repeat(64)),
-                read_offset: 0,
-                read_limit: 0,
-            });
-            for (name, value) in &claims {
-                put(&mut request, name, value);
-            }
-            let mut client = ByteStreamClient::new(channel);
-            match client.read(request).await {
-                Ok(response) => response.into_inner().message().await.map(drop),
-                Err(status) => Err(status),
-            }
-        }
-    };
-    let passed = read(forwarded("node-a", "daemon")).await;
-    assert!(
-        passed.as_ref().is_ok() || passed.as_ref().is_err_and(|s| s.code() == Code::NotFound),
-        "admitted, then answered for the blob: {passed:?}"
-    );
-    let mut no_node = forwarded("node-a", "daemon");
-    no_node.remove(1);
-    let refused = read(no_node).await.expect_err("no node");
-    assert_eq!(refused.code(), Code::Unauthenticated);
-    let storage = read(forwarded("node-a", "storage"))
-        .await
-        .expect_err("storage");
-    assert_eq!(storage.code(), Code::PermissionDenied);
-    let bare = read(vec![(NODE_ID.to_owned(), "node-a".to_owned())])
-        .await
-        .expect_err("no secret");
-    assert_eq!(bare.code(), Code::Unauthenticated);
 }
 
 /// One HTTP/1.1 request to `api` with `headers`; the status code.
@@ -550,11 +418,7 @@ async fn without_the_flag_nothing_changes() {
         401,
         "the headers are not a credential"
     );
-    let anonymous = session(
-        server.worker,
-        "node-a",
-        &[(NODE_ID, "node-b"), (ROLE, "daemon")],
-    );
+    let anonymous = session(server.worker, &[(NODE_ID, "node-b"), (ROLE, "storage")]);
     anonymous.await.expect("plain text admits as before");
 }
 
@@ -943,12 +807,12 @@ async fn the_binary_serves_behind_the_proxy_when_given_the_flag() {
     .expect("read the start line");
     let (worker, api) = (address(&line, "worker="), address(&line, "api="));
 
-    let anonymous = session(worker, "node-a", &[(NODE_ID, "node-a"), (ROLE, "daemon")]).await;
+    let anonymous = session(worker, &[(NODE_ID, "node-a"), (ROLE, "storage")]).await;
     assert_eq!(
         anonymous.expect_err("no secret").code(),
         Code::Unauthenticated
     );
-    session_as(worker, "node-a", &forwarded("node-a", "daemon"))
+    session_as(worker, &forwarded("node-a", "storage"))
         .await
         .expect("the proxy vouched for node-a");
 

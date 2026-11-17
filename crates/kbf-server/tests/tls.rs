@@ -5,17 +5,15 @@ use std::future::pending;
 use std::path::Path;
 
 use clap::Parser;
-use futures::channel::mpsc::unbounded;
 use kbf_auth::Policy;
 use kbf_front::Cache;
 use kbf_proto::grpc::health::v1::HealthCheckRequest;
 use kbf_proto::grpc::health::v1::health_check_response::ServingStatus;
 use kbf_proto::grpc::health::v1::health_client::HealthClient;
+use kbf_proto::kbf::map::v1::RegisterRequest;
+use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_proto::reapi::GetCapabilitiesRequest;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
-use kbf_proto::worker::{
-    Capability, DaemonMessage, Hello, daemon_message, server_message, worker_client::WorkerClient,
-};
 use kbf_server::{Args, bind_server, bind_server_with_policy};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -53,8 +51,8 @@ fn pki(name: &str) -> Pki {
     let leaf = |names: Vec<String>, cn: &str, eku: ExtendedKeyUsagePurpose| {
         let mut params = CertificateParams::new(names).expect("leaf params");
         if eku == ExtendedKeyUsagePurpose::ClientAuth {
-            // The daemon role, as the worker listener requires.
-            let role = "urn:kbf:role:daemon".try_into().expect("an IA5 name");
+            // The storage role, as the worker listener requires for the calls it serves.
+            let role = "urn:kbf:role:storage".try_into().expect("an IA5 name");
             params.subject_alt_names.push(SanType::URI(role));
         }
         params.distinguished_name.push(DnType::CommonName, cn);
@@ -90,8 +88,8 @@ fn path(dir: &Path, file: &str) -> String {
     dir.join(file).to_str().expect("UTF-8 path").to_owned()
 }
 
-/// Opens a session as `identity` (or with no client certificate) and returns whether
-/// the server welcomed it.
+/// Calls the worker listener as `identity` (or with no client certificate) and returns
+/// whether the call got through to the service behind its TLS and roles.
 async fn welcomed(addr: std::net::SocketAddr, pki: &Pki, identity: Option<Identity>) -> bool {
     let mut tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(&pki.ca))
@@ -106,7 +104,7 @@ async fn welcomed(addr: std::net::SocketAddr, pki: &Pki, identity: Option<Identi
     session_welcomed(endpoint).await
 }
 
-/// Opens a session in plain text and returns whether the server welcomed it.
+/// Calls the worker listener in plain text and returns whether the call got through.
 async fn welcomed_in_plain_text(addr: std::net::SocketAddr) -> bool {
     session_welcomed(Endpoint::from_shared(format!("http://{addr}")).expect("endpoint")).await
 }
@@ -115,42 +113,16 @@ async fn session_welcomed(endpoint: Endpoint) -> bool {
     let Ok(channel) = endpoint.connect().await else {
         return false;
     };
-    let (tx, rx) = unbounded();
-    let hello = Hello {
-        protocol_version: 1,
-        node_id: "node-1".to_owned(),
-        capabilities: vec![
-            Capability {
-                key: "cpus".to_owned(),
-                value: "1".to_owned(),
-            },
-            Capability {
-                key: "mem_gib".to_owned(),
-                value: "1".to_owned(),
-            },
-            Capability {
-                key: "arch".to_owned(),
-                value: "x86_64".to_owned(),
-            },
-        ],
-        ..Hello::default()
-    };
-    tx.unbounded_send(DaemonMessage {
-        message: Some(daemon_message::Message::Hello(hello)),
-    })
-    .expect("queue Hello");
-    let Ok(response) = WorkerClient::new(channel).session(rx).await else {
-        return false;
-    };
-    let first = response.into_inner().message().await;
-    matches!(
-        first,
-        Ok(Some(m)) if matches!(m.message, Some(server_message::Message::Welcome(_)))
-    )
+    // A server with no state store serves no membership: UNIMPLEMENTED is the answer of a
+    // call that passed the listener's TLS and its table of roles.
+    let answer = MembershipClient::new(channel)
+        .register(RegisterRequest::default())
+        .await;
+    matches!(answer, Err(status) if status.code() == tonic::Code::Unimplemented)
 }
 
 /// Catches: TLS flags that are read but not applied (the worker listener serves plain
-/// text), and a listener that welcomes a daemon presenting no client certificate.
+/// text), and a listener that lets through a caller presenting no client certificate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_worker_listener_requires_a_client_certificate() {
     let pki = pki("worker");

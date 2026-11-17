@@ -18,17 +18,15 @@ use axum::Router;
 use axum::routing::get;
 use axum::serve::Listener;
 use futures::stream;
-use kbf_front::{ByteStreamService, Cache, MemoryMetaLog};
-use kbf_objstore::MemoryStore;
-use kbf_proto::google::bytestream::ReadRequest;
-use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
-use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
+use kbf_proto::kbf::map::v1 as pb;
+use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
+use kbf_proto::kbf::map::v1::membership_server::{Membership, MembershipServer};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tonic::metadata::{MetadataKey, MetadataValue};
 use tonic::transport::server::{Connected, Server};
 use tonic::transport::{Channel, Endpoint};
-use tonic::{Code, Request};
+use tonic::{Code, Request, Response, Status};
 
 use crate::Behind;
 use crate::proxy_auth::{NODE_ID, PROXY_AUTH, ProxySecret, ROLE};
@@ -200,13 +198,32 @@ impl AsyncWrite for Conn {
     }
 }
 
-/// The worker listener (`worker_peers`) with a `ByteStream` service, as `peer` reaches it;
-/// a `Read` of a blob the cache lacks, with `claims` as request headers: the status code.
+/// A `Membership` service that answers a registration with an empty one and refuses a heartbeat.
+struct Standin;
+
+#[tonic::async_trait]
+impl Membership for Standin {
+    async fn register(
+        &self,
+        _request: Request<pb::RegisterRequest>,
+    ) -> Result<Response<pb::RegisterResponse>, Status> {
+        Ok(Response::new(pb::RegisterResponse::default()))
+    }
+
+    async fn heartbeat(
+        &self,
+        _request: Request<pb::HeartbeatRequest>,
+    ) -> Result<Response<pb::HeartbeatResponse>, Status> {
+        Err(Status::unimplemented("not under test"))
+    }
+}
+
+/// The worker listener (`worker_peers`) with a `Membership` service, as `peer` reaches it;
+/// a `Register`, with `claims` as request headers: the status code.
 async fn worker(peer: &str, claims: &[(&str, String)]) -> (Code, String) {
     let behind = behind();
     let (mut server, _peers, _tls) = worker_peers(Server::builder(), None, Some(&behind));
-    let cache: Arc<Cache<MemoryMetaLog, MemoryStore>> = Arc::new(Cache::memory());
-    let service = ByteStreamServer::new(ByteStreamService::new(cache));
+    let service = MembershipServer::new(Standin);
     let socket = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let at = socket.local_addr().expect("address");
     let info = kbf_tls::ConnInfo {
@@ -231,33 +248,26 @@ async fn worker(peer: &str, claims: &[(&str, String)]) -> (Code, String) {
         .connect()
         .await
         .expect("connect");
-    let mut request = Request::new(ReadRequest {
-        resource_name: format!("blobs/{}/0", "0".repeat(64)),
-        read_offset: 0,
-        read_limit: 0,
-    });
+    let mut request = Request::new(pb::RegisterRequest::default());
     for (name, value) in claims {
         let key = MetadataKey::from_bytes(name.as_bytes()).expect("a key");
         let value: MetadataValue<_> = value.parse().expect("a value");
         request.metadata_mut().insert(key, value);
     }
-    let result = match ByteStreamClient::new(channel).read(request).await {
-        Ok(response) => response.into_inner().message().await.map(drop),
-        Err(status) => Err(status),
-    };
+    let result = MembershipClient::new(channel).register(request).await;
     served.abort();
     match result {
-        Ok(()) => (Code::Ok, String::new()),
+        Ok(_) => (Code::Ok, String::new()),
         Err(status) => (status.code(), status.message().to_owned()),
     }
 }
 
-/// What the proxy forwards for a verified daemon.
+/// What the proxy forwards for a verified storage node.
 fn forwarded() -> Vec<(&'static str, String)> {
     vec![
         (PROXY_AUTH, hex::encode(SECRET)),
         (NODE_ID, "node-a".to_owned()),
-        (ROLE, "daemon".to_owned()),
+        (ROLE, "storage".to_owned()),
     ]
 }
 
@@ -278,13 +288,9 @@ async fn the_worker_listener_refuses_a_remote_peer_behind_the_proxy() {
 }
 
 /// The control of the test above: the same call from a loopback peer passes the layer and
-/// the role table and is answered by the service (the blob is not there), and without the
-/// secret it is not the proxy's.
+/// the role table and is answered by the service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_worker_listener_serves_the_proxy_on_loopback() {
     let (code, message) = worker(LOOPBACK, &forwarded()).await;
-    assert!(
-        matches!(code, Code::Ok | Code::NotFound),
-        "answered by the service: {code:?} {message}"
-    );
+    assert_eq!(code, Code::Ok, "answered by the service: {message}");
 }

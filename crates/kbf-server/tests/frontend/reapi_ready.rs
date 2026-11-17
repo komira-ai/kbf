@@ -56,7 +56,7 @@ async fn reapi_readiness_needs_a_connected_worker() {
         "{plain}"
     );
 
-    let daemon = FakeDaemon::connect(front.worker, hello("node-a", 4, 8))
+    let daemon = FakeDaemon::connect(front.farm.clone(), hello("node-a", 4, 8))
         .await
         .expect("registered");
     let (code, body) = get(front.api, "/readyz/reapi").await;
@@ -76,7 +76,7 @@ async fn reapi_readiness_needs_a_connected_worker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reapi_readiness_keeps_the_checks_of_readyz() {
     let (mut node, front) = ready_front(&["--readyz-store-timeout-ms=500"]).await;
-    let _daemon = FakeDaemon::connect(front.worker, hello("node-a", 4, 8))
+    let _daemon = FakeDaemon::connect(front.farm.clone(), hello("node-a", 4, 8))
         .await
         .expect("registered");
     assert_eq!(get(front.api, "/readyz/reapi").await.0, 200);
@@ -100,7 +100,7 @@ async fn reapi_readiness_is_open_like_readyz() {
     let flag = format!("--api-token-file={}", token_file.display());
     let (_node, front) = ready_front(&[&flag]).await;
     assert_eq!(get(front.api, "/readyz/reapi").await.0, 503);
-    let _daemon = FakeDaemon::connect(front.worker, hello("node-a", 4, 8))
+    let _daemon = FakeDaemon::connect(front.farm.clone(), hello("node-a", 4, 8))
         .await
         .expect("registered");
     assert_eq!(get(front.api, "/readyz/reapi").await.0, 200);

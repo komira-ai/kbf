@@ -5,15 +5,10 @@
 //! applies it to every call before routing, and [`crate::serve::worker_peers`] puts the
 //! layer on the listener's server, so every service added to that server is behind it.
 //!
-//! - The daemon role opens a worker session (`kbf.worker.v1.Worker/Session`, which also
-//!   carries the storage map to the daemon) and makes the blob calls: `ByteStream`,
-//!   `ContentAddressableStorage` (the chunking calls too) and `kbf.worker.v1.Segments`, and,
-//!   from a frontend started with `--pack-index`, `kbf.worker.v1.PackIndex/Locate` (and, with
-//!   the pack store flags too, `CommitPack`).
 //! - The storage role registers and heartbeats (`kbf.map.v1.Membership`); a storage
 //!   node gets the map in those answers. It also fetches the farm's registered cold store
 //!   and its keys (`kbf.enroll.v1.ColdStore/GetStoreConfig`): the only method that
-//!   carries the secret, so the only row a daemon or frontend certificate must never reach.
+//!   carries the secret, so the only row a frontend or updater certificate must never reach.
 //! - The frontend role may call nothing here.
 //!
 //! A method not in the table is refused PERMISSION_DENIED, whatever the certificate and
@@ -29,10 +24,6 @@
 //! none is UNAUTHENTICATED, as one without a certificate is. [`crate::serve::worker_peers`]
 //! puts the proxy layer before this one.
 //!
-//! A node that runs both storage and a daemon holds two certificates and presents one on
-//! each connection: its daemon half's connection is a daemon's, its storage half's a
-//! storage node's.
-//!
 //! **Node calls.** Four HTTP/JSON calls about its own node are the exception to the table: a
 //! host's updater makes them with an `updater` certificate ([`crate::node_self`]), and the
 //! layer judges them by their shape and the certificate's node, not by the table. They are the
@@ -40,9 +31,8 @@
 //! `/v1/` (no gRPC method does) is HTTP, and one that is not admitted as a node call is
 //! answered with a plain 403, never a gRPC status.
 //!
-//! The services keep their own checks behind this one: the worker stream and the blob
-//! calls bind the certificate's node name and read the deny list ([`crate::identity`]),
-//! and `Membership` takes the storage role alone again ([`crate::members_rpc`]).
+//! The services keep their own checks behind this one: `Membership` takes the storage role
+//! alone again ([`crate::members_rpc`]) and reads the deny list ([`crate::identity`]).
 
 use std::task::{Context, Poll};
 
@@ -55,58 +45,10 @@ use tower_layer::Layer;
 use crate::identity::{Presented, presented};
 use crate::node_self::{admit as admit_node_call, node_call};
 
-const DAEMON: &[PeerRole] = &[PeerRole::Daemon];
 const STORAGE: &[PeerRole] = &[PeerRole::Storage];
 
 /// Each gRPC method path the worker listener serves, and the roles that may call it.
 pub const WORKER_LISTENER_ROLES: &[(&str, &[PeerRole])] = &[
-    ("/kbf.worker.v1.Worker/Session", DAEMON),
-    ("/google.bytestream.ByteStream/Read", DAEMON),
-    ("/google.bytestream.ByteStream/Write", DAEMON),
-    ("/google.bytestream.ByteStream/QueryWriteStatus", DAEMON),
-    (
-        "/build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs",
-        DAEMON,
-    ),
-    (
-        "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchUpdateBlobs",
-        DAEMON,
-    ),
-    (
-        "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchReadBlobs",
-        DAEMON,
-    ),
-    (
-        "/build.bazel.remote.execution.v2.ContentAddressableStorage/GetTree",
-        DAEMON,
-    ),
-    (
-        "/build.bazel.remote.execution.v2.ContentAddressableStorage/SplitBlob",
-        DAEMON,
-    ),
-    (
-        "/build.bazel.remote.execution.v2.ContentAddressableStorage/SpliceBlob",
-        DAEMON,
-    ),
-    (
-        "/build.bazel.remote.execution.v2.ContentAddressableStorage/GetChunkMapping",
-        DAEMON,
-    ),
-    (
-        "/build.bazel.remote.execution.v2.ContentAddressableStorage/RegisterChunkMapping",
-        DAEMON,
-    ),
-    ("/kbf.worker.v1.Segments/Begin", DAEMON),
-    ("/kbf.worker.v1.Segments/PutRange", DAEMON),
-    ("/kbf.worker.v1.Segments/Commit", DAEMON),
-    ("/kbf.worker.v1.Segments/Locate", DAEMON),
-    ("/kbf.worker.v1.Segments/ReadRange", DAEMON),
-    // Where a blob lies in a pack (`crate::pack_locate`): served only by a frontend started
-    // with `--pack-index`, which answers UNIMPLEMENTED to the daemon role otherwise.
-    ("/kbf.worker.v1.PackIndex/Locate", DAEMON),
-    // A daemon's commit of a pack it stored: served only by a frontend started with
-    // `--pack-index` and the pack store flags, which answers UNIMPLEMENTED otherwise.
-    ("/kbf.worker.v1.PackIndex/CommitPack", DAEMON),
     ("/kbf.map.v1.Membership/Register", STORAGE),
     ("/kbf.map.v1.Membership/Heartbeat", STORAGE),
     // The registered cold store and its keys (`crate::store_config`): storage nodes only.

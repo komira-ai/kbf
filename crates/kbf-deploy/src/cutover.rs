@@ -1,5 +1,5 @@
-//! `kbf-deploy job-service plan`, `apply` and `back-out`: moving one frontend's executor onto
-//! the job service and back (`docs/deploy/job-service-cutover.md`).
+//! `kbf-deploy job-service plan` and `apply`: moving one frontend's executor onto the job
+//! service (`docs/deploy/job-service-cutover.md`).
 //!
 //! The settings are keys of the `[executor]` table of the frontend's `kbf.toml`, one key per
 //! flag of the same name. [`Settings`] is what the switch sets: `executor = "js-agent"`, the job
@@ -11,10 +11,9 @@
 //! [`Readiness`] names the ones that are not.
 //!
 //! - `plan` reads the file and prints, for each key, what it holds now and what the switch
-//!   sets, the executor flags of the job-service mode, and the back-out: the flags of the
-//!   mode the frontend runs now. It changes nothing and reads no token: the token file is
-//!   named by its path only, so no output holds a token.
-//! - `apply` and `back-out` ([`crate::cutover_apply`]) are dry runs without `--apply`.
+//!   sets, and the executor flags of the job-service mode. It changes nothing and reads no
+//!   token: the token file is named by its path only, so no output holds a token.
+//! - `apply` ([`crate::cutover_apply`]) is a dry run without `--apply`.
 //!
 //! Exit 0 the plan is complete; 1 the file lacks something the executor needs (`FAIL: ...` on
 //! stderr, after the plan); 2 refused: a flag, or a file that cannot be read or rewritten
@@ -32,8 +31,8 @@ use kbf_job_client::Origin;
 /// The table of `kbf.toml` that holds the executor's keys.
 pub(crate) const TABLE: &str = "executor";
 
-/// The executor the frontend runs when the file names none.
-pub(crate) const DEFAULT_EXECUTOR: &str = "kbf-daemon";
+/// What `executor now` says of a file that names no executor: the frontend then builds none.
+pub(crate) const NO_EXECUTOR: &str = "no executor";
 
 /// The executor of the job service.
 pub(crate) const JOB_SERVICE_EXECUTOR: &str = "js-agent";
@@ -154,15 +153,13 @@ impl Value {
         }
     }
 
-    /// The flag that sets `key` to this value, or the words for a key that is not set.
-    fn flag(&self, key: &str) -> String {
+    /// The flag that sets `key` to this value: a text or a number; none for a key that is not
+    /// set (the switch sets no other kind).
+    fn flag(&self, key: &str) -> Option<String> {
         match self {
-            Value::Text(s) => format!("--{key}={s}"),
-            Value::Number(n) => format!("--{key}={n}"),
-            Value::Switch(true) => format!("--{key}"),
-            Value::Switch(false) => format!("no --{key}"),
-            Value::Other(v) => format!("--{key}={v}"),
-            Value::Absent => format!("no --{key}"),
+            Value::Text(s) => Some(format!("--{key}={s}")),
+            Value::Number(n) => Some(format!("--{key}={n}")),
+            _ => None,
         }
     }
 }
@@ -257,11 +254,7 @@ impl Settings {
     /// The executor flags of these settings, one per line: what the frontend is started
     /// with once the switch is made. A key the switch removes is left out.
     pub(crate) fn flags(&self) -> Vec<String> {
-        self.0
-            .iter()
-            .filter(|(_, v)| *v != Value::Absent)
-            .map(|(k, v)| v.flag(k))
-            .collect()
+        self.0.iter().filter_map(|(k, v)| v.flag(k)).collect()
     }
 }
 
@@ -292,26 +285,12 @@ impl Executor {
         Value::of(self.0.get(key))
     }
 
-    /// The executor the file names: its `executor` key, or the default.
+    /// The executor the file names: its `executor` key, or `no executor` when it has none.
     pub(crate) fn mode(&self) -> String {
         match self.value("executor") {
             Value::Text(s) => s,
-            _ => DEFAULT_EXECUTOR.to_owned(),
+            _ => NO_EXECUTOR.to_owned(),
         }
-    }
-
-    /// The back-out of a switch made from this table: the flag of each key the switch
-    /// sets, as the file holds it now. The executor is named even when the file leaves it
-    /// to the default, so that the flags say which mode the frontend returns to.
-    pub(crate) fn back_out_flags(&self) -> Vec<String> {
-        KEYS.iter()
-            .map(|key| match (self.value(key), *key) {
-                (Value::Absent, "executor") => {
-                    format!("--executor={DEFAULT_EXECUTOR} (the default: the file has no key)")
-                }
-                (value, key) => value.flag(key),
-            })
-            .collect()
     }
 }
 
@@ -401,10 +380,6 @@ pub(crate) fn plan(t: &Target, out: &mut dyn Write) -> Result<(), CutoverError> 
     let ready = Readiness::of(&table);
     let _ = writeln!(out, "kbf-deploy job-service plan (changes nothing)");
     print_plan(&t.config, &table, &settings, &ready, out);
-    let _ = writeln!(out, "back-out: the flags of the mode it runs now:");
-    for flag in table.back_out_flags() {
-        let _ = writeln!(out, "  {flag}");
-    }
     let _ = writeln!(
         out,
         "to switch: kbf-deploy job-service apply with these flags and the restart's (a dry \

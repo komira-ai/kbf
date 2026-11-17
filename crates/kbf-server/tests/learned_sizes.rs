@@ -306,9 +306,7 @@ async fn a_mac_action_is_asked_about_with_or_without_a_mac_node() {
     assert_eq!(estimates(argv).len(), 1, "asked with no Mac node");
 
     let hello = support::hello_on("node-mac", 4, 8, &[("os", "macos"), ("arch", "arm64")]);
-    let _mac_node = FakeDaemon::connect(cell.worker_addr, hello)
-        .await
-        .expect("registered");
+    let _mac_node = cell.daemon_hello(hello).await.expect("registered");
     let second = job(argv, "b", &mac);
     cell.upload(&second.blobs()).await;
     let _second = cell.execute(&second.action).await;

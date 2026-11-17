@@ -744,7 +744,7 @@ where
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
     let (metrics, _metrics) = metrics
-        .map(|m| m.serve(Arc::clone(&cache), None, listener.tls.clone()))
+        .map(|m| m.serve(Arc::clone(&cache), listener.tls.clone()))
         .unzip();
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);

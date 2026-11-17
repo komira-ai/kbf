@@ -107,7 +107,7 @@ fn a_restarted_frontend_has_the_maps_before_the_change() {
 
     let restarted = frontend(&s);
     let maps = FrontMaps::new(Arc::clone(&restarted));
-    restarted.map_source().expect("seeded from the store");
+    restarted.current_map().expect("seeded from the store");
     let view = maps.current().expect("a view");
     assert_eq!(view.map.generation(), 3);
     assert_eq!(view.previous.as_deref().map(Map::generation), Some(2));

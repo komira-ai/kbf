@@ -1,4 +1,4 @@
-//! The line edit of `kbf.toml`, its refusals, and the staging, placing and restoring of the
+//! The line edit of `kbf.toml`, its refusals, and the staging and placing of the
 //! file, each in a scratch directory of its own.
 
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -20,10 +20,15 @@ fn the_edit_changes_only_the_switchs_keys() {
     let dir = scratch("edit");
     let s = settings(dir.path(), "https://192.0.2.30:8443", true);
     let path = dir.path().join("kbf.toml");
-    let new = rewritten(&path, &ready_config(), &s).unwrap();
+    // A file from before the daemon was deleted names `kbf-daemon`; the edit takes the line out.
+    let old = ready_config().replace(
+        "[executor]\n# where actions run\n",
+        "[executor]\n# where actions run\nexecutor = \"kbf-daemon\"\n",
+    );
+    let new = rewritten(&path, &old, &s).unwrap();
     let token = dir.path().join("job-service.token").display().to_string();
     let ca = dir.path().join("ca.pem").display().to_string();
-    let expected = ready_config().replace(
+    let expected = old.replace(
         "[executor]\n# where actions run\nexecutor = \"kbf-daemon\"\n",
         &format!(
             "[executor]\nexecutor = \"js-agent\"\n\
@@ -96,10 +101,9 @@ fn a_file_the_line_edit_cannot_rewrite_is_refused() {
 
 /// Behaviour: staging keeps the original byte for byte with the file's mode, and the
 /// staged text with it too; placing renames the staged file over the file and keeps the
-/// backup; restoring puts the original back, with its mode, and keeps the backup until it is
-/// forgotten.
+/// backup, which a later switch is refused over.
 #[test]
-fn stage_place_and_restore_keep_the_original_byte_for_byte() {
+fn stage_and_place_keep_the_original_byte_for_byte() {
     let dir = scratch("stage");
     let file = write(dir.path(), "kbf.toml", "old\n");
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
@@ -114,25 +118,8 @@ fn stage_place_and_restore_keep_the_original_byte_for_byte() {
     assert!(!beside(&file, STAGED_SUFFIX).exists());
     let e = require_no_backup(&file).unwrap_err();
     assert!(e.to_string().contains("is there already"), "{e}");
-    let (found, text) = read_backup(&file).unwrap();
-    assert_eq!(
-        (found.as_path(), text.as_str()),
-        (backup.as_path(), "old\n")
-    );
-    restore(&file, &found).unwrap();
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
-    assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o7777, 0o640);
-    assert!(!beside(&file, STAGED_SUFFIX).exists());
-    // The backup stays until the back-out is done, so a stopped back-out can run again.
-    assert!(backup.exists());
-    forget(&backup).unwrap();
-    assert!(!backup.exists());
-    assert_eq!(forget(&backup).unwrap_err().code(), 1);
-    let e = read_backup(&file).unwrap_err();
-    assert!(
-        e.to_string().contains("there is no switch to back out"),
-        "{e}"
-    );
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), "old\n");
+    assert_eq!(std::fs::metadata(&backup).unwrap().mode() & 0o7777, 0o640);
 }
 
 /// Behaviour: a staging that is dropped before it is placed leaves no file of its own; a
@@ -151,8 +138,8 @@ fn a_dropped_staging_removes_its_files_and_a_stale_one_is_refused() {
     assert!(!beside(&file, BACKUP_SUFFIX).exists());
 }
 
-/// Behaviour: a missing file, a place that cannot be renamed over, and a backup that is not a
-/// regular file are each said, and change nothing else.
+/// Behaviour: a missing file and a place that cannot be renamed over are each said, and change
+/// nothing else.
 #[test]
 fn files_that_cannot_be_read_or_renamed_are_reported() {
     let dir = scratch("stage-fail");
@@ -169,18 +156,6 @@ fn files_that_cannot_be_read_or_renamed_are_reported() {
             .to_string()
             .starts_with("cannot rename ")
     );
-    std::fs::create_dir(beside(&file, BACKUP_SUFFIX)).unwrap();
-    assert!(
-        read_backup(&file)
-            .unwrap_err()
-            .to_string()
-            .contains("not a regular file")
-    );
-    let e = restore(&file, &dir.path().join("none")).unwrap_err();
-    assert_eq!(e.code(), 1);
-    let unreadable = write(dir.path(), "b.toml", "x");
-    std::fs::write(beside(&unreadable, BACKUP_SUFFIX), [0xff, 0xfe]).unwrap();
-    assert_eq!(read_backup(&unreadable).unwrap_err().code(), 2);
 }
 
 /// Behaviour: a file that cannot be given its owner is removed, not left half made. As
@@ -213,25 +188,4 @@ fn a_staging_that_cannot_write_fails_and_leaves_nothing() {
     assert_eq!(e.code(), 1);
     assert!(e.to_string().starts_with("cannot write "), "{e}");
     assert!(!beside(&file, BACKUP_SUFFIX).exists());
-}
-
-/// Behaviour: a restore whose staged file cannot be made, or cannot be renamed over the
-/// file, fails, leaves the backup, and leaves no staged file of its own.
-#[test]
-fn a_restore_that_cannot_stage_or_rename_keeps_the_backup() {
-    let dir = scratch("restore-fail");
-    let file = write(dir.path(), "kbf.toml", "new\n");
-    let backup = write(dir.path(), "kbf.toml.pre-job-service", "old\n");
-    let stale = write(dir.path(), "kbf.toml.job-service-new", "theirs\n");
-    let e = restore(&file, &backup).unwrap_err();
-    assert!(e.to_string().starts_with("cannot read or write "), "{e}");
-    assert_eq!(std::fs::read_to_string(&stale).unwrap(), "theirs\n");
-    std::fs::remove_file(&stale).unwrap();
-    let as_dir = dir.path().join("dir.toml");
-    std::fs::create_dir(&as_dir).unwrap();
-    std::fs::write(as_dir.join("x"), "").unwrap();
-    let e = restore(&as_dir, &backup).unwrap_err();
-    assert!(e.to_string().starts_with("cannot rename "), "{e}");
-    assert!(!beside(&as_dir, STAGED_SUFFIX).exists());
-    assert_eq!(std::fs::read_to_string(&backup).unwrap(), "old\n");
 }

@@ -6,11 +6,11 @@
 //!   [`raft_log`]; an S3 or local-directory object store, with an optional local hot
 //!   store in front of it; the flags that choose them are `--cold-store`,
 //!   `--hot-store` and `--meta-dir`, see [`stores`]).
-//! - `kbf.worker.v1` on another ([`worker`]): daemons register, heartbeat, receive
-//!   lease offers and `Start`s, and report results. Under mutual TLS a daemon's
-//!   certificate must name its node, and a deny list refuses certificates and nodes
-//!   ([`identity`]). The same listener serves daemons `ByteStream` for their blob
-//!   reads and writes ([`blobs`]), each call admitted by the same rules.
+//! - The worker listener on another: storage nodes register and heartbeat with
+//!   `kbf.map.v1.Membership`, and a host's updater makes its node calls
+//!   ([`node_self`]). Under mutual TLS a certificate must name its node, and a deny list
+//!   refuses certificates and nodes ([`identity`]). No node opens a session to a server:
+//!   the farm's workers are the executor's ([`executor`]), registered in-process.
 //! - The operator API ([`api`]): HTTP/JSON under `/v1` on a third listener, off unless
 //!   `--api-listen` is given; `GET /v1/nodes`, and cordon, drain and uncordon, which
 //!   need the token of `--api-token-file` ([`token`]), and, behind the farm's proxy
@@ -73,7 +73,6 @@ pub mod answer;
 pub(crate) mod answer_tests;
 pub mod api;
 pub mod api_client;
-pub mod blobs;
 #[cfg(test)]
 mod build_commit;
 #[doc(hidden)]
@@ -108,10 +107,8 @@ mod key_file;
 pub mod learned;
 mod listen;
 mod load_metrics;
-mod local;
 pub mod log_file;
 pub mod machine;
-mod map_push;
 pub mod members;
 pub mod members_rpc;
 mod memory;
@@ -122,7 +119,6 @@ pub mod node_self;
 mod notify;
 pub mod object_store;
 mod pack_daemon_metrics;
-pub mod pack_locate;
 pub mod placement_load;
 pub mod placement_predictions;
 pub mod proxy_auth;
@@ -189,7 +185,6 @@ pub use kbf_sched::MemoryLadder;
 pub use kbf_tls::{TlsError, TlsFiles, TlsSource};
 pub use learned::LearnedSizes;
 pub use listen::Held;
-pub use local::LocalStore;
 pub use node_map::NodeMap;
 pub use placement_load::PlacementLoad;
 pub use placement_predictions::PlacementPredictions;
@@ -197,8 +192,8 @@ pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use scheduler_core::SchedulerCore;
 pub use serve::{
     Api, Behind, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming,
-    WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_policy,
-    bind_server_with_state, bind_server_with_storage, bind_service, bind_storage,
+    WorkerTls, bind_server, bind_server_with_api, bind_server_with_policy, bind_server_with_state,
+    bind_server_with_storage, bind_service, bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
 pub use start_exit::{
@@ -212,7 +207,6 @@ pub use ui_mount::{bind_server_holding, bind_server_with_options, bind_server_wi
 pub use usage_profiles::UsageProfiles;
 pub use whole_node::WholeNodeFlags;
 pub use worker::HostFloor;
-pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build
 /// had no git checkout. `build.rs` embeds it (`src/build_commit.rs` has the rule,

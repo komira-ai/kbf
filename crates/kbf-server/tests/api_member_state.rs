@@ -19,7 +19,6 @@ use kbf_server::token::ApiToken;
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store, StoreTime};
-use support::{HELLO_WAIT, INTERVAL};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -53,15 +52,12 @@ fn listeners() -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        heartbeat_interval: INTERVAL,
-        hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         memory_climb: true,
-        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         exclusive_actions: false,
         placement_load: kbf_server::PlacementLoad::Off,
@@ -73,7 +69,6 @@ fn listeners() -> Listeners {
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
-        segments: kbf_front::SegmentsConfig::DEFAULT,
         stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
@@ -96,7 +91,6 @@ fn start(state: Option<StateStore>) -> Server {
     let api = Api {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         token: Some(token()),
-        local_cache: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),

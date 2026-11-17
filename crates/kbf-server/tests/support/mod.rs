@@ -1,16 +1,15 @@
-//! An in-process single-node server on loopback ports, REAPI clients for it, and a
-//! scripted fake daemon speaking `kbf.worker.v1` in plain text.
+//! An in-process single-node server on loopback ports, REAPI clients for it, and a scripted
+//! fake daemon: a node registered with the server's farm in-process, as the executor registers
+//! its workers.
 
 #![allow(dead_code)]
 
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_front::{Cache, Leadership, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError};
 use kbf_meta::{Applied, Command as MetaCommand, MetaState, Retention};
 use kbf_objstore::KeyPrefix;
@@ -24,15 +23,11 @@ use kbf_proto::reapi::{
     ExecuteResponse, FileNode, FindMissingBlobsRequest, GetActionResultRequest, OutputFile,
     Platform, batch_update_blobs_request, platform,
 };
-use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, Hello, LeaseId, LeaseOffer, NodeStatus, PackReadCounts,
-    PackWriteCounts, ResultAck, ServerMessage, Start, daemon_message, server_message,
-    worker_client::WorkerClient,
-};
+use kbf_proto::worker::{Capability, Hello, LeaseId, Start};
 use kbf_server::token::ApiToken;
 use kbf_server::{
     Api, Bound, Listeners, MemoryLadder, RaftMetaLog, ServeError, StreamLimits,
-    bind_server_with_map,
+    bind_server_with_state,
 };
 use kbf_store::FaultFs;
 use prost::Message;
@@ -41,7 +36,9 @@ use tokio::time::timeout;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Streaming};
 
+mod daemon;
 mod store;
+pub use daemon::FakeDaemon;
 pub use store::SharedStore;
 
 /// How long a test waits for something that should happen promptly.
@@ -50,9 +47,6 @@ pub const PROMPT: Duration = Duration::from_secs(5);
 /// How long a test watches for something that must not happen. Several ticks and
 /// heartbeat intervals.
 pub const QUIET: Duration = Duration::from_millis(400);
-
-/// How long the test server waits for a stream's `Hello`.
-pub const HELLO_WAIT: Duration = Duration::from_millis(300);
 
 /// The heartbeat interval the test server names in `Welcome`.
 pub const INTERVAL: Duration = Duration::from_millis(100);
@@ -235,6 +229,9 @@ pub struct Client {
     pub reapi_addr: SocketAddr,
     pub worker_addr: SocketAddr,
     channel: Channel,
+    /// The farm the server serves, which a [`FakeDaemon`] registers with. Empty for a client
+    /// of a server in another process.
+    farm: std::sync::Weak<kbf_server::farm::Farm>,
 }
 
 /// The memory ladder of every cell but [`Cell::start_with_ladder`]'s: 1, 2 and 4 GiB,
@@ -264,7 +261,7 @@ impl Cell {
         let store = SharedStore::new();
         let cache = Self::cold_cache(&store, None).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve_with_map(
+        Self::serve_with_state(
             cache,
             store,
             None,
@@ -273,7 +270,6 @@ impl Cell {
             retention,
             small_ladder(),
             StreamLimits::DEFAULT,
-            None,
             None,
             default_platform,
             kbf_server::LearnedSizes::Off,
@@ -312,7 +308,7 @@ impl Cell {
         let store = SharedStore::new();
         let cache = Self::cold_cache(&store, None).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve_with_map(
+        Self::serve_with_state(
             cache,
             store,
             None,
@@ -321,7 +317,6 @@ impl Cell {
             retention,
             ladder,
             StreamLimits::DEFAULT,
-            None,
             state,
             kbf_front::DefaultPlatform::NONE,
             mode,
@@ -340,7 +335,7 @@ impl Cell {
         let store = SharedStore::new();
         let cache = Self::cold_cache(&store, None).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve_with_map(
+        Self::serve_with_state(
             cache,
             store,
             None,
@@ -349,7 +344,6 @@ impl Cell {
             retention,
             ladder,
             StreamLimits::DEFAULT,
-            None,
             state,
             kbf_front::DefaultPlatform::NONE,
             mode,
@@ -377,29 +371,6 @@ impl Cell {
         .await
     }
 
-    /// A cell that sends its daemons the storage map `map` holds.
-    pub async fn start_with_map(map: Arc<dyn kbf_mapsync::MapSource>) -> Self {
-        let store = SharedStore::new();
-        let cache = Self::cold_cache(&store, None).await;
-        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve_with_map(
-            cache,
-            store,
-            None,
-            None,
-            wait,
-            retention,
-            small_ladder(),
-            StreamLimits::DEFAULT,
-            Some(map),
-            None,
-            kbf_front::DefaultPlatform::NONE,
-            kbf_server::LearnedSizes::Off,
-            true,
-        )
-        .await
-    }
-
     /// A cell whose scheduler keeps its state in `state` (and writes the build history it
     /// names, if any), and that serves the operator API without a token: its `/metrics`
     /// is at [`Cell::api`].
@@ -409,10 +380,9 @@ impl Cell {
         let api = Api {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: None,
-            local_cache: None,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve_with_map(
+        Self::serve_with_state(
             cache,
             store,
             Some(api),
@@ -421,7 +391,6 @@ impl Cell {
             retention,
             small_ladder(),
             StreamLimits::DEFAULT,
-            None,
             Some(state),
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
@@ -437,10 +406,9 @@ impl Cell {
         let api = Api {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: Some(api_token()),
-            local_cache: None,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve_with_map(
+        Self::serve_with_state(
             cache,
             store,
             Some(api),
@@ -449,7 +417,6 @@ impl Cell {
             retention,
             small_ladder(),
             StreamLimits::DEFAULT,
-            None,
             Some(state),
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
@@ -508,7 +475,6 @@ impl Cell {
         let api = Api {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: Some(api_token()),
-            local_cache: None,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let cache = Self::cold_cache(&store, None).await;
@@ -634,7 +600,7 @@ impl Cell {
         ladder: MemoryLadder,
         streams: StreamLimits,
     ) -> Self {
-        Self::serve_with_map(
+        Self::serve_with_state(
             cache,
             store,
             api_config,
@@ -644,7 +610,6 @@ impl Cell {
             ladder,
             streams,
             None,
-            None,
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
             true,
@@ -652,9 +617,9 @@ impl Cell {
         .await
     }
 
-    /// [`Cell::serve`], sending its daemons the storage map `map` holds if given.
+    /// [`Cell::serve`], over the scheduler's `state` if given.
     #[allow(clippy::too_many_arguments)]
-    async fn serve_with_map(
+    async fn serve_with_state(
         cache: Arc<Cache<GateLog, SharedStore>>,
         store: SharedStore,
         api_config: Option<Api>,
@@ -663,7 +628,6 @@ impl Cell {
         retention: Duration,
         ladder: MemoryLadder,
         streams: StreamLimits,
-        map: Option<Arc<dyn kbf_mapsync::MapSource>>,
         state: Option<kbf_server::StateStore>,
         default_platform: kbf_front::DefaultPlatform,
         learned: kbf_server::LearnedSizes,
@@ -674,15 +638,12 @@ impl Cell {
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
             reapi_tls: None,
             worker_tls: None,
-            heartbeat_interval: INTERVAL,
-            hello_wait: HELLO_WAIT,
             tick: Duration::from_millis(50),
             unservable_wait: wait,
             default_platform,
             qos_allowed: kbf_front::QosAllow::DEFAULT,
             memory_ladder: ladder,
             memory_climb: climb,
-            vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
             exclusive_actions: false,
             placement_load: kbf_server::PlacementLoad::Off,
@@ -694,7 +655,6 @@ impl Cell {
             streams: kbf_server::StreamTiming::default(),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
-            segments: kbf_front::SegmentsConfig::DEFAULT,
             stream_limits: streams,
         };
         let (stop, stop_rx) = oneshot::channel::<()>();
@@ -715,13 +675,12 @@ impl Cell {
                     let shutdown = async move {
                         let _ = stop_rx.await;
                     };
-                    let bound = bind_server_with_map(
+                    let bound = bind_server_with_state(
                         server_cache,
                         listeners,
                         server_api,
                         kbf_auth::Policy::allow_all(),
                         state,
-                        map,
                         shutdown,
                     );
                     run(bound.expect("bind"), bound_tx).await;
@@ -741,8 +700,8 @@ impl Cell {
             stopped: Some(stopped),
             recorder,
             drain,
+            client: Client::connect_to(reapi, worker, farm.clone()).await,
             farm,
-            client: Client::connect(reapi, worker).await,
         }
     }
 }
@@ -789,6 +748,15 @@ fn api_token() -> ApiToken {
 impl Client {
     /// A client of the server listening at `reapi` and `worker`.
     pub async fn connect(reapi: SocketAddr, worker: SocketAddr) -> Self {
+        Self::connect_to(reapi, worker, std::sync::Weak::new()).await
+    }
+
+    /// [`Client::connect`], with the `farm` of the server, for a client that opens daemons.
+    pub async fn connect_to(
+        reapi: SocketAddr,
+        worker: SocketAddr,
+        farm: std::sync::Weak<kbf_server::farm::Farm>,
+    ) -> Self {
         let channel = Endpoint::from_shared(format!("http://{reapi}"))
             .expect("endpoint")
             .connect()
@@ -798,6 +766,7 @@ impl Client {
             reapi_addr: reapi,
             worker_addr: worker,
             channel,
+            farm,
         }
     }
 
@@ -899,9 +868,22 @@ impl Client {
     /// a test opens for one node this way is the same daemon process (a new stream of
     /// it); see [`Client::daemon_process`].
     pub async fn daemon(&self, node: &str, cpus: u32, mem_gib: u32) -> FakeDaemon {
-        FakeDaemon::connect(self.worker_addr, hello(node, cpus, mem_gib))
+        FakeDaemon::connect(self.farm.clone(), hello(node, cpus, mem_gib))
             .await
             .expect("registered")
+    }
+
+    /// A daemon registered with `hello`, or the refusal.
+    pub async fn daemon_hello(&self, hello: Hello) -> Result<FakeDaemon, tonic::Status> {
+        FakeDaemon::connect(self.farm.clone(), hello).await
+    }
+
+    /// [`Client::daemon_hello`] for a node that sends no `NodeStatus`.
+    pub async fn daemon_hello_without_status(
+        &self,
+        hello: Hello,
+    ) -> Result<FakeDaemon, tonic::Status> {
+        FakeDaemon::connect_without_status(self.farm.clone(), hello).await
     }
 
     /// A daemon for `node`, registered by the daemon process `instance` (its
@@ -917,7 +899,7 @@ impl Client {
             instance_id: instance.to_owned(),
             ..hello(node, cpus, mem_gib)
         };
-        FakeDaemon::connect(self.worker_addr, hello)
+        FakeDaemon::connect(self.farm.clone(), hello)
             .await
             .expect("registered")
     }
@@ -965,335 +947,6 @@ pub fn hello_on(node: &str, cpus: u32, mem_gib: u32, platform: &[(&str, &str)]) 
         instance_id: format!("{node}-daemon"),
         phase: None,
         predecessor_instance_id: String::new(),
-    }
-}
-
-/// The server's side of a session, as a daemon sees it. Messages a test is not waiting
-/// for are kept, in order, for a later `expect`.
-pub struct FakeDaemon {
-    tx: UnboundedSender<DaemonMessage>,
-    inbound: Streaming<ServerMessage>,
-    kept: VecDeque<server_message::Message>,
-    seq: u64,
-    /// The lease epoch the Welcome named (0 before it).
-    pub epoch: u64,
-    /// The storage map the Welcome carried.
-    pub map: Option<kbf_proto::kbf::map::v1::Map>,
-}
-
-impl FakeDaemon {
-    /// Opens a stream, sends `hello`, waits for Welcome and sends a `NodeStatus`, as a
-    /// daemon does.
-    pub async fn connect(addr: SocketAddr, hello: Hello) -> Result<Self, tonic::Status> {
-        let d = Self::connect_without_status(addr, hello).await?;
-        d.send(daemon_message::Message::NodeStatus(NodeStatus {
-            os_name: "Ubuntu".to_owned(),
-            daemon_version: "test".to_owned(),
-            ..NodeStatus::default()
-        }));
-        Ok(d)
-    }
-
-    /// Opens a stream, sends `hello` and waits for Welcome: a daemon that predates
-    /// `NodeStatus`.
-    pub async fn connect_without_status(
-        addr: SocketAddr,
-        hello: Hello,
-    ) -> Result<Self, tonic::Status> {
-        let mut d = Self::open(addr, daemon_message::Message::Hello(hello)).await?;
-        match d.next().await {
-            Some(server_message::Message::Welcome(w)) => {
-                assert_eq!(w.protocol_version, 1);
-                assert_eq!(w.heartbeat_interval_ms, INTERVAL.as_millis() as u64);
-                d.epoch = w.epoch;
-                d.map = w.map;
-                Ok(d)
-            }
-            other => panic!("expected Welcome, got {other:?}"),
-        }
-    }
-
-    /// Opens a stream whose first message is `first`, and returns once the server has
-    /// answered with headers (or refused).
-    pub async fn open(
-        addr: SocketAddr,
-        first: daemon_message::Message,
-    ) -> Result<Self, tonic::Status> {
-        let channel = Endpoint::from_shared(format!("http://{addr}"))
-            .expect("endpoint")
-            .connect()
-            .await
-            .expect("connect");
-        let (tx, rx) = unbounded();
-        tx.unbounded_send(DaemonMessage {
-            message: Some(first),
-        })
-        .expect("queue the first message");
-        let inbound = WorkerClient::new(channel).session(rx).await?.into_inner();
-        Ok(Self {
-            tx,
-            inbound,
-            kept: VecDeque::new(),
-            seq: 0,
-            epoch: 0,
-            map: None,
-        })
-    }
-
-    pub fn send(&self, message: daemon_message::Message) {
-        self.tx
-            .unbounded_send(DaemonMessage {
-                message: Some(message),
-            })
-            .expect("the stream is open");
-    }
-
-    pub fn send_empty(&self) {
-        self.tx
-            .unbounded_send(DaemonMessage { message: None })
-            .expect("the stream is open");
-    }
-
-    /// Ends the stream from the daemon side.
-    pub fn close(self) {}
-
-    async fn next(&mut self) -> Option<server_message::Message> {
-        if let Some(m) = self.kept.pop_front() {
-            return Some(m);
-        }
-        let msg = timeout(PROMPT, self.inbound.message())
-            .await
-            .expect("a server message in time")
-            .expect("the stream is healthy")?;
-        Some(msg.message.expect("a non-empty server message"))
-    }
-
-    /// The first message `pick` accepts, within `within`, keeping the others.
-    pub async fn expect_within<T>(
-        &mut self,
-        within: Duration,
-        mut pick: impl FnMut(&server_message::Message) -> Option<T>,
-    ) -> Option<T> {
-        if let Some(at) = self.kept.iter().position(|m| pick(m).is_some()) {
-            let m = self.kept.remove(at).expect("present");
-            return pick(&m);
-        }
-        let deadline = tokio::time::Instant::now() + within;
-        loop {
-            let msg = timeout(
-                deadline - tokio::time::Instant::now(),
-                self.inbound.message(),
-            )
-            .await
-            .ok()?
-            .expect("the stream is healthy")?;
-            let m = msg.message.expect("a non-empty server message");
-            if let Some(t) = pick(&m) {
-                return Some(t);
-            }
-            self.kept.push_back(m);
-        }
-    }
-
-    /// The generation of the next `MapUpdate`, within `within`.
-    pub async fn map_update_within(&mut self, within: Duration) -> Option<u64> {
-        self.expect_within(within, |m| match m {
-            server_message::Message::MapUpdate(u) => {
-                Some(u.map.as_ref().map_or(0, |m| m.generation))
-            }
-            _ => None,
-        })
-        .await
-    }
-
-    pub async fn expect<T>(
-        &mut self,
-        what: &str,
-        pick: impl FnMut(&server_message::Message) -> Option<T>,
-    ) -> T {
-        self.expect_within(PROMPT, pick)
-            .await
-            .unwrap_or_else(|| panic!("no {what} within {PROMPT:?}"))
-    }
-
-    pub async fn offer(&mut self) -> LeaseOffer {
-        self.expect("LeaseOffer", |m| match m {
-            server_message::Message::LeaseOffer(o) => Some(o.clone()),
-            _ => None,
-        })
-        .await
-    }
-
-    /// The next Start. The offer of the same lease, if kept, is dropped with it.
-    pub async fn start(&mut self) -> Start {
-        let start = self
-            .expect("Start", |m| match m {
-                server_message::Message::Start(s) => Some(s.clone()),
-                _ => None,
-            })
-            .await;
-        self.kept.retain(|m| {
-            !matches!(m, server_message::Message::LeaseOffer(o) if o.lease_id == start.lease_id)
-        });
-        start
-    }
-
-    /// The status the server ends the stream with, within [`PROMPT`]; messages before
-    /// it are dropped. Panics if the stream stays open or ends without an error.
-    pub async fn ended(&mut self) -> tonic::Status {
-        let ending = async {
-            loop {
-                match self.inbound.message().await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => panic!("the stream ended without an error"),
-                    Err(status) => return status,
-                }
-            }
-        };
-        timeout(PROMPT, ending)
-            .await
-            .expect("the server ended the stream in time")
-    }
-
-    /// Waits, within [`PROMPT`], until the stream ends, by the server's status or by
-    /// the connection closing; messages before that are dropped.
-    pub async fn closed(&mut self) {
-        let ending = async { while let Ok(Some(_)) = self.inbound.message().await {} };
-        timeout(PROMPT, ending)
-            .await
-            .expect("the stream ended in time");
-    }
-
-    /// The lease of the next `Cancel` within [`QUIET`], if one arrives.
-    pub async fn cancelled(&mut self) -> Option<LeaseId> {
-        self.expect_within(QUIET, |m| match m {
-            server_message::Message::Cancel(c) => Some(c.lease_id.expect("a lease id")),
-            _ => None,
-        })
-        .await
-    }
-
-    /// The leases of every `Cancel` already received and kept, in order, without waiting.
-    /// The server queues a heartbeat's cancels before its acknowledgement, so after
-    /// `beat_*_acked` these are all that heartbeat caused.
-    pub fn cancels_received(&mut self) -> Vec<LeaseId> {
-        let mut leases = Vec::new();
-        self.kept.retain(|m| match m {
-            server_message::Message::Cancel(c) => {
-                leases.push(c.lease_id.expect("a lease id"));
-                false
-            }
-            _ => true,
-        });
-        leases
-    }
-
-    /// Asserts no Offer or Start arrives within [`QUIET`].
-    pub async fn no_work(&mut self) {
-        let work = self
-            .expect_within(QUIET, |m| match m {
-                server_message::Message::LeaseOffer(_) | server_message::Message::Start(_) => {
-                    Some(m.clone())
-                }
-                _ => None,
-            })
-            .await;
-        assert_eq!(work, None, "work arrived");
-    }
-
-    /// Sends a heartbeat listing `running` and returns whether it was acknowledged
-    /// within [`QUIET`].
-    pub async fn heartbeat(&mut self, running: &[LeaseId]) -> bool {
-        let seq = self.beat(running, None);
-        self.expect_within(QUIET, ack_of(seq)).await.is_some()
-    }
-
-    /// Sends a heartbeat listing `running` and carrying the pack-read counts `pack_reads`, and
-    /// waits for its acknowledgement for as long as [`PROMPT`], a bound on failure only.
-    pub async fn beat_acked(&mut self, running: &[LeaseId], pack_reads: Option<PackReadCounts>) {
-        let seq = self.beat(running, pack_reads);
-        self.expect("HeartbeatAck", ack_of(seq)).await;
-    }
-
-    /// [`Self::beat_acked`] with the pack-write counts `pack_writes` too.
-    pub async fn beat_counted_acked(
-        &mut self,
-        pack_reads: Option<PackReadCounts>,
-        pack_writes: Option<PackWriteCounts>,
-    ) {
-        let seq = self.beat_with(&[], pack_reads, pack_writes);
-        self.expect("HeartbeatAck", ack_of(seq)).await;
-    }
-
-    /// Sends a heartbeat listing nothing and carrying the node load `load`, and waits for its
-    /// acknowledgement for as long as [`PROMPT`], a bound on failure only.
-    pub async fn beat_loaded_acked(&mut self, load: Option<kbf_proto::worker::NodeLoad>) {
-        self.beat_running_loaded_acked(&[], load).await;
-    }
-
-    /// [`Self::beat_loaded_acked`] listing `running` too.
-    pub async fn beat_running_loaded_acked(
-        &mut self,
-        running: &[LeaseId],
-        load: Option<kbf_proto::worker::NodeLoad>,
-    ) {
-        self.seq += 1;
-        let seq = self.seq;
-        self.send(daemon_message::Message::Heartbeat(Heartbeat {
-            seq,
-            report_hash: Vec::new(),
-            running: running.to_vec(),
-            pack_reads: None,
-            pack_writes: None,
-            node_load: load,
-            input_cache: None,
-        }));
-        self.expect("HeartbeatAck", ack_of(seq)).await;
-    }
-
-    /// Sends a heartbeat with the next sequence number; the number.
-    fn beat(&mut self, running: &[LeaseId], pack_reads: Option<PackReadCounts>) -> u64 {
-        self.beat_with(running, pack_reads, None)
-    }
-
-    /// [`Self::beat`] carrying the pack-write counts `pack_writes` too.
-    fn beat_with(
-        &mut self,
-        running: &[LeaseId],
-        pack_reads: Option<PackReadCounts>,
-        pack_writes: Option<PackWriteCounts>,
-    ) -> u64 {
-        self.seq += 1;
-        let seq = self.seq;
-        self.send(daemon_message::Message::Heartbeat(Heartbeat {
-            seq,
-            report_hash: Vec::new(),
-            running: running.to_vec(),
-            pack_reads,
-            pack_writes,
-            node_load: None,
-            input_cache: None,
-        }));
-        seq
-    }
-
-    /// Sends `result` and returns the server's acknowledgement.
-    pub async fn report(&mut self, result: kbf_proto::worker::Result) -> ResultAck {
-        let lease = result.lease_id;
-        self.send(daemon_message::Message::Result(result));
-        self.expect("ResultAck", |m| match m {
-            server_message::Message::ResultAck(a) if a.lease_id == lease => Some(*a),
-            _ => None,
-        })
-        .await
-    }
-}
-
-/// Picks the `HeartbeatAck` of the heartbeat numbered `seq`.
-fn ack_of(seq: u64) -> impl FnMut(&server_message::Message) -> Option<()> {
-    move |m| match m {
-        server_message::Message::HeartbeatAck(a) if a.seq == seq => Some(()),
-        _ => None,
     }
 }
 

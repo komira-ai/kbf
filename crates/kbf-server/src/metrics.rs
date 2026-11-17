@@ -1,8 +1,7 @@
 //! `GET /metrics` on the operator API listener: the cache's upload-path metrics
 //! ([`kbf_front::metrics`]), the write tier's when one is attached, the lost-blob
-//! families read from the metadata state ([`kbf_front::Losses`]), and the fill of the
-//! node's one cache when the process has one (`kbf all-in-one`,
-//! [`kbf_storage::local_cache`]), and the storage health of a frontend with a state store
+//! families read from the metadata state ([`kbf_front::Losses`]), and the storage health of a
+//! frontend with a state store
 //! ([`crate::storage_health`]), in the Prometheus text format, for a scraper or for
 //! `curl` while an upload is slow (`docs/api.md#get-metrics`).
 //!
@@ -10,7 +9,6 @@
 //! only counts and latencies. Every listener that serves the cache (REAPI and the
 //! daemons' worker listener) counts into the same families.
 
-use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -22,7 +20,6 @@ use axum::routing::get;
 use futures::FutureExt as _;
 use kbf_front::{Cache, MetaLog};
 use kbf_objstore::ObjectStore;
-use kbf_storage::local_cache::{Fill, LocalCache};
 use kbf_tls::TlsSource;
 
 use crate::farm::Farm;
@@ -35,13 +32,12 @@ use crate::start::AbortOnDrop;
 /// The media type of the answer: the Prometheus text exposition format.
 pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// What a scrape adds to the cache's own metrics: the node's one cache's fill if the
-/// process has one, build history's counters if the server keeps history, and the pack
+/// What a scrape adds to the cache's own metrics: build history's counters if the server
+/// keeps history, and the pack
 /// reads the daemons report if the process has a farm. Not generic: nothing here depends on
 /// the cache.
 #[derive(Clone)]
 struct Extras {
-    local: Option<Arc<LocalCache>>,
     history: Option<Arc<crate::history::Stats>>,
     farm: Option<Arc<Farm>>,
 }
@@ -49,9 +45,6 @@ struct Extras {
 impl Extras {
     /// Appends what there is to `out`.
     fn render(self, out: &mut String) {
-        if let Some(local) = self.local {
-            render_fill(out, local.fill());
-        }
         if let Some(history) = self.history {
             history.render(out);
         }
@@ -93,13 +86,12 @@ impl<M, O> Clone for Sources<M, O> {
     }
 }
 
-/// The `/metrics` route over `cache`'s metrics, `local`'s fill, when the server keeps
+/// The `/metrics` route over `cache`'s metrics, when the server keeps
 /// build history its counters, the storage health of `members`, the reloads of the
 /// listeners' `tls` files and, given the `farm` its daemons register with, the pack reads
 /// they report.
 pub fn router<M, O>(
     cache: Arc<Cache<M, O>>,
-    local: Option<Arc<LocalCache>>,
     history: Option<Arc<crate::history::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
@@ -113,11 +105,7 @@ where
         .route("/metrics", get(metrics::<M, O>))
         .with_state(Sources {
             cache,
-            extras: Extras {
-                local,
-                history,
-                farm,
-            },
+            extras: Extras { history, farm },
             members,
             tls: tls.into(),
         })
@@ -162,20 +150,18 @@ impl NodeMetrics {
         socket.http().map(|listener| Self { listener, addr })
     }
 
-    /// Serves `/metrics` over `cache` (and `local`'s fill, when the process has one
-    /// cache for the daemon half and the store; and the reloads of the listener's
-    /// `tls`) until the returned task is dropped: where it listens, and the task.
+    /// Serves `/metrics` over `cache` (and the reloads of the listener's `tls`) until the
+    /// returned task is dropped: where it listens, and the task.
     pub fn serve<M, O>(
         self,
         cache: Arc<Cache<M, O>>,
-        local: Option<Arc<LocalCache>>,
         tls: Option<TlsSource>,
     ) -> (SocketAddr, AbortOnDrop)
     where
         M: MetaLog,
         O: ObjectStore + 'static,
     {
-        let routes = router(cache, local, None, None, tls.into_iter().collect(), None);
+        let routes = router(cache, None, None, tls.into_iter().collect(), None);
         // `pending` is its stop, so it ends only when the task is aborted; an error of
         // the accept loop has nothing to be reported to.
         // The node is not behind the proxy: no secret, so `gate_requests` admits a direct caller.
@@ -209,32 +195,5 @@ pub(crate) fn bind_node_sockets(
 pub(crate) async fn scrape_health(out: &mut String, members: Option<&Arc<Members>>) {
     if let Some(members) = members {
         crate::storage_health::scrape(out, members).await;
-    }
-}
-
-/// Appends the one cache's gauges to `out`.
-fn render_fill(out: &mut String, fill: Fill) {
-    let gauges = [
-        (
-            "kbf_local_cache_input_bytes",
-            "Bytes of the input cache's entries, in the node's one cache",
-            fill.inputs,
-        ),
-        (
-            "kbf_local_cache_storage_bytes",
-            "Bytes the node's local storage holds on the one cache's disk: the write tier's blocks",
-            fill.storage,
-        ),
-        (
-            "kbf_local_cache_fill_bytes",
-            "What the node's one cache holds on its disk, each byte once: the input cache's entries and local storage's bytes",
-            fill.total(),
-        ),
-    ];
-    for (name, help, value) in gauges {
-        let _ = writeln!(
-            out,
-            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"
-        );
     }
 }

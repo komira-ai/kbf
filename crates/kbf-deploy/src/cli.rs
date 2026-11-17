@@ -34,7 +34,6 @@
 //!                             --hosts N --host-cpus N --host-memory-gib N [--host-slots N]
 //! kbf-deploy job-service apply <the flags of plan> <the restart flags>
 //!                              [--canary-deadline-secs SECS] [--apply]
-//! kbf-deploy job-service back-out --config FILE <the restart flags> [--apply]
 //!   restart flags: --instance NAME --api-token-file FILE --ssh-host ADDRESS --ssh-user USER
 //!                  --ssh-key-file FILE --known-hosts FILE [--api ADDR] [--ssh-port PORT]
 //!                  [--kbf FILE] [--ssh FILE] [--poll-secs SECS] [--drain-deadline-secs SECS]
@@ -74,7 +73,7 @@
 //! `job-service plan` only reads the frontend's `kbf.toml` (never the token): it prints what the
 //! switch onto the job service sets, and exits 0, 1 the file lacks a key the executor needs
 //! (`FAIL: ...` on stderr, after the plan), or 2 refused ([`crate::cutover`]). `job-service
-//! apply` and `back-out` change the frontend only with `--apply`: they print their steps as
+//! apply` changes the frontend only with `--apply`: it prints its steps as
 //! `DRY-RUN:` lines without it, and exit 0 done, 1 a step failed (`FAIL: ...` on stderr), or 2
 //! refused ([`crate::cutover_apply`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
@@ -151,7 +150,7 @@ enum Kit {
     /// The job service a frontend's executor submits to: `check` calls ListJobs with kbf's
     /// client token; `agent-egress` prints the egress lines of a farm agent's flags file;
     /// `plan` prints the switch of the executor onto the service (those three only read);
-    /// `apply` makes the switch and `back-out` undoes it, each a dry run without --apply.
+    /// `apply` makes the switch, a dry run without --apply.
     #[command(subcommand)]
     JobService(crate::job_service::JobService),
 }

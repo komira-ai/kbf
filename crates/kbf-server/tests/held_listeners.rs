@@ -29,15 +29,12 @@ fn listeners(reapi: SocketAddr, worker: SocketAddr) -> Listeners {
         worker,
         reapi_tls: None,
         worker_tls: None,
-        heartbeat_interval: Duration::from_millis(200),
-        hello_wait: Duration::from_secs(5),
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         memory_climb: true,
-        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         exclusive_actions: false,
         placement_load: kbf_server::PlacementLoad::Off,
@@ -49,7 +46,6 @@ fn listeners(reapi: SocketAddr, worker: SocketAddr) -> Listeners {
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
-        segments: kbf_front::SegmentsConfig::DEFAULT,
         stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
@@ -58,7 +54,6 @@ fn api(listen: SocketAddr) -> Option<Api> {
     Some(Api {
         listen,
         token: None,
-        local_cache: None,
     })
 }
 
@@ -96,7 +91,6 @@ async fn a_server_serves_on_the_sockets_it_is_handed() {
         None,
         None,
         None,
-        None,
         true,
         std::future::pending(),
     )
@@ -117,7 +111,6 @@ async fn a_server_serves_on_the_sockets_it_is_handed() {
         listeners(reapi_at, worker_at),
         api(operator_at),
         Policy::allow_all(),
-        None,
         None,
         None,
         None,
@@ -156,7 +149,6 @@ async fn listeners_without_a_held_socket_bind_and_a_spare_one_is_closed() {
         listeners(reapi_at, loopback()),
         api(loopback()),
         Policy::allow_all(),
-        None,
         None,
         None,
         None,

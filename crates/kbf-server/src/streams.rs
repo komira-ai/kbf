@@ -3,8 +3,8 @@
 //!
 //! The two listeners differ. A REAPI client (buck2) holds one `Execute` stream open per
 //! outstanding action, idle almost the whole time, so its backlog must not wait in the
-//! client behind a small cap. A daemon holds one persistent session stream and a few
-//! short, busy transfer streams. The flow-control windows follow the limit
+//! client behind a small cap. A storage node holds a few short unary calls on the worker
+//! listener. The flow-control windows follow the limit
 //! ([`flow_windows`]): the connection's window always holds every stream's window.
 
 use kbf_front::{DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, STREAM_WINDOW_BYTES};
@@ -85,8 +85,7 @@ pub struct StreamArgs {
     )]
     pub reapi_max_streams: u32,
     /// The most HTTP/2 streams one connection to the worker listener may have open: a
-    /// daemon's persistent session stream and its short transfer streams. At least 1, at
-    /// most 32767.
+    /// storage node's short unary calls. At least 1, at most 32767.
     #[arg(
         long,
         default_value_t = DEFAULT_WORKER_STREAMS,

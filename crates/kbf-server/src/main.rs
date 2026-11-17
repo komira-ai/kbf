@@ -1,4 +1,4 @@
-//! `kbf-server`: serves REAPI and `kbf.worker.v1` until interrupted. See the library
+//! `kbf-server`: serves REAPI and the worker listener until interrupted. See the library
 //! docs for what it wires together.
 //!
 //! On start it prints one line, `kbf-server <version> reapi=<addr> worker=<addr>`, with

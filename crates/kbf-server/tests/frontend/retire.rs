@@ -144,6 +144,8 @@ pub(super) struct Member {
     pub(super) reapi: SocketAddr,
     pub(super) worker: SocketAddr,
     pub(super) api: SocketAddr,
+    /// The frontend's farm, which a fake daemon registers with.
+    pub(super) farm: std::sync::Weak<kbf_server::farm::Farm>,
     /// The frontend's drain: the events of its phases, and the ends of its two waits.
     pub(super) drain: Arc<Drain>,
     /// Counts the intake polls the frontend has run to the end.
@@ -170,6 +172,7 @@ impl Member {
             handle.api,
         );
         let (drain, polls) = (handle.drain(), handle.intake_polls());
+        let farm = handle.farm.clone();
         let (finish, ended) = watch::channel(false);
         let serving = async move {
             let served = handle.serve().await;
@@ -180,12 +183,18 @@ impl Member {
             reapi,
             worker,
             api: api.expect("the operator API"),
+            farm,
             drain,
             polls,
             stop: Some(stop),
             served: tokio::spawn(serving),
             ended,
         }
+    }
+
+    /// A client of the frontend, which opens fake daemons on its farm.
+    pub(super) async fn client(&self) -> Client {
+        Client::connect_to(self.reapi, self.worker, self.farm.clone()).await
     }
 
     /// Gives the frontend its stop signal, as SIGTERM does, and goes on at once.
@@ -354,7 +363,7 @@ pub(super) async fn queued(api: SocketAddr) -> u64 {
 async fn a_retired_frontend_hands_its_daemon_to_the_other_and_still_answers_its_caller() {
     let pair = Pair::start("retire-handover").await;
     let (a, b) = (&pair.a, &pair.b);
-    let client = Client::connect(a.reapi, a.worker).await;
+    let client = a.client().await;
     let mut daemon = client.daemon("node-a", 4, 8).await;
     let job = Job::new("a build across a retire", &[]);
     client.upload(&job.blobs()).await;
@@ -378,7 +387,7 @@ async fn a_retired_frontend_hands_its_daemon_to_the_other_and_still_answers_its_
 
     let ended = daemon.ended().await;
     assert_eq!(ended.code(), Code::Unavailable, "{ended}");
-    let reached = Client::connect(b.reapi, b.worker).await;
+    let reached = b.client().await;
     let mut daemon = reached.daemon("node-a", 4, 8).await;
     assert_eq!(daemon.epoch, lease.term, "the epoch was kept");
     assert!(
@@ -409,7 +418,7 @@ async fn a_retired_frontend_hands_its_daemon_to_the_other_and_still_answers_its_
 async fn a_retired_frontend_is_not_ready_and_refuses_a_new_execute() {
     let pair = Pair::start("retire-refuses").await;
     let (a, b) = (&pair.a, &pair.b);
-    let client = Client::connect(a.reapi, a.worker).await;
+    let client = a.client().await;
     let job = Job::new("refused by a retired frontend", &[]);
     client.upload(&job.blobs()).await;
     assert_eq!(readyz(a.api).await, 200);
@@ -437,7 +446,7 @@ async fn a_retired_frontend_is_not_ready_and_refuses_a_new_execute() {
 async fn a_retired_frontend_takes_no_more_work_in_from_the_store() {
     let pair = Pair::start("retire-intake").await;
     let (a, b) = (&pair.a, &pair.b);
-    let client = Client::connect(b.reapi, b.worker).await;
+    let client = b.client().await;
     let first = Job::new("queued before the retire", &[]);
     let second = Job::new("queued after the retire", &[]);
     client.upload(&first.blobs()).await;

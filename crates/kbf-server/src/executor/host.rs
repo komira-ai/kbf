@@ -4,18 +4,16 @@
 //! `js-mac:<frontend>-<n>`, [`crate::executor::mac`]), that registers, takes `Start`s,
 //! lists what it runs in its heartbeats and reports results. Nothing of the farm knows
 //! otherwise but its registration: the worker owns the receiving end of the `Outbound` channel
-//! the farm sends a daemon's messages on, and calls the farm's own `register_virtual` and
-//! `resize_virtual` (a daemon's `register` and `resize` that skip no Linux worker), `heartbeat`
+//! the farm sends a daemon's messages on, and calls the farm's own `register`, `resize`, `heartbeat`
 //! and `report`. Its shape (the cores, the memory and the slots the flags declare) is how many
 //! actions of which size the farm may have in flight on it; each becomes a job, and the job
 //! service decides which host runs it. The worker holds no host, and is never retired because a host went
 //! away: a job is.
 //!
-//! What a real session does and this one skips, and why that is safe:
+//! What this worker does not send the farm, and why that is safe:
 //!
-//! - `peers.admit` (the certificate check): nothing here is a peer; the job service's token
-//!   is the credential.
-//! - `MapRequest` and `MapUpdate`: the task reads through a grant, not the storage map.
+//! - A certificate check: nothing here is a peer; the job service's token is the credential.
+//! - The storage map: the task reads through a grant, not the map.
 //! - `note_pack_reads` and `note_pack_writes`: the task's reads and its one pack are
 //!   counted by the frontend's own ingest.
 //! - `Welcome.pack_commit` and `placement_load`: nothing here commits a pack through
@@ -314,7 +312,7 @@ impl HostWorker {
         self.reported.phase = kbf_sched::NodePhase::Draining;
         ctx.deps
             .farm
-            .resize_virtual(&self.id, self.stream, self.reported.clone());
+            .resize(&self.id, self.stream, self.reported.clone());
     }
 
     /// Heartbeats the farm when one is due, and fences when the farm, or the job service while
@@ -382,7 +380,7 @@ fn register(
         })),
     };
     let (outbound, inbox): (Outbound, Inbox) = mpsc::unbounded_channel();
-    let stream = ctx.deps.farm.register_virtual(
+    let stream = ctx.deps.farm.register(
         id,
         DaemonInstance::new(instance.clone()),
         DaemonInstance::new(predecessor),

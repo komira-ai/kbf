@@ -1,25 +1,22 @@
-//! Who is on the worker listener: the node a daemon's client certificate names, and
-//! the deny list (issue #79). The same rules admit a worker stream and each blob call
-//! a daemon makes on that listener ([`crate::blobs`]).
+//! Who is on the worker listener: the node a client certificate names, and the deny list
+//! (issue #79). The same rules admit the node calls of a host's updater
+//! ([`crate::node_self`]) and, with the storage role's own checks on top, `Membership`
+//! ([`crate::members_rpc`]).
 //!
 //! **The role** is checked before any of this, per method, by the listener's table
-//! ([`crate::worker_roles`]): a worker stream or a blob call reaches these rules only
-//! from a certificate naming the daemon role.
+//! ([`crate::worker_roles`]).
 //!
-//! **The rule.** Under mutual TLS a daemon's client certificate must carry exactly one
-//! DNS name in its subjectAltName extension, and that name must equal, byte for byte,
-//! the `node_id` of every `Hello` the stream sends. The subject's common name is not
-//! read. A certificate for one node therefore cannot open, or take over, another
-//! node's session. A blob call carries no node id: its certificate must still carry
-//! exactly one DNS name, and that name is the node the deny list is checked against.
+//! **The rule.** Under mutual TLS a client certificate must carry exactly one DNS name in its
+//! subjectAltName extension, and that name is the node the deny list is checked against and,
+//! for a node call, the node the call is about. The subject's common name is not read. A
+//! certificate for one node therefore cannot speak for another.
 //!
 //! **Behind the farm's proxy** (`--proxy-auth-file`, [`crate::proxy_auth`]) there is no
 //! certificate on the connection: the proxy terminated the TLS and forwards the node and
 //! role it verified. [`presented`] is the one function that says which a call has, and every
-//! check above (the role table, the `Hello` binding, the blob calls, `Membership`) goes
-//! through it: a proxied identity names its node as a certificate would, so the same
-//! `Hello.node_id` rule applies (a mismatch is PERMISSION_DENIED), and a `node` deny entry
-//! names it; it has no serial or key hash, so those entries cannot.
+//! check above (the role table, the node calls, `Membership`) goes through it: a proxied
+//! identity names its node as a certificate would, and a `node` deny entry names it; it has no
+//! serial or key hash, so those entries cannot.
 //!
 //! **The deny list** is a file the server looks at again at every check, so an edit
 //! takes effect without a restart. Each check reads the file's metadata (device,
@@ -32,12 +29,10 @@
 //! node mac-07                # a node id, whatever certificate it comes with
 //! ```
 //!
-//! A stream whose certificate or node is listed is refused PERMISSION_DENIED at its
-//! first `Hello`, and ended at the next `Hello`, `Heartbeat` or `Result` it sends after
-//! the entry is added, and a blob call is refused PERMISSION_DENIED from the first
-//! call after it. A `node` entry is compared with a node id or a DNS name up to ASCII case,
+//! A call whose certificate or node is listed is refused PERMISSION_DENIED from the first
+//! call after the entry is added. A `node` entry is compared with a node id or a DNS name up to ASCII case,
 //! as DNS compares names. A deny list that cannot be read or parsed refuses every check (fail
-//! closed) until it is fixed, which ends every connected stream within one heartbeat.
+//! closed) until it is fixed.
 //! A storage node's `Register` and `Heartbeat` ([`crate::members_rpc`]) are checked against
 //! the same list by its certificate ([`DenyList::admit_cert`]): a listed serial or key,
 //! or any DNS name in it that is a listed node, is refused PERMISSION_DENIED, and an
@@ -56,8 +51,8 @@
 //! fails keeps the earlier snapshot in use for [`DENY_SNAPSHOT_SWEEPS`] beats; after that, or
 //! before any refresh has read the rows, every check is refused UNAVAILABLE (fail closed), as
 //! an unusable file does, and the frontend's `/readyz` fails its `deny_rows` check. A corrupt `deny/` row makes every refresh fail, so it ends in that
-//! state until the row is repaired (see `docs/api.md`). A revoked daemon's stream therefore
-//! ends at its next message, and its blob calls are refused from the next call.
+//! state until the row is repaired (see `docs/api.md`). A revoked node's calls are therefore
+//! refused from the next call.
 //! Both are compared with a certificate through the one reader,
 //! `kbf_peer::identity_of` ([`PeerCert`] wraps it).
 //! Replace the file by renaming a new one over it: an in-place edit that keeps the
@@ -177,7 +172,7 @@ impl Presented {
 
 /// Who the call whose request extensions are `extensions` presents itself as: the identity a
 /// proxy verified ([`Trust::Proxied`]), else the client certificate. The one function that
-/// decides, so the role check, the `Hello` binding, the blob calls and `Membership` cannot
+/// decides, so the role check, the node calls and `Membership` cannot
 /// disagree about it.
 #[must_use]
 pub fn presented(extensions: &Extensions) -> Presented {
@@ -190,13 +185,13 @@ pub fn presented(extensions: &Extensions) -> Presented {
     }
 }
 
-/// How the worker listener knows who is on a stream.
+/// How the worker listener knows who is calling.
 #[derive(Clone, Debug)]
 pub enum Peers {
     /// Plain text: no certificate, so no node is bound to one. For tests and trials on
     /// one machine only.
     Unauthenticated,
-    /// Mutual TLS: every stream's certificate must name its node, and is checked
+    /// Mutual TLS: every call's certificate must name its node, and is checked
     /// against the deny list if there is one.
     Certified {
         /// Read again at every check.
@@ -296,7 +291,7 @@ impl Peers {
         }
     }
 
-    /// The certificate of a new stream or blob call, from the chain TLS verified (`leaf`
+    /// The certificate of a call, from the chain TLS verified (`leaf`
     /// is its first certificate; `None` in plain text). Its role was checked before the
     /// call was routed ([`crate::worker_roles`]).
     ///
@@ -329,7 +324,7 @@ impl Peers {
         }
     }
 
-    /// Whether the stream whose certificate is `peer` may speak as `node_id` now: the
+    /// Whether the caller whose certificate is `peer` may speak as `node_id` now: the
     /// certificate names it, and neither is on the deny list.
     ///
     /// # Errors
@@ -363,28 +358,6 @@ impl Peers {
             Some(why) => Err(Status::permission_denied(format!("denied: {why}"))),
             None => Ok(()),
         }
-    }
-
-    /// Whether a blob call on the worker listener, presenting `presented` (its verified
-    /// chain's leaf, or the identity a proxy forwarded), may go on now: there is mutual TLS
-    /// and a certificate (or a proxied node), it names exactly one node, and neither the
-    /// certificate nor that node is denied. Returns the node.
-    ///
-    /// # Errors
-    /// UNAUTHENTICATED: plain text, or no certificate (or one that does not parse).
-    /// PERMISSION_DENIED: the certificate names no node or several, or it (or its
-    /// node) is denied. UNAVAILABLE: the deny list cannot be read or parsed.
-    pub async fn admit_call(&self, presented: &Presented) -> Result<String, Status> {
-        // Under mutual TLS a missing certificate is an error already; `None` is plain text.
-        let Some(peer) = self.peer_of(presented)? else {
-            return Err(Status::unauthenticated(
-                "blob calls on the worker listener need mutual TLS, which this server \
-                 does not serve there",
-            ));
-        };
-        let node = peer.node()?.to_owned();
-        self.admit(Some(&peer), &node).await?;
-        Ok(node)
     }
 }
 
@@ -564,7 +537,7 @@ impl Denied {
         denied
     }
 
-    /// Why a stream with certificate `peer` speaking as `node_id` is denied, if it is: a
+    /// Why a caller with certificate `peer` speaking as `node_id` is denied, if it is: a
     /// listed node is `node_id` up to ASCII case (a DNS name is, as for the storage nodes'
     /// map: [`kbf_peer::PeerNames::has_dns_name`]), then its serial and key.
     #[must_use]

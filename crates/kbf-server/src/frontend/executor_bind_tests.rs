@@ -76,11 +76,10 @@ fn js_agent_names_what_it_prepares_its_runs_with() {
     assert!(parsed(argv(&[], &[])).is_ok(), "and with all of them");
 }
 
-/// Catches the checks applying when the executor is switched back: a unit that keeps every
-/// setting of the host executor, and that has dropped what it needs, still starts on daemons. The
-/// rollback is the one flag.
+/// Catches the checks applying with no executor: a unit that keeps every setting of the host
+/// executor, and that has dropped what it needs, still starts with none.
 #[test]
-fn the_daemon_executor_is_not_checked_against_them() {
+fn no_executor_is_not_checked_against_them() {
     let flags = parsed(argv(
         &[
             "--executor",
@@ -91,9 +90,9 @@ fn the_daemon_executor_is_not_checked_against_them() {
             "--task-secret-file",
             "--task-out-root",
         ],
-        &["--executor=kbf-daemon"],
+        &[],
     ))
-    .expect("starts on daemons");
+    .expect("starts with no executor");
     assert!(flags.executor.js.is_none());
 }
 
@@ -131,16 +130,14 @@ fn the_longest_run_must_fit_the_keys_ceiling_less_the_slack() {
     parsed(argv(&[], &no_slack)).expect("fits with no slack");
 }
 
-/// Pins that `--job-plain-http` is accepted beside `--executor kbf-daemon` (and with no executor,
-/// which the flag tests of the listener parse): the listener is independent of the executor, and
-/// the daemon executor takes no read grant, so the plain listener leaks nothing it would not
-/// serve anyway. The listener's plain mode stays what the flag says.
+/// Pins that `--job-plain-http` is accepted with no executor: the listener is independent of the
+/// executor, and with none no read grant is given, so the plain listener leaks nothing it would
+/// not serve anyway. The listener's plain mode stays what the flag says.
 #[test]
-fn a_plain_job_listener_is_accepted_beside_the_daemon_executor() {
+fn a_plain_job_listener_is_accepted_with_no_executor() {
     let flags = parsed(argv(
         &["--executor"],
         &[
-            "--executor=kbf-daemon",
             "--job-listen=192.0.2.6:9400",
             "--job-plain-http",
             "--job-grant-secret-file=/nowhere/secret",

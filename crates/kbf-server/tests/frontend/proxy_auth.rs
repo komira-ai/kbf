@@ -5,11 +5,8 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 
-use futures::channel::mpsc::unbounded;
-use kbf_proto::worker::{
-    Capability, DaemonMessage, Hello, ServerMessage, daemon_message, server_message,
-    worker_client::WorkerClient,
-};
+use kbf_proto::kbf::map::v1::RegisterRequest;
+use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use tonic::Code;
 use tonic::metadata::{MetadataKey, MetadataValue};
 
@@ -25,29 +22,11 @@ fn private_file(dir: &Path, name: &str, content: &[u8]) -> String {
     path.to_str().expect("UTF-8").to_owned()
 }
 
-/// A worker session for `node-a` carrying `claims` as request headers: `Welcome`, or the
-/// status the frontend refused it with.
+/// A `Membership/Register` call carrying `claims` as request headers. A frontend with no state
+/// store serves no membership, so UNIMPLEMENTED is the answer of a call the proxy layer and the
+/// table of roles let through: `Ok`.
 async fn session(worker: SocketAddr, claims: &[(&str, String)]) -> Result<(), tonic::Status> {
-    let entry = |key: &str, value: &str| Capability {
-        key: key.to_owned(),
-        value: value.to_owned(),
-    };
-    let (tx, rx) = unbounded();
-    tx.unbounded_send(DaemonMessage {
-        message: Some(daemon_message::Message::Hello(Hello {
-            protocol_version: 1,
-            node_id: "node-a".to_owned(),
-            capabilities: vec![
-                entry("arch", "x86_64"),
-                entry("cpus", "1"),
-                entry("mem_gib", "1"),
-                entry("drivers", "fake"),
-            ],
-            ..Hello::default()
-        })),
-    })
-    .expect("open");
-    let mut request = tonic::Request::new(rx);
+    let mut request = tonic::Request::new(RegisterRequest::default());
     for (name, value) in claims {
         let key = MetadataKey::from_bytes(name.as_bytes()).expect("a key");
         let value: MetadataValue<_> = value.parse().expect("a value");
@@ -58,15 +37,10 @@ async fn session(worker: SocketAddr, claims: &[(&str, String)]) -> Result<(), to
         .connect()
         .await
         .expect("connect");
-    let mut inbound = WorkerClient::new(channel)
-        .session(request)
-        .await?
-        .into_inner();
-    match inbound.message().await? {
-        Some(ServerMessage {
-            message: Some(server_message::Message::Welcome(_)),
-        }) => Ok(()),
-        other => panic!("expected Welcome or an error, got {other:?}"),
+    match MembershipClient::new(channel).register(request).await {
+        Err(status) if status.code() == Code::Unimplemented => Ok(()),
+        Err(status) => Err(status),
+        Ok(other) => panic!("expected an error, got {other:?}"),
     }
 }
 
@@ -123,18 +97,21 @@ async fn a_frontend_behind_the_proxy_takes_its_identity_and_gates_writes() {
 
     let anonymous = [
         ("x-kbf-node-id", "node-a".to_owned()),
-        ("x-kbf-role", "daemon".to_owned()),
+        ("x-kbf-role", "storage".to_owned()),
     ];
     let refused = session(front.worker, &anonymous).await;
     assert_eq!(
         refused.expect_err("no secret").code(),
         Code::Unauthenticated
     );
-    session(front.worker, &forwarded("node-a", "daemon"))
+    session(front.worker, &forwarded("node-a", "storage"))
         .await
         .expect("the proxy vouched for node-a");
-    let forged = session(front.worker, &forwarded("node-b", "daemon")).await;
-    assert_eq!(forged.expect_err("forged").code(), Code::PermissionDenied);
+    let frontend = session(front.worker, &forwarded("node-a", "frontend")).await;
+    assert_eq!(
+        frontend.expect_err("frontend").code(),
+        Code::PermissionDenied
+    );
 
     let bearer = format!("Bearer {TOKEN}");
     assert_eq!(cordon(front.api, &[("Authorization", &bearer)]).await, 403);

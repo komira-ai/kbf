@@ -8,7 +8,7 @@
 //!
 //! The commit is the one this binary was built from ([`crate::BUILD_COMMIT_FULL`]): the bundle
 //! of another release is not taken, and a build that does not know its commit publishes nothing.
-//! Under `--executor kbf-daemon` there is no [`Start`]: nothing is read or written, whatever the
+//! Without `--executor js-agent` there is no [`Start`]: nothing is read or written, whatever the
 //! flag says.
 //!
 //! A failure at any step fails the start ([`ServeError::BaseTree`]), naming the flag and the

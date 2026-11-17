@@ -8,7 +8,7 @@ mod support;
 use std::io::Write;
 use std::sync::{Mutex, Once, PoisonError};
 
-use support::{Cell, FakeDaemon, Job, done, failed, hello_on, output, ran};
+use support::{Cell, Job, done, failed, hello_on, output, ran};
 use tonic::Code;
 
 /// Every line logged in this test binary. Each test names its own nodes and reads only
@@ -73,7 +73,8 @@ const ARM: &[(&str, &str)] = &[("arch", "arm64"), ("os", "linux")];
 
 /// Runs a job asking `platform` on a node `name` with `caps`; returns after its grant.
 async fn granted(cell: &Cell, name: &str, caps: &[(&str, &str)], platform: &[(&str, &str)]) {
-    let mut daemon = FakeDaemon::connect(cell.worker_addr, hello_on(name, 4, 8, caps))
+    let mut daemon = cell
+        .daemon_hello(hello_on(name, 4, 8, caps))
         .await
         .expect("registered");
     let job = Job::new(name, platform);

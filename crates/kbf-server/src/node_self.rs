@@ -18,7 +18,7 @@
 //! that node must be the `{id}` of the call. A daemon, storage, frontend or coordinator
 //! certificate, a call with no certificate, and an updater of another node are refused (401
 //! without a certificate, 403 otherwise). The worker listener's deny list then applies to the
-//! node, as it does to a daemon's calls ([`crate::identity::Peers::admit`]). Every other call
+//! node, as it does to a storage node's calls ([`crate::identity::Peers::admit`]). Every other call
 //! of an updater certificate is refused: the shapes of [`node_call`] are exact, and the
 //! router below serves nothing else, so no operator route is reachable from here whatever the
 //! certificate.

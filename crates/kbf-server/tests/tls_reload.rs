@@ -20,14 +20,12 @@ use std::time::Duration;
 
 use clap::Parser;
 use futures::StreamExt;
-use futures::channel::mpsc::unbounded;
 use hyper_util::rt::TokioIo;
 use kbf_front::Cache;
+use kbf_proto::kbf::map::v1::RegisterRequest;
+use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_proto::reapi::GetCapabilitiesRequest;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
-use kbf_proto::worker::{
-    Capability, DaemonMessage, Hello, daemon_message, server_message, worker_client::WorkerClient,
-};
 use kbf_server::{Api, Args, bind_server_with_api};
 use kbf_tls::{Incoming, TlsSource};
 use rcgen::{
@@ -223,47 +221,21 @@ async fn capabilities_answered(endpoint: Endpoint) -> bool {
     }
 }
 
-/// Whether a daemon session to `endpoint` is welcomed, each step within `limit`: a
-/// refusal at any step (the server certificate, the client certificate, the call) is
-/// `false`, a step that does not answer in time fails the test.
+/// Whether a call to the worker listener at `endpoint` gets through to the service behind
+/// its TLS and its table of roles, each step within `limit`: a refusal at any step (the server
+/// certificate, the client certificate, the call) is `false`, a step that does not answer in
+/// time fails the test. A server with no state store serves no membership, so UNIMPLEMENTED is
+/// the answer of a call that got through.
 async fn session_welcomed_within(limit: Duration, endpoint: Endpoint) -> bool {
     let Some(channel) = connect(limit, endpoint).await else {
         return false;
     };
-    let (tx, rx) = unbounded();
-    let capability = |key: &str, value: &str| Capability {
-        key: key.to_owned(),
-        value: value.to_owned(),
-    };
-    let hello = Hello {
-        protocol_version: 1,
-        node_id: "node-1".to_owned(),
-        capabilities: vec![
-            capability("cpus", "1"),
-            capability("mem_gib", "1"),
-            capability("arch", "x86_64"),
-        ],
-        ..Hello::default()
-    };
-    tx.unbounded_send(DaemonMessage {
-        message: Some(daemon_message::Message::Hello(hello)),
-    })
-    .expect("queue Hello");
-    let mut worker = WorkerClient::new(channel);
-    let call = worker.session(rx);
-    let Ok(response) = within(limit, "the response to the session call", call).await else {
-        return false;
-    };
-    let first = within(
-        limit,
-        "the first message of the session",
-        response.into_inner().message(),
-    )
-    .await;
-    matches!(
-        first,
-        Ok(Some(m)) if matches!(m.message, Some(server_message::Message::Welcome(_)))
-    )
+    let mut membership = MembershipClient::new(channel);
+    let call = membership.register(RegisterRequest::default());
+    match within(limit, "the response to the call", call).await {
+        Err(status) => status.code() == tonic::Code::Unimplemented,
+        Ok(_) => false,
+    }
 }
 
 async fn session_welcomed(endpoint: Endpoint) -> bool {
@@ -324,7 +296,6 @@ fn start(args: &[String]) -> Running {
     let api = Api {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         token: None,
-        local_cache: None,
     };
     let bound = bind_server_with_api(Arc::new(Cache::memory()), listeners, Some(api), pending())
         .expect("bind");
@@ -395,9 +366,9 @@ async fn a_renewed_reapi_certificate_is_served_without_a_restart() {
     assert!(metrics.contains("kbf_tls_leaf_not_after_seconds{listener=\"reapi\"} "));
 }
 
-/// The worker listener's three files: after its client CA is replaced, a daemon with a
-/// certificate of the new CA is welcomed and one of the old CA is not; after its server
-/// certificate is replaced, a daemon that trusts only the new issuer is welcomed and
+/// The worker listener's three files: after its client CA is replaced, a caller with a
+/// certificate of the new CA is let through and one of the old CA is not; after its server
+/// certificate is replaced, a caller that trusts only the new issuer is let through and
 /// one that trusts the old issuer is not.
 ///
 /// Each replacement is waited for in `/metrics` (the server counted the look that
@@ -428,7 +399,7 @@ async fn the_worker_listener_reloads_its_client_ca_and_identity() {
         let pair = issuer.leaf(
             "node-1",
             ExtendedKeyUsagePurpose::ClientAuth,
-            Some("daemon"),
+            Some("storage"),
         );
         Identity::from_pem(pair.cert, pair.key)
     };

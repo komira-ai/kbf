@@ -1,6 +1,7 @@
 //! The `kbf-server` binary with a `file://` `--cold-store` and a `--meta-dir`: blob bytes
 //! in a local directory, an index in a Raft log, both kept across a restart. Every check
-//! goes through the REAPI surface of a real process.
+//! goes through the REAPI surface of a real process, except those that run an action: a fake
+//! daemon registers with the farm of the server, so those start the server in this process.
 
 #![cfg(unix)]
 
@@ -13,11 +14,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use clap::Parser;
 use kbf_proto::google::bytestream::ReadRequest;
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::{BatchUpdateBlobsRequest, batch_update_blobs_request};
+use kbf_server::Args;
 use support::{Blob, Client, Job, done, output, ran, response};
+use tokio::sync::oneshot;
 use tonic::Code;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-server");
@@ -67,6 +71,23 @@ impl Dirs {
         c
     }
 
+    /// The flags of [`Dirs::server`], for a server started in this process.
+    fn flags(&self) -> Vec<String> {
+        let mut flags = vec![
+            "kbf-server".to_owned(),
+            "--cold-store".to_owned(),
+            format!("file://{}", self.blobs.display()),
+            "--meta-dir".to_owned(),
+            self.raft.display().to_string(),
+            "--cold-store-floor-bytes".to_owned(),
+            "1".to_owned(),
+            "--shutdown-timeout-secs".to_owned(),
+            "1".to_owned(),
+        ];
+        flags.extend(ANY_PORT.map(str::to_owned));
+        flags
+    }
+
     /// [`Dirs::server`] without a floor.
     fn unfloored(&self) -> Command {
         let mut c = Command::new(BIN);
@@ -75,8 +96,6 @@ impl Dirs {
             .arg("--meta-dir")
             .arg(&self.raft)
             .args(ANY_PORT)
-            // The heartbeat interval the fake daemon expects.
-            .args(["--heartbeat-interval-ms", "100"])
             .args(["--shutdown-timeout-secs", "1"]);
         c
     }
@@ -144,6 +163,44 @@ fn stop(mut child: Running) {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(status.success(), "kbf-server exited with {status}");
+}
+
+/// A server started in this process over the stores of a [`Dirs`], so that a fake daemon
+/// registers with its farm: a spawned process has none to register with.
+struct Here {
+    stop: Option<oneshot::Sender<()>>,
+    served: tokio::task::JoinHandle<Result<(), kbf_server::ServeError>>,
+}
+
+/// Starts the server of `dirs` in this process; it, a client of both listeners with the
+/// farm, and the start line.
+async fn started_here(dirs: &Dirs) -> (Here, Client, String) {
+    let args = Args::try_parse_from(dirs.flags()).expect("flags");
+    let (stop, stopped) = oneshot::channel::<()>();
+    let handle = kbf_server::start(&args, || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .await
+    .expect("starts");
+    let line = handle.start_line().to_owned();
+    let client = Client::connect_to(handle.reapi, handle.worker, handle.farm.clone()).await;
+    let served = tokio::spawn(handle.serve());
+    let here = Here {
+        stop: Some(stop),
+        served,
+    };
+    (here, client, line)
+}
+
+/// Stops a server started by [`started_here`] and checks it ends without an error within
+/// `BOUND`, with its stores released.
+async fn stopped_here(mut here: Here) {
+    drop(here.stop.take());
+    let ended = tokio::time::timeout(BOUND, here.served).await;
+    let served = ended.expect("the server ends in time").expect("its task");
+    served.expect("served without an error");
 }
 
 /// Runs to exit and returns the exit code and stderr; fails the test if the server is
@@ -237,7 +294,7 @@ fn pattern(len: u32) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_keeps_the_blobs_and_the_action_cache() {
     let dirs = Dirs::new("restart");
-    let (server, before) = started(dirs.server()).await;
+    let (server, before, _) = started_here(&dirs).await;
     let mut daemon = before.daemon("node-a", 4, 8).await;
     let job = Job::new("before the restart", &[]);
     before.upload(&job.blobs()).await;
@@ -250,9 +307,9 @@ async fn a_restart_keeps_the_blobs_and_the_action_cache() {
     assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
     assert_eq!(before.cached(&job.action).await, Ok(result.clone()));
     drop((ops, daemon, before));
-    stop(server);
+    stopped_here(server).await;
 
-    let (server, after) = started(dirs.server()).await;
+    let (server, after, _) = started_here(&dirs).await;
     assert_eq!(
         after.cached(&job.action).await,
         Ok(result),
@@ -268,7 +325,7 @@ async fn a_restart_keeps_the_blobs_and_the_action_cache() {
         );
     }
     drop(after);
-    stop(server);
+    stopped_here(server).await;
     dirs.remove();
 }
 
@@ -305,7 +362,7 @@ fn copy_tree(from: &Path, to: &Path) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_copy_of_a_stopped_servers_meta_dir_is_a_backup() {
     let dirs = Dirs::new("backup");
-    let (server, before, line) = started_with_line(dirs.server()).await;
+    let (server, before, line) = started_here(&dirs).await;
     let live_log = log_id(&line);
     let mut daemon = before.daemon("node-a", 4, 8).await;
     let job = Job::new("before the backup", &[]);
@@ -316,13 +373,13 @@ async fn a_copy_of_a_stopped_servers_meta_dir_is_a_backup() {
     assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
     assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
     drop((ops, daemon, before));
-    stop(server);
+    stopped_here(server).await;
 
     let copy = Dirs::new("backup-restored");
     copy_tree(&dirs.raft, &copy.raft);
     copy_tree(&dirs.blobs, &copy.blobs);
     dirs.remove();
-    let (server, after, line) = started_with_line(copy.server()).await;
+    let (server, after, line) = started_here(&copy).await;
     assert_eq!(log_id(&line), live_log, "the copy opened another log");
     assert_eq!(
         after.cached(&job.action).await,
@@ -339,7 +396,7 @@ async fn a_copy_of_a_stopped_servers_meta_dir_is_a_backup() {
         );
     }
     drop(after);
-    stop(server);
+    stopped_here(server).await;
 
     std::fs::remove_file(copy.raft.join("log-record")).expect("drop the record");
     let (code, stderr) = fails(copy.server());
@@ -453,7 +510,7 @@ async fn a_file_cold_store_refuses_what_it_cannot_keep() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hit_whose_output_file_is_lost_is_a_miss_after_a_restart() {
     let dirs = Dirs::new("lost-output");
-    let (server, before) = started(dirs.server()).await;
+    let (server, before, _) = started_here(&dirs).await;
     let mut daemon = before.daemon("node-a", 4, 8).await;
     let job = Job::new("its output file is lost", &[]);
     before.upload(&job.blobs()).await;
@@ -464,17 +521,17 @@ async fn a_hit_whose_output_file_is_lost_is_a_miss_after_a_restart() {
     assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
     assert_eq!(before.cached(&job.action).await, Ok(result));
     drop((ops, daemon, before));
-    stop(server);
+    stopped_here(server).await;
 
     let out = Blob::new("an output whose file is deleted");
     let (path, _) = object_holding(&dirs.blobs, &out.data);
     std::fs::remove_file(path).expect("delete the output's object");
 
-    let (server, after) = started(dirs.server()).await;
+    let (server, after, _) = started_here(&dirs).await;
     assert_eq!(after.cached(&job.action).await, Err(Code::NotFound));
     forgotten(&after, &[&out]).await;
     drop(after);
-    stop(server);
+    stopped_here(server).await;
     dirs.remove();
 }
 

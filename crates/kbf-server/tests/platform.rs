@@ -52,7 +52,8 @@ async fn next(ops: &mut Streaming<Operation>) -> Operation {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_action_runs_on_a_daemon_of_its_platform() {
     let cell = Cell::start().await;
-    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("node-a", 4, 8, ARM))
+    let mut arm = cell
+        .daemon_hello(hello_on("node-a", 4, 8, ARM))
         .await
         .expect("registered");
     let mut linux = cell.daemon("node-b", 4, 8).await;
@@ -147,7 +148,8 @@ async fn a_daemon_that_can_run_it_ends_the_wait() {
         "a joiner not told why"
     );
 
-    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("node-m", 4, 8, ARM))
+    let mut arm = cell
+        .daemon_hello(hello_on("node-m", 4, 8, ARM))
         .await
         .expect("registered");
     let start = arm.start().await;
@@ -173,14 +175,12 @@ async fn the_hello_carries_what_placement_matches() {
     let cell = Cell::start().await;
     let mut no_arch = hello("node-x", 4, 8);
     no_arch.capabilities.retain(|c| c.key != "arch");
-    let refused = FakeDaemon::connect(cell.worker_addr, no_arch)
-        .await
-        .err()
-        .expect("refused");
+    let refused = cell.daemon_hello(no_arch).await.err().expect("refused");
     assert_eq!(refused.code(), Code::InvalidArgument);
     assert!(refused.message().contains("arch"), "{}", refused.message());
 
-    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("node-m", 4, 8, ARM))
+    let mut arm = cell
+        .daemon_hello(hello_on("node-m", 4, 8, ARM))
         .await
         .expect("registered");
     let job = Job::new("pool", &[("os_image", "image-a")]);
@@ -246,7 +246,8 @@ async fn run_on(cell: &Cell, job: &Job, daemon: &mut FakeDaemon, others: &mut [&
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_action_naming_no_os_is_not_leased_to_an_arm_node() {
     let cell = Cell::start_with_default_platform(kbf_front::DefaultPlatform::LINUX_X86_64).await;
-    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("arm-a", 4, 8, ARM))
+    let mut arm = cell
+        .daemon_hello(hello_on("arm-a", 4, 8, ARM))
         .await
         .expect("registered");
     let mut linux = cell.daemon("node-b", 4, 8).await;
@@ -264,7 +265,8 @@ async fn an_action_naming_no_os_is_not_leased_to_an_arm_node() {
 async fn half_a_platform_still_goes_to_the_node_it_names() {
     let cell = Cell::start_with_default_platform(kbf_front::DefaultPlatform::LINUX_X86_64).await;
     let mut linux = cell.daemon("node-a", 4, 8).await;
-    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("node-b", 4, 8, ARM))
+    let mut arm = cell
+        .daemon_hello(hello_on("node-b", 4, 8, ARM))
         .await
         .expect("registered");
 
@@ -278,7 +280,8 @@ async fn half_a_platform_still_goes_to_the_node_it_names() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn default_platform_none_leaves_placement_to_the_first_fit() {
     let cell = Cell::start_with_default_platform(kbf_front::DefaultPlatform::NONE).await;
-    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("arm-a", 4, 8, ARM))
+    let mut arm = cell
+        .daemon_hello(hello_on("arm-a", 4, 8, ARM))
         .await
         .expect("registered");
     let mut linux = cell.daemon("node-b", 4, 8).await;

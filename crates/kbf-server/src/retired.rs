@@ -13,6 +13,10 @@
 //! the admin port (`--handover-*`, `--instance`, `--envoy-*`, `--admin-listen`,
 //! `--await-takeover`): a frontend on a shared Postgres state store has no process to hand
 //! over to, and the flags of a unit written before the removal must still parse.
+//!
+//! And the flags of the worker session (`--heartbeat-interval-ms`, `--vm-host-floor-cpus`,
+//! `--vm-host-floor-mem-gib`, `--pack-commit-sample`): no daemon opens a session or commits a
+//! pack to a server, so nothing reads them ([`RetiredWorkerFlags`]).
 
 use std::path::PathBuf;
 
@@ -161,6 +165,57 @@ impl RetiredHandoverFlags {
     }
 }
 
+/// The flags of the removed worker session: the heartbeat interval daemons were asked for, the
+/// share of a node with VM slots kept for its host, and how many blobs of a daemon's committed
+/// pack were checked. Values are not checked: nothing reads them, and a value that was valid
+/// before must stay accepted.
+#[derive(Clone, Debug, Default, Args)]
+pub struct RetiredWorkerFlags {
+    /// Retired: no longer read, the worker session was removed. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "MILLISECONDS")]
+    pub heartbeat_interval_ms: Option<String>,
+    /// Retired: no longer read, the worker session was removed. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "CPUS")]
+    pub vm_host_floor_cpus: Option<String>,
+    /// Retired: no longer read, the worker session was removed. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "GIB")]
+    pub vm_host_floor_mem_gib: Option<String>,
+    /// Retired: no longer read, a daemon's committed pack is no longer taken. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "BLOBS")]
+    pub pack_commit_sample: Option<String>,
+}
+
+impl RetiredWorkerFlags {
+    /// One line for each retired flag that was given, naming it.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<String> {
+        let given = [
+            (
+                "--heartbeat-interval-ms",
+                self.heartbeat_interval_ms.is_some(),
+            ),
+            ("--vm-host-floor-cpus", self.vm_host_floor_cpus.is_some()),
+            (
+                "--vm-host-floor-mem-gib",
+                self.vm_host_floor_mem_gib.is_some(),
+            ),
+            ("--pack-commit-sample", self.pack_commit_sample.is_some()),
+        ];
+        given
+            .into_iter()
+            .filter(|(_, given)| *given)
+            .map(|(flag, _)| format!("{flag} is no longer read: the worker session was removed"))
+            .collect()
+    }
+
+    /// Logs [`warnings`](Self::warnings), once at start.
+    pub fn warn(&self) {
+        for line in self.warnings() {
+            tracing::warn!("{line}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::{Args as _, Command, FromArgMatches as _, Parser};
@@ -280,5 +335,36 @@ mod tests {
             assert!(arg.is_hide_set(), "{:?}", arg.get_long());
         }
         assert_eq!(command.get_arguments().count(), HANDOVER.len());
+    }
+
+    /// Catches: a worker-session flag deleted outright (an old `kbf.toml` or unit would then
+    /// fail to start), one accepted in silence, and a value that was valid before refused.
+    /// Each flag given is named by exactly one line; none given, no line.
+    #[test]
+    fn each_retired_worker_flag_given_warns_once_naming_it() {
+        let warnings = |argv: &[&str]| {
+            let mut all = vec!["kbf-server"];
+            all.extend_from_slice(argv);
+            Args::try_parse_from(all)
+                .expect("the retired flags still parse")
+                .retired_worker
+                .warnings()
+        };
+        assert!(warnings(&[]).is_empty());
+        let all = warnings(&[
+            "--heartbeat-interval-ms=500",
+            "--vm-host-floor-cpus=4",
+            "--vm-host-floor-mem-gib=16",
+            "--pack-commit-sample=2",
+        ]);
+        let said: Vec<String> = [
+            "--heartbeat-interval-ms",
+            "--vm-host-floor-cpus",
+            "--vm-host-floor-mem-gib",
+            "--pack-commit-sample",
+        ]
+        .map(|flag| format!("{flag} is no longer read: the worker session was removed"))
+        .into();
+        assert_eq!(all, said);
     }
 }

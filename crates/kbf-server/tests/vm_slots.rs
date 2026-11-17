@@ -11,7 +11,7 @@ use kbf_server::HostFloor;
 use kbf_server::worker::capacity;
 use kbf_types::Resources;
 use serde_json::json;
-use support::{Cell, FakeDaemon, hello};
+use support::{Cell, hello};
 
 const GIB: u64 = 1 << 30;
 
@@ -86,27 +86,6 @@ fn the_host_floor_is_subtracted_from_cpus_and_memory() {
     assert_eq!(HostFloor::default(), HostFloor::new(2, 8));
 }
 
-/// Catches: `--vm-host-floor-cpus` and `--vm-host-floor-mem-gib` not reaching the
-/// listeners, a default other than 2 cores and 8 GiB, and a word accepted as a number.
-#[test]
-fn the_host_floor_comes_from_its_flags() {
-    use clap::Parser;
-    let listeners = |args: &[&str]| {
-        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
-            .map(|args| args.listeners().expect("listeners"))
-    };
-    assert_eq!(
-        listeners(&[]).expect("parses").vm_host_floor,
-        HostFloor::new(2, 8)
-    );
-    let set = listeners(&["--vm-host-floor-cpus", "3", "--vm-host-floor-mem-gib=12"])
-        .expect("parses")
-        .vm_host_floor;
-    assert_eq!(set, HostFloor::new(3, 12));
-    assert!(listeners(&["--vm-host-floor-cpus", "two"]).is_err());
-    assert!(listeners(&["--vm-host-floor-mem-gib", "-1"]).is_err());
-}
-
 /// Catches: a server that adds a node's reported capacity to what it already holds when
 /// the same node name registers again (a daemon restarted over its predecessor's stream),
 /// so the node would hold four VM slots and twice the floored CPUs and memory; and a node
@@ -116,10 +95,12 @@ fn the_host_floor_comes_from_its_flags() {
 async fn re_registering_a_node_replaces_its_vm_slots_and_floor() {
     let cell = Cell::start_with_api().await;
     let api = cell.api.expect("an API address");
-    let _first = FakeDaemon::connect(cell.worker_addr, hello_with_slots("mac-1", Some("2")))
+    let _first = cell
+        .daemon_hello(hello_with_slots("mac-1", Some("2")))
         .await
         .expect("registered");
-    let _second = FakeDaemon::connect(cell.worker_addr, hello_with_slots("mac-1", Some("2")))
+    let _second = cell
+        .daemon_hello(hello_with_slots("mac-1", Some("2")))
         .await
         .expect("registered");
     let (code, node) = get(api, "/v1/nodes/mac-1").await;

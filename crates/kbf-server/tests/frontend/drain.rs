@@ -236,8 +236,8 @@ fn is_a_refusal(status: &tonic::Status) -> bool {
 async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_frontend() {
     let pair = Pair::start_with("drain-wait", &HELD).await;
     let (a, b) = (&pair.a, &pair.b);
-    let on_a = Client::connect(a.reapi, a.worker).await;
-    let on_b = Client::connect(b.reapi, b.worker).await;
+    let on_a = a.client().await;
+    let on_b = b.client().await;
     let (first, second, third, hold) = (
         Job::new("taken in the wait", &[]),
         Job::new("refused after the wait", &[]),
@@ -314,7 +314,7 @@ async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_fron
 async fn a_running_execution_finishes_before_the_frontend_exits() {
     let pair = Pair::start_with("drain-finish", &NO_WAIT).await;
     let a = &pair.a;
-    let client = Client::connect(a.reapi, a.worker).await;
+    let client = a.client().await;
     let mut daemon = client.daemon("node-a", 4, 8).await;
     let job = Job::new("finishes while the frontend drains", &[]);
     client.upload(&job.blobs()).await;
@@ -351,7 +351,7 @@ async fn a_running_execution_finishes_before_the_frontend_exits() {
 async fn past_the_deadline_the_streams_stay_open_until_the_execution_ends() {
     let pair = Pair::start_with("drain-deadline", &NO_WAIT).await;
     let a = &pair.a;
-    let client = Client::connect(a.reapi, a.worker).await;
+    let client = a.client().await;
     let mut daemon = client.daemon("node-a", 4, 8).await;
     let job = Job::new("kept past the deadline", &[]);
     client.upload(&job.blobs()).await;
@@ -399,7 +399,7 @@ async fn past_the_deadline_the_streams_stay_open_until_the_execution_ends() {
 async fn a_stop_signal_runs_the_same_sequence() {
     let mut pair = Pair::start_with("drain-signal", &HELD).await;
     let a = &pair.a;
-    let client = Client::connect(a.reapi, a.worker).await;
+    let client = a.client().await;
     let (first, second, third) = (
         Job::new("open before the signal", &[]),
         Job::new("taken in the wait", &[]),
@@ -448,7 +448,7 @@ async fn a_stop_signal_runs_the_same_sequence() {
 async fn every_listener_is_sent_goaway_when_the_wait_ends() {
     let pair = Pair::start_with("drain-goaway", &HELD).await;
     let a = &pair.a;
-    let client = Client::connect(a.reapi, a.worker).await;
+    let client = a.client().await;
     let job = Job::new("holds the drain open", &[]);
     client.upload(&job.blobs()).await;
     let _daemon = client.daemon("node-a", 4, 8).await;

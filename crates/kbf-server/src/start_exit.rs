@@ -1,6 +1,6 @@
 //! How a start that failed exits: "refused" (exit 2) or "not ready" (exit 75).
 //!
-//! The units of `storage`, `storage-and-daemon` and `all-in-one` carry
+//! The unit of a storage node carries
 //! `RestartPreventExitStatus=2`, so a start that can succeed on a later try must not
 //! exit 2: a node whose data directory is still held by the process that is stopping,
 //! or whose registration the frontend answered with a boot the log has used, would stay

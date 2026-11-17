@@ -963,9 +963,6 @@ fn startup_failures_exit_2() {
     let (code, stderr) = fails(c);
     assert_eq!(code, Some(2));
     assert!(stderr.contains("--worker-tls-key"), "{stderr}");
-
-    let (code, _) = fails(server(&["--heartbeat-interval-ms", "0"]));
-    assert_eq!(code, Some(2), "a zero heartbeat interval accepted");
 }
 
 /// Catches: a plain-text listener on an address other machines reach refused (or
@@ -1158,22 +1155,6 @@ fn the_reapi_auth_policy_flag_is_read_at_start() {
         (tonic::Code::Unauthenticated, "closed")
     );
     interrupt(child);
-}
-
-/// Catches (issue #23): a heartbeat interval longer than half the window in which a
-/// daemon may act on a `Start` accepted (each `Start` names the newest heartbeat, so
-/// a Start sent just before the next one would be refused), or the longest one that
-/// fits refused.
-#[test]
-fn the_heartbeat_interval_fits_the_start_window() {
-    use clap::Parser;
-    let parse =
-        |ms: &str| kbf_server::Args::try_parse_from(["kbf-server", "--heartbeat-interval-ms", ms]);
-    let longest = parse("7000").expect("7 s, half of the 14 s window");
-    assert_eq!(longest.heartbeat_interval_ms, 7_000);
-    assert_eq!(kbf_server::config::MAX_HEARTBEAT_INTERVAL_MS, 7_000);
-    let err = parse("7001").expect_err("over half the window accepted");
-    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
 }
 
 /// Catches: `--unservable-wait-secs` parsed but not handed to the scheduler (work no

@@ -18,7 +18,6 @@ use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
 use kbf_tls::{Alpn, TlsError, TlsFiles, TlsSource};
 
 use kbf_auth::{AllowAuthorizer, Authorizer, Policy, PolicyError};
-use kbf_front::SegmentsConfig;
 use kbf_meta::ServerId;
 use kbf_threads::disk::FreeSpace;
 
@@ -27,7 +26,6 @@ use crate::proxy_auth::{ProxySecret, ProxySecretError};
 use crate::serve::{Api, Behind, Listeners, StreamTiming, WorkerTls};
 use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
-use crate::worker::HostFloor;
 
 /// Where the worker listener is when `--worker-listen` is not given, in every mode but
 /// `kbf frontend` (which then has none).
@@ -59,10 +57,6 @@ pub struct Args {
     /// The roles to run.
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
-    /// The node's one cache, when a daemon in this process shares the hot store's disk
-    /// (`kbf all-in-one`, `kbf_storage::local_cache`). No flag sets it.
-    #[arg(skip)]
-    pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
     /// The durable object store, where every blob ends up: `file:///absolute/path` (a
     /// directory, `kbf_objstore::FsStore`: locked while the server runs, a second
     /// server on it is refused; a write that would leave its filesystem with less free
@@ -208,11 +202,11 @@ pub struct Args {
     /// answers those calls itself.
     #[arg(long, value_name = "URL")]
     pub storage: Option<String>,
-    /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,
-    /// `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address;
-    /// off loopback the start line carries a warning. `kbf frontend` binds it only when it is
-    /// given (a frontend with no daemons and no storage nodes serves none); every other mode
-    /// binds 127.0.0.1:8981 when it is not.
+    /// The worker listener: storage nodes' `Membership` calls and a host updater's node calls.
+    /// Without mutual TLS (`--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca`) it
+    /// serves plain text, on any address; off loopback the start line carries a warning.
+    /// `kbf frontend` binds it only when it is given (a frontend with no storage nodes serves
+    /// none); every other mode binds 127.0.0.1:8981 when it is not.
     #[arg(long)]
     pub worker_listen: Option<SocketAddr>,
     /// The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are
@@ -306,15 +300,6 @@ pub struct Args {
         value_parser = clap::value_parser!(u64).range(1..=3600)
     )]
     pub tls_reload_interval_secs: u64,
-    /// The heartbeat interval daemons are asked for, in milliseconds, at most half the
-    /// window in which a daemon may act on a `Start` (each `Start` names the newest
-    /// heartbeat the server took, so a longer interval would leave it too little).
-    #[arg(
-        long,
-        default_value_t = 5_000,
-        value_parser = clap::value_parser!(u64).range(1..=MAX_HEARTBEAT_INTERVAL_MS)
-    )]
-    pub heartbeat_interval_ms: u64,
     /// How long, in seconds, queued work waits while no connected daemon can run it
     /// (none satisfies its platform, or none that does is large enough) before it is
     /// refused FAILED_PRECONDITION. The wait restarts whenever one can.
@@ -377,15 +362,6 @@ pub struct Args {
     /// action's: it runs again with the same booking, as it does without this flag
     #[arg(long)]
     pub no_memory_climb: bool,
-    /// The cores a node that reports VM slots (`vm.slots`) keeps for the host itself:
-    /// subtracted from the CPUs placement may book on it, so that guests cannot take the
-    /// host's own share. A node that reports none books the whole machine.
-    #[arg(long, default_value_t = 2)]
-    pub vm_host_floor_cpus: u64,
-    /// The memory, in GiB, a node that reports VM slots (`vm.slots`) keeps for the host
-    /// itself, subtracted as `--vm-host-floor-cpus` subtracts cores.
-    #[arg(long, default_value_t = 8)]
-    pub vm_host_floor_mem_gib: u64,
     /// What the farm does with `kbf-estimator`, which predicts an action's memory from
     /// what its earlier runs used. `off` calls it never. `shadow` shows it every attempt
     /// that finishes and logs, for every new operation, a `size estimate:` line with what
@@ -743,6 +719,9 @@ pub struct Args {
     /// The retired release poller's and release store's flags: accepted, hidden, ignored.
     #[command(flatten)]
     pub retired_release: crate::retired::RetiredReleaseFlags,
+    /// The retired worker session's flags: accepted, hidden, ignored.
+    #[command(flatten)]
+    pub retired_worker: crate::retired::RetiredWorkerFlags,
     /// Serves the web UI on the operator API (`--api-listen`): read-only pages under `/ui`
     /// (`docs/design/kbf-ui-v1.md`). On by default; `--ui=false` turns it off, and `/ui` is
     /// then a `404`. The UI is open: it asks for no login or certificate, and it shows
@@ -1031,15 +1010,12 @@ impl Args {
             reapi_tls,
             worker: self.worker_listen.unwrap_or(DEFAULT_WORKER_LISTEN),
             worker_tls,
-            heartbeat_interval: Duration::from_millis(self.heartbeat_interval_ms),
-            hello_wait: Duration::from_secs(10),
             tick: Duration::from_secs(1),
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             default_platform: self.default_platform,
             qos_allowed: self.qos_allowed,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             memory_climb: !self.no_memory_climb,
-            vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
             exclusive_actions: self.exclusive_actions,
             placement_load: self.placement_load,
@@ -1058,10 +1034,6 @@ impl Args {
             },
             store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
             invocation_memory: usize::try_from(self.invocation_memory).unwrap_or(usize::MAX),
-            segments: SegmentsConfig {
-                max_bytes: self.segment_upload_max_bytes,
-                idle: Duration::from_secs(self.segment_upload_idle_secs),
-            },
             stream_limits: self.streams.limits(),
         })
     }
@@ -1170,12 +1142,7 @@ impl Args {
             .as_deref()
             .map(ApiToken::from_file)
             .transpose()?;
-        let local_cache = self.local_cache.clone();
-        Ok(Some(Api {
-            listen,
-            token,
-            local_cache,
-        }))
+        Ok(Some(Api { listen, token }))
     }
 
     /// How the cache groups and bounds uploads: `--write-linger`,

@@ -84,8 +84,8 @@ pub fn backoff(base: Duration, failures: u32) -> Duration {
         .min(RETRY_MAX)
 }
 
-/// `wait` less up to half of it: `wait * (1 - unit / 2)` for `unit` in `[0, 1)`, as the
-/// daemon jitters its own reconnect wait (`kbf_daemon::connect`).
+/// `wait` less up to half of it: `wait * (1 - unit / 2)` for `unit` in `[0, 1)`, as a
+/// reconnect wait is jittered.
 #[must_use]
 pub fn jittered(wait: Duration, unit: f64) -> Duration {
     wait.mul_f64(1.0 - unit.clamp(0.0, 1.0) / 2.0)

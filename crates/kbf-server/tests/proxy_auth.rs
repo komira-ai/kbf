@@ -876,7 +876,7 @@ fn a_deny_list_that_cannot_be_read_or_parsed_stops_a_proxied_start_without_the_s
 }
 
 /// Catches the proxy arm of the role table: a proxied call is judged by the role the proxy
-/// forwarded (a daemon may open a session, a storage node may not, a call with no role is
+/// forwarded (a storage node may register, a daemon may not, a call with no role is
 /// UNAUTHENTICATED), under no admission only the path is checked, and a method the listener
 /// does not serve is refused for a proxy as for a certificate.
 ///
@@ -885,8 +885,8 @@ fn a_deny_list_that_cannot_be_read_or_parsed_stops_a_proxied_start_without_the_s
 #[test]
 fn the_role_table_judges_a_proxied_call_by_its_forwarded_role() {
     use kbf_server::worker_roles::admit_presented;
-    let session = "/kbf.worker.v1.Worker/Session";
-    let unserved = "/kbf.worker.v1.Worker/Unknown";
+    let session = "/kbf.map.v1.Membership/Register";
+    let unserved = "/kbf.worker.v1.Worker/Session";
     let by = |role: Option<PeerRole>| {
         Presented::Proxy(Identity {
             node_id: Some("n".to_owned()),
@@ -895,10 +895,10 @@ fn the_role_table_judges_a_proxied_call_by_its_forwarded_role() {
         })
     };
     let certified = |path, role| admit_presented(Admission::Certified, path, &by(role));
-    assert!(certified(session, Some(PeerRole::Daemon)).is_ok());
+    assert!(certified(session, Some(PeerRole::Storage)).is_ok());
     assert_eq!(
-        certified(session, Some(PeerRole::Storage))
-            .expect_err("storage")
+        certified(session, Some(PeerRole::Daemon))
+            .expect_err("daemon")
             .code(),
         Code::PermissionDenied
     );
@@ -907,7 +907,7 @@ fn the_role_table_judges_a_proxied_call_by_its_forwarded_role() {
         Code::Unauthenticated
     );
     assert_eq!(
-        certified(unserved, Some(PeerRole::Daemon))
+        certified(unserved, Some(PeerRole::Storage))
             .expect_err("unserved")
             .code(),
         Code::PermissionDenied

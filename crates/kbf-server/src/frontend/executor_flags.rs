@@ -1,14 +1,17 @@
 //! The flags that choose where placed actions run: `--executor` and its companions.
 //!
-//! `--executor kbf-daemon`, the default, is what a frontend has always done: the farm places
-//! actions on the daemons that dialled it. No executor is built, no job service is dialled and
-//! none of the companions is read. `--executor js-agent` runs each of them as a job of the job
-//! scheduler's job service instead ([`crate::executor`]).
+//! `--executor js-agent` runs each action the farm places as a job of the job scheduler's job
+//! service ([`crate::executor`]); it is the only executor there is. Without `--executor` no
+//! executor is built, no job service is dialled and none of the companions is read: the
+//! frontend serves its cache and CAS alone. `--executor kbf-daemon`, which named the deleted
+//! daemon, is refused at start, and any other value too.
 //!
-//! The companions are the frontend's own. They are not refused with `kbf-daemon`, so a unit or
-//! `kbf.toml` that names the job service keeps its settings when the executor is switched back
-//! (the rollback is the one flag). `--executor-insecure-argv-secrets` too: it is ignored with a
-//! warning, since nothing reads it there, and refusing it would make the rollback a second edit.
+//! The companions are the frontend's own. They are not refused without `--executor`, so a
+//! `kbf.toml` that names the job service starts with or without the executor.
+//! `--executor-insecure-argv-secrets` too: it is ignored with a warning, since nothing reads it
+//! there. The two whose absence of an executor would make them silently do nothing for a
+//! reason of their own, `--executor-secret-delivery files` and `--executor-locate`, are
+//! refused.
 //!
 //! The executor runs on exactly one frontend. There is no flag that says a frontend is one of
 //! several: any frontends that open the same state store are, so the executor itself looks for
@@ -23,7 +26,7 @@
 //!
 //! A job books no disk: the pool books none, and a job writes to its host's scratch with no
 //! quota. `--executor-output-disk-bytes`, the scratch a job once asked for its outputs, is gone
-//! the same way: a frontend started with it, with either executor, fails at start, naming it.
+//! the same way: a frontend started with it fails at start, naming it.
 //!
 //! Every secret is a file: the job service's token (mode 0600 or 0400) and its CA certificate.
 
@@ -41,8 +44,8 @@ use kbf_types::ImageRef;
 
 use crate::Farm;
 use crate::executor::{
-    Config, DEFAULT_MAC_OS_VERSION, Delivery, Deps, Executor, ExecutorKind, Front, FrontParts,
-    MacPool, Metrics, Network, PutDirParts, PutDirRoots, RunSource, TaskOut,
+    Config, DEFAULT_MAC_OS_VERSION, Delivery, Deps, Executor, Front, FrontParts, MacPool, Metrics,
+    Network, PutDirParts, PutDirRoots, RunSource, TaskOut,
 };
 
 const KIND: &str = "executor";
@@ -147,13 +150,10 @@ pub(super) fn args() -> Vec<Arg> {
         Arg::new(KIND)
             .long("executor")
             .value_name("KIND")
-            .value_parser(["kbf-daemon", "js-agent"])
-            .default_value("kbf-daemon")
+            .value_parser(clap::value_parser!(String))
             .help(
-                "Where the farm runs the actions it places. `kbf-daemon`, the default, is the \
-                 daemon of each node, over the worker listener: no executor is built and no \
-                 job service is contacted, whatever the other `--executor-*` flags say. \
-                 `js-agent` runs each as a job of the job scheduler's job service, in the kbf \
+                "Where the farm runs the actions it places: `js-agent`, the only value, runs \
+                 each as a job of the job scheduler's job service, in the kbf \
                  image (`--executor-kbf-image`, built from `--executor-base-image`), whose \
                  task tool runs the action inside it; it needs the job service's flags \
                  (`--executor-job-url`, `--executor-job-token-file`, and \
@@ -166,10 +166,10 @@ pub(super) fn args() -> Vec<Arg> {
                  `--executor-host-memory-gib`) has defaults. The executor runs \
                  on exactly one frontend: a second frontend that has jobs on the same job \
                  service stops. A restart of the frontend fails the builds in flight. \
-                 Switching back to `kbf-daemon` cancels the jobs when the frontend is stopped, \
-                 not when it is killed: a killed frontend's jobs run to their wall limit, \
-                 unless a later `js-agent` start cancels them. \
-                 `--executor-insecure-argv-secrets` is ignored with `kbf-daemon`",
+                 A frontend stopped cancels its jobs; a killed frontend's jobs run \
+                 to their wall limit, unless a later `js-agent` start cancels them. Left out, \
+                 no executor is built and no job service is contacted, whatever the other \
+                 `--executor-*` flags say; `--executor-insecure-argv-secrets` is then ignored",
             ),
         text(
             FRONTEND,
@@ -288,7 +288,7 @@ pub(super) fn args() -> Vec<Arg> {
              The answer names no store and no grant (tierstore v0.3.29 removed the store read \
              grants), so the task still reads every input through the listener, as without the \
              flag; every byte is checked against its digest. Off by default. Used only with \
-             `--executor js-agent`, and refused with `--executor kbf-daemon`",
+             `--executor js-agent`, and refused without it",
         ),
         switch(
             INSECURE,
@@ -310,7 +310,7 @@ pub(super) fn args() -> Vec<Arg> {
                  which its host writes read-only at `/run/js-files`: no argument holds a \
                  secret, and `--executor-insecure-argv-secrets` is refused with it; a host whose \
                  agent cannot write files refuses to start the job, and the farm runs the \
-                 action again. `files` is refused with `--executor kbf-daemon`, which builds no \
+                 action again. `files` is refused without `--executor js-agent`, which builds the \
                  command line",
             ),
         text(
@@ -350,8 +350,8 @@ pub(super) fn args() -> Vec<Arg> {
                  credentials must be allowed to write there, and records the tree as \
                  `job-tree/<digest>` in `--state-store` if there is one. A bundle that cannot be \
                  had, is not listed or not the listed bytes, or a write that fails, fails the \
-                 start, naming this flag. Needed with `--executor js-agent`; with \
-                 `--executor kbf-daemon` nothing is read, fetched or written",
+                 start, naming this flag. Needed with `--executor js-agent`; without it \
+                 nothing is read, fetched or written",
             ),
         text(
             BASE_TREE_URL,
@@ -557,57 +557,60 @@ pub struct JsAgentFlags {
     pub put_retry: Duration,
 }
 
-/// What `--executor` says: the daemons, or jobs of a job service.
-#[derive(Clone, Debug)]
+/// What `--executor` says: jobs of a job service, or no executor.
+#[derive(Clone, Debug, Default)]
 pub struct ExecutorFlags {
-    /// Which executor.
-    pub kind: ExecutorKind,
-    /// The settings of `js-agent`; `None` for `kbf-daemon`.
+    /// The settings of `js-agent`; `None` when `--executor` is left out.
     pub js: Option<JsAgentFlags>,
-}
-
-impl Default for ExecutorFlags {
-    fn default() -> Self {
-        Self {
-            kind: ExecutorKind::KbfDaemon,
-            js: None,
-        }
-    }
 }
 
 /// The setting the flags in `m` make.
 ///
 /// # Errors
-/// For `js-agent`, a flag it
-/// needs that is missing, a setting that breaks a rule ([`Config::validate`]), a job service
-/// URL that is not one or does not agree with the CA flag, or a base or kbf image that is not
-/// pinned by digest or is the same image twice.
+/// An `--executor` other than `js-agent` (`kbf-daemon` is named as deleted). For `js-agent`, a
+/// flag it needs that is missing, a setting that breaks a rule ([`Config::validate`]), a job
+/// service URL that is not one or does not agree with the CA flag, or a base or kbf image that
+/// is not pinned by digest or is the same image twice.
 pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
-    let js_agent = m.get_one::<String>(KIND).is_some_and(|k| k == "js-agent");
-    if !js_agent {
-        // Every setting of the executor may stay in the unit or `kbf.toml` after the rollback,
-        // this one too: nothing reads it here, and refusing it would make the rollback a second
-        // edit, in an incident.
-        if m.get_flag(INSECURE) {
-            tracing::warn!(
-                "--executor-insecure-argv-secrets is ignored: it is for --executor js-agent, and this frontend runs placed actions on daemons"
-            );
-        }
-        if delivery(m) == Delivery::Files {
+    match m.get_one::<String>(KIND).map(String::as_str) {
+        Some("js-agent") => {}
+        Some("kbf-daemon") => {
             return Err(
-                "--executor-secret-delivery files is for --executor js-agent: daemons build no \
-                 task command line, so with --executor kbf-daemon it would do nothing"
+                "--executor kbf-daemon is gone: kbf-daemon was deleted, and placed actions run \
+                 as jobs of the job service, with --executor js-agent"
                     .to_owned(),
             );
         }
-        if m.get_flag(LOCATE) {
-            return Err(
-                "--executor-locate is for --executor js-agent: daemons build no task command \
-                 line, so with --executor kbf-daemon it would do nothing"
-                    .to_owned(),
-            );
+        Some(other) => {
+            return Err(format!(
+                "--executor {other}: the only executor is js-agent, which runs placed actions \
+                 as jobs of the job service"
+            ));
         }
-        return Ok(ExecutorFlags::default());
+        None => {
+            // Every setting of the executor may stay in `kbf.toml` without it, this one too:
+            // nothing reads it here.
+            if m.get_flag(INSECURE) {
+                tracing::warn!(
+                    "--executor-insecure-argv-secrets is ignored: it is for --executor js-agent, and this frontend has no executor"
+                );
+            }
+            if delivery(m) == Delivery::Files {
+                return Err(
+                    "--executor-secret-delivery files is for --executor js-agent: without an \
+                     executor no task command line is built, so it would do nothing"
+                        .to_owned(),
+                );
+            }
+            if m.get_flag(LOCATE) {
+                return Err(
+                    "--executor-locate is for --executor js-agent: without an executor no task \
+                     command line is built, so it would do nothing"
+                        .to_owned(),
+                );
+            }
+            return Ok(ExecutorFlags::default());
+        }
     }
     let missing: Vec<&str> = REQUIRED
         .iter()
@@ -646,10 +649,7 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
         ),
         network => tracing::info!(?network, "--executor-network: the network of every job"),
     }
-    Ok(ExecutorFlags {
-        kind: ExecutorKind::JsAgent,
-        js: Some(js),
-    })
+    Ok(ExecutorFlags { js: Some(js) })
 }
 
 fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {

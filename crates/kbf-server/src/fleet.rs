@@ -380,7 +380,7 @@ pub struct SoftwareView {
     pub os_build: String,
     /// The kernel release (Linux).
     pub kernel: String,
-    /// The `kbf-daemon` version.
+    /// The daemon version a session reported.
     pub daemon_version: String,
     /// The Xcode builds actions can use on it (Mac).
     pub xcode_builds: Vec<String>,

@@ -1,4 +1,4 @@
-//! The edit of `kbf.toml` that `job-service apply` makes, and the restore of `back-out`.
+//! The edit of `kbf.toml` that `job-service apply` makes.
 //!
 //! The edit is made on the text, line by line, so that every comment, every other table and
 //! the order of the other keys stay as they were: each line of the `[executor]` table that
@@ -11,9 +11,8 @@
 //! The original is kept byte for byte beside the file as `<file>.pre-job-service`, with the
 //! file's mode and owner, and the new text is staged as `<file>.job-service-new`, also with
 //! them, so that `kbf --check` can read it before it is put in place by a rename. Both are
-//! made with `create_new`: a backup that is there already (from a switch that was not backed
-//! out) is refused and left alone. `back-out` stages the backup's bytes, mode and owner and
-//! renames them over the file, and removes the backup only once its restart is done.
+//! made with `create_new`: a backup that is there already (from an earlier switch) is
+//! refused and left alone.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -209,8 +208,8 @@ pub(crate) fn require_no_backup(file: &Path) -> Result<(), CutoverError> {
         let path = beside(file, suffix);
         if fs::symlink_metadata(&path).is_ok() {
             return Err(CutoverError::Refused(format!(
-                "{} is there already: a switch was made and not backed out, or one stopped \
-                 half way; back it out (job-service back-out) or move the file away by hand",
+                "{} is there already: a switch was made, or one stopped half way; move \
+                 the file away by hand",
                 path.display()
             )));
         }
@@ -243,8 +242,8 @@ impl Staged {
         Ok(staged)
     }
 
-    /// Rename the staged file over the file. The backup stays: it is the back-out, and once
-    /// the rename is made it is kept whatever follows.
+    /// Rename the staged file over the file. The backup stays: once the rename is made it is
+    /// kept whatever follows.
     pub(crate) fn put_in_place(mut self) -> Result<(), CutoverError> {
         rename(&self.staged, &self.file)?;
         self.made.clear();
@@ -258,51 +257,6 @@ impl Drop for Staged {
             let _ = fs::remove_file(path);
         }
     }
-}
-
-/// The backup of `file`, as text, or a refusal when there is none.
-pub(crate) fn read_backup(file: &Path) -> Result<(PathBuf, String), CutoverError> {
-    let backup = beside(file, BACKUP_SUFFIX);
-    match fs::symlink_metadata(&backup) {
-        Ok(meta) if meta.is_file() => {}
-        _ => {
-            return Err(CutoverError::Refused(format!(
-                "{} is not there (or is not a regular file): there is no switch to back out",
-                backup.display()
-            )));
-        }
-    }
-    let text = fs::read_to_string(&backup)
-        .map_err(|e| CutoverError::Refused(format!("{}: {e}", backup.display())))?;
-    Ok((backup, text))
-}
-
-/// Put the backup of `file` back over it: its bytes, mode and owner are staged beside the
-/// file and renamed over it. The backup stays until [`forget`] removes it, so a back-out
-/// whose restart fails can be run again.
-pub(crate) fn restore(file: &Path, backup: &Path) -> Result<(), CutoverError> {
-    let failed = |what: &Path, e: std::io::Error| {
-        CutoverError::Failed(format!("cannot read or write {}: {e}", what.display()))
-    };
-    let staged = beside(file, STAGED_SUFFIX);
-    let bytes = fs::read(backup).map_err(|e| failed(backup, e))?;
-    let meta = fs::metadata(backup).map_err(|e| failed(backup, e))?;
-    create(&staged, &bytes, meta.mode(), meta.uid(), meta.gid()).map_err(|e| failed(&staged, e))?;
-    if let Err(e) = rename(&staged, file) {
-        let _ = fs::remove_file(&staged);
-        return Err(e);
-    }
-    sync_dir(file)
-}
-
-/// Remove the backup once the back-out is done.
-pub(crate) fn forget(backup: &Path) -> Result<(), CutoverError> {
-    fs::remove_file(backup).map_err(|e| {
-        CutoverError::Failed(format!(
-            "the back-out is done, but {} could not be removed: {e}",
-            backup.display()
-        ))
-    })
 }
 
 #[cfg(test)]

@@ -1,18 +1,9 @@
-//! The storage half of `kbf storage-and-daemon` (`docs/design/architecture-v2.md`,
-//! sections 1 and 10): the storage node `kbf storage` runs, on the same flags
-//! ([`StorageFlags`]), with the storage it serves also handed to the caller in-process
-//! ([`StorageHalf::storage`]), and the service that serves it callable in-process
-//! ([`StorageHalf::in_process`]), so the daemon half of the same process reads and writes
-//! it through calls, with no socket between.
+//! A storage node with its storage also handed to the caller ([`StorageHalf::storage`]): the
+//! storage node `kbf storage` runs, on the same flags ([`StorageFlags`]).
 //!
 //! [`start`] opens the stores and binds the listener as
-//! [`crate::storage_node::start_storage`] does, with two differences:
-//! - **One cache.** When `flags.server.local_cache` is set (the daemon half's input
-//!   cache shares the hot store's disk), the write tier keeps no flushed copies and its
-//!   bytes are counted in that one cache's budget, as `kbf all-in-one`'s server half
-//!   does (`kbf_storage::local_cache`).
-//! - **The handle.** The [`Storage`] the listener serves, and the service over it
-//!   ([`kbf_storage::service::InProcess`]), are kept, for the daemon half.
+//! [`crate::storage_node::start_storage`] does, and keeps the [`Storage`] the listener
+//! serves.
 //!
 //! - **The map and the chain.** With `--frontend` the half binds its listener, registers
 //!   (retrying until the frontend answers), opens its cache as the registration's member
@@ -22,10 +13,7 @@
 //!   by that map, serving nothing until the first arrives (UNAVAILABLE `no storage map
 //!   yet`); under mutual TLS it is a link of the chain that copies a write to the blob's
 //!   second owner, with the repair worker that makes a copy owed
-//!   ([`StorageHalf::repairs`]); all as [`crate::replication`] says. The check is the
-//!   service's own, made on every call, so the daemon half, which calls the service
-//!   in-process ([`StorageHalf::in_process`]), is judged by the same map and its writes
-//!   are copied by the same chain as a call over the listener.
+//!   ([`StorageHalf::repairs`]); all as [`crate::replication`] says.
 //!
 //! The rest (the listener's checks, the stores, the metadata log, the flusher and the
 //! start-up pass over a `file://` cold store) is `kbf storage`'s, step for step.
@@ -46,7 +34,6 @@ use kbf_objstore::FsStore;
 use kbf_storage::Storage;
 use kbf_storage::legacy::{CountedStorage, LegacyReads};
 use kbf_storage::repair::Repairs;
-use kbf_storage::service::InProcess;
 use kbf_threads::disk::Statvfs;
 
 use crate::cold_apply::{ColdPick, Fixed, RegisteredOnly, Registrable, explain_prefix};
@@ -57,7 +44,7 @@ use crate::ram_drain::RamDrain;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, bind_node};
 use crate::serve::{ServeError, StorageListener};
-use crate::start::{AbortOnDrop, open_cold_file, share_storage, tier_bytes};
+use crate::start::{AbortOnDrop, open_cold_file};
 use crate::startup_pass::StartPass;
 use crate::storage_node::{Holder, holder_of};
 use crate::storage_node::{StorageFlags, open_cache};
@@ -73,7 +60,6 @@ pub struct StorageHalf {
     /// Where it serves `/metrics`, when `--metrics-listen` is given.
     pub metrics: Option<SocketAddr>,
     storage: Arc<dyn Storage>,
-    in_process: InProcess,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     maps: Arc<MapHolder>,
@@ -109,23 +95,12 @@ impl StorageHalf {
         self.repairs.clone()
     }
 
-    /// The storage the listener serves, itself, with none of the service's checks: for a
-    /// daemon half that is not part of a farm ([`kbf_storage::service::InProcess`] is the
-    /// view that is). A blob or an action entry read through it and found is counted on the
-    /// `in_process` rows of `kbf_storage_legacy_read_total` ([`CountedStorage`]); everything
+    /// The storage the listener serves, itself, with none of the service's checks. A blob
+    /// or an action entry read through it and found is counted on the `in_process` rows of `kbf_storage_legacy_read_total` ([`CountedStorage`]); everything
     /// else is the node's storage as it is.
     #[must_use]
     pub fn storage(&self) -> Arc<dyn Storage> {
         Arc::clone(&self.storage)
-    }
-
-    /// The storage service the listener serves, called in-process: what the daemon half
-    /// reaches the node that is its own member through, so that a write it makes takes the
-    /// path a call over the listener takes (the generation check, the chain's forward to
-    /// the replica).
-    #[must_use]
-    pub fn in_process(&self) -> InProcess {
-        self.in_process.clone()
     }
 
     /// The line the node prints once it is bound, as `kbf storage` prints it:
@@ -239,10 +214,9 @@ where
     let cold_metrics = Arc::new(StoreMetrics::cold());
     let cold = CountedPick(cold, Arc::clone(&cold_metrics));
     let (cache, registered) = open_cache(flags, socket, (meta, cold, prefix, log)).await?;
-    // The reads this node serves from its own copy: the service counts the calls it serves
-    // and the daemon half's calls through `in_process()`, `StorageHalf::storage` counts the
-    // daemon half's reads of a node without a frontend, and the scrape of the cache renders
-    // them all.
+    // The reads this node serves from its own copy: the service counts the calls it serves,
+    // `StorageHalf::storage` counts the reads made through it, and the scrape of the cache
+    // renders them all.
     let legacy_reads = Arc::new(LegacyReads::default());
     let cache = cache
         .with_legacy_reads(Arc::clone(&legacy_reads))
@@ -251,21 +225,12 @@ where
         .with_write_pool(args.write_pool_config())
         .with_durable_wait(args.durable_wait())
         .with_ram_ack_bytes(args.ram_ack_bytes());
-    let local = args.local_cache.as_ref();
     let hot = stores.hot.as_ref();
-    let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
+    let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
-    // With the one cache, its fill is on the scrape too.
     let (metrics, _metrics) = metrics
-        .map(|m| {
-            m.serve(
-                Arc::clone(&cache),
-                args.local_cache.clone(),
-                listener.tls.clone(),
-            )
-        })
+        .map(|m| m.serve(Arc::clone(&cache), listener.tls.clone()))
         .unzip();
-    share_storage(local, tier_bytes(Arc::downgrade(&cache)));
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
@@ -303,7 +268,6 @@ where
         addr,
         metrics,
         storage,
-        in_process: node.in_process,
         start_line: format!("kbf-storage {SERVER_VERSION} storage={addr} log={log}"),
         serving: Box::pin(ram.after(node.serving)),
         maps: node.maps,

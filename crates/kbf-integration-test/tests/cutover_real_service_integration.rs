@@ -149,7 +149,7 @@ struct Rig {
 fn ready_config(base_tree: &std::path::Path) -> String {
     format!(
         "[scheduler]\nstate-store = \"postgres:///kbf\"\n\n[executor]\n\
-         executor = \"kbf-daemon\"\nexecutor-frontend-id = \"{FRONTEND}\"\n\
+         executor-frontend-id = \"{FRONTEND}\"\n\
          executor-base-image = \"registry.example/base@sha256:{base}\"\n\
          executor-kbf-image = \"docker://{kbf}\"\n\
          executor-base-tree = \"{base_tree}\"\n\

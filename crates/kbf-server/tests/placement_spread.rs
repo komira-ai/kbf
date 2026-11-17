@@ -172,7 +172,8 @@ async fn a_node_with_less_memory_free_gets_fewer_leases() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_platform_is_matched_before_the_spread() {
     let cell = Cell::start().await;
-    let mut arm = FakeDaemon::connect(cell.worker_addr, hello_on("node-a", 4, 8, ARM))
+    let mut arm = cell
+        .daemon_hello(hello_on("node-a", 4, 8, ARM))
         .await
         .expect("registered");
     let mut linux_b = cell.daemon("node-b", 4, 8).await;

@@ -75,9 +75,7 @@ async fn running_on_a(
 /// Connects `node-a` again as `hello`, and sends its first heartbeat, which lists
 /// nothing.
 async fn come_back(cell: &Client, hello: Hello) -> FakeDaemon {
-    let mut a = FakeDaemon::connect(cell.worker_addr, hello)
-        .await
-        .expect("registered");
+    let mut a = cell.daemon_hello(hello).await.expect("registered");
     assert!(a.heartbeat(&[]).await);
     a
 }
@@ -285,7 +283,8 @@ fn mac(instance: &str, predecessor: &str, phase: Phase, lease: Option<LeaseId>) 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_whole_machine_restart_mid_action_runs_the_action_again() {
     let cell = Cell::start().await;
-    let mut before = FakeDaemon::connect(cell.worker_addr, mac("one", "", Phase::Serving, None))
+    let mut before = cell
+        .daemon_hello(mac("one", "", Phase::Serving, None))
         .await
         .expect("registered");
     let job = Job::new("a GPU test cut short", WHOLE);
@@ -304,9 +303,7 @@ async fn a_whole_machine_restart_mid_action_runs_the_action_again() {
     tokio::time::sleep(CLOSING).await;
 
     let restoring = mac("two", "one", Phase::Restoring, Some(lease));
-    let mut after = FakeDaemon::connect(cell.worker_addr, restoring)
-        .await
-        .expect("registered");
+    let mut after = cell.daemon_hello(restoring).await.expect("registered");
     let again = after.start().await;
     assert_eq!(
         again.lease_id,

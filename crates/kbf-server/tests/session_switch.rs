@@ -8,7 +8,7 @@
 mod support;
 
 use kbf_proto::worker::{Hello, LeaseId, NodePhase, Phase, daemon_message};
-use support::{Cell, FakeDaemon, Job, done, hello_on, output, ran};
+use support::{Cell, Job, done, hello_on, output, ran};
 
 const MAC: &[(&str, &str)] = &[
     ("arch", "arm64"),
@@ -57,7 +57,8 @@ fn switching(phase: Phase, lease: LeaseId) -> Option<NodePhase> {
 async fn a_daemon_back_from_the_session_switch_is_sent_its_start_again() {
     log();
     let cell = Cell::start().await;
-    let mut before = FakeDaemon::connect(cell.worker_addr, mac("before", None))
+    let mut before = cell
+        .daemon_hello(mac("before", None))
         .await
         .expect("registered");
     let job = Job::new("a GPU test", WHOLE);
@@ -74,9 +75,7 @@ async fn a_daemon_back_from_the_session_switch_is_sent_its_start_again() {
     before.close();
 
     let preparing = mac("after the restart", switching(Phase::Preparing, lease));
-    let mut after = FakeDaemon::connect(cell.worker_addr, preparing)
-        .await
-        .expect("registered");
+    let mut after = cell.daemon_hello(preparing).await.expect("registered");
     let again = after.start().await;
     assert_eq!(again.lease_id, Some(lease), "granted again, not resent");
     assert_eq!(again.kind, "whole_machine");
@@ -99,7 +98,8 @@ async fn a_daemon_back_from_the_session_switch_is_sent_its_start_again() {
 async fn a_switching_lease_not_held_here_is_cancelled() {
     log();
     let cell = Cell::start().await;
-    let mut daemon = FakeDaemon::connect(cell.worker_addr, mac("one", None))
+    let mut daemon = cell
+        .daemon_hello(mac("one", None))
         .await
         .expect("registered");
     let job = Job::new("a finished test", WHOLE);
@@ -133,7 +133,8 @@ async fn a_quarantined_node_is_offered_nothing_until_it_serves_again() {
     let job = Job::new("waits for the Mac", WHOLE);
     cell.upload(&job.blobs()).await;
     let mut ops = cell.execute(&job.action).await;
-    let mut daemon = FakeDaemon::connect(cell.worker_addr, mac("one", quarantined))
+    let mut daemon = cell
+        .daemon_hello(mac("one", quarantined))
         .await
         .expect("registered");
     daemon.no_work().await;
@@ -165,7 +166,8 @@ async fn a_node_under_memory_pressure_is_offered_nothing_until_it_serves_again()
     let job = Job::new("waits out the pressure", WHOLE);
     cell.upload(&job.blobs()).await;
     let mut ops = cell.execute(&job.action).await;
-    let mut daemon = FakeDaemon::connect(cell.worker_addr, mac("one", pressured))
+    let mut daemon = cell
+        .daemon_hello(mac("one", pressured))
         .await
         .expect("registered");
     daemon.no_work().await;
@@ -191,7 +193,8 @@ async fn a_switching_phase_without_its_lease_is_refused() {
         lease_id: None,
         reason: String::new(),
     });
-    let refused = FakeDaemon::connect(cell.worker_addr, mac("one", nameless))
+    let refused = cell
+        .daemon_hello(mac("one", nameless))
         .await
         .err()
         .expect("refused");
@@ -209,7 +212,8 @@ async fn an_unknown_phase_is_offered_nothing() {
         phase: 99,
         ..NodePhase::default()
     });
-    let mut daemon = FakeDaemon::connect(cell.worker_addr, mac("one", unknown))
+    let mut daemon = cell
+        .daemon_hello(mac("one", unknown))
         .await
         .expect("registered");
     let job = Job::new("waits", WHOLE);
@@ -228,7 +232,8 @@ async fn a_tainted_phase_is_offered_nothing() {
         reason: "a container could not be removed".to_owned(),
         ..NodePhase::default()
     });
-    let mut daemon = FakeDaemon::connect(cell.worker_addr, mac("one", tainted))
+    let mut daemon = cell
+        .daemon_hello(mac("one", tainted))
         .await
         .expect("registered");
     let job = Job::new("waits", WHOLE);
@@ -245,7 +250,8 @@ async fn a_tainted_phase_is_offered_nothing() {
 async fn a_draining_node_is_offered_nothing_and_keeps_its_running_lease() {
     log();
     let cell = Cell::start().await;
-    let mut daemon = FakeDaemon::connect(cell.worker_addr, mac("one", None))
+    let mut daemon = cell
+        .daemon_hello(mac("one", None))
         .await
         .expect("registered");
     let first = Job::new("runs through the drain", PLAIN);

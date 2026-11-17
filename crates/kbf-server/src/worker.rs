@@ -1,76 +1,21 @@
-//! The server side of `kbf.worker.v1`: one `Session` stream per daemon.
+//! What a node report says, and the `kbf.worker.v1` versions this build speaks.
 //!
-//! Under mutual TLS a stream without a usable client certificate is refused before its
-//! first message is read. The first message must be `Hello`. It is checked (protocol
-//! version, node id, that the certificate names that node and neither is denied: see
-//! [`identity`](crate::identity) and issue #79; the capacity entries of the node report,
-//! and the entries placement matches platforms against: `arch` and the rest that
-//! [`caps`] reads), answered with `Welcome`, and registers the node: only this first
-//! `Hello` does (issue #25). `Welcome` names the farm's lease epoch
-//! ([`Farm::lease_epoch`]: this process's term, or the Raft log's id; issue #137).
-//! The registration names the daemon process by the `Hello`'s `instance_id`: leases
-//! whose `Start` went to another process are given up only once it has fenced (issue
-//! #140), or at once if the `Hello` names that process as its predecessor and the
-//! stream it came from has closed (`predecessor_instance_id`; issue #22). On the
-//! stream after that:
-//! - a resent `Hello` whose `node_id` is not the stream's node, or that the deny list
-//!   now refuses, ends the stream with that error; otherwise it changes the node's
-//!   capacity and capabilities and nothing else;
-//! - a `Heartbeat` the deny list now refuses ends the stream. Otherwise it is fed to
-//!   the scheduler and acknowledged, unless a newer stream of
-//!   the same node has registered since: then it is dropped unacknowledged, so a
-//!   daemon still talking on the old stream fences on time. Over a state store it is
-//!   fed but not acknowledged either when this frontend no longer owns the node (the daemon
-//!   said `Hello` to another) or has not written the node's session row lately
-//!   ([`crate::farm::ACK_WINDOW`]). A lease it lists that the
-//!   scheduler no longer holds on the node is sent a `Cancel` (issue #23). A lease it
-//!   leaves out that was lost to a restart past its farm reruns answers the
-//!   operation's callers. The pack-read counts it carries, if any, are kept as the node's
-//!   newest for `/metrics` ([`Farm::note_pack_reads`]), and so are its pack-write counts
-//!   ([`Farm::note_pack_writes`]) and its input cache counts ([`Farm::note_input_cache`]);
-//! - a `Result` the deny list now refuses ends the stream, so it never reaches the
-//!   action cache. Otherwise it is accepted only from the node holding the
-//!   operation's current lease, and only if the action it names (if any) is the one
-//!   that lease runs, and answered with a `ResultAck`. It is settled on a task of its
-//!   own: its writes to the object store may be slow, and the messages behind it
-//!   (heartbeats above all) are handled meanwhile;
-//! - a `NodeStatus` the deny list now refuses ends the stream, so it never reaches
-//!   the operator API. Otherwise it is kept as the node's newest software status,
-//!   unless a newer stream of the node has registered since;
-//! - after the server ends a stream, nothing more is read from it;
-//! - a `MapRequest` is answered with a `MapUpdate` of the storage map the server holds
-//!   now, when it holds one (the `map_push` module);
-//! - an `UpdateStatus` the deny list now refuses ends the stream. Otherwise it is kept
-//!   as the node's newest update status, unless a newer stream of the node has
-//!   registered since ([`Farm::update_status`]); the update session reads it
-//!   ([`crate::update_status`]);
-//! - an `Offer` from a daemon is not read: offers go the other way.
+//! The farm registers a node with what [`reported`] reads from its `Hello`: the capacity
+//! placement books ([`capacity`]), the entries it matches platforms against ([`caps`]: `arch`
+//! and the rest that `NodeCaps::from_report` reads) and the node's phase ([`phase`]). The
+//! executor's virtual workers register through it ([`crate::executor`]); no node opens a
+//! session to a server any more.
 //!
-//! A server given a [`MapSource`] ([`WorkerService::with_map`]) names its map in
-//! `Welcome`, and sends a `MapUpdate` each time the source's map changes. A server that serves
-//! `PackIndex/CommitPack` ([`WorkerService::with_pack_commit`]) says so in
-//! `Welcome.pack_commit`; a daemon that writes packs commits them only to one that does.
+//! [`PROTOCOL_VERSION`] and [`OLDEST_PROTOCOL_VERSION`] are the versions this build speaks and
+//! the oldest it accepts: `kbf --version --json` reports them, the registration of a storage
+//! node names them, and `GET /v1/nodes` lists the version each node speaks.
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
-
-use futures::{Stream, stream};
 use kbf_caps::NodeCaps;
-use kbf_mapsync::MapSource;
-use kbf_proto::worker::{
-    Capability, DaemonMessage, HeartbeatAck, Hello, Phase, ServerMessage, Welcome, daemon_message,
-    server_message, worker_server::Worker,
-};
-use kbf_sched::{DaemonInstance, NodePhase};
-use kbf_types::{LeaseId, Resources, WorkerId};
-use tokio::sync::mpsc;
-use tokio::time::timeout;
-use tonic::{Request, Response, Status, Streaming};
+use kbf_proto::worker::{Capability, Hello, Phase};
+use kbf_sched::NodePhase;
+use kbf_types::{LeaseId, Resources};
 
-use crate::farm::{Farm, Outbound, Reported, StreamId};
-use crate::identity::{PeerCert, Peers, presented};
-use crate::map_push::MapFeed;
+use crate::farm::Reported;
 
 /// The `kbf.worker.v1` version this server speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -87,329 +32,6 @@ pub const OLDEST_PROTOCOL_VERSION: u32 = 1;
 #[must_use]
 pub const fn named_protocol(wire: u32) -> Option<u32> {
     if wire == 0 { None } else { Some(wire) }
-}
-
-/// The `Worker` service over a [`Farm`].
-#[derive(Debug)]
-pub struct WorkerService {
-    farm: Arc<Farm>,
-    peers: Peers,
-    heartbeat_interval: Duration,
-    hello_wait: Duration,
-    /// What a node that reports VM slots keeps for itself ([`capacity`]).
-    host_floor: HostFloor,
-    map: MapFeed,
-    /// The oldest and the newest `Hello` version a session accepts.
-    protocols: (u32, u32),
-    /// Whether `Welcome` says this frontend takes `PackIndex/CommitPack` (`Welcome.pack_commit`).
-    pack_commit: bool,
-    /// What `Welcome.placement_load` carries (`--placement-load`).
-    placement_load: Option<bool>,
-}
-
-impl WorkerService {
-    /// The service over `farm`, knowing its daemons as `peers`. `Welcome` asks daemons
-    /// for a heartbeat every `heartbeat_interval`; a stream that sends no `Hello` within
-    /// `hello_wait` is ended DEADLINE_EXCEEDED.
-    pub const fn new(
-        farm: Arc<Farm>,
-        peers: Peers,
-        heartbeat_interval: Duration,
-        hello_wait: Duration,
-    ) -> Self {
-        Self {
-            farm,
-            peers,
-            heartbeat_interval,
-            hello_wait,
-            host_floor: HostFloor::DEFAULT,
-            map: MapFeed::NONE,
-            protocols: (OLDEST_PROTOCOL_VERSION, PROTOCOL_VERSION),
-            pack_commit: false,
-            placement_load: None,
-        }
-    }
-
-    /// The service accepting `Hello` versions from `oldest` and answering a newer one
-    /// with `newest`. Only a test of the negotiation needs a range other than this
-    /// build's: both are 1 today.
-    #[doc(hidden)]
-    #[must_use]
-    pub const fn with_protocols(mut self, oldest: u32, newest: u32) -> Self {
-        self.protocols = (oldest, newest);
-        self
-    }
-
-    /// The service keeping `floor` of the CPUs and memory of each node that reports VM
-    /// slots for the node itself ([`capacity`]).
-    #[must_use]
-    pub const fn with_host_floor(mut self, floor: HostFloor) -> Self {
-        self.host_floor = floor;
-        self
-    }
-
-    /// The service telling each daemon, in `Welcome.pack_commit`, whether this frontend takes
-    /// `kbf.worker.v1.PackIndex/CommitPack` (`on`): a daemon that writes packs commits them only
-    /// to a frontend that says so. Off for a service built without it.
-    #[must_use]
-    pub const fn with_pack_commit(mut self, on: bool) -> Self {
-        self.pack_commit = on;
-        self
-    }
-
-    /// The service telling each daemon, in `Welcome.placement_load`, the mode of
-    /// `--placement-load`. `off` (the default) leaves the field out.
-    #[must_use]
-    pub const fn with_placement_load(mut self, mode: crate::PlacementLoad) -> Self {
-        self.placement_load = mode.welcome();
-        self
-    }
-
-    /// The service sending the storage map `map` holds to each daemon: in `Welcome`, and
-    /// in a `MapUpdate` each time it changes.
-    #[must_use]
-    pub fn with_map(mut self, map: Arc<dyn MapSource>) -> Self {
-        self.map = MapFeed::new(map);
-        self
-    }
-}
-
-/// The server's half of a session.
-pub type SessionStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send>>;
-
-#[tonic::async_trait]
-impl Worker for WorkerService {
-    type SessionStream = SessionStream;
-
-    async fn session(
-        &self,
-        request: Request<Streaming<DaemonMessage>>,
-    ) -> Result<Response<SessionStream>, Status> {
-        let peer = self.peers.peer_of(&presented(request.extensions()))?;
-        let mut inbound = request.into_inner();
-        let first = timeout(self.hello_wait, inbound.message())
-            .await
-            .map_err(|_| Status::deadline_exceeded("no Hello within the wait"))??;
-        let Some(daemon_message::Message::Hello(hello)) = first.and_then(|m| m.message) else {
-            return Err(Status::invalid_argument(
-                "the first message of a session must be Hello",
-            ));
-        };
-        let (oldest, newest) = self.protocols;
-        let version = negotiate(hello.protocol_version, oldest, newest)?;
-        if hello.node_id.is_empty() {
-            return Err(Status::invalid_argument("Hello has no node_id"));
-        }
-        self.peers.admit(peer.as_ref(), &hello.node_id).await?;
-        let mut reported = reported(&hello, self.host_floor).map_err(Status::invalid_argument)?;
-        // The stream speaks what `Welcome` names, which a newer daemon's `Hello` may exceed.
-        reported.protocol = Some(version);
-        let worker = WorkerId::new(hello.node_id);
-        let instance = DaemonInstance::new(hello.instance_id);
-        let predecessor = DaemonInstance::new(hello.predecessor_instance_id);
-        // Subscribed before the map is read: a change between the two is sent again as a
-        // `MapUpdate`, never missed.
-        let changes = self.map.subscribe();
-        let welcome = message(server_message::Message::Welcome(Welcome {
-            protocol_version: version,
-            heartbeat_interval_ms: u64::try_from(self.heartbeat_interval.as_millis())
-                .unwrap_or(u64::MAX),
-            epoch: self.farm.lease_epoch(),
-            map: self.map.welcome_map(),
-            pack_commit: self.pack_commit,
-            placement_load: self.placement_load,
-        }));
-        let (outbound, responses) = mpsc::unbounded_channel();
-        let capacity = reported.capacity;
-        let stream = self.farm.register(
-            &worker,
-            instance,
-            predecessor,
-            reported,
-            outbound.clone(),
-            welcome,
-        );
-        tracing::info!(%worker, ?capacity, "worker registered");
-        // After `register`, which queued the `Welcome`: the first update follows it.
-        self.map.push(changes, &outbound);
-        let session = Session {
-            map: self.map.clone(),
-            farm: Arc::clone(&self.farm),
-            peers: self.peers.clone(),
-            peer,
-            worker,
-            stream,
-            host_floor: self.host_floor,
-        };
-        tokio::spawn(session.serve(inbound, outbound));
-        Ok(Response::new(Box::pin(stream::unfold(
-            responses,
-            |mut responses| async move { responses.recv().await.map(|m| (m, responses)) },
-        ))))
-    }
-}
-
-/// The version a session speaks, which `Welcome` names: the lesser of `hello`, the
-/// version the `Hello` names, and `newest`, when `hello` is at least `oldest`.
-///
-/// A `Hello` in `oldest..=newest` is answered with its own version, which a daemon of
-/// that version requires (it checks that `Welcome` names the version it sent). A `Hello`
-/// above `newest` is a daemon newer than this server: it is answered with `newest`, and a
-/// daemon newer than this server must accept a `Welcome` below its own version (the daemon
-/// does, down to the oldest it speaks). A `Hello` below `oldest` is refused.
-///
-/// # Errors
-/// FAILED_PRECONDITION: `hello` is below `oldest`.
-fn negotiate(hello: u32, oldest: u32, newest: u32) -> Result<u32, Status> {
-    if hello < oldest {
-        return Err(Status::failed_precondition(format!(
-            "protocol version {hello} is not accepted; this server speaks {oldest} to {newest}"
-        )));
-    }
-    Ok(hello.min(newest))
-}
-
-/// One stream after its first `Hello`.
-struct Session {
-    map: MapFeed,
-    farm: Arc<Farm>,
-    peers: Peers,
-    /// The stream's client certificate (`None` in plain text).
-    peer: Option<PeerCert>,
-    worker: WorkerId,
-    stream: StreamId,
-    host_floor: HostFloor,
-}
-
-impl Session {
-    /// Handles the stream's messages until it ends, or one of them ends it.
-    async fn serve(self, mut inbound: Streaming<DaemonMessage>, outbound: Outbound) {
-        let worker = &self.worker;
-        while let Ok(Some(received)) = inbound.message().await {
-            // The response stream outlives this loop unless the stream is gone.
-            match self.handle(received.message, &outbound).await {
-                Ok(None) => {}
-                Ok(Some(reply)) => {
-                    let _ = outbound.send(Ok(message(reply)));
-                }
-                Err(status) => {
-                    tracing::warn!(%worker, %status, "worker stream ended by the server");
-                    let _ = outbound.send(Err(status));
-                    break;
-                }
-            }
-        }
-        // The farm keeps the stream as the worker's until it registers again: `Start`s
-        // sent meanwhile are lost, and the scheduler gives their leases up (at once on
-        // the next session's first heartbeat, or after G).
-        tracing::info!(%worker, "worker stream ended");
-    }
-
-    /// The reply to one message, if any; an error ends the stream with it. A `Result`
-    /// is answered later, on `outbound`.
-    async fn handle(
-        &self,
-        received: Option<daemon_message::Message>,
-        outbound: &Outbound,
-    ) -> Result<Option<server_message::Message>, Status> {
-        let (farm, worker, stream) = (&self.farm, &self.worker, self.stream);
-        let reply = match received {
-            Some(daemon_message::Message::Hello(hello)) => {
-                if hello.node_id != worker.as_str() {
-                    return Err(Status::permission_denied(format!(
-                        "a resent Hello names node {:?}; this stream is {worker}'s",
-                        hello.node_id
-                    )));
-                }
-                self.peers
-                    .admit(self.peer.as_ref(), worker.as_str())
-                    .await?;
-                match reported(&hello, self.host_floor) {
-                    Ok(reported) => farm.resize(worker, stream, reported),
-                    Err(e) => tracing::warn!(%worker, error = %e, "a resent Hello ignored"),
-                }
-                None
-            }
-            Some(daemon_message::Message::Heartbeat(beat)) => {
-                self.peers
-                    .admit(self.peer.as_ref(), worker.as_str())
-                    .await?;
-                // Before the acknowledgement below, so a daemon that has been acknowledged
-                // has its counts on `/metrics`.
-                farm.note_pack_reads(worker, stream, beat.pack_reads);
-                farm.note_pack_writes(worker, stream, beat.pack_writes);
-                farm.note_input_cache(worker, stream, beat.input_cache);
-                // The accepted reading goes to the scheduler with the heartbeat.
-                let load = farm.note_node_load(worker, stream, beat.node_load.as_ref());
-                let running = beat
-                    .running
-                    .iter()
-                    .map(|l| LeaseId::new(l.term, l.seq))
-                    .collect();
-                farm.heartbeat_with_load(worker, stream, beat.seq, running, load)
-                    .await
-                    .then_some(server_message::Message::HeartbeatAck(HeartbeatAck {
-                        seq: beat.seq,
-                    }))
-            }
-            Some(daemon_message::Message::Result(result)) => {
-                // A revoked daemon must not write its result into the action cache,
-                // even before its next heartbeat.
-                self.peers
-                    .admit(self.peer.as_ref(), worker.as_str())
-                    .await?;
-                // Settling it writes to the object store and the metadata log, which
-                // can take many seconds; it runs beside this loop, so the heartbeats
-                // behind it are still acknowledged before the daemon fences.
-                let (farm, worker, outbound) = (Arc::clone(farm), worker.clone(), outbound.clone());
-                tokio::spawn(async move {
-                    if let Some(ack) = farm.report(&worker, result).await {
-                        let reply = server_message::Message::ResultAck(ack);
-                        let _ = outbound.send(Ok(message(reply)));
-                    }
-                });
-                None
-            }
-            Some(daemon_message::Message::NodeStatus(status)) => {
-                // A revoked daemon's status must not reach the operator API either.
-                self.peers
-                    .admit(self.peer.as_ref(), worker.as_str())
-                    .await?;
-                // Logged there; the lines are for tests.
-                let _ = farm.node_status(worker, stream, status);
-                None
-            }
-            Some(daemon_message::Message::MapRequest(_)) => {
-                self.peers
-                    .admit(self.peer.as_ref(), worker.as_str())
-                    .await?;
-                self.map.answer()
-            }
-            Some(daemon_message::Message::UpdateStatus(status)) => {
-                // A revoked daemon's status must not reach the update session either.
-                self.peers
-                    .admit(self.peer.as_ref(), worker.as_str())
-                    .await?;
-                // Kept as the node's newest, unless a newer stream of the node has
-                // registered since.
-                let _ = farm.update_status(worker, stream, status);
-                None
-            }
-            // The frontend sends offers; one from a daemon is not read.
-            Some(daemon_message::Message::Offer(_)) => None,
-            None => {
-                tracing::warn!(%worker, "an empty daemon message ignored");
-                None
-            }
-        };
-        Ok(reply)
-    }
-}
-
-pub(crate) fn message(message: server_message::Message) -> ServerMessage {
-    ServerMessage {
-        message: Some(message),
-    }
 }
 
 /// What a `Hello` reports: [`capacity`], [`caps`] and [`phase`], and the version it
@@ -565,9 +187,32 @@ fn entry(capabilities: &[Capability], key: &str) -> Result<Option<u64>, String> 
 
 #[cfg(test)]
 mod tests {
-    use tonic::Code;
+    use kbf_proto::worker::{Capability, Hello, NodePhase as Wire, Phase};
+    use kbf_sched::NodePhase;
+    use kbf_types::{LeaseId, Resources};
 
-    use super::{named_protocol, negotiate};
+    use super::{HostFloor, MAX_VM_SLOTS, capacity, caps, named_protocol, phase, reported};
+
+    /// A `Hello` reporting 4 CPUs, 8 GiB and a Linux x86-64 platform, with `more` entries.
+    fn hello(more: &[(&str, &str)]) -> Hello {
+        let entry = |key: &str, value: &str| Capability {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        };
+        let mut capabilities = vec![
+            entry("cpus", "4"),
+            entry("mem_gib", "8"),
+            entry("arch", "x86_64"),
+            entry("os", "linux"),
+        ];
+        capabilities.extend(more.iter().map(|(key, value)| entry(key, value)));
+        Hello {
+            protocol_version: 1,
+            node_id: "node-a".to_owned(),
+            capabilities,
+            ..Hello::default()
+        }
+    }
 
     /// Catches: a wire 0 (a field its sender never set) taken for a version, so that a
     /// node naming none would read as speaking version 0 and pull the oldest version of
@@ -579,38 +224,129 @@ mod tests {
         assert_eq!(named_protocol(u32::MAX), Some(u32::MAX));
     }
 
-    /// Catches: a `Welcome` that names the server's newest version for a `Hello` in range
-    /// (the integration tests speak version 1 to a server of version 1, so they cannot
-    /// tell it from the `Hello`'s own: an older daemon requires its own version back);
-    /// the greater of the two for a `Hello` above the newest (a daemon newer than the
-    /// server would be told a version the server does not speak); that `Hello` refused,
-    /// as it was before; and an accepted range with the oldest bound moved out.
+    /// Catches: a node report that books the whole machine for a node that holds VM slots
+    /// (the host's floor not subtracted), a floor subtracted below zero, VM slots above
+    /// Apple's limit booked, a GPU entry or an `action_slots` cap that is dropped, and a
+    /// node without them that is capped.
     #[test]
-    fn a_hello_is_answered_with_the_lesser_of_its_version_and_the_newest() {
-        assert_eq!(negotiate(1, 1, 3).expect("the oldest"), 1);
-        assert_eq!(negotiate(2, 1, 3).expect("in range"), 2);
-        assert_eq!(negotiate(3, 1, 3).expect("the newest"), 3);
-        assert_eq!(negotiate(5, 1, 3).expect("newer than the server"), 3);
-        assert_eq!(negotiate(u32::MAX, 1, 3).expect("far newer"), 3);
-        assert_eq!(negotiate(1, 1, 1).expect("the only version"), 1);
-        assert_eq!(negotiate(2, 1, 1).expect("above the only version"), 1);
+    fn a_report_books_the_machine_less_the_floor_of_a_node_with_vm_slots() {
+        let plain = capacity(&hello(&[]), HostFloor::DEFAULT).expect("capacity");
+        assert_eq!(plain, Resources::new(4_000, 8 << 30));
+
+        let slots = hello(&[("vm.slots", "9"), ("gpu", "1"), ("action_slots", "3")]);
+        let booked = capacity(&slots, HostFloor::new(1, 2)).expect("capacity");
+        let want = Resources::new(3_000, 6 << 30)
+            .with_gpus(1)
+            .with_vms(MAX_VM_SLOTS)
+            .with_lease_cap(3);
+        assert_eq!(booked, want);
+
+        let small = hello(&[("vm.slots", "1")]);
+        let none = capacity(&small, HostFloor::new(64, 64)).expect("capacity");
+        assert_eq!(none, Resources::new(0, 0).with_vms(1));
     }
 
-    /// Catches: a version below the oldest accepted (the check dropped, or the bound
-    /// moved out by one), the wrong code, and a message that does not name the version
-    /// refused and the range the server speaks.
+    /// Catches: a node report without `cpus` or `mem_gib`, with one repeated, or with one that
+    /// is not a whole number, taken for a valid one; and an error that does not name the entry.
     #[test]
-    fn a_hello_below_the_oldest_is_refused_naming_the_range() {
-        let status = negotiate(0, 1, 3).expect_err("below the oldest");
-        assert_eq!(status.code(), Code::FailedPrecondition);
-        let said = "protocol version 0 is not accepted";
-        assert!(status.message().contains(said), "{}", status.message());
-        assert!(status.message().contains("1 to 3"), "{}", status.message());
+    fn a_report_that_lacks_garbles_or_repeats_an_entry_is_refused_naming_it() {
+        let mut no_cpus = hello(&[]);
+        no_cpus.capabilities.retain(|c| c.key != "cpus");
+        let said = capacity(&no_cpus, HostFloor::DEFAULT).expect_err("no cpus");
+        assert_eq!(said, "the node report needs exactly one \"cpus\" entry");
+        let twice = hello(&[("mem_gib", "9")]);
+        let said = capacity(&twice, HostFloor::DEFAULT).expect_err("two");
+        assert_eq!(said, "the node report needs exactly one \"mem_gib\" entry");
+        let mut garbled = hello(&[]);
+        garbled.capabilities[1].value = "lots".to_owned();
+        let said = capacity(&garbled, HostFloor::DEFAULT).expect_err("garbled");
         assert_eq!(
-            negotiate(1, 2, 3)
-                .expect_err("below a raised oldest")
-                .code(),
-            Code::FailedPrecondition
+            said,
+            "node report entry mem_gib=\"lots\" is not a whole number"
         );
+        let said = capacity(&hello(&[("gpu", "x")]), HostFloor::DEFAULT).expect_err("gpu");
+        assert_eq!(said, "node report entry gpu=\"x\" is not a whole number");
+        assert!(reported(&no_cpus, HostFloor::DEFAULT).is_err());
+    }
+
+    /// Catches: a node whose `arch` is missing or unknown taken for one placement can match
+    /// platforms against.
+    #[test]
+    fn a_report_without_a_known_arch_has_no_platform() {
+        assert!(caps(&hello(&[])).is_ok());
+        let mut nameless = hello(&[]);
+        nameless.capabilities.retain(|c| c.key != "arch");
+        assert!(caps(&nameless).is_err());
+        let sparc = hello(&[]);
+        let mut sparc = Hello {
+            capabilities: sparc.capabilities,
+            ..Hello::default()
+        };
+        sparc.capabilities.iter_mut().for_each(|c| {
+            if c.key == "arch" {
+                c.value = "sparc".to_owned();
+            }
+        });
+        assert!(caps(&sparc).is_err());
+    }
+
+    fn phased(phase: i32, lease: Option<kbf_proto::worker::LeaseId>, reason: &str) -> Hello {
+        Hello {
+            phase: Some(Wire {
+                phase,
+                lease_id: lease,
+                reason: reason.to_owned(),
+            }),
+            ..hello(&[])
+        }
+    }
+
+    /// Catches: a `Hello` that names no phase taken for anything but serving; a preparing or
+    /// restoring phase that loses its lease or is accepted without one; a quarantine that
+    /// loses its reason; and a phase this build does not know (and `Tainted`, on the wire
+    /// before it is acted on) read as serving, which would offer a node work it may not be
+    /// ready for.
+    #[test]
+    fn a_phase_is_read_as_reported_and_an_unknown_one_quarantines_the_node() {
+        assert_eq!(phase(&hello(&[])), Ok(NodePhase::Serving));
+        let lease = kbf_proto::worker::LeaseId { term: 3, seq: 4 };
+        let held = LeaseId::new(3, 4);
+        let read = |phase: Phase, lease| phase_of(phase as i32, lease, "why");
+        assert_eq!(read(Phase::Serving, None), Ok(NodePhase::Serving));
+        assert_eq!(
+            read(Phase::Preparing, Some(lease)),
+            Ok(NodePhase::Preparing(held))
+        );
+        assert_eq!(
+            read(Phase::Restoring, Some(lease)),
+            Ok(NodePhase::Restoring(held))
+        );
+        assert_eq!(
+            read(Phase::Quarantined, None),
+            Ok(NodePhase::Quarantined("why".to_owned()))
+        );
+        assert_eq!(
+            read(Phase::MemoryPressure, None),
+            Ok(NodePhase::MemoryPressure)
+        );
+        assert_eq!(read(Phase::Draining, None), Ok(NodePhase::Draining));
+        let said = "a preparing or restoring phase names no lease";
+        assert_eq!(read(Phase::Preparing, None), Err(said.to_owned()));
+        assert_eq!(read(Phase::Restoring, None), Err(said.to_owned()));
+        for unknown in [Phase::Tainted as i32, 99] {
+            let NodePhase::Quarantined(reason) = phase_of(unknown, None, "").expect("a phase")
+            else {
+                panic!("an unknown phase must quarantine");
+            };
+            assert!(reason.contains("does not know"), "{reason}");
+        }
+    }
+
+    fn phase_of(
+        phase: i32,
+        lease: Option<kbf_proto::worker::LeaseId>,
+        reason: &str,
+    ) -> Result<NodePhase, String> {
+        super::phase(&phased(phase, lease, reason))
     }
 }

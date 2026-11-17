@@ -19,9 +19,6 @@ mod membership_tls;
 #[path = "frontend/object_stores.rs"]
 mod object_stores;
 
-#[path = "frontend/pack_locate.rs"]
-mod pack_locate;
-
 #[path = "frontend/proxy_auth.rs"]
 mod proxy_auth;
 
@@ -134,6 +131,8 @@ struct Front {
     reapi: SocketAddr,
     worker: SocketAddr,
     api: SocketAddr,
+    /// The farm the frontend serves, which a fake daemon registers with.
+    farm: std::sync::Weak<kbf_server::farm::Farm>,
     _stop: oneshot::Sender<()>,
 }
 
@@ -151,17 +150,19 @@ impl Front {
             handle.worker.expect("a worker listener"),
             handle.api,
         );
+        let farm = handle.farm.clone();
         tokio::spawn(handle.serve());
         Self {
             reapi,
             worker,
             api: api.expect("the operator API"),
+            farm,
             _stop: stop,
         }
     }
 
     async fn client(&self) -> Client {
-        Client::connect(self.reapi, self.worker).await
+        Client::connect_to(self.reapi, self.worker, self.farm.clone()).await
     }
 }
 
@@ -1440,8 +1441,9 @@ async fn an_open_execute_survives_stop_until_its_action_is_done() {
     )
     .expect("starts");
     let (reapi, worker) = (handle.reapi, handle.worker.expect("a worker listener"));
+    let farm = handle.farm.clone();
     let served = tokio::spawn(handle.serve());
-    let client = Client::connect(reapi, worker).await;
+    let client = Client::connect_to(reapi, worker, farm).await;
     let mut daemon = client.daemon("node-a", 4, 8).await;
 
     let job = Job::new("build", &[]);
@@ -1599,8 +1601,9 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         handle.api.expect("an API"),
     );
     let drain = handle.drain();
+    let farm = handle.farm.clone();
     let served = tokio::spawn(handle.serve());
-    let client = Client::connect(reapi, worker).await;
+    let client = Client::connect_to(reapi, worker, farm).await;
     let job = Job::new("drained on a frontend", &[]);
     client.upload(&job.blobs()).await;
     let mut ops = client.execute(&job.action).await;

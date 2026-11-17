@@ -105,7 +105,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "default-platform",
             "exclusive-actions",
             "finished-retention-secs",
-            "heartbeat-interval-ms",
             "pack-index",
             "placement-load",
             "placement-predictions",
@@ -118,8 +117,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "state-store-wait-secs",
             "unservable-wait-secs",
             "usage-profiles",
-            "vm-host-floor-cpus",
-            "vm-host-floor-mem-gib",
             "whole-node-allow-last-capable",
             "whole-node-drain-after-secs",
             "whole-node-drain-deadline-secs",
@@ -137,6 +134,18 @@ const GROUPS: &[(&str, &[&str])] = &[
             "history-index-root",
             "history-objects",
             "invocation-memory",
+        ],
+    ),
+    (
+        // The flags of the removed worker session, accepted and ignored for one release
+        // (`kbf_server::retired::RetiredWorkerFlags`): the keys stay so that a `kbf.toml`
+        // written before the removal is still read.
+        "worker-session",
+        &[
+            "heartbeat-interval-ms",
+            "pack-commit-sample",
+            "vm-host-floor-cpus",
+            "vm-host-floor-mem-gib",
         ],
     ),
     (
@@ -216,7 +225,6 @@ const GROUPS: &[(&str, &[&str])] = &[
             "pack-bytes",
             "pack-cache-bytes",
             "pack-cache-dir",
-            "pack-commit-sample",
             "pack-inflight-bytes",
             "pack-store-bucket",
             "pack-store-credentials-file",

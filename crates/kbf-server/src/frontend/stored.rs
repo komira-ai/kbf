@@ -15,8 +15,8 @@ use super::{Args, ExecutorFlags, PackFlags};
 use crate::health::{Checks, Readiness, StateProbe};
 
 /// What a frontend with no `--storage` needs instead: the blobs it keeps itself and the one
-/// executor that does not need a node. The daemons' blob traffic (reads, uploads, the segments)
-/// is a storage node's, so `--executor kbf-daemon` is refused by name; the packs and the pack
+/// executor that does not need a node. The blob traffic of reads, uploads and segments
+/// is a storage node's, so a frontend with no executor is refused; the packs and the pack
 /// index are where the blobs and the action cache are.
 pub(super) fn without_storage(
     server: &Args,
@@ -25,8 +25,8 @@ pub(super) fn without_storage(
 ) -> Result<(), String> {
     if executor.js.is_none() {
         return Err(
-            "no --storage needs --executor js-agent: with --executor kbf-daemon (the default) the \
-             daemons read and write blobs on a storage node, so give --storage"
+            "no --storage needs --executor js-agent: without an executor the frontend serves \
+             blobs from a storage node, so give --storage"
                 .to_owned(),
         );
     }

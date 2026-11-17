@@ -8,19 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::serve::ListenerExt;
-use futures::StreamExt as _;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
-use kbf_front::{
-    Backend, ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES, MetaLog,
-    RECORDER_CHANNEL, Recorder, RequestMetadataLayer, SegmentsConfig, SegmentsService,
-};
+use kbf_front::{Backend, Cache, MetaLog, RECORDER_CHANNEL, Recorder, RequestMetadataLayer};
 use kbf_objstore::ObjectStore;
-use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
-use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorageServer;
-use kbf_proto::worker::segments_server::SegmentsServer;
-use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_sched::MemoryLadder;
 use kbf_storage::service::Admission;
 use kbf_tls::{Incoming, TlsSource};
@@ -29,7 +21,6 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use tower_layer::{Identity, Stack};
 
-use crate::blobs::{WorkerBlobs, WorkerCas, WorkerSegments};
 use crate::drain::Drain;
 use crate::farm::{Farm, StateError};
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
@@ -37,7 +28,7 @@ use crate::health::{Checks, Readiness};
 use crate::http_blobs::ReadBudget;
 use crate::identity::{DenyList, Peers};
 use crate::listen::Binder;
-use crate::members::{Members, MembershipError};
+use crate::members::Members;
 use crate::members_rpc::MembershipService;
 use crate::object_store::delivery::Delivery;
 use crate::proxy_auth::{ProxyAuthLayer, ProxySecret, gate_requests};
@@ -47,9 +38,7 @@ use crate::store_config::service::ColdStoreService;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
 use crate::ui_mount::bind_server_with_options;
-use crate::worker::{HostFloor, WorkerService};
 use crate::worker_roles::WorkerRolesLayer;
-use kbf_mapsync::MapSource;
 use kbf_proto::kbf::enroll::v1::cold_store_server::ColdStoreServer;
 use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 
@@ -63,17 +52,13 @@ pub struct Listeners {
     /// address `reapi` names (nothing refuses a bind off loopback; the binary's start
     /// line warns about one).
     pub reapi_tls: Option<TlsSource>,
-    /// The `kbf.worker.v1` listener: daemons' worker streams and blob calls
-    /// ([`crate::blobs`]), and storage nodes' `kbf.map.v1.Membership` calls; who may
-    /// call which method is [`crate::worker_roles`]'s table.
+    /// The worker listener: storage nodes' `kbf.map.v1.Membership` calls, and the node calls
+    /// of a host's updater ([`crate::node_self`]); who may call which method is
+    /// [`crate::worker_roles`]'s table.
     pub worker: SocketAddr,
     /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
-    /// node is bound to a certificate and every blob call is refused.
+    /// node is bound to a certificate.
     pub worker_tls: Option<WorkerTls>,
-    /// The heartbeat interval `Welcome` names.
-    pub heartbeat_interval: Duration,
-    /// How long a new worker stream may take to send its `Hello`.
-    pub hello_wait: Duration,
     /// How often the scheduler expires silent workers' leases and places queued work
     /// when no input arrives.
     pub tick: Duration,
@@ -92,10 +77,6 @@ pub struct Listeners {
     /// Whether an action that passes its own memory limit runs again on the next rung
     /// (`false` is `--no-memory-climb`: the kill finishes it).
     pub memory_climb: bool,
-    /// What a node that reports VM slots keeps for the host: its CPUs and memory,
-    /// subtracted from what placement may book on it (`--vm-host-floor-cpus`,
-    /// `--vm-host-floor-mem-gib`).
-    pub vm_host_floor: HostFloor,
     /// Whether the farm shows `kbf-estimator` what finished (`--learned-sizes`).
     pub learned_sizes: crate::LearnedSizes,
     /// Whether every `action` lease books the whole worker it lands on, so that one action
@@ -127,9 +108,6 @@ pub struct Listeners {
     /// The memory bound of the invocation records, in bytes
     /// (`docs/design/invocations.md`, section 3.5).
     pub invocation_memory: usize,
-    /// The worker listener's segment uploads (`--segment-upload-*`;
-    /// `docs/design/write-path.md`, section 4).
-    pub segments: SegmentsConfig,
     /// The most HTTP/2 streams one connection may have open on each listener
     /// (`--reapi-max-streams`, `--worker-max-streams`).
     pub stream_limits: StreamLimits,
@@ -195,10 +173,6 @@ pub struct Api {
     pub listen: SocketAddr,
     /// The token writes must present; `None` turns writes off (reads still answer).
     pub token: Option<ApiToken>,
-    /// The node's one cache, whose fill `/metrics` reports, when the process runs a
-    /// daemon whose input cache shares the disk with this server's store
-    /// (`kbf all-in-one`).
-    pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
 }
 
 /// Why the server could not start or stopped.
@@ -220,9 +194,6 @@ pub enum ServeError {
     /// The scheduler's state store could not be taken up.
     #[error("--state-store: {0}")]
     State(#[from] StateError),
-    /// The storage map could not be read from the state store.
-    #[error("storage map: {0}")]
-    Map(#[from] MembershipError),
     /// The pack store does not refuse to replace an object, or cannot be written to.
     #[error("--pack-store-endpoint: {0}")]
     Packs(String),
@@ -420,21 +391,6 @@ pub(crate) fn worker_peers(
     }
 }
 
-/// The accepted connections of the worker listener, each registered in `connections`
-/// until it closes, so an upload is dropped when the connection that began it closes.
-/// Not generic, for the same reason as [`worker_peers`].
-pub(crate) fn tracked(
-    incoming: Incoming,
-    connections: Connections,
-) -> impl futures::Stream<Item = std::io::Result<kbf_front::Tracked<kbf_tls::Conn>>> {
-    incoming.map(move |accepted| {
-        accepted.map(|conn| {
-            let peer = conn.remote_addr();
-            connections.track_peer(conn, peer)
-        })
-    })
-}
-
 /// `server` with the HTTP/2 limits a listener states rather than leaves to the
 /// transport's defaults: at most `max_streams` open streams per connection (each
 /// listener its own, [`StreamLimits`]), and the stream and connection windows
@@ -487,23 +443,6 @@ pub(crate) fn members_of(
         );
     }
     Some(members)
-}
-
-/// The storage map daemons are sent: `explicit` if a caller gave one, else the members'
-/// (every frontend with a state store has members), else none (a farm of one member, whose
-/// daemons use the cache they were given). Not generic, for the same reason as
-/// [`sweeping`].
-///
-/// # Errors
-/// The state store failing to read the map.
-pub(crate) fn map_of(
-    explicit: Option<Arc<dyn MapSource>>,
-    members: Option<&Arc<Members>>,
-) -> Result<Option<Arc<dyn MapSource>>, MembershipError> {
-    if explicit.is_some() {
-        return Ok(explicit);
-    }
-    members.map(Members::map_source).transpose()
 }
 
 /// The membership service storage nodes register with, when there are members to keep:
@@ -717,9 +656,7 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(
-        cache, listeners, api, policy, None, None, None, None, shutdown,
-    )
+    bind_server_with_options(cache, listeners, api, policy, None, None, None, shutdown)
 }
 
 /// [`bind_server_with_policy`], with the scheduler's state kept in `state` if given
@@ -739,32 +676,7 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(
-        cache, listeners, api, policy, state, None, None, None, shutdown,
-    )
-}
-
-/// [`bind_server_with_state`], sending daemons the storage map `map` holds if given: in
-/// `Welcome`, and in a `MapUpdate` each time it changes ([`WorkerService::with_map`]).
-///
-/// # Errors
-/// As [`bind_server_with_state`].
-pub fn bind_server_with_map<M, O>(
-    cache: Arc<Cache<M, O>>,
-    listeners: Listeners,
-    api: Option<Api>,
-    policy: Policy,
-    state: Option<StateStore>,
-    map: Option<Arc<dyn MapSource>>,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
-    bind_server_with_options(
-        cache, listeners, api, policy, state, None, map, None, shutdown,
-    )
+    bind_server_with_options(cache, listeners, api, policy, state, None, None, shutdown)
 }
 
 /// [`bind_server_with_policy`], and with a `storage` node (`--storage`) the REAPI
@@ -785,9 +697,7 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(
-        cache, listeners, api, policy, None, storage, None, None, shutdown,
-    )
+    bind_server_with_options(cache, listeners, api, policy, None, storage, None, shutdown)
 }
 
 /// [`crate::bind_server_with_ui`], each listener bound through `binder`: one budget for the
@@ -804,7 +714,6 @@ pub(crate) fn bind_server_through<M, O>(
     policy: Policy,
     state: Option<StateStore>,
     storage: Option<tonic::transport::Endpoint>,
-    map: Option<Arc<dyn MapSource>>,
     proxy: Option<Behind>,
     ui: bool,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -835,7 +744,6 @@ where
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref(), None);
-    let map = map_of(map, members.as_ref())?;
     // The API reads the same store, whose handle is shared.
     let api_store = state.as_ref().map(|s| Arc::clone(&s.store));
     let node_store = api_store.clone();
@@ -861,9 +769,7 @@ where
     let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
     let worker_incoming = Incoming::new(worker_incoming, worker_tls);
     let probe_timeout = listeners.store_probe_timeout;
-    let (api_listen, token, local) = api.map_or((None, None, None), |api| {
-        (Some(api.listen), api.token, api.local_cache)
-    });
+    let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));
     // One line: a `?` alone on its own line is a never-taken error region, a missed
     // line in the coverage ratchet (it counts lines per generic copy, best copy wins).
     let api_listener = api_listen.map(|l| bind_api(l, &binder)).transpose()?;
@@ -895,7 +801,6 @@ where
     .merge(crate::health::routes(&checks, &farm, members.as_ref()))
     .merge(crate::metrics::router(
         Arc::clone(&cache),
-        local,
         history.as_ref().map(crate::history::History::stats),
         members.clone(),
         tls_sources,
@@ -917,29 +822,6 @@ where
         listeners.streams,
     )
     .layer(ProxyAuthLayer::new(proxy_secret.clone()));
-    let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
-        ByteStreamService::new(Arc::clone(&cache)),
-        peers.clone(),
-    ))
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let worker_cas = ContentAddressableStorageServer::new(WorkerCas::new(
-        CasService::new(Arc::clone(&cache)),
-        peers.clone(),
-    ))
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    // Each accepted worker connection is tracked, so an upload is dropped when the
-    // connection that began it closes.
-    let connections = Connections::new();
-    let tracking = connections.clone();
-    let worker_incoming = tracked(worker_incoming, tracking);
-    let worker_segments = SegmentsServer::new(WorkerSegments::new(
-        SegmentsService::new(Arc::clone(&cache), listeners.segments, connections),
-        peers.clone(),
-    ))
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let membership = membership(members.clone(), &peers, None);
     // The four calls a host's updater makes about its own node.
     let node_calls = crate::node_self::routes(
@@ -948,19 +830,6 @@ where
         node_store,
         peers.clone(),
     );
-    let sessions = WorkerService::new(
-        Arc::clone(&farm),
-        peers,
-        listeners.heartbeat_interval,
-        listeners.hello_wait,
-    )
-    .with_host_floor(listeners.vm_host_floor)
-    .with_placement_load(listeners.placement_load);
-    // The map, if there is one: no branch in this generic function.
-    let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
-    let worker_service = WorkerServer::new(sessions)
-        .max_decoding_message_size(MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
@@ -1019,10 +888,6 @@ where
             });
         let worker_serve = worker_server
             .add_routes(node_calls)
-            .add_service(worker_service)
-            .add_service(worker_blobs)
-            .add_service(worker_cas)
-            .add_service(worker_segments)
             .add_optional_service(membership)
             .serve_with_incoming(worker_incoming);
         // Told when the REAPI listener is done, so the operator API answers what it is
@@ -1154,16 +1019,12 @@ pub fn bind_storage(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
     let service = listener.service(storage);
-    bind_service(service, listener.listen, listener.tls, shutdown).map(|(bound, _)| bound)
+    bind_service(service, listener.listen, listener.tls, shutdown)
 }
 
 /// [`bind_storage`] over a service the caller has set up: a node that is one of several
 /// gives it the map it judges calls by and its chain ([`crate::replication`]). `tls` must be
-/// what the service's admission was made from ([`StorageListener::service`]). Also returns
-/// the [`kbf_storage::service::InProcess`] view of the very service the listener serves: a
-/// caller in this process (the daemon half of `kbf storage-and-daemon`) reaches the node
-/// through it and takes the path a call over the listener takes, the service's own map
-/// check and chain included, not the inner storage.
+/// what the service's admission was made from ([`StorageListener::service`]).
 ///
 /// # Errors
 /// As [`bind_storage`].
@@ -1172,13 +1033,7 @@ pub fn bind_service(
     listen: SocketAddr,
     tls: Option<TlsSource>,
     shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<
-    (
-        BoundStorage<impl Future<Output = Result<(), ServeError>>>,
-        kbf_storage::service::InProcess,
-    ),
-    ServeError,
-> {
+) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
     serve_service(service, bind_storage_socket(listen)?, tls, shutdown)
 }
 
@@ -1216,13 +1071,7 @@ pub fn serve_service(
     socket: StorageSocket,
     tls: Option<TlsSource>,
     shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<
-    (
-        BoundStorage<impl Future<Output = Result<(), ServeError>>>,
-        kbf_storage::service::InProcess,
-    ),
-    ServeError,
-> {
+) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
     let StorageSocket { incoming, addr } = socket;
     let mut server = flow_control(
         Server::builder(),
@@ -1230,7 +1079,7 @@ pub fn serve_service(
     );
     let incoming = Incoming::new(incoming, tls);
     let service = Arc::new(service);
-    let (routes, in_process) = (service.shared_routes(), service.in_process());
+    let routes = service.shared_routes();
     let serving = async move {
         server
             .add_routes(routes)
@@ -1238,5 +1087,5 @@ pub fn serve_service(
             .await
             .map_err(ServeError::from)
     };
-    Ok((BoundStorage { addr, serving }, in_process))
+    Ok(BoundStorage { addr, serving })
 }

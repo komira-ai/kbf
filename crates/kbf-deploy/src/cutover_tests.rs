@@ -14,11 +14,11 @@ pub(crate) const SECRET: &str = "kbf-plan-SECRET-token-0c9d8e7f6a5b4c3d";
 pub(crate) const KBF_IMAGE: &str =
     "registry.example/kbf@sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
-/// A frontend's `[executor]` table that has everything the switch keeps, on the daemons.
+/// A frontend's `[executor]` table that has everything the switch keeps, and names no executor.
 pub(crate) fn ready_config() -> String {
     format!(
         "# the frontend\n[scheduler]\nstate-store = \"postgres:///kbf\"\n\n[executor]\n\
-         # where actions run\nexecutor = \"kbf-daemon\"\nexecutor-frontend-id = \"fe-a\"\n\
+         # where actions run\nexecutor-frontend-id = \"fe-a\"\n\
          executor-base-image = \"registry.example/base@sha256:{d}\"\n\
          executor-kbf-image = \"docker://{KBF_IMAGE}\"\n\
          executor-base-tree = \"/opt/kbf/base-tree\"\n\
@@ -90,10 +90,11 @@ fn the_flags_are_the_job_service_executor_flags_and_hold_no_token() {
     assert!(flags.iter().all(|f| !f.contains(SECRET)));
 }
 
-/// Behaviour: the plan prints each key now and then, the flags, what is kept and the
-/// back-out, exits 0, and holds no token; the file is left as it was.
+/// Behaviour: the plan prints each key now and then, the flags and what is kept, exits 0, and
+/// holds no token; the file is left as it was. A file that names no executor is `no executor`
+/// now.
 #[test]
-fn the_plan_of_a_ready_file_prints_now_then_and_the_back_out() {
+fn the_plan_of_a_ready_file_prints_now_and_then() {
     let dir = scratch("plan");
     let text = ready_config();
     let config = write(dir.path(), "kbf.toml", &text);
@@ -105,8 +106,8 @@ fn the_plan_of_a_ready_file_prints_now_then_and_the_back_out() {
     let expected = format!(
         "kbf-deploy job-service plan (changes nothing)\n\
          config: [executor] in {config}\n\
-         \x20 executor now: kbf-daemon\n\
-         \x20 executor: \"kbf-daemon\" -> \"js-agent\"\n\
+         \x20 executor now: no executor\n\
+         \x20 executor: absent -> \"js-agent\"\n\
          \x20 executor-job-url: absent -> \"http://127.0.0.1:9443\"\n\
          \x20 executor-job-token-file: absent -> \"{token}\"\n\
          \x20 executor-job-ca-file: absent unchanged absent\n\
@@ -128,15 +129,6 @@ fn the_plan_of_a_ready_file_prints_now_then_and_the_back_out() {
          \x20 executor-kbf-image = \"docker://{KBF_IMAGE}\"\n\
          \x20 executor-base-tree = \"/opt/kbf/base-tree\"\n\
          \x20 executor-secret-delivery = \"files\"\n\
-         back-out: the flags of the mode it runs now:\n\
-         \x20 --executor=kbf-daemon\n\
-         \x20 no --executor-job-url\n\
-         \x20 no --executor-job-token-file\n\
-         \x20 no --executor-job-ca-file\n\
-         \x20 no --executor-hosts\n\
-         \x20 no --executor-host-cpus\n\
-         \x20 no --executor-host-memory-gib\n\
-         \x20 --executor-host-slots=8\n\
          to switch: kbf-deploy job-service apply with these flags and the restart's (a dry \
          run without --apply)\n",
         config = config.display(),
@@ -147,9 +139,9 @@ fn the_plan_of_a_ready_file_prints_now_then_and_the_back_out() {
     assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
 }
 
-/// Behaviour: a file with no `executor` key names the default as the mode to go back to,
-/// and one without an `[executor]` table plans every key from absent; what it lacks fails
-/// the plan (exit 1) after printing it, naming each missing key.
+/// Behaviour: a file with no `executor` key is `no executor` now, and one without an
+/// `[executor]` table plans every key from absent; what it lacks fails the plan (exit 1) after
+/// printing it, naming each missing key.
 #[test]
 fn a_file_that_lacks_the_kept_keys_fails_after_the_plan() {
     let dir = scratch("missing");
@@ -157,15 +149,12 @@ fn a_file_that_lacks_the_kept_keys_fails_after_the_plan() {
     let t = target(dir.path(), &config, "http://127.0.0.1:9443", false);
     let (code, out, err) = planned(&t);
     assert_eq!(code, ExitCode::from(1));
-    assert!(out.contains("  executor now: kbf-daemon\n"), "{out}");
+    assert!(out.contains("  executor now: no executor\n"), "{out}");
     assert!(
         out.contains("  executor: absent -> \"js-agent\"\n"),
         "{out}"
     );
-    assert!(
-        out.contains("  --executor=kbf-daemon (the default: the file has no key)\n"),
-        "{out}"
-    );
+    assert!(!out.contains("back-out"), "{out}");
     assert!(
         out.contains("  MISSING: executor-frontend-id (a text value)\n"),
         "{out}"
@@ -210,33 +199,43 @@ fn the_secret_delivery_is_read_as_the_executor_reads_it() {
     );
 }
 
-/// Behaviour: the back-out flags carry each value the file holds now, whatever its kind.
+/// Behaviour: a file that still names the deleted `kbf-daemon` executor plans to replace it
+/// with `js-agent`.
 #[test]
-fn the_back_out_flags_carry_every_kind_of_value() {
-    let table = Executor::parse(
-        Path::new("k"),
-        "[executor]\nexecutor = \"js-agent\"\nexecutor-hosts = 2\nexecutor-job-url = [1]\n\
-         executor-job-ca-file = true\nexecutor-job-token-file = false\n",
-    )
-    .unwrap();
-    assert_eq!(table.mode(), "js-agent");
-    assert_eq!(
-        table.back_out_flags(),
-        [
-            "--executor=js-agent",
-            "--executor-job-url=[1]",
-            "no --executor-job-token-file",
-            "--executor-job-ca-file",
-            "--executor-hosts=2",
-            "no --executor-host-cpus",
-            "no --executor-host-memory-gib",
-            "no --executor-host-slots",
-        ]
+fn a_file_naming_the_deleted_daemon_executor_plans_to_replace_it() {
+    let dir = scratch("old-key");
+    let text = ready_config().replace(
+        "# where actions run\n",
+        "# where actions run\nexecutor = \"kbf-daemon\"\n",
     );
+    let config = write(dir.path(), "kbf.toml", &text);
+    let t = target(dir.path(), &config, "http://127.0.0.1:9443", false);
+    let (code, out, err) = planned(&t);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(out.contains("  executor now: kbf-daemon\n"), "{out}");
+    assert!(
+        out.contains("  executor: \"kbf-daemon\" -> \"js-agent\"\n"),
+        "{out}"
+    );
+}
+
+/// Behaviour: the executor now is the file's `executor` text, `kbf-daemon` of an old file
+/// included, and `no executor` when the key is absent or not text; every kind of value prints
+/// as TOML, an absent key as `absent`.
+#[test]
+fn the_mode_is_the_executor_key_or_none() {
+    let mode = |body: &str| {
+        Executor::parse(Path::new("k"), &format!("[executor]\n{body}"))
+            .unwrap()
+            .mode()
+    };
+    assert_eq!(mode("executor = \"js-agent\"\n"), "js-agent");
+    assert_eq!(mode("executor = \"kbf-daemon\"\n"), "kbf-daemon");
+    assert_eq!(mode("executor = 3\n"), NO_EXECUTOR);
+    assert_eq!(mode(""), NO_EXECUTOR);
     assert_eq!(Value::Other(toml::Value::Float(1.5)).to_string(), "1.5");
     assert_eq!(Value::Switch(true).to_string(), "true");
-    let numbered = Executor::parse(Path::new("k"), "[executor]\nexecutor = 3\n").unwrap();
-    assert_eq!(numbered.mode(), DEFAULT_EXECUTOR);
+    assert_eq!(Value::Absent.to_string(), "absent");
 }
 
 /// Behaviour: every bad flag is refused (exit 2) naming the flag, with nothing on stdout.

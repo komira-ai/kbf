@@ -1,4 +1,4 @@
-//! `job-service apply` and `back-out` on a scripted host: the tools' answers and the HTTP
+//! `job-service apply` on a scripted host: the tools' answers and the HTTP
 //! statuses are the test's, the job service is `kbf-job-client`'s in-process fake on loopback,
 //! and the pause between two asks is the hook that moves the canary job. No test reads a
 //! clock or sleeps.
@@ -263,10 +263,7 @@ async fn a_dry_run_runs_asks_and_writes_nothing() {
         out.contains("\ndry run: nothing changed. Re-run with --apply.\n"),
         "{out}"
     );
-    assert!(
-        out.contains("back-out: kbf-deploy job-service back-out --config "),
-        "{out}"
-    );
+    assert!(!out.contains("kept as"), "{out}");
     assert!(!out.contains(TOKEN), "{out}");
     assert!(host.runs.is_empty() && host.asked.is_empty() && host.pauses.is_empty());
     assert!(server.calls().is_empty());
@@ -294,8 +291,8 @@ async fn an_apply_switches_restarts_and_passes_the_canary() {
         std::fs::read_to_string(&file).unwrap(),
         cutover_edit::rewritten(&file, &text, &settings).unwrap()
     );
-    let (_, kept) = cutover_edit::read_backup(&file).unwrap();
-    assert_eq!(kept, text);
+    let backup = cutover_edit::beside(&file, cutover_edit::BACKUP_SUFFIX);
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), text);
     let programs: Vec<(String, Vec<String>)> = host
         .runs
         .iter()
@@ -360,7 +357,13 @@ async fn an_apply_switches_restarts_and_passes_the_canary() {
         out.contains("\ndone: the frontend runs executor = \"js-agent\"\n"),
         "{out}"
     );
-    assert!(out.ends_with("  --executor=kbf-daemon\n  no --executor-job-url\n  no --executor-job-token-file\n  no --executor-job-ca-file\n  no --executor-hosts\n  no --executor-host-cpus\n  no --executor-host-memory-gib\n  --executor-host-slots=8\n"), "{out}");
+    assert!(
+        out.ends_with(&format!(
+            "the file from before the switch is kept as {}\n",
+            backup.display()
+        )),
+        "{out}"
+    );
     assert!(!out.contains(TOKEN), "{out}");
 }
 
@@ -425,11 +428,11 @@ async fn a_staged_file_kbf_refuses_changes_nothing() {
     cutover_edit::require_no_backup(&std::fs::canonicalize(&config).unwrap()).unwrap();
 }
 
-/// Behaviour: each failure after the switch is in place names its step and prints the
-/// back-out: a restart kbf-host-install refuses, a frontend that never exits by the drain
-/// deadline, one that is never ready, a canary that exits 1.
+/// Behaviour: each failure after the switch is in place names its step and says where the
+/// file from before it is kept: a restart kbf-host-install refuses, a frontend that never
+/// exits by the drain deadline, one that is never ready, a canary that exits 1.
 #[tokio::test]
-async fn a_failure_after_the_switch_prints_the_back_out() {
+async fn a_failure_after_the_switch_says_where_the_original_is_kept() {
     let server = service().await;
     let cases: Vec<(&str, Setup, String)> =
         vec![
@@ -479,12 +482,20 @@ async fn a_failure_after_the_switch_prints_the_back_out() {
         set(&mut a, &mut host);
         let (done, out) = applied(&a, &mut host).await;
         assert_eq!(done.unwrap_err().to_string(), says, "{name}");
+        let file = std::fs::canonicalize(&config).unwrap();
+        let backup = cutover_edit::beside(&file, cutover_edit::BACKUP_SUFFIX);
         assert!(
-            out.contains("but a step after it failed\nback-out: kbf-deploy job-service back-out"),
+            out.ends_with(&format!(
+                "but a step after it failed\nthe file from before the switch is kept as {}\n",
+                backup.display()
+            )),
             "{name}: {out}"
         );
-        let file = std::fs::canonicalize(&config).unwrap();
-        assert!(cutover_edit::read_backup(&file).is_ok(), "{name}");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            ready_config(),
+            "{name}"
+        );
     }
 }
 
@@ -502,7 +513,10 @@ async fn apply_refuses_before_any_step() {
             "lacks executor-frontend-id",
         ),
         (
-            ready.replace("executor = \"kbf-daemon\"", "executor = \"js-agent\""),
+            ready.replace(
+                "# where actions run\n",
+                "# where actions run\nexecutor = \"js-agent\"\n",
+            ),
             Box::new(|_| {}),
             "already runs executor = \"js-agent\"",
         ),
@@ -571,104 +585,11 @@ async fn apply_refuses_before_any_step() {
     assert!(server.calls().is_empty());
 }
 
-/// `back-out`'s flags for `config`.
-fn back_args(config: &Path, apply: bool) -> BackOutArgs {
-    BackOutArgs {
-        config: config.to_path_buf(),
-        restart: restart(),
-        apply,
-    }
-}
-
-async fn backed_out(a: &BackOutArgs, host: &mut dyn Host) -> (Result<(), CutoverError>, String) {
-    let mut out = Vec::new();
-    let done = back_out(a, host, &mut out).await;
-    (done, String::from_utf8(out).unwrap())
-}
-
-/// Behaviour: a back-out dry run prints the flags it returns to and its steps and changes
-/// nothing; with `--apply` it checks the backup, puts it back byte for byte, and restarts
-/// the same way; with no backup it is refused.
-#[tokio::test]
-async fn a_back_out_restores_the_original_and_restarts() {
-    let dir = scratch("back-out");
-    let text = ready_config();
-    let config = write(
-        dir.path(),
-        "kbf.toml",
-        "[executor]\nexecutor = \"js-agent\"\n",
-    );
-    write(dir.path(), "kbf.toml.pre-job-service", &text);
-    let mut host = Script::healthy();
-    let (done, out) = backed_out(&back_args(&config, false), &mut host).await;
-    done.unwrap();
-    let file = std::fs::canonicalize(&config).unwrap();
-    assert!(
-        out.starts_with(&format!(
-            "kbf-deploy job-service back-out (dry run)\nconfig: {f}.pre-job-service back over {f}\n\
-         \x20 executor now: js-agent, then: kbf-daemon\nthe flags it returns to:\n\
-         \x20 --executor=kbf-daemon\n",
-            f = file.display()
-        )),
-        "{out}"
-    );
-    assert!(
-        out.contains(&format!(
-            "DRY-RUN: /usr/bin/kbf --mode=frontend --config {}.pre-job-service --check\n",
-            file.display()
-        )),
-        "{out}"
-    );
-    assert!(
-        out.ends_with("dry run: nothing changed. Re-run with --apply.\n"),
-        "{out}"
-    );
-    assert!(host.runs.is_empty());
-    let (done, out) = backed_out(&back_args(&config, true), &mut host).await;
-    done.unwrap();
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
-    assert!(!dir.path().join("kbf.toml.pre-job-service").exists());
-    assert_eq!(host.runs.len(), 3);
-    assert_eq!(host.runs[2].args, ssh_args());
-    assert!(
-        out.ends_with("done: the frontend runs executor = \"kbf-daemon\" again\n"),
-        "{out}"
-    );
-    let e = backed_out(&back_args(&config, true), &mut host)
-        .await
-        .0
-        .unwrap_err();
-    assert!(
-        e.to_string().contains("there is no switch to back out"),
-        "{e}"
-    );
-    let e = backed_out(
-        &BackOutArgs {
-            restart: Restart {
-                instance: String::new(),
-                ..restart()
-            },
-            ..back_args(&config, false)
-        },
-        &mut host,
-    )
-    .await
-    .0
-    .unwrap_err();
-    assert!(e.to_string().starts_with("--instance: "), "{e}");
-}
-
 /// Behaviour: a tool that cannot be started, a tool that fails with words on stdout only, one
 /// killed by a signal, and a restart answer that is not kbf-host-install's are each said.
 #[tokio::test]
 async fn tools_that_fail_are_named() {
-    let dir = scratch("tools");
-    let config = write(
-        dir.path(),
-        "kbf.toml",
-        "[executor]\nexecutor = \"js-agent\"\n",
-    );
-    write(dir.path(), "kbf.toml.pre-job-service", &ready_config());
+    let server = service().await;
     let cases: Vec<(Answer<'static>, &str)> = vec![
         (
             Box::new(|_| Err(io::ErrorKind::NotFound.into())),
@@ -735,17 +656,13 @@ async fn tools_that_fail_are_named() {
             "the restart: cannot run /usr/bin/ssh: ",
         ),
     ];
-    for (answer, says) in cases {
-        let backup = dir.path().join("kbf.toml.pre-job-service");
-        if !backup.exists() {
-            std::fs::copy(&config, &backup).unwrap();
-        }
+    for (i, (answer, says)) in cases.into_iter().enumerate() {
+        let dir = scratch(&format!("tools-{i}"));
+        let config = write(dir.path(), "kbf.toml", &ready_config());
+        let a = args(dir.path(), &config, &server.origin(), true);
         let mut host = Script::healthy();
         host.answer = answer;
-        let e = backed_out(&back_args(&config, true), &mut host)
-            .await
-            .0
-            .unwrap_err();
+        let e = applied(&a, &mut host).await.0.unwrap_err();
         assert!(e.to_string().starts_with(says), "{says}: {e}");
     }
 }
@@ -808,7 +725,8 @@ fn no_runtime_fails_the_verb() {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = run_on(
         Err(io::Error::other("no threads")),
-        Verb::BackOut(&back_args(&config, false)),
+        &args(dir.path(), &config, "http://127.0.0.1:1", false),
+        NOW,
         &mut Script::healthy(),
         &mut out,
         &mut err,
@@ -820,68 +738,53 @@ fn no_runtime_fails_the_verb() {
     );
 }
 
-/// Behaviour: the verb's exit code is 0 for a back-out dry run on its own runtime.
+/// Behaviour: the verb's exit code is 0 for an apply dry run on its own runtime, and the
+/// refusal of a file that is not ready is exit 2 with its words on stderr.
 #[test]
-fn a_dry_run_on_the_verbs_runtime_exits_0() {
+fn a_dry_run_on_the_verbs_runtime_exits_0_and_a_refusal_exits_2() {
     let dir = scratch("verb-runtime");
-    let config = write(
-        dir.path(),
-        "kbf.toml",
-        "[executor]\nexecutor = \"js-agent\"\n",
-    );
-    write(dir.path(), "kbf.toml.pre-job-service", "");
+    let config = write(dir.path(), "kbf.toml", &ready_config());
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let runtime = tokio::runtime::Builder::new_current_thread().build();
     let code = run_on(
         runtime,
-        Verb::BackOut(&back_args(&config, false)),
+        &args(dir.path(), &config, "http://127.0.0.1:1", false),
+        NOW,
         &mut Script::healthy(),
         &mut out,
         &mut err,
     );
     assert_eq!(code, ExitCode::SUCCESS);
     assert!(err.is_empty());
+
+    let other = scratch("verb-runtime-refused");
+    let bare = write(other.path(), "bare.toml", "[executor]\n");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let runtime = tokio::runtime::Builder::new_current_thread().build();
+    let code = run_on(
+        runtime,
+        &args(other.path(), &bare, "http://127.0.0.1:1", false),
+        NOW,
+        &mut Script::healthy(),
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, ExitCode::from(2));
+    assert!(out.is_empty());
+    assert!(String::from_utf8(err).unwrap().starts_with("REFUSED: "));
 }
 
-/// Behaviour: a back-out whose restart fails keeps the backup and says so, and run again it
-/// finishes; a frontend that is not running (its operator API refuses the connection) is not
+/// Behaviour: a frontend that is not running (its operator API refuses the connection) is not
 /// drained, and the restart starts it.
 #[tokio::test]
-async fn a_stopped_back_out_can_run_again_and_a_down_frontend_is_not_drained() {
-    let dir = scratch("back-out-again");
-    let text = ready_config();
-    let config = write(
-        dir.path(),
-        "kbf.toml",
-        "[executor]\nexecutor = \"js-agent\"\n",
-    );
-    let backup = write(dir.path(), "kbf.toml.pre-job-service", &text);
-    let mut host = Script::healthy();
-    host.answer = Box::new(|cmd| {
-        Ok(if cmd.program.as_str() == "/usr/bin/ssh" {
-            reply(2, "{\"result\":\"refused\",\"reason\":\"busy\"}", "")
-        } else {
-            reply(0, "", "")
-        })
-    });
-    let (done, out) = backed_out(&back_args(&config, true), &mut host).await;
-    assert_eq!(
-        done.unwrap_err().to_string(),
-        "the restart through kbf-host-install: exit 2: refused: busy"
-    );
-    let kept = std::fs::canonicalize(&backup).unwrap();
-    assert!(
-        out.ends_with(&format!(
-            "the back-out stopped; {} is kept: run back-out again once the cause is fixed\n",
-            kept.display()
-        )),
-        "{out}"
-    );
-    assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
-    assert!(backup.exists());
-
+async fn a_down_frontend_is_not_drained_and_the_restart_starts_it() {
+    let dir = scratch("apply-down");
+    let config = write(dir.path(), "kbf.toml", &ready_config());
+    let server = service().await;
+    let a = args(dir.path(), &config, &server.origin(), true);
     let mut host = Script::healthy().answers("/healthz", vec![refused()]);
-    let (done, out) = backed_out(&back_args(&config, true), &mut host).await;
+    host.on_pause = Box::new(finishes(&server, 0));
+    let (done, out) = applied(&a, &mut host).await;
     done.unwrap();
     assert!(
         out.contains("\nthe frontend is not running: nothing to drain\n"),
@@ -889,6 +792,4 @@ async fn a_stopped_back_out_can_run_again_and_a_down_frontend_is_not_drained() {
     );
     let programs: Vec<String> = host.runs.iter().map(|c| c.program.to_string()).collect();
     assert_eq!(programs, ["/usr/bin/kbf", "/usr/bin/ssh"]);
-    assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
-    assert!(!backup.exists());
 }

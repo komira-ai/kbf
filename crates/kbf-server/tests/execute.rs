@@ -26,8 +26,8 @@ use kbf_proto::reapi::{ActionResult, WaitExecutionRequest};
 use kbf_proto::worker::daemon_message;
 use kbf_proto::worker::server_message::Message;
 use support::{
-    Blob, Cell, FakeDaemon, Job, done, done_within_quiet, failed, hello_on, output, ran,
-    report_every_run, response, stage,
+    Blob, Cell, Job, done, done_within_quiet, failed, hello_on, output, ran, report_every_run,
+    response, stage,
 };
 use tonic::Code;
 
@@ -757,7 +757,8 @@ async fn a_whole_machine_lease_starts_only_on_a_daemon_that_serves_it() {
     let cell = Cell::start().await;
     let mut shared = cell.daemon("mac-0", 4, 8).await;
     let report = [("arch", "arm64"), ("drivers", "native-whole-machine")];
-    let mut whole = FakeDaemon::connect(cell.worker_addr, hello_on("mac-1", 4, 8, &report))
+    let mut whole = cell
+        .daemon_hello(hello_on("mac-1", 4, 8, &report))
         .await
         .expect("registered");
     let job = Job::new("whole", &[("kbf-lease", "whole_machine")]);

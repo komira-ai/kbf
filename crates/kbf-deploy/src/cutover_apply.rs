@@ -1,5 +1,5 @@
-//! `kbf-deploy job-service apply` and `back-out`: the switch of one frontend's executor onto
-//! the job service, and its way back, each a dry run without `--apply`.
+//! `kbf-deploy job-service apply`: the switch of one frontend's executor onto the job service,
+//! a dry run without `--apply`.
 //!
 //! `apply --apply`, in order, each step printed before it is made:
 //!
@@ -8,7 +8,8 @@
 //! 2. The new `kbf.toml` is staged beside the file with a byte-exact backup
 //!    ([`crate::cutover_edit`]), and `kbf --mode=frontend --config <staged> --check` must
 //!    pass on it. A failure here removes both files: nothing has changed.
-//! 3. The staged file is renamed over the file. From here a failure says how to back out.
+//! 3. The staged file is renamed over the file. The backup stays beside it, and a failure from
+//!    here says where it is.
 //! 4. The restart, through the update path a roll takes for a frontend: the frontend's own
 //!    drain (`kbf cluster drain --frontend`, `POST /v1/frontend/drain`), a wait until it has
 //!    exited (its operator API refuses the connection), however long its open executions
@@ -22,9 +23,7 @@
 //! A frontend whose operator API refuses the connection before the drain is not running: it is
 //! not drained, and the restart starts it.
 //!
-//! `back-out --apply` checks the backup with `kbf --check`, puts it back over the file,
-//! restarts the same way (step 4), and only then removes the backup, so a back-out that
-//! stopped can be run again. Neither verb has a `--force`, and no flag skips a step.
+//! The verb has no `--force`, and no flag skips a step.
 //!
 //! The waits ask once per `--poll-secs`; the pause between asks is injected ([`Host`]), so
 //! a test reads no clock and never sleeps. A deadline is a number of asks.
@@ -78,7 +77,7 @@ impl<E: Exec> Host for OnHost<'_, E> {
     }
 }
 
-/// How the frontend is restarted: the flags `apply` and `back-out` share.
+/// How the frontend is restarted: the flags of `apply`.
 #[derive(Args, Clone, Debug)]
 pub struct Restart {
     /// The frontend's unit as the host's `kbf-host-install` names it: `-` for
@@ -142,19 +141,6 @@ pub struct ApplyArgs {
     pub(crate) apply: bool,
 }
 
-/// The arguments of `job-service back-out`.
-#[derive(Args, Clone, Debug)]
-pub struct BackOutArgs {
-    /// The frontend's `kbf.toml`, beside which `apply` kept the backup.
-    #[arg(long, value_name = "FILE")]
-    pub(crate) config: PathBuf,
-    #[command(flatten)]
-    pub(crate) restart: Restart,
-    /// Carry the plan out.
-    #[arg(long)]
-    pub(crate) apply: bool,
-}
-
 /// How many asks a wait of `secs` makes, one per `poll` seconds, at least one.
 pub(crate) fn asks(secs: u64, poll: u64) -> u64 {
     secs.div_ceil(poll).max(1)
@@ -204,13 +190,9 @@ enum Step {
     CheckConfig(Cmd),
     /// Rename the staged file over the file.
     PutInPlace,
-    /// Rename the backup over the file.
-    Restore { file: PathBuf, backup: PathBuf },
     /// `kbf cluster drain --frontend`, unless `url` (the operator API) refuses the
     /// connection: a frontend that is not running has nothing to drain.
     Drain { cmd: Cmd, url: HttpUrl },
-    /// Remove the backup, once the back-out's restart is done.
-    Forget(PathBuf),
     /// Wait until the operator API refuses the connection.
     AwaitExit { url: HttpUrl, asks: Option<u64> },
     /// The forced command `restart frontend=<instance>`, over ssh.
@@ -242,11 +224,7 @@ impl std::fmt::Display for Step {
             ),
             Step::CheckConfig(cmd) => write!(f, "{cmd}"),
             Step::Drain { cmd, url } => write!(f, "{cmd} (unless {url} refuses the connection)"),
-            Step::Forget(backup) => write!(f, "remove {}", backup.display()),
             Step::PutInPlace => f.write_str("rename the staged file over the config"),
-            Step::Restore { file, backup } => {
-                write!(f, "put {} back over {}", backup.display(), file.display())
-            }
             Step::AwaitExit { url, asks: None } => {
                 write!(
                     f,
@@ -490,7 +468,6 @@ impl Carry<'_> {
                 Some(staged) => staged.put_in_place(),
                 None => Err(CutoverError::Failed("nothing is staged".to_owned())),
             },
-            Step::Restore { file, backup } => cutover_edit::restore(file, backup),
             Step::Drain { cmd, url } => {
                 if exited(&self.host.status(url)) {
                     let _ = writeln!(out, "the frontend is not running: nothing to drain");
@@ -498,7 +475,6 @@ impl Carry<'_> {
                 }
                 ran(self.host, cmd, "the drain").map(drop)
             }
-            Step::Forget(backup) => cutover_edit::forget(backup),
             Step::AwaitExit { url, asks } => {
                 if self.wait(url, *asks, exited) {
                     Ok(())
@@ -573,18 +549,13 @@ async fn carry(
     Ok(())
 }
 
-/// The back-out line printed after a switch: the command and the flags it returns to.
-fn print_back_out(config: &Path, table: &Executor, out: &mut dyn Write) {
+/// The line printed after a switch: where the file from before it is kept.
+fn print_backup(config: &Path, out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "back-out: kbf-deploy job-service back-out --config {} with the same restart flags \
-         (restores {} and restarts the same way); it returns to:",
-        config.display(),
+        "the file from before the switch is kept as {}",
         cutover_edit::beside(config, cutover_edit::BACKUP_SUFFIX).display()
     );
-    for flag in table.back_out_flags() {
-        let _ = writeln!(out, "  {flag}");
-    }
 }
 
 /// The canary of a frontend whose `[executor]` table is `table`, named by `now_secs`.
@@ -697,7 +668,7 @@ pub(crate) async fn apply(
             "the switch is in place in {}, but a step after it failed",
             file.display()
         );
-        print_back_out(&file, &table, out);
+        print_backup(&file, out);
         return Err(e);
     }
     if a.apply {
@@ -705,89 +676,25 @@ pub(crate) async fn apply(
             out,
             "done: the frontend runs executor = \"{JOB_SERVICE_EXECUTOR}\""
         );
-    } else {
-        let _ = writeln!(out, "{DRY_RUN}");
-    }
-    print_back_out(&file, &table, out);
-    Ok(())
-}
-
-/// `back-out`.
-pub(crate) async fn back_out(
-    a: &BackOutArgs,
-    host: &mut dyn Host,
-    out: &mut dyn Write,
-) -> Result<(), CutoverError> {
-    let restart = restart_steps(&a.restart)?;
-    let file = cutover_edit::canonical(&a.config)?;
-    let now = Executor::parse(&file, &read_config(&file)?)?;
-    let (backup, text) = cutover_edit::read_backup(&file)?;
-    let then = Executor::parse(&backup, &text)?;
-    let mut steps = vec![
-        Step::CheckConfig(check_config(&a.restart, &backup)?),
-        Step::Restore {
-            file: file.clone(),
-            backup: backup.clone(),
-        },
-    ];
-    steps.extend(restart);
-    steps.push(Step::Forget(backup.clone()));
-    let mode = if a.apply { "apply" } else { "dry run" };
-    let _ = writeln!(out, "kbf-deploy job-service back-out ({mode})");
-    let _ = writeln!(
-        out,
-        "config: {} back over {}",
-        backup.display(),
-        file.display()
-    );
-    let _ = writeln!(out, "  executor now: {}, then: {}", now.mode(), then.mode());
-    let _ = writeln!(out, "the flags it returns to:");
-    for flag in then.back_out_flags() {
-        let _ = writeln!(out, "  {flag}");
-    }
-    let (before, after) = steps.split_at(1);
-    carry(before, a.apply, host, a.restart.poll_secs, None, out).await?;
-    if let Err(e) = carry(after, a.apply, host, a.restart.poll_secs, None, out).await {
-        let _ = writeln!(
-            out,
-            "the back-out stopped; {} is kept: run back-out again once the cause is fixed",
-            backup.display()
-        );
-        return Err(e);
-    }
-    if a.apply {
-        let _ = writeln!(
-            out,
-            "done: the frontend runs executor = \"{}\" again",
-            then.mode()
-        );
+        print_backup(&file, out);
     } else {
         let _ = writeln!(out, "{DRY_RUN}");
     }
     Ok(())
 }
 
-/// The verb that runs on the cutover's runtime.
-pub(crate) enum Verb<'a> {
-    Apply(&'a ApplyArgs, u64),
-    BackOut(&'a BackOutArgs),
-}
-
-/// Run `verb` on `runtime`, as an exit code.
+/// Run `apply` on `runtime`, with the instant `now_secs` naming the canary job, as an exit
+/// code.
 pub(crate) fn run_on(
     runtime: io::Result<Runtime>,
-    verb: Verb<'_>,
+    a: &ApplyArgs,
+    now_secs: u64,
     host: &mut dyn Host,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
     let done = match runtime {
-        Ok(runtime) => runtime.block_on(async {
-            match verb {
-                Verb::Apply(a, now_secs) => apply(a, host, now_secs, out).await,
-                Verb::BackOut(a) => back_out(a, host, out).await,
-            }
-        }),
+        Ok(runtime) => runtime.block_on(apply(a, host, now_secs, out)),
         Err(e) => Err(CutoverError::Failed(format!("no runtime: {e}"))),
     };
     match done {

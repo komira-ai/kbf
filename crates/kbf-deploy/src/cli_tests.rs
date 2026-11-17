@@ -841,13 +841,13 @@ fn job_service_agent_egress_runs_through_the_same_command_line() {
     assert!(exec.queries.borrow().is_empty());
 }
 
-/// Catches a `job-service plan`, `apply` or `back-out` the command line does not reach, or a
-/// dry run that runs anything on the host: through `run`, a plan of a file that lacks the
-/// executor's keys fails (exit 1) after printing the plan, an `apply` dry run of the same file
-/// is refused (exit 2) and a `back-out` with no backup is refused (exit 2), a missing flag is
-/// a usage error, and no tool is run.
+/// Catches a `job-service plan` or `apply` the command line does not reach, a deleted
+/// `back-out` that is still a verb, or a dry run that runs anything on the host: through
+/// `run`, a plan of a file that lacks the executor's keys fails (exit 1) after printing the
+/// plan, an `apply` dry run of the same file is refused (exit 2), `back-out` is a usage error
+/// (exit 2), a missing flag is a usage error, and no tool is run.
 #[test]
-fn job_service_plan_apply_and_back_out_run_through_the_same_command_line() {
+fn job_service_plan_and_apply_run_through_the_same_command_line() {
     let dir = TestDir::under(std::env::temp_dir(), "kbf-deploy-cli-cutover");
     let config = dir.path().join("kbf.toml");
     std::fs::write(&config, "[executor]\n").unwrap();
@@ -908,7 +908,7 @@ fn job_service_plan_apply_and_back_out_run_through_the_same_command_line() {
     let (code, out, err) = cli(&mut exec, &no_env, &back_out);
     assert_eq!(code, ExitCode::from(2), "{err}");
     assert_eq!(out, "");
-    assert!(err.contains("there is no switch to back out"), "{err}");
+    assert!(err.contains("back-out"), "{err}");
 
     let (code, _, err) = cli(
         &mut exec,

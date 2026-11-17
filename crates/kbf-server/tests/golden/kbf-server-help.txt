@@ -63,7 +63,7 @@ Options:
           Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then answers a client's CAS, ByteStream and action-cache calls from that node, passing ByteStream through without holding a blob. The local stores are still opened: Execution and the worker listener use them (`kbf frontend` is this mode without them: Execution reads the node too). Plain text (`http://`) only here; `kbf frontend` takes the flags of the mutual TLS to the node. Without it, the server answers those calls itself
 
       --worker-listen <WORKER_LISTEN>
-          The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address; off loopback the start line carries a warning. `kbf frontend` binds it only when it is given (a frontend with no daemons and no storage nodes serves none); every other mode binds 127.0.0.1:8981 when it is not
+          The worker listener: storage nodes' `Membership` calls and a host updater's node calls. Without mutual TLS (`--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address; off loopback the start line carries a warning. `kbf frontend` binds it only when it is given (a frontend with no storage nodes serves none); every other mode binds 127.0.0.1:8981 when it is not
 
       --api-listen <API_LISTEN>
           The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are open to whoever reaches it: bind it where only operators do
@@ -104,11 +104,6 @@ Options:
           
           [default: 30]
 
-      --heartbeat-interval-ms <HEARTBEAT_INTERVAL_MS>
-          The heartbeat interval daemons are asked for, in milliseconds, at most half the window in which a daemon may act on a `Start` (each `Start` names the newest heartbeat the server took, so a longer interval would leave it too little)
-          
-          [default: 5000]
-
       --unservable-wait-secs <UNSERVABLE_WAIT_SECS>
           How long, in seconds, queued work waits while no connected daemon can run it (none satisfies its platform, or none that does is large enough) before it is refused FAILED_PRECONDITION. The wait restarts whenever one can
           
@@ -134,16 +129,6 @@ Options:
 
       --no-memory-climb
           Keeps an action's memory booking where it started. An action that passes its own memory limit is not run again on the next rung of `--memory-ladder-gib`: the kill finishes it, FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, as a kill at the largest node does, and its attempt is recorded with `memory_kill` `own_limit`. A booking is therefore the first rung, or the GiB the action names in `kbf-book-mem-gib`. No floor is raised, so with `--learned-sizes on` an own-limit kill leaves none either. A kill the node made under memory pressure is not the action's: it runs again with the same booking, as it does without this flag
-
-      --vm-host-floor-cpus <VM_HOST_FLOOR_CPUS>
-          The cores a node that reports VM slots (`vm.slots`) keeps for the host itself: subtracted from the CPUs placement may book on it, so that guests cannot take the host's own share. A node that reports none books the whole machine
-          
-          [default: 2]
-
-      --vm-host-floor-mem-gib <VM_HOST_FLOOR_MEM_GIB>
-          The memory, in GiB, a node that reports VM slots (`vm.slots`) keeps for the host itself, subtracted as `--vm-host-floor-cpus` subtracts cores
-          
-          [default: 8]
 
       --learned-sizes <LEARNED_SIZES>
           What the farm does with `kbf-estimator`, which predicts an action's memory from what its earlier runs used. `off` calls it never. `shadow` shows it every attempt that finishes and logs, for every new operation, a `size estimate:` line with what it would book, and counts how the attempts fall against its estimates (`kbf_estimator_shadow_total`); it books exactly what `off` books. `on` is `shadow` plus one change to a booking: a kill at an action's own memory limit leaves a floor under the action's key (instance, platform class, instrument and shape), which every later digest of the key, queued or new, books at least, strictly below the memory of the largest node that could run it. The floor falls only by the estimator's decay: it halves once the key has run 256 times and 7 days have passed without an own-limit kill or a sample above half of it, and a floor that falls to the first rung or below is dropped; a kill raises it again. Only an action whose memory the client did not name, on a platform that pins the OS, is keyed. The size summaries and the keys are kept in the state store, in rows of their own that a release without this flag never reads; `off` neither reads nor deletes the summaries, and ignores the keys. The memory a floor raised a queued operation to is not stored: a restart, or a rollback to `off`, books such an operation at its submitted memory until it ends
@@ -231,13 +216,13 @@ Options:
           [default: 20]
 
       --async-threads <N>
-          Worker threads of the async runtime, which run every task between its waits. Default: every CPU the process may use on the server; `max(2, reserve/4)`, at most the physical cores, on the daemon
+          Worker threads of the async runtime, which run every task between its waits. Default: every CPU the process may use
 
       --blocking-threads <N>
-          The most threads the runtime's blocking pool runs at once, for calls that wait on a disk or a process (a thread is made when a call needs one and ends when idle). Default: 512 (tokio's) for the server, 64 for the daemon
+          The most threads the runtime's blocking pool runs at once, for calls that wait on a disk or a process (a thread is made when a call needs one and ends when idle). Default: 512 (tokio's)
 
       --cpu-threads <N>
-          Threads for CPU-bound work, such as hashing, which never waits and so is held to the CPUs. Default: every CPU the process may use on the server; `max(2, reserve/2)`, at most the physical cores, on the daemon
+          Threads for CPU-bound work, such as hashing, which never waits and so is held to the CPUs. Default: every CPU the process may use
 
       --invocation-memory <INVOCATION_MEMORY>
           The memory, in bytes, the invocation records may take together (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id go first, then idle ones, least recently seen first; with only open builds left, the largest stops taking rows. Records are kept in memory only and lost on restart. Their heap was measured at up to 1.08 times this at 200 kB and above, and 1.12 at 50 kB (section 3.5)
@@ -275,7 +260,7 @@ Options:
           [default: 10000]
 
       --worker-max-streams <WORKER_MAX_STREAMS>
-          The most HTTP/2 streams one connection to the worker listener may have open: a daemon's persistent session stream and its short transfer streams. At least 1, at most 32767
+          The most HTTP/2 streams one connection to the worker listener may have open: a storage node's short unary calls. At least 1, at most 32767
           
           [default: 200]
 

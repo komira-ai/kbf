@@ -116,11 +116,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_map::{DenyEntry, Map, MapError, Member, MemberId, MemberState, Rule};
-use kbf_mapsync::{MapSource, RETAINED_MAPS};
+use kbf_mapsync::RETAINED_MAPS;
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_state::{Cond, Store, StoreError, StoreTime, Txn, Versioned};
 use prost::Message as _;
-use tokio::sync::watch;
 
 use crate::storage_health::{
     MemberReport, NotIdle, Planned, Report, Reported, StorageHealth, node_idle, storage_health,
@@ -499,8 +498,6 @@ pub struct Members {
     config: MembershipConfig,
     /// The newest map this process has seen, whoever bumped it, and those before it.
     seen: Mutex<Seen>,
-    /// Its generation (0 before any): [`MapSource::changes`].
-    generation: watch::Sender<u64>,
     /// The oldest protocol this build accepts: the least floor of any map it makes.
     oldest: u32,
     /// Automatic promotion of joiners ([`Members::with_handoff`]); `None`: by an operator only.
@@ -533,7 +530,6 @@ impl Members {
             store,
             config,
             seen: Mutex::default(),
-            generation: watch::Sender::new(0),
             oldest,
             handoff: None,
             denied_seen: Mutex::new(None),
@@ -551,21 +547,15 @@ impl Members {
     }
 
     /// Notes `map` as seen: if it is newer than the last, keeps it (and the one it
-    /// replaced) and wakes the [`MapSource::changes`] receivers. `older` are maps the
+    /// replaced). `older` are maps the
     /// store holds from before `map` (the pins, or the map a bump replaced): those this
     /// process does not have join its history, which stays newest first and at most
     /// [`RETAINED_MAPS`] long.
     fn publish(&self, map: &Map, older: Vec<Map>) {
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        if seen
-            .latest
-            .as_ref()
-            .is_none_or(|l| l.generation() < map.generation())
-        {
-            if let Some(replaced) = seen.latest.replace(Arc::new(map.clone())) {
-                seen.history.insert(0, replaced);
-            }
-            self.generation.send_replace(map.generation());
+        let newer = (seen.latest.as_ref()).is_none_or(|l| l.generation() < map.generation());
+        if newer && let Some(replaced) = seen.latest.replace(Arc::new(map.clone())) {
+            seen.history.insert(0, replaced);
         }
         let newest = seen.latest.as_ref().map_or(0, |l| l.generation());
         for map in older {
@@ -589,21 +579,6 @@ impl Members {
         let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         let latest = seen.latest.clone()?;
         Some((latest, seen.history.clone()))
-    }
-
-    /// The map the push protocol reads: its current value (`None` until the first member
-    /// registers) and a receiver of its generation, which changes on every bump this
-    /// process commits or observes (a bump by another frontend is seen at the next
-    /// [`Members::refresh`], which the frontend runs every beat). Seeded from the store,
-    /// so a restarted frontend has the map its members left.
-    ///
-    /// # Errors
-    /// The store failing.
-    pub fn map_source(self: &Arc<Self>) -> Result<Arc<dyn MapSource>, MembershipError> {
-        self.current_map()?;
-        Ok(Arc::new(MemberMap {
-            members: Arc::clone(self),
-        }))
     }
 
     /// The deny list as the newest read of the `deny/` rows found it ([`Members::refresh`],
@@ -640,7 +615,7 @@ impl Members {
     /// holds decides, not the build's constants. The map is read first, then the node's
     /// protocol compared, and only then is an identity assigned: a refused node leaves no
     /// row. The read is [`Members::current_map`], so it also publishes the stored map to
-    /// [`Members::view`] and [`MapSource::changes`], refused or not, and a registration costs
+    /// [`Members::view`], refused or not, and a registration costs
     /// one more store read than it did. The read and the commit are not one transaction: a
     /// floor another frontend raises between them is not applied to this call.
     ///
@@ -1180,7 +1155,7 @@ impl Members {
     }
 
     /// The current map, or `None` before the first member registered. This is what a
-    /// map push (`Welcome.map`, `MapUpdate`) and a `STALE_MAP` answer read.
+    /// `STALE_MAP` answer reads.
     ///
     /// # Errors
     /// The store failing; the stored map not decoding.
@@ -1401,19 +1376,4 @@ fn decode_id(value: &[u8]) -> Result<u64, MembershipError> {
     <[u8; 8]>::try_from(value)
         .map(u64::from_be_bytes)
         .map_err(|_| MembershipError::Corrupt("instance entry is not a member id".to_owned()))
-}
-
-/// [`Members`] as a [`MapSource`].
-struct MemberMap {
-    members: Arc<Members>,
-}
-
-impl MapSource for MemberMap {
-    fn current(&self) -> Option<Arc<Map>> {
-        self.members.view().map(|(latest, _)| latest)
-    }
-
-    fn changes(&self) -> watch::Receiver<u64> {
-        self.members.generation.subscribe()
-    }
 }

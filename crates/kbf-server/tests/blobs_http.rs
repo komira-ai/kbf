@@ -47,15 +47,12 @@ impl Server {
             worker: loopback(),
             reapi_tls: None,
             worker_tls: None,
-            heartbeat_interval: Duration::from_millis(200),
-            hello_wait: Duration::from_secs(5),
             tick: Duration::from_millis(50),
             unservable_wait: kbf_sched::UNSERVABLE_WAIT,
             default_platform: kbf_front::DefaultPlatform::NONE,
             qos_allowed: kbf_front::QosAllow::DEFAULT,
             memory_ladder: kbf_server::MemoryLadder::default(),
             memory_climb: true,
-            vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: kbf_server::LearnedSizes::Off,
             exclusive_actions: false,
             placement_load: kbf_server::PlacementLoad::Off,
@@ -67,7 +64,6 @@ impl Server {
             streams: kbf_server::StreamTiming::default(),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
-            segments: kbf_front::SegmentsConfig::DEFAULT,
             stream_limits: kbf_server::StreamLimits::DEFAULT,
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -77,7 +73,6 @@ impl Server {
         let api = Api {
             listen: loopback(),
             token: None,
-            local_cache: None,
         };
         let bound =
             bind_server_with_policy(Arc::clone(&cache), listeners, Some(api), policy, shutdown)

@@ -41,17 +41,14 @@ pub enum JobService {
     /// from. Only reads.
     AgentEgress(crate::agent_egress::AgentEgressArgs),
     /// Print what switching the frontend's executor onto the job service sets in the
-    /// `[executor]` table of its `kbf.toml`: each key now and then, the executor flags, and
-    /// the flags of the mode it runs now (the back-out). Changes nothing.
+    /// `[executor]` table of its `kbf.toml`: each key now and then, and the executor flags.
+    /// Changes nothing.
     Plan(crate::cutover::Target),
     /// Switch the frontend's executor onto the job service: check the service, rewrite the
     /// `[executor]` table (the original kept beside it), drain and restart the frontend
     /// through kbf-host-install, wait for its first virtual worker, and run one canary job.
     /// A dry run without --apply.
     Apply(Box<crate::cutover_apply::ApplyArgs>),
-    /// Put back the `kbf.toml` that `apply` kept, and drain and restart the frontend the
-    /// same way. A dry run without --apply.
-    BackOut(crate::cutover_apply::BackOutArgs),
 }
 
 /// The arguments of `kbf-deploy job-service check`.
@@ -235,7 +232,7 @@ fn runtime() -> io::Result<Runtime> {
         .build()
 }
 
-/// Run a `job-service` verb. `host` runs the tools and HTTP asks of `apply` and `back-out`;
+/// Run a `job-service` verb. `host` runs the tools and HTTP asks of `apply`;
 /// `now_secs` names the canary job.
 pub(crate) fn run(
     verb: &JobService,
@@ -244,13 +241,12 @@ pub(crate) fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    use crate::cutover_apply::{Verb, run_on as run_cutover};
+    use crate::cutover_apply::run_on as run_cutover;
     match verb {
         JobService::Check(a) => run_on(runtime(), a, out, err),
         JobService::AgentEgress(a) => crate::agent_egress::run(a, out, err),
         JobService::Plan(t) => crate::cutover::run_plan(t, out, err),
-        JobService::Apply(a) => run_cutover(runtime(), Verb::Apply(a, now_secs), host, out, err),
-        JobService::BackOut(a) => run_cutover(runtime(), Verb::BackOut(a), host, out, err),
+        JobService::Apply(a) => run_cutover(runtime(), a, now_secs, host, out, err),
     }
 }
 

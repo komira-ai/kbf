@@ -253,28 +253,26 @@ pub(super) fn methods(fake: &FakeJobServer) -> Vec<&'static str> {
         .collect()
 }
 
-/// Catches an executor built where none was asked for: a frontend of `kbf-daemon`, given or not
-/// given the flag, and given every setting of a job service (as a unit is, after the rollback),
-/// serves and stops without one call to the job service, and its metrics have no executor
-/// family. An executor would have listed its jobs before it could be stopped.
+/// Catches an executor built where none was asked for: a frontend given no `--executor` flag,
+/// and given every setting of a job service, serves and stops without one call to the job
+/// service, and its metrics have no executor family. An executor would have listed its jobs
+/// before it could be stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_that_runs_on_daemons_never_contacts_the_job_service() {
-    for executor in [&["--executor=kbf-daemon"][..], &[]] {
-        let s3 = FakeS3::start().await;
-        let dir = scratch_dir("executor-default");
-        let fake = job_server(&["host-1"]).await;
-        let flags = flags(dir.path(), &s3, &fake, executor);
-        let (handle, stop) = started(&flags, Some(source())).expect("starts");
-        let api = handle.api.expect("the operator API");
-        let served = tokio::spawn(handle.serve());
-        let text = scrape(api).await;
-        assert!(!text.contains("kbf_executor_"), "{text}");
-        stop.send(()).expect("stopped");
-        served.await.expect("joined").expect("served");
-        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
-        // The flag's directory exists and holds the release's bundle: nothing is read from it.
-        assert!(s3.keys().is_empty(), "{:?}", s3.keys());
-    }
+async fn a_frontend_with_no_executor_never_contacts_the_job_service() {
+    let s3 = FakeS3::start().await;
+    let dir = scratch_dir("executor-default");
+    let fake = job_server(&["host-1"]).await;
+    let flags = flags(dir.path(), &s3, &fake, &[]);
+    let (handle, stop) = started(&flags, Some(source())).expect("starts");
+    let api = handle.api.expect("the operator API");
+    let served = tokio::spawn(handle.serve());
+    let text = scrape(api).await;
+    assert!(!text.contains("kbf_executor_"), "{text}");
+    stop.send(()).expect("stopped");
+    served.await.expect("joined").expect("served");
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    // The flag's directory exists and holds the release's bundle: nothing is read from it.
+    assert!(s3.keys().is_empty(), "{:?}", s3.keys());
 }
 
 /// Catches an executor that does not live with the frontend: it asks nothing of the job service

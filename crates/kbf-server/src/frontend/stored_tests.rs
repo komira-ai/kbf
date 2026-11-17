@@ -90,15 +90,12 @@ async fn a_frontend_with_no_storage_needs_the_executor_the_pack_index_and_the_pa
     daemon.retain(|flag| !flag.starts_with("--executor="));
     let why = refused(argv_over(None, &daemon));
     assert!(
-        why.contains("no --storage needs --executor js-agent") && why.contains("kbf-daemon"),
+        why.contains("no --storage needs --executor js-agent") && !why.contains("kbf-daemon"),
         "{why}"
     );
     daemon.push("--executor=kbf-daemon".to_owned());
     let why = refused(argv_over(None, &daemon));
-    assert!(
-        why.contains("no --storage needs --executor js-agent"),
-        "{why}"
-    );
+    assert!(why.contains("--executor kbf-daemon is gone"), "{why}");
 
     let mut no_packs = full.clone();
     no_packs
