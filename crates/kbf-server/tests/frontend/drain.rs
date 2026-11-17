@@ -47,6 +47,18 @@ async fn reaches(member: &Member, phase: Phase) {
     seen.expect("the drain is alive");
 }
 
+/// Waits until `member`'s drain has left the wait: the sequence publishes `draining` only once
+/// it refuses new Execute calls and has sent GOAWAY, so an Execute sent after this is one the
+/// drain has had the chance to refuse (`Drain::end_lb_wait` only fires the event the
+/// sequence acts on).
+async fn leaves_the_wait(member: &Member) {
+    let mut phases = member.drain.phases();
+    let waiting = phases.wait_for(|now| !matches!(now, Phase::Serving | Phase::LbWait));
+    let left = tokio::time::timeout(SAFETY, waiting).await;
+    let seen = left.expect("the wait is left in time");
+    seen.expect("the drain is alive");
+}
+
 /// An HTTP/2 client connection to a listener, and the bytes the listener has sent on it.
 struct Conn {
     stream: TcpStream,
@@ -194,6 +206,7 @@ async fn the_wait_serves_unary_calls_and_its_end_refuses_new_work() {
     );
 
     a.drain.end_lb_wait();
+    leaves_the_wait(a).await;
     assert_refused_after_the_wait(&client, &second).await;
     a.exits().await;
     drop(client);
@@ -228,6 +241,7 @@ async fn a_stop_signal_runs_the_same_sequence() {
     );
 
     a.drain.end_lb_wait();
+    leaves_the_wait(a).await;
     assert_refused_after_the_wait(&client, &second).await;
     a.exits().await;
     drop(client);
