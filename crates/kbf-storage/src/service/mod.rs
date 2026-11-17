@@ -3,7 +3,7 @@
 //! `Arc<dyn Storage>`).
 //!
 //! **The wire.** Blob calls are the standard protocols, because every REAPI client and
-//! the daemon's transfer engine (`kbf-transfer`) already speak them:
+//! the transfer engine (`kbf-transfer`) already speak them:
 //!
 //! - `ContentAddressableStorage.FindMissingBlobs`. The batch calls and `GetTree` answer
 //!   UNIMPLEMENTED: a frontend reaches single blobs through ByteStream, and the batch
@@ -322,9 +322,8 @@ impl StorageService {
         )
     }
 
-    /// The service called in this process, without a connection ([`InProcess`]): what the
-    /// daemon half of a storage-and-daemon process uses for the one member that is its own
-    /// node, so that a write it makes takes the path a call from another node takes (the
+    /// The service called in this process, without a connection ([`InProcess`]): what a
+    /// caller in the same process uses for the one member that is its own node, so that a write it makes takes the path a call from another node takes (the
     /// generation check, the chain's forward to the replica).
     #[must_use]
     pub fn in_process(self: &Arc<Self>) -> InProcess {

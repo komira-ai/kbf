@@ -1,5 +1,0 @@
-remote
-cache
-farm
-action
-digest

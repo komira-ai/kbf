@@ -1,6 +1,6 @@
 //! [`RemoteStorage`]: a [`Storage`] over a gRPC connection to a storage node, so a
 //! caller keeps holding `Arc<dyn Storage>` whether the cache is in its process or not.
-//! This is the storage client the frontend (and, over a map, the daemon) uses.
+//! This is the storage client the frontend (and, over a map, any client of the farm) uses.
 
 use std::collections::VecDeque;
 use std::iter;

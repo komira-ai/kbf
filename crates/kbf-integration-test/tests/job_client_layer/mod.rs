@@ -166,7 +166,7 @@ fn a_crate_that_depends_on_the_job_client_is_named() {
                 {"name": "kbf-job-client", "kind": "dev"}, {"name": "tonic", "kind": null}]},
             {"name": "kbf-storage", "dependencies": [{"name": "kbf-job-client", "kind": null}]},
             {"name": "kbf-front", "dependencies": [{"name": "kbf-job-client", "kind": "dev"}]},
-            {"name": "kbf-node", "dependencies": [{"name": "tonic", "kind": null}]},
+            {"name": "kbf-sched", "dependencies": [{"name": "tonic", "kind": null}]},
             {"name": "kbf-deploy", "dependencies": [
                 {"name": "kbf-job-client", "kind": null},
                 {"name": "kbf-job-client", "kind": "dev"}]},

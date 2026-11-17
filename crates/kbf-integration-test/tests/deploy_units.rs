@@ -5,15 +5,13 @@
 //! - a server unit whose `ExecStart=` names a flag `kbf-server` does not have, gives one
 //!   a value it refuses, or leaves out a flag another requires (a deny list without
 //!   mutual TLS);
-//! - a unit that starts a binary neither this test nor `kbf-node`'s
-//!   (`src/deploy_doc_tests.rs`) parses, so its flags would go unchecked;
+//! - a unit that starts a binary this test does not parse, so its flags would go unchecked;
 //! - a flag `storage-node.md` lists as planned that `kbf-server` now accepts, so the doc
 //!   still calls built code planned;
-//! - a converged worked example that does not add up, or whose result is not the
-//!   converged daemon's `--actions-memory-max-gib`; a reservation that is not its unit's
-//!   `MemoryMin=`; a `kbf.slice` whose `MemoryMin=` is not the sum of its units';
-//! - units that break the priority order MinIO > `kbf-server` > `kbf-daemon` in
-//!   `OOMScoreAdjust=` or `CPUWeight=`;
+//! - a reservation that is not its unit's `MemoryMin=`; a `kbf.slice` whose `MemoryMin=` is
+//!   not the sum of its units';
+//! - units that break the priority order MinIO > `kbf-server` in `OOMScoreAdjust=` or
+//!   `CPUWeight=`;
 //! - a `kbf cluster ...` command line in a deploy doc (`switch-object-store.md`'s
 //!   commands and its held script among them) whose verb or flag `kbf cluster` does not
 //!   have, gives a value the verb refuses, or leaves out a flag the verb requires;
@@ -27,13 +25,12 @@ use clap::Parser as _;
 use clap::error::ErrorKind;
 use kbf_cli::cluster::object_store::ObjectStore;
 use kbf_cli::cluster::{MemberState, Verb};
-use kbf_integration_test::deploy_units::{Unit, fenced, table_after, units};
+use kbf_integration_test::deploy_units::{Unit, fenced, units};
 use kbf_integration_test::doc_commands::{ClusterCommand, cluster_commands};
 use kbf_server::Args;
 
-/// The binaries a unit may start: this test parses `kbf-server`'s flags, `kbf-node`'s
-/// tests parse `kbf-daemon`'s.
-const BINARIES: &[&str] = &["/usr/local/bin/kbf-server", "/usr/local/bin/kbf-daemon"];
+/// The binaries a unit may start: this test parses `kbf-server`'s flags.
+const BINARIES: &[&str] = &["/usr/local/bin/kbf-server"];
 
 fn deploy_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/deploy")
@@ -96,7 +93,6 @@ fn every_server_units_flags_parse_with_kbf_servers_parser() {
     // Catches: a misspelled or removed kbf-server flag in a doc, a value it refuses, a
     // missing required flag; a unit starting an unparsed binary; units that moved.
     let mut servers = 0;
-    let mut daemons = 0;
     for (name, _, units) in docs() {
         for u in &units {
             let Some(argv) = u.exec_start() else { continue };
@@ -107,22 +103,14 @@ fn every_server_units_flags_parse_with_kbf_servers_parser() {
                 u.path,
                 argv[0]
             );
-            if argv[0].ends_with("kbf-daemon") {
-                daemons += 1;
-                continue;
-            }
             servers += 1;
             if let Err(e) = Args::try_parse_from(&argv) {
                 panic!("{name} {}: kbf-server refuses its ExecStart=:\n{e}", u.path);
             }
         }
     }
-    // The server-only unit; the build host's and the converged host's daemons.
-    assert_eq!(
-        (servers, daemons),
-        (1, 2),
-        "units starting kbf-server, kbf-daemon"
-    );
+    // The server-only unit.
+    assert_eq!(servers, 1, "units starting kbf-server");
 }
 
 #[test]
@@ -147,59 +135,6 @@ fn the_planned_server_flags_are_still_refused() {
 }
 
 #[test]
-fn the_converged_worked_example_adds_up_and_is_the_daemons_cap() {
-    // Catches: one number in the worked example changed so it no longer adds up, the
-    // converged daemon's cap not the example's result, a reservation that is not its
-    // unit's MemoryMin=.
-    let (text, units) = storage_node();
-    let rows = table_after(&text, "### Worked example: a 256 GiB host");
-    let gib = |label: &str| -> u64 {
-        let row = rows
-            .iter()
-            .find(|r| r[0] == label)
-            .unwrap_or_else(|| panic!("no row {label:?} in {rows:?}"));
-        row[1].parse().unwrap_or_else(|_| panic!("{row:?}"))
-    };
-    let subtracted: Vec<u64> = rows
-        .iter()
-        .filter(|r| r[0].starts_with("minus "))
-        .map(|r| r[1].parse().expect("GiB"))
-        .collect();
-    assert_eq!(subtracted.len(), 3, "MinIO, kbf-server, the OS: {rows:?}");
-    let cap = gib("`--actions-memory-max-gib`");
-    assert_eq!(gib("RAM") - subtracted.iter().sum::<u64>(), cap, "{rows:?}");
-
-    let daemon = unit(
-        &units,
-        "Converged units",
-        "/etc/systemd/system/kbf-daemon.service",
-    );
-    let flag = format!("--actions-memory-max-gib={cap}");
-    let argv = daemon.exec_start().expect("ExecStart").expect("argv");
-    assert!(
-        argv.contains(&flag),
-        "the converged daemon needs {flag}: {argv:?}"
-    );
-
-    // A reservation is the unit's MemoryMin=.
-    let minio = unit(
-        &units,
-        "Server-only units",
-        "/etc/systemd/system/minio.service.d/kbf.conf",
-    );
-    let server = unit(
-        &units,
-        "Server-only units",
-        "/etc/systemd/system/kbf-server.service",
-    );
-    assert_eq!(memory_min(minio), gib("minus MinIO's reservation") * 1024);
-    assert_eq!(
-        memory_min(server),
-        gib("minus `kbf-server`'s reservation") * 1024
-    );
-}
-
-#[test]
 fn each_slice_protects_the_sum_of_its_units() {
     // Catches: a slice MemoryMin= below its units' sum (the kernel caps their
     // protection at it) or above it (the excess goes to builds), and a unit outside
@@ -215,9 +150,7 @@ fn each_slice_protects_the_sum_of_its_units() {
         "Server-only units",
         "/etc/systemd/system/kbf-server.service",
     );
-    let daemon = of("Converged units", "/etc/systemd/system/kbf-daemon.service");
     assert_eq!(slice("Server-only units"), minio + server);
-    assert_eq!(slice("Converged units"), minio + server + daemon);
     for u in units.iter().filter(|u| !u.path.ends_with(".slice")) {
         assert_eq!(u.get("Slice"), Some("kbf.slice"), "{}", u.path);
     }
@@ -225,8 +158,8 @@ fn each_slice_protects_the_sum_of_its_units() {
 
 #[test]
 fn the_units_keep_the_priority_order() {
-    // Catches: an OOMScoreAdjust= or CPUWeight= edit that ranks the daemon above the
-    // server or the server above MinIO, or the daemon at or above builds' 0.
+    // Catches: an OOMScoreAdjust= or CPUWeight= edit that ranks the server above MinIO,
+    // or the server at or above builds' 0.
     let (_, units) = storage_node();
     let order = [
         unit(
@@ -238,11 +171,6 @@ fn the_units_keep_the_priority_order() {
             &units,
             "Server-only units",
             "/etc/systemd/system/kbf-server.service",
-        ),
-        unit(
-            &units,
-            "Converged units",
-            "/etc/systemd/system/kbf-daemon.service",
         ),
     ];
     let values = |key: &str| -> Vec<i64> {
@@ -256,7 +184,7 @@ fn the_units_keep_the_priority_order() {
         oom.is_sorted_by(|a, b| a < b),
         "OOMScoreAdjust= must rise: {oom:?}"
     );
-    assert!(oom[2] < 0, "builds run at 0, below the daemon: {oom:?}");
+    assert!(oom[1] < 0, "builds run at 0, below the server: {oom:?}");
     let cpu = values("CPUWeight");
     assert!(
         cpu.is_sorted_by(|a, b| a > b),

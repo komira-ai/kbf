@@ -50,8 +50,8 @@ fn published_files_from_another_job_are_refused() {
         .find(|(p, _)| p.ends_with("smoke.yml"))
         .expect("the pipeline calls smoke.yml");
     let spoiled = text.replacen(
-        "name: beta-b0-${{ github.run_attempt }}",
-        "name: assets-darwin-arm64-b0",
+        "      - uses: actions/cache/save@",
+        "      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n        with:\n          name: assets-darwin-arm64-b0\n          path: dist/\n      - uses: actions/cache/save@",
         1,
     );
     assert_ne!(*text, spoiled, "smoke.yml is spoiled");

@@ -26,7 +26,7 @@
 //! operation, status OK, an `ActionResult` not from the cache, exit 0) and, if not, why;
 //! and the per-lease phases the result's `ExecutedActionMetadata` carries: the worker, the
 //! frontend's queued and worker times, and the input fetch, execution and output upload
-//! (a daemon's own stamps, the fields of its `lease phases:` line; under the executor, the
+//! (a worker's own stamps, or under the executor the
 //! task's claim, marked `claimed`). Nothing here asserts or judges a number: that is the
 //! reader's (`js-analysis`).
 
@@ -143,7 +143,7 @@ pub struct Record {
     /// The result's worker, when there is a result.
     pub worker: Option<String>,
     /// `input_fetch_ms`, `execution_ms` and `output_upload_ms` are a task's claim
-    /// (`kbf_proto::task_claim`), not a daemon's measurement; `queued_ms` and
+    /// (`kbf_proto::task_claim`), not a worker's measurement; `queued_ms` and
     /// `worker_ms` are the frontend's own times either way.
     pub claimed: bool,
     /// `queued_timestamp` to `worker_start_timestamp`.

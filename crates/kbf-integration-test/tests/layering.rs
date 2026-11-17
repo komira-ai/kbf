@@ -19,38 +19,19 @@
 //!   pass vacuously;
 //! - a pure module of an impure crate (`PURE_MODULES`) whose file no longer denies
 //!   the `clippy.toml` lists, or that was moved or removed;
-//! - the server and the worker daemon linked together outside the one crate meant to
-//!   (`JOINERS`): `kbf-server` and `kbf-node` are libraries so a combined binary can
-//!   run both in one process, and any other crate that links both, or either one into
-//!   the other's side of the farm, makes the split meaningless;
-//! - a `main.rs` of those two that grows past `THIN_MAIN_LINES` code lines, which
-//!   means assembly that a combined binary could not reuse is back in a binary;
+//! - the server (`kbf-server`) depending, directly or through another crate, on the blob
+//!   transfer engine (`SERVER_MUST_NOT_REACH`): the server stores and schedules, it never moves
+//!   blobs as a client;
+//! - a `main.rs` of the server or the `kbf` binary that grows past `THIN_MAIN_LINES` code lines,
+//!   which means assembly that another binary could not reuse is back in a binary;
 //! - the storage crate (`kbf-storage`) depending, directly or through another crate, on
 //!   a frontend crate (`STORAGE_MUST_NOT_REACH`: the scheduler and authorization), which
 //!   would make a storage process link the frontend; and the storage crate renamed or
 //!   removed, which would make that check pass vacuously;
 //! - the routing library (`kbf-route`) depending, directly or through another crate, on a
-//!   frontend crate, the server, or the daemon's side (`ROUTE_MUST_NOT_REACH`): the
-//!   frontend and the daemon both link it, and neither may pull in the other's code
+//!   frontend crate, the server, or the transfer engine (`ROUTE_MUST_NOT_REACH`): the
+//!   frontend and the storage nodes both link it, and neither may pull in the other's code
 //!   through it;
-//! - a daemon crate (`DAEMON_ONLY`: `kbf-node`, the `kbf-daemon` binary's library, and
-//!   `kbf-daemon` beneath it) depending, directly or through another crate, on a crate that
-//!   holds the cold store behind its cache, or on a standalone HTTP client one could be
-//!   written over (`COLD_STORE_CLIENT`); and a walk that cannot see those crates (renamed,
-//!   or the server no longer reaching the front), which would make that check pass
-//!   vacuously. A daemon-only node holds no cold-store credential and reaches bytes
-//!   through storage (docs/design/architecture-v2.md, section 9). The one exception is
-//!   `--pack-read` (`kbf_daemon::packed`): a daemon reads the packs of the farm's object
-//!   store with a key that may read `cas/` and write nothing, in a file named by a flag,
-//!   so the daemon crates now reach the object store client (`kbf-objstore`) and the HTTP
-//!   client it is written over (`reqwest`), and the check no longer refuses them. What this
-//!   pins is the daemon's code: the daemon crates cannot build the cold store of a
-//!   frontend or a storage node. The deployed `kbf daemon` is the `kbf` binary
-//!   (`kbf-cli`), which links `kbf-server` for its other modes (`JOINERS`). For that
-//!   binary the protection is that it is given no credential in its environment: its unit
-//!   loads no environment file or systemd credential (kbf-deploy's `linux/modes_tests.rs`),
-//!   and no daemon flag names a store or reads an environment variable, but the seven
-//!   `--pack-read` flags, which take a key file and never a secret (kbf-cli's tests);
 //! - the front-door proxy library (`kbf-proxy`) depending, directly or through another crate,
 //!   on a child's, the installer's or the runtime's crates (`PROXY_MUST_NOT_REACH`); and any
 //!   file of `kbf-installer/src` outside `MAY_NAME_THE_PROXY`, the root helper first of all,
@@ -62,11 +43,11 @@
 //!   without its `proxy` feature (`kbf-installer` turns it on), so the tree of
 //!   `cargo build -p kbf-cli` holds `kbf-setup` and no `kbf-proxy`;
 //! - the packing client (`kbf-pack`) depending, directly or through another crate, on the
-//!   frontend, the server, the storage node or the daemon (`PACK_MUST_NOT_REACH`); and a walk
+//!   frontend, the server or the storage node (`PACK_MUST_NOT_REACH`); and a walk
 //!   that cannot see `kbf-objstore` beneath it, which would make that check pass vacuously;
 //! - the pack adoption tool (`kbf-pack-adopt`) depending, directly or through another crate, on
-//!   a crate of `PACK_MUST_NOT_REACH`, so that the operator binary never links the frontend, the
-//!   server or the daemon; and a walk that cannot see `kbf-pack` beneath it;
+//!   a crate of `PACK_MUST_NOT_REACH`, so that the operator binary never links the frontend or the
+//!   server; and a walk that cannot see `kbf-pack` beneath it;
 //! - the state store (`kbf-state`, a re-export of `js-state`) depending on any other crate of
 //!   this workspace (with its test-database feature too, which brings `js-testkit` and not
 //!   `kbf-testkit`), which would stop it from being extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;
@@ -417,22 +398,9 @@ fn pure_modules_deny_the_clippy_lists() {
     }
 }
 
-/// The crates allowed to depend on both the server and the node library: the combined
-/// binary and the one `kbf` binary.
-const JOINERS: &[&str] = &["kbf-storage-and-daemon", "kbf-cli"];
-
-/// What the server library's normal dependencies must not reach: the daemon side. The
-/// server stores and schedules; it never moves blobs as a client.
-const DAEMON_SIDE: &[&str] = &[
-    "kbf-node",
-    "kbf-daemon",
-    "kbf-transfer",
-    "kbf-driver-container",
-    "kbf-driver-native",
-];
-
-/// What the node library's normal dependencies must not reach: the server side.
-const SERVER_SIDE: &[&str] = &["kbf-server", "kbf-front"];
+/// What the server library's normal dependencies must not reach: the blob transfer engine.
+/// The server stores and schedules; it never moves blobs as a client.
+const SERVER_MUST_NOT_REACH: &[&str] = &["kbf-transfer"];
 
 /// Names in `names` that `root`'s normal closure contains, with the chain reaching each.
 fn reaches(g: &Graph, root: &str, names: &[&str]) -> Vec<String> {
@@ -448,30 +416,20 @@ fn reaches(g: &Graph, root: &str, names: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn server_and_node_libraries_stay_apart() {
+fn the_server_does_not_link_the_transfer_engine() {
     let g = load_graph();
-    let mut violations = Vec::new();
-    for lib in ["kbf-server", "kbf-node"] {
-        let (_, root) = &g.members[lib];
-        assert!(root.is_some(), "{lib} must have a library target");
+    for name in SERVER_MUST_NOT_REACH {
+        assert!(
+            g.names.values().any(|n| n == *name),
+            "{name} is not a package of the workspace's graph"
+        );
     }
-    violations.extend(reaches(&g, "kbf-server", DAEMON_SIDE));
-    violations.extend(reaches(&g, "kbf-node", SERVER_SIDE));
-    for (member, (id, _)) in &g.members {
-        if JOINERS.contains(&member.as_str()) {
-            continue;
-        }
-        let linked: BTreeSet<&str> = normal_closure(&g, id)
-            .keys()
-            .map(|dep| g.names[dep].as_str())
-            .collect();
-        if linked.contains("kbf-server") && linked.contains("kbf-node") {
-            violations.push(format!("{member} links both kbf-server and kbf-node"));
-        }
-    }
+    let (_, root) = &g.members["kbf-server"];
+    assert!(root.is_some(), "kbf-server must have a library target");
+    let violations = reaches(&g, "kbf-server", SERVER_MUST_NOT_REACH);
     assert!(
         violations.is_empty(),
-        "the server and the node library are linked together outside {JOINERS:?}:\n{}",
+        "the server links the transfer engine:\n{}",
         violations.join("\n")
     );
 }
@@ -480,13 +438,9 @@ fn server_and_node_libraries_stay_apart() {
 const THIN_MAIN_LINES: usize = 40;
 
 #[test]
-fn the_server_and_daemon_binaries_are_thin() {
+fn the_server_and_kbf_binaries_are_thin() {
     let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    for main in [
-        "kbf-server/src/main.rs",
-        "kbf-node/src/main.rs",
-        "kbf-cli/src/main.rs",
-    ] {
+    for main in ["kbf-server/src/main.rs", "kbf-cli/src/main.rs"] {
         let path = crates.join(main);
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -597,71 +551,9 @@ fn the_updater_has_no_tie_to_the_proxy() {
     }
 }
 
-/// The daemon crates: the daemon's code, which the `kbf-daemon` binary is and which
-/// `kbf daemon` runs inside the `kbf` binary, with the drivers, which `kbf-node` names
-/// and so are in its closure.
-const DAEMON_ONLY: &[&str] = &["kbf-node", "kbf-daemon"];
-
-/// What a daemon crate's normal dependencies must not reach: the crates that hold the cold
-/// store behind their cache and build it from a cold-store URI (`kbf-front`, `kbf-server`),
-/// and a standalone HTTP client an S3 client could be written over (`ureq`). The object
-/// store client (`kbf-objstore`) and the `reqwest` it is written over are not listed since
-/// `--pack-read`: a daemon reads packs with it (the module docs). `hyper-util` is not listed
-/// either: tonic's channel, which the daemon dials the server with, is built on its client.
-const COLD_STORE_CLIENT: &[&str] = &["kbf-front", "kbf-server", "ureq"];
-
-#[test]
-fn a_daemon_cannot_build_a_cold_store_client() {
-    let g = load_graph();
-    // Every name the check looks for is a package of the graph, and the walk sees the
-    // crate where it is linked: the server holds the front, which builds the cold store.
-    // Without these, a renamed or misspelled crate would pass the check below.
-    for name in COLD_STORE_CLIENT {
-        assert!(
-            g.names.values().any(|n| n == *name),
-            "{name} is not a package of the workspace's graph"
-        );
-    }
-    assert!(
-        !reaches(&g, "kbf-server", &["kbf-front"]).is_empty(),
-        "the server's closure must reach kbf-front, or this walk proves nothing"
-    );
-    let violations: Vec<String> = DAEMON_ONLY
-        .iter()
-        .flat_map(|daemon| reaches(&g, daemon, COLD_STORE_CLIENT))
-        .collect();
-    assert!(
-        violations.is_empty(),
-        "a daemon crate reaches a crate that builds the cold store or a standalone HTTP \
-         client (a daemon-only node holds no cold-store credential, \
-         docs/design/architecture-v2.md section 9):\n{}",
-        violations.join("\n")
-    );
-}
-
-/// The daemon bins each lease's usage with the jobscheduler's standalone `js-agent-usage`
-/// crate, which depends on nothing. The crates that read the same files and post them
-/// (`js-agent`, `js-client`) are in no package of the workspace's graph: a daemon that took
-/// `js-agent` would reach `ureq`, and `a_daemon_cannot_build_a_cold_store_client` would say
-/// only that; this one says why.
-#[test]
-fn a_daemon_takes_the_usage_binner_from_js_agent_usage_alone() {
-    let g = load_graph();
-    assert!(
-        !reaches(&g, "kbf-daemon", &["js-agent-usage"]).is_empty(),
-        "kbf-daemon's closure must hold js-agent-usage"
-    );
-    for name in ["js-agent", "js-client"] {
-        assert!(
-            !g.names.values().any(|n| n == name),
-            "{name} is a package of the workspace's graph"
-        );
-    }
-}
-
 /// What the routing library's normal dependencies must not reach: the frontend's scheduler
-/// and authorization, the server, and the daemon's side (the transfer engine and the node).
-/// The frontend and the daemon both use it (docs/design/architecture-v2.md, section 7); a
+/// and authorization, the server, and the transfer engine.
+/// The frontend and the storage nodes both use it (docs/design/architecture-v2.md, section 7); a
 /// path to either side's code would make the other link it.
 const ROUTE_MUST_NOT_REACH: &[&str] = &[
     "kbf-sched",
@@ -669,12 +561,10 @@ const ROUTE_MUST_NOT_REACH: &[&str] = &[
     "kbf-front",
     "kbf-server",
     "kbf-transfer",
-    "kbf-node",
-    "kbf-daemon",
 ];
 
 #[test]
-fn route_reaches_neither_the_frontend_nor_the_daemon() {
+fn route_reaches_neither_the_frontend_nor_the_transfer_engine() {
     let g = load_graph();
     let (_, root) = g
         .members
@@ -684,16 +574,14 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
     let violations = reaches(&g, "kbf-route", ROUTE_MUST_NOT_REACH);
     assert!(
         violations.is_empty(),
-        "kbf-route reaches a frontend or daemon crate:\n{}",
+        "kbf-route reaches a frontend or transfer crate:\n{}",
         violations.join("\n")
     );
 }
 
 /// What the packing client's normal dependencies must not reach: the frontend's scheduler and
-/// authorization, the server and the storage node, and the daemon's side. A frontend and a
-/// daemon (`--pack-read`) use the packing client; a path to either side's code would make the
-/// other link it. Wiring it into the daemon changed `COLD_STORE_CLIENT`, as `kbf-pack` is
-/// written over `kbf-objstore`.
+/// authorization, the server and the storage node, and the transfer engine. A frontend uses
+/// the packing client; a path to the server's or the engine's code would make it link them.
 const PACK_MUST_NOT_REACH: &[&str] = &[
     "kbf-sched",
     "kbf-auth",
@@ -701,16 +589,14 @@ const PACK_MUST_NOT_REACH: &[&str] = &[
     "kbf-server",
     "kbf-storage",
     "kbf-transfer",
-    "kbf-node",
-    "kbf-daemon",
     "kbf-cli",
 ];
 
-/// Asserts that the packing client (`kbf-pack`) reaches neither the frontend nor the daemon,
+/// Asserts that the packing client (`kbf-pack`) reaches neither the frontend nor the transfer engine,
 /// and that the walk sees the object store client it is written over, so the check does not
 /// pass on an empty walk.
 #[test]
-fn pack_reaches_neither_the_frontend_nor_the_daemon() {
+fn pack_reaches_neither_the_frontend_nor_the_transfer_engine() {
     let g = load_graph();
     let (_, root) = g
         .members
@@ -724,7 +610,7 @@ fn pack_reaches_neither_the_frontend_nor_the_daemon() {
     let violations = reaches(&g, "kbf-pack", PACK_MUST_NOT_REACH);
     assert!(
         violations.is_empty(),
-        "kbf-pack reaches a frontend or daemon crate:\n{}",
+        "kbf-pack reaches a frontend or transfer crate:\n{}",
         violations.join("\n")
     );
 }
@@ -733,7 +619,7 @@ fn pack_reaches_neither_the_frontend_nor_the_daemon() {
 /// reaches none of the crates the packing client may not (`PACK_MUST_NOT_REACH`), and that the
 /// walk sees the packing client beneath it, so the check does not pass on an empty walk.
 #[test]
-fn pack_adopt_reaches_neither_the_frontend_nor_the_daemon() {
+fn pack_adopt_reaches_neither_the_frontend_nor_the_transfer_engine() {
     let g = load_graph();
     let (_, root) = g
         .members
@@ -747,7 +633,7 @@ fn pack_adopt_reaches_neither_the_frontend_nor_the_daemon() {
     let violations = reaches(&g, "kbf-pack-adopt", PACK_MUST_NOT_REACH);
     assert!(
         violations.is_empty(),
-        "kbf-pack-adopt reaches a frontend or daemon crate:\n{}",
+        "kbf-pack-adopt reaches a frontend or transfer crate:\n{}",
         violations.join("\n")
     );
 }
@@ -973,7 +859,7 @@ fn the_state_store_links_no_build_specific_crate() {
 }
 
 /// Asserts that the pack index (`kbf-pack-index`) links no workspace crate but the state
-/// store it keeps its tables in, with its Postgres feature on, so the frontend, the daemon,
+/// store it keeps its tables in, with its Postgres feature on, so the frontend,
 /// the packing client and the adoption tool can all depend on it without a cycle, and that
 /// the walk sees the state store beneath it, so the check does not pass on an empty walk.
 #[test]
@@ -999,8 +885,8 @@ fn the_pack_index_links_only_the_state_store() {
 /// What the front-door proxy library's normal dependencies must not reach
 /// (docs/design/kbf-proxy-api.md, sections 1 and 11). The proxy routes bytes: it never
 /// decodes a child's protocol (`kbf-proto`), runs none of the frontend, storage or node code
-/// (`kbf-server`, `kbf-front`, `kbf-storage`, `kbf-node`, `kbf-daemon`, the binaries
-/// `kbf-cli` and `kbf-storage-and-daemon`), and does not know the installer, its host plan or its
+/// (`kbf-server`, `kbf-front`, `kbf-storage`, the binary
+/// `kbf-cli`), and does not know the installer, its host plan or its
 /// update types (`kbf-installer`, `kbf-setup`, `kbf-host`, `kbf-update`, `kbf-deploy`): the
 /// admin calls to a child are the installer's, through a trait that lives there (the proxy
 /// makes none), and the installer and the setup library depend on the proxy, not the other way
@@ -1014,10 +900,7 @@ const PROXY_MUST_NOT_REACH: &[&str] = &[
     "kbf-server",
     "kbf-front",
     "kbf-storage",
-    "kbf-node",
-    "kbf-daemon",
     "kbf-cli",
-    "kbf-storage-and-daemon",
     "kbf-proto",
 ];
 

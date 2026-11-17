@@ -19,7 +19,7 @@ pub const MAX_PACK_BYTES: u64 = MAX_SEGMENT_BYTES;
 /// The most records a pack may hold, the manifest among them.
 pub const MAX_PACK_RECORDS: usize = 16_384;
 
-/// The longest record. A larger blob is never read from a pack by a daemon, so an output over
+/// The longest record. A larger blob is never read from a pack, so an output over
 /// this is a task failure, not a bigger pack.
 pub const MAX_RECORD_BYTES: u64 = 64 << 20;
 

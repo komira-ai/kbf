@@ -381,7 +381,7 @@ async fn the_segments_handlers_are_judged_too() {
 /// node rebuilds its index, a read (whole, ranged), a FindMissing with a miss, an
 /// action-cache lookup with no entry, and a Prepare or Commit naming a closure blob the store
 /// did not find must be UNAVAILABLE, with the very text the same node answers over the wire
-/// (the daemon then asks another owner instead of acting on a false miss). Once the rebuild
+/// (the caller then asks another owner instead of acting on a false miss). Once the rebuild
 /// is done the same calls are the store's own answers: NOT_FOUND, the digest listed, no entry,
 /// the Absent refusal.
 ///

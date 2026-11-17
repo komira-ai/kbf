@@ -1,11 +1,10 @@
 //! A run: the requests that send (or read back) a tree's blobs, made `in_flight` at a
 //! time over one channel, each one timed.
 //!
-//! `bytestream` moves each blob through the daemon's transfer engine
+//! `bytestream` moves each blob through the transfer engine
 //! ([`kbf_transfer::Transfers`], over the run's channel, its in-flight limit
-//! `in_flight`, the daemon's `--transfer-in-flight`; every other limit the engine's
-//! default): an upload is the engine's `put_chunks`, as the container driver stores an
-//! output file, so the engine first asks FindMissing about the blob (its calls
+//! `in_flight`; every other limit the engine's default): an upload is the engine's
+//! `put_chunks`, as an output file is stored, so the engine first asks FindMissing about the blob (its calls
 //! coalesced, one at a time) and sends a ByteStream Write only when the server lacks
 //! it; a read is the engine's ByteStream Read through memory, checked against its
 //! digest ([`kbf_transfer::fetch`]). `batch` packs blobs into BatchUpdateBlobs and
@@ -38,7 +37,7 @@ pub const FIND_MISSING_DIGESTS: usize = 1000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Method {
-    /// One ByteStream Write (or Read) per blob, as the daemon does.
+    /// One ByteStream Write (or Read) per blob, as the transfer engine does.
     Bytestream,
     /// BatchUpdateBlobs (or BatchReadBlobs) calls of up to `--batch-bytes` of data.
     Batch,
@@ -60,8 +59,8 @@ impl Method {
 pub struct Options {
     pub method: Method,
     /// The most requests in flight at once; at least 1. It bounds the requests the run
-    /// makes and is the engine's limit for the whole run (as `--transfer-in-flight` is
-    /// for a daemon), so a ByteStream write and the FindMissing call before it share it.
+    /// makes and is the engine's limit for the whole run (the engine's
+    /// in-flight limit), so a ByteStream write and the FindMissing call before it share it.
     pub in_flight: usize,
     /// Upload only: ask FindMissingBlobs first and send only what is missing.
     pub find_missing: bool,

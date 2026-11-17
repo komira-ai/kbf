@@ -1,5 +1,5 @@
 //! A kbf-server in this process over the in-memory cache, with a mutual-TLS worker
-//! listener and a plain-text REAPI listener, and the TLS files a daemon would hold.
+//! listener and a plain-text REAPI listener, and the TLS files of a node.
 
 #![allow(dead_code)]
 
@@ -55,7 +55,7 @@ impl Server {
         let signed = |names: Vec<String>, usage: ExtendedKeyUsagePurpose| {
             let mut params = CertificateParams::new(names).expect("params");
             if usage == ExtendedKeyUsagePurpose::ClientAuth {
-                // The daemon role, as the worker listener requires.
+                // The daemon role, which the worker listener's role table still requires.
                 let role = "urn:kbf:role:daemon".try_into().expect("an IA5 name");
                 params.subject_alt_names.push(SanType::URI(role));
             }
@@ -105,7 +105,7 @@ impl Server {
         self.dir.join(name)
     }
 
-    /// The worker listener, as a daemon reaches it: mutual TLS with a node certificate.
+    /// The worker listener, as a node reaches it: mutual TLS with a node certificate.
     pub fn worker_target(&self) -> Target {
         Target {
             cas: format!("https://{}", self.worker),

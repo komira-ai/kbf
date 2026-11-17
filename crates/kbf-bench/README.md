@@ -1,10 +1,10 @@
 # kbf-bench
 
-Times blob uploads to a kbf-server's CAS, and reads back, the way a daemon stores an
-action's outputs: so a slow output upload can be measured apart from the build that
+Times blob uploads to a kbf-server's CAS, and reads back, the way an
+action's outputs are stored: so a slow output upload can be measured apart from the build that
 made it, on the node that saw it, against the same server.
 
-`kbf-bench upload` builds a tree, connects as `kbf-daemon` does, sends every distinct
+`kbf-bench upload` builds a tree, connects with a node's TLS files, sends every distinct
 blob, and prints what each request took. `kbf-bench read` reads the same blobs back and
 checks each one against its digest.
 
@@ -28,25 +28,25 @@ stored, and the server does the whole write. Upload picks a seed from the clock 
 none is given; the report names it, and `read` needs it, with the same tree flags.
 
 Besides the files, a run sends each directory's REAPI `Directory` message (the output
-directory's too: 990 for the default tree) and one `Tree` message of them all, as the
-daemon does for an output directory. Each digest is sent once (the 144 empty files are
-one blob), as the daemon does.
+directory's too: 990 for the default tree) and one `Tree` message of them all, as is
+stored for an output directory. Each digest is sent once (the 144 empty files are
+one blob).
 
 ## The connection
 
 `--cas` is the blob service: a server's worker listener (`https://<server>:<worker
-port>`, as the daemon's `--cas`), or its REAPI listener (`https://`, or `http://` when
-it serves plain text). The TLS flags are the daemon's: `--ca-cert`, `--cert`, `--key`,
-`--tls-server-name`; with `--cert` and `--key` the files are loaded by the daemon's own
-loader. One HTTP/2 connection carries every request, as the daemon's does, with the
-daemon's default HTTP/2 windows (`--transfer-stream-window-bytes`, 8 MiB per stream and
+port>`), or its REAPI listener (`https://`, or `http://` when
+it serves plain text). The TLS flags are `--ca-cert`, `--cert`, `--key`,
+`--tls-server-name`; with `--cert` and `--key` the client presents that identity, and
+the CA is the only one trusted. One HTTP/2 connection carries every request, with the
+transfer engine's default HTTP/2 windows (`--transfer-stream-window-bytes`, 8 MiB per stream and
 eight times that for the connection).
 
 ## The requests
 
-- `--method bytestream` (the default): every blob through the daemon's transfer engine
-  (`kbf_transfer::Transfers`), as the daemon moves it. An upload is the engine's
-  `put_chunks`, the call the container driver stores an output file with: the engine
+- `--method bytestream` (the default): every blob through the transfer engine
+  (`kbf_transfer::Transfers`). An upload is the engine's
+  `put_chunks`, the call an output file is stored with: the engine
   asks FindMissing about the blob first (its FindMissing calls coalesce, one call at a
   time, up to 1000 digests each) and sends one ByteStream Write only when the server
   lacks it. A blob the server already holds is not sent again and still counts as
@@ -55,12 +55,12 @@ eight times that for the connection).
 - `--method batch`: BatchUpdateBlobs (BatchReadBlobs) calls of up to `--batch-bytes` of
   blob data (default 4 MiB, the front's limit), made directly: the engine does not
   batch yet. A larger blob goes through the engine, as with `bytestream`.
-- `--in-flight N` (default 64, the daemon's): the most requests at once, and the
-  engine's limit for the whole run, as `--transfer-in-flight` is for a daemon; a
+- `--in-flight N` (default 64): the most requests at once, and the
+  engine's limit for the whole run; a
   FindMissing call takes one of those slots too. Every other engine limit is the
-  daemon's default.
+  engine's default.
 - `--find-missing on` (upload; default off): FindMissingBlobs about the whole tree
-  first, 1000 digests a call, then only the missing blobs. The daemon does not ask for
+  first, 1000 digests a call, then only the missing blobs. A real upload does not ask for
   the whole tree first; with `bytestream` the engine still asks about each blob.
 - `--timeout-secs N`: stop after N seconds and report what finished (default 0: wait).
 - `--progress-secs N`: a progress line on stderr every N seconds, and one at the start
@@ -131,8 +131,8 @@ Build it (it is not in the release assets):
 cargo build --release -p kbf-bench
 ```
 
-Copy `target/release/kbf-bench` to the node and run it as the daemon's user (who can
-read the daemon's key), with the daemon's TLS files and its `--cas` URL (placeholders as in
+Copy `target/release/kbf-bench` to the node and run it as the user who can
+read a node's key, with that node's TLS files and a `--cas` URL (placeholders as in
 [docs/deploy/linux-build-host.md](../../docs/deploy/linux-build-host.md)):
 
 ```sh
@@ -226,8 +226,8 @@ names it), so two runs of `kbf-bench` share no action.
 | `ok`, `error` | `true` for a done operation, status OK, an `ActionResult` not from the cache and exit 0; otherwise `false` and why |
 | `exit_code`, `worker` | from the result, when there is one |
 | `queued_ms`, `worker_ms` | the result's `queued_timestamp` to `worker_start_timestamp`, and `worker_start_timestamp` to `worker_completed_timestamp`: the frontend's own times for the lease |
-| `input_fetch_ms`, `execution_ms`, `output_upload_ms` | the result's three phases: a daemon's own stamps (the fields of its `lease phases:` line), or under the executor the task's claim |
-| `claimed` | the three phases are a task's claim, not a daemon's measurement (`kbf_proto::task_claim`) |
+| `input_fetch_ms`, `execution_ms`, `output_upload_ms` | the result's three phases: a worker's own stamps, or under the executor the task's claim |
+| `claimed` | the three phases are a task's claim, not a worker's measurement (`kbf_proto::task_claim`) |
 
 A phase is `null` when either of its stamps is missing or they are out of order. The
 executor's own phases (`kbf_executor_phase_seconds`: prepare, start, queue, task, ingest)

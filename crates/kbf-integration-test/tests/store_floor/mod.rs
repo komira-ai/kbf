@@ -35,16 +35,8 @@ const ALLOWED: &[(&str, &str)] = &[
         "paths that do not exist, checked by the preflight and never opened",
     ),
     (
-        "crates/kbf-cli/tests/preflight.rs",
-        "its cold store is an s3 URI; the file:// URI is the hot store's, and nothing writes",
-    ),
-    (
         "crates/kbf-cli/tests/config_process.rs",
         "starts a node from a settings file and stops it, with no blob written; the file's values are strings",
-    ),
-    (
-        "crates/kbf-integration-test/tests/m2.rs",
-        "compares the cell's flag list with an exact expected line; the cell runs in its own job",
     ),
 ];
 

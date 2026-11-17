@@ -138,7 +138,7 @@ impl Wire {
     fn upload_name(&self, digest: &Digest) -> String {
         let n = self.uploads.fetch_add(1, Ordering::Relaxed);
         format!(
-            "uploads/kbf-daemon-{}-{n}/blobs/{}",
+            "uploads/kbf-transfer-{}-{n}/blobs/{}",
             std::process::id(),
             label(digest)
         )

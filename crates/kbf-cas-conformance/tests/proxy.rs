@@ -2,7 +2,7 @@
 //! REAPI client, over one HTTP/2 connection to the frontend's proxy
 //! ([`kbf_front::Proxy`]), which passes ByteStream through to a real storage node (the
 //! storage service over an in-memory cache) on another loopback port. The proxy does
-//! not serve `Segments` (the daemon's), so the engine falls back to blob by blob, as
+//! not serve `Segments` (a storage node's), so the engine falls back to blob by blob, as
 //! it does against any server without it.
 
 use std::net::SocketAddr;

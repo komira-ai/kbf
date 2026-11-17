@@ -23,11 +23,6 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "product code: a tool's private state directory, removed by the Drop of its guard",
     ),
     (
-        "crates/kbf-driver-container/tests/support/real.rs",
-        1,
-        "the image store every cell shares, kept between runs on purpose (subordinate-id owned, read-only images)",
-    ),
-    (
         "crates/kbf-harness/src/lib.rs",
         1,
         "one root whose per-run directories the next run sweeps (`sweep_dead`, tested)",

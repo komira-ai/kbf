@@ -44,17 +44,6 @@
 //!     counts exactly the staged bytes.
 //! 13. **Drained** (invariant F). At the end no object is left staged.
 //!
-//! One more, of a storage-and-daemon node (docs/design/architecture-v2.md, sections 1
-//! and 10), in [`Kind::WholeProcess`] runs, where the daemon half stores each output
-//! before it reports and dies with the process that holds the store and the log:
-//!
-//! 14. **Answered with outputs.** Every action a client has been answered for has an
-//!     action-cache entry the server serves (a hit, so its result blob is indexed), at
-//!     every step the server is up from then on, across kills of the whole process:
-//!     no action is answered as succeeded with its outputs missing, and the index and
-//!     the action cache survive the kill. An action whose run the kill cut is answered
-//!     only by a later run, which the client's retry starts.
-//!
 //! Properties 3 and 4 do not hold yet once the server restarts or its log stops,
 //! because the scheduler's state is not in the log: property 3 is enforced in
 //! runs without a restart only ([`Kind::restarts`]), until control inputs go through
@@ -73,7 +62,7 @@ use kbf_sim::{NodeId, Sim};
 use kbf_types::{Digest, FarmTime, LeaseId, OperationId};
 
 use crate::cell::{CellNode, Kind, Scenario};
-use crate::client::{FakeClient, Job};
+use crate::client::Job;
 use crate::replica::{self, Broken};
 use crate::server::Seen;
 use crate::store::BlobHomes;
@@ -96,7 +85,6 @@ pub enum Property {
     WithinBudget,
     NoLeak,
     Drained,
-    AnsweredWithOutputs,
 }
 
 impl fmt::Display for Property {
@@ -115,7 +103,6 @@ impl fmt::Display for Property {
             Self::WithinBudget => "11 (within budget)",
             Self::NoLeak => "12 (no leak)",
             Self::Drained => "13 (drained)",
-            Self::AnsweredWithOutputs => "14 (answered with outputs)",
         };
         f.write_str(name)
     }
@@ -202,23 +189,6 @@ pub(crate) fn orphans(
 ) -> BTreeSet<ObjectId> {
     let named: BTreeSet<ObjectId> = answers.filter_map(located).map(|at| at.object).collect();
     objects.filter(|o| !named.contains(o)).collect()
-}
-
-/// Property 14 over the actions answered so far (when, and which): each is a hit.
-fn answered_with_outputs(
-    answered: impl IntoIterator<Item = (FarmTime, Digest)>,
-    meta: &MetaState,
-) -> Result<(), Broken> {
-    let detail = answered
-        .into_iter()
-        .find_map(|(at, action)| match meta.action(&action) {
-            ActionAnswer::Hit { .. } => None,
-            ActionAnswer::Miss(miss) => Some(format!(
-                "{action:?} answered at {} ms, not served now: {miss:?}",
-                at.as_millis()
-            )),
-        });
-    hold_if(detail, Property::AnsweredWithOutputs)
 }
 
 /// Property 3.
@@ -374,14 +344,6 @@ impl<'a> Checker<'a> {
         if let (true, Some(meta)) = (one_result_holds(kind), &meta) {
             self.hold(now, one_result(seen, meta));
         }
-        if let (Kind::WholeProcess, Some(meta)) = (kind, &meta) {
-            let answered = sim
-                .nodes()
-                .filter_map(|(_, n)| n.client())
-                .flat_map(FakeClient::jobs)
-                .filter_map(|j| Some((j.answered?, j.action)));
-            self.hold(now, answered_with_outputs(answered, meta));
-        }
     }
 
     /// Properties 5, 8 and 9 with the tier: against the store and the staged blocks
@@ -476,7 +438,7 @@ mod tests {
     use kbf_types::{DigestFunction, WorkerId};
 
     use super::*;
-    use crate::{Down, StorePoint, action, input_of};
+    use crate::{Down, FakeClient, StorePoint, action, input_of};
 
     fn lease(seq: u64) -> LeaseId {
         LeaseId::new(1, seq)
@@ -677,46 +639,6 @@ mod tests {
         );
     }
 
-    /// Catches an answered-with-outputs check that passes an action with no entry
-    /// (the log refuses an entry whose result blob it lacks, as the write of a result
-    /// reported before its output was stored is refused), or fails a servable one.
-    #[test]
-    fn an_answer_the_server_would_not_serve_breaks_answered_with_outputs() {
-        let mut meta = MetaState::new(Retention::default());
-        let epoch = kbf_meta::Epoch::new(1);
-        assert_eq!(meta.execute(1, Command::AllocEpoch), Applied::Epoch(epoch));
-        let answered = [(FarmTime::from_millis(4), action(0))];
-        let none = answered_with_outputs(answered, &meta);
-        assert_eq!(property(none), Property::AnsweredWithOutputs);
-        let result = crate::output_of(&action(0));
-        let put = || Command::PutAction {
-            role: Role::Daemon,
-            action: action(0),
-            record: ActionRecord {
-                result,
-                closure: Closure::new(),
-            },
-        };
-        assert!(matches!(meta.execute(2, put()), Applied::Action(Err(_))));
-        let early = answered_with_outputs(answered, &meta);
-        assert_eq!(property(early), Property::AnsweredWithOutputs);
-        let location = Location {
-            store: StoreId::new(0),
-            object: ObjectId::new(epoch, 0),
-            offset: 0,
-        };
-        meta.execute(
-            3,
-            Command::PutBlob {
-                digest: result,
-                location,
-            },
-        );
-        assert!(matches!(meta.execute(4, put()), Applied::Action(Ok(()))));
-        assert!(answered_with_outputs(answered, &meta).is_ok());
-        assert!(answered_with_outputs([], &MetaState::new(Retention::default())).is_ok());
-    }
-
     /// Catches a liveness check that passes an unanswered action.
     #[test]
     fn an_unanswered_action_breaks_liveness() {
@@ -809,7 +731,6 @@ mod tests {
             Property::WithinBudget,
             Property::NoLeak,
             Property::Drained,
-            Property::AnsweredWithOutputs,
         ];
         let names: Vec<String> = all.iter().map(ToString::to_string).collect();
         let want = [
@@ -826,7 +747,6 @@ mod tests {
             "11 (within budget)",
             "12 (no leak)",
             "13 (drained)",
-            "14 (answered with outputs)",
         ];
         assert_eq!(names, want);
     }

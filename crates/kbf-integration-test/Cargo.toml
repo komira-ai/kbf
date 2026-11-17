@@ -7,21 +7,6 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# `kbf-cell`, the M1, M2 and cross-version integration harnesses: the tests themselves
-# (`kbf-cell m1`, `kbf-cell m2`, `kbf-cell cross-version`), test certificates, the test-only
-# daemon (the daemon library with its local runtime) and the build-summary check; see the
-# library docs.
-[[bin]]
-name = "kbf-cell"
-path = "src/bin/kbf-cell.rs"
-
-# `kbf-m2-act`, the program every action of the M2 sample project runs (`m2/`): the
-# M2 image has no shell. Its verbs are kbf-testkit's (the standard library, rustix and
-# two plain libc calls), so CI can still link it statically.
-[[bin]]
-name = "kbf-m2-act"
-path = "src/bin/kbf-m2-act.rs"
-
 # `kbf-js-stand-in`, the `crun`, `ip`, `nft` and `nsenter` that
 # `tests/executor_real_service_integration.rs` gives the pinned js-agent: a thin main over
 # `js_stand_in`.
@@ -31,28 +16,28 @@ path = "src/bin/kbf-js-stand-in.rs"
 
 [dependencies]
 clap.workspace = true
-# `kbf-cell cross-version`'s probe stream (a Hello of its own, as a fake daemon sends it).
+# `tests/proxy_soak.rs`: the soak's concurrent streams.
 futures.workspace = true
 kbf-unitfile.workspace = true
 # The tests under `tests/` that call into the installer library: `package_trust` (settings,
 # layout, archive) and `package_installer_verbs` (cli, layout, setup plan).
 kbf-installer.workspace = true
 kbf-objstore.workspace = true
-# The worker protocol's messages and client, for the same probe.
+# The REAPI and map messages of the proxy and executor tests.
 kbf-proto.workspace = true
 kbf-testkit.workspace = true
 kbf-transfer.workspace = true
 rcgen.workspace = true
-# `kbf-cell m1`'s calls to the operator API.
 reqwest.workspace = true
-# SIGINT for the processes `kbf-cell m1` started.
+# The signals of `js_stand_in` and the js-agent the executor test starts.
 rustix = { workspace = true, features = ["process"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tonic.workspace = true
 tracing-subscriber.workspace = true
-# `kbf-cell m2` sets the runner up with `cargo xtask crun-tests`'s own function.
+# The release tooling's library the lints and the real-service tests read
+# (`xtask::budget`, `xtask::entitlements`, `xtask::fetch`, `xtask::js_pin`).
 xtask.workspace = true
 
 [dev-dependencies]
@@ -102,9 +87,6 @@ kbf-job-client = { workspace = true, features = ["fake"] }
 kbf-deploy.workspace = true
 prost-types.workspace = true
 tar.workspace = true
-# SIGPIPE ignored by the fake `kbf-server` of tests/cross_version.rs, which runs before
-# the Rust runtime has (a write to a socket the peer closed would end the process).
-libc.workspace = true
 proc-macro2.workspace = true
 prost.workspace = true
 # `tests/agents_md`: CLAUDE.md read as CommonMark, so an import inside code is not counted.

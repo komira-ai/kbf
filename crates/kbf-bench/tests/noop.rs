@@ -317,7 +317,7 @@ fn at(seconds: i64, nanos: i32) -> Option<Timestamp> {
 /// answer to the call, the first update, which the fake sends 100 ms and 1 s after the
 /// call, or the done operation's own arrival), and a phase of the result's metadata read from the wrong
 /// two stamps, made up when a stamp is missing, negative when they are out of order, or
-/// wrong across a second's boundary; the task's claim not told from a daemon's stamps.
+/// wrong across a second's boundary; the task's claim not told from a worker's stamps.
 #[tokio::test(start_paused = true)]
 async fn a_run_records_execute_to_done_and_the_phases_its_result_carries() {
     let mut stamped = ExecutedActionMetadata {

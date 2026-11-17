@@ -1,5 +1,5 @@
 //! A throwaway certificate authority for one integration cell: a CA, a server
-//! certificate for `localhost`, one daemon client certificate, and the certificates of a
+//! certificate for `localhost`, one worker client certificate (the shipped `daemon` role), and the certificates of a
 //! frontend and a storage node as `kbf --mode=...` requires them, written as PEM files.
 //!
 //! The keys are generated fresh on every call and never leave the cell's directory.
@@ -13,10 +13,10 @@ use rcgen::{
     KeyPair, KeyUsagePurpose, SanType,
 };
 
-/// The name in the server certificate. A daemon verifies it with `--tls-server-name`.
+/// The name in the server certificate. A client verifies it with `--tls-server-name`.
 pub const SERVER_NAME: &str = "localhost";
 
-/// The role the daemon's client certificate names, as the worker listener requires.
+/// The role the worker client certificate names, as the worker listener requires.
 const DAEMON_ROLE_URI: &str = "urn:kbf:role:daemon";
 /// The roles `kbf --mode=frontend` and `kbf --mode=storage` check their own certificates
 /// for at start (each with both server and client use).
@@ -26,12 +26,12 @@ const STORAGE_ROLE_URI: &str = "urn:kbf:role:storage";
 /// Where [`write`] put each file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PkiFiles {
-    /// The CA certificate: the server's client CA and the daemon's trust root.
+    /// The CA certificate: the server's client CA and a client's trust root.
     pub ca_cert: PathBuf,
     /// The server certificate and its key.
     pub server_cert: PathBuf,
     pub server_key: PathBuf,
-    /// The daemon's client certificate and its key.
+    /// The worker client certificate and its key.
     pub client_cert: PathBuf,
     pub client_key: PathBuf,
     /// The frontend's certificate and key (role `frontend`, for `localhost`): its worker
@@ -60,7 +60,7 @@ pub enum PkiError {
 
 /// Generates a CA, a server certificate for [`SERVER_NAME`], a client certificate
 /// that names `node_id` (as its one DNS subjectAltName, which the server binds to the
-/// daemon's `Hello`, and as its common name) and the daemon role
+/// worker's `Hello`, and as its common name) and the daemon role
 /// (`urn:kbf:role:daemon`), and the certificates of a frontend and a storage node (each
 /// for [`SERVER_NAME`], with its role and both server and client use), and writes them
 /// under `dir` (created if missing).

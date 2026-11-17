@@ -652,8 +652,7 @@ fn only_a_push_to_main_runs_the_pipeline() {
 #[test]
 fn smoke_tests_the_artifacts_of_the_same_run_and_builds_no_kbf() {
     // Catches: a smoke that rebuilds the kbf it tests, takes it from another run, skips the
-    // check of the downloaded files, or runs the farm from another directory than the one
-    // holding the artifact's kbf.
+    // check of the downloaded files, or checks the tarball's kbf before the files.
     red(
         &plant(
             "smoke.yml",
@@ -694,27 +693,25 @@ fn smoke_tests_the_artifacts_of_the_same_run_and_builds_no_kbf() {
         ),
         "does not run `build-commit check-asset`",
     );
+    // The tarball's kbf checked before the files are: the two commands swapped.
+    let mut files = real();
+    let verify = "run: cargo xtask verify-assets sums dist";
+    let check = "run: cargo xtask build-commit check-asset \"dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz\" \"$GITHUB_SHA\"";
+    assert!(files.smoke.contains(verify) && files.smoke.contains(check));
+    files.smoke = files
+        .smoke
+        .replace(verify, "run: @@")
+        .replace(check, verify)
+        .replace("run: @@", check);
     red(
-        &plant(
-            "smoke.yml",
-            "-C \"$RUNNER_TEMP/bin\" kbf",
-            "-C \"$RUNNER_TEMP/bin\" kbf-deploy",
-        ),
-        "does not check the files, then check the tarball's kbf",
+        &problems(&files).expect("the workflows are read"),
+        "does not check the files with `verify-assets sums dist`, then check the tarball's kbf",
     );
     red(
         &plant(
             "smoke.yml",
-            "--bin-dir \"$RUNNER_TEMP/bin\"",
-            "--bin-dir target/debug",
-        ),
-        "does not run from `--bin-dir",
-    );
-    red(
-        &plant(
-            "smoke.yml",
-            "run: cargo build -p kbf-harness -p kbf-integration-test --bins --locked",
-            "run: cargo build -p kbf-cli -p kbf-harness -p kbf-integration-test --bins --locked",
+            "run: mkdir published",
+            "run: cargo build -p kbf-cli --locked",
         ),
         "the job `smoke` builds `kbf`",
     );

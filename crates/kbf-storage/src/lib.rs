@@ -4,7 +4,7 @@
 //! CAS reads and writes, FindMissing, the action cache and the `Segments` service, over
 //! one store. Today the one implementation is `kbf-front`'s adapter over its own cache
 //! (`kbf_front::CacheStorage`), and `kbf-server`'s in-process store
-//! (`kbf_server::LocalStore`, what `kbf all-in-one`'s daemon reads and writes through)
+//! (`kbf_server::LocalStore`, what an in-process caller reads and writes through)
 //! holds an `Arc<dyn Storage>`. The cache's code moves into this crate later; the trait
 //! is the boundary it moves behind, so the callers do not change when it does. A storage
 //! process of its own serves one over gRPC, and [`service::RemoteStorage`] is the
@@ -19,7 +19,7 @@
 //! - **Present means durable.** A blob is reported present, and a write answered, only
 //!   once its bytes are stored and indexed.
 //! - **Every byte is verified,** on write and on read.
-//! - **Only a daemon writes the action cache**, and only once every blob the entry
+//! - **Only the `Role::Daemon` role writes the action cache**, and only once every blob the entry
 //!   needs is held.
 //!
 //! This crate depends on no frontend crate: not the scheduler (`kbf-sched`) and not
@@ -218,12 +218,12 @@ pub trait Storage: Send + Sync {
     }
 
     /// A `Segments` service of its own over the store, with uploads no other caller
-    /// can name: the handlers a remote daemon's `Begin`, `PutRange` and `Commit` reach.
+    /// can name: the handlers a remote client's `Begin`, `PutRange` and `Commit` reach.
     fn segments(&self) -> Arc<dyn Segments>;
 
     /// [`Storage::segments`], counting each upload in `open` from its `Begin` until the
     /// commit started for it ends or it is dropped, so a node that reports its open writes
-    /// does not report none while a daemon uploads its outputs. The service of a storage node
+    /// does not report none while a client uploads its outputs. The service of a storage node
     /// asks for this one. A store whose uploads are not counted answers [`Storage::segments`]
     /// and the node under-reports; the store a node runs (kbf-front's) overrides it.
     fn segments_counted(&self, open: &service::OpenWrites) -> Arc<dyn Segments> {

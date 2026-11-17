@@ -949,11 +949,7 @@ fn every_test_that_starts_kbf_gives_it_a_config_of_its_own_or_is_a_listed_allowa
         "the scan found {} starts of kbf; it reads too little",
         naming.len()
     );
-    assert_eq!(
-        kbf_spawns::ALLOWANCE.len(),
-        13,
-        "the allowance only shrinks"
-    );
+    assert_eq!(kbf_spawns::ALLOWANCE.len(), 8, "the allowance only shrinks");
 }
 
 #[test]

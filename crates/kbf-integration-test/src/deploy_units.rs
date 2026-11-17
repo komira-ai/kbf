@@ -1,8 +1,7 @@
 //! The systemd units in `docs/deploy/*.md`, read so tests can check them against the
 //! code: `tests/deploy_units.rs` runs `kbf-server`'s flag parser over each server
-//! unit's `ExecStart=`, and `kbf-node`'s tests run `kbf-daemon`'s over each daemon
-//! unit's. A doc whose example names a flag the binary does not have, or gives one a
-//! value it refuses, then fails a test instead of a deployment.
+//! unit's `ExecStart=`. A doc whose example names a flag the binary does not have, or
+//! gives one a value it refuses, then fails a test instead of a deployment.
 //!
 //! What counts as a unit: a fenced block with the info string `ini` whose nearest
 //! non-blank line above is `` `/etc/systemd/system/<file>`: ``. An `ini` block without
@@ -25,7 +24,6 @@ pub const PLACEHOLDERS: &[(&str, &str)] = &[
     ("<server>", "storage-a.example"),
     ("<worker port>", "8981"),
     ("<node id>", "node-1"),
-    ("<RAM in GiB minus 4 to 8>", "248"),
     ("<storage host address>", "192.0.2.10"),
     ("<storage host name>", "storage-a.example"),
     ("<node>", "node-1"),
@@ -170,22 +168,6 @@ pub fn fenced<'a>(markdown: &'a str, info: &str) -> Vec<Vec<&'a str>> {
     out
 }
 
-/// The cells of the first pipe table after the line `heading`, header and separator
-/// rows left out; empty when there is none.
-pub fn table_after(markdown: &str, heading: &str) -> Vec<Vec<String>> {
-    markdown
-        .lines()
-        .skip_while(|l| l.trim() != heading)
-        .skip_while(|l| !l.trim_start().starts_with('|'))
-        .take_while(|l| l.trim_start().starts_with('|'))
-        .skip(2)
-        .map(|row| {
-            let row = row.trim().trim_start_matches('|').trim_end_matches('|');
-            row.split('|').map(|c| c.trim().to_owned()).collect()
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,18 +281,5 @@ ExecStart=/usr/local/bin/b \\
         let doc = "```text a\n--x\n--y\n```\n```text\n--z\n```\n";
         assert_eq!(fenced(doc, "text a"), [vec!["--x", "--y"]]);
         assert_eq!(fenced(doc, "text"), [vec!["--z"]]);
-    }
-
-    #[test]
-    fn the_table_after_a_heading_is_read_without_its_header() {
-        // Catches: the header or separator row read as data, or the first table in the
-        // doc read instead of the one after the heading.
-        let doc = "| x | y |\n|---|---|\n| 0 | 0 |\n### H\n\ntext\n| a | b |\n|---|---|\n\
-                   | one | 1 |\n| two | 2 |\nafter\n| z | 9 |\n";
-        assert_eq!(
-            table_after(doc, "### H"),
-            [vec!["one", "1"], vec!["two", "2"]]
-        );
-        assert!(table_after(doc, "### None").is_empty());
     }
 }

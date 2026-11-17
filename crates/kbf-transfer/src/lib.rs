@@ -1,7 +1,7 @@
-//! `kbf-transfer`: the shared blob transfer engine of a kbf-daemon
+//! `kbf-transfer`: the shared blob transfer engine of a process that moves the farm's blobs
 //! (`docs/design/worker-cache.md#4-the-shared-transfer-engine`).
 //!
-//! Every blob a daemon moves goes through one [`Transfers`] per process: input files,
+//! Every blob such a process moves goes through one [`Transfers`] per process: input files,
 //! output uploads, and the input cache's fills. It speaks gRPC to kbf-server over one
 //! HTTP/2 connection with many streams, and bounds the whole process with one
 //! in-flight limit and one byte budget, not one per call. Uploads hold at most all but
@@ -13,14 +13,14 @@
 //! resumes from the bytes it received.
 //!
 //! - [`cas`]: the [`Cas`] trait every store implements (the engine, and the in-memory
-//!   stores of tests), with [`digest_of`], [`fetch`] and [`label`]. It is the daemon's
+//!   stores of tests), with [`digest_of`], [`fetch`] and [`label`]. It is the
 //!   data plane; `kbf-cas-conformance` holds the checks any implementation must pass.
-//!   A store in the daemon's own process may take output files as the walk reads them
+//!   A store in the caller's own process may take output files as the walk reads them
 //!   to hash them ([`Intake`]), so each is read once.
 //! - [`Transfers`] and [`Scope`]: the engine, and one lease's view of it, which counts
 //!   the lease's [`TransferStats`].
 //! - [`RoutedCas`]: the same [`Cas`] over the storage map (`kbf-route`): each blob goes to
-//!   the storage nodes that own it, so a daemon moves bytes to and from storage directly.
+//!   the storage nodes that own it, so a client moves bytes to and from storage directly.
 //! - [`TransferConfig`]: the `--transfer-*` flags and `--segment-upload-streams` and `--segment-uploads-in-flight`.
 //! - [`Record`]: a blob to store, with where its bytes are ([`Source`]: memory, a file the
 //!   caller hashed, or a [`Spool`]). [`Cas::put_records`] stores them; the engine reads

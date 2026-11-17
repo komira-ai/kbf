@@ -1,7 +1,7 @@
 //! [`InProcess`]: a storage node's own [`StorageService`] called as a [`Storage`], without
 //! a connection.
 //!
-//! A process that is a storage node and also a caller of the farm (`kbf storage-and-daemon`)
+//! A process that is a storage node and also a caller of the farm
 //! reaches the one member that is itself through this, and every other member through
 //! [`super::RemoteStorage`]. The two answer alike because they run the same code: a write
 //! takes the service's own write body ([`StorageService::write_in`]: the generation check,

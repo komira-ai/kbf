@@ -1,5 +1,5 @@
 //! The blobs a run sends or reads: an output tree, generated or read from a directory,
-//! as the daemon would store it (each file a blob, each directory's REAPI `Directory`
+//! as an output directory is stored (each file a blob, each directory's REAPI `Directory`
 //! message a blob, and one REAPI `Tree` message of them all), each distinct digest once.
 //!
 //! A generated tree is a function of its [`Shape`] and seed alone, so `kbf-bench read`
@@ -56,7 +56,7 @@ pub struct Tree {
     pub skipped: u64,
     /// Every distinct blob, by digest: the files, each directory's `Directory`
     /// message (the output directory's too) and the `Tree` message of them all, what
-    /// the daemon stores for an output directory.
+    /// is stored for an output directory.
     pub blobs: Vec<Blob>,
     /// The `Tree` message's digest (one of `blobs`).
     pub tree_digest: Digest,
@@ -307,7 +307,7 @@ impl Layout {
                 directories,
                 ..Directory::default()
             };
-            // As the daemon's `store_directories`: every Directory the Tree names is
+            // As an output directory is stored: every Directory the Tree names is
             // stored, so each digest in it can be fetched.
             let bytes = message.encode_to_vec();
             self.add(Blob {

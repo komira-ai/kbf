@@ -13,8 +13,8 @@
 //! - `kind="cas"`, `source="segments"`: a `Segments` `ReadRange` the node answered with bytes,
 //!   one per call (a call reads a run of blobs from one segment, so a call is not a blob).
 //! - `kind="ac"`, `source="action_store"`: an `ActionStore` `Get` that found an entry.
-//! - `kind="cas"` and `kind="ac"`, `source="in_process"`: the same three reads made by the
-//!   daemon half of a `storage-and-daemon` process, which reaches its own node without a
+//! - `kind="cas"` and `kind="ac"`, `source="in_process"`: the same three reads made by a
+//!   caller in the node's own process, which reaches it without a
 //!   connection ([`crate::service::InProcess`]); a `Segments` read made that way is counted
 //!   as `source="segments"`.
 //!
@@ -22,7 +22,7 @@
 //! a read of the empty blob, which no store holds; `FindMissingBlobs` and `QueryWriteStatus`
 //! (they ask whether a blob is held and return none of it); `Segments` `Locate`; every write;
 //! and the node's own reads of its disk for flushing, repair and replication, which serve no
-//! caller. A read that the frontend or a daemon serves from a pack never reaches a node, so it
+//! caller. A read that the frontend or a client serves from a pack never reaches a node, so it
 //! is not counted anywhere here.
 //!
 //! One [`LegacyReads`] per node, shared by its service and by the `/metrics` scrape of the node
@@ -52,11 +52,11 @@ pub enum Path {
     CasByteStream,
     /// `Segments` `ReadRange`.
     CasSegments,
-    /// A blob read by the daemon half of the same process, without a connection.
+    /// A blob read by a caller in the same process, without a connection.
     CasInProcess,
     /// `ActionStore` `Get` of an entry.
     AcActionStore,
-    /// An action-cache entry read by the daemon half of the same process.
+    /// An action-cache entry read by a caller in the same process.
     AcInProcess,
 }
 
@@ -138,8 +138,8 @@ impl LegacyReads {
     }
 }
 
-/// A node's [`Storage`] as the daemon half of a `storage-and-daemon` process without a
-/// frontend reads it: directly, with no service in between (the farm is this node alone, a
+/// A node's [`Storage`] as a caller in the same process, with no
+/// frontend, reads it: directly, with no service in between (the farm is this node alone, a
 /// map of itself). Every call is the inner storage's; a blob read that is found and an
 /// action entry that is found are counted on the `in_process` rows, as
 /// [`crate::service::InProcess`] counts the same reads on a node that registers with a

@@ -20,8 +20,6 @@
 pub const FLAGGED: &[&str] = &[
     "crates/kbf-cli/tests/frontend_history_lock.rs",
     "crates/kbf-cli/tests/host_rules.rs",
-    "crates/kbf-cli/tests/storage_and_daemon.rs",
-    "crates/kbf-cli/tests/storage_and_daemon_behind_frontend.rs",
     "crates/kbf-cli/tests/storage_process.rs",
     "crates/kbf-harness/src/farm.rs",
     "crates/kbf-integration-test/tests/proxy_support/mod.rs",
@@ -31,16 +29,11 @@ pub const FLAGGED: &[&str] = &[
 /// `kbf-cli`, each with its own runner and several of them testing the default path or a
 /// named `--config` on purpose. Each is to be ported to the flag, one file at a time.
 pub const ALLOWANCE: &[&str] = &[
-    "crates/kbf-cli/tests/beta_b0.rs",
-    "crates/kbf-cli/tests/beta_b0_killed.rs",
-    "crates/kbf-cli/tests/beta_b0_red.rs",
-    "crates/kbf-cli/tests/beta_support/mod.rs",
     "crates/kbf-cli/tests/binary.rs",
     "crates/kbf-cli/tests/cluster_support/mod.rs",
     "crates/kbf-cli/tests/config_process.rs",
     "crates/kbf-cli/tests/frontend_process.rs",
     "crates/kbf-cli/tests/help_golden.rs",
-    "crates/kbf-cli/tests/helpers.rs",
     "crates/kbf-cli/tests/node_process.rs",
     "crates/kbf-cli/tests/preflight.rs",
     "crates/kbf-cli/tests/rehearsal_in_a_box.rs",
@@ -175,7 +168,7 @@ const PATH_USE: &[&str] = &[
 pub const HOST_PATH_ALLOWANCE: &[(&str, usize, &str)] = &[
     (
         "crates/kbf-cli/tests/deploy_units.rs",
-        2,
+        1,
         "asserts the default of `api-token-file` as a `Path` value; nothing is opened",
     ),
     (

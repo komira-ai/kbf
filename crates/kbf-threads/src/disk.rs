@@ -10,8 +10,8 @@
 //! Two ways to take a share, for two kinds of directory:
 //!
 //! - [`Space::of_capacity`]: a share of the filesystem's size less the floor. For a
-//!   directory that fills up on purpose and evicts to keep the floor free (the daemon's
-//!   input cache): a share of the *free* space would shrink at every restart, by what
+//!   directory that fills up on purpose and evicts to keep the floor free (an input
+//!   cache): a share of the *free* space would shrink at every restart, by what
 //!   the cache already holds. The server's `file://` cold store evicts to the same
 //!   [`keep_free`] floor, read afresh at each write, with no budget of its own.
 //! - [`Space::of_free`]: a share of the free space less the floor (at most half of what

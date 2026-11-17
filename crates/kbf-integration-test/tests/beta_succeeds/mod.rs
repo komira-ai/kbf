@@ -104,8 +104,8 @@ mod rules {
     #[test]
     fn continue_on_error_on_a_step_is_refused() {
         let text = planted(
-            "      - name: B0, the farm under build load\n",
-            "      - name: B0, the farm under build load\n        continue-on-error: true\n",
+            "      - name: Assemble SHA256SUMS, which must be the published one\n",
+            "      - name: Assemble SHA256SUMS, which must be the published one\n        continue-on-error: true\n",
         );
         let found = problems(SMOKE, &text).unwrap();
         assert!(
@@ -130,8 +130,8 @@ mod rules {
     #[test]
     fn a_new_step_condition_is_refused() {
         let text = planted(
-            "      - name: B0, the farm under build load\n",
-            "      - name: B0, the farm under build load\n        if: ${{ always() }}\n",
+            "      - name: Assemble SHA256SUMS, which must be the published one\n",
+            "      - name: Assemble SHA256SUMS, which must be the published one\n        if: ${{ always() }}\n",
         );
         let found = problems(SMOKE, &text).unwrap();
         assert!(

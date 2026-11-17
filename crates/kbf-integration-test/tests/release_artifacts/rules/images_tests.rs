@@ -54,8 +54,8 @@ fn the_frontend_image_is_built_twice_from_the_attested_tarball_and_compared() {
     );
     line(
         "--kbf-tarball \"dist/kbf-$GITHUB_SHA-",
-        "--kbf-tarball \"dist/kbf-installer-$GITHUB_SHA-",
-        "has --kbf-tarball \"dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz\", not `dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz`",
+        "--kbf-tarball \"dist/kbf-deploy-$GITHUB_SHA-",
+        "has --kbf-tarball \"dist/kbf-deploy-$GITHUB_SHA-linux-x86_64.tar.gz\", not `dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz`",
     );
     line(
         "--image target/image-out/1.oci.tar",

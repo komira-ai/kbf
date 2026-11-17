@@ -13,14 +13,14 @@
 //! can be one that cannot fail.
 //!
 //! Catches:
-//! - a unit missing a rule that its mode needs (`restart`, `stop`, `kill-mode`,
-//!   `delegate`, `credential`, `caps`, `swap`, `oom`, `cpuset`, user, slice,
-//!   `LimitNOFILE`), each named below;
+//! - a unit missing a rule that its mode needs (`restart`, `stop`, `credential`, `swap`, user,
+//!   slice, `LimitNOFILE`), each named below, and a slice that disables a controller or narrows
+//!   the CPUs (`delegate`, `cpuset`);
 //! - a unit that runs a program other than `/usr/bin/kbf` and the installer's binary (the
 //!   installer's own unit and the proxy's), another mode than its name, a `--config` or any
 //!   flag the contract does not give it;
 //! - kbf-installer's own unit running anything but `run`, or gating its start on a step that is
-//!   not built; the verbs every unit and the macOS property list name exist, and the runtime
+//!   not built; the verbs every unit names exist, and the runtime
 //!   units' program is `/usr/bin/kbf`: `package_installer_verbs.rs`;
 //! - a unit that starts without its gate (`ConditionPathExists=`, the two checks, in
 //!   order), or whose gate is `ExecCondition=` or a `-`-prefixed command that ignores a
@@ -53,30 +53,21 @@ const CONFIG: &str = "/etc/kbf/kbf.toml";
 const INSTALLER_CONFIG: &str = "/etc/kbf/installer.toml";
 
 /// The files of the package, and nothing else.
-const FILES: [&str; 9] = [
-    "kbf-all-in-one.service",
-    "kbf-daemon.service",
+const FILES: [&str; 6] = [
     "kbf-frontend.service",
     "kbf-installer.service",
     "kbf-proxy.service",
     "kbf-proxy.socket",
-    "kbf-storage-and-daemon.service",
     "kbf-storage.service",
     "kbf.slice",
 ];
 
 /// The runtime units kbf-installer starts before (`Before=` of its unit). The proxy is not one:
 /// it runs no release.
-const RUNTIME: [&str; 5] = [
-    "kbf-all-in-one.service",
-    "kbf-daemon.service",
-    "kbf-frontend.service",
-    "kbf-storage-and-daemon.service",
-    "kbf-storage.service",
-];
+const RUNTIME: [&str; 2] = ["kbf-frontend.service", "kbf-storage.service"];
 
 /// The rules, by the tag a violation starts with.
-const RULES: [&str; 36] = [
+const RULES: [&str; 32] = [
     "install",
     "network",
     "positional",
@@ -92,19 +83,15 @@ const RULES: [&str; 36] = [
     "nofile",
     "user",
     "state-dir",
-    "state-dir-search",
     "credential",
     "restart",
     "restart-limit",
     "restart-exit",
     "stop",
-    "kill-mode",
     "delegate",
     "notify",
     "conflicts",
     "swap",
-    "caps",
-    "oom",
     "cpuset",
     "memory",
     "reload",
@@ -143,24 +130,6 @@ fn all<'a>(unit: &'a UnitFile, section: &str, key: &str) -> Vec<&'a str> {
         .filter(|d| d.section == section && d.key == key)
         .map(|d| trim(&d.value))
         .collect()
-}
-
-/// systemd's `Delegate=` as `config_parse_delegate` reads it (see package rule
-/// `delegate`): a boolean sets all or none, a list adds, an empty value starts over.
-fn delegated(unit: &UnitFile) -> Vec<String> {
-    let mut set: Vec<String> = Vec::new();
-    for d in unit.directives().iter().filter(|d| d.key == "Delegate") {
-        match trim(&d.value) {
-            "yes" | "true" | "1" | "on" => {
-                set = ["cpu", "cpuset", "memory", "pids"]
-                    .map(String::from)
-                    .to_vec();
-            }
-            "no" | "false" | "0" | "off" | "" => set.clear(),
-            list => set.extend(list.split_whitespace().map(String::from)),
-        }
-    }
-    set
 }
 
 /// A `@KEY@` kbf-deploy would render, on a line that is not a comment.
@@ -357,15 +326,10 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     if unit.get_in("Service", "LimitNOFILE").map(trim) != Some("1048576") {
         v("nofile", "no LimitNOFILE=1048576".into());
     }
-    // Catches a server half run as the user builds run as: the frontend (the state store,
-    // the operator token) and a storage node (the cold store's key) run as kbf-server, so an
-    // action (run as kbf) cannot read what they hold; the modes that run builds run as kbf.
-    // As the retired kbf-deploy units did.
-    let want = if mode.is_some_and(|m| ["frontend", "storage"].contains(&m)) {
-        "kbf-server"
-    } else {
-        "kbf"
-    };
+    // Catches a server run as the user builds run as: the frontend (the state store, the
+    // operator token) and a storage node (the cold store's key) run as kbf-server, so an action
+    // (run as kbf) cannot read what they hold. As the retired kbf-deploy units did.
+    let want = "kbf-server";
     if unit.get_in("Service", "User").map(trim) != Some(want) {
         v("user", format!("User= is not {want}"));
     }
@@ -459,39 +423,13 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             format!("ExecStartPre= is {pre:?}, not {want:?}"),
         );
     }
-    // Catches kbf's own state in the wrong place: /var/lib/kbf is the unit's StateDirectory=,
-    // which the installer never touches.
-    // One directory per user: systemd chowns a StateDirectory= to the unit's user at every
-    // start, so a host running a kbf-server unit and a kbf unit would hand one directory
-    // back and forth.
-    let dir = if ["frontend", "storage"].contains(&mode) {
-        "kbf-server"
-    } else {
-        "kbf"
-    };
+    // Catches kbf's own state in the wrong place: /var/lib/kbf-server is the unit's StateDirectory=,
+    // which the installer never touches. One directory per user: systemd chowns a
+    // StateDirectory= to the unit's user at every start.
+    let dir = "kbf-server";
     if unit.get_in("Service", "StateDirectory").map(trim) != Some(dir) {
         v("state-dir", format!("no StateDirectory={dir}"));
     }
-    // Catches a container-running unit whose state directory others cannot search: systemd
-    // applies StateDirectoryMode= at every start, and the container driver refuses to start
-    // unless every directory down to its lease directories (under /var/lib/kbf) has the
-    // others-execute bit (its container ids are not the unit user's), so the node would
-    // crash-loop. The bits are read as octal; a unit with no StateDirectoryMode= gets
-    // systemd's 0755, which passes.
-    if matches!(mode, "daemon" | "storage-and-daemon" | "all-in-one") {
-        let bits = unit.get_in("Service", "StateDirectoryMode").map(trim);
-        let searchable = match bits {
-            None => true,
-            Some(m) => u32::from_str_radix(m, 8).is_ok_and(|b| b & 0o001 != 0),
-        };
-        if !searchable {
-            v(
-                "state-dir-search",
-                format!("StateDirectoryMode= is {bits:?}, which others cannot search (need o+x)"),
-            );
-        }
-    }
-
     // Catches start-limit-hit on a failure that repeats quickly: every mode unit, the
     // frontend too, restarts at 5 s and has no start limit (a drained frontend instance
     // exits 0 and stays down regardless: Restart=on-failure never restarts a clean exit).
@@ -508,9 +446,8 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         }
     }
 
-    // Catches a stop that SIGKILLs a drain (every build in flight fails, and the daemon's
-    // leases are abandoned): every mode unit waits for its drain without end, the daemon's
-    // too (it has no default drain deadline).
+    // Catches a stop that SIGKILLs a drain (every build in flight fails): every mode unit waits
+    // for its drain without end.
     let timeout = unit
         .directives()
         .iter()
@@ -530,78 +467,8 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         v("stop", format!("KillSignal= is {signal:?}, not SIGTERM"));
     }
 
-    // Catches a node unit that signals the actions with the daemon: with KillMode=
-    // control-group (the default) a stop sends SIGTERM to every process of the unit, the
-    // actions in their sub-cgroups among them, and the daemon's drain ends in seconds.
-    // process would leave them for ever, so only mixed is accepted.
-    if matches!(mode, "daemon" | "storage-and-daemon" | "all-in-one") {
-        let kill_mode = unit.get_in("Service", "KillMode").map(trim);
-        if kill_mode != Some("mixed") {
-            v(
-                "kill-mode",
-                format!("KillMode= is {kill_mode:?}, not mixed"),
-            );
-        }
-    }
-
-    // Catches a build node without the controllers the daemon's cgroups and
-    // --lease-placement=numa-node need (cpuset above all), or one that disables them.
-    if matches!(mode, "daemon" | "storage-and-daemon" | "all-in-one") {
-        let set = delegated(&unit);
-        for c in ["cpu", "cpuset", "memory", "pids"] {
-            if !set.iter().any(|s| s == c) {
-                v("delegate", format!("controller {c} is not delegated"));
-            }
-        }
-        if unit
-            .get("DisableControllers")
-            .is_some_and(|x| !trim(x).is_empty())
-        {
-            v(
-                "delegate",
-                "DisableControllers= disables a controller".into(),
-            );
-        }
-    }
-
-    // Catches a limit on a build node's own unit (package rules `caps` and `swap`):
-    // its leases live in the unit's cgroup, so the builds are capped by the daemon's
-    // actions/memory.max alone and a limit here would cap the supervisor with them; and
-    // a MemorySwapMax= would turn the daemon's swap watch into an OOM kill of the unit
-    // that holds every lease. An empty value is unset, as systemd reads it.
-    if matches!(mode, "daemon" | "storage-and-daemon" | "all-in-one") {
-        for key in ["MemoryMax", "MemoryHigh", "CPUQuota", "AllowedCPUs"] {
-            if unit.get(key).is_some_and(|x| !trim(x).is_empty()) {
-                v("caps", format!("sets {key}= on a build node's unit"));
-            }
-        }
-        if unit
-            .get("MemorySwapMax")
-            .is_some_and(|x| !trim(x).is_empty())
-        {
-            v("swap", "a build node sets MemorySwapMax=".into());
-        }
-        // Catches a build node whose OOM score is not below 0, the build containers'
-        // score (package rule `oom`): a host-wide OOM kills the highest score
-        // first, so a lease must die before the daemon that holds them.
-        match unit
-            .get("OOMScoreAdjust")
-            .map(trim)
-            .filter(|x| !x.is_empty())
-        {
-            None => v("oom", "no OOMScoreAdjust= (it defaults to 0)".into()),
-            Some(x) => match x.parse::<i64>() {
-                Ok(n) if n < 0 => {}
-                Ok(_) => v("oom", format!("OOMScoreAdjust={x} is not below 0")),
-                Err(_) => v("oom", format!("OOMScoreAdjust={x} is not an integer")),
-            },
-        }
-    }
-
     // Catches a storage node or frontend that may swap (it would slow every build at once).
-    if matches!(mode, "frontend" | "storage")
-        && unit.get_in("Service", "MemorySwapMax").map(trim) != Some("0")
-    {
+    if unit.get_in("Service", "MemorySwapMax").map(trim) != Some("0") {
         v("swap", "no MemorySwapMax=0".into());
     }
 
@@ -824,7 +691,7 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
         }
         n += 1;
     }
-    assert_eq!(n, 7, "a unit was not checked");
+    assert_eq!(n, 4, "a unit was not checked");
 }
 
 /// The modes whose units `files` hold, sorted.
@@ -835,13 +702,14 @@ fn modes_in<'a>(files: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// Catches the units drifting from the mode table of kbf-cli (`names::MODES`): the modes the package
-/// ships are exactly the five `kbf --mode=` takes (there is no `node` mode), each as
-/// `kbf-<mode>.service`; an extra or a missing mode unit is not that set.
+/// ships are exactly the two `kbf --mode=` takes, `frontend` and `storage` (kbf runs no daemon, and
+/// there is no `node` mode), each as `kbf-<mode>.service`; an extra or a missing mode unit is not
+/// that set.
 #[test]
-fn the_kbf_modes_are_exactly_the_five() {
+fn the_kbf_modes_are_exactly_frontend_and_storage() {
     let mut want: Vec<&str> = kbf_cli::names::MODES.iter().map(|m| m.name).collect();
     want.sort_unstable();
-    assert_eq!(want.len(), 5);
+    assert_eq!(want, ["frontend", "storage"]);
     assert_eq!(modes_in(&FILES), want);
     // The defects: a unit for a mode that does not exist, and one unit fewer.
     let mut extra = FILES.to_vec();
@@ -883,21 +751,21 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
         "placeholder",
     ),
     (
-        "kbf-daemon.service",
-        "ExecStart=/usr/bin/kbf --mode=daemon",
-        "ExecStart=/usr/bin/kbf --mode=daemon \\\n    # a note\n    ",
+        "kbf-storage.service",
+        "ExecStart=/usr/bin/kbf --mode=storage",
+        "ExecStart=/usr/bin/kbf --mode=storage \\\n    # a note\n    ",
         "continuation",
     ),
     (
-        "kbf-daemon.service",
-        "ExecStart=/usr/bin/kbf --mode=daemon",
-        "ExecStart=/usr/local/bin/kbf daemon",
+        "kbf-storage.service",
+        "ExecStart=/usr/bin/kbf --mode=storage",
+        "ExecStart=/usr/local/bin/kbf storage",
         "exec",
     ),
     (
-        "kbf-daemon.service",
-        "ExecStartPre=/usr/bin/kbf --mode=daemon --check",
-        "ExecStartPre=-/usr/bin/kbf --mode=daemon --check",
+        "kbf-storage.service",
+        "ExecStartPre=/usr/bin/kbf --mode=storage --check",
+        "ExecStartPre=-/usr/bin/kbf --mode=storage --check",
         "exec-prefix",
     ),
     (
@@ -913,14 +781,14 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
         "gate-file",
     ),
     (
-        "kbf-all-in-one.service",
-        "ExecStartPre=/usr/bin/kbf --mode=all-in-one --check",
-        "ExecCondition=/usr/bin/kbf --mode=all-in-one --check",
+        "kbf-storage.service",
+        "ExecStartPre=/usr/bin/kbf --mode=storage --check",
+        "ExecCondition=/usr/bin/kbf --mode=storage --check",
         "gate-skip",
     ),
     (
-        "kbf-daemon.service",
-        "ExecStartPre=+/usr/bin/kbf boot-check --mode=daemon\n",
+        "kbf-storage.service",
+        "ExecStartPre=+/usr/bin/kbf boot-check --mode=storage\n",
         "",
         "gate-check",
     ),
@@ -937,19 +805,13 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
         "user",
     ),
     (
-        "kbf-daemon.service",
-        "\nUser=kbf\n",
-        "\nUser=kbf-server\n",
-        "user",
-    ),
-    (
         "kbf-storage.service",
         "StateDirectory=kbf-server\n",
         "StateDirectory=kbf\n",
         "state-dir",
     ),
     (
-        "kbf-daemon.service",
+        "kbf-storage.service",
         "\nWantedBy=multi-user.target\n",
         "\n",
         "install",
@@ -961,13 +823,13 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
         "network",
     ),
     (
-        "kbf-daemon.service",
-        "\nDelegate=yes\n",
-        "\nDelegate=yes\nEnvironmentFile=/etc/kbf/s3.env\n",
+        "kbf-storage.service",
+        "\nStateDirectoryMode=0750\n",
+        "\nStateDirectoryMode=0750\nEnvironmentFile=/etc/kbf/s3.env\n",
         "credential",
     ),
     (
-        "kbf-storage-and-daemon.service",
+        "kbf-storage.service",
         "\nRestart=on-failure\n",
         "\nRestart=always\n",
         "restart",
@@ -979,7 +841,7 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
         "restart-limit",
     ),
     (
-        "kbf-all-in-one.service",
+        "kbf-storage.service",
         "RestartPreventExitStatus=2",
         "RestartPreventExitStatus=2 75",
         "restart-exit",
@@ -1015,58 +877,16 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
         "notify",
     ),
     (
-        "kbf-daemon.service",
+        "kbf-storage.service",
         "\nTimeoutStopSec=infinity\n",
         "\nTimeoutStopSec=660\n",
         "stop",
     ),
     (
-        "kbf-daemon.service",
+        "kbf-storage.service",
         "\nKillSignal=SIGTERM\n",
         "\nKillSignal=SIGKILL\n",
         "stop",
-    ),
-    (
-        "kbf-daemon.service",
-        "\nKillMode=mixed\n",
-        "\n",
-        "kill-mode",
-    ),
-    (
-        "kbf-daemon.service",
-        "\nKillMode=mixed\n",
-        "\nKillMode=control-group\n",
-        "kill-mode",
-    ),
-    (
-        "kbf-storage-and-daemon.service",
-        "\nKillMode=mixed\n",
-        "\n",
-        "kill-mode",
-    ),
-    (
-        "kbf-storage-and-daemon.service",
-        "\nKillMode=mixed\n",
-        "\nKillMode=control-group\n",
-        "kill-mode",
-    ),
-    (
-        "kbf-all-in-one.service",
-        "\nKillMode=mixed\n",
-        "\n",
-        "kill-mode",
-    ),
-    (
-        "kbf-all-in-one.service",
-        "\nKillMode=mixed\n",
-        "\nKillMode=control-group\n",
-        "kill-mode",
-    ),
-    (
-        "kbf-storage-and-daemon.service",
-        "\nDelegate=yes\n",
-        "\nDelegate=memory pids\n",
-        "delegate",
     ),
     (
         "kbf-storage.service",
@@ -1074,61 +894,6 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
         "MemorySwapMax=1G",
         "swap",
     ),
-    (
-        "kbf-daemon.service",
-        "OOMScoreAdjust=-900",
-        "OOMScoreAdjust=-900\nMemorySwapMax=0",
-        "swap",
-    ),
-    (
-        "kbf-all-in-one.service",
-        "OOMScoreAdjust=-925",
-        "OOMScoreAdjust=-925\nMemorySwapMax=0",
-        "swap",
-    ),
-    (
-        "kbf-daemon.service",
-        "OOMScoreAdjust=-900",
-        "OOMScoreAdjust=-900\nMemoryMax=64G",
-        "caps",
-    ),
-    (
-        "kbf-storage-and-daemon.service",
-        "OOMScoreAdjust=-925",
-        "OOMScoreAdjust=-925\nMemoryHigh=64G",
-        "caps",
-    ),
-    (
-        "kbf-all-in-one.service",
-        "OOMScoreAdjust=-925",
-        "OOMScoreAdjust=-925\nCPUQuota=400%",
-        "caps",
-    ),
-    (
-        "kbf-daemon.service",
-        "OOMScoreAdjust=-900",
-        "OOMScoreAdjust=-900\nAllowedCPUs=0-3",
-        "caps",
-    ),
-    (
-        "kbf-daemon.service",
-        "OOMScoreAdjust=-900",
-        "OOMScoreAdjust=0",
-        "oom",
-    ),
-    (
-        "kbf-storage-and-daemon.service",
-        "OOMScoreAdjust=-925",
-        "OOMScoreAdjust=100",
-        "oom",
-    ),
-    (
-        "kbf-all-in-one.service",
-        "OOMScoreAdjust=-925",
-        "OOMScoreAdjust=high",
-        "oom",
-    ),
-    ("kbf-daemon.service", "OOMScoreAdjust=-900\n", "", "oom"),
     (
         "kbf.slice",
         "[Slice]\n",
@@ -1154,7 +919,7 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
         "runtime",
     ),
     (
-        "kbf-daemon.service",
+        "kbf-storage.service",
         "[Service]\n",
         "[Service]\nType=notify\n",
         "notify",
@@ -1198,7 +963,7 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
     (
         "kbf-frontend.service",
         "kbf --mode=frontend --config",
-        "kbf --mode=daemon --config",
+        "kbf --mode=storage --config",
         "exec",
     ),
     (
@@ -1328,24 +1093,6 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
         "state-dir",
     ),
     (
-        "kbf-daemon.service",
-        "StateDirectoryMode=0711\n",
-        "StateDirectoryMode=0750\n",
-        "state-dir-search",
-    ),
-    (
-        "kbf-storage-and-daemon.service",
-        "StateDirectoryMode=0711\n",
-        "StateDirectoryMode=0700\n",
-        "state-dir-search",
-    ),
-    (
-        "kbf-all-in-one.service",
-        "StateDirectoryMode=0711\n",
-        "StateDirectoryMode=0750\n",
-        "state-dir-search",
-    ),
-    (
         "kbf-frontend.service",
         "Slice=kbf.slice",
         "Slice=system.slice",
@@ -1391,7 +1138,7 @@ fn each_planted_defect_is_reported_by_its_rule() {
     }
 }
 
-/// Asserts that the `gate-check` rule reports each of the five mode units whose `boot-check`
+/// Asserts that the `gate-check` rule reports each of the two mode units whose `boot-check`
 /// is not `+/usr/bin/kbf boot-check --mode=<the unit's mode>`: one with no mode, one that is
 /// the installer's `boot-check` of the earlier packages, one that names the mode of another
 /// unit and one that does not run as root.
@@ -1404,10 +1151,10 @@ fn a_boot_check_other_than_kbfs_for_the_units_mode_fails_the_gate_check_of_every
         let right = format!("+{KBF} boot-check --mode={mode}\n");
         assert!(text.contains(&right), "{name}: no `{right}`");
         let earlier = format!("+{INSTALLER} boot-check --kbf={KBF} --mode={mode}\n");
-        let other = if mode == "daemon" {
-            "storage"
+        let other = if mode == "storage" {
+            "frontend"
         } else {
-            "daemon"
+            "storage"
         };
         for wrong in [
             format!("+{KBF} boot-check\n"),
@@ -1424,16 +1171,16 @@ fn a_boot_check_other_than_kbfs_for_the_units_mode_fails_the_gate_check_of_every
         }
         checked += 1;
     }
-    assert_eq!(checked, 5, "a mode unit was not checked");
+    assert_eq!(checked, 2, "a mode unit was not checked");
 }
 
-/// Catches a daemon stop timeout the rule lets through that cuts a drain short: any
+/// Catches a storage node stop timeout the rule lets through that cuts a drain short: any
 /// number of seconds (the old 660, 90, and one far above any drain), `0`, a word that is
-/// not `infinity`, and none at all are refused; `infinity` is accepted. The daemon drains
-/// until its leases end, so a finite timeout SIGKILLs them.
+/// not `infinity`, and none at all are refused; `infinity` is accepted. The node drains
+/// until its calls have ended, so a finite timeout SIGKILLs a Write in flight.
 #[test]
-fn a_daemon_stop_timeout_must_be_infinity() {
-    let name = "kbf-daemon.service";
+fn a_storage_stop_timeout_must_be_infinity() {
+    let name = "kbf-storage.service";
     let text = read(name);
     let shipped = "\nTimeoutStopSec=infinity\n";
     assert!(text.contains(shipped));
@@ -1450,30 +1197,6 @@ fn a_daemon_stop_timeout_must_be_infinity() {
     }
     let none = text.replacen(shipped, "\n", 1);
     assert_eq!(stop(&none), 1, "no TimeoutStopSec= was accepted");
-}
-
-/// Proves each unit that hosts the node daemon stops by signalling its main process alone
-/// with SIGTERM: KillMode=mixed and KillSignal=SIGTERM, read from the shipped file.
-#[test]
-fn units_that_host_the_daemon_signal_only_the_main_process_on_stop() {
-    for name in [
-        "kbf-daemon.service",
-        "kbf-storage-and-daemon.service",
-        "kbf-all-in-one.service",
-    ] {
-        let text = read(name);
-        let unit = UnitFile::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(
-            unit.get_in("Service", "KillMode").map(trim),
-            Some("mixed"),
-            "{name}: KillMode="
-        );
-        assert_eq!(
-            unit.get_in("Service", "KillSignal").map(trim),
-            Some("SIGTERM"),
-            "{name}: KillSignal="
-        );
-    }
 }
 
 /// Catches a rule with no defect (a check that cannot be shown to fail), and a defect
@@ -1505,7 +1228,7 @@ fn setup_enables_only_units_the_kbf_deb_ships() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
     let at = |rel: &str| -> PathBuf { root.join(rel) };
     let plan = xtask::pkg_linux::kbf_plan(&xtask::pkg_linux::Inputs {
-        kbf: &at("units/kbf-daemon.service"),
+        kbf: &at("units/kbf-storage.service"),
         units: &at("units"),
         trust: &at("testdata/trust"),
         sysusers: &at("sysusers.d/kbf-installer.conf"),
@@ -1523,9 +1246,9 @@ fn setup_enables_only_units_the_kbf_deb_ships() {
                 .strip_prefix(&format!("{}/", xtask::pkg_linux::UNIT_DIR))
         })
         .collect();
-    assert!(shipped.contains(&"kbf-daemon.service"), "{shipped:?}");
+    assert!(shipped.contains(&"kbf-storage.service"), "{shipped:?}");
     let modes = kbf_installer::cli::Mode::value_variants();
-    assert_eq!(modes.len(), 5, "every mode is checked");
+    assert_eq!(modes.len(), 2, "every mode is checked");
     for mode in modes {
         let units = kbf_installer::setup::plan::mode_units(*mode);
         assert!(!units.is_empty(), "{mode:?}");

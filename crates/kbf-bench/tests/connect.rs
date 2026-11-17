@@ -45,6 +45,23 @@ async fn bad_connection_flags_are_refused_before_any_request() {
         refused(&no_ca)
     );
 
+    for missing in ["cert", "key"] {
+        let mut no_identity = server.worker_target();
+        if missing == "cert" {
+            no_identity.tls.cert = Some(server.file("missing.pem"));
+        } else {
+            no_identity.tls.key = Some(server.file("missing.pem"));
+        }
+        assert!(
+            matches!(
+                connect::channel(&no_identity),
+                Err(ConnectError::Read { flag, ref path, .. })
+                    if flag == format!("--{missing}") && path.ends_with("missing.pem")
+            ),
+            "a missing client {missing} file"
+        );
+    }
+
     let mut garbage = server.worker_target();
     garbage.tls.cert = Some(server.file("garbage.pem"));
     assert!(matches!(
@@ -52,6 +69,6 @@ async fn bad_connection_flags_are_refused_before_any_request() {
         Err(ConnectError::Transport(..))
     ));
 
-    connect::channel(&server.worker_target()).expect("the daemon's flags");
+    connect::channel(&server.worker_target()).expect("a CA and a client identity");
     connect::channel(&server.reapi_target()).expect("plain text");
 }

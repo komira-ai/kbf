@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The checks every implementation of the daemon's data plane (`kbf_transfer::Cas`) must
+# The checks every implementation of the blob data plane (`kbf_transfer::Cas`) must
 # pass, generic over the implementation. Not a dependency of any shipped binary: each
 # implementation's own tests depend on it.
 [dependencies]

@@ -7,20 +7,14 @@
 //! a `kbf-store` store, its entries `kbf-log` commands applied to a `MetaState`) on a
 //! fault-injecting in-memory disk ([`kbf_store::FaultFs`]); the farm core is a
 //! `kbf-sched` [`kbf_sched::Scheduler`] and a [`kbf_server::machine::FarmMachine`],
-//! fed as `kbf-server`'s farm core feeds them. Daemons ([`FakeDaemon`]) keep their
-//! contact with the server in the daemon's own [`kbf_daemon::Contact`] and drop the
-//! leases of an earlier epoch by [`kbf_daemon::superseded`]. Clients ([`FakeClient`])
+//! fed as `kbf-server`'s farm core feeds them. Daemons ([`FakeDaemon`], the worker nodes
+//! of the worker protocol) keep their contact with the server in a `Contact` (T after
+//! the newest acknowledged heartbeat, [`FENCE_AFTER`]) and drop the leases of an earlier
+//! epoch by `superseded`, the rules `kbf-server`'s scheduler fences against. Clients ([`FakeClient`])
 //! upload an input, check it with `FindMissingBlobs` and `Execute` an action. The
 //! object store ([`ObjectStore`]) keeps every object it accepts, and meets the faults
 //! of its [`StorePlan`]: it hangs, is slow, fails PUTs, or loses their answers. The
 //! server can be taken down at a named point of its write path ([`CrashPlan`]).
-//!
-//! **Storage and daemon in one process** ([`Kind::WholeProcess`]): one daemon is the
-//! daemon half of the server's process (`kbf storage-and-daemon`; its design,
-//! docs/design/architecture-v2.md, sections 1 and 10). It stores each run's output in
-//! the server before it reports, and a kill of the process takes both halves down
-//! together, mid-build, and starts both again. The cell's server is also the scheduler,
-//! so the kill is stricter than a node's: the scheduler's state goes with it.
 //!
 //! [`run`] runs a [`Scenario`] step by step and checks properties 1 to 7 of ha.md
 //! section 15, the write path's 8 and 9 (docs/design/write-tier-scenarios.md), and
@@ -31,6 +25,7 @@
 mod cell;
 pub mod check;
 mod client;
+mod contact;
 mod daemon;
 mod hook;
 mod msg_text;
@@ -44,6 +39,7 @@ use kbf_types::{Digest, DigestFunction, LeaseId, OperationId, Outcome, Resources
 
 pub use cell::{Kind, RunReport, Scenario, run};
 pub use client::{FakeClient, Job};
+pub use contact::FENCE_AFTER;
 pub use daemon::FakeDaemon;
 pub use hook::{CrashPlan, Down, StorePoint, TierPoint};
 pub use server::{

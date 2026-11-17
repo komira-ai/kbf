@@ -1,10 +1,10 @@
-//! What every implementation of the daemon's data plane must do.
+//! What every implementation of the blob data plane must do.
 //!
-//! The data plane is [`kbf_transfer::Cas`]: the operations a worker daemon uses against
+//! The data plane is [`kbf_transfer::Cas`]: the operations a client uses against
 //! the farm's blob store (find which blobs are missing, store an action's outputs as
 //! records or a spool, read a blob whole, to a file or as chunks). Today there is one
-//! implementation, [`kbf_transfer::Transfers`], which speaks gRPC to a server; a daemon
-//! linked into the same process as the server will have another that calls the server's
+//! implementation, [`kbf_transfer::Transfers`], which speaks gRPC to a server; an
+//! implementation linked into the same process as the server would call the server's
 //! store directly. Both must be indistinguishable to a runtime, and this crate is how
 //! that is kept true: one set of checks, generic over the implementation.
 //!
@@ -35,7 +35,7 @@ pub trait Subject {
     /// The data plane being checked.
     type Cas: Cas;
 
-    /// A store with nothing in it, as a daemon sees it. Called once per check.
+    /// A store with nothing in it, as a client sees it. Called once per check.
     fn fresh(&self) -> impl Future<Output = Arc<Self::Cas>>;
 
     /// A directory the checks may make files in (spools, files to upload, files to read

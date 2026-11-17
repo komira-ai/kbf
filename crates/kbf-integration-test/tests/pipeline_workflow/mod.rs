@@ -31,8 +31,8 @@
 //!   `artifacts-sign` (stage sign) call, so a push to main runs each check once.
 //! - **Smoke tests the artifacts of the same run; beta needs none.** `smoke.yml` downloads the
 //!   `assets-*` and `sha256sums` artifacts without a `run-id` (the run it is part of), checks
-//!   them with `verify-assets sums`, takes the `kbf` of the linux-x86_64 tarball and runs the
-//!   farm from it; the job that runs the farm builds no `kbf` of its own. `beta.yml` downloads
+//!   them with `verify-assets sums`, then checks the `kbf` of the linux-x86_64 tarball with
+//!   `build-commit check-asset`; the job builds no `kbf` of its own. `beta.yml` downloads
 //!   no artifact, which is what lets it start beside `ci`.
 //! - **A running pipeline is not cancelled by a push; a release is never cancelled.** The
 //!   pipeline's concurrency is `pipeline-${{ github.ref }}` with `cancel-in-progress: false`: the
@@ -597,7 +597,7 @@ fn digests_handed_on(artifacts: &str, out: &mut Vec<String>) -> Result<(), Strin
     Ok(())
 }
 
-/// The smoke runs the `kbf` of the linux-x86_64 tarball of this run's artifacts.
+/// The smoke checks the `kbf` of the linux-x86_64 tarball of this run's artifacts.
 fn smoke_consumes_the_run(smoke: &str, out: &mut Vec<String>) -> Result<(), String> {
     if code(smoke).contains("run-id") {
         out.push(
@@ -639,13 +639,6 @@ fn smoke_consumes_the_run(smoke: &str, out: &mut Vec<String>) -> Result<(), Stri
     let asset_checked = exact(
         "cargo xtask build-commit check-asset \"dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz\" \"$GITHUB_SHA\"",
     );
-    let extracted =
-        exact("tar -xzf \"dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz\" -C \"$RUNNER_TEMP/bin\" kbf");
-    let ran = steps.iter().position(|s| {
-        s.run
-            .as_deref()
-            .is_some_and(|r| r.starts_with("target/debug/kbf-beta b0 "))
-    });
     if checked.is_none() {
         out.push(
             "the job `smoke` does not check the downloaded files with `verify-assets sums dist`"
@@ -655,26 +648,16 @@ fn smoke_consumes_the_run(smoke: &str, out: &mut Vec<String>) -> Result<(), Stri
     if asset_checked.is_none() {
         out.push("the job `smoke` does not run `build-commit check-asset` on the linux-x86_64 tarball for this commit: a kbf of another commit or a debug build could be the one tested".to_owned());
     }
-    match (checked, asset_checked, extracted, ran) {
-        (Some(c), Some(a), Some(e), Some(r)) if c < a && a < e && e < r => {}
-        _ => out.push("the job `smoke` does not check the files, then check the tarball's kbf with `build-commit check-asset`, then take `kbf` out of the linux-x86_64 tarball into `$RUNNER_TEMP/bin`, then run the farm, in that order".to_owned()),
-    }
-    if let Some(r) = ran
-        && !steps[r]
-            .run
-            .as_deref()
-            .unwrap_or_default()
-            .contains("--bin-dir \"$RUNNER_TEMP/bin\"")
-    {
-        out.push("the farm of `smoke` does not run from `--bin-dir \"$RUNNER_TEMP/bin\"`, where the tarball's kbf is".to_owned());
+    match (checked, asset_checked) {
+        (Some(c), Some(a)) if c < a => {}
+        _ => out.push("the job `smoke` does not check the files with `verify-assets sums dist`, then check the tarball's kbf with `build-commit check-asset`, in that order".to_owned()),
     }
     for s in &steps {
         let run = s.run.as_deref().unwrap_or_default();
         if run.starts_with("cargo build") && (run.contains("kbf-cli") || run.contains("--bin kbf "))
         {
             out.push(
-                "the job `smoke` builds `kbf`: the farm must run the artifact of this run"
-                    .to_owned(),
+                "the job `smoke` builds `kbf`: it must check the artifact of this run".to_owned(),
             );
         }
     }

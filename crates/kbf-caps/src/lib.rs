@@ -10,9 +10,8 @@
 //! layering test in `kbf-integration-test` and the lists in `clippy.toml` enforce it,
 //! and `js-caps` depends only on `thiserror`.
 //!
-//! `tests/fixtures` stays here because `kbf-daemon` reads some of its files with
-//! `include_str!`. `tests/wire_keys.rs` pins the platform property names a kbf client
-//! and daemon exchange, so a revision that renames one fails here.
+//! `tests/wire_keys.rs` pins the platform property names a kbf client and a worker
+//! node exchange, so a revision that renames one fails here.
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]

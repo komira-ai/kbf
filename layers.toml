@@ -1,6 +1,6 @@
 # Groups of crates kept apart from the rest of the workspace by declaration, checked by
 # crates/kbf-integration-test/tests/mdm_layering.rs. The farm's own layering (the pure crates,
-# the server and daemon split, the storage and proxy rules) is in tests/layering.rs.
+# the server layers, the storage and proxy rules) is in tests/layering.rs.
 #
 # A group's crates may depend (normal, optional, dev or build) on no crate of this workspace
 # but the ones their `may_link` row names, which must be crates of the group; no crate outside

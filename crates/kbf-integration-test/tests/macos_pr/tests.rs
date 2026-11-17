@@ -115,8 +115,7 @@ fn the_secrets_context_is_found_in_every_spelling_and_nothing_else() {
 #[test]
 fn a_listed_job_that_lost_its_gate_is_refused() {
     // Catches: macos-pr.yml's jobs given a condition (a job it skips reports success, so a
-    // required check would pass without a Mac), artifacts.yml's darwin build without its label,
-    // and a workflow's own `pull_request.paths` dropped.
+    // required check would pass without a Mac), and artifacts.yml's darwin build without its label.
     for job in ["macos-test", "macos-device"] {
         let found = changed_to(
             MACOS_PR,
@@ -150,25 +149,6 @@ fn a_listed_job_that_lost_its_gate_is_refused() {
         &found,
         "artifacts.yml#darwin-arm64 would run on a Mac for every pull request: its gate (Label) is gone",
     );
-    // A paths filter that matches every path, and one that is gone.
-    let found = changed_to(
-        "host-install-mac.yml",
-        "  pull_request:\n    paths:\n      - crates/kbf-host-install/**\n",
-        "  pull_request:\n    paths:\n      - '**'\n      - crates/kbf-host-install/**\n",
-    );
-    has(
-        &found,
-        "host-install-mac.yml#real-mac would run on a Mac for every pull request: its gate (TriggerPaths) is gone",
-    );
-    let found = changed_to(
-        "host-install-mac.yml",
-        "  pull_request:\n    paths:\n      - crates/kbf-host-install/**\n      - .github/workflows/host-install-mac.yml\n",
-        "  pull_request:\n",
-    );
-    has(
-        &found,
-        "host-install-mac.yml#real-mac would run on a Mac for every pull request: its gate (TriggerPaths) is gone",
-    );
 }
 
 #[test]
@@ -176,26 +156,33 @@ fn a_listed_job_that_is_gone_or_off_a_mac_is_stale() {
     // Catches: a list that keeps a row for a job moved to Linux or renamed, so the next macOS job
     // given its name would pass unexamined.
     let found = changed_to(
-        "host-install-mac.yml",
-        "    runs-on: macos-15",
-        "    runs-on: ubuntu-latest",
+        MACOS_PR,
+        "  macos-device:\n    runs-on: macos-15\n",
+        "  macos-device:\n    runs-on: ubuntu-latest\n",
     );
     has(
         &found,
-        "host-install-mac.yml#real-mac is listed as a pull request's macOS job, and is no job on a Mac: drop it from the list",
+        "macos-pr.yml#macos-device is listed as a pull request's macOS job, and is no job on a Mac: drop it from the list",
     );
-    let found = changed_to(
-        "host-install-mac.yml",
-        "  real-mac:\n",
-        "  real-mac-renamed:\n",
-    );
+    let found = changed_to(MACOS_PR, "  macos-device:\n", "  macos-device-renamed:\n");
     has(
         &found,
-        "host-install-mac.yml#real-mac is listed as a pull request's macOS job, and is no job on a Mac: drop it from the list",
+        "macos-pr.yml#macos-device is listed as a pull request's macOS job, and is no job on a Mac: drop it from the list",
     );
     has_part(
         &found,
-        "host-install-mac.yml#real-mac-renamed runs on a Mac for a pull request",
+        "macos-pr.yml#macos-device-renamed runs on a Mac for a pull request",
+    );
+    // The Mac workflow that used to carry its own path filter is gone, and a new one is no
+    // exemption: it is a macOS job of a pull-request workflow that is not on the list.
+    let found = changed_to(
+        "host-install-linux.yml",
+        "runs-on: ubuntu",
+        "runs-on: macos-15\n    # was: ubuntu",
+    );
+    has_part(
+        &found,
+        "host-install-linux.yml#real-linux runs on a Mac for a pull request and is not one of",
     );
 }
 
@@ -238,13 +225,13 @@ fn a_pull_request_macos_job_with_a_secret_is_refused() {
         );
     }
     let found = changed_to(
-        "host-install-mac.yml",
-        "GH_TOKEN: ${{ github.token }}",
-        "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
+        MACOS_PR,
+        "          KBF_TEST_GH: ${{ runner.temp }}/tools/gh\n",
+        "          KBF_TEST_GH: ${{ runner.temp }}/tools/gh\n          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n",
     );
     has(
         &found,
-        "host-install-mac.yml#real-mac names a secret (the `secrets` context); a pull request's macOS job holds none",
+        "macos-pr.yml#macos-device names a secret (the `secrets` context); a pull request's macOS job holds none",
     );
     let found = changed_to(
         MACOS_PR,
@@ -296,13 +283,13 @@ fn a_pull_request_macos_job_with_an_environment_oidc_or_a_write_scope_is_refused
         );
     }
     let found = changed_to(
-        "host-install-mac.yml",
-        "    permissions:\n      contents: read\n",
-        "    permissions:\n      contents: write\n",
+        MACOS_PR,
+        "    timeout-minutes: 75\n    permissions:\n      contents: read\n",
+        "    timeout-minutes: 75\n    permissions:\n      contents: write\n",
     );
     has(
         &found,
-        "host-install-mac.yml#real-mac sets `contents: write`; a pull request's macOS job may only read",
+        "macos-pr.yml#macos-test sets `contents: write`; a pull request's macOS job may only read",
     );
 }
 
@@ -415,21 +402,21 @@ fn a_step_of_the_after_merge_mac_jobs_that_no_pull_request_runs_is_refused() {
     );
     let found = changed_to(
         MACOS_PR,
-        "      - run: cargo test -p xtask --test pkg_macos --locked -- --ignored homebrew\n        if: ${{ !cancelled() }}\n",
-        "      - run: cargo test -p xtask --test pkg_macos --locked -- --ignored homebrew\n",
+        "      - name: The pinned gh verifies a real attestation offline\n        run: cargo test -p kbf-installer --test real_gh --locked -- --ignored --test-threads=1\n        env:\n          KBF_TEST_GH: ${{ runner.temp }}/tools/gh\n",
+        "",
     );
-    has_part(
+    has(
         &found,
-        "beta.yml#native-macos runs `cargo test -p xtask --test pkg_macos --locked -- --ignored homebrew",
+        "beta.yml#native-macos runs `cargo test -p kbf-installer --test real_gh --locked -- --ignored --test-threads=1` and no step of macos-pr.yml's macOS jobs is that step",
     );
     let found = changed_to(
         "beta.yml",
-        "MACOSX_DEPLOYMENT_TARGET: \"14.0\"\n      - run: cargo test -p xtask",
-        "MACOSX_DEPLOYMENT_TARGET: \"15.0\"\n      - run: cargo test -p xtask",
+        "      - name: The pinned gh verifies a real attestation offline\n        run: cargo test -p kbf-installer --test real_gh --locked -- --ignored --test-threads=1\n        env:\n          KBF_TEST_GH: ${{ runner.temp }}/tools/gh\n      - uses: actions/cache/save",
+        "      - name: The pinned gh verifies a real attestation offline\n        if: ${{ !cancelled() }}\n        run: cargo test -p kbf-installer --test real_gh --locked -- --ignored --test-threads=1\n        env:\n          KBF_TEST_GH: ${{ runner.temp }}/tools/gh\n      - uses: actions/cache/save",
     );
     has_part(
         &found,
-        "beta.yml#native-macos runs `cargo xtask sudo-test -p xtask --test pkg_macos",
+        "beta.yml#native-macos runs `cargo test -p kbf-installer --test real_gh",
     );
     let found = changed_to(
         "beta.yml",
@@ -455,7 +442,11 @@ fn a_step_of_the_after_merge_mac_jobs_that_no_pull_request_runs_is_refused() {
 fn a_crate_the_mac_tests_whole_and_the_linux_check_misses_is_refused() {
     // Catches: a crate added to `macos-test` and not to ci.yml's darwin `--tests` check, so a
     // macOS compile error in it reaches main from a pull request that runs no Mac.
-    let found = changed_to("ci.yml", " -p kbf-update -p update-hook", " -p update-hook");
+    let found = changed_to(
+        "ci.yml",
+        " -p kbf-seatbelt -p kbf-update",
+        " -p kbf-seatbelt",
+    );
     has(
         &found,
         "macos-pr.yml#macos-test tests kbf-update whole, and ci.yml's `lint` job does not check its tests for aarch64-apple-darwin: add `-p kbf-update` there",
@@ -475,7 +466,7 @@ fn a_cargo_line_selects_its_packages_and_targets() {
         })
     );
     assert_eq!(
-        s("cargo xtask sudo-test -p a --test t1 --test t2 -- --nocapture"),
+        s("cargo test -p a --test t1 --test t2 -- --nocapture"),
         Some(Selection {
             packages: vec!["a".into()],
             whole: false,

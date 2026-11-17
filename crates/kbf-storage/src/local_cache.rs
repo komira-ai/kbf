@@ -1,10 +1,11 @@
-//! The one cache of a node that runs local storage and a daemon on one disk
+//! The one cache of a node that runs local storage and an input cache on one disk
 //! ([`LocalCache`]; `docs/design/architecture-v2.md`, sections 10 and 15 item 8).
 //!
-//! On such a node (`all-in-one`, and `storage-and-daemon` once it is built) the daemon's
-//! input cache and the node's local storage are one cache, never two copies of a blob:
+//! On such a node the input cache and the node's local storage are one cache, never two
+//! copies of a blob. Only local storage attaches now (the process that held an input cache,
+//! the daemon, is gone), so the input side reads as 0:
 //!
-//! - **One directory and one index of whole blobs**: the daemon's input cache
+//! - **One directory and one index of whole blobs**: the input cache
 //!   (`<data-dir>/cache`), whose entries leases link (and shared read-only trees link,
 //!   at their own path, `<data-dir>/trees`). Local storage keeps no read copies of its
 //!   own beside it: its write tier deletes a block once it is flushed instead of keeping
@@ -29,7 +30,7 @@ use std::sync::OnceLock;
 /// What one half of the node holds on the disk now, in bytes.
 pub type HeldBytes = Box<dyn Fn() -> u64 + Send + Sync>;
 
-/// The one cache of a node that runs local storage and a daemon on one disk: see the
+/// The one cache of a node that runs local storage and an input cache on one disk: see the
 /// module docs. Shared by the two halves behind an `Arc`.
 #[derive(Default)]
 pub struct LocalCache {

@@ -1,32 +1,24 @@
-//! A fake daemon: one process, with the daemon's own rules for contact and epochs and
-//! a fake run of each lease.
+//! A fake daemon: one worker node of the cell, with the worker protocol's rules for
+//! contact and epochs and a fake run of each lease.
 //!
-//! Its contact with the server is a [`Contact`], the daemon's: a heartbeat every
-//! interval the `Welcome` named, each recorded when sent and confirmed by its
-//! acknowledgement; once contact is lost (T after the newest acknowledged send) every
-//! run is killed, and once a gap is declared (two intervals without an
-//! acknowledgement) the daemon opens a new stream. A `Welcome` drops the leases of an
-//! earlier epoch by [`superseded`], the daemon's rule. A run ends after a few seconds
-//! with a completed result; the result is kept until its `ResultAck`, listed in every
-//! heartbeat and resent with each, and on every new stream. One run in ten is long. A `Start` is taken only on
-//! the current stream, with contact confirmed, for a lease it does not hold.
-//!
-//! **The daemon half of `kbf storage-and-daemon`** ([`FakeDaemon::in_process`]) shares
-//! the server's process (the cell's server holds the store and the log). Its run stores the action's output ([`output_of`]) in the server
-//! before it reports, and its result names that output: it reports a run only once the
-//! server has acknowledged the output's upload. The process dies with the server's
-//! ([`FakeDaemon::die`]: every run, staged output and unacknowledged result is lost)
-//! and starts again with it ([`FakeDaemon::revive`]) as a new instance, on a new stream:
-//! a message of the dead process's streams means nothing to it.
+//! Its contact with the server is a [`Contact`]: a heartbeat every interval the
+//! `Welcome` named, each recorded when sent and confirmed by its acknowledgement; once
+//! contact is lost (T after the newest acknowledged send) every run is killed, and
+//! once a gap is declared (two intervals without an acknowledgement) the daemon opens a
+//! new stream. A `Welcome` drops the leases of an earlier epoch by [`superseded`]. A run
+//! ends after a few seconds with a completed result; the result is kept until its
+//! `ResultAck`, listed in every heartbeat and resent with each, and on every new
+//! stream. One run in ten is long. A `Start` is taken only on the current stream, with
+//! contact confirmed, for a lease it does not hold.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use kbf_daemon::{Contact, FENCE_AFTER, Moment, superseded};
 use kbf_sim::{Chance, Event, NodeId, NodeInput, Output, SimRng};
 use kbf_types::{Digest, Effect, FarmTime, LeaseId, OperationId, Outcome, Resources, StateMachine};
 
-use crate::{Msg, input_of, output_of};
+use crate::contact::{Contact, FENCE_AFTER, superseded};
+use crate::{Msg, input_of};
 
 /// How often the daemon checks its runs and its contact.
 const POLL: Duration = Duration::from_secs(1);
@@ -39,8 +31,6 @@ const RUN_MS: (u64, u64) = (1_000, 6_000);
 const LONG_RUN: Duration = Duration::from_secs(80);
 /// A `Hello` not answered within this is sent again on a new stream.
 const HELLO_WAIT: Duration = Duration::from_secs(10);
-/// An output upload not acknowledged within this is sent again.
-const UPLOAD_WAIT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Debug)]
 struct Run {
@@ -50,12 +40,9 @@ struct Run {
     ends: FarmTime,
 }
 
-/// A finished run of the in-process half whose output is being stored: its action,
-/// and when its upload was last sent.
-#[derive(Clone, Copy, Debug)]
-struct Staging {
-    action: Digest,
-    sent: FarmTime,
+/// `t` as the time since the simulation's origin, the instants a [`Contact`] takes.
+fn since_origin(t: FarmTime) -> Duration {
+    Duration::from_millis(t.as_millis())
 }
 
 /// The daemon node.
@@ -63,8 +50,6 @@ struct Staging {
 pub struct FakeDaemon {
     server: NodeId,
     instance: String,
-    /// The instance's name without its incarnation, for [`FakeDaemon::revive`].
-    name: String,
     capacity: Resources,
     contact: Contact,
     stream: u64,
@@ -77,23 +62,7 @@ pub struct FakeDaemon {
     unacked: BTreeMap<LeaseId, (Digest, Outcome)>,
     /// Every lease this daemon has reported a result for.
     reported: BTreeSet<LeaseId>,
-    /// The half of a storage-and-daemon process: it stores each run's output first.
-    in_process: bool,
-    /// The in-process half's finished runs whose output upload is not acknowledged.
-    staging: BTreeMap<LeaseId, Staging>,
-    /// Dead with its process: it ignores every input until revived.
-    dead: bool,
-    /// Revived, and connects at its next poll.
-    reviving: bool,
-    /// How many times its process has started.
-    incarnation: u64,
-    /// The runs, staged outputs and unacknowledged results lost with the process.
-    lost: usize,
     out: Vec<Output<Msg>>,
-}
-
-fn moment(t: FarmTime) -> Moment {
-    Moment::from_origin(Duration::from_millis(t.as_millis()))
 }
 
 impl FakeDaemon {
@@ -105,7 +74,6 @@ impl FakeDaemon {
     pub fn new(server: NodeId, instance: String, capacity: Resources) -> Self {
         Self {
             server,
-            name: instance.clone(),
             instance,
             capacity,
             contact: Contact::new(FENCE_AFTER),
@@ -118,77 +86,14 @@ impl FakeDaemon {
             runs: BTreeMap::new(),
             unacked: BTreeMap::new(),
             reported: BTreeSet::new(),
-            in_process: false,
-            staging: BTreeMap::new(),
-            dead: false,
-            reviving: false,
-            incarnation: 1,
-            lost: 0,
             out: Vec::new(),
         }
-    }
-
-    /// The daemon half of a storage-and-daemon process whose store is `server`: its
-    /// instance is `<name>-<incarnation>`.
-    #[must_use]
-    pub fn in_process(server: NodeId, name: &str, capacity: Resources) -> Self {
-        let mut daemon = Self::new(server, format!("{name}-1"), capacity);
-        daemon.name = name.to_owned();
-        daemon.in_process = true;
-        daemon
-    }
-
-    /// The process died (the server half's did): every run, staged output and
-    /// unacknowledged result goes with it, and so does contact. It ignores every input
-    /// until [`FakeDaemon::revive`].
-    pub fn die(&mut self) {
-        self.dead = true;
-        self.reviving = false;
-        self.lost += self.runs.len() + self.staging.len() + self.unacked.len();
-        self.runs.clear();
-        self.staging.clear();
-        self.unacked.clear();
-        self.welcomed = false;
-        self.epoch = None;
-        self.contact = Contact::new(FENCE_AFTER);
-    }
-
-    /// The process started again: a new instance, which connects at its next poll on a
-    /// new stream.
-    pub fn revive(&mut self) {
-        if !self.dead {
-            return;
-        }
-        self.dead = false;
-        self.reviving = true;
-        self.incarnation += 1;
-        self.instance = format!("{}-{}", self.name, self.incarnation);
-    }
-
-    /// The server's process went down (`up` false) or started (true): the daemon half
-    /// of that process dies or starts with it; any other daemon is not touched.
-    pub fn server_process(&mut self, up: bool) {
-        if !self.in_process {
-            return;
-        }
-        if up {
-            self.revive();
-        } else {
-            self.die();
-        }
-    }
-
-    /// The runs, staged outputs and unacknowledged results lost with the process, over
-    /// every death.
-    #[must_use]
-    pub fn lost(&self) -> usize {
-        self.lost
     }
 
     /// The runs going on at `now` and not fenced: the lease of each, and the term and
     /// operation it runs.
     pub fn unfenced_runs(&self, now: FarmTime) -> impl Iterator<Item = (LeaseId, OperationId)> {
-        let fenced = self.contact.lost(moment(now));
+        let fenced = self.contact.lost(since_origin(now));
         self.runs
             .iter()
             .filter(move |_| !fenced)
@@ -240,11 +145,10 @@ impl FakeDaemon {
             return;
         }
         self.seq += 1;
-        self.contact.sent(self.seq, moment(now));
+        self.contact.sent(self.seq, since_origin(now));
         let running = self
             .runs
             .keys()
-            .chain(self.staging.keys())
             .chain(self.unacked.keys())
             .copied()
             .collect();
@@ -258,18 +162,16 @@ impl FakeDaemon {
     }
 
     fn poll(&mut self, now: FarmTime) {
-        if self.contact.lost(moment(now)) {
+        if self.contact.lost(since_origin(now)) {
             // Fenced: every run is killed; its result is never sent.
             self.runs.clear();
-            self.staging.clear();
         }
-        let gap = self.contact.check_gap(moment(now)).is_some();
+        let gap = self.contact.check_gap(since_origin(now)).is_some();
         let unanswered =
             !self.welcomed && now.saturating_duration_since(self.hello_sent) >= HELLO_WAIT;
-        if std::mem::take(&mut self.reviving) || gap || unanswered {
+        if gap || unanswered {
             self.connect(now);
         }
-        self.resend_uploads(now);
         let ended: Vec<LeaseId> = self
             .runs
             .iter()
@@ -278,17 +180,7 @@ impl FakeDaemon {
             .collect();
         for lease in ended {
             let run = self.runs.remove(&lease).expect("listed above");
-            if self.in_process {
-                let output = output_of(&run.action);
-                let staging = Staging {
-                    action: run.action,
-                    sent: now,
-                };
-                self.staging.insert(lease, staging);
-                self.send(Msg::Upload { digest: output });
-            } else {
-                self.report(lease, run.action, input_of(&run.action));
-            }
+            self.report(lease, run.action, input_of(&run.action));
         }
     }
 
@@ -309,34 +201,6 @@ impl FakeDaemon {
         });
     }
 
-    /// Sends again each output upload not acknowledged within [`UPLOAD_WAIT`].
-    fn resend_uploads(&mut self, now: FarmTime) {
-        let mut again = Vec::new();
-        for staging in self.staging.values_mut() {
-            if now.saturating_duration_since(staging.sent) >= UPLOAD_WAIT {
-                staging.sent = now;
-                again.push(output_of(&staging.action));
-            }
-        }
-        for digest in again {
-            self.send(Msg::Upload { digest });
-        }
-    }
-
-    /// The server stored `digest`: each staged run whose output it is reports now.
-    fn stored(&mut self, digest: Digest) {
-        let staged: Vec<(LeaseId, Digest)> = self
-            .staging
-            .iter()
-            .filter(|(_, s)| output_of(&s.action) == digest)
-            .map(|(lease, s)| (*lease, s.action))
-            .collect();
-        for (lease, action) in staged {
-            self.staging.remove(&lease);
-            self.report(lease, action, digest);
-        }
-    }
-
     /// Takes the epoch a `Welcome` named, and drops each lease granted under another.
     fn new_epoch(&mut self, epoch: u64) {
         self.epoch = Some(epoch);
@@ -354,7 +218,7 @@ impl FakeDaemon {
                 self.welcomed = true;
                 self.interval = Duration::from_millis(interval_ms);
                 self.contact.new_stream(self.interval);
-                self.contact.confirm(moment(self.hello_sent));
+                self.contact.confirm(since_origin(self.hello_sent));
                 self.new_epoch(epoch);
                 self.resend_results();
             }
@@ -367,10 +231,8 @@ impl FakeDaemon {
                 operation,
                 action,
             } if stream == self.stream && self.welcomed => {
-                let held = self.runs.contains_key(&lease)
-                    || self.staging.contains_key(&lease)
-                    || self.unacked.contains_key(&lease);
-                if held || self.contact.lost(moment(now)) || self.reported.contains(&lease) {
+                let held = self.runs.contains_key(&lease) || self.unacked.contains_key(&lease);
+                if held || self.contact.lost(since_origin(now)) || self.reported.contains(&lease) {
                     return;
                 }
                 let mut rng = SimRng::from_seed(entropy);
@@ -396,9 +258,7 @@ impl FakeDaemon {
             }
             Msg::Cancel { stream, lease } if stream == self.stream => {
                 self.runs.remove(&lease);
-                self.staging.remove(&lease);
             }
-            Msg::Uploaded { digest } => self.stored(digest),
             Msg::Reset { stream } if stream == self.stream => self.connect(now),
             _ => {}
         }
@@ -410,9 +270,6 @@ impl StateMachine for FakeDaemon {
 
     fn apply(&mut self, input: NodeInput<Msg>) -> Vec<Effect> {
         let now = input.now;
-        // A dead process does nothing; its timers keep firing, standing for the next
-        // process's.
-        let dead = self.dead;
         match input.event {
             Event::Start => {
                 self.connect(now);
@@ -426,24 +283,19 @@ impl StateMachine for FakeDaemon {
                 });
             }
             Event::Timer { tag: T_POLL } => {
-                if !dead {
-                    self.poll(now);
-                }
+                self.poll(now);
                 self.out.push(Output::Timer {
                     after: POLL,
                     tag: T_POLL,
                 });
             }
             Event::Timer { .. } => {
-                if !dead {
-                    self.heartbeat(now);
-                }
+                self.heartbeat(now);
                 self.out.push(Output::Timer {
                     after: self.interval,
                     tag: T_HEARTBEAT,
                 });
             }
-            Event::Message { .. } if dead => {}
             Event::Message { msg, .. } => self.receive(now, msg, input.entropy),
         }
         Vec::new()

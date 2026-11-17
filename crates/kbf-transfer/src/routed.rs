@@ -1,9 +1,9 @@
-//! [`RoutedCas`]: the daemon's data plane over the storage map.
+//! [`RoutedCas`]: the data plane over the storage map.
 //!
 //! The same [`Cas`] a runtime uses against [`crate::Transfers`], but each blob goes to
 //! the storage nodes that own it (`kbf_route::Router`): reads from the owners in rank
 //! order (callers of one blob at once share one read), writes to the first owner that is
-//! not down, FindMissing split by primary. A daemon holds a connection to a frontend for
+//! not down, FindMissing split by primary. A client holds a connection to a frontend for
 //! work, and to storage nodes for bytes.
 //!
 //! What it keeps from the engine: at most `--transfer-in-flight` requests at once for the
@@ -40,7 +40,7 @@ use crate::cas::{Cas, CasError, label};
 use crate::config::TransferConfig;
 use crate::spool::to_proto;
 
-/// The daemon's data plane over the storage map. Cheap to clone through its `Arc`.
+/// The data plane over the storage map. Cheap to clone through its `Arc`.
 pub struct RoutedCas {
     router: Router,
     /// Requests in flight for the whole process.

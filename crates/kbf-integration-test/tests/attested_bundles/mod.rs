@@ -14,10 +14,8 @@
 //!   one bundle for several tarballs). A step for a tarball no job of that group
 //!   packages is named too.
 //! - **The packages.** The `kbf` deb that `cargo xtask pkg-kbf-asset` lists
-//!   ([`attested_assets::packaged_kbf_debs`]) and the Mac `.pkg` that `cargo xtask
-//!   pkg-macos-asset` lists ([`attested_assets::packaged_macos_pkgs`]) are held to the same
-//!   two rules, as `dist/kbf-<commit>-<platform>.deb` and `dist/kbf-installer-<commit>-<platform>.pkg`
-//!   and their `.deb.sigstore.json` (`.pkg.sigstore.json`).
+//!   ([`attested_assets::packaged_kbf_debs`]) is held to the same two rules, as
+//!   `dist/kbf-<commit>-<platform>.deb` and its `.deb.sigstore.json`.
 //!   So is the native `kbf` deb that `cargo xtask pkg-kbf-asset --native` lists
 //!   ([`attested_assets::packaged_native_debs`]), as `dist/kbf-native-<commit>-<platform>.deb`.
 //!   So are the frontend, coordinator and task images that `cargo xtask pkg-image-asset` lists
@@ -116,8 +114,7 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
     if packaged.is_empty() {
         return Err("no `cargo xtask package` line in any `run:` step".to_owned());
     }
-    // The packages: (binary, platform, extension), the `kbf` deb of a Linux job and the
-    // installer's `.pkg` of the macOS one.
+    // The packages: (binary, platform, extension), the `kbf` deb of a Linux job.
     let mut packages: Vec<(&str, String, &str)> = Vec::new();
     for platform in attested_assets::packaged_kbf_debs(artifacts)? {
         packages.push(("kbf", platform, "deb"));
@@ -125,9 +122,6 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
     // The native deb is held to the same rules, as `dist/kbf-native-<commit>-<platform>.deb`.
     for platform in attested_assets::packaged_native_debs(artifacts)? {
         packages.push(("kbf-native", platform, "deb"));
-    }
-    for platform in attested_assets::packaged_macos_pkgs(artifacts)? {
-        packages.push(("kbf-installer", platform, "pkg"));
     }
     // The images are held to the same rules, as `dist/kbf-<service>-image-<commit>-<platform>.oci.tar`.
     for (service, platform) in attested_assets::packaged_images(artifacts)? {

@@ -1,6 +1,6 @@
 //! The mark on execution metadata whose phase times are a task's claim.
 //!
-//! A daemon measures its `input_fetch`, `execution` and `output_upload` times. A task run by
+//! A worker that measures its `input_fetch`, `execution` and `output_upload` times writes them as they are. A task run by
 //! the executor only claims its three durations in its manifest, and the frontend lays them
 //! out as timestamps. The two are told apart by an empty `auxiliary_metadata` entry of the
 //! type [`TYPE_URL`], which the frontend adds when it lays out a claim and nothing else

@@ -125,7 +125,7 @@ fn fixture(text: &str) -> Value {
 }
 
 // The wrapper crates `kbf-sched`, `kbf-caps`, `kbf-estimator`, `kbf-sim`, `kbf-state` and
-// `kbf-usage`, and `kbf-daemon` (through `js-agent-usage`), keep their `js-*` dependencies:
+// `kbf-usage`, keep their `js-*` dependencies:
 // the legacy farm core uses them until it is removed, after the cutover to the job service. So
 // they are not checked here: only the scheduler's server crates and the lease client are.
 /// Asserts that no workspace member reaches `js-server-core` or `js-store` through a normal, dev

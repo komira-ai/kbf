@@ -109,11 +109,11 @@ const KBF_BUILDS: &[(&str, &str)] = &[
     ),
     (
         "linux-x86_64",
-        "- run: cargo build --locked --release --target \"$TARGET\" -p kbf-node -p kbf-server -p kbf-cli --bins\n",
+        "- run: cargo build --locked --release --target \"$TARGET\" -p kbf-server -p kbf-cli --bins\n",
     ),
     (
         "linux-arm64",
-        "- run: cargo build --locked --release --target \"$TARGET\" -p kbf-node -p kbf-server -p kbf-cli --bins\n",
+        "- run: cargo build --locked --release --target \"$TARGET\" -p kbf-server -p kbf-cli --bins\n",
     ),
 ];
 

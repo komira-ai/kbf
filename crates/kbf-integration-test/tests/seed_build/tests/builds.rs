@@ -318,11 +318,11 @@ fn every_shipped_binary_needs_its_own_unconditional_plain_build() {
     for job in SEED_JOBS {
         let binaries = shipped(job);
         assert!(binaries.contains(&"kbf"), "{job} ships kbf: {binaries:?}");
-        assert!(
-            binaries.contains(&"kbf-host-install"),
-            "{job}: {binaries:?}"
-        );
         if job.starts_with("linux-") {
+            assert!(
+                binaries.contains(&"kbf-host-install"),
+                "{job}: {binaries:?}"
+            );
             assert!(
                 binaries.contains(&"kbf-coordinator"),
                 "{job} ships the coordinator image's binary: {binaries:?}"
@@ -340,10 +340,22 @@ fn every_shipped_binary_needs_its_own_unconditional_plain_build() {
                 ),
             );
         }
-        let host = "        run: KBF_BUILD_COMMIT=";
-        let found = spoil_artifacts(job, host, &format!("        if: ${{{{ false }}}}\n{host}"));
-        for binary in ["kbf-host-install", "kbf-updater", "kbf-deploy"] {
-            red(&found, &format!("of `{binary}` (package `{binary}`)"));
+        if job.starts_with("linux-") {
+            let host = "        run: KBF_BUILD_COMMIT=";
+            let found =
+                spoil_artifacts(job, host, &format!("        if: ${{{{ false }}}}\n{host}"));
+            for binary in ["kbf-host-install", "kbf-updater", "kbf-deploy"] {
+                red(&found, &format!("of `{binary}` (package `{binary}`)"));
+            }
+        } else {
+            // The Mac ships `kbf-deploy` beside `kbf`, built by a line of its own.
+            let deploy = "cargo build --locked --release --target \"$TARGET\" -p kbf-deploy --bin kbf-deploy\n";
+            let found = spoil_artifacts(
+                job,
+                &format!("- run: {deploy}"),
+                &format!("- if: ${{{{ false }}}}\n        run: {deploy}"),
+            );
+            red(&found, "of `kbf-deploy` (package `kbf-deploy`)");
         }
     }
     // A package built, but not the binary it ships.

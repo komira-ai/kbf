@@ -1,4 +1,4 @@
-//! The property names kbf clients and daemons exchange, pinned where kbf can see them.
+//! The property names kbf clients and worker nodes exchange, pinned where kbf can see them.
 //!
 //! The behaviour behind them is tested in `js-caps`; these are the names themselves, so a
 //! revision of that crate that renames one fails here and not on a farm.

@@ -11,10 +11,10 @@ publish.workspace = true
 clap.workspace = true
 futures.workspace = true
 hex.workspace = true
-# The daemon's TLS loader, so a run connects as a daemon does.
+# The blob service's messages.
 kbf-proto.workspace = true
-# The daemon's transfer engine (FindMissing, ByteStream Write and Read), so a run
-# sends and reads blobs exactly as a daemon does.
+# The transfer engine (FindMissing, ByteStream Write and Read), so a run
+# sends and reads blobs as the engine does.
 kbf-transfer.workspace = true
 prost.workspace = true
 # The timestamps of a result's execution metadata.

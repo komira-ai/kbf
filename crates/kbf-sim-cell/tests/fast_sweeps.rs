@@ -20,11 +20,11 @@ fn count(swept: &Sweep, met: impl Fn(&RunReport) -> bool) -> usize {
     swept.each().filter(|r| met(r)).count()
 }
 
-/// Catches a calm network, a restart or a whole-process kill that breaks a property, a
+/// Catches a calm network, or a restart that breaks a property, a
 /// run that answers nothing, and a restart kind that never restarts.
 #[test]
-fn calm_restart_and_whole_process_seeds_answer_and_keep_every_property() {
-    for kind in [Kind::Calm, Kind::Restart, Kind::WholeProcess] {
+fn calm_and_restart_seeds_answer_and_keep_every_property() {
+    for kind in [Kind::Calm, Kind::Restart] {
         let swept = swept(kind, 0..3);
         for (seed, r) in &swept.reports {
             assert!(
@@ -34,12 +34,6 @@ fn calm_restart_and_whole_process_seeds_answer_and_keep_every_property() {
             if kind.restarts() {
                 assert!(r.starts > 1, "{kind:?} seed {seed} never restarted");
             }
-        }
-        if kind == Kind::WholeProcess {
-            assert!(
-                count(&swept, |r| r.lost > 0) > 0,
-                "no kill cut the daemon half"
-            );
         }
     }
 }

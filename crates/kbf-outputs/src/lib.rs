@@ -15,9 +15,9 @@
 //!   set on any entry and every ACL, never following a symlink; [`remove_tree_at`]
 //!   does the same for a name in a directory the caller holds open.
 //!
-//! The native driver (`kbf-driver-native`) uses both. The container driver
-//! (`kbf-driver-container`) keeps its own copy of the walk for now; moving it onto
-//! this crate is a follow-up.
+//! `kbf-task` reads a job's outputs with [`collect`]. Nothing outside this crate's own
+//! tests calls [`remove_tree`] now; they use it to clear scratch trees deeper than any
+//! path the kernel accepts.
 //!
 //! Callers must end every process of the action first: a process left running could
 //! swap a directory between a check and a read. The walk still refuses what such a

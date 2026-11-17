@@ -452,7 +452,7 @@ async fn a_read_more_than_half_done_finishes_for_the_next_caller() {
 }
 
 /// Catches a waiter that hangs, or panics, when its read's task is gone without an
-/// answer (the runtime it ran on shut down, as at daemon exit): it gets UNAVAILABLE.
+/// answer (the runtime it ran on shut down, as at process exit): it gets UNAVAILABLE.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_read_whose_task_is_gone_is_unavailable() {
     let fake = Arc::new(Fake::default());

@@ -1,5 +1,5 @@
 //! Generated protocol code: the Remote Execution API v2, the `kbf.worker.v1`
-//! server-daemon protocol, the `kbf.log.v1` replicated-log entries, the `kbf.map.v1`
+//! server-worker protocol, the `kbf.log.v1` replicated-log entries, the `kbf.map.v1`
 //! storage map (with its conversions to `kbf_map` types: `MapDecodeError`), the `kbf.enroll.v1`
 //! enrollment protocol, the `kbf.update.v1` self-update messages and release fetch, and the gRPC health
 //! checking protocol (`grpc.health.v1`), compiled from `.proto` files by `build.rs`.
@@ -86,7 +86,7 @@ pub mod kbf {
         }
     }
     pub mod worker {
-        /// The protocol between `kbf-daemon` and `kbf-server`.
+        /// The protocol between a worker node and `kbf-server`.
         pub mod v1 {
             tonic::include_proto!("kbf.worker.v1");
         }

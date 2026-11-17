@@ -300,7 +300,7 @@ mod tests {
         for run in [
             "cargo xtask release plan",
             "kbf-installer status",
-            "kbf-installer setup --mode=daemon",
+            "kbf-installer setup --mode=storage",
             "echo kbf-deploy host install",
         ] {
             let job = format!("      - run: {run}\n");

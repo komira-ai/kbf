@@ -1,6 +1,5 @@
 //! Reading a lease's [`ResourceUsage`] out of an `ActionResult`, and the `key=value`
-//! fields both the daemon's `lease phases:` line and the server's `action usage:`
-//! line print for its [`CgroupUsage`]. One formatter, so the two lines agree.
+//! fields the server's `action usage:` line prints for its [`CgroupUsage`].
 //!
 //! The derived numbers are integers in hundredths (`parallelism_centi`), so they stay
 //! comparable and exact; they are printed with two decimals.

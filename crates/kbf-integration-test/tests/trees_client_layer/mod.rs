@@ -139,7 +139,7 @@ fn a_crate_that_depends_on_the_trees_client_is_named() {
         r#"[
             {"name": "kbf-trees-client", "dependencies": [
                 {"name": "kbf-trees-client", "kind": "dev"}, {"name": "tonic", "kind": null}]},
-            {"name": "kbf-node", "dependencies": [{"name": "kbf-trees-client", "kind": null}]},
+            {"name": "kbf-storage", "dependencies": [{"name": "kbf-trees-client", "kind": null}]},
             {"name": "kbf-front", "dependencies": [{"name": "kbf-trees-client", "kind": "dev"}]},
             {"name": "kbf-cli", "dependencies": [{"name": "kbf-trees-client", "kind": "build"}]}
         ]"#,
@@ -147,7 +147,7 @@ fn a_crate_that_depends_on_the_trees_client_is_named() {
     .unwrap();
     assert_eq!(
         dependents(&packages),
-        ["kbf-node (normal)", "kbf-front (dev)", "kbf-cli (build)"]
+        ["kbf-storage (normal)", "kbf-front (dev)", "kbf-cli (build)"]
     );
     assert!(dependents(&packages[..1]).is_empty());
     let itself_normal: Vec<Value> = serde_json::from_str(

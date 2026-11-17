@@ -17,7 +17,7 @@ pub const DEFAULT_SEGMENT_STREAMS: usize = 16;
 /// the buffers of uploads begun, not a way past `--transfer-in-flight`.
 pub const DEFAULT_SEGMENT_UPLOADS: usize = 4;
 
-/// The engine's limits. Every field is a flag of `kbf-daemon` (crate `kbf-node`).
+/// The engine's limits. The flag name in each field's doc is the one a caller's command line gives it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferConfig {
     /// The most requests in flight at once for the whole process: ByteStream reads and

@@ -3,11 +3,11 @@
 //! files and reports each way they differ from these rules:
 //!
 //! - **The expected list.** Every job a pull request can run on a macOS runner is one of
-//!   [`PR_MACOS_JOBS`], with its gate ([`Gate`]): macos-pr.yml's two jobs with none at all (no
-//!   `if:`, so they run, and report, on every pull request), artifacts.yml's darwin build behind
-//!   exactly its label condition ([`LABEL_IF`]), and the jobs of the workflow that has
-//!   its own `pull_request.paths` (none of them `*` or `**`): host-install-mac.yml. A macOS job (any case of
-//!   `macos-`) of a workflow that runs on `pull_request` is a pull request's unless its `if:` is
+//!   [`PR_MACOS_JOBS`], with its gate ([`Gate`]): macos-pr.yml's two jobs, `macos-test` (the
+//!   macOS crates' tests) and `macos-device` (the pinned gh against a real attestation), with none
+//!   at all (no `if:`, so they run, and report, on every pull request), and artifacts.yml's darwin
+//!   build behind exactly its label condition ([`LABEL_IF`]). No kbf runs on a Mac, so there is no
+//!   job that tests a kbf program, a package or an installer. A macOS job (any case of `macos-`) of a workflow that runs on `pull_request` is a pull request's unless its `if:` is
 //!   exactly [`NOT_ON_A_PULL_REQUEST`] (ci.yml's `task-macos`, which runs after the merge); a job
 //!   of such a workflow that calls a local workflow with a macOS job is refused, as the lint cannot
 //!   read the call's gate. A listed job that is gone, or not on a Mac, is stale.
@@ -66,14 +66,11 @@ pub enum Gate {
     Always,
     /// The job's `if:` asks for the label `needs-artifacts`.
     Label,
-    /// The workflow's `pull_request` trigger has a `paths` filter.
-    TriggerPaths,
 }
 
 /// Every job a pull request can run on a macOS runner, `(workflow, job, gate)`.
-pub const PR_MACOS_JOBS: [(&str, &str, Gate); 4] = [
+pub const PR_MACOS_JOBS: [(&str, &str, Gate); 3] = [
     ("artifacts.yml", "darwin-arm64", Gate::Label),
-    ("host-install-mac.yml", "real-mac", Gate::TriggerPaths),
     (MACOS_PR, "macos-test", Gate::Always),
     (MACOS_PR, "macos-device", Gate::Always),
 ];
@@ -199,11 +196,6 @@ fn expected_list(workflows: &[(String, String)], out: &mut Vec<String>) -> Resul
         let gated = match gate {
             Gate::Always => condition.is_empty(),
             Gate::Label => condition == LABEL_IF,
-            Gate::TriggerPaths => workflows::trigger_filters(text, "pull_request").is_ok_and(|f| {
-                f.iter().any(|(k, v)| {
-                    k == "paths" && !v.is_empty() && v.iter().all(|p| p != "*" && p != "**")
-                })
-            }),
         };
         if !gated {
             out.push(match gate {
@@ -388,13 +380,12 @@ pub struct Selection {
     pub whole: bool,
 }
 
-/// The selection of a `cargo test`, `cargo build`, `cargo check` or `cargo xtask sudo-test`
-/// line, read up to its `--`; `None` for any other line.
+/// The selection of a `cargo test`, `cargo build` or `cargo check` line, read up to its `--`;
+/// `None` for any other line.
 pub fn selection(run: &str) -> Option<Selection> {
     let words: Vec<&str> = run.split_whitespace().collect();
     let rest = match words.as_slice() {
         ["cargo", "test" | "build" | "check", rest @ ..] => rest,
-        ["cargo", "xtask", "sudo-test", rest @ ..] => rest,
         _ => return None,
     };
     let mut s = Selection {

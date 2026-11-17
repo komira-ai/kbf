@@ -55,8 +55,8 @@ fn the_kbf_package_is_built_and_made_an_asset_for_the_commit_and_tarball_it_name
     );
     change(
         "--kbf-tarball \"dist/kbf-$GITHUB_SHA-",
-        "--kbf-tarball \"dist/kbf-installer-$GITHUB_SHA-",
-        "has --kbf-tarball \"dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz\", not `dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz`",
+        "--kbf-tarball \"dist/kbf-deploy-$GITHUB_SHA-",
+        "has --kbf-tarball \"dist/kbf-deploy-$GITHUB_SHA-linux-x86_64.tar.gz\", not `dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz`",
     );
     change(
         "--package target/pkg/out",
@@ -199,8 +199,8 @@ fn the_native_package_is_configured_built_and_made_an_asset_for_the_kbf_the_job_
     );
     change(
         "--kbf-tarball \"dist/kbf-$GITHUB_SHA-",
-        "--kbf-tarball \"dist/kbf-installer-$GITHUB_SHA-",
-        "has --kbf-tarball \"dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz\", not `dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz`",
+        "--kbf-tarball \"dist/kbf-deploy-$GITHUB_SHA-",
+        "has --kbf-tarball \"dist/kbf-deploy-$GITHUB_SHA-linux-x86_64.tar.gz\", not `dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz`",
     );
     change(
         "--package target/pkg/native/out",

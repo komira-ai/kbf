@@ -19,8 +19,8 @@ const PILOT: Shape = Shape {
 };
 
 /// The `Tree` message among the blobs, checked: the blobs that are no file are it
-/// and every `Directory` it holds (the root's too), no more and no fewer, as the
-/// daemon stores an output directory.
+/// and every `Directory` it holds (the root's too), no more and no fewer, as an
+/// output directory is stored.
 fn message(tree: &Tree, files: &BTreeSet<String>) -> TreeMessage {
     let blob = tree
         .blobs

@@ -289,7 +289,7 @@ async fn blobs_the_server_holds_are_not_sent_again() {
     assert!(front.all_present(&all).await);
 }
 
-/// Catches a new daemon failing against an old server (defect: UNIMPLEMENTED is an
+/// Catches a new client failing against an old server (defect: UNIMPLEMENTED is an
 /// error): a front without `Segments` gets every blob by ByteStream (a large one
 /// streamed from the spool), and the next spool does not try `Segments` again.
 #[tokio::test]
@@ -695,7 +695,7 @@ async fn records_are_sent_from_their_files_with_no_copy() {
 }
 
 /// Catches a file that changed after the walk hashed it being uploaded under the digest
-/// of what it held (the walk's one read is the only hash on the daemon, so this is the
+/// of what it held (the walk's one read is the only hash on the client, so this is the
 /// guard): each way a file can differ from what was hashed (rewritten, appended to,
 /// replaced by another file, removed, replaced by a symlink) fails the upload with a
 /// read error naming the file, and the blob is not stored. Catches: the
@@ -751,7 +751,7 @@ async fn a_file_changed_after_it_was_hashed_is_refused() {
 /// stamp is taken after the content differs, as a write that raced the walk's hash would
 /// leave it), are refused by the server's per-record check at `Commit`, and by the
 /// ByteStream fallback's, so the upload fails and neither digest is stored (defect: the
-/// server's record check is in kbf-front, see its tests; this one pins that the daemon
+/// server's record check is in kbf-front, see its tests; this one pins that the client
 /// does not paper over a refused upload).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bytes_that_do_not_hash_to_their_digest_are_never_stored() {

@@ -198,7 +198,7 @@ async fn writes_and_existence_checks_are_not_reads() {
     assert_eq!(rows(&reads), [0, 0, 0, 0, 0]);
 }
 
-/// Catches an in-process caller (the daemon half of a storage-and-daemon process) that reads
+/// Catches an in-process caller that reads
 /// around the counter: a blob read whole, a ranged read, an action entry, an action result and
 /// a segment range each count once on the in-process or segments row, and nothing is
 /// counted on the wire rows.
@@ -260,7 +260,7 @@ async fn an_in_process_miss_or_stale_read_is_not_counted() {
     assert_eq!(rows(&reads), [0, 0, 0, 0, 0]);
 }
 
-/// Catches a daemon half of a node without a frontend that reads its storage directly and so
+/// Catches an in-process caller of a node without a frontend that reads its storage directly and so
 /// around the counter: through `CountedStorage` a blob read whole, a ranged read, an action
 /// entry and an action result each count once on an `in_process` row; a miss, the empty
 /// blob, a store failure, a write and an existence check count nothing; and every call

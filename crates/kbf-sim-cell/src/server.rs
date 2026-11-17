@@ -40,8 +40,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::contact::FENCE_AFTER;
 use futures::FutureExt as _;
-use kbf_daemon::FENCE_AFTER;
 use kbf_front::{Described, MetaLog};
 use kbf_log::FarmLogId;
 use kbf_meta::{

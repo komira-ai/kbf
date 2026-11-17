@@ -1,39 +1,16 @@
-//! Thread and disk sizing for the two farm binaries, `kbf-daemon` and `kbf-server`.
-//! Disk sizing (what a cache, a tree store or a write tier may take of a filesystem) is
-//! the [`disk`] module.
+//! Thread and disk sizing for `kbf-server`. Disk sizing (what a cache, a tree store or a
+//! write tier may take of a filesystem) is the [`disk`] module.
 //!
-//! Each binary runs a tokio runtime with two pools (async workers, and a blocking pool
+//! The server runs a tokio runtime with two pools (async workers, and a blocking pool
 //! for calls that wait on a disk or a process) and has CPU-bound work (hashing) that
-//! must not run wider than the CPUs it may use. The two binaries differ:
-//!
-//! - The daemon shares its host with the actions it runs. Tokio's defaults, one worker
-//!   per logical CPU and up to 512 blocking threads, would only add contention on a
-//!   hyperthreaded farm node (44 cores, 88 logical CPUs), so its sizes come from a
-//!   reserve ([`ThreadArgs`], [`Topology`]).
-//! - The server runs no actions, so nothing needs protecting from it: it uses every
-//!   CPU it may ([`PoolArgs::resolve`]). There is no reserve flag on the server.
+//! must not run wider than the CPUs it may use. It runs no actions, so nothing needs
+//! protecting from it: it uses every CPU it may ([`PoolArgs::resolve`]).
 //!
 //! - [`PoolArgs`] is the optional overrides `--async-threads`, `--blocking-threads` and
 //!   `--cpu-threads`. The server flattens it into its command line.
-//! - [`ThreadArgs`] is [`PoolArgs`] plus `--reserve-cpus` and `--reserve-share`, for
-//!   the daemon.
-//! - [`ThreadArgs::resolve`] and [`PoolArgs::resolve`] turn them and a [`Topology`]
-//!   into [`Sizes`] (the daemon's can be refused: [`ReserveError`]).
+//! - [`PoolArgs::resolve`] turns them and a [`Topology`] into [`Sizes`].
 //! - [`Sizes::runtime`] builds the tokio runtime with those sizes, and
 //!   [`Sizes::log`] says them once at start.
-//!
-//! # The daemon's reserve
-//!
-//! No core numbers are pinned. `--reserve-cpus=N` says how many logical CPUs the farm's
-//! own processes keep for themselves; every other CPU is for the actions. The leases
-//! get the CPUs the process may use minus `N` ([`Sizes::lease_cpus`]), and the
-//! daemon's own pools are sized from `N` ([`pool_sizes`]): async workers
-//! `max(2, N/4)`, CPU pool `max(2, N/2)`, each at most the physical cores. On a host
-//! that runs the server and the daemon (the all-in-one) the operator gives the daemon
-//! `N`, which covers both processes; the server takes no share of it and does not size
-//! itself from it.
-//!
-//! # The server
 //!
 //! Async workers and the CPU pool default to every logical CPU the process may use
 //! ([`Topology::logical`], so an affinity mask or a cgroup quota counts), the blocking
@@ -53,7 +30,6 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use clap::Args;
-use thiserror::Error;
 
 /// Where the kernel publishes the CPU topology.
 const SYSFS: &str = "/sys";
@@ -136,62 +112,25 @@ fn siblings_in_list(text: &str) -> Option<usize> {
     Some(count)
 }
 
-/// The daemon's default cap on the blocking pool: threads that mostly sleep on disks
-/// and processes, so not tied to the CPUs.
-const DAEMON_BLOCKING_DEFAULT: usize = 64;
-
 /// Tokio's own cap on the blocking pool, which the server keeps.
 pub const TOKIO_BLOCKING_DEFAULT: usize = 512;
 
-/// The daemon's `--reserve-cpus` default, in physical cores: 4, each with its hyperthreads.
-/// That is 8 logical CPUs where two threads share a core and 4 where each core has one
-/// thread, as on Apple silicon ([`ThreadArgs::resolve`]).
-pub const DEFAULT_DAEMON_RESERVE_CORES: usize = 4;
-
-/// The async-worker and CPU-pool sizes a reserve of `reserve` logical CPUs gives on a
-/// machine of `cores` physical cores: `max(2, reserve/4)` and `max(2, reserve/2)`,
-/// each at most `cores` (and at least 1).
-#[must_use]
-pub fn pool_sizes(reserve: usize, cores: usize) -> (usize, usize) {
-    let cores = cores.max(1);
-    (
-        (reserve / 4).max(2).min(cores),
-        (reserve / 2).max(2).min(cores),
-    )
-}
-
-/// A `--reserve-cpus` the machine cannot give.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
-pub enum ReserveError {
-    /// The daemon's leases would get no CPU.
-    #[error(
-        "--reserve-cpus={reserve} leaves no CPU for leases: this machine has {logical} \
-         (give less than that)"
-    )]
-    NoneLeft { reserve: usize, logical: usize },
-    /// More than the machine has.
-    #[error("--reserve-cpus={reserve} is more than this machine's {logical} CPUs")]
-    MoreThanTheMachine { reserve: usize, logical: usize },
-}
-
-/// The overrides of the three thread counts. A count left out comes from the binary's
-/// default ([`ThreadArgs::resolve`], [`PoolArgs::resolve`]); one given is used as
+/// The overrides of the three thread counts. A count left out comes from the default
+/// ([`PoolArgs::resolve`]); one given is used as
 /// given, even above the CPUs.
 #[derive(Args, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PoolArgs {
     /// Worker threads of the async runtime, which run every task between its waits.
-    /// Default: every CPU the process may use on the server; `max(2, reserve/4)`, at
-    /// most the physical cores, on the daemon.
+    /// Default: every CPU the process may use.
     #[arg(long, value_name = "N")]
     pub async_threads: Option<NonZeroUsize>,
     /// The most threads the runtime's blocking pool runs at once, for calls that wait
     /// on a disk or a process (a thread is made when a call needs one and ends when
-    /// idle). Default: 512 (tokio's) for the server, 64 for the daemon.
+    /// idle). Default: 512 (tokio's).
     #[arg(long, value_name = "N")]
     pub blocking_threads: Option<NonZeroUsize>,
     /// Threads for CPU-bound work, such as hashing, which never waits and so is held
-    /// to the CPUs. Default: every CPU the process may use on the server;
-    /// `max(2, reserve/2)`, at most the physical cores, on the daemon.
+    /// to the CPUs. Default: every CPU the process may use.
     #[arg(long, value_name = "N")]
     pub cpu_threads: Option<NonZeroUsize>,
 }
@@ -202,85 +141,15 @@ impl PoolArgs {
     /// is taken: the server runs no actions.
     #[must_use]
     pub fn resolve(&self, topology: Topology) -> Sizes {
-        self.sizes(
-            topology,
-            None,
-            (
-                topology.logical(),
-                TOKIO_BLOCKING_DEFAULT,
-                topology.logical(),
-            ),
-        )
-    }
-
-    /// `defaults` (async, blocking, cpu) with the overrides on top; a size is at least 1.
-    fn sizes(
-        &self,
-        topology: Topology,
-        reserve: Option<usize>,
-        defaults: (usize, usize, usize),
-    ) -> Sizes {
         let or = |given: Option<NonZeroUsize>, default: usize| {
             given.map_or(default, NonZeroUsize::get).max(1)
         };
         Sizes {
-            async_threads: or(self.async_threads, defaults.0),
-            blocking_threads: or(self.blocking_threads, defaults.1),
-            cpu_threads: or(self.cpu_threads, defaults.2),
-            reserve,
+            async_threads: or(self.async_threads, topology.logical()),
+            blocking_threads: or(self.blocking_threads, TOKIO_BLOCKING_DEFAULT),
+            cpu_threads: or(self.cpu_threads, topology.logical()),
             topology,
         }
-    }
-}
-
-/// The daemon's thread flags. `--reserve-cpus` and `--reserve-share` size everything;
-/// the three thread counts ([`PoolArgs`]) are overrides.
-#[derive(Args, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ThreadArgs {
-    /// Logical CPUs the farm's own processes keep, in CPUs (hyperthreads count one
-    /// each). The daemon gives its leases every CPU it may use but these, with no
-    /// pinning, and sizes its own pools from them. Default: 4 physical cores with their
-    /// hyperthreads, so 8 where two threads share a core and 4 where each core has one
-    /// (half the CPUs on a smaller machine). 0 is allowed; a value that leaves no CPU for leases,
-    /// or is more than the machine has, is refused. On a host that also runs the
-    /// server, this covers both; the server has no reserve flag.
-    #[arg(long, value_name = "N")]
-    pub reserve_cpus: Option<usize>,
-    /// How many of the farm's processes on this host share the reserve: the daemon
-    /// sizes its pools from `reserve / share` CPUs. Default 1.
-    #[arg(long, value_name = "N")]
-    pub reserve_share: Option<NonZeroUsize>,
-    #[command(flatten)]
-    pub pools: PoolArgs,
-}
-
-impl ThreadArgs {
-    /// The daemon's sizes on `topology`: the reserve (given, or the default), the pools
-    /// from the reserve's share, then the overrides. The async and CPU defaults are
-    /// limited to the physical cores; the blocking default is not, because its threads
-    /// mostly sleep.
-    ///
-    /// # Errors
-    ///
-    /// A reserve the machine cannot give ([`ReserveError`]).
-    pub fn resolve(&self, topology: Topology) -> Result<Sizes, ReserveError> {
-        let logical = topology.logical();
-        let reserve = self.reserve_cpus.unwrap_or_else(|| {
-            (DEFAULT_DAEMON_RESERVE_CORES * topology.threads_per_core()).min(logical / 2)
-        });
-        if reserve > logical {
-            return Err(ReserveError::MoreThanTheMachine { reserve, logical });
-        }
-        if reserve == logical {
-            return Err(ReserveError::NoneLeft { reserve, logical });
-        }
-        let share = reserve / self.reserve_share.map_or(1, NonZeroUsize::get);
-        let (async_default, cpu_default) = pool_sizes(share, topology.physical());
-        Ok(self.pools.sizes(
-            topology,
-            Some(reserve),
-            (async_default, DAEMON_BLOCKING_DEFAULT, cpu_default),
-        ))
     }
 }
 
@@ -290,30 +159,10 @@ pub struct Sizes {
     async_threads: usize,
     blocking_threads: usize,
     cpu_threads: usize,
-    /// `None` on the server, which reserves nothing.
-    reserve: Option<usize>,
     topology: Topology,
 }
 
 impl Sizes {
-    /// The daemon's reserve in logical CPUs, as given or defaulted; 0 for the server,
-    /// which has none.
-    #[must_use]
-    pub fn reserve_cpus(&self) -> usize {
-        self.reserve.unwrap_or(0)
-    }
-
-    /// The CPUs the daemon's leases get: the CPUs the process may use, minus the
-    /// reserve (at least 1; a daemon whose reserve leaves none is refused by
-    /// [`ThreadArgs::resolve`]). For the server, which runs no leases, all of them.
-    #[must_use]
-    pub fn lease_cpus(&self) -> usize {
-        self.topology
-            .logical
-            .saturating_sub(self.reserve_cpus())
-            .max(1)
-    }
-
     /// Worker threads of the async runtime.
     #[must_use]
     pub const fn async_threads(&self) -> usize {
@@ -347,15 +196,11 @@ impl Sizes {
             .build()
     }
 
-    /// The line logged at start: the sizes and what they came from. The daemon's names
-    /// its reserve and the CPUs left for leases; the server's has neither.
+    /// The line logged at start: the sizes and the topology they came from.
     #[must_use]
     pub fn describe(&self) -> String {
-        let reserve = self.reserve.map_or_else(String::new, |reserve| {
-            format!(" reserve={reserve} leases={}", self.lease_cpus())
-        });
         format!(
-            "threads: async={} blocking={} cpu={}{reserve} (cpus={} threads_per_core={} physical_cores={})",
+            "threads: async={} blocking={} cpu={} (cpus={} threads_per_core={} physical_cores={})",
             self.async_threads,
             self.blocking_threads,
             self.cpu_threads,

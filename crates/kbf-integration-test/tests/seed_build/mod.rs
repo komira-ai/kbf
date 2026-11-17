@@ -81,10 +81,8 @@ const ALL_SUMS: &str = "sums";
 /// table to each package's `Cargo.toml`.
 pub const SHIPPED_BINARIES: &[(&str, &str)] = &[
     ("kbf", "kbf-cli"),
-    ("kbf-daemon", "kbf-node"),
     ("kbf-server", "kbf-server"),
     ("kbf-deploy", "kbf-deploy"),
-    ("kbf-installer", "kbf-installer"),
     ("kbf-host-install", "kbf-host-install"),
     ("kbf-updater", "kbf-updater"),
     ("kbf-signer", "kbf-signer"),

@@ -102,7 +102,6 @@ fn a_listed_binary_gets_the_virtualization_plist() {
 fn every_other_binary_gets_none() {
     for name in [
         "kbf",
-        "kbf-daemon",
         "kbf-server",
         "kbf-task",
         "kbf-installer",

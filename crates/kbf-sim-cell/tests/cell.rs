@@ -61,35 +61,6 @@ fn partition_seeds_keep_properties_1_2_3_5_6_7() {
     sweep(Kind::Partition);
 }
 
-/// A storage-and-daemon node (docs/design/architecture-v2.md, sections 1 and 10): kills of
-/// the whole process, both halves, mid-build. Catches an action answered as succeeded with its
-/// output missing, now or after a kill (property 14: the defect "the daemon half
-/// reports before the server acknowledged its output"), a log the kill does not keep
-/// (the defect "the restarted process opens an empty log", as `--meta-log=memory`
-/// would, is caught first by 6: farm time goes back to 0 with the index), and an
-/// action whose run the kill cut never answered (7: the defect "the client sends
-/// `Execute` once and never again"). Not vacuous: kills
-/// cut the daemon half's work (the defect "the daemon half outlives the kill" leaves
-/// `lost` at 0), and the actions cut were run again by a later process, whose
-/// scheduler started empty.
-#[test]
-fn whole_process_seeds_keep_every_property_and_rerun_what_the_kill_cut() {
-    let swept = sweep(Kind::WholeProcess);
-    let lost: usize = swept.each().map(|r| r.lost).sum();
-    let rerun: usize = swept.each().map(|r| r.rerun).sum();
-    assert!(lost > 0, "no kill cut the daemon half's work");
-    assert!(rerun > 0, "no action was run again after a kill");
-    // The daemon half stored its outputs through the server, in every seed.
-    let tag = kbf_sim_cell::output_of(&kbf_sim_cell::action(0)).hash[0];
-    for (seed, report) in &swept.reports {
-        let outputs = report.acked.iter().filter(|(_, d, _)| d.hash[0] == tag);
-        assert!(
-            outputs.count() > 0,
-            "seed {seed} stored no output: {report:?}"
-        );
-    }
-}
-
 /// Catches a cell that reads a clock, a random source or a hashed map's order: one
 /// seed replays to one trace, and another seed gives another.
 #[test]
