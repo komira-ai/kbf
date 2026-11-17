@@ -44,10 +44,12 @@
 //! after its write succeeded. [`TreeWriter::forget`] drops the place memo whole.
 //!
 //! **The tree list** ([`listing`], [`TreeWriter::write_listing`]) is the same action tree as one
-//! object, tierstore's tree list: every entry at its path, the base tree's included
-//! ([`BaseTree::listed`]), a file with bytes naming its pack span or whole object and its SHA-256, stored
-//! create-only at `cas/l/<sha256 of the list>`. tierstore's mount provider makes a job's tree
-//! from it (`--executor-input-tree provider`).
+//! object, tierstore's tree list in its version 2, the `TSTREE` layout ([`tstree`]): every entry
+//! as a fixed record, breadth first from the root, the base tree's included
+//! ([`BaseTree::listed`]), a file with bytes naming its pack span or whole object and its SHA-256,
+//! and a table of the pack ranges the tree reads; stored create-only at
+//! `cas/l/<sha256 of the list>`. tierstore's mount provider makes a job's tree from it
+//! (`--executor-input-tree provider`).
 //!
 //! The executor's runs that commit into a put directory call it (`--task-out-mode put-dir`),
 //! each run's action tree written over the published base tree before the job is submitted, as
@@ -60,6 +62,9 @@ mod memo;
 mod place;
 mod places;
 mod retry;
+mod tstree;
+#[cfg(test)]
+mod tstree_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -191,18 +196,20 @@ pub enum NoTree {
         directory: Digest,
     },
     /// tierstore's reader refuses the tree list of the tree (a name it does not take, a
-    /// list over its size limit): [`TreeWriter::write_listing`] only.
+    /// list over its size limit), or a record cannot hold it (a name over 255 bytes):
+    /// [`TreeWriter::write_listing`] only.
     #[error("the tree list of the tree is one tierstore refuses: {why}")]
     ListingRefused {
         /// What the reader said.
         why: String,
     },
     /// The tree list would hold more entries than the writer takes
-    /// ([`TreeWriter::with_list_entries`], by default [`MAX_ENTRIES`]):
-    /// [`TreeWriter::write_listing`] only.
+    /// ([`TreeWriter::with_list_entries`], by default [`MAX_ENTRIES`]), or more than fit in the
+    /// largest list tierstore reads (256 MiB, 64 bytes an entry): [`TreeWriter::write_listing`]
+    /// only.
     #[error("the tree list has {entries} entries or more, over the {limit} it may have")]
     ListTooLong {
-        /// The entries listed when the list was given up.
+        /// The entries the list would have (at most `u64::MAX`).
         entries: u64,
         /// The most it may have.
         limit: u64,

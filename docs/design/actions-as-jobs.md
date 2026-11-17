@@ -475,24 +475,33 @@ resubmits it as today's job (section 6). kbf uses none of js TI's tree inputs (`
 tree as **one object** instead of a manifest per directory, and the job's one layer names tierstore's mount provider
 instead of a host directory (jobscheduler's `docs/design/mount-providers.md`, komira-ai/jobscheduler#896):
 
-- **The object** is tierstore's *tree list* (`tierstore::TreeList`, the format tierstore owns and documents: JSON Lines, a header line, then one line per entry sorted by path): every
-  entry of the action tree at its path below the root. The base tree's entries come from its manifests, flattened once
-  when the frontend publishes the bundle (3.3; `BaseTree::listed`); then `work` and every entry of the input root
-  below it, and `.kbf` with `action` and `command`, as in 4.1. A file names its size and mode (0755 if REAPI marks
-  it executable, else 0644) and, if it has bytes, the object they are in (the pack span the index gives, else the
-  whole object `cas/l/<sha256>`, which is written first if it is missing, as in 4.1) and its SHA-256, which the
-  provider checks each fill against; a file of no bytes names neither. Every directory is listed, mode 0755, so an empty one is made too; an
-  empty input root is `work` with nothing below it. The list is read back by tierstore's own reader before it is
-  stored, and stored with one create-only write at `cas/l/<sha256 of its bytes>`: a retry or another run with the
-  same inputs finds it there and writes nothing.
+- **The object** is tierstore's *tree list*, version 2 (the `TSTREE` layout tierstore owns and documents in its
+  `crates/tierstore/docs/tree-manifest.md`: a 64-byte header, fixed 32-byte entry records in breadth-first order with
+  each directory's children together and sorted by name, a table of their SHA-256s, the pack keys, the names, and a
+  table of the pack ranges the tree reads; `crates/kbf-front/src/action_tree/tstree.rs`): every entry of the action
+  tree. The base tree's entries come from its manifests, flattened once when the frontend publishes the bundle (3.3;
+  `BaseTree::listed`); then `work` and every entry of the input root below it, and `.kbf` with `action` and
+  `command`, as in 4.1. The list is laid out from the root straight from the base's entries and the input root's
+  `Directory` messages, so no path is made; a `Directory` at several paths is listed at each. A file names its size
+  and mode (0755 if REAPI marks it executable, else 0644) and, if it has bytes, the object they are in (the pack span
+  the index gives, else the whole object `cas/l/<sha256>`, which is written first if it is missing, as in 4.1) and its
+  SHA-256, which the provider checks each fill against; a file of no bytes names no object and has the SHA-256 of no
+  bytes. Every directory is an entry, mode 0755, so an empty one is made too; an empty input root is `work` with
+  nothing below it. The ranges table holds every file's span, sorted, those of one pack merged when they are at most
+  64 KiB apart: it is a hint of what to fetch, and each file's own span is still read and checked against its digest.
+  The list is read back by tierstore's own reader (`TreeListV2::open`, then `build`) before it is stored, and stored
+  with one create-only write at `cas/l/<sha256 of its bytes>`: a retry or another run with the same inputs finds it
+  there and writes nothing. kbf writes no version 1 (JSON Lines) list.
 - **The layer** is `{provider: "tierstore", ref: <that key>}`. jobscheduler places the job only on a host whose agent
   serves the provider (`mount-provider.tierstore`); the agent hands the ref to tierstore's provider when the job is
   assigned, and tierstore fetches the list and fills every file in parallel while the container is made. kbf calls no
   node, and the manifests and the memo of 4.2 are not written for such a job.
 - **What it refuses**, as the manifests do (4.6's `why`): `unrepresentable` for `node_properties`, the input name
-  `.kbf-out`, a list the reader refuses, or more entries than tierstore takes (2^24 - 1; a directory named at several
-  paths of the input root is listed at each); `store` for a failed lookup or write, and for a base tree published
-  without its listing.
+  `.kbf-out`, a list the reader refuses, a name over the 255 bytes a record holds, or more entries than tierstore
+  takes (2^24 - 1) or than the records of the 256 MiB list it reads hold (4,194,302 below the root at 64 bytes an
+  entry, names and keys aside; a list that passes 256 MiB with its names and keys is refused too; a
+  directory named at several paths of the input root is counted at each, before anything is looked up); `store` for a
+  failed lookup or write, and for a base tree published without its listing.
 - **macOS** keeps the manifests: the native runtime takes no provider yet (jobscheduler's design, Q4).
 
 The flag selects the path per frontend; the manifests' path is removed once the tree list is the default on the farm.

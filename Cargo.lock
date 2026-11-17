@@ -2782,7 +2782,7 @@ dependencies = [
 [[package]]
 name = "objstore-s3"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=9a6718b2f3d75c2dfbaca76e8d85f22085054550#9a6718b2f3d75c2dfbaca76e8d85f22085054550"
+source = "git+https://github.com/komira-ai/tierstore?rev=2849287b8931a244ad64ae919c8f079bb15b124d#2849287b8931a244ad64ae919c8f079bb15b124d"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3778,7 +3778,7 @@ dependencies = [
 [[package]]
 name = "tierstore"
 version = "0.3.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=9a6718b2f3d75c2dfbaca76e8d85f22085054550#9a6718b2f3d75c2dfbaca76e8d85f22085054550"
+source = "git+https://github.com/komira-ai/tierstore?rev=2849287b8931a244ad64ae919c8f079bb15b124d#2849287b8931a244ad64ae919c8f079bb15b124d"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3842,7 +3842,7 @@ dependencies = [
 [[package]]
 name = "tierstore-trees-api"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=9a6718b2f3d75c2dfbaca76e8d85f22085054550#9a6718b2f3d75c2dfbaca76e8d85f22085054550"
+source = "git+https://github.com/komira-ai/tierstore?rev=2849287b8931a244ad64ae919c8f079bb15b124d#2849287b8931a244ad64ae919c8f079bb15b124d"
 dependencies = [
  "prost",
  "protox 0.10.0",

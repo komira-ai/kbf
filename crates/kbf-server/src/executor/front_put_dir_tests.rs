@@ -1,6 +1,7 @@
 //! The seams of a frontend whose tasks commit into put directories (`--task-out-mode put-dir`):
 //! the directory and the action tree a run gets, and the ingest of what it committed.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -383,7 +384,7 @@ async fn a_tree_that_only_the_pack_holds_is_read_through_the_same_packs() {
 
 /// Asserts that a run minted with `InputTree::Provider` over a listed base tree parks a key
 /// that `Inputs::tree` hands out once: `cas/l/` and 64 lowercase hex digits, an object the store
-/// holds whose bytes parse as a tree list that names the base tree's symlink, `work/input` and
+/// holds whose bytes tierstore's version 2 reader opens and builds to a tree that names the base tree's symlink, `work/input` and
 /// `.kbf/action`, and whose key is the one tierstore names the list by. Catches: a provider run
 /// that parks a manifest digest, a key of a list that was never stored, and a list that leaves
 /// out the input root or the action.
@@ -419,10 +420,30 @@ async fn a_provider_run_gets_the_key_of_a_stored_tree_list_once() {
         .get_range(&object, ByteRange::new(0, len).expect("a range"))
         .await
         .expect("read");
-    // The tierstore tree-list API: adjust to the pinned crate.
-    let list = tierstore::parse_tree_list(&bytes, &TreeDigest::of(&bytes)).expect("a tree list");
+    // Read as tierstore's mount provider reads it: tree list version 2, opened and built.
+    let list = tierstore::TreeListV2::open(&bytes).expect("a tree list");
+    let built = list
+        .build(&tierstore::TreeLimits::default(), |_| {})
+        .expect("a tree list the reader builds");
     assert_eq!(tierstore::tree_list_key(&bytes), key);
-    let paths: Vec<&str> = list.entries.iter().map(|e| e.path.as_str()).collect();
+    let records: BTreeMap<[u8; 32], &tierstore::TreeRecord> = (built.records.iter())
+        .map(|(digest, record)| (*digest.as_bytes(), record))
+        .collect();
+    let mut paths: BTreeMap<String, &tierstore::RecordChild> = BTreeMap::new();
+    let mut stack = vec![(String::new(), records[built.root.as_bytes()])];
+    while let Some((at, record)) = stack.pop() {
+        for child in record.children() {
+            let path = if at.is_empty() {
+                child.name().to_owned()
+            } else {
+                format!("{at}/{}", child.name())
+            };
+            if let tierstore::RecordChild::Dir { digest, .. } = child {
+                stack.push((path.clone(), records[digest.as_bytes()]));
+            }
+            paths.insert(path, child);
+        }
+    }
     for want in [
         "bin",
         "work",
@@ -431,16 +452,12 @@ async fn a_provider_run_gets_the_key_of_a_stored_tree_list_once() {
         ".kbf/action",
         ".kbf/command",
     ] {
-        assert!(paths.contains(&want), "{want} in {paths:?}");
+        assert!(paths.contains_key(want), "{want} in {:?}", paths.keys());
     }
-    let bin = list
-        .entries
-        .iter()
-        .find(|e| e.path == "bin")
-        .expect("the base tree's link");
     assert!(
-        matches!(&bin.kind, tierstore::ListKind::Symlink { target } if target == "usr/bin"),
-        "{bin:?}"
+        matches!(paths["bin"], tierstore::RecordChild::Symlink { target, .. } if target == "usr/bin"),
+        "{:?}",
+        paths["bin"]
     );
 }
 

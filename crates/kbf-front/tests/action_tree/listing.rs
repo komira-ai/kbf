@@ -1,14 +1,18 @@
-//! The action tree as one tierstore tree list (`TreeWriter::write_listing`): what the stored
-//! list names for each kind of entry, the base tree's entries, the key it is stored at, and
-//! every refusal and store fault, by name.
+//! The action tree as one tierstore tree list, version 2 (`TreeWriter::write_listing`): what the
+//! stored list names for each kind of entry, the base tree's entries, the ranges it says the tree
+//! reads, the key it is stored at, and every refusal and store fault, by name.
 //!
-//! A stored list is read back with tierstore's own reader and described entry by entry; no
+//! A stored list is read back with tierstore's own reader at kbf's pin (`TreeListV2::open`, then
+//! `build`, as the mount provider reads it) and the tree it builds described entry by entry; no
 //! test reads the encoded bytes.
 
 use kbf_front::action_tree::Listing;
-use tierstore::{ListKind, Mode, TreeList, parse_tree_list};
+use tierstore::{BuiltTree, ListRange, Mode, RecordChild, TreeLimits, TreeListV2, TreeRecord};
 
 use super::*;
+
+/// The SHA-256 of no bytes, in hex: what a file of size 0 has.
+const EMPTY_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// The base of the rig with every entry below its root listed, from the manifests the farm
 /// holds.
@@ -40,7 +44,7 @@ pub(super) async fn list(rig: &Rig, root: &Digest) -> Result<Listing, NoTree> {
 }
 
 /// A mode as the file modes of the list are written.
-fn mode_name(mode: &Mode) -> &'static str {
+fn mode_name(mode: Mode) -> &'static str {
     match mode.bits() {
         0o644 => "0644",
         0o755 => "0755",
@@ -48,44 +52,73 @@ fn mode_name(mode: &Mode) -> &'static str {
     }
 }
 
-/// Every entry of `list` by path, described: `dir <mode>`, `symlink <target>` or
-/// `file <mode> size=<n> src=<key>@<offset or -> sha=<hex or ->`.
-fn describe(list: &TreeList) -> BTreeMap<String, String> {
+/// Every entry of the tree `built` by path, described: `dir <mode>`, `symlink <target>` or
+/// `file <mode> size=<n> src=<key>@<offset or -> sha=<hex>`.
+fn describe(built: &BuiltTree) -> BTreeMap<String, String> {
+    let records: BTreeMap<&[u8; 32], &TreeRecord> = built
+        .records
+        .iter()
+        .map(|(digest, record)| (digest.as_bytes(), record))
+        .collect();
+    let sources: BTreeMap<&str, String> = built
+        .files
+        .iter()
+        .filter_map(|file| {
+            let source = file.source.as_ref()?;
+            Some((
+                file.path.as_str(),
+                format!("{}@{}", source.key, source.offset),
+            ))
+        })
+        .collect();
     let mut described = BTreeMap::new();
-    for entry in &list.entries {
-        let text = match &entry.kind {
-            ListKind::Dir { mode } => format!("dir {}", mode_name(mode)),
-            ListKind::Symlink { target } => format!("symlink {target}"),
-            ListKind::File {
-                mode,
-                size,
-                source,
-                sha256,
-            } => {
-                let source = source.as_ref().map_or("-".to_owned(), |source| {
-                    format!("{}@{}", source.key, source.offset)
-                });
-                let sha = sha256.as_ref().map_or("-".to_owned(), ToString::to_string);
-                format!(
-                    "file {} size={size} src={source} sha={sha}",
-                    mode_name(mode)
-                )
-            }
-        };
-        assert!(
-            described.insert(entry.path.clone(), text).is_none(),
-            "{} is listed twice",
-            entry.path
-        );
+    let mut stack = vec![(String::new(), records[built.root.as_bytes()])];
+    while let Some((at, record)) = stack.pop() {
+        for child in record.children() {
+            let path = if at.is_empty() {
+                child.name().to_owned()
+            } else {
+                format!("{at}/{}", child.name())
+            };
+            let text = match child {
+                RecordChild::Dir { digest, .. } => {
+                    let below = records[digest.as_bytes()];
+                    stack.push((path.clone(), below));
+                    format!("dir {}", mode_name(below.mode()))
+                }
+                RecordChild::Symlink { target, .. } => format!("symlink {target}"),
+                RecordChild::File {
+                    mode, size, sha256, ..
+                } => {
+                    let source = sources.get(path.as_str()).map_or("-", String::as_str);
+                    format!(
+                        "file {} size={size} src={source} sha={sha256}",
+                        mode_name(*mode)
+                    )
+                }
+            };
+            assert!(
+                described.insert(path.clone(), text).is_none(),
+                "{path} is listed twice"
+            );
+        }
     }
     described
 }
 
-/// The list stored at `key`, read by tierstore's reader against the digest of its bytes.
-fn stored(rig: &Rig, key: &str) -> BTreeMap<String, String> {
+/// The list stored at `key`, read by tierstore's version 2 reader as its mount provider reads it.
+fn built(rig: &Rig, key: &str) -> (BuiltTree, Vec<ListRange>) {
     let bytes = rig.farm.object(key).expect("the list is stored");
-    let parsed = parse_tree_list(&bytes, &TreeDigest::of(&bytes)).expect("a list the reader takes");
-    describe(&parsed)
+    let list = TreeListV2::open(&bytes).expect("a list the reader opens");
+    let built = list
+        .build(&TreeLimits::default(), |_| {})
+        .expect("a list the reader builds");
+    (built, list.ranges().collect())
+}
+
+/// The list stored at `key`, described.
+fn stored(rig: &Rig, key: &str) -> BTreeMap<String, String> {
+    describe(&built(rig, key).0)
 }
 
 /// The list the writer stored for `listing`.
@@ -215,9 +248,9 @@ async fn an_unlocated_blob_is_written_whole_before_the_list_names_it() {
     );
 }
 
-/// Catches: an empty file given a source, a hash or a wrong size: it has size 0 and names
-/// neither an object nor a hash (the tree list's rule for a file of no bytes), and no object is
-/// written for it.
+/// Catches: an empty file given a source, another hash or a wrong size: it has size 0, names no
+/// object and has the SHA-256 of no bytes (version 2's rule for a file of no bytes), and no object
+/// is written for it.
 #[tokio::test]
 async fn an_empty_file_has_size_zero_and_no_source() {
     let rig = Rig::new().await;
@@ -226,7 +259,7 @@ async fn an_empty_file_has_size_zero_and_no_source() {
     let listing = list(&rig, &root).await.expect("a list");
     assert_eq!(
         read(&rig, &listing).get("work/f0"),
-        Some(&file_line("0644", 0, "-", "-"))
+        Some(&file_line("0644", 0, "-", EMPTY_HEX))
     );
     assert_eq!(rig.farm.puts(), [listing.key().to_owned()]);
 }
@@ -593,7 +626,239 @@ async fn an_empty_file_beside_an_empty_directory_are_both_listed() {
         .await;
     let listing = list(&rig, &root).await.expect("a list");
     let got = read(&rig, &listing);
-    assert_eq!(got.get("work/blank"), Some(&file_line("0644", 0, "-", "-")));
+    assert_eq!(
+        got.get("work/blank"),
+        Some(&file_line("0644", 0, "-", EMPTY_HEX))
+    );
     assert_eq!(got.get("work/hollow").map(String::as_str), Some("dir 0755"));
     assert!(!got.keys().any(|path| path.starts_with("work/hollow/")));
+}
+
+/// Catches: a ranges table that leaves out a pack's spans, merges spans of one pack further
+/// apart than 64 KiB, merges two packs, or leaves out the base's or `.kbf`'s files: the files of
+/// `cas/f/w/p0` exactly 64 KiB apart are one range and the one a byte further is another, the
+/// whole object and the base's spans each have theirs, and the Action and Command (100 bytes
+/// apart in `cas/f/w/p9`) are one.
+#[tokio::test]
+async fn the_ranges_table_holds_every_pack_span_merged_within_64_kib() {
+    let rig = Rig::new().await;
+    let gap = 64 * 1024;
+    let a = rig.farm.packed("aaa", "cas/f/w/p0", 0).await;
+    let b = rig.farm.packed("bbb", "cas/f/w/p0", 3 + gap).await;
+    let c = rig.farm.packed("ccc", "cas/f/w/p0", 6 + 2 * gap + 1).await;
+    let big = rig.farm.whole("a large object").await;
+    let root = root_of(&rig, &[a, b, c, big]).await;
+    let listing = list(&rig, &root).await.expect("a list");
+    let (_, ranges) = built(&rig, listing.key());
+    let of = |key: &str| -> Vec<(u64, u64)> {
+        (ranges.iter())
+            .filter(|range| &*range.key == key)
+            .map(|range| (range.offset, range.len))
+            .collect()
+    };
+    assert_eq!(of("cas/f/w/p0"), [(0, 6 + gap), (6 + 2 * gap + 1, 3)]);
+    assert_eq!(of(&whole_key(&big.hash_hex())), [(0, 14)]);
+    assert_eq!(of("cas/f/base/p0"), [(3, 5)]);
+    // `usr/cc` and `.kbf-tools/kbf-task` are one whole object.
+    assert_eq!(of(&whole_key(BASE_FILE)), [(0, 5)]);
+    let action = rig.action(&root).await;
+    assert_eq!(of("cas/f/w/p9"), [(0, 100 + action.size_bytes)]);
+    assert_eq!(ranges.len(), 6);
+}
+
+/// Catches: a pack key the reader refuses (over its 1024 bytes) stored in a list anyway:
+/// `NoTree::ListingRefused` naming the key's fault, unrepresentable, and nothing is written.
+#[tokio::test]
+async fn a_pack_key_the_reader_refuses_makes_no_list() {
+    let rig = Rig::new().await;
+    let long = format!("cas/f/{}", "k".repeat(1100));
+    let blob = rig.farm.packed("far away", &long, 0).await;
+    let root = root_of(&rig, &[blob]).await;
+    let refused = list(&rig, &root).await.expect_err("no list");
+    assert!(
+        matches!(&refused, NoTree::ListingRefused { why } if why.contains("key")),
+        "{refused:?}"
+    );
+    assert_eq!(refused.why(), "unrepresentable");
+    assert!(rig.farm.puts().is_empty());
+}
+
+/// Catches: a name longer than a record holds (255 bytes) cut short or wrapped: a file named by
+/// 256 bytes is `NoTree::ListingRefused`, unrepresentable, and nothing is written; one of 255 is
+/// listed at its path.
+#[tokio::test]
+async fn a_name_over_255_bytes_makes_no_list_and_one_of_255_is_listed() {
+    let rig = Rig::new().await;
+    let blob = rig.farm.packed("named", "cas/f/w/p0", 0).await;
+    let over = rig
+        .store(&directory(
+            vec![file(&"n".repeat(256), &blob, false)],
+            vec![],
+            vec![],
+        ))
+        .await;
+    let refused = list(&rig, &over).await.expect_err("no list");
+    assert!(
+        matches!(&refused, NoTree::ListingRefused { why } if why.contains("256 bytes")),
+        "{refused:?}"
+    );
+    assert_eq!(refused.why(), "unrepresentable");
+    assert!(rig.farm.puts().is_empty());
+    let longest = "n".repeat(255);
+    let fits = rig
+        .store(&directory(
+            vec![file(&longest, &blob, false)],
+            vec![],
+            vec![],
+        ))
+        .await;
+    let listing = list(&rig, &fits).await.expect("a list");
+    assert!(read(&rig, &listing).contains_key(&format!("work/{longest}")));
+}
+
+/// Catches: a tree whose list could not fit in the 256 MiB tierstore reads laid out (and held in
+/// memory) before it is refused, or refused at the writer's own limit when that is the larger: an
+/// input root of 64 directories, each of the same 64, four levels deep (33,820,736 entries from
+/// five Directory messages) is `NoTree::ListTooLong` against the 4,194,302 entries that fit, with
+/// nothing asked of the index and nothing written.
+#[tokio::test]
+async fn a_tree_too_large_for_any_list_is_refused_before_anything_is_looked_up() {
+    let rig = Rig::new().await;
+    let blob = rig.farm.packed("leaf", "cas/f/w/p0", 0).await;
+    let mut level = rig
+        .store(&directory(vec![file("leaf", &blob, false)], vec![], vec![]))
+        .await;
+    for _ in 0..4 {
+        let fan = (0..64)
+            .map(|at| subdir(&format!("d{at}"), &level))
+            .collect();
+        level = rig.store(&directory(vec![], fan, vec![])).await;
+    }
+    let kept = rig.kept(&level).await;
+    rig.farm.clear_records();
+    let refused = rig
+        .writer
+        .write_listing(&kept, &listed_base(&rig))
+        .await
+        .expect_err("no list");
+    // 64 + 64^2 + 64^3 + 64^4 directories, a leaf in each of the 64^4, the base's six and four.
+    let entries = 64 + 4096 + 262_144 + 16_777_216 + 16_777_216 + 6 + 4;
+    // (256 MiB - the 64-byte header) / 64 bytes an entry, less the root.
+    assert_eq!(
+        refused,
+        NoTree::ListTooLong {
+            entries,
+            limit: 4_194_302
+        }
+    );
+    assert_eq!(refused.why(), "unrepresentable");
+    assert!(rig.farm.asked().is_empty());
+    assert!(rig.farm.puts().is_empty());
+}
+
+/// Catches: a list that makes another tree than the action tree's manifests name (a name, mode,
+/// size, digest or link target changed, an entry left out or added, a directory at two paths
+/// listed once): the tree tierstore builds from the list has the digest of the tree it builds
+/// from the manifests [`TreeWriter::write`] stores for the same Action, flattened.
+#[tokio::test]
+async fn the_list_makes_the_tree_the_manifests_of_the_same_action_name() {
+    let rig = Rig::new().await;
+    let x = rig.farm.packed("#define X", "cas/f/w/p1", 0).await;
+    let run = rig.farm.packed("echo ran\n", "cas/f/w/p1", 9).await;
+    let big = rig.farm.whole("a large object").await;
+    let empty = kbf_segments::sha256(&[]);
+    let hollow = rig.store(&directory(vec![], vec![], vec![])).await;
+    let sub = rig
+        .store(&directory(
+            vec![file("x.h", &x, false), file("blank", &empty, false)],
+            vec![subdir("hollow", &hollow)],
+            vec![link("up", "..")],
+        ))
+        .await;
+    let root = rig
+        .store(&directory(
+            vec![file("run.sh", &run, true), file("big", &big, false)],
+            vec![subdir("a", &sub), subdir("b", &sub)],
+            vec![link("l", "a/x.h")],
+        ))
+        .await;
+    let listing = list(&rig, &root).await.expect("a list");
+    let (from_list, _) = built(&rig, listing.key());
+    let tree = rig.write(&root).await.expect("the manifests");
+    let flattened = rig.farm.flatten(&tree).expect("flattened");
+    let mut paths: Vec<String> = Vec::new();
+    let mut entries = Vec::new();
+    for entry in &flattened {
+        let path = match entry.parent.map(|parent| paths[parent as usize].as_str()) {
+            None => String::new(),
+            Some("") => entry.name.to_string(),
+            Some(parent) => format!("{parent}/{}", entry.name),
+        };
+        paths.push(path.clone());
+        if entry.parent.is_none() {
+            continue;
+        }
+        let kind = match &entry.kind {
+            tierstore::EntryKind::Dir { .. } => tierstore::ListKind::Dir { mode: Mode::DIR },
+            tierstore::EntryKind::File {
+                digest,
+                size,
+                exec,
+                source,
+            } => tierstore::ListKind::File {
+                mode: if *exec { Mode::DIR } else { Mode::FILE },
+                size: *size,
+                source: (*size > 0).then(|| {
+                    source.clone().unwrap_or_else(|| tierstore::BlobSource {
+                        key: whole_key(&digest.to_string()).into(),
+                        offset: 0,
+                    })
+                }),
+                sha256: Some(*digest),
+            },
+            tierstore::EntryKind::Symlink { target } => tierstore::ListKind::Symlink {
+                target: target.to_string(),
+            },
+        };
+        entries.push(tierstore::ListEntry { path, kind });
+    }
+    let new_entries = tierstore::TreeList { entries }
+        .into_entries()
+        .expect("the manifests' entries");
+    let from_manifests =
+        tierstore::build_tree(None, new_entries, &TreeLimits::default()).expect("a tree");
+    // The root's digest covers every name, mode, size, digest and target below it.
+    assert_eq!(from_list.root, from_manifests.root);
+}
+
+/// Catches: a base file of no bytes given a source (its whole object, which does not exist) or
+/// another digest when the base is listed: it is listed with size 0, no object and the SHA-256
+/// of no bytes, beside the input root.
+#[tokio::test]
+async fn an_empty_file_of_the_base_names_no_object() {
+    let rig = Rig::new().await;
+    let root = format!(
+        r#"{{"v":1,"children":[{{"name":"empty","kind":"file","sha256":"{EMPTY_HEX}","size":0}}]}}"#
+    );
+    let facts = BaseFacts {
+        entries: 1,
+        depth: 1,
+    };
+    let base = BaseTree::new(root.as_bytes(), facts)
+        .expect("a base tree")
+        .listed(|_: &TreeDigest| Ok::<Vec<u8>, &str>(root.clone().into_bytes()))
+        .expect("listed");
+    let input = root_of(&rig, &[]).await;
+    let kept = rig.kept(&input).await;
+    let listing = rig
+        .writer
+        .write_listing(&kept, &base)
+        .await
+        .expect("a list");
+    let got = read(&rig, &listing);
+    assert_eq!(
+        got.get("empty"),
+        Some(&file_line("0644", 0, "-", EMPTY_HEX))
+    );
+    assert_eq!(got.get("work").map(String::as_str), Some("dir 0755"));
 }
