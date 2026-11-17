@@ -23,39 +23,25 @@ use std::path::Path;
 
 use kbf_unitfile::UnitFile;
 
-use crate::node_support::{cgroup_tree, id_files, oci_runtime};
-use crate::topology::{Driver, NodeMode, Role, Topology};
+use crate::topology::{Role, Topology};
 
 /// The packaged unit of each mode the farm starts, and the `kbf.toml` of each with every
 /// setting of the mode (`kbf-cli`'s golden files, generated from the flag definitions).
 const FRONTEND_UNIT: &str = include_str!("../../../packaging/linux/units/kbf-frontend.service");
 const STORAGE_UNIT: &str = include_str!("../../../packaging/linux/units/kbf-storage.service");
-const STORAGE_AND_DAEMON_UNIT: &str =
-    include_str!("../../../packaging/linux/units/kbf-storage-and-daemon.service");
-const DAEMON_UNIT: &str = include_str!("../../../packaging/linux/units/kbf-daemon.service");
 const FRONTEND_KEYS: &str = include_str!("../../kbf-cli/tests/golden/kbf-frontend.toml");
 const STORAGE_KEYS: &str = include_str!("../../kbf-cli/tests/golden/kbf-storage.toml");
-const STORAGE_AND_DAEMON_KEYS: &str =
-    include_str!("../../kbf-cli/tests/golden/kbf-storage-and-daemon.toml");
-const DAEMON_KEYS: &str = include_str!("../../kbf-cli/tests/golden/kbf-daemon.toml");
 
 /// The modes a farm starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Frontend,
     Storage,
-    StorageAndDaemon,
-    Daemon,
 }
 
 impl Mode {
     /// Every mode a farm starts.
-    pub const ALL: [Mode; 4] = [
-        Mode::Frontend,
-        Mode::Storage,
-        Mode::StorageAndDaemon,
-        Mode::Daemon,
-    ];
+    pub const ALL: [Mode; 2] = [Mode::Frontend, Mode::Storage];
 
     /// The mode's name, as `kbf --mode=` takes it.
     #[must_use]
@@ -63,8 +49,6 @@ impl Mode {
         match self {
             Mode::Frontend => "frontend",
             Mode::Storage => "storage",
-            Mode::StorageAndDaemon => "storage-and-daemon",
-            Mode::Daemon => "daemon",
         }
     }
 
@@ -73,8 +57,6 @@ impl Mode {
         match self {
             Mode::Frontend => FRONTEND_UNIT,
             Mode::Storage => STORAGE_UNIT,
-            Mode::StorageAndDaemon => STORAGE_AND_DAEMON_UNIT,
-            Mode::Daemon => DAEMON_UNIT,
         }
     }
 
@@ -83,8 +65,6 @@ impl Mode {
         match self {
             Mode::Frontend => FRONTEND_KEYS,
             Mode::Storage => STORAGE_KEYS,
-            Mode::StorageAndDaemon => STORAGE_AND_DAEMON_KEYS,
-            Mode::Daemon => DAEMON_KEYS,
         }
     }
 }
@@ -176,35 +156,23 @@ pub struct Wiring {
     pub storage_url: String,
 }
 
-/// Where one process lives and what it dials: its own address, node id, directories under
-/// `root` and storage port, and the farm's [`Wiring`].
+/// Where one process lives and what it dials: its own address, directories under `root` and
+/// storage port, and the farm's [`Wiring`].
 pub struct Settings<'a> {
     pub root: &'a Path,
     pub host: &'a str,
-    pub node_id: &'a str,
     pub storage_port: u16,
     pub wiring: &'a Wiring,
-    /// The image the daemon half is pinned to (`repo@sha256:...`), or empty for none.
-    pub image: &'a str,
 }
 
 /// The name every dialler of the frontend uses for it (a certificate names it).
 const FRONTEND_NAME: &str = "localhost";
 
-/// The memory a daemon leaves to actions: the RAM given (16 GiB) less the reserved shares
-/// (1 and 1) and the OS headroom (4).
-const ACTIONS_MEMORY_MAX_GIB: u32 = 10;
-
-/// The daemon's own memory floor, in MiB.
-const SUPERVISOR_MEMORY_MIN_MIB: u32 = 256;
-
-/// The `kbf.toml` of one process: its mode's settings, by key, and the environment its
-/// unit gave it.
+/// The `kbf.toml` of one process: its mode's settings, by key.
 #[derive(Clone, Debug)]
 pub struct Unit {
     pub mode: Mode,
     settings: BTreeMap<String, Setting>,
-    pub env: Vec<(String, String)>,
 }
 
 /// A flag as a test gives it, `--name=value` or `--name`, taken apart.
@@ -217,16 +185,15 @@ fn flag_parts(flag: &str) -> (&str, Option<&str>) {
 }
 
 impl Unit {
-    /// The unit of `mode` for the process `s` describes, run by the user `uid`: the
-    /// settings the farm gives it for the directories, ports and addresses of `s`.
+    /// The unit of `mode` for the process `s` describes: the settings the farm gives it for
+    /// the directories, ports and addresses of `s`.
     ///
     /// # Panics
     /// When a setting it names is not one of the mode's keys.
     #[must_use]
-    pub fn new(mode: Mode, s: &Settings, uid: u32) -> Self {
+    pub fn new(mode: Mode, s: &Settings) -> Self {
         let root = s.root.display();
         let etc = format!("{root}/etc");
-        let frontend = format!("https://{FRONTEND_NAME}:{}", s.wiring.worker);
         let storage = vec![
             "--cold-store=s3://kbf-cas?endpoint=http://127.0.0.1:9000&conditional-put=true"
                 .to_owned(),
@@ -237,21 +204,6 @@ impl Unit {
             format!("--storage-tls-key={etc}/storage.key"),
             format!("--storage-client-ca={etc}/ca.pem"),
         ];
-        let mut daemon = vec![
-            "--driver=container".to_owned(),
-            "--oci-runtime=/usr/bin/crun".to_owned(),
-            format!("--server={frontend}"),
-            format!("--ca-cert={etc}/ca.pem"),
-            format!("--cert={etc}/node.pem"),
-            format!("--key={etc}/node.key"),
-            format!("--node-id={}", s.node_id),
-            format!("--data-dir={root}/data"),
-            format!("--actions-memory-max-gib={ACTIONS_MEMORY_MAX_GIB}"),
-            format!("--supervisor-memory-min-mib={SUPERVISOR_MEMORY_MIN_MIB}"),
-        ];
-        if !s.image.is_empty() {
-            daemon.push(format!("--image=docker://{}", s.image));
-        }
         let flags = match mode {
             Mode::Frontend => vec![
                 format!("--listen={}:{}", s.host, s.wiring.reapi),
@@ -270,29 +222,10 @@ impl Unit {
                 "--state-store=postgres:///kbf?host=/run/postgresql".to_owned(),
             ],
             Mode::Storage => storage,
-            Mode::StorageAndDaemon => {
-                let mut flags = storage;
-                flags.push(format!("--frontend={frontend}"));
-                flags.push(format!("--advertise-addr={}:{}", s.host, s.storage_port));
-                flags.extend(daemon);
-                flags
-            }
-            Mode::Daemon => {
-                daemon.push(format!("--cas={frontend}"));
-                daemon
-            }
-        };
-        // The daemon half runs rootless containers: its unit's session directory.
-        let env = match mode {
-            Mode::Frontend | Mode::Storage => Vec::new(),
-            Mode::StorageAndDaemon | Mode::Daemon => {
-                vec![("XDG_RUNTIME_DIR".to_owned(), format!("/run/user/{uid}"))]
-            }
         };
         Unit {
             mode,
             settings: BTreeMap::new(),
-            env,
         }
         .append(&flags)
     }
@@ -330,8 +263,8 @@ impl Unit {
         self
     }
 
-    /// Takes out the flags named `names` (`--image`, which only the container driver
-    /// takes): each must be set, so a setting the unit stops having is not hidden.
+    /// Takes out the flags named `names`: each must be set, so a setting the unit stops
+    /// having is not hidden.
     ///
     /// # Panics
     /// When a name is not one of the mode's flags, or the unit sets none of it.
@@ -423,8 +356,8 @@ impl Unit {
 }
 
 /// The flag that makes a farm's frontend take the node as its own (the nodes are this
-/// host, whatever its architecture): the unit's default (`linux/x86_64`) leaves an action
-/// that names no architecture with no worker on an aarch64 host.
+/// host, whatever its architecture): the unit's default (`linux/x86_64`) names an
+/// architecture an aarch64 host does not have.
 const ONE_HOST_PLATFORM: &str = "--default-platform=none";
 
 /// The flag that ends a farm's frontend without the wait a load balancer needs: a stop
@@ -434,51 +367,10 @@ const ONE_HOST_PLATFORM: &str = "--default-platform=none";
 /// does not know the flag.
 const NO_LB_WAIT: &str = "--drain-lb-wait=0";
 
-/// What the container driver's nodes get from the box: the stand-in `crun`
-/// (`--oci-runtime=`), the planted cgroup tree and the id files.
-pub struct Container {
-    pub oci_runtime: String,
-    pub flags: Vec<String>,
-}
-
-impl Container {
-    /// The box's container driver for the node whose files are under `root` and whose
-    /// stand-in `crun` is in `bin` ([`crate::node_support`]); makes the cgroup tree.
-    #[must_use]
-    pub fn planted(bin: &Path, root: &Path) -> Self {
-        let mut flags = cgroup_tree(bin);
-        flags.push(format!("--id-files={}", id_files(root).display()));
-        Container {
-            oci_runtime: oci_runtime(bin),
-            flags,
-        }
-    }
-}
-
-/// `unit` with the flags the topology gives `role` set on top of everything else.
-fn overrides(topo: &Topology, role: Role, unit: Unit) -> Unit {
-    let flags: Vec<String> = topo
-        .overrides
-        .iter()
-        .filter(|(r, _)| *r == role)
-        .flat_map(|(_, f)| f.iter().cloned())
-        .collect();
-    unit.set(&flags)
-}
-
-/// `unit` for `driver`: the container driver is the unit's own; the native driver replaces
-/// it.
-fn driven(unit: Unit, driver: Driver) -> Unit {
-    match driver {
-        Driver::StandInContainer => unit,
-        Driver::Native => unit.replace(&["--driver=native".to_owned()]),
-    }
-}
-
 /// The frontend's unit. The unit's state store is the host's Postgres; the box has none, so
 /// the farm gives the frontend a SQLite file.
 #[must_use]
-pub fn frontend(s: &Settings, uid: u32, topo: &Topology) -> Unit {
+pub fn frontend(s: &Settings, topo: &Topology) -> Unit {
     let state = format!("--state-store=sqlite://{}/state/state.db", s.root.display());
     // A frontend of an older release has no such flag, and its start fails on one it does not
     // know: it is given none, and its stop has no wait to skip.
@@ -487,71 +379,29 @@ pub fn frontend(s: &Settings, uid: u32, topo: &Topology) -> Unit {
     if !older.any(|role| role == Role::Frontend) {
         flags.push(NO_LB_WAIT.to_owned());
     }
-    let unit = Unit::new(Mode::Frontend, s, uid)
+    Unit::new(Mode::Frontend, s)
         .replace(&[state])
         .set(&flags)
-        .set(&topo.limits.frontend);
-    overrides(topo, Role::Frontend, unit)
+        .set(&topo.limits.frontend)
 }
 
-/// The unit of storage node `n` (from 1), whose `/metrics` route is on loopback port
+/// The unit of a storage node, whose `/metrics` route is on loopback port
 /// `metrics`: the cold store is a directory (no MinIO here), the unit is given the scrape
-/// route no unit sets, and a node with the native driver (`kbf storage`, which has no
-/// daemon half) is given `--frontend` and `--advertise-addr` that the storage-and-daemon
-/// unit sets, so that it registers with the frontend as the other does.
-///
-/// # Panics
-/// When the topology's driver and node mode do not go together (the farm's start refuses
-/// that first).
+/// route no unit sets, and `--frontend` and `--advertise-addr`, which the packaged unit
+/// leaves to the host's `kbf.toml`, so that the node registers with the frontend.
 #[must_use]
-pub fn node(
-    (s, uid): (&Settings, u32),
-    n: usize,
-    metrics: u16,
-    topo: &Topology,
-    container: Option<&Container>,
-) -> Unit {
-    let mode = match topo.node_mode {
-        NodeMode::Storage => Mode::Storage,
-        NodeMode::StorageAndDaemon => Mode::StorageAndDaemon,
-    };
+pub fn node(s: &Settings, metrics: u16, topo: &Topology) -> Unit {
     let cold = format!("--cold-store=file://{}", s.root.join("cold").display());
     let scrape = format!("--metrics-listen=127.0.0.1:{metrics}");
-    let unit = Unit::new(mode, s, uid).replace(&[cold]).append(&[scrape]);
-    let unit = if topo.driver == Driver::Native {
-        unit.append(&[
-            format!("--frontend=https://{FRONTEND_NAME}:{}", s.wiring.worker),
-            format!("--advertise-addr={}:{}", s.host, s.storage_port),
-        ])
-    } else {
-        driven(unit, topo.driver)
-    };
-    let unit = overrides(topo, Role::Node(n), unit.set(&topo.limits.node));
-    with_container(unit, container)
-}
-
-/// The unit of plain daemon `d` (from 1).
-#[must_use]
-pub fn daemon(
-    (s, uid): (&Settings, u32),
-    d: usize,
-    topo: &Topology,
-    container: Option<&Container>,
-) -> Unit {
-    let unit = driven(Unit::new(Mode::Daemon, s, uid), topo.driver).set(&topo.limits.daemon);
-    with_container(overrides(topo, Role::Daemon(d), unit), container)
-}
-
-/// `unit` with the box's container driver: its `--oci-runtime` made the stand-in `crun`
-/// (the unit names `/usr/bin/crun`, and this box's is the stand-in, which finds its state
-/// beside the link it was run through), the cgroup tree and the id files.
-fn with_container(unit: Unit, container: Option<&Container>) -> Unit {
-    match container {
-        Some(c) => unit
-            .replace(std::slice::from_ref(&c.oci_runtime))
-            .append(&c.flags),
-        None => unit,
-    }
+    let register = [
+        format!("--frontend=https://{FRONTEND_NAME}:{}", s.wiring.worker),
+        format!("--advertise-addr={}:{}", s.host, s.storage_port),
+    ];
+    let unit = Unit::new(Mode::Storage, s)
+        .replace(&[cold])
+        .append(&[scrape])
+        .append(&register);
+    unit.set(&topo.limits.node)
 }
 
 #[cfg(test)]

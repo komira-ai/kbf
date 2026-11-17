@@ -1,43 +1,23 @@
-//! What a farm is made of and what it reports: the binaries it runs, the driver, the roles,
-//! the topologies of the rehearsal and of the beta farm, the limits of a hosted runner, and
+//! What a farm is made of and what it reports: the binary it runs, the roles, the
+//! topologies of the rehearsal and of the beta farm, the limits of a hosted runner, and
 //! the records of a start or a failure to start. Re-exported by [`crate::farm`], where the
 //! farm itself is.
 
 use std::path::{Path, PathBuf};
-
-use serde::Serialize;
-
-use crate::interrupt::Interrupt;
 
 /// The binaries a farm runs, by path (a library cannot use `CARGO_BIN_EXE_*`).
 #[derive(Clone, Debug)]
 pub struct Bins {
     /// `kbf`.
     pub kbf: PathBuf,
-    /// The stand-in `crun`, for [`Driver::StandInContainer`].
-    pub fake_crun: Option<PathBuf>,
-}
-
-/// What runs the actions on the daemons.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub enum Driver {
-    /// `--driver=native`: each action is a plain process in its lease directory. No
-    /// container path is exercised; any argv a build sends runs as sent.
-    Native,
-    /// `--driver=container` as the unit has it, over the stand-in `crun` (which runs one
-    /// planted argv whatever the lease asks for), a planted cgroup tree and id files.
-    StandInContainer,
 }
 
 /// A role of the farm.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
     Frontend,
-    /// A storage node (with its daemon, in a [`NodeMode::StorageAndDaemon`] farm),
-    /// numbered from 1.
+    /// A storage node (`kbf --mode=storage`), numbered from 1.
     Node(usize),
-    /// A plain daemon, numbered from 1.
-    Daemon(usize),
 }
 
 impl std::fmt::Display for Role {
@@ -45,25 +25,8 @@ impl std::fmt::Display for Role {
         match self {
             Role::Frontend => f.write_str("frontend"),
             Role::Node(n) => write!(f, "node-{n}"),
-            Role::Daemon(n) => f.write_str(&daemon_id(*n)),
         }
     }
-}
-
-/// The node id of plain daemon `n` (from 1).
-#[must_use]
-pub fn daemon_id(n: usize) -> String {
-    format!("daemon-{n}")
-}
-
-/// What a storage node runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NodeMode {
-    /// `kbf storage`: storage alone. Its actions run on the plain daemons.
-    Storage,
-    /// `kbf storage-and-daemon`: storage and a daemon in one process. The daemon half
-    /// runs the container driver only.
-    StorageAndDaemon,
 }
 
 /// The ceilings that keep the farm small enough for a hosted runner (about 4 vCPU and
@@ -73,7 +36,6 @@ pub enum NodeMode {
 pub struct Limits {
     pub frontend: Vec<String>,
     pub node: Vec<String>,
-    pub daemon: Vec<String>,
 }
 
 impl Limits {
@@ -91,7 +53,7 @@ impl Limits {
 
     /// The limits of a hosted runner: a small hot tier and a small write buffer on each
     /// storage node (the stores and the write tier are a storage node's: a frontend refuses
-    /// these flags), and one CPU kept by each daemon.
+    /// these flags).
     #[must_use]
     pub fn small() -> Self {
         Self {
@@ -101,9 +63,6 @@ impl Limits {
                 format!("--hot-store-max-bytes={}", 256 << 20),
                 format!("--write-bytes-in-flight={}", 128 << 20),
             ],
-            // A daemon keeps 8 CPUs for the farm's processes unless told otherwise, and
-            // leases the rest: none on a runner of 4.
-            daemon: vec!["--reserve-cpus=1".to_owned()],
         }
     }
 }
@@ -113,55 +72,34 @@ impl Limits {
 pub struct Topology {
     /// How many storage nodes there are (the farm's replication needs two).
     pub storage_nodes: usize,
-    pub node_mode: NodeMode,
-    /// How many plain daemons there are.
-    pub daemons: usize,
-    pub driver: Driver,
     pub limits: Limits,
-    /// Flags to set on one role after everything else (a fault's, or a test's).
-    pub overrides: Vec<(Role, Vec<String>)>,
     /// The `kbf` to run for a role in place of [`Bins::kbf`]: an older release's, for a farm
     /// of two versions. A role not listed runs [`Bins::kbf`].
     pub binaries: Vec<(Role, PathBuf)>,
-    /// Whether the run was asked to stop: every wait of the farm looks at it.
-    pub interrupt: Interrupt,
 }
 
 impl Topology {
-    /// The rehearsal's: `storage_nodes` storage-and-daemon nodes and a daemon, the
-    /// stand-in container driver, and a cold store that keeps no free space of the
-    /// disk it is on ([`Limits::COLD_STORE_FLOOR`]).
+    /// The rehearsal's: `storage_nodes` storage nodes, and a cold store that keeps no free
+    /// space of the disk it is on ([`Limits::COLD_STORE_FLOOR`]).
     #[must_use]
     pub fn rehearsal(storage_nodes: usize) -> Self {
         Self {
             storage_nodes,
-            node_mode: NodeMode::StorageAndDaemon,
-            daemons: 1,
-            driver: Driver::StandInContainer,
             limits: Limits {
                 node: vec![Limits::COLD_STORE_FLOOR.to_owned()],
                 ..Limits::none()
             },
-            overrides: Vec::new(),
             binaries: Vec::new(),
-            interrupt: Interrupt::new(),
         }
     }
 
-    /// The beta farm's: three storage nodes, two plain daemons running actions as plain
-    /// processes (the native driver, which only a plain daemon takes), a hosted runner's
-    /// limits.
+    /// The beta farm's: three storage nodes under a hosted runner's limits.
     #[must_use]
     pub fn beta() -> Self {
         Self {
             storage_nodes: 3,
-            node_mode: NodeMode::Storage,
-            daemons: 2,
-            driver: Driver::Native,
             limits: Limits::small(),
-            overrides: Vec::new(),
             binaries: Vec::new(),
-            interrupt: Interrupt::new(),
         }
     }
 
@@ -183,8 +121,8 @@ pub struct FarmError {
     pub report: String,
 }
 
-/// One start of one role, for the result document: the stand-in for a boot counter.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+/// One start of one role: the stand-in for a boot counter.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcRecord {
     pub role: String,
     pub pid: u32,
@@ -196,7 +134,7 @@ pub struct ProcRecord {
     pub ended: Option<String>,
 }
 
-/// The node id of storage-and-daemon node `n` (from 1).
+/// The node id of storage node `n` (from 1).
 #[must_use]
 pub fn node_id(n: usize) -> String {
     format!("node-{n}")

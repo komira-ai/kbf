@@ -2,13 +2,10 @@
 //!
 //! Each process leads a process group of its own and asks the kernel to kill it if the
 //! harness dies. That reaches the process itself and nothing it started: the kernel's
-//! parent-death signal is sent to the group leader only. So each process also writes its
-//! group's id in a file beside its logs ([`pgid_file`]) as it starts, and removes it when the
-//! group is swept; the sentinel ([`crate::reap`]) kills the groups the files name when the
-//! harness dies, which takes what the processes started (the actions of a native daemon)
-//! with them. A process that is ended while the harness lives takes its group with it.
-//! What is not covered: a harness killed between the spawn and the write of the file, when
-//! the process has not started anything yet.
+//! parent-death signal is sent to the group leader only. A process that is ended while the
+//! harness lives takes its group with it. What is not covered: what a process started, when
+//! the harness is killed by SIGKILL (a `kbf` storage node or frontend starts no process of
+//! its own that outlives it).
 
 use std::fs::File;
 use std::os::unix::process::CommandExt as _;
@@ -50,8 +47,6 @@ pub struct Proc {
     status: Option<ExitStatus>,
     out: PathBuf,
     err: PathBuf,
-    /// Names its group while it runs ([`pgid_file`]).
-    pgid: PathBuf,
 }
 
 /// The log files of generation `generation` of process `name` in `logs`: the first start
@@ -95,36 +90,12 @@ pub fn log_hits(logs: &Path, needle: &str) -> Vec<String> {
     hits
 }
 
-/// The file in `logs` that holds the process group id of generation `generation` of process
-/// `name` while it runs: a number and a newline. The sentinel kills the groups of the files
-/// there are when the harness dies.
-#[must_use]
-pub fn pgid_file(logs: &Path, name: &str, generation: usize) -> PathBuf {
-    let (out, _) = log_files(logs, name, generation);
-    out.with_extension("pgid")
-}
-
 /// What the child does between fork and exec: asks the kernel to kill it with SIGKILL when the
 /// thread that started it ends, which a harness killed by SIGKILL (no `Drop` runs) does. A
 /// function of its own so the test that runs it in a process of its own covers it (the
 /// child's own counters are lost at exec).
 fn die_with_the_harness() -> std::io::Result<()> {
     rustix::process::set_parent_process_death_signal(Some(Signal::KILL)).map_err(Into::into)
-}
-
-/// Writes `pgid` to `file`, whole or not at all (a rename), so the sentinel never reads half
-/// a number. Best effort: a process whose file cannot be written still dies with the harness
-/// (the parent-death signal), and its group is swept by the harness while it lives.
-fn write_pgid(file: &Path, pgid: u32) {
-    let temp = file.with_extension("pgid.tmp");
-    if let Err(e) =
-        std::fs::write(&temp, format!("{pgid}\n")).and_then(|()| std::fs::rename(&temp, file))
-    {
-        eprintln!(
-            "kbf-harness: cannot record the group of {}: {e}",
-            file.display()
-        );
-    }
 }
 
 impl Proc {
@@ -155,15 +126,12 @@ impl Proc {
         let child = command
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {}: {e}", spec.program.display()));
-        let pgid = pgid_file(logs, &spec.name, generation);
-        write_pgid(&pgid, child.id());
         Self {
             name: spec.name.clone(),
             child,
             status: None,
             out,
             err,
-            pgid,
         }
     }
 
@@ -196,9 +164,6 @@ impl Proc {
     /// still alive could keep the group's id; an error (no such group) is the point.
     fn sweep(&self) {
         let _ = rustix::process::kill_process_group(self.pid_as_group(), Signal::KILL);
-        // The group is gone, and its id may be given to another one: the sentinel must not
-        // kill that.
-        let _ = std::fs::remove_file(&self.pgid);
     }
 
     /// Its exit status, if it has ended. The first time it is found ended, what it left

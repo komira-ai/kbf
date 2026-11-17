@@ -100,7 +100,7 @@ fn a_restart_keeps_the_output_of_the_process_before() {
     let d = dir("restart-logs");
     let marker = d.join("marker");
     std::fs::write(&marker, "first-start\n").expect("marker");
-    let role = Role::Daemon(1);
+    let role = Role::Node(1);
     let mut farm = Farm::supervise(&d, vec![chatty(role, &marker, &d)]);
     farm.wait("the first start's output", |f| {
         f.logs().contains("first-start").then_some(())
@@ -111,10 +111,10 @@ fn a_restart_keeps_the_output_of_the_process_before() {
     farm.wait("the second start's output", |f| {
         f.logs().contains("second-start").then_some(())
     });
-    assert!(d.join("daemon-1.out").exists());
-    assert!(d.join("daemon-1.1.out").exists());
+    assert!(d.join("node-1.out").exists());
+    assert!(d.join("node-1.1.out").exists());
     assert!(
-        std::fs::read_to_string(d.join("daemon-1.out"))
+        std::fs::read_to_string(d.join("node-1.out"))
             .expect("log")
             .contains("first-start")
     );
@@ -123,7 +123,7 @@ fn a_restart_keeps_the_output_of_the_process_before() {
 #[test]
 #[should_panic(expected = "still runs")]
 fn a_role_that_runs_cannot_be_restarted() {
-    // Catches: two processes of one role (two daemons with one node id, one port twice).
+    // Catches: two processes of one role (two nodes with one node id, one port twice).
     let d = dir("restart-running");
     let mut farm = Farm::supervise(&d, vec![sleeper(Role::Node(1), &d)]);
     farm.restart(Role::Node(1));
@@ -145,11 +145,11 @@ fn a_restart_can_run_another_program_on_the_same_command_line() {
     farm.restart_with(role, Path::new("true"));
     assert_eq!(farm.spec(role).program, PathBuf::from("true"));
     assert_eq!(farm.spec(role).argv, argv);
-    wait_all_ended_but(&mut farm, Role::Daemon(9));
+    wait_all_ended_but(&mut farm, Role::Node(9));
     let table = farm.process_table();
     assert_eq!(table[1].ended.as_deref(), Some("exit 0"), "{table:?}");
     farm.restart(role);
-    wait_all_ended_but(&mut farm, Role::Daemon(9));
+    wait_all_ended_but(&mut farm, Role::Node(9));
     let table = farm.process_table();
     assert_eq!(table.len(), 3, "{table:?}");
     assert_eq!(table[2].ended.as_deref(), Some("exit 0"), "{table:?}");
@@ -157,7 +157,7 @@ fn a_restart_can_run_another_program_on_the_same_command_line() {
 
 #[test]
 fn a_role_runs_the_kbf_the_topology_names_for_it_else_the_default() {
-    // Catches: a `kbf` named for one role run by another (node 2 and daemon 2 are different
+    // Catches: a `kbf` named for one role run by another (node 2 and node 3 are different
     // roles), the default lost for the roles with no entry, and the entry ignored.
     // Catches: `kbf_of` compares the roles' numbers only.
     let topology = Topology {
@@ -169,7 +169,7 @@ fn a_role_runs_the_kbf_the_topology_names_for_it_else_the_default() {
         topology.kbf_of(Role::Node(2), default),
         Path::new("/older/kbf")
     );
-    for role in [Role::Frontend, Role::Node(1), Role::Daemon(2)] {
+    for role in [Role::Frontend, Role::Node(1), Role::Node(3)] {
         assert_eq!(topology.kbf_of(role, default), default, "{role}");
     }
 }
@@ -228,7 +228,7 @@ fn a_process_exit_while_waiting_fails_at_once_with_the_logs() {
         &d,
         vec![
             chatty(Role::Node(1), &marker, &d),
-            spec(Role::Daemon(1), "true", &[], &d),
+            spec(Role::Node(2), "true", &[], &d),
         ],
     )
     // Only a guard against a hang of this test: the failure must come before it.
@@ -236,7 +236,7 @@ fn a_process_exit_while_waiting_fails_at_once_with_the_logs() {
     let err = farm
         .try_wait("a state that never comes", |_| None::<()>)
         .expect_err("an exit");
-    assert!(err.what.starts_with("daemon-1 exited"), "{}", err.what);
+    assert!(err.what.starts_with("node-2 exited"), "{}", err.what);
     assert!(
         err.what.contains("a state that never comes"),
         "{}",
@@ -281,7 +281,7 @@ fn stop_all_ends_the_last_started_first_and_says_how() {
         vec![
             sleeper(Role::Frontend, &d),
             sleeper(Role::Node(1), &d),
-            sleeper(Role::Daemon(1), &d),
+            sleeper(Role::Node(2), &d),
         ],
     );
     farm.kill(Role::Node(1));
@@ -290,7 +290,7 @@ fn stop_all_ends_the_last_started_first_and_says_how() {
     assert_eq!(
         ended,
         vec![
-            (Role::Daemon(1), "signal 15".to_owned()),
+            (Role::Node(2), "signal 15".to_owned()),
             (Role::Frontend, "signal 15".to_owned())
         ]
     );
@@ -300,22 +300,22 @@ fn stop_all_ends_the_last_started_first_and_says_how() {
 fn a_role_that_ended_before_its_turn_is_reported_with_how() {
     // Catches: a stop that skips a role which had already exited on its own and so drops
     // its status: a node that crashed (exit 1) or left (exit 0) before the stop reached it
-    // would then be in no `clean_stop` evidence, and a crash would pass the gate.
+    // would then be in no evidence of a clean stop, and a crash would pass.
     let d = dir("ended-before");
     let mut farm = Farm::supervise(
         &d,
         vec![
             spec(Role::Node(1), "false", &[], &d),
             spec(Role::Node(2), "true", &[], &d),
-            sleeper(Role::Daemon(1), &d),
+            sleeper(Role::Node(3), &d),
         ],
     );
-    wait_all_ended_but(&mut farm, Role::Daemon(1));
+    wait_all_ended_but(&mut farm, Role::Node(3));
     let ended = farm.stop_all();
     assert_eq!(
         ended,
         vec![
-            (Role::Daemon(1), "signal 15".to_owned()),
+            (Role::Node(3), "signal 15".to_owned()),
             (Role::Node(2), "exited before the stop: exit 0".to_owned()),
             (Role::Node(1), "exited before the stop: exit 1".to_owned()),
         ]
@@ -342,10 +342,10 @@ fn wait_all_ended_but(farm: &mut Farm, except: Role) {
 #[test]
 fn a_process_that_ignores_sigterm_is_killed_and_reported() {
     // Catches: a stop that waits for ever on a process that will not drain, or kills it and
-    // says it exited cleanly (the `clean_stop` gate reads this text).
+    // says it exited cleanly (the text is what a test reads as a clean stop).
     let d = dir("ignores-term");
     let stubborn = spec(
-        Role::Daemon(1),
+        Role::Node(3),
         "env",
         &["--ignore-signal=TERM", "sleep", "300"],
         &d,
@@ -357,7 +357,7 @@ fn a_process_that_ignores_sigterm_is_killed_and_reported() {
     assert_eq!(
         ended,
         vec![(
-            Role::Daemon(1),
+            Role::Node(3),
             "still running after SIGTERM: killed".to_owned()
         )]
     );
@@ -366,8 +366,8 @@ fn a_process_that_ignores_sigterm_is_killed_and_reported() {
 
 #[test]
 fn a_process_that_ends_with_a_code_is_reported_with_it() {
-    // Catches: an exit code read as a signal or not at all (`exit 1` is what the
-    // `clean_stop` gate calls unclean).
+    // Catches: an exit code read as a signal or not at all (`exit 1` is what a stop
+    // test calls unclean).
     let d = dir("code");
     let mut farm = Farm::supervise(&d, vec![spec(Role::Node(1), "false", &[], &d)]);
     let table = loop {
@@ -388,15 +388,12 @@ fn the_process_list_names_every_role() {
         vec![
             sleeper(Role::Frontend, &d),
             sleeper(Role::Node(1), &d),
-            sleeper(Role::Daemon(2), &d),
+            sleeper(Role::Node(3), &d),
         ],
     );
-    assert_eq!(
-        farm.roles(),
-        [Role::Frontend, Role::Node(1), Role::Daemon(2)]
-    );
+    assert_eq!(farm.roles(), [Role::Frontend, Role::Node(1), Role::Node(3)]);
     let names: Vec<String> = farm.roles().iter().map(ToString::to_string).collect();
-    assert_eq!(names, ["frontend", "node-1", "daemon-2"]);
+    assert_eq!(names, ["frontend", "node-1", "node-3"]);
     assert_eq!(node_id(3), "node-3");
 }
 
@@ -478,14 +475,14 @@ fn term_kills_what_ignores_sigterm_and_says_nothing_of_its_status() {
     // Catches: a `term` that waits for ever on a process that will not drain, or leaves it running.
     let d = dir("term-stubborn");
     let stubborn = spec(
-        Role::Daemon(1),
+        Role::Node(3),
         "env",
         &["--ignore-signal=TERM", "sleep", "300"],
         &d,
     );
     let mut farm = Farm::supervise(&d, vec![stubborn]).with_hang(Duration::from_millis(300));
     wait_until_running(farm.process_table()[0].pid, "sleep");
-    assert_eq!(farm.term(Role::Daemon(1)), None);
+    assert_eq!(farm.term(Role::Node(3)), None);
     assert_eq!(farm.process_table()[0].ended.as_deref(), Some("signal 9"));
 }
 
@@ -516,10 +513,6 @@ fn serve(routes: Vec<(&'static str, &'static str)>) -> u16 {
     port
 }
 
-const NODES_BOTH: &str =
-    r#"{"nodes":[{"node_id":"node-1","connected":true},{"node_id":"node-2","connected":true}]}"#;
-const NODES_ONE: &str =
-    r#"{"nodes":[{"node_id":"node-1","connected":true},{"node_id":"node-2","connected":false}]}"#;
 const MEMBERS_ACTIVE: &str = r#"{"members":[{"state":"active"},{"state":"active"}]}"#;
 const MEMBERS_CATCHING_UP: &str = r#"{"members":[{"state":"active"},{"state":"catching_up"}]}"#;
 
@@ -529,47 +522,37 @@ fn farm_with_api(name: &str, routes: Vec<(&'static str, &'static str)>) -> Farm 
     let mut farm = Farm::supervise(&d, vec![sleeper(Role::Frontend, &d)]);
     farm.api = serve(routes);
     farm.storage_nodes = 2;
-    farm.node_ids = vec!["node-1".to_owned(), "node-2".to_owned()];
     farm
 }
 
 #[test]
-fn a_farm_is_whole_when_every_node_is_connected_and_every_member_active() {
-    // Catches: a check that fails a healthy farm (the end-of-load gate would be red on
-    // every run).
-    let farm = farm_with_api(
-        "whole",
-        vec![("/v1/nodes", NODES_BOTH), ("/v1/members", MEMBERS_ACTIVE)],
-    );
+fn a_farm_is_whole_when_every_member_is_active() {
+    // Catches: a check that fails a healthy farm (every wait for the farm to be whole
+    // would then fail).
+    let farm = farm_with_api("whole", vec![("/v1/members", MEMBERS_ACTIVE)]);
     assert_eq!(farm.whole(), Ok(()));
 }
 
 #[test]
-fn a_farm_that_lost_a_node_a_member_or_its_frontend_is_not_whole() {
-    // Catches: a node that is still running but no longer connected, a member that has
-    // fallen back to catching up, and a frontend that does not answer, each passing as a
-    // whole farm.
-    let lost_node = farm_with_api(
-        "not-whole-node",
-        vec![("/v1/nodes", NODES_ONE), ("/v1/members", MEMBERS_ACTIVE)],
-    );
-    let why = lost_node.whole().expect_err("a node is not connected");
-    assert!(why.starts_with("nodes connected: [\"node-1\"]"), "{why}");
+fn a_farm_that_lost_a_member_or_its_frontend_is_not_whole() {
+    // Catches: a member that has fallen back to catching up, a frontend that lists fewer
+    // members than the farm has nodes, and a frontend that does not answer, each passing as
+    // a whole farm.
     let catching_up = farm_with_api(
         "not-whole-member",
-        vec![
-            ("/v1/nodes", NODES_BOTH),
-            ("/v1/members", MEMBERS_CATCHING_UP),
-        ],
+        vec![("/v1/members", MEMBERS_CATCHING_UP)],
     );
     let why = catching_up.whole().expect_err("a member is not active");
     assert!(why.starts_with("storage members"), "{why}");
-    let no_members = farm_with_api("not-whole-nomembers", vec![("/v1/nodes", NODES_BOTH)]);
-    let why = no_members.whole().expect_err("no /v1/members");
-    assert!(why.contains("/v1/members does not answer"), "{why}");
+    let one = farm_with_api(
+        "not-whole-count",
+        vec![("/v1/members", r#"{"members":[{"state":"active"}]}"#)],
+    );
+    let why = one.whole().expect_err("a member is missing");
+    assert!(why.contains("(1, true)"), "{why}");
     let silent = farm_with_api("not-whole-silent", Vec::new());
-    let why = silent.whole().expect_err("no /v1/nodes");
-    assert!(why.contains("/v1/nodes does not answer"), "{why}");
+    let why = silent.whole().expect_err("no /v1/members");
+    assert!(why.contains("/v1/members does not answer"), "{why}");
 }
 
 #[test]
@@ -629,28 +612,6 @@ fn a_stop_is_bounded_as_a_whole_not_per_role() {
 }
 
 #[test]
-fn a_wait_ends_at_once_when_the_run_is_asked_to_stop() {
-    // Catches: a run that has been sent SIGTERM going on waiting for a farm to become ready
-    // (up to the farm's whole wait) before it notices. Catches: `try_wait` does not look at
-    // the flag.
-    let d = dir("interrupted");
-    let mut farm =
-        Farm::supervise(&d, vec![sleeper(Role::Node(1), &d)]).with_hang(Duration::from_secs(3600));
-    farm.interrupt.set();
-    let error = farm
-        .try_wait("never", |_| None::<()>)
-        .expect_err("a wait that is interrupted fails");
-    assert!(
-        error
-            .what
-            .starts_with("interrupted by a signal while waiting for never"),
-        "{}",
-        error.what
-    );
-    assert!(error.report.contains("--- processes ---"));
-}
-
-#[test]
 fn a_farm_removes_the_scratch_it_owns_when_it_drops() {
     // Catches: a farm that leaves its scratch directory behind (every run left one per
     // test), and one that removes it before its processes are reaped.
@@ -660,48 +621,6 @@ fn a_farm_removes_the_scratch_it_owns_when_it_drops() {
     assert!(path.is_dir());
     drop(farm);
     assert!(!path.exists(), "{} is left behind", path.display());
-}
-
-#[test]
-fn a_farm_reaps_its_processes_before_it_removes_the_scratch() {
-    // Catches: the scratch removed while a process still runs in it (a field order, or a
-    // Drop, that takes the directory first). The watcher spins until the marker it was
-    // started beside is gone, then records that; the directory holds many files, so its
-    // removal takes long enough for a watcher still alive to see it. A farm that kills
-    // first leaves no watcher to write anything.
-    let outside = dir("order");
-    let scratch = kbf_testkit::dir::TestDir::under(&outside, "own");
-    let path = scratch.path().to_path_buf();
-    let marker = path.join("marker");
-    std::fs::write(&marker, b"x").expect("write the marker");
-    for n in 0..3000 {
-        std::fs::write(path.join(format!("f{n}")), b"x").expect("write a filler");
-    }
-    let (up, saw_gone) = (outside.join("up"), outside.join("saw_gone"));
-    let bin = crate::stand_in::sibling_bin("kbf-harness-watcher");
-    let argv = [&up, &marker, &saw_gone].map(|p| p.display().to_string());
-    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let watcher = spec(
-        Role::Node(1),
-        bin.to_str().expect("utf-8 path"),
-        &argv,
-        &path,
-    );
-    let farm = Farm::supervise(&path, vec![watcher]).owning(scratch);
-    let until = std::time::Instant::now() + Duration::from_secs(30);
-    while !up.exists() {
-        assert!(
-            std::time::Instant::now() < until,
-            "the watcher never started"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    drop(farm);
-    assert!(!path.exists(), "{} is left behind", path.display());
-    assert!(
-        !saw_gone.exists(),
-        "the scratch was removed while a process still ran in it"
-    );
 }
 
 /// The unit of `mode` for a made-up process under `root`.
@@ -715,12 +634,10 @@ fn unit_under(root: &Path, mode: Mode) -> Unit {
     let settings = Settings {
         root,
         host: "127.0.0.1",
-        node_id: "n-1",
         storage_port: 5,
         wiring: &wiring,
-        image: "",
     };
-    Unit::new(mode, &settings, 1000)
+    Unit::new(mode, &settings)
 }
 
 #[test]
@@ -737,7 +654,7 @@ fn a_launched_kbf_child_is_given_a_settings_file_of_the_harnesss_own() {
     let unit = unit_under(&root, Mode::Storage);
     let text = unit.toml();
     let flags = unit.flags();
-    farm.launch(Path::new("true"), Role::Node(1), &root, unit, None);
+    farm.launch(Path::new("true"), Role::Node(1), &root, unit);
     let file = root.join("kbf.toml");
     assert_eq!(
         farm.spec(Role::Node(1)).argv,
@@ -751,35 +668,6 @@ fn a_launched_kbf_child_is_given_a_settings_file_of_the_harnesss_own() {
     use std::os::unix::fs::PermissionsExt as _;
     let mode = std::fs::metadata(&file).expect("meta").permissions().mode();
     assert_eq!(mode & 0o022, 0, "{mode:o}");
-}
-
-#[test]
-fn a_container_driver_child_is_given_the_settings_file_of_its_root_not_of_its_bin() {
-    // Catches: the `Some(bin)` branch of `launch` (the container driver's, whose child
-    // runs in `bin`) building its command line without `--config`, or putting the file under
-    // `bin` (shared by every child) instead of the child's own root; the `None` test
-    // above pins the other branch only.
-    let d = dir("own-config-bin");
-    let (root, bin) = (d.join("root"), d.join("bin"));
-    for p in [&root, &bin] {
-        std::fs::create_dir_all(p).expect("dir");
-    }
-    let mut farm = Farm::supervise(&d, Vec::new());
-    let unit = unit_under(&root, Mode::Daemon);
-    let text = unit.toml();
-    farm.launch(Path::new("true"), Role::Node(1), &root, unit, Some(&bin));
-    let file = root.join("kbf.toml");
-    let argv = &farm.spec(Role::Node(1)).argv;
-    assert_eq!(
-        argv,
-        &[
-            "--mode=daemon".to_owned(),
-            format!("--config={}", file.display())
-        ]
-    );
-    assert_eq!(std::fs::read_to_string(&file).expect("the file"), text);
-    assert!(!bin.join("kbf.toml").exists());
-    assert_eq!(farm.spec(Role::Node(1)).cwd, bin);
 }
 
 #[test]

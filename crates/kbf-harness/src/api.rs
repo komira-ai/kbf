@@ -1,5 +1,5 @@
 //! The frontend's operator API, read with a plain HTTP/1.1 request: the pages the
-//! harness waits on (`/readyz`, the nodes and members it lists) and `/metrics`.
+//! harness waits on (`/readyz`, the members it lists) and the operator calls a test makes.
 
 use std::io::{Read as _, Write as _};
 use std::time::Duration;
@@ -42,23 +42,6 @@ fn request(api: u16, request: &str) -> Option<(u16, String)> {
     let (head, body) = text.split_once("\r\n\r\n")?;
     let code = head.split_whitespace().nth(1)?.parse().ok()?;
     Some((code, body.to_owned()))
-}
-
-/// The ids of the nodes the frontend lists as connected, sorted; `None` while it does
-/// not answer.
-#[must_use]
-pub fn connected(api: u16) -> Option<Vec<String>> {
-    let (code, body) = get(api, "/v1/nodes")?;
-    (code == 200).then_some(())?;
-    let view: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let mut ids: Vec<String> = view["nodes"]
-        .as_array()?
-        .iter()
-        .filter(|n| n["connected"] == true)
-        .filter_map(|n| n["node_id"].as_str().map(str::to_owned))
-        .collect();
-    ids.sort();
-    Some(ids)
 }
 
 /// How many storage members `GET /v1/members` lists, and whether every one is `active`: a

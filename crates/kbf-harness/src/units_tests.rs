@@ -16,22 +16,16 @@ fn wiring() -> Wiring {
     }
 }
 
-/// The unit of `mode` for a made-up process (root `/R`, node `n-1`), pinned to `image`.
-fn unit_of(mode: Mode, image: &str) -> Unit {
+/// The unit of `mode` for a made-up process (root `/R`, node `n-1`).
+fn unit(mode: Mode) -> Unit {
     let w = wiring();
     let s = Settings {
         root: Path::new("/R"),
         host: "127.0.0.1",
-        node_id: "n-1",
         storage_port: 5555,
         wiring: &w,
-        image,
     };
-    Unit::new(mode, &s, 1000)
-}
-
-fn unit(mode: Mode) -> Unit {
-    unit_of(mode, "")
+    Unit::new(mode, &s)
 }
 
 fn has(unit: &Unit, flag: &str) -> bool {
@@ -42,7 +36,7 @@ fn has(unit: &Unit, flag: &str) -> bool {
 fn a_unit_names_its_mode_as_its_one_mode_word_and_no_other_spelling_passes() {
     // Catches: a check so loose that a unit naming another mode passes, that takes the old
     // positional spelling (`kbf storage`), `--mode <name>` as two words, a second `--mode=`,
-    // or a prefix of the name (`--mode=storage-and-daemon` for `storage`): a unit that
+    // or a prefix of the name (`--mode=storage-node` for `storage`): a unit that
     // starts something else than its name says would start a farm of the wrong processes.
     // Catches: `names_mode` accepts the mode name as any word; takes the first `--mode=`
     // only; compares a prefix.
@@ -50,18 +44,18 @@ fn a_unit_names_its_mode_as_its_one_mode_word_and_no_other_spelling_passes() {
         &["--mode=storage", "--cold-store=x"],
         Mode::Storage
     ));
-    assert!(!names_mode(&["--mode=storage"], Mode::Daemon));
+    assert!(!names_mode(&["--mode=storage"], Mode::Frontend));
     assert!(!names_mode(&["storage", "--cold-store=x"], Mode::Storage));
     assert!(!names_mode(&["--mode", "storage"], Mode::Storage));
     assert!(!names_mode(
-        &["--mode=storage", "--mode=daemon"],
+        &["--mode=storage", "--mode=frontend"],
         Mode::Storage
     ));
     assert!(!names_mode(
-        &["--mode=daemon", "--mode=storage"],
+        &["--mode=frontend", "--mode=storage"],
         Mode::Storage
     ));
-    assert!(!names_mode(&["--mode=storage-and-daemon"], Mode::Storage));
+    assert!(!names_mode(&["--mode=storage-node"], Mode::Storage));
     assert!(!names_mode(&[], Mode::Storage));
 }
 
@@ -90,15 +84,15 @@ fn every_mode_has_its_settings_and_each_key_has_its_table() {
         assert!(keys.len() > 30, "{mode}: {}", keys.len());
         assert!(keys.values().all(|(table, _)| !table.is_empty()));
     }
-    let daemon = keys(Mode::Daemon);
-    assert_eq!(daemon["data-dir"], ("daemon", false));
+    let storage = keys(Mode::Storage);
+    assert_eq!(storage["cold-store"], ("stores", false));
     // A commented key (no default) is a key, and a switch is a live `= false` line.
-    assert_eq!(daemon["image"], ("daemon", false));
-    assert_eq!(daemon["no-input-cache"], ("daemon", true));
+    assert_eq!(storage["hot-store-max-bytes"], ("stores", false));
+    assert!(keys(Mode::Frontend)["no-memory-climb"].1);
     assert_eq!(keys(Mode::Frontend)["handover-socket"], ("handover", false));
     // The help text of a setting is not a key.
-    assert!(!daemon.contains_key("#"));
-    assert!(daemon.keys().all(|k| !k.contains(' ')));
+    assert!(!storage.contains_key("#"));
+    assert!(storage.keys().all(|k| !k.contains(' ')));
 }
 
 #[test]
@@ -118,155 +112,135 @@ fn each_mode_starts_with_the_settings_its_unit_had_for_the_farms_directories() {
     let storage = unit(Mode::Storage).flags();
     assert!(storage.contains(&"--storage-listen=127.0.0.1:5555".to_owned()));
     assert!(storage.contains(&"--hot-store=file:///R/hot".to_owned()));
-    assert!(storage.iter().all(|f| !f.starts_with("--driver")));
-    let both = unit(Mode::StorageAndDaemon).flags();
-    assert!(both.contains(&"--frontend=https://localhost:2222".to_owned()));
-    assert!(both.contains(&"--advertise-addr=127.0.0.1:5555".to_owned()));
-    assert!(both.contains(&"--driver=container".to_owned()));
-    assert!(both.contains(&"--actions-memory-max-gib=10".to_owned()));
-    let daemon = unit(Mode::Daemon).flags();
-    assert!(daemon.contains(&"--cas=https://localhost:2222".to_owned()));
-    assert!(daemon.contains(&"--node-id=n-1".to_owned()));
-    assert!(daemon.iter().all(|f| !f.starts_with("--storage-listen")));
-    // The daemon half's session directory is the unit's environment; the others have none.
-    assert_eq!(
-        unit(Mode::Daemon).env,
-        [("XDG_RUNTIME_DIR".to_owned(), "/run/user/1000".to_owned())]
-    );
-    assert_eq!(unit(Mode::StorageAndDaemon).env, unit(Mode::Daemon).env);
-    assert!(unit(Mode::Frontend).env.is_empty());
-    assert!(unit(Mode::Storage).env.is_empty());
-}
-
-#[test]
-fn an_image_is_a_setting_only_when_one_is_pinned() {
-    // Catches: `--image=docker://` with nothing after it (a farm of the native driver has
-    // no image), or a pinned image that does not reach the daemon.
-    assert!(
-        unit(Mode::Daemon)
-            .flags()
-            .iter()
-            .all(|f| !f.starts_with("--image"))
-    );
-    let pinned = unit_of(Mode::Daemon, "repo@sha256:abc");
-    assert!(has(&pinned, "--image=docker://repo@sha256:abc"));
+    // The registration with the frontend is the farm's (`node`), not the unit's.
+    assert!(storage.iter().all(|f| !f.starts_with("--frontend")));
 }
 
 #[test]
 fn replace_changes_the_set_flag_and_adds_nothing() {
     // Catches: a replaced flag duplicated, or one that lands in another key.
-    let before = unit(Mode::Daemon);
-    let after = unit(Mode::Daemon).replace(&["--driver=native".to_owned()]);
+    let before = unit(Mode::Storage);
+    let after = unit(Mode::Storage).replace(&["--cold-store=file:///x".to_owned()]);
     assert_eq!(after.flags().len(), before.flags().len());
-    assert!(has(&after, "--driver=native"));
-    assert!(!has(&after, "--driver=container"));
+    assert!(has(&after, "--cold-store=file:///x"));
+    assert!(!has(
+        &after,
+        "--cold-store=s3://kbf-cas?endpoint=http://127.0.0.1:9000&conditional-put=true"
+    ));
 }
 
 #[test]
-#[should_panic(expected = "kbf daemon takes no --no-such-flag")]
+#[should_panic(expected = "kbf storage takes no --no-such-flag")]
 fn replace_of_a_flag_the_mode_does_not_take_panics() {
     // Catches: a silent no-op or a key `kbf` would refuse written into the file, so a
     // flag the mode stopped taking leaves the farm running with the unit's own value while
     // the test believes it changed it.
-    let _ = unit(Mode::Daemon).replace(&["--no-such-flag=1".to_owned()]);
+    let _ = unit(Mode::Storage).replace(&["--no-such-flag=1".to_owned()]);
 }
 
 #[test]
-#[should_panic(expected = "daemon sets no --image")]
+#[should_panic(expected = "storage sets no --hot-store-max-bytes")]
 fn replace_of_a_flag_the_unit_does_not_set_panics() {
     // Catches: a `replace` that adds (a flag the unit stopped setting would then be
     // given silently, where `set` is the call that adds).
-    let _ = unit(Mode::Daemon).replace(&["--image=docker://x".to_owned()]);
+    let _ = unit(Mode::Storage).replace(&["--hot-store-max-bytes=7".to_owned()]);
 }
 
 #[test]
-#[should_panic(expected = "daemon already sets --driver")]
+#[should_panic(expected = "storage already sets --cold-store")]
 fn append_of_a_flag_the_unit_sets_panics() {
     // Catches: a key given twice (the later one would hide the unit's value).
-    let _ = unit(Mode::Daemon).append(&["--driver=native".to_owned()]);
+    let _ = unit(Mode::Storage).append(&["--cold-store=file:///x".to_owned()]);
 }
 
 #[test]
-#[should_panic(expected = "kbf daemon takes no --no-such-flag")]
+#[should_panic(expected = "kbf storage takes no --no-such-flag")]
 fn append_of_a_flag_the_mode_does_not_take_panics() {
     // Catches: a typo taken for a new setting nobody reads.
-    let _ = unit(Mode::Daemon).append(&["--no-such-flag=1".to_owned()]);
+    let _ = unit(Mode::Storage).append(&["--no-such-flag=1".to_owned()]);
 }
 
 #[test]
 fn append_adds_a_flag_the_unit_does_not_set() {
-    let after = unit(Mode::Daemon).append(&["--image=docker://x".to_owned()]);
-    assert!(has(&after, "--image=docker://x"));
+    let after = unit(Mode::Storage).append(&["--hot-store-max-bytes=7".to_owned()]);
+    assert!(has(&after, "--hot-store-max-bytes=7"));
 }
 
 #[test]
 fn set_replaces_or_adds() {
     // Catches: a limit that is dropped when the unit sets no such flag, or one that is
     // added next to the unit's own.
-    let before = unit(Mode::Daemon).flags();
-    let after = unit(Mode::Daemon)
+    let before = unit(Mode::Storage).flags();
+    let after = unit(Mode::Storage)
         .set(&[
-            "--driver=native".to_owned(),
-            "--image=docker://x".to_owned(),
+            "--cold-store=file:///x".to_owned(),
+            "--hot-store-max-bytes=7".to_owned(),
         ])
         .flags();
     assert_eq!(after.len(), before.len() + 1);
-    assert!(after.contains(&"--driver=native".to_owned()));
-    assert!(after.contains(&"--image=docker://x".to_owned()));
+    assert!(after.contains(&"--cold-store=file:///x".to_owned()));
+    assert!(after.contains(&"--hot-store-max-bytes=7".to_owned()));
     assert_eq!(
-        after.iter().filter(|f| f.starts_with("--driver")).count(),
+        after
+            .iter()
+            .filter(|f| f.starts_with("--cold-store="))
+            .count(),
         1
     );
 }
 
 #[test]
-#[should_panic(expected = "kbf daemon takes no --no-such-flag")]
+#[should_panic(expected = "kbf storage takes no --no-such-flag")]
 fn set_of_a_flag_the_mode_does_not_take_panics() {
     // Catches: a limit a mode refuses (a frontend refuses a storage node's) written to its
     // file, where `kbf` would exit 2 at the start instead of the test naming the key.
-    let _ = unit(Mode::Daemon).set(&["--no-such-flag=1".to_owned()]);
+    let _ = unit(Mode::Storage).set(&["--no-such-flag=1".to_owned()]);
 }
 
 #[test]
 fn remove_takes_a_set_flag_out() {
-    let before = unit(Mode::Daemon);
-    let after = unit(Mode::Daemon).remove(&["--driver"]);
+    let before = unit(Mode::Storage);
+    let after = unit(Mode::Storage).remove(&["--hot-store"]);
     assert_eq!(after.flags().len(), before.flags().len() - 1);
-    assert!(after.flags().iter().all(|f| !f.starts_with("--driver")));
+    assert!(after.flags().iter().all(|f| !f.starts_with("--hot-store=")));
 }
 
 #[test]
-#[should_panic(expected = "daemon sets no --image")]
+#[should_panic(expected = "storage sets no --hot-store-max-bytes")]
 fn remove_of_a_flag_the_unit_does_not_set_panics() {
     // Catches: a removal that hides that the unit stopped having the flag.
-    let _ = unit(Mode::Daemon).remove(&["--image"]);
+    let _ = unit(Mode::Storage).remove(&["--hot-store-max-bytes"]);
 }
 
 #[test]
-#[should_panic(expected = "kbf daemon takes no --no-such-flag")]
+#[should_panic(expected = "kbf storage takes no --no-such-flag")]
 fn remove_of_a_flag_the_mode_does_not_take_panics() {
-    let _ = unit(Mode::Daemon).remove(&["--no-such-flag"]);
+    let _ = unit(Mode::Storage).remove(&["--no-such-flag"]);
 }
 
 #[test]
 fn a_switch_is_given_without_a_value_and_a_value_flag_with_one() {
     // Catches: `--switch=true` written as a string (kbf refuses a switch that is not a
     // boolean), or a value flag written as a switch.
-    let on = unit(Mode::Daemon).set(&["--no-input-cache".to_owned()]);
-    assert!(has(&on, "--no-input-cache"));
-    assert!(on.toml().contains("no-input-cache = true"), "{}", on.toml());
+    let on = unit(Mode::Frontend).set(&["--no-memory-climb".to_owned()]);
+    assert!(has(&on, "--no-memory-climb"));
+    assert!(
+        on.toml().contains("no-memory-climb = true"),
+        "{}",
+        on.toml()
+    );
 }
 
 #[test]
-#[should_panic(expected = "--no-input-cache is a switch")]
+#[should_panic(expected = "--no-memory-climb is a switch")]
 fn a_switch_with_a_value_panics() {
-    let _ = unit(Mode::Daemon).set(&["--no-input-cache=true".to_owned()]);
+    let _ = unit(Mode::Frontend).set(&["--no-memory-climb=true".to_owned()]);
 }
 
 #[test]
-#[should_panic(expected = "--data-dir takes a value")]
+#[should_panic(expected = "--meta-dir takes a value")]
 fn a_value_flag_without_a_value_panics() {
-    let _ = unit(Mode::Daemon).set(&["--data-dir".to_owned()]);
+    let _ = unit(Mode::Storage).set(&["--meta-dir".to_owned()]);
 }
 
 #[test]
@@ -303,10 +277,8 @@ fn only_a_frontend_of_this_release_is_given_the_drain_wait() {
     let place = Settings {
         root: Path::new("/R"),
         host: "127.0.0.1",
-        node_id: "n-1",
         storage_port: 5555,
         wiring: &w,
-        image: "",
     };
     let older = |roles: &[Role]| {
         let mut topo = Topology::rehearsal(2);
@@ -314,7 +286,7 @@ fn only_a_frontend_of_this_release_is_given_the_drain_wait() {
             .iter()
             .map(|role| (*role, PathBuf::from("/older/kbf")))
             .collect();
-        frontend(&place, 1000, &topo)
+        frontend(&place, &topo)
     };
 
     assert!(has(&older(&[]), "--drain-lb-wait=0"));
@@ -328,81 +300,35 @@ fn only_a_frontend_of_this_release_is_given_the_drain_wait() {
 #[test]
 fn the_compositions_apply_the_edits_of_a_farm_to_the_units_defaults() {
     // Catches: an edit of the farm that goes missing or lands on the wrong role: the
-    // frontend's SQLite store, the nodes' directory cold store and scrape route, the
-    // limits and the overrides over them, the container driver's stand-in.
+    // frontend's SQLite store, the nodes' directory cold store, scrape route and
+    // registration with the frontend, and the limits over them.
     let w = wiring();
-    let place = |image| Settings {
+    let place = Settings {
         root: Path::new("/R"),
         host: "127.0.0.1",
-        node_id: "n-1",
         storage_port: 5555,
         wiring: &w,
-        image,
     };
-    let mut topo = Topology::beta();
-    topo.overrides = vec![
-        (Role::Node(2), vec!["--hot-store-max-bytes=7".to_owned()]),
-        (Role::Daemon(1), vec!["--reserve-cpus=3".to_owned()]),
-        (Role::Frontend, vec!["--api-listen=127.0.0.1:1".to_owned()]),
-    ];
-    let front: Unit = frontend(&place(""), 1000, &topo);
+    let topo = Topology::beta();
+    let front: Unit = frontend(&place, &topo);
     assert!(has(&front, "--state-store=sqlite:///R/state/state.db"));
     assert!(has(&front, "--default-platform=none"));
     assert!(has(&front, "--drain-lb-wait=0"));
-    assert!(has(&front, "--api-listen=127.0.0.1:1"));
-    let nodes = |n| -> Unit { node((&place(""), 1000), n, 9999, &topo, None) };
-    let first = nodes(1);
+    let first: Unit = node(&place, 9999, &topo);
+    assert_eq!(first.mode, Mode::Storage);
     assert!(has(&first, "--cold-store=file:///R/cold"));
     assert!(has(&first, "--metrics-listen=127.0.0.1:9999"));
     assert!(has(&first, "--frontend=https://localhost:2222"));
     assert!(has(&first, "--advertise-addr=127.0.0.1:5555"));
     assert!(has(&first, "--hot-store-max-bytes=268435456"));
-    assert!(has(&nodes(2), "--hot-store-max-bytes=7"));
-    let plain: Unit = daemon((&place(""), 1000), 1, &topo, None);
-    assert!(has(&plain, "--driver=native"));
-    assert!(has(&plain, "--reserve-cpus=3"));
-    // The container driver: the stand-in's runtime replaces the unit's, the rest is added.
-    let container = Container {
-        oci_runtime: "--oci-runtime=/B/crun".to_owned(),
-        flags: vec!["--id-files=/B/ids".to_owned()],
-    };
-    let rehearsal = Topology::rehearsal(2);
-    let both: Unit = node(
-        (&place("r@sha256:aa"), 1000),
-        1,
-        9999,
-        &rehearsal,
-        Some(&container),
-    );
-    assert!(has(&both, "--driver=container"));
-    assert!(has(&both, "--oci-runtime=/B/crun"));
-    assert!(has(&both, "--id-files=/B/ids"));
-    assert!(has(&both, "--frontend=https://localhost:2222"));
-    assert!(has(&both, "--image=docker://r@sha256:aa"));
-    let plain: Unit = daemon((&place(""), 1000), 1, &rehearsal, Some(&container));
-    assert!(has(&plain, "--oci-runtime=/B/crun"));
-}
-
-#[test]
-fn a_container_planted_in_a_directory_names_the_runtime_the_tree_and_the_id_files() {
-    // Catches: the stand-in's flags pointed at another directory than the node's own `bin`
-    // (a runtime that is not the stand-in), or the id files of another node.
-    let d = crate::scratch("units-container");
-    let (bin, root) = (d.join("bin"), d.join("root"));
-    for p in [&bin, &root] {
-        std::fs::create_dir_all(p).expect("dir");
-    }
-    let c = Container::planted(&bin, &root);
-    assert_eq!(
-        c.oci_runtime,
-        format!("--oci-runtime={}/crun", bin.display())
-    );
-    assert!(c.flags.iter().any(|f| f.starts_with("--cgroup-root=")));
-    assert!(c.flags.iter().any(|f| f.starts_with("--self-cgroup=")));
+    // The rehearsal's limits are the cold store's floor only.
+    let rehearsal: Unit = node(&place, 9999, &Topology::rehearsal(2));
+    assert!(has(&rehearsal, "--cold-store-floor-bytes=0"));
     assert!(
-        c.flags.iter().any(|f| f.starts_with("--id-files=")),
-        "{:?}",
-        c.flags
+        rehearsal
+            .flags()
+            .iter()
+            .all(|f| !f.starts_with("--hot-store-max-bytes"))
     );
 }
 
@@ -433,7 +359,7 @@ fn a_unit_that_starts_another_binary_or_mode_is_refused() {
     let ok = "[Service]\nExecStart=/var/lib/x/kbf --mode=storage\n";
     assert_eq!(mode_word_in(ok, Mode::Storage), "--mode=storage");
     for bad in [
-        "[Service]\nExecStart=/var/lib/x/kbf --mode=daemon\n",
+        "[Service]\nExecStart=/var/lib/x/kbf --mode=frontend\n",
         "[Service]\nExecStart=/var/lib/x/other --mode=storage\n",
         "[Service]\nExecStart=/var/lib/x/kbf storage\n",
         "[Service]\nRestart=no\n",

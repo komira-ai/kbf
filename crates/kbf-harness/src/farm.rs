@@ -1,9 +1,9 @@
-//! The farm of real `kbf` processes: a frontend, `storage_nodes` storage nodes (each
-//! with a daemon in the same process, or storage alone) and `daemons` plain daemons, on
-//! loopback addresses of their own,
+//! The farm of real `kbf` processes: a frontend and `storage_nodes` storage nodes
+//! (`kbf --mode=storage`), on loopback addresses of their own,
 //! each started as the packaged unit starts `kbf` (`kbf --mode=<mode> --config <kbf.toml>`,
 //! [`crate::units`]) with a `kbf.toml` of its own that the harness writes, under
-//! certificates of the rows the farm's certificate table has.
+//! certificates of the rows the farm's certificate table has. The farm runs no action:
+//! placed actions run as js-agent jobs of the frontend's job service, not in this farm.
 //!
 //! A role starts only from that command line and file, and the [`Farm`] keeps the line, so
 //! [`Farm::restart`] runs the identical command and a test that changes the line
@@ -19,16 +19,13 @@ use kbf_ca::verify_cert::Row;
 use kbf_testkit::dir::TestDir;
 
 use crate::api;
-use crate::interrupt::Interrupt;
-use crate::node_support::{crun, files_holding, image_path};
+use crate::node_support::files_holding;
 use crate::pki::Pki;
 use crate::ports::{Claim, Ports};
 use crate::procs::{HANG, Proc, Spec, after, field};
-use crate::units::{self, Container, Settings, Unit, Wiring};
+use crate::units::{self, Settings, Unit, Wiring};
 
-pub use crate::topology::{
-    Bins, Driver, FarmError, Limits, NodeMode, ProcRecord, Role, Topology, daemon_id, node_id,
-};
+pub use crate::topology::{Bins, FarmError, Limits, ProcRecord, Role, Topology, node_id};
 
 /// The bearer token the frontend of a [`Farm::start`] farm is given (32 or more visible
 /// characters, as the API requires), for the operator calls a scenario makes.
@@ -58,18 +55,9 @@ pub struct Farm {
     client_port: u16,
     api: u16,
     ca: Vec<u8>,
-    /// The image the actions name: the one unpacked in each node's image store.
-    image: String,
     storage_nodes: usize,
-    /// The port of each storage node's `/metrics` (`--metrics-listen`, on loopback), node 1
-    /// first.
-    metrics_ports: Vec<u16>,
-    /// The ids the frontend must list as connected, sorted.
-    node_ids: Vec<String>,
     /// How long [`Farm::try_wait`] and [`Farm::stop_all`] wait before giving up.
     hang: Duration,
-    /// Whether the run was asked to stop.
-    interrupt: Interrupt,
     /// The block of ports the farm's processes bind, held while the farm lives, and the
     /// ports of it that the processes were told.
     claim: Option<(Claim, Ports)>,
@@ -80,7 +68,7 @@ pub struct Farm {
 }
 
 /// A loopback address of its own for each process (the whole of `127/8` is loopback on
-/// Linux): the frontend's, then each node's, then the plain daemon's.
+/// Linux): the frontend's, then each node's.
 fn loopback(n: usize) -> String {
     format!("127.0.0.{}", n + 1)
 }
@@ -92,17 +80,13 @@ fn unix_now() -> u64 {
 }
 
 /// The directories a process's unit expects to exist (the installer makes them on a
-/// host).
-fn make_dirs(root: &Path) -> PathBuf {
-    // `etc` holds the keys, and a shared runner has other users: private to this one. The rest
-    // is as made: the OCI backend refuses a data directory (and its parents) that others
-    // cannot search.
+/// host). `etc` holds the keys, and a shared runner has other users: private to this one.
+fn make_dirs(root: &Path) {
     std::fs::create_dir_all(root).expect("mkdir");
     crate::pki::private_dir(&root.join("etc"));
-    for name in ["data", "meta", "hot", "state", "cold", "bin"] {
+    for name in ["meta", "hot", "state", "cold"] {
         std::fs::create_dir_all(root.join(name)).expect("mkdir");
     }
-    root.join("bin")
 }
 
 impl Farm {
@@ -113,18 +97,10 @@ impl Farm {
     /// The settings a test box cannot take as the packaged units' defaults have them, and
     /// what each is changed to:
     /// - the nodes' `--cold-store=s3://...` (no MinIO here) is a `file://` directory;
-    /// - a `kbf storage` node (which has no daemon half) is given `--frontend` and
-    ///   `--advertise-addr`, which its unit does not set (the storage-and-daemon
-    ///   unit sets them), so that it registers with the frontend, and with the
-    ///   frontend;
-    /// - with [`Driver::StandInContainer`], `--driver=container` stays, over the stand-in
-    ///   `crun`: `--oci-runtime=` names it (the unit names `/usr/bin/crun`), the id tools
-    ///   are on the daemons' `PATH`, their cgroup tree (`--cgroup-root`, `--self-cgroup`)
-    ///   is planted and `--id-files` stands for `/etc/subuid`;
-    /// - with [`Driver::Native`], `--driver=native` replaces it and `KBF_IMAGES` is empty
-    ///   (only the container driver takes `--image`);
+    /// - a `kbf --mode=storage` node is given `--frontend` and `--advertise-addr`, which its
+    ///   unit leaves to the host's `kbf.toml`, so that it registers with the frontend;
     /// - the frontend's `--default-platform` is `none` (the nodes are this host);
-    /// - the topology's [`Limits`] and overrides are set on top.
+    /// - the topology's [`Limits`] are set on top.
     ///
     /// Every other setting is the unit's.
     ///
@@ -145,17 +121,6 @@ impl Farm {
     /// mode does not take): a defect of the harness.
     pub fn start(logs: &Path, dir: &Path, bins: &Bins, topo: &Topology) -> Result<Self, FarmError> {
         std::fs::create_dir_all(logs).expect("logs");
-        let native = topo.driver == Driver::Native;
-        // The native driver is the plain daemon's: `kbf storage-and-daemon` runs the container
-        // driver only, so nodes with a daemon half go with the container driver and storage
-        // nodes with the native one.
-        assert_eq!(
-            native,
-            topo.node_mode == NodeMode::Storage,
-            "the native driver needs NodeMode::Storage nodes and the container driver \
-             NodeMode::StorageAndDaemon ones"
-        );
-        let uid = rustix::process::getuid().as_raw();
         let nodes = topo.storage_nodes;
         // Every port is the farm's own, from a block no other farm of the host holds.
         let claim = Claim::new();
@@ -169,13 +134,6 @@ impl Farm {
             storage_url: format!("https://{}:{}", loopback(1), storage[0]),
         };
         let pki = Pki::new();
-        let steps = ["write-lines", "$UPPER/out/file.txt", "a file"];
-        // The nodes that have a daemon half connect to the frontend as nodes.
-        let mut node_ids: Vec<String> = (1..=topo.daemons).map(daemon_id).collect();
-        if topo.node_mode == NodeMode::StorageAndDaemon {
-            node_ids.extend((1..=nodes).map(node_id));
-        }
-        node_ids.sort();
         let mut farm = Farm {
             logs: logs.to_owned(),
             members: Vec::new(),
@@ -183,37 +141,11 @@ impl Farm {
             client_port: front.0,
             api: wiring.api,
             ca: Vec::new(),
-            image: String::new(),
             storage_nodes: nodes,
-            metrics_ports: metrics.clone(),
-            node_ids,
             hang: HANG,
-            interrupt: topo.interrupt.clone(),
             claim: Some((claim, ports.clone())),
             scratch: None,
         };
-        let fake = || {
-            bins.fake_crun
-                .as_ref()
-                .expect("Bins::fake_crun for the stand-in container driver")
-                .display()
-                .to_string()
-        };
-        // The stand-in `crun` in `bin`, the image it names unpacked under the node's
-        // `data` directory beside it, and that image, bare.
-        let stand_in = |farm: &mut Farm, bin: &Path| {
-            if native {
-                return String::new();
-            }
-            let image = crun(bin, &bin.with_file_name("data"), &fake(), &steps);
-            let bare = image
-                .strip_prefix("docker://")
-                .expect("docker://")
-                .to_owned();
-            farm.image = image;
-            bare
-        };
-
         // The frontend: its unit as packaged, a state directory made.
         let root = dir.join("frontend");
         let etc = root.join("etc");
@@ -229,83 +161,41 @@ impl Farm {
         let place = Settings {
             root: &root,
             host: &loopback0,
-            node_id: "frontend-1",
             storage_port: spare,
             wiring: &wiring,
-            image: "",
         };
-        let unit = units::frontend(&place, uid, topo);
+        let unit = units::frontend(&place, topo);
         farm.launch(
             topo.kbf_of(Role::Frontend, &bins.kbf),
             Role::Frontend,
             &root,
             unit,
-            None,
         );
         let line = farm.start_line(Role::Frontend, "kbf-frontend ")?;
         farm.reapi = field(&line, "reapi=").to_owned();
 
-        // The storage nodes, then the plain daemons.
+        // The storage nodes.
         for (i, port) in storage.iter().enumerate() {
             let (id, host) = (node_id(i + 1), loopback(i + 1));
-            let id = id.as_str();
-            let root = dir.join(id);
-            let bin = make_dirs(&root);
+            let root = dir.join(&id);
+            make_dirs(&root);
             let etc = root.join("etc");
             pki.write_ca(&etc);
             pki.issue(&etc, "storage", Row::Storage, &[&host]);
-            if !native {
-                pki.issue(&etc, "node", Row::Daemon, &[id]);
-            }
-            let bare = if native {
-                String::new()
-            } else {
-                stand_in(&mut farm, &bin)
-            };
             let place = Settings {
                 root: &root,
                 host: &host,
-                node_id: id,
                 storage_port: *port,
                 wiring: &wiring,
-                image: &bare,
             };
-            let container = (!native).then(|| Container::planted(&bin, &root));
-            let unit = units::node((&place, uid), i + 1, metrics[i], topo, container.as_ref());
+            let unit = units::node(&place, metrics[i], topo);
             farm.launch(
                 topo.kbf_of(Role::Node(i + 1), &bins.kbf),
                 Role::Node(i + 1),
                 &root,
                 unit,
-                (!native).then_some(bin.as_path()),
             );
             farm.start_line(Role::Node(i + 1), "kbf-storage ")?;
-        }
-        for d in 1..=topo.daemons {
-            let (id, host) = (daemon_id(d), loopback(nodes + d));
-            let root = dir.join(&id);
-            let bin = make_dirs(&root);
-            let etc = root.join("etc");
-            pki.write_ca(&etc);
-            pki.issue(&etc, "node", Row::Daemon, &[&id]);
-            let bare = stand_in(&mut farm, &bin);
-            let place = Settings {
-                root: &root,
-                host: &host,
-                node_id: &id,
-                storage_port: spare,
-                wiring: &wiring,
-                image: &bare,
-            };
-            let container = (!native).then(|| Container::planted(&bin, &root));
-            let unit = units::daemon((&place, uid), d, topo, container.as_ref());
-            farm.launch(
-                topo.kbf_of(Role::Daemon(d), &bins.kbf),
-                Role::Daemon(d),
-                &root,
-                unit,
-                (!native).then_some(bin.as_path()),
-            );
         }
 
         Ok(farm)
@@ -327,12 +217,8 @@ impl Farm {
             client_port: 0,
             api: 0,
             ca: Vec::new(),
-            image: String::new(),
             storage_nodes: 0,
-            metrics_ports: Vec::new(),
-            node_ids: Vec::new(),
             hang: HANG,
-            interrupt: Interrupt::new(),
             claim: None,
             scratch: None,
         };
@@ -360,21 +246,15 @@ impl Farm {
 
     /// Starts the process for `unit`: its `kbf.toml` written beside the process's other
     /// files (in `root`) and named by `--config`, so that the child never reads the
-    /// host's /etc/kbf/kbf.toml, which `kbf` reads when it is given no `--config`. Those
-    /// with a `bin` (the container driver's) run in it, with the id tools on `PATH`.
-    fn launch(&mut self, kbf: &Path, role: Role, root: &Path, unit: Unit, bin: Option<&Path>) {
-        let (cwd, mut env) = match bin {
-            Some(bin) => (bin, vec![("PATH".to_owned(), image_path(bin))]),
-            None => (root, Vec::new()),
-        };
+    /// host's /etc/kbf/kbf.toml, which `kbf` reads when it is given no `--config`.
+    fn launch(&mut self, kbf: &Path, role: Role, root: &Path, unit: Unit) {
         let config = kbf_testkit::config::flag_with(root, &unit.toml());
-        env.extend(unit.env.iter().cloned());
         let spec = Spec {
             name: role.to_string(),
             program: kbf.to_owned(),
             argv: unit.argv(config),
-            env,
-            cwd: cwd.to_owned(),
+            env: Vec::new(),
+            cwd: root.to_owned(),
         };
         self.launch_spec(role, root, spec, unit.flags());
     }
@@ -447,16 +327,10 @@ impl Farm {
         }
     }
 
-    /// Whether the wait for `what` may go on: not when the run was asked to stop, and not
-    /// when a process that is not one the harness killed has ended. Not generic: one copy
+    /// Whether the wait for `what` may go on: not when a process that is not one the harness
+    /// killed has ended. Not generic: one copy
     /// for every wait, whatever the closure it waits on.
     fn nothing_ended(&mut self, what: &str) -> Result<(), FarmError> {
-        if self.interrupt.is_set() {
-            return Err(FarmError {
-                what: format!("interrupted by a signal while waiting for {what}"),
-                report: self.logs(),
-            });
-        }
         let ended = self.members.iter_mut().find_map(|m| {
             if m.killed {
                 return None;
@@ -500,33 +374,23 @@ impl Farm {
         })
     }
 
-    /// Waits until the frontend is ready and lists every node as connected and every
-    /// storage member active.
+    /// Waits until the frontend is ready and lists every storage member active.
     ///
     /// # Errors
     /// As [`Farm::try_wait`].
     pub fn wait_ready(&mut self) -> Result<(), FarmError> {
         self.try_wait("the frontend's /readyz", |f| answers_200(f.api, "/readyz"))?;
-        self.try_wait("every node connected to the frontend", Farm::all_connected)?;
         self.try_wait("every storage member active", Farm::all_active)?;
         Ok(())
     }
 
-    /// Whether the frontend still lists every node as connected and every storage member
-    /// active (what [`Farm::wait_ready`] waited for): a process that is alive proves
-    /// nothing of this, since a node that lost its place in the farm keeps running.
+    /// Whether the frontend still lists every storage member active (what
+    /// [`Farm::wait_ready`] waited for): a process that is alive proves nothing of this,
+    /// since a node that lost its place in the farm keeps running.
     ///
     /// # Errors
     /// What the frontend lists instead, or that it does not answer.
     pub fn whole(&self) -> Result<(), String> {
-        let connected = api::connected(self.api)
-            .ok_or_else(|| "the frontend's /v1/nodes does not answer".to_owned())?;
-        if connected != self.node_ids {
-            return Err(format!(
-                "nodes connected: {connected:?}, expected {:?}",
-                self.node_ids
-            ));
-        }
         let members = api::members_active(self.api)
             .ok_or_else(|| "the frontend's /v1/members does not answer".to_owned())?;
         if members != (self.storage_nodes, true) {
@@ -536,11 +400,6 @@ impl Farm {
             ));
         }
         Ok(())
-    }
-
-    /// Every node connected to the frontend; `None` while the frontend does not say so.
-    fn all_connected(&self) -> Option<()> {
-        (api::connected(self.api)? == self.node_ids).then_some(())
     }
 
     /// Every storage member active; `None` while the frontend does not say so.
@@ -716,29 +575,10 @@ impl Farm {
         &self.ca
     }
 
-    /// The image the actions name (the one unpacked in each node's image store); empty
-    /// with the native driver.
-    #[must_use]
-    pub fn image(&self) -> &str {
-        &self.image
-    }
-
-    /// How many storage-and-daemon nodes there are.
+    /// How many storage nodes there are.
     #[must_use]
     pub fn storage_nodes(&self) -> usize {
         self.storage_nodes
-    }
-
-    /// The port of each storage node's `/metrics` on loopback, node 1 first.
-    #[must_use]
-    pub fn metrics_ports(&self) -> &[u16] {
-        &self.metrics_ports
-    }
-
-    /// The ids the frontend lists as connected when the farm is whole, sorted.
-    #[must_use]
-    pub fn node_ids(&self) -> &[String] {
-        &self.node_ids
     }
 
     /// The nodes (numbered from 1) that hold `bytes` in their hot or cold store.
@@ -752,8 +592,8 @@ impl Farm {
             .collect()
     }
 
-    /// SIGTERM to each process still running, last started first (the daemons and nodes,
-    /// before the frontend, which waits for open streams); each role and how it
+    /// SIGTERM to each process still running, last started first (the nodes, before the
+    /// frontend, which waits for open streams); each role and how it
     /// ended. A role that had ended on its own before its turn is reported as that, with its
     /// status (`exited before the stop: exit 0`), which is never a clean stop: a crash
     /// must not be absent from the evidence, and a role that left with 0 on its own was

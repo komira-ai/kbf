@@ -1,56 +1,27 @@
-//! The beta harness as a library (docs/design/kbf-cicd.md, sections 4.2 and 4.3), grown
-//! from the rehearsal in a box: one set of parts that the rehearsal tests of `kbf-cli`
-//! and the beta scenarios share.
+//! The harness as a library (docs/design/kbf-cicd.md, section 4.2): the parts that the
+//! rehearsal tests of `kbf-cli` and the mixed-version test of `kbf-integration-test` share.
 //!
-//! - [`farm`]: a frontend, storage nodes (each with a daemon in its process, or alone) and
-//!   plain daemons, each a real `kbf` process started as the packaged unit starts
-//!   it (`kbf --mode=<mode> --config <kbf.toml>`, [`units`]), on a loopback address of its own, under certificates of the right
-//!   rows ([`pki`]); a supervisor with `term`, `kill`, `restart`, a process table and a
-//!   report of every process's output for a hang ([`procs`]).
-//! - [`reapi`]: a client of a farm's frontend (the REAPI listener under the farm CA), and the
-//!   upload and `Execute` of one action, for the black-box test crates.
-//! - [`scrape`] and [`gates`]: the frontend's metrics read every second, and the gates a
-//!   scenario applies to what it measured.
-//! - [`load`] and [`eventlog`]: the Buck2 builds that load the farm, and what their event
-//!   logs say of each action.
-//! - [`result`]: the result document, `beta-result.json`, and the job summary's table.
-//! - [`b0`]: scenario B0, `farm_under_build_load`, and [`cli`], the command line of the
-//!   `kbf-beta` binary that runs it.
+//! - [`farm`]: a frontend and storage nodes, each a real `kbf` process started as the
+//!   packaged unit starts it (`kbf --mode=<mode> --config <kbf.toml>`, [`units`]), on a
+//!   loopback address of its own, under certificates of the right rows ([`pki`]); a
+//!   supervisor with `term`, `kill`, `restart`, a process table and a report of every
+//!   process's output for a hang ([`procs`]). The farm runs no action: placed actions run
+//!   as js-agent jobs, not in this farm.
+//! - [`reapi`]: a client channel to a farm's frontend (the REAPI listener under the farm
+//!   CA), for the black-box test crates that write and read blobs through it.
 //!
-//! To run B0 by hand, with the binaries built (`cargo build -p kbf-cli -p kbf-harness -p kbf-integration-test
-//! --bins`), and a pinned `buck2` (the beta workflow
-//! fetches it by checksum):
-//!
-//! ```text
-//! kbf-beta b0 --bin-dir target/debug --buck2 <buck2> --project crates/kbf-integration-test/beta/buck2 \
-//!     --work <a directory that does not exist yet> --duration-secs 60 --concurrency 2
-//! ```
-//!
-//! writes `<work>/beta-result.json` and the logs in `<work>/logs`, and exits 0 only if every
-//! gate passed. `--fault` makes the farm worse in one way each gate exists to catch.
-//!
-//! The library spawns the binaries it is given by path and links neither `kbf-server`
-//! nor `kbf-node` today (tests/layering.rs fails a crate outside its joiners that links
-//! both): `kbf` is a process here, not a dependency.
+//! The library spawns the binaries it is given by path and links no `kbf-server` code:
+//! `kbf` is a process here, not a dependency.
 
 #![cfg(target_os = "linux")]
 
 pub mod api;
-pub mod b0;
-pub mod cli;
-pub mod eventlog;
 pub mod farm;
-pub mod gates;
-pub mod interrupt;
-pub mod load;
 pub mod node_support;
 pub mod pki;
 pub mod ports;
 pub mod procs;
-pub mod reap;
 pub mod reapi;
-pub mod result;
-pub mod scrape;
 pub mod stand_in;
 pub mod topology;
 pub mod units;

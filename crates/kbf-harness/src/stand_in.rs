@@ -1,14 +1,10 @@
-//! The stand-in `buck2` of the tests of scenario B0, which is a binary of this
-//! package (`kbf-harness-fake-buck2`). A test of another package
-//! (kbf-cli's, which has the `kbf` binary B0 needs) cannot name it with
-//! `CARGO_BIN_EXE_*`, which only the package that owns a binary may; it finds it beside
-//! its own test binary, where `cargo test --workspace` (and `cargo build -p kbf-harness
-//! --bins`) puts it. It is not a binary of `kbf-cli`, so it is not built into a release.
+//! Finding the binaries a test of another package needs beside its own test binary. A test
+//! of another package (kbf-cli's, which has the `kbf` binary) cannot name a binary of this
+//! package with `CARGO_BIN_EXE_*`, which only the package that owns a binary may; it finds
+//! it beside its own test binary, where `cargo test --workspace` (and `cargo build -p
+//! kbf-harness --bins`) puts it.
 
 use std::path::{Path, PathBuf};
-
-/// The stand-in `buck2`.
-pub const FAKE_BUCK2: &str = "kbf-harness-fake-buck2";
 
 /// The binary `name` built in the same profile as the running test binary.
 ///

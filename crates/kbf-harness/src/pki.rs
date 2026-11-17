@@ -40,7 +40,7 @@ impl Pki {
         std::fs::write(etc.join("ca.pem"), self.ca.pem()).expect("write the CA");
     }
 
-    /// The certificate of `row` for `names` (a daemon's: its one name, the node id), as
+    /// The certificate of `row` for `names`, as
     /// `<stem>.pem` and `<stem>.key` in `etc`. Panics if `verify-cert` would fail it.
     pub(crate) fn issue(&self, etc: &Path, stem: &str, row: Row, names: &[&str]) {
         let mut leaf = CertificateParams::new(Vec::<String>::new()).expect("params");
@@ -52,12 +52,11 @@ impl Pki {
         ));
         self.sign(etc, stem, leaf, row.ekus());
         let read = |name: &str| std::fs::read(etc.join(name)).expect("read");
-        let node_id = (row == Row::Daemon).then(|| names[0]);
         let failures = verify(
             self.ca.pem().as_bytes(),
             &read(&format!("{stem}.pem")),
             row,
-            node_id,
+            None,
             SystemTime::now(),
         )
         .expect("verify-cert checks it");
