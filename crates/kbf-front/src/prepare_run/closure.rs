@@ -494,11 +494,13 @@ async fn read_level(
     level: Vec<Digest>,
 ) -> Result<Vec<(Digest, Parsed)>, ClosureError> {
     // The empty Directory is never cached: it is left to `directory`, as without a cache.
-    let held: Vec<Option<KeptDirectory>> = stream::iter(&level)
+    // Owned digests: a closure over a borrowed one makes the future's `Send` unprovable where
+    // it is boxed (`kbf_server`'s `RunPrepare`, an `async_trait`).
+    let held: Vec<Option<KeptDirectory>> = stream::iter(level.clone())
         .map(|digest| async move {
-            match is_empty_blob(digest) {
+            match is_empty_blob(&digest) {
                 true => None,
-                false => remembered(cache, digest).await,
+                false => remembered(cache, &digest).await,
             }
         })
         .buffered(DIRECTORIES_IN_FLIGHT)
