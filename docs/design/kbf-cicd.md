@@ -668,7 +668,7 @@ the concurrency of the pipeline (never cancelled) and the absence of a write in 
 ### 8.1 Prod: publish
 
 Prod is `release.yml`, extended. **[F]** today: started by the success of a `pipeline` run for a push to `main` (section 8.0);
-the `verify` job checks the sums and every attestation of that run's files (the per-file `gh attestation` checks run in parallel); the `publish` job, the only one with `contents: write`, attaches the
+the `verify` job checks the sums and every attestation of that run's files (the per-file `gh attestation` checks run in parallel, and a refused file is checked once more, alone, after them); the `publish` job, the only one with `contents: write`, attaches the
 already-built files and is idempotent, in the `release` environment. The tag check
 and the notes (items 1 to 3) are built. There is no hand-started dry run: a failed job is re-run from the run's page.
 

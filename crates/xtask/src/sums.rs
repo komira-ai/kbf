@@ -387,6 +387,17 @@ impl Attestations<'_> {
     /// Whether `gh attestation verify` accepts `file` as signed by `signer`, with
     /// `--predicate-type` `predicate` when given. An error when gh cannot be run.
     fn verifies(&self, file: &Path, signer: &str, predicate: Option<&str>) -> Result<bool, Error> {
+        self.verify_run(file, signer, predicate)
+            .map(|(verified, _)| verified)
+    }
+
+    /// `verifies`, and what `gh` printed on stderr.
+    fn verify_run(
+        &self,
+        file: &Path,
+        signer: &str,
+        predicate: Option<&str>,
+    ) -> Result<(bool, String), Error> {
         let mut gh = Command::new(self.gh);
         gh.args(["attestation", "verify"])
             .arg(file)
@@ -402,18 +413,23 @@ impl Attestations<'_> {
         let out = gh
             .output()
             .map_err(Error::spawn(self.gh.display().to_string()))?;
-        Ok(out.status.success())
+        let said = String::from_utf8_lossy(&out.stderr).trim_end().to_owned();
+        Ok((out.status.success(), said))
     }
 
-    /// `verifies`, as a requirement: the error names the file and the signer.
+    /// `verifies`, as a requirement: the error names the file and the signer, and holds
+    /// the tail of what `gh` said (a refusal and a failed call exit alike, so the reason
+    /// is only there).
     fn require(&self, file: &Path, signer: &str, predicate: Option<&str>) -> Result<(), Error> {
-        if self.verifies(file, signer, predicate)? {
+        let (verified, said) = self.verify_run(file, signer, predicate)?;
+        if verified {
             return Ok(());
         }
         let what = predicate.unwrap_or("build provenance");
         Err(Error::Failed(format!(
-            "{}: no {what} attestation signed by {signer} verifies",
-            file.display()
+            "{}: no {what} attestation signed by {signer} verifies; gh said: {}",
+            file.display(),
+            tail(&said)
         )))
     }
 
@@ -484,11 +500,10 @@ impl Attestations<'_> {
         if verified {
             return Ok(());
         }
-        let start = said.char_indices().rev().nth(999).unwrap_or((0, ' ')).0;
-        let tail = &said[start..];
         Err(Error::Failed(format!(
-            "{}: its bundle {bundle_name} does not verify: {tail}",
-            file.display()
+            "{}: its bundle {bundle_name} does not verify: {}",
+            file.display(),
+            tail(&said)
         )))
     }
 
@@ -574,6 +589,12 @@ impl Attestations<'_> {
     }
 }
 
+/// The end of what `gh` said, at most 1000 characters: the reason is last.
+fn tail(said: &str) -> &str {
+    let start = said.char_indices().rev().nth(999).map_or(0, |(at, _)| at);
+    &said[start..]
+}
+
 /// The most threads `check_lines` runs at once. Each check is a `gh attestation verify`
 /// round trip to GitHub, so the lines are checked a few at a time rather than one after
 /// the other, without hammering the API.
@@ -582,8 +603,12 @@ const VERIFY_WORKERS: usize = 8;
 /// The checks of every line of the sums: the lines to print, in the order of the sums. The
 /// first line is checked alone, so its `gh` fetches and caches the trusted metadata the
 /// others then read (concurrent first calls would race to write it); the rest run on at
-/// most `VERIFY_WORKERS` threads. A failure is the error of the first failing line in sums
-/// order, whichever check finished first.
+/// most `VERIFY_WORKERS` threads. Then every line that failed is checked once more, alone,
+/// one after another in sums order, after the pool has finished: a `gh attestation verify`
+/// among several at once was refused once on main for a file whose attestation was there
+/// (the cause is not known), where checks made one at a time had passed. A line that fails
+/// again is the error, which holds what `gh` said, so it is the first failing line in
+/// sums order, whichever check finished first; a file nobody attested is refused twice.
 fn check_lines(
     dir: &Path,
     lines: &[Line],
@@ -591,15 +616,18 @@ fn check_lines(
     workflow: &str,
 ) -> Result<Vec<String>, Error> {
     let (first, rest) = lines.split_at(lines.len().min(1));
-    let mut printed = first
+    let mut checked: Vec<Result<String, Error>> = first
         .iter()
         .map(|l| check_line(dir, lines, l, a, workflow))
-        .collect::<Result<Vec<String>, Error>>()?;
-    let others = in_order(rest.len(), VERIFY_WORKERS, |at| {
+        .collect();
+    checked.extend(in_order(rest.len(), VERIFY_WORKERS, |at| {
         check_line(dir, lines, &rest[at], a, workflow)
-    });
-    printed.extend(others.into_iter().collect::<Result<Vec<String>, Error>>()?);
-    Ok(printed)
+    }));
+    lines
+        .iter()
+        .zip(checked)
+        .map(|(l, result)| result.or_else(|_| check_line(dir, lines, l, a, workflow)))
+        .collect()
 }
 
 /// `f(0)` to `f(count - 1)` on at most `workers` threads: the results in that order,

@@ -245,13 +245,7 @@ fn a_missing_attestation_fails_the_run_and_names_it() {
         r.attest(Some((name.as_str(), is_sbom)));
         let (code, _, err) = r.verify(WORKFLOW, None);
         assert_eq!(code, Some(1), "{name} {what}");
-        assert_eq!(
-            err,
-            format!(
-                "xtask: {}: no {what} attestation signed by {WORKFLOW} verifies\n",
-                s(&r.dist.join(name))
-            )
-        );
+        assert_eq!(err, refused(s(&r.dist.join(name)), what));
     }
 }
 
@@ -378,11 +372,7 @@ fn version_facts_are_verified_for_build_provenance_and_nothing_else() {
     r.attest(Some((facts.as_str(), false)));
     let (code, _, err) = r.verify(WORKFLOW, None);
     assert_eq!(code, Some(1), "{err}");
-    let want = format!(
-        "xtask: {path}: no build provenance attestation signed by \
-         {WORKFLOW} verifies\n"
-    );
-    assert_eq!(err, want);
+    assert_eq!(err, refused(&path, "build provenance"));
 }
 
 #[test]
@@ -508,12 +498,7 @@ fn the_task_image_is_verified_with_an_sbom_attestation_and_its_sbom_with_provena
     r.attest(Some((image.as_str(), true)));
     let (code, _, err) = r.verify(WORKFLOW, None);
     assert_eq!(code, Some(1), "{err}");
-    assert_eq!(
-        err,
-        format!(
-            "xtask: {path}: no https://cyclonedx.org/bom attestation signed by {WORKFLOW} verifies\n"
-        )
-    );
+    assert_eq!(err, refused(&path, "https://cyclonedx.org/bom"));
     // The SBOM file's own provenance lost: refused as any file's.
     r.attest(Some((sbom.as_str(), false)));
     let (code, _, err) = r.verify(WORKFLOW, None);
@@ -564,11 +549,7 @@ fn the_facts_of_the_task_image_are_verified_for_build_provenance_and_nothing_els
     r.attest(Some((facts.as_str(), false)));
     let (code, _, err) = r.verify(WORKFLOW, None);
     assert_eq!(code, Some(1), "{err}");
-    let want = format!(
-        "xtask: {path}: no build provenance attestation signed by \
-         {WORKFLOW} verifies\n"
-    );
-    assert_eq!(err, want);
+    assert_eq!(err, refused(&path, "build provenance"));
 }
 
 #[test]
@@ -598,10 +579,7 @@ fn the_base_tree_bundle_is_verified_for_build_provenance_and_nothing_else() {
     r.attest(Some((bundle.as_str(), false)));
     let (code, _, err) = r.verify(WORKFLOW, None);
     assert_eq!(code, Some(1), "{err}");
-    assert_eq!(
-        err,
-        format!("xtask: {path}: no build provenance attestation signed by {WORKFLOW} verifies\n")
-    );
+    assert_eq!(err, refused(&path, "build provenance"));
 
     let r = Release::build_with("base-tree-odd-name", &[("linux-x86_64", names)]);
     let odd = "kbf-base-tree-notacommit-linux-x86_64.tree.tar";
