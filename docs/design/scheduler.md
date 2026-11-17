@@ -1,10 +1,12 @@
 # Scheduler
 
+> **kbf-daemon is deleted.** Where this page says a daemon holds a lease, it describes the deleted `kbf-daemon`. Placed actions run only as js-agent jobs of the job service; the frontend registers virtual workers with its farm for them (`crates/kbf-server/src/executor/host.rs`).
+
 The scheduler decides which worker runs which action, and makes sure that however
 workers, networks and leaders fail, each operation is answered exactly once. This
 document covers the scheduler core (`kbf-sched`), how `kbf-server` carries it out
 (`kbf-server/src/farm.rs`), and what is **planned**. Lease handling on the daemon side
-is in [daemon.md](daemon.md); the messages are in [worker-protocol.md](worker-protocol.md).
+is in `daemon.md`, deleted with kbf-daemon; the messages are in [worker-protocol.md](worker-protocol.md).
 
 ## Shape: a pure state machine
 
@@ -208,7 +210,7 @@ was killed fences nothing. For its runs, each run's keeper (a process that ends 
 when the daemon dies) is the guarantee whether or not a daemon is started again, and the
 restarted daemon's sweep is the second line, when a daemon is started again on the same
 node with the same scratch directory. What neither reaches is listed in
-[daemon.md](daemon.md#when-the-daemon-is-killed).
+`daemon.md`, deleted with kbf-daemon.
 
 ### A daemon moving between frontends
 
@@ -445,7 +447,7 @@ registration's included, before any placement round:
   (`Scheduler::not_held`).
 - `quarantined <why>`: a cleanup failed. The worker takes no lease.
 - `memory_pressure`: the daemon holds a lease and its node's memory stall time is above
-  `--memory-pressure-pause-percent` (default 10; [daemon.md](daemon.md#cgroups-and-limits),
+  `--memory-pressure-pause-percent` (default 10; `daemon.md`, deleted with kbf-daemon,
   "The memory backstop"). The worker takes no new lease until the daemon says
   `serving` again, and keeps the ones it runs. It is no fault of the node's, and
   counts as none.

@@ -1,31 +1,26 @@
-# Storage nodes: the server-only and converged profiles
+# Storage nodes
 
-How to run `kbf-server` on a storage host: the systemd units, the priorities between
-the processes that share the host, and, on a host that also runs builds, how much
-memory builds may use. Where servers run and why is in
-[deployment-topology.md](../design/deployment-topology.md); a host that runs builds
-only is [linux-build-host.md](linux-build-host.md).
+How to run `kbf-server` on a storage host: the systemd units and the priorities between
+the processes that share the host. Where servers run and why is in
+[deployment-topology.md](../design/deployment-topology.md). A storage host runs no builds:
+placed actions run as jobs of the job service ([kbf-modes.md](kbf-modes.md)).
 
-## Profiles
+## Profile
 
-| Profile | Runs | Units on this page |
-|---|---|---|
-| server-only | a node of the object store (MinIO here) and `kbf-server` | [server-only units](#server-only-units) |
-| converged | the same, and a `kbf-daemon` with the container driver ([converged topology](../design/deployment-topology.md#converged-topology)) | the server-only units, with the slice and daemon of the [converged units](#converged-units) |
-| build-only | a `kbf-daemon` only | [linux-build-host.md](linux-build-host.md) |
+| Runs | Units on this page |
+|---|---|
+| a node of the object store (MinIO here) and `kbf-server` | [server-only units](#server-only-units) |
 
 ## Where the bytes live: storage glossary
 
-Five places hold what a farm keeps, and each has one flag or one directory. The server
-takes two store URIs and, sometimes, a directory; the daemon takes one directory.
+Three places hold what a farm keeps, and each has one flag or one directory. The server
+takes two store URIs and, sometimes, a directory.
 
 | Term | What it is | Set by |
 |---|---|---|
 | **Object store** (the cold store) | The durable home of every blob: an S3 bucket (MinIO, RustFS) or a directory on a disk. A `file://` directory deletes its least recently used objects when its disk is short of room ([Eviction under disk pressure](../design/storage.md#eviction-under-disk-pressure)), and the start-up pass deletes orphan files; an `s3://` store is never evicted from. | `kbf-server --cold-store` |
 | **Write tier** (the hot store) | A fast local disk in front of the object store. Uploads land there first and are flushed to the object store in the background; reads are served from it while a blob is still there. Optional: without one, uploads go straight to the object store. | `kbf-server --hot-store` |
 | **Metadata log** | The index of what the object store holds (digest to segment object and offset) and the action cache: a single-voter Raft log on a local disk. Lose it and the blobs are unreachable. | in the hot store's directory (`<hot>/meta`), else `kbf-server --meta-dir` |
-| **Input cache** | The daemon's per-node cache of input files, from which each lease's inputs are linked. Evicts least recently used past its budget. | `kbf-daemon --data-dir` (`cache/`) |
-| **Input trees** | The daemon's shared read-only trees: a large directory of inputs built once and mounted read-only into every action that has it. | `kbf-daemon --data-dir` (`trees/`) |
 
 The object store and the write tier are not exclusive: the write tier is a fast cache
 of recent writes in front of the object store, which is cold and durable. A farm that
@@ -53,63 +48,29 @@ A store URI is `file:///absolute/path` or `s3://bucket/prefix?endpoint=http://ho
 Sizes are not flags. The hot store's budget is 80% of its filesystem's free space after
 it keeps 5% of the filesystem free (at least 1 GiB, and never more than half of what is
 free), lowered by `--hot-store-max-bytes`; at the budget,
-uploads take the direct path to the object store. The daemon's budgets are in
-[the data directory](#the-daemons-data-directory).
+uploads take the direct path to the object store.
 
 ## Priorities
 
-When the host runs short, the object store goes last, then `kbf-server`, then the
-daemon; builds go first. The object store holds every blob and the server holds the
-farm's state, so losing either stops every build, while a build that is killed runs
-again. Each unit says so in four settings:
+When the host runs short, the object store goes last, then `kbf-server`. The object store
+holds every blob and the server holds the farm's state, so losing either stops every build.
+Each unit says so in four settings:
 
 | Unit | `OOMScoreAdjust=` | `MemoryMin=` | `CPUWeight=` | `MemorySwapMax=` |
 |---|---|---|---|---|
 | MinIO | -950 | 32G | 400 | 0 |
 | `kbf-server` | -925 | 16G | 300 | 0 |
-| `kbf-daemon` | -900 | 256M | 200 | not set |
-| build containers | 0 (the driver's `--oom-score-adj=0`) | none | each lease's `cpu.weight`, inside the daemon's | not set |
 
 - **`OOMScoreAdjust=`**: under a host-wide OOM the kernel kills the process with the
   highest score, so the lowest adjustment goes to what must survive longest.
 - **`MemoryMin=`**: memory the kernel does not reclaim from the unit while it uses no
-  more. The kernel caps it at what the unit's slice protects, so all three units sit
-  in `kbf.slice`, whose `MemoryMin=` is the sum of theirs (see
-  [linux-build-host.md](linux-build-host.md#memory-on-the-host) for why it is equal,
-  not more). The figures are this page's example; size MinIO's and the server's to
-  what they use at their peak on your host.
+  more. The kernel caps it at what the unit's slice protects, so both units sit
+  in `kbf.slice`, whose `MemoryMin=` is the sum of theirs. The figures are this page's
+  example; size MinIO's and the server's to what they use at their peak on your host.
 - **`CPUWeight=`**: how CPU is shared between the units of `kbf.slice` when it is
-  contended. Nothing is capped: CPU a unit leaves idle goes to the others, builds
-  included.
-- **`MemorySwapMax=0`**: the object store's and the server's pages stay in RAM. A
-  converged host has a large swapfile for builds; a server answering from swap would
-  slow every build at once.
-
-## Memory on a converged host
-
-On a converged host, builds get what is left after the object store, the server and
-the OS:
-
-```text
---actions-memory-max-gib = RAM - (MinIO's reservation + kbf-server's reservation + 4 to 8 GiB for the OS)
-```
-
-The 4 to 8 GiB is the same headroom as on a build host
-([linux-build-host.md](linux-build-host.md#headroom---actions-memory-max-gib)): the
-kernel, systemd, sshd, the daemon itself and the containers' runtime processes. A reservation is what
-the process uses at its peak, and the same figure as its `MemoryMin=` above. The daemon
-writes the result to `actions/memory.max` and reports the lower of it and the host's
-memory as `mem_gib`, so the scheduler books no more than builds may use.
-
-### Worked example: a 256 GiB host
-
-| Part | GiB |
-|---|---|
-| RAM | 256 |
-| minus MinIO's reservation | 32 |
-| minus `kbf-server`'s reservation | 16 |
-| minus the OS, systemd, sshd, the daemon and the containers' runtime | 8 |
-| `--actions-memory-max-gib` | 200 |
+  contended. Nothing is capped: CPU a unit leaves idle goes to the others.
+- **`MemorySwapMax=0`**: the object store's and the server's pages stay in RAM; a server
+  answering from swap would slow every call at once.
 
 ## Server-only units
 
@@ -147,7 +108,7 @@ Wants=network-online.target
 After=network-online.target minio.service
 
 [Service]
-# Not the daemon's user: builds must not read the operator API token.
+# Its own user: no other service may read the operator API token.
 User=kbf-server
 Slice=kbf.slice
 MemoryMin=16G
@@ -187,9 +148,8 @@ What each group of flags does:
 - **The stores.** `--cold-store` is the bucket on the host's own MinIO node; blob bytes
   go there under `kbf/<log id>/`. `--meta-dir` is the metadata log, which keeps the
   index across a restart: a build after the restart gets the cache hits it got before.
-  Put it on a partition of its own, not shared with the daemon's data directory, swap or
-  the object store's data, so a full build disk cannot stop the log
-  ([converged topology](../design/deployment-topology.md#converged-topology)). A fast
+  Put it on a partition of its own, not shared with swap or the object store's data, so a
+  full disk elsewhere cannot stop the log. A fast
   local disk for uploads is `--hot-store=file:///path`; the log then lives in its
   `meta/` directory unless `--meta-dir` says otherwise.
 - **The REAPI listener** serves TLS with a certificate from the farm's internal CA, for
@@ -198,11 +158,10 @@ What each group of flags does:
   flags. Without `--reapi-auth-policy` every call is accepted ([reapi-auth.md](../reapi-auth.md)).
   The proxy health-checks the server with `grpc.health.v1` on this listener
   ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)).
-- **The worker listener** serves daemons over mutual TLS: their certificates must
+- **The worker listener** serves storage nodes over mutual TLS: their certificates must
   chain to `--worker-client-ca`, and the deny list is read again at every check: a
-  daemon's `Hello`, `Heartbeat` and other calls, and a storage node's `Register` and
-  `Heartbeat`, so a deny list that cannot be read refuses the storage nodes too
-  ([worker-protocol.md](../design/worker-protocol.md)).
+  storage node's `Register` and `Heartbeat`, so a deny list that cannot be read refuses
+  the storage nodes ([worker-protocol.md](../design/worker-protocol.md)).
 - **The operator API** (`/v1`, `/healthz`, `/readyz`) answers reads to whoever reaches
   it, so it is bound to loopback; writes need the token in `--api-token-file`, owned
   by `kbf-server` with mode 0600 or 0400 ([api.md](../api.md)).
@@ -214,64 +173,6 @@ sudo systemctl daemon-reload
 sudo systemctl restart minio.service
 sudo systemctl enable --now kbf-server.service
 ```
-
-## Converged units
-
-A converged host runs the server-only units above with this slice in place of theirs,
-and a daemon set up as on a build host
-([linux-build-host.md](linux-build-host.md): `crun` and `uidmap`, the `kbf` user, swap),
-in the same slice, with this unit.
-
-`/etc/systemd/system/kbf.slice`:
-
-```ini
-[Unit]
-Description=kbf build farm
-
-[Slice]
-# The sum of its units' MemoryMin=: MinIO 32G + kbf-server 16G + kbf-daemon 256M.
-MemoryMin=49408M
-```
-
-`/etc/systemd/system/kbf-daemon.service`:
-
-```ini
-[Unit]
-Description=kbf build farm node daemon
-Wants=network-online.target
-After=network-online.target kbf-server.service
-
-[Service]
-User=kbf
-Slice=kbf.slice
-Delegate=yes
-# Equal to --supervisor-memory-min-mib.
-MemoryMin=256M
-OOMScoreAdjust=-900
-CPUWeight=200
-Environment=XDG_RUNTIME_DIR=/run/user/<kbf uid>
-ExecStart=/usr/local/bin/kbf-daemon \
-    --driver=container \
-    --oci-runtime=/usr/bin/crun \
-    --server=https://<storage host name>:8981 \
-    --cas=https://<storage host name>:8981 \
-    --ca-cert=/etc/kbf/ca.pem \
-    --cert=/etc/kbf/node.pem \
-    --key=/etc/kbf/node.key \
-    --node-id=<node id> \
-    --data-dir=/var/lib/kbf \
-    --actions-memory-max-gib=200 \
-    --supervisor-memory-min-mib=256
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`--actions-memory-max-gib` is the [worked example](#worked-example-a-256-gib-host)'s
-result; on another host, compute it from that host's RAM. The daemon's other settings
-and what it logs at start are as on a build host
-([linux-build-host.md](linux-build-host.md#the-units)).
 
 ## One host without MinIO: a `file://` cold store
 
@@ -372,7 +273,7 @@ kbf-server \
   is not, the hit is a miss (the action runs again) and its blobs are reported
   missing.
 - Eviction under disk pressure: the floor is 5% of the file system and at least
-  1 GiB (the rule the daemon's cache keeps; not a flag). A write that would leave less
+  1 GiB (not a flag). A write that would leave less
   free is refused (its upload answered `UNAVAILABLE`; the server's PUT retries
   twice) and wakes the evictor, which also looks every 10 seconds once the start-up
   pass is done. While less than twice the floor is free, it takes the least recently
@@ -457,7 +358,7 @@ only unless its unit is given the flag.
 
 `kbf-server` keeps its metadata in the Raft log on local disk (`--meta-dir`, or
 `<hot store>/meta`; [deployment-topology.md](../design/deployment-topology.md#built-and-planned)).
-Until the scheduler's state is in the log too, a restart keeps the daemons' epoch but not
+Until the scheduler's state is in the log too, a restart keeps the epoch but not
 the server's leases, so the old runs go on as orphans whose results are refused. The
 unit gains this flag once the scheduler's state is built:
 
@@ -467,54 +368,25 @@ unit gains this flag once the scheduler's state is built:
 
 - `--meta-dir` (or `<hot store>/meta`): the server's state applied from a single-voter
   Raft log kept in the directory. Mount that directory on a partition of its own, not
-  shared with build scratch, swap or the object store's data, so a full build disk
-  cannot stop the log
-  ([converged topology](../design/deployment-topology.md#converged-topology)). The
+  shared with swap or the object store's data, so a full disk elsewhere
+  cannot stop the log. The
   server holds an exclusive lock on `log.lock` in the directory while it runs, so a
   second server started on the same directory is refused rather than writing the log.
 - `--runtime-dir`: where the log's store records that a write to disk failed, so it
   does not reopen the log until the host reboots. `/run` is a tmpfs, cleared at reboot
   as the page cache is.
 
-## The daemon's data directory
-
-`kbf-daemon` keeps everything it writes under one directory, `--data-dir` (default
-`/var/lib/kbf`), made if missing:
-
-| Path | Holds | Mode |
-|---|---|---|
-| `<data-dir>/leases` | lease directories (every real driver) | 0700; 0711 under the container driver |
-| `<data-dir>/cache` | the input cache (container driver) | 0700 |
-| `<data-dir>/trees` | the shared input trees (container driver, Linux) | 0711 |
-
-The data directory itself is 0755: a rootless container's root is a subordinate id, an
-"other" to the daemon's directories, and must search down to a tree. The three share one
-filesystem, which the cache and the trees need to link files instead of copying them.
-
-The cache and the trees are on by default under the container driver and sized from the
-filesystem, not by flags: with a floor of 5% of the filesystem (at least 1 GiB) kept free
-for everything else, the cache may keep half and the trees a quarter of the rest, and
-the cache evicts entries no running lease links to keep the floor free.
-`--data-max-bytes` only lowers the size they are budgeted from. The native driver never
-makes `cache/` or `trees/`: its actions run as the daemon's user, who owns them and
-could write them. A cache another daemon owns, or one that cannot be used, is left alone:
-the daemon warns (`cache: off:<reason>`) and runs uncached.
-
-At start the daemon logs the data directory, the leases directory, and the cache and
-tree budgets it resolved; the server logs its cold store, hot store (with its budget) and
-metadata directory.
-
 ## A mode's units
 
 Each mode of the one `kbf` binary has a packaged unit, installed by the `kbf` package (which runs `/usr/bin/kbf`) and
 configured by `/etc/kbf/kbf.toml`; they are described, with the rules they are held to, in
 [kbf-units.md](kbf-units.md). `kbf-deploy linux render-units`, `check-units` and
-`install-units` (and the converged form of them, with `--restart-minio` and `--uninstall`)
+`install-units`
 are gone; the units above remain the hand-written example of that layout. A node that still
-runs `kbf-server.service` and `kbf-daemon.service` stops and disables them (`systemctl
+runs `kbf-server.service` stops and disables it (`systemctl
 disable --now`) before it installs a mode's unit: both would hold the same directories.
 
-## The build swapfile
+## The swapfile
 
 `kbf-deploy linux swap`, as root, reads the host first, prints its plan as `DRY-RUN:`
 lines and changes nothing; `--apply` carries the plan out, stopping at the first step
@@ -548,8 +420,7 @@ design, the rules it keeps and the crash tests are
 farm, or on none: a node with 0 still holds the blob its peer asks it to (it writes it to
 disk before it answers), and the farm then acknowledges from RAM on one side only.
 
-What the flags mean, per storage node (`kbf storage`, and the storage half of
-`kbf storage-and-daemon`; `kbf all-in-one` refuses them):
+What the flags mean, per storage node (`kbf --mode=storage`):
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -563,7 +434,7 @@ What is not acknowledged from RAM, and is counted in
 4 MiB (`large`), a blob with one owner (`single_owner`), a replica that cannot be reached
 (`replica_lost`, with its repair debt journaled first), a full budget (`budget`), a full
 write-pool queue (`queue_full`) and a blob that goes straight to the object store
-(`store_path`). A `Segments` upload from a daemon is always acknowledged from the disk.
+(`store_path`).
 
 The loss window: a blob acknowledged from RAM is lost if **both** owners lose their RAM
 before either has written it (both processes killed, or both hosts losing power, inside
@@ -610,11 +481,10 @@ kbf-deploy linux meta-verify --archive FILE --into DIR
   A stop that passes `--ram-drain-deadline` loses the blobs that were acknowledged but are
   held only in RAM (the stop logs them at error level, with their count and bytes); that is
   why `meta-backup` refuses while any are held.
-  `kbf-server` and `kbf-all-in-one` do not flush their write tier at shutdown (the latter
-  refuses `--ram-drain-deadline`), so a block left on the hot store holds acknowledged
-  bytes the object store does not have. (`kbf storage` and
-  `kbf storage-and-daemon` do: after their calls end and the blobs held in RAM are
-  written, they flush the staged blocks to the cold store, within the same
+  `kbf-server` does not flush its write tier at shutdown, so a block left on the hot store holds acknowledged
+  bytes the object store does not have. (`kbf --mode=storage`
+  does: after its calls end and the blobs held in RAM are
+  written, it flushes the staged blocks to the cold store, within the same
   `--ram-drain-deadline`; what the deadline leaves is logged at error level with its
   block count and bytes, stays on the hot store, and is flushed by the next start.) A
   server with a write tier needs `--hot-dir` (its `--hot-store` directory); one without
@@ -671,11 +541,8 @@ backup.
 
 - `crates/kbf-integration-test/tests/deploy_units.rs` runs `kbf-server`'s flag parser over the
   `ExecStart=` of every server unit in `docs/deploy/`, checks that the planned flag
-  above is still refused, that the worked example adds up and matches the converged
-  daemon unit's `--actions-memory-max-gib`, and that the units keep the
-  [priority](#priorities) order.
-- `kbf-node`'s tests (`src/deploy_doc_tests.rs`) run `kbf-daemon`'s flag parser over
-  every daemon unit in `docs/deploy/`.
+  above is still refused, that the slice's `MemoryMin=` is the sum of its units', and that
+  the units keep the [priority](#priorities) order.
 - `kbf-deploy`'s tests (`src/linux/config_tests.rs`) refuse each bad swap setting and check
   that an unset key takes the default `swap.example` shows. The units' rules are tested as
   [kbf-units.md](kbf-units.md) says; the swap verb's tests

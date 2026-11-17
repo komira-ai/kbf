@@ -10,7 +10,7 @@ hands the node over with kbf's update hook, `kbf package-hook`.
 What this page does not cover:
 
 - **The frontend.** It is deployed as a container, not by this path.
-- **Macs.** No macOS package is published to a channel; a Mac keeps the path it has.
+- **Macs.** No macOS package is published to a channel; a Mac runs no `kbf` and takes no part in this path.
 - **MinIO.** The object store is not part of the `kbf` package. It stays as its own installation put it.
 - **kbf-updater.** The agent, the root helper and the coordinator stay in this repository, and `rehearse`
   and `rehearse-agent` still rehearse them, but nothing in a release run talks to a coordinator any more.
@@ -58,12 +58,12 @@ saying so, and, only when `KBF_SETS_DESIRED` is `true`, runs the remote-only Buc
 hostkeeper runs `/usr/bin/kbf package-hook <step> [<staged release>] --params <file>` as root, from the
 copy of the program in the package it staged, with the steps of hostkeeper's hook contract (its
 `crates/hostkeeper-hook`; kbf's copy of the contract is [crates/update-hook](../../crates/update-hook)).
-The hook's params are `unit` (`kbf-storage-and-daemon.service`), `mode` (`storage-and-daemon`) and
+The hook's params are `unit` (`kbf-storage.service`), `mode` (`storage`) and
 `state_dir` (`/var/lib/kbf-package-hook`, where it keeps its record and its lock).
 
 | step | what it does |
 |---|---|
-| `prepare` | runs the staged `kbf --mode=<mode> --check` against the node's `/etc/kbf/kbf.toml`: a release that refuses the node's configuration (exit 2) fails here, with nothing changed; then stops the unit. kbf drains on SIGTERM and the unit's `TimeoutStopSec=infinity` lets every lease and write in flight finish, however long that takes: `prepare` is the one step hostkeeper lets run without a bound, and the manifest gives it none |
+| `prepare` | runs the staged `kbf --mode=<mode> --check` against the node's `/etc/kbf/kbf.toml`: a release that refuses the node's configuration (exit 2) fails here, with nothing changed; then stops the unit. kbf drains on SIGTERM and the unit's `TimeoutStopSec=infinity` lets every write in flight finish, however long that takes: `prepare` is the one step hostkeeper lets run without a bound, and the manifest gives it none |
 | (hostkeeper) | `apt-get install kbf=<version>` while the unit is stopped |
 | `cutover` | starts the unit |
 | `verify` | passes when the unit is active and the installed `kbf` is the version set; while the unit is still starting it defers |

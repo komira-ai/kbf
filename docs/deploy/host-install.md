@@ -13,7 +13,6 @@ the same run as every other asset ([../artifacts.md](../artifacts.md)):
 |---|---|
 | Linux, x86_64 | `kbf-host-install-<commit>-linux-x86_64.tar.gz` |
 | Linux, arm64 | `kbf-host-install-<commit>-linux-arm64.tar.gz` |
-| macOS, Apple silicon | `kbf-host-install-<commit>-darwin-arm64.tar.gz` (ad hoc signed with the hardened runtime) |
 
 No package ships it: neither the `kbf` nor the `kbf-installer` deb installs it, so a Linux
 host gets it from the tarball too. (The `kbf` deb ships the units that run it and the agent,
@@ -21,9 +20,8 @@ host gets it from the tarball too. (The `kbf` deb ships the units that run it an
 [../../packaging/host-agent/README.md](../../packaging/host-agent/README.md), "A host that runs
 the package".) Each tarball holds one member, `kbf-host-install`. Its
 `<commit>` is the commit of the release the host is on or going to. The updater,
-`kbf-updater`, is the same kind of asset for the operator's Linux box and for a Mac's host agent
-(`kbf-updater-<commit>-linux-<arch>.tar.gz` and `kbf-updater-<commit>-darwin-arm64.tar.gz`, one
-member `kbf-updater`; the Mac one is ad hoc signed with the hardened runtime).
+`kbf-updater`, is the same kind of asset for the operator's Linux box
+(`kbf-updater-<commit>-linux-<arch>.tar.gz`, one member `kbf-updater`).
 
 Fetch the tarball with its bundle and check the bundle before the binary is placed anywhere
 (the flags are those of [../artifacts.md](../artifacts.md#provenance-bundles-verifying-a-tarball-offline)):
@@ -32,7 +30,7 @@ Fetch the tarball with its bundle and check the bundle before the binary is plac
 gh release download <tag> --repo komira-ai/kbf \
   --pattern 'kbf-host-install-<commit>-<platform>.tar.gz*' --pattern SHA256SUMS --dir dl
 gh attestation trusted-root > dl/trusted_root.jsonl
-cd dl && sha256sum --check --strict --ignore-missing SHA256SUMS      # shasum -a 256 -c on a Mac
+cd dl && sha256sum --check --strict --ignore-missing SHA256SUMS
 gh attestation verify kbf-host-install-<commit>-<platform>.tar.gz \
   --bundle kbf-host-install-<commit>-<platform>.tar.gz.sigstore.json \
   --custom-trusted-root trusted_root.jsonl --repo komira-ai/kbf \
@@ -43,10 +41,9 @@ gh attestation verify kbf-host-install-<commit>-<platform>.tar.gz \
 tar -xzf kbf-host-install-<commit>-<platform>.tar.gz kbf-host-install
 ```
 
-Place the binary at the path the key or the Mac section below names, as root, in directories
+Place the binary at the path the key names, as root, in directories
 only root can write. `kbf-host-install --version` prints `kbf-host-install <package version>`
-and does nothing else: it is the one argument the program takes outside the Mac's two
-internal ones, and what the release uses to check the signed Mac binary runs.
+and does nothing else.
 
 ## The key
 
@@ -165,8 +162,7 @@ environment of `PATH`, `LANG=C` and `DEBIAN_FRONTEND=noninteractive` alone.
 ## What a restart does
 
 A package install restarts no `kbf` unit, so a client that has installed a new version asks for
-the restart of the one frontend unit it rolls, after the install. Linux only: a Mac refuses
-the request as `bad_command` (it has no such unit).
+the restart of the one frontend unit it rolls, after the install.
 
 The process sshd starts does all of it, and holds the install lock (`flock` on
 `/run/kbf-host-install.lock`) from before the first command until it answers, so while it runs a
@@ -205,8 +201,7 @@ One JSON line on stdout.
 | failed | `{"result":"failed","reason":"<code>"}`, detail on stderr | 3 |
 
 Refusal codes: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
-`channel_unsigned`, `key_untrusted`, `channel_insecure`, and, on a Mac, for a channel whose source
-is GitHub, `unknown_release`, `ambiguous_release` and `fetch_failed`. Failure codes:
+`channel_unsigned`, `key_untrusted` and `channel_insecure`. Failure codes:
 `audit_unavailable`, `query_failed`, `installed_version_invalid`, `package_state_unclean`,
 `update_failed`, `install_failed`, `verify_failed`, `busy`, `lock_unavailable`, and for a restart
 `restart_failed` and `restart_timeout`.
@@ -217,7 +212,7 @@ Every line has a `result`: `installed`, `already_installed`, `restarted`, `query
 `installed_version` of a query is the version dpkg reports when `kbf` is cleanly installed,
 and null when it is not installed or dpkg flags an error on the package (the updater then
 installs, which repairs it). `running_commit` is the commit `kbf --version --json` of the
-installed binary reports, or null (it is the installed binary's, not the running process's: a daemon that was not restarted after an upgrade still runs the older one, which the Mac side avoids by reading the process); the binary is killed after 10 seconds, and a binary that
+installed binary reports, or null (it is the installed binary's, not the running process's: a unit that was not restarted after an upgrade still runs the older one); the binary is killed after 10 seconds, and a binary that
 fails, hangs or prints something else has none. `node_id` is the id of the node: `[node] id`
 of `/etc/kbf/kbf.toml`, else its `[identity] node-id`, else the short host name in lower case
 (the id an enrolling node takes when its configuration names none). It is null when the file
@@ -239,246 +234,15 @@ guess.
 Every invocation, refused ones included, appends one JSON line to
 `/var/log/kbf-host-install.log` (created root-owned, mode 0600, never through a symbolic
 link): the time, the verb (`install`, `restart` or `query`), the version, the channel, the
-outcome and the reason, and, on the line of a restart, the `unit`. On a Mac the
-apply job appends one more line when it ends: verb `apply`, the version, outcome `applied` or
-`failed`, and `result`, the status line (`done`, `failed:not_welcomed:rolled_back`, ...). A request
+outcome and the reason, and, on the line of a restart, the `unit`. A request
 that was not understood is recorded escaped and cut at 200 characters. An install or a restart
 is not started when the log cannot be opened.
 
-## On a Mac
+## Channels of the local socket
 
-A Mac takes the same `install kbf=<version> from <channel>` and `query` requests (a `restart`
-is refused as `bad_command`) and answers in the same shape, but it installs the attested release tarball
-`kbf-<commit>-darwin-arm64.tar.gz` (not a package), into the kit layout, and restarts the
-daemon's launchd job on it. The program is the same binary; the platform picks the Mac side.
-Nothing here is a Homebrew formula or a `kbf-installer` order.
-
-### The layout it works in
-
-```text
-/usr/local/kbf/releases/<commit>/kbf        the release (root:wheel, 0755), and beside it
-/usr/local/kbf/releases/<commit>/VERSION    the version text it was installed as
-/usr/local/kbf/current   -> releases/<commit>   relative links, moved by atomic rename
-/usr/local/kbf/previous  -> releases/<commit>
-/usr/local/kbf/etc/av2_mac.conf             NODE_ID=<id> (the node's id)
-/usr/local/kbf/log/kbf-daemon.err.log       where launchd writes the daemon's stderr
-/Library/LaunchDaemons/com.komira.kbf-daemon.plist    the daemon's job, run as _kbf
-```
-
-The error-log path is the `StandardErrorPath` of the kit's daemon plist.
-
-`<version>` is the version text of a build, `0.1.<seq>+g<12 hex digits>-<run>`. Its 12 digits
-pick the one tarball `kbf-<40 hex digits>-darwin-arm64.tar.gz` whose commit starts with them:
-among the file names of the channel's `dir`, or, when the channel pins its releases with
-`sums`, among the lines of its `SHA256SUMS`, or, for a channel whose source is GitHub, among the
-assets of the repository's releases. No tarball is an unknown release and two are ambiguous
-(`verify_failed`, with the reason on stderr; a channel on GitHub refuses with `unknown_release`
-and `ambiguous_release`). The version text is kept in `VERSION`,
-and `query` reports it as `installed_version`.
-
-### The files, once per Mac (the operator's one root session)
-
-Everything below is done once, as an administrator with `sudo`; this program does none of it.
-
-1. The binary is the `kbf-host-install` of the verified darwin-arm64 release tarball ([Getting the binary](#getting-the-binary)), placed at `/usr/local/libexec/kbf/kbf-host-install`, `root:wheel` 0755, in directories
-   (`/usr/local`, `libexec`, `kbf`) that group and others cannot write. An install checks this
-   before it does anything else and refuses with `config_unsafe` when the program or one of
-   those directories is not root's or is writable by group or others (some Intel Homebrew
-   setups leave `/usr/local` group-writable).
-2. An ordinary account for the updater's ssh login. It is not root and not an administrator;
-   the examples call it `kbfupdate`. Remote Login is on, and its
-   `~kbfupdate/.ssh/authorized_keys` has exactly one line:
-
-   ```text
-   from="203.0.113.10",restrict,command="/usr/local/libexec/kbf/kbf-host-install" ssh-ed25519 AAAA...
-   ```
-
-3. The single sudoers rule, in `/etc/sudoers.d/kbf-host-install` (`root:wheel` 0440, checked
-   with `visudo -cf`):
-
-   ```text
-   kbfupdate ALL=(root) NOPASSWD: /usr/local/libexec/kbf/kbf-host-install --as-root
-   ```
-
-   It allows one program with one argument, to one account. The program then reads the
-   request from its standard input and checks it against the grammar again, so the rule does
-   not widen what the key can ask for. The sudoers entry, not the ssh key, is what bounds
-   `kbfupdate`; a `Defaults:kbfupdate !setenv, env_reset` line keeps its environment out of the
-   program.
-4. `/usr/local/etc/kbf/host-install.toml`, root's alone to write:
-
-   ```toml
-   [channels.stable]
-   dir = "/usr/local/kbf-host-install/stable"
-   sums = "/usr/local/etc/kbf/host-install/stable.SHA256SUMS"   # optional
-   source_ref = "refs/heads/main"      # optional; this is the default
-
-   [channels.online]                   # a channel on GitHub instead of a directory
-   source = "github"
-   token_file = "/usr/local/etc/kbf/host-install/github.token"   # optional: a higher rate limit; see below
-   ```
-
-   A channel takes its releases from a `dir` or from `source = "github"`, never both (the
-   allowlist is `config_invalid` when it names both or neither). `sums` and `source_ref` go with
-   either. A channel on GitHub is described in [its own section](#a-channel-on-github).
-
-   The trust anchor is the build attestation, which every release must pass (check 4 below).
-   `sums` is optional. When it is set it is an extra freeze list: the pinned `SHA256SUMS` of the
-   releases the channel offers, root's alone to write, and a release it does not list is
-   refused, and a tarball is taken only when its sha256 is listed there. When it is absent the
-   attestation alone decides. `dir` is where the release files
-   are put: `kbf-<commit>-darwin-arm64.tar.gz` and `kbf-<commit>-darwin-arm64.tar.gz.sigstore.json`.
-   Whoever puts them there is not trusted; they are copied once and checked. Putting them there
-   is not done by this program.
-5. The pinned `gh` and the Sigstore trusted root that the `kbf-installer` package installs
-   (`/usr/local/kbf-installer/trust/gh` and `trusted_root.jsonl`), root-owned as that package
-   leaves them.
-
-The first install into a Mac that the kit set up needs nothing else: the kit's links, plist and
-`av2_mac.conf` are what this program reads.
-
-### The three entries
-
-| process | started by | does |
-|---|---|---|
-| `kbf-host-install` as `kbfupdate` | sshd (the forced command) | passes the request, unchanged, to the root process through `sudo -n ... --as-root` and prints its line and exit status |
-| `kbf-host-install --as-root` as root | that sudo rule | reads the request from standard input; checks it, audits it, answers; for an install, checks the release and launches the apply job |
-| `kbf-host-install --apply <stage>` as root | launchd, as the one-shot job `com.komira.kbf-host-install-apply` | lays the release out, moves the links, restarts the daemon, records the result |
-
-A login that is already root (the key is root's) handles the request in its own process and
-needs no sudo. `--as-root` and `--apply` are refused for any other user, and `--apply` for any
-stage but the program's own.
-
-### What an install checks first
-
-Before anything on the Mac changes, in this order (a failure changes nothing and removes the
-stage):
-
-1. the request, the channel and its pinned sums (when it has any), and that `gh` and the trusted
-   root are root's;
-2. the files of the channel's `dir` (or, for a channel on GitHub, the two files fetched as
-   `nobody` into a directory it owns inside the stage) are copied once, into `/var/db/kbf-host-install/stage`
-   (root's, mode 0700), without following links, as regular files with one link and under a size
-   limit; only that copy is checked from here on;
-3. when the channel has sums, the sha256 of the tarball is the one they list (a channel without
-   sums skips this);
-4. `gh attestation verify` accepts the tarball and its bundle, offline, run as `nobody` and
-   never as root. This is the trust anchor, and it binds: the tarball's sha256 as a subject
-   (`gh` hashes the staged copy), the build's source digest to the full 40-digit commit (not the
-   version's 12 digits), its source ref to the channel's branch, the signer to
-   `komira-ai/kbf`'s `artifacts.yml` workflow (the repository's former name is still accepted,
-   for releases attested under it; a channel may name [another repository and
-   workflow](#a-channel-of-another-repository)), and GitHub-hosted runners only;
-5. the tarball holds a regular file named `kbf`, a Mach-O file for arm64, and may hold the
-   release's updater declaration `updater.d/kbf.toml`, which is unpacked beside it in the
-   stage; no member is a link, a device or a FIFO or has an absolute name or a `..` in it,
-   and a member of another name is ignored with one line on stderr;
-6. the binary carries no `com.apple.quarantine` attribute (it is removed, and proven gone);
-7. `codesign --verify --strict` accepts it and its signature has the hardened runtime;
-8. the new binary, run as `_kbf`, accepts the daemon's live configuration
-   (`kbf --mode=daemon --config /usr/local/etc/kbf/kbf.toml --check`);
-9. the staged binary is root's, in directories only root can write.
-
-Steps 4 and 8 start their program with the privilege drop made in the child just before it
-executes (`setgroups` to the one gid, then `setgid`, then `setuid`), in `/`: started by
-`Command::uid` and `gid` alone, a child on macOS keeps the old effective gid (group 0, `wheel`) as
-a supplementary group. A drop through `chroot(8)` is not used: macOS kills a process that calls
-`chroot(2)` and then executes a program (`SIGKILL` at once, even for `/usr/bin/true`). The
-real-Mac tests check that a system program run as `nobody` exits 0 and that the child's groups are
-its own gid and nothing else.
-
-The stage is opened to traverse-only (0711) for steps 4 and 8, which run as other users, and
-is 0700 otherwise. While it is 0711 the users `nobody` and `_kbf` can pass through it but
-cannot list it or write to it. Every file in it is root's and not writable by them except
-`gh-home`, the directory of `gh`'s own home, which belongs to `nobody`; the files are public
-release bytes. It is closed to 0700 again before `plan.json` is written. The same version already installed and running is `already_installed`; an
-older version is installed like a newer one.
-
-### The apply
-
-The install verb returns once it has launched the apply job, so a dropped ssh session cannot
-end the work between `launchctl bootout` and `launchctl bootstrap`. It answers
-
-```json
-{"result":"apply_started","version":"...","commit":"...","apply":"running"}
-```
-
-and exits 0. The job:
-
-0. starts from the links the install saw: `current` and `previous` as they were when the install
-   was accepted are in `plan.json` (so the job, a rollback, and whoever has to repair a job that
-   was killed halfway work from the same facts; the next install repairs the kit too);
-1. lays out `releases/<commit>/kbf` and `VERSION` (a release already there must be the same
-   bytes), after checking that the file and every directory above it up to `/usr/local/kbf` are
-   root's and closed to others, again without a quarantine attribute;
-2. moves `previous` to the release that ran and `current` to the new one, each by renaming a
-   link made aside;
-3. runs `launchctl bootout system/com.komira.kbf-daemon`, waits (at most 60 seconds) until
-   `launchctl print` no longer finds the service (bootout returns before the service is gone, and
-   a bootstrap in that gap fails with an input/output error), then
-   `launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist`;
-4. waits (at most 180 seconds) for the `welcomed` line of the NEW process in the daemon's error
-   log, counting only what the log gained since before the bootstrap, and then requires (for at
-   most 60 seconds) that the daemon's process runs the release that was started: the same reading
-   `query` reports as `running_commit`;
-5. if step 3 or 4 fails, moves both links back, checks that the old release's file is root's,
-   restarts it the same way (with the same two checks) and records what became of it;
-6. removes the stage, then writes the result line, so that the status leaves `running` only when
-   nothing of the job is left to remove; and appends the outcome to the audit log.
-
-Nothing here waits for leases: the drain that keeps builds from being cut is the updater's, done
-before it asks for the install. `bootout` is synchronous and launchd kills the daemon after its
-exit timeout.
-
-The result is one line in `/var/db/kbf-host-install/status` and the `apply` field of `query`:
-
-| `apply` | meaning |
-|---|---|
-| `null` | no apply has been recorded |
-| `running` | the job is running (`in_progress` is true) |
-| `done` | the new daemon logged `welcomed`; `running_commit` is the new commit |
-| `failed:<reason>` | before anything restarted: `plan_invalid`, `stage_untrusted`, `stage_changed`, `release_differs`, `quarantine`, `layout_failed`, `release_untrusted`, `links_failed`, `launch_failed`; and `apply_lost` for a `running` status whose job is gone |
-| `failed:<reason>:rolled_back` | the restart failed (`bootout_timeout`, `bootstrap_failed`, `not_welcomed`, `wrong_release`) and the previous release is running again |
-| `failed:<reason>:rollback_failed` | the previous release did not come up either |
-| `failed:<reason>:no_previous` | there was no release before this one to go back to |
-
-A reader polls `query` until `in_progress` is false and then reads `apply`.
-
-A second install while the apply job is loaded and has not ended, including the moment after
-launchd has loaded it and before it has started, is `busy`: the stage is not touched. A failed
-move of the links is undone before `failed:links_failed` is recorded, so `previous` keeps naming
-the release before the last apply.
-
-### A rollback is an install of an older version
-
-There is no floor and no "not older" refusal. To go back, install the older version from the
-channel that offers it; it takes the same path, and `previous` is only where the last apply came
-from.
-
-The other side of this is that whoever holds the updater's key can install any release the
-channel offers that passes the attestation, including an old one with a known defect. On a
-channel with `sums` the way to make a release uninstallable is to remove its line from that file;
-on one without, it is to remove its files from `dir`.
-
-### `query` on a Mac
-
-```json
-{"result":"query","installed_version":"..."|null,"running_commit":"..."|null,"node_id":"..."|null,"in_progress":true|false,"apply":"..."|null}
-```
-
-- `installed_version` is the `VERSION` of the release `current` names, or null.
-- `running_commit` is the commit of the program the RUNNING daemon executes: the pid from
-  `launchctl print system/com.komira.kbf-daemon`, and the file `lsof` says that process has
-  mapped as its program, which must be `releases/<commit>/kbf`. It is null when any step does not
-  say; it is never read from the disk. A release that `current` names and the daemon has not
-  restarted onto is therefore not reported as running.
-- `node_id` is `NODE_ID` of `av2_mac.conf`, read as data: every line must be blank, a `#`
-  comment or `KEY=VALUE` with a plain value, the value must be a DNS label, and it must appear
-  once; any other file gives null.
-- `apply` is new on a Mac, and the install answer `apply_started` is too. The failures reuse the
-  closed codes of the Linux side (`verify_failed` for every check above, `install_failed` for a
-  stage or launch that failed, `busy`, `package_state_unclean` for a missing kit); the words are
-  on stderr.
+The local socket's channels are in `/etc/kbf/host-install-releases.toml`: a `dir`, or a source
+on GitHub. (The ssh path's `host-install.toml` is the apt channels' and is not read by the
+socket.)
 
 ### A channel on GitHub
 
@@ -487,7 +251,7 @@ release: the install fetches the release itself, as `nobody`, from the GitHub re
 `komira-ai/kbf` (or the repository the channel names, [below](#a-channel-of-another-repository)), and then handles the two files exactly as it handles the files of a `dir`
 (copied once into the stage, `sums` checked when set, then the offline attestation check and
 everything after it). The build attestation is still the only trust anchor; the listing and the
-download only bring the bytes. A directory channel stays for a Mac that cannot reach GitHub.
+download only bring the bytes. A directory channel stays for a host that cannot reach GitHub.
 
 What the install does, in this order, with the system `curl` (listing) and the pinned `gh`
 (download), both run as `nobody` (the same privilege drop as the attestation check) in a
@@ -499,7 +263,7 @@ directory that `nobody` owns inside the stage, with its own `HOME`:
    fails the command, a time limit, a size limit, and an empty environment. It is 100 a page, newest first, page
    after page until a page is empty, and at most 30 pages (an empty page ends it; a short one
    does not); never only the latest, so a rollback to an old release works;
-2. finds the asset named `kbf-<40 hex>-darwin-arm64.tar.gz` whose commit starts with the 12 hex
+2. finds the asset named `kbf-<40 hex>-<platform>.tar.gz` (or the package, per the layout) whose commit starts with the 12 hex
    digits of the version, across all the pages read. None is `unknown_release`; assets of two
    different commits are `ambiguous_release`; the same commit in two releases is one release (the
    newest). A listing cut at the 30-page limit without a match is `fetch_failed`, not
@@ -517,29 +281,28 @@ directory that `nobody` owns inside the stage, with its own `HOME`:
 5. copies the two files once, as root, into the stage, and removes the directory `nobody` wrote
    in. From here on nothing differs from a directory channel.
 
-Every one of these refusals is exit status 2 with no change to the kit, the status file or
-launchd, and no stage left behind.
+Every one of these refusals is exit status 2 with no change to the host, and no stage left behind.
 
-#### What the Mac needs
+#### What the host needs
 
 - Outbound HTTPS to GitHub: `api.github.com` and `github.com`, and the host GitHub serves
   release assets from. The child's environment is cleared, so no proxy variable reaches `gh`;
-  a Mac that can reach GitHub only through a proxy cannot use this source.
+  a host that can reach GitHub only through a proxy cannot use this source.
 - No token. The listing and the download of a public repository need none, and by default
-  no secret is on the Mac.
+  no secret is on the host.
 - Optionally, a token for a higher rate limit. A channel may name a `token_file`: a file that is
   root's alone to write (checked like the allowlist) holding a GitHub token, one line of letters,
   digits, `_`, `-` and `.`, at most 1024 bytes (a workflow token of GitHub Actions is about 520). It needs no scope: the repository is public. The root process reads it and
   sends it to `curl` as an `Authorization` header in a configuration on `curl`'s standard input
   (never in its arguments, which every user can read), and gives it to `gh release download` as
   `GH_TOKEN`; the attestation check never gets it.
-- The system `curl` that macOS ships, `/usr/bin/curl`, which must be root's and not writable by
+- The system `curl`, `/usr/bin/curl`, which must be root's and not writable by
   others (checked like the pinned `gh`, and only for a GitHub channel: a directory channel never
   runs it).
 
 #### The residuals
 
-- A token, when a channel names one, is a credential on the Mac. It can read public data only,
+- A token, when a channel names one, is a credential on the host. It can read public data only,
   but it is an account's token; `nobody`'s `curl` process holds it in memory and `gh release
   download` in its environment while they run. Without a `token_file` there is none.
 - The listing is read through GitHub's API and is not itself trusted: it can only choose among
@@ -622,18 +385,17 @@ kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N] [--k
 - `--socket`: an absolute path. The program binds it itself (a `umask` of 0177, then a `chown`
   to the account), mode 0600, in a directory that is root's and that others cannot write. A
   stale socket file is replaced; a file of another kind in the way is an error.
-- `--socket-user`: the one account that may connect. On Linux it is looked up in `/etc/passwd`,
-  on a Mac with `dscl`; root is refused.
+- `--socket-user`: the one account that may connect. It is looked up in `/etc/passwd`; root is refused.
 - `--window-secs`: how long a release on trial has to be confirmed, 120 to 1800 (default 600).
 - `--keep-releases`: how many releases the host keeps besides the ones that must stay, 2 to 32
   (default 4). See [The releases a host keeps](#the-releases-a-host-keeps).
-- `--layout`: how a Linux host keeps its releases. `installer` (the default) is the hand-placed
+- `--layout`: how a host keeps its releases. `installer` (the default) is the hand-placed
   layout of `kbf-installer`, described under "On Linux". `deb` and `rpm` are a host whose units
   are the `kbf` package's and run `/usr/bin/kbf`, updated by installing that package ("On a Linux
-  daemon host that runs the package"). A Mac takes none.
-- `--restart-unit`: on Linux, a unit that runs the release (`kbf-<name>.service` or
+  storage host that runs the package").
+- `--restart-unit`: a unit that runs the release (`kbf-<name>.service` or
   `kbf-<name>@<instance>.service`), repeated for each; at least one is required, unless the host
-  serves a frontend container. A Mac restarts the daemon's launchd job and takes none.
+  serves a frontend container.
 - `--frontend-container`: a Linux host whose frontend runs as a container, not as units: the
   release is the frontend's image and the switch recreates the container
   ([A frontend container](#a-frontend-container)). Not given with `--restart-unit`, nor with
@@ -685,22 +447,19 @@ never to the line.
 
 ### The releases a host keeps
 
-A host with release directories (the `installer` layout, and a Mac's kit) keeps, in `releases/`:
+A host with release directories (the `installer` layout) keeps, in `releases/`:
 the release that runs (`current`), the one before it (`previous`), every pinned release, the
 coordinator's last good release, and the `--keep-releases` newest others (by the time each was
 laid out). So going back to any of them needs no download. The rest are removed after a
 `confirm`, and only then: never while a release is on trial, and not by `install` or `switch`.
-On a Mac, the ssh path's apply removes them once the new daemon is welcomed, keeping 4 others,
-unless the socket has a swap on trial (its marker is there) or another install or switch holds
-the install lock; the audit log gets a `prune` line with what was kept and removed (`pruned`) or
-why nothing could be (`prune_failed`). A confirm whose `last_good` cannot be recorded (the listing or the file cannot
+A confirm whose `last_good` cannot be recorded (the listing or the file cannot
 be read or written, or its 12 digits name two releases) fails with `state_unavailable` and the
 release stays on trial, so no collection removes anything; the log says why. The confirm asked
 again, once the last good can be recorded, keeps the release. The last good is recorded before the
 trial ends, so a collection run by any program right after the confirm keeps it.
 
-What must stay besides the links is in `retain.json`, beside the installer's state (Linux,
-`/var/lib/kbf-installer/retain.json`) or in the work directory (Mac): `pinned` (a list of
+What must stay besides the links is in `retain.json`, beside the installer's state
+(`/var/lib/kbf-installer/retain.json`): `pinned` (a list of
 commits), `last_good` (a commit) and `versions` (the version text of each release, for the
 listing). Every key is optional and an unknown one is ignored. A file that cannot be parsed
 removes nothing, since it may hold a pin. Each change of it holds `retain.lock` beside it, and a
@@ -747,9 +506,8 @@ still desires the bad release), root on the host makes a release the host keeps 
 runs, with the helper at its fixed path:
 
 ```text
-systemctl stop kbf-updater-agent        # a Mac: launchctl bootout system/com.komira.kbf-updater-agent
-/usr/libexec/kbf/kbf-host-install activate kbf=<commit|version> --pin --restart-unit kbf-daemon.service
-                                         # a Mac: /usr/local/libexec/kbf/kbf-host-install activate kbf=<commit|version> --pin
+systemctl stop kbf-updater-agent
+/usr/libexec/kbf/kbf-host-install activate kbf=<commit|version> --pin --restart-unit kbf-storage.service
 ```
 
 ```text
@@ -760,34 +518,26 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
   forced-command request (sshd passes the forced command no arguments).
 - **The release** is named by its commit (12 to 40 lower-case hex digits, the start of the full
   one), by its version (whose `+g<12 hex>` names the commit), or by the version text the host
-  recorded for it. It must be one the host keeps (`releases/` of the layout or the kit): nothing is
+  recorded for it. It must be one the host keeps (`releases/` of the layout): nothing is
   fetched, so the release source and the network may be gone. A release the host does not keep,
   or a name that fits two, is refused (`not_kept`, `ambiguous_release`) with the kept releases, and
   so is a kept release whose binary is not a regular file root may run (`not_kept`):
   in the JSON line as `releases`, and on stderr one line each (`kept: <commit> <version> (why)`).
 - **No trial.** The swap is final: there is no deadline and no revert. `previous` becomes the
   release that ran (the one left); a release that was on trial is on trial no more, so no deadline
-  puts it back. On Linux the installer's `state.json` is written first, then the links; on a Mac
-  the links move, then the socket's `pending.json` is removed (one that cannot be removed puts the
-  links back and fails with `state_unavailable`).
-- **The restart.** On Linux `--restart-unit` names the units that run the release, as `--serve`
-  takes them (at least one; the packaged unit is `kbf-daemon.service`); a Mac restarts the
-  daemon's launchd job and takes none. Every unit is restarted, each whatever became of the others.
+  puts it back. The installer's `state.json` is written first, then the links.
+- **The restart.** `--restart-unit` names the units that run the release, as `--serve`
+  takes them (at least one; the packaged unit is `kbf-storage.service`). Every unit is restarted, each whatever became of the others.
   A unit that does not come up on the release named is `restart_failed` (exit 3), and the host
   stays on that release: it is not put back on the one it left. Name another kept release to go
   elsewhere.
 - **Nothing of the release left runs.** The helper is not part of any kbf release (it is at its
   fixed path, which no release install writes), it moves the links itself, and the service manager
   starts the release named: no program under `releases/<the release left>` is executed.
-- **The install lock** (`/run/kbf-host-install.lock` on Linux, `lock` in the work directory on a
-  Mac) is taken without waiting, as every install, switch and restart takes it. Each taker writes
+- **The install lock** (`/run/kbf-host-install.lock`) is taken without waiting, as every install, switch and restart takes it. Each taker writes
   its process id into the lock file. A held lock is refused (`busy`, exit 2) and its holder named on
   stderr: `pid N, which is alive` (let it end or stop it), `pid N, which is gone` (a process it
-  started keeps the lock), or `a process that wrote no id` (a helper from before this one). On a
-  Mac an apply job of the ssh path that is running is refused the same way (`busy`), since it runs
-  without the lock: launchd is asked about the job whatever its status file says, and anything but
-  "no such service" or a listing that says it ended (another status, a signal, a `launchctl` that
-  cannot run) counts as running. The locks taken inside it (the installer's state lock,
+  started keeps the lock), or `a process that wrote no id` (a helper from before this one). The locks taken inside it (the installer's state lock,
   `retain.json`'s) are taken without waiting too: a holder is refused (`busy`), not waited for.
 - **`--force-lock`** takes the lock from a holder that is gone or stuck: the lock file is made
   anew under its name and locked (a `flock` cannot be taken from its holder; the holder keeps the
@@ -798,14 +548,13 @@ kbf-host-install activate kbf=<commit|version> [--pin] [--force-lock] [--restart
   not taken from). A stuck holder is not stopped: stop it first if
   it may still move the links. Each take is appended at once (before the release is even
   looked up) to `lock-takes.jsonl`
-  beside the helper's `state.json` (`/var/lib/kbf-host-install` on Linux, the work directory on a
-  Mac; root's, 0600), one line per take:
+  beside the helper's `state.json` (`/var/lib/kbf-host-install`; root's, 0600), one line per take:
   `{"at_unix":N,"by":"activate","target":T,"holder_pid":N|null,"holder_alive":bool}`. It is a file
   of its own because helpers before this one read `state.json` strictly and would refuse a new
   key. A line cut short by a crash is ended before the next one is appended. A take that cannot be recorded stops the activate (`state_unavailable`). The audit line says
   `install lock taken` too.
 - **`--pin`** holds the host on the release: it writes the hold file
-  `/var/lib/kbf-updater/pin.json` (a Mac: `/var/db/kbf-updater/pin.json`), in the packaged
+  `/var/lib/kbf-updater/pin.json`, in the packaged
   agent's state directory, root's and 0644,
   `{"commit":C,"version":V|null,"at_unix":N,"by":"activate"}`, and adds the commit to `pinned` in
   `retain.json`, so no prune removes it. Both are written once the links name the release (also
@@ -837,7 +586,7 @@ runs restarts its units and moves no link.
 #### Undoing the pin: `unpin`
 
 ```text
-/usr/libexec/kbf/kbf-host-install unpin        # a Mac: /usr/local/libexec/kbf/kbf-host-install unpin
+/usr/libexec/kbf/kbf-host-install unpin
 ```
 
 - **Root only**, and it takes no argument; anything else is refused (exit 2) before anything runs.
@@ -868,7 +617,7 @@ The release goes in the layout of `kbf-installer` ([host-releases.md](host-relea
 installer's `state.json`, which is also where the pending marker lives (`pending_confirm`, with
 the deadline). A host that was set up by hand with `kbf-deploy host install` has all of it; a host
 with no `current` release has nothing to go back to and is refused (`no_current`). The channels
-are in `/etc/kbf/host-install-releases.toml`, in the format of the Mac's allowlist below (a
+are in `/etc/kbf/host-install-releases.toml`, in the format described under "A channel on GitHub" (a
 channel whose `source = "github"`, which may name its own [repository and signer](#a-channel-of-another-repository); the ssh path's `host-install.toml` is the apt channels' and is
 not read):
 
@@ -887,12 +636,12 @@ say it is that commit. Nothing is fetched when the trust files are not root's. A
 `protocol` or `state_schema` is newer than this program's `kbf-installer` understands is refused
 (the installer's rule, `verify_failed`): put the newer installer on the host first.
 
-### On a Linux daemon host that runs the package
+### On a Linux storage host that runs the package
 
 With `--layout deb` (or `rpm`) the host's units are the packaged ones
 ([packaging/linux](../../packaging/linux/README.md)), which run `/usr/bin/kbf`. The `kbf` deb ships
 this program's unit, `kbf-host-local.service`, with `--layout deb` and `--restart-unit
-kbf-daemon.service`, and enables it. No release is laid
+kbf-storage.service`, and enables it. No release is laid
 out beside the running one and no link moves: the update is two installations of a package file,
 with the trial recorded first. The same requests apply, with the same answers and codes, and
 the same channels file as above. The package and a record of it live in the program's state
@@ -922,7 +671,7 @@ A node that was set up by hand moves to this layout once, with
 ### A frontend container
 
 With `--frontend-container` the release is the frontend's image
-(`kbf-frontend-image-<commit>-linux-<arch>.oci.tar`, [artifacts.md](../artifacts.md#the-frontend-image-oci))
+(`kbf-frontend-image-<commit>-linux-<arch>.oci.tar`, [artifacts.md](../artifacts.md#the-frontend-and-coordinator-images-oci))
 and the runtime is Docker. The requests are the same, so the pending marker, its deadline and
 the revert at the deadline are the same. The host needs `docker` at `/usr/bin/docker`, the channels
 file above (the image is fetched from the same releases), the installer's trust files (the pinned
@@ -1065,11 +814,3 @@ the two. So each file must give its frontend its own state directory and, when
 `LOCK` in that directory (`crates/kbf-objstore/src/fs_store.rs:294-304`), so a second frontend on
 the same directory never opens it while the first runs: it waits for the lock, logging every
 attempt, with no deadline, and does not serve.
-
-### On a Mac
-
-The release is checked and laid out by the same code as the ssh path's install (above), into the
-kit tree, with the channels of the same `host-install.toml`. The swap is the apply job's: the links,
-then a restart of the daemon's job that must say it was welcomed, and the old release started again
-if it does not. The pending marker is `pending.json` in the work directory, root's and 0600, and
-holds the links as they were.

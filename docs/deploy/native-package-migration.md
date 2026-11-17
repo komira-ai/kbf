@@ -1,11 +1,11 @@
 # Moving a hand-placed host to the `kbf` package
 
-A daemon host set up before the packages kept each release in
+A storage host set up before the packages kept each release in
 `/var/lib/kbf-installer/releases/<commit>`, with a unit of its own in `/etc/systemd/system` that
 runs `releases/current/kbf` with the node's flags ([host releases](host-releases.md), "by hand" in
 [update-a-host.md](update-a-host.md)). A host on the `kbf` package runs the packaged unit, which
 runs `/usr/bin/kbf`, and is updated by installing the next package
-([host-install.md](host-install.md#on-a-linux-daemon-host-that-runs-the-package)). This page is the
+([host-install.md](host-install.md#on-a-linux-storage-host-that-runs-the-package)). This page is the
 one-time move from the first to the second. It is a held step: nothing here runs by itself, and
 each node is moved by an operator, as root, one at a time.
 
@@ -14,9 +14,9 @@ nothing without `--apply`.
 
 ```text
 kbf-host-install --migrate-to-package --layout deb --channel stable \
-    --unit kbf-storage-and-daemon.service --dir /root/kbf-release
+    --unit kbf-storage.service --dir /root/kbf-release
 kbf-host-install --migrate-to-package --layout deb --channel stable \
-    --unit kbf-storage-and-daemon.service --dir /root/kbf-release --apply
+    --unit kbf-storage.service --dir /root/kbf-release --apply
 ```
 
 ## Before: what the node needs
@@ -32,10 +32,6 @@ kbf-host-install --migrate-to-package --layout deb --channel stable \
   names `current` and prints `pending confirm: none`. The release it runs is the one the package
   must be, so the move changes the way the node is installed and not the build it runs. Move to a
   newer build afterwards, with the local socket.
-- For an `all-in-one` unit, `/etc/kbf/installer.toml` readable: the packaged unit runs `kbf
-  boot-check` first, which reads that file for a `database` key (none is fine; an unreadable or
-  invalid file stops the start). The other daemon modes do not read it. A hand-placed node has the
-  file already, since the installer reads it.
 - The node drained by whatever drains it (for a storage node, take it out of routing first:
   [update-a-host.md](update-a-host.md#restarting-a-storage-member)). Moving restarts its unit once.
   Do one node at a time.
@@ -58,13 +54,12 @@ kbf-host-install --migrate-to-package --layout deb --channel stable \
 Both the plan and `--apply` do these, and change nothing:
 
 1. The installer's state names the release the node runs (`current`) and has no release on trial.
-2. The unit is the unit of a daemon mode (`kbf-daemon`, `kbf-storage`, `kbf-storage-and-daemon` or
-   `kbf-all-in-one`), is a regular file in `/etc/systemd/system`, has exactly one `ExecStart=`, and
+2. The unit is `kbf-storage.service`, is a regular file in `/etc/systemd/system`, has exactly one `ExecStart=`, and
    that runs the `kbf` of a release under `/var/lib/kbf-installer/releases`. Its flags are plain
    words (letters, digits and `_ . / : = @ + , ~ - ? &`, so a cold-store URL with a query is
    carried as it is): whitespace, a quote, a backslash, a `$`, a `%`, a `;` or the like in a flag stops the move, and the line says
    which word. The mode it gives, as `--mode=` (or `--mode MODE`) or as the older first word after the
-   program (`kbf storage-and-daemon --cold-store=...`), must be the mode of the unit's name.
+   program (`kbf storage --cold-store=...`), must be the mode of the unit's name.
 3. No drop-in `10-node-flags.conf` and no `<unit>.hand-placed` file is there already.
 4. The package in `--dir` is the package of that commit and passes every check an update's package
    passes: the sha256 `SHA256SUMS` lists for it, `gh attestation verify` offline (this repository's
@@ -77,12 +72,8 @@ Both the plan and `--apply` do these, and change nothing:
    last: `kbf` reads every flag before it prints help and starts nothing. A flag it refuses (for
    example "unexpected argument") stops the move. An rpm is not unpacked: the plan says so, and the
    flags follow the same rule alone.
-6. The directories the node's flags name (`--data-dir`, which is `/var/lib/kbf` when a daemon unit
-   gives none, `--meta-dir` and a `--cold-store=file://` path) that exist are recorded with their mode
-   and owner. For a unit that runs containers (`daemon`, `storage-and-daemon`, `all-in-one`), every
-   directory from `/` down to the data directory must be searchable by others, which the container
-   runtime needs; a closed one stops the move and the line names it (`chmod o+x` it first: the move
-   keeps the modes it finds and chooses none). For a deb the plan also prints which directories the
+6. The directories the node's flags name (`--meta-dir` and a `--cold-store=file://` path) that
+   exist are recorded with their mode and owner. For a deb the plan also prints which directories the
    packaged unit's `StateDirectory=` and `StateDirectoryMode=` would change (the packaged unit sets
    `/var/lib/kbf` to 0750) and that the drop-in keeps them.
 
@@ -125,7 +116,7 @@ from the unit it read. For a unit like this one:
 [Service]
 User=kbf
 Environment=RUST_LOG=info
-ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage-and-daemon \
+ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage \
     --cold-store=file:///var/lib/kbf/cold --meta-dir=/var/lib/kbf-meta
 Restart=always
 ```
@@ -141,20 +132,19 @@ User=kbf
 Environment=RUST_LOG=info
 StateDirectory=
 ExecStart=
-ExecStart=/usr/bin/kbf --mode=storage-and-daemon --cold-store=file:///var/lib/kbf/cold --meta-dir=/var/lib/kbf-meta
+ExecStart=/usr/bin/kbf --mode=storage --cold-store=file:///var/lib/kbf/cold --meta-dir=/var/lib/kbf-meta
 ExecStartPre=
-ExecStartPre=+/usr/bin/kbf boot-check --mode=storage-and-daemon
-ExecStartPre=/usr/bin/kbf --mode=storage-and-daemon --cold-store=file:///var/lib/kbf/cold --meta-dir=/var/lib/kbf-meta --check
+ExecStartPre=+/usr/bin/kbf boot-check --mode=storage
+ExecStartPre=/usr/bin/kbf --mode=storage --cold-store=file:///var/lib/kbf/cold --meta-dir=/var/lib/kbf-meta --check
 ```
 
 - `ExecStart=` is the node's own, with the program replaced by `/usr/bin/kbf`. The mode is named by
   `--mode=` alone, because `kbf` refuses the older first word after `--mode=`: if the unit gave
-  the mode as that word (`kbf storage-and-daemon --cold-store=...`), the word is dropped; if it
+  the mode as that word (`kbf storage --cold-store=...`), the word is dropped; if it
   gave no mode, the mode of the unit's name is added. The same flags are on the `--check` below.
 - `StateDirectory=` is cleared. The packaged unit has `StateDirectory=kbf` and
   `StateDirectoryMode=0750`, which makes systemd set `/var/lib/kbf` to 0750 (and own it for the
-  unit's user) at every start, closing it to the container runtime. The node's directories are
-  the node's and keep the mode they have.
+  unit's user) at every start. The node's directories are the node's and keep the mode they have.
 - `ExecStartPre=` is cleared and given again as the packaged unit has it (`boot-check`, then
   `--check`), with the node's flags on the `--check`, because `--check` without flags would read a
   `kbf.toml` the node does not have.
@@ -178,10 +168,10 @@ should come up on exactly the flags it ran on.
 ## After
 
 - Point the node's update agent at the package. The `kbf` deb ships `kbf-host-local.service` with
-  `--layout deb` and `--restart-unit kbf-daemon.service`, enabled
+  `--layout deb` and `--restart-unit kbf-storage.service`, enabled
   ([packaging/host-agent](../../packaging/host-agent/README.md), "A host that runs the package"):
   remove the node's hand-placed copy from `/etc/systemd/system`, which takes precedence over it,
-  or, when the node runs another unit than `kbf-daemon.service`, keep its own line in a drop-in;
+  or, when the node runs another unit than `kbf-storage.service`, keep its own line in a drop-in;
   run `systemctl daemon-reload` and restart it. A hand-placed copy that stays instead gets
   `--layout deb` (or `rpm`) added to its `--serve` line, once: the helper refuses a flag given
   twice. From then on `install`, `switch`, `confirm` and `revert` work on the package.
@@ -191,5 +181,5 @@ should come up on exactly the flags it ran on.
 
 ## What is not moved
 
-Macs keep the signed tarball. A frontend host and the frontend containers are moved another way, and
+A frontend host and the frontend containers are moved another way, and
 `kbf-proxy` is not touched.

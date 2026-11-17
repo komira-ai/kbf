@@ -11,7 +11,7 @@ mutants planted and shown red.
 
 What the scheduler does is in [scheduler.md](scheduler.md); the messages and the
 daemon's side of fencing are in [worker-protocol.md](worker-protocol.md) and
-[daemon.md](daemon.md); cordon, drain and rollouts are in
+`daemon.md`, deleted with kbf-daemon; cordon, drain and rollouts are in
 [fleet-updates.md](fleet-updates.md) (sections 3.3 and 4).
 
 ## 1. What exists today

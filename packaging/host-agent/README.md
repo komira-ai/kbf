@@ -120,7 +120,7 @@ command, which `crates/kbf-updater/tests/agent_packaging.rs` checks against the 
   `docs/deploy/host-install.md`, "A frontend container"). Its agent runs the A/B through the
   helper, which drains the container through the frontend's own operator API, recreates it from the
   new attested image and puts the old image back when the new one is not ready. The agent drains no
-  node unless `--daemon-node` names the daemon the host also runs.
+  node.
 
 ## The root part
 

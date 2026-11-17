@@ -32,8 +32,7 @@ installer that has that change. An installer without it still refuses.
 
 ## (a) By hand
 
-Put the release in a directory that holds `kbf` (and `kbf-daemon` if the release has one, and
-`units/` if it has units), then, as root:
+Put the release in a directory that holds `kbf` (and `units/` if it has units), then, as root:
 
 ```text
 sudo kbf-deploy host status
@@ -66,39 +65,29 @@ sudo kbf-deploy host status
 
 `kbf-installer` has the same verbs for a host it manages: `kbf-installer rollback --unit <unit>`,
 `kbf-installer gc [--keep N]` (the same rule: 2 or more, default 4) and `kbf-installer
-status`. Like `host`, they change nothing without `--apply`. `rollback` takes `--unit` (or
-`--launchd-label` on a Mac), because the installer restarts that service itself.
+status`. Like `host`, they change nothing without `--apply`. `rollback` takes `--unit`, because the installer restarts that service itself.
 
 ### Restarting a storage member
 
 A storage node holds blobs, and a restart takes it out of reach for as long as it is down. Take it
 out of routing first, so that writes move to its other owner at once and not after a heartbeat
-times out. For a node that also runs actions (`storage-and-daemon`), drain it first:
+times out. Ask first whether the host may stop, and plan the restart of the member, with the
+id from `GET /v1/members`:
 
 ```text
-kbf cluster drain <node> --deadline-secs 600 --token-file /etc/kbf/api-token
+kbf cluster safe-to-stop <member id> --token-file /etc/kbf/api-token
+kbf cluster member <member id> --state planned-down --for-secs 900 --token-file /etc/kbf/api-token
 ```
 
-That is `POST /v1/nodes/{node}:drain` of [the operator API](../api.md); the node is `drained` once
-its leases have ended, and `draining` or `drain_paused` until then. Without `--deadline-secs` the
-drain has no deadline and never pauses: it waits for the leases however long they run. Then plan the restart of the
-member, with the id from `GET /v1/members`:
-
-```text
-curl -sS -X POST http://127.0.0.1:8982/v1/members/<id> \
-    -H "Authorization: Bearer $(sudo cat /etc/kbf/api-token)" \
-    -H 'Content-Type: application/json' \
-    -d '{"state":"planned_down","for_secs":900}'
-```
-
-Run it on the frontend's host, where the API listens on `127.0.0.1:8982` unless `--api-listen` says
-otherwise (a write passes only from a loopback peer with the token and a JSON content type). The
-answer is `{"id": N, "state": "...", "generation": G}`. `planned_down` works only on an `active`
-member (any other state is `409`) and `for_secs` is 1 to 86400, default 900. The member is `down`
-in the map from that call, whatever its heartbeat does, until `for_secs` has passed. Then restart
-its unit, and wait for it to register again: it is `active` when its index is whole, `catching_up`
-while it rebuilds. `kbf cluster member` takes only `active` and `draining`, so use the request above
-for `planned_down`. `{"state":"active"}` undoes a plan for a restart that did not happen.
+Run them on the frontend's host, where the API listens on `127.0.0.1:8982` unless `--api` says
+otherwise (a write passes only from a loopback peer with the token and a JSON content type).
+`safe-to-stop` exits 0 when the host may stop and 3, with the reasons, when not. The second is
+`POST /v1/members/{id}` of [the operator API](../api.md) with `planned_down`, which works only on
+an `active` member (any other state is `409`); `--for-secs` is 1 to 86400, default 900. The member
+is `down` in the map from that call, whatever its heartbeat does, until `--for-secs` has passed.
+Then restart its unit, and wait for it to register again: it is `active` when its index is whole,
+`catching_up` while it rebuilds. `kbf cluster member <member id> --state active` undoes a plan for a
+restart that did not happen.
 
 **Take one storage member out at a time.** Blobs are kept on R owners, and R is 2 by default
 ([the architecture](../design/architecture-v2.md)). With two members out at once, a blob whose two
@@ -120,12 +109,11 @@ frontend host behind the proxy runs a pool of frontends that run on their own
 
 ## (c) By package, with `kbf-updater`
 
-A release reaches a host as an operating-system package. `kbf-updater` drains the host, installs the
-package, restarts the units, waits until the host is healthy and undrains it; on a Mac it installs the
-signed tarball instead. On a Linux daemon host the install is done by `kbf-host-install --serve --layout deb` (or `rpm`),
+A release reaches a host as an operating-system package. `kbf-updater` installs the
+package, restarts the units and waits until the host is healthy. On a Linux storage host the install is done by `kbf-host-install --serve --layout deb` (or `rpm`),
 which fetches the release's attested package, checks it offline, installs it with the package manager,
 restarts the units, and puts the previous package back if the new one is not confirmed by its deadline
-([host-install.md](host-install.md#on-a-linux-daemon-host-that-runs-the-package)). A host set up by
+([host-install.md](host-install.md#on-a-linux-storage-host-that-runs-the-package)). A host set up by
 hand moves to the package once ([native-package-migration.md](native-package-migration.md)). The frontend keeps no release store and no desired release: the routes
 `GET /v1/update` and `POST /v1/update/{desired,pause,resume}` and the release routes answer `404`, and
 `--releases-dir` is accepted, ignored and warned about (see [the operator API](../api.md)).

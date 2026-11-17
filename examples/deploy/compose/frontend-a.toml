@@ -8,7 +8,7 @@ mode = "frontend"
 [listener]
 # In a container the listeners must bind a reachable address, not loopback.
 listen = "0.0.0.0:8980"          # REAPI (Buck2)
-worker-listen = "0.0.0.0:8981"   # daemons and storage nodes, mutual TLS
+worker-listen = "0.0.0.0:8981"   # storage nodes, mutual TLS
 # Operator API, /healthz and /readyz. Envoy reaches it for health checks; do not
 # publish it. Writes need a loopback peer and the token below.
 api-listen = "0.0.0.0:8982"

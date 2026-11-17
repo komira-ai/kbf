@@ -6,9 +6,9 @@ interface TraceData {
   duration_ms: number;
   nodes: number;
   client: { cached: number; commands: number; failed: number; local: number; remote: number; pending: [number, number][] };
-  /** [daemon, start ms, end ms, outputs flag]: a lease. */
+  /** [worker, start ms, end ms, outputs flag]: a lease. */
   grants: [number, number, number, number][];
-  /** [daemon, end ms, failed flag] */
+  /** [worker, end ms, failed flag] */
   remote: [number, number, number][];
   /** [ms, count] */
   hits: [number, number][];

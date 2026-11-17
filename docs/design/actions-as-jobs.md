@@ -82,7 +82,7 @@ Settled by the owner and not reopened here:
 
 **kbf** [code]:
 
-- `--executor` (`crates/kbf-server/src/executor/mod.rs`) picks `kbf-daemon` (the default) or `js-agent`;
+- `--executor` (`crates/kbf-server/src/executor/mod.rs`) picked `kbf-daemon` (the default) or `js-agent`; `kbf-daemon` is deleted and placed actions run only as `js-agent` jobs.
   `kbf-deploy job-service apply|back-out` is the held procedure around the switch, with a canary job
   (`docs/deploy/job-service-cutover.md`).
 - In `js-agent` mode the frontend's farm (`farm.rs` over `kbf-sched`) still decides which operation runs and how often
@@ -943,7 +943,7 @@ documents named with it.
 19. **The trees switch** (8.3), after the one-node run and the gate of arm C.
 20. **The nodes move to `kbf storage`** (7.1).
 21. **Delete the Linux container driver**, the daemon's Linux-only wiring and the placement filter. Docs: `kbf-modes.md`,
-    `job-service-cutover.md`, `docs/artifacts.md`, `docs/design/daemon.md`.
+    `job-service-cutover.md`, `docs/artifacts.md` (`docs/design/daemon.md` is deleted).
 22. **The removal of the copy to scratch and the packs** (7.2), when its conditions are read from section 10; then one
     pull request per row of its table, the task's fetch first and the image last. Docs: the same.
 
@@ -1086,13 +1086,11 @@ copies the inputs out of the tree instead of running on it.
   Mac (its `docs/design/job-rootfs.md` item 7; a job with mounts asks for `layered-rootfs`, which no Mac reports),
   and serve the tierstore trees and put directories on the Macs. Until then no Mac runs a kbf action, as none runs
   a daemon (komira-ai/jobscheduler#888 lists the four items).
-- **The `kbf-daemon` Mac path is removed.** The Mac daemon driver (`native` and `native-whole-machine` on a Mac, Xcode,
+- **`kbf-daemon` is deleted.** Its Mac path went first: the Mac daemon driver (`native` and `native-whole-machine` on a Mac, Xcode,
   simulator, iOS device and VM leases on a daemon), the Mac session and lease-user pool, the Mac provisioning tool and the
-  VM crates are deleted, and `kbf-daemon` itself stays for the Linux daemons (`--executor kbf-daemon`, and the
-  `native` driver as plain processes on Linux for the beta smoke farm). A macOS action has one runner, the job
+  VM crates were deleted, and then `kbf-daemon` itself, with the Linux daemons and the `--executor kbf-daemon` choice. A macOS action has one runner, the job
   above. Kept: the executor's Mac path, `kbf-task` and its bundle, the wire and proto fields of the removed path (a
-  reader still reads old data), and the Mac side of the host install (`kbf-host-install`, `kbf-installer`, the
-  package), which install `kbf` on a Mac host and are a separate change.
+  reader still reads old data). The Mac side of the host install (the Mac installer paths, package and cask) is deleted too, and a Mac runs js-agent only.
 
 **Other open points:**
 

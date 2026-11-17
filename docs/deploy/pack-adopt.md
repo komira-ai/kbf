@@ -34,7 +34,7 @@ anywhere else but the files you name.
    row keeps it. The run after the last member flush should report `packs: new 0` and
    `rows: new 0`.
 
-Daemons still upload their outputs to the storage members, so while daemons run, members keep
+Clients still upload their outputs to the storage members, so while uploads run, members keep
 flushing new segments, and a run is only as current as the moment it listed. Run it again
 later, and once more after the members are quiet. **Nothing deletes from the members**: they
 go on serving everything they hold, and the index only adds a second way to find it. A pack

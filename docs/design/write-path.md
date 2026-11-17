@@ -372,7 +372,7 @@ blob. Blobs that share an object and sit close together are coalesced into large
 ranges (gaps under 1 MiB are read through and dropped), and `Segments/ReadRange
 { object, offset, length }` calls (at most 4 MiB, as `PutRange`; longer is
 `INVALID_ARGUMENT`) run in parallel on the one connection, through the transfer engine
-of [worker-cache.md](worker-cache.md#4-the-shared-transfer-engine), served from the
+of `worker-cache.md`, deleted with kbf-daemon, served from the
 tier when the object is staged or has a `.seg` copy, else from the store. The daemon
 checks every blob's SHA-256 as today. Object ids are stable across a flush, so a
 `Locate` answer stays valid; a range the server can no longer serve is `NOT_FOUND` for

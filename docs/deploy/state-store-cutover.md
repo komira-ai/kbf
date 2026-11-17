@@ -39,7 +39,7 @@ The SQLite file is never changed by any of them.
 
 1. **Find the setting.** The frontend takes `--state-store` from the `state-store` key under
    `[scheduler]` in its `kbf.toml` (on a host set up by `kbf-installer setup`,
-   `/etc/kbf/kbf.toml`, an all-in-one host's included), or from a `--state-store=sqlite://<path>` flag on the command line in the unit file
+   `/etc/kbf/kbf.toml`), or from a `--state-store=sqlite://<path>` flag on the command line in the unit file
    or in a drop-in of it (`/etc/systemd/system/<unit>.d/*.conf`). **A flag on the command line
    overrides the key.** Look in both places: `systemctl cat <unit>` shows the unit and its
    drop-ins, and `kbf.toml` shows the key. If the command line has `--state-store=`, that
@@ -155,7 +155,7 @@ agree (the write is conditional on the row they read), and a store that already 
 marker is left as it is. Do it in this order:
 
 1. **Stop every frontend of an earlier release that uses the database**: each `kbf frontend`
-   and `kbf all-in-one` unit, and any process of an earlier release started with
+   unit, and any process of an earlier release started with
    `--admin-listen` (a candidate waiting for a takeover included). Check that each unit says
    `inactive`.
 2. **Back up the database** (the `kbf_state` schema). The marker is not undone by going back to
@@ -163,7 +163,7 @@ marker is left as it is. Do it in this order:
    is the way back.
 3. **Start the first frontend of this release.** Its open replaces the generation row (an
    8-byte number, or no row on a new database; a database copied by `kbf-state-copy` carries
-   the SQLite file's number) with the marker. The epoch is not touched, so the daemons that
+   the SQLite file's number) with the marker. The epoch is not touched, so the workers that
    reconnect keep the leases they hold.
 4. **Start the others.** They find the marker and write nothing to the row.
 

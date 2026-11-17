@@ -1,5 +1,7 @@
 # Frontends behind kbf-proxy: a pool on one shared state store
 
+> **kbf-daemon is deleted.** Where this page names a `kbf-daemon` beside a frontend, that daemon no longer exists; placed actions run only as js-agent jobs.
+
 This page says what the code does now. A host's public port belongs to `kbf-proxy`, which
 balances over frontends that run on their own; the frontends share one Postgres state store;
 a frontend is updated by taking it out of the pool, retiring it, restarting it and putting it

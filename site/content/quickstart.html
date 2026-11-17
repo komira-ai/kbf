@@ -2,7 +2,7 @@
 <p class="lede">From a host to your first remote build. Each step is tagged: <span class="tag tag-ok">works today</span> is in the code, <span class="tag tag-planned">specified</span> is decided in the design documents and not built yet.</p>
 
 <div class="notice">
-  <p><strong>One rule for the command line.</strong> A host's role is a flag, <code>--mode=frontend|storage|daemon|storage-and-daemon|all-in-one</code>, or <code>mode = "..."</code> in <code>/etc/kbf/kbf.toml</code>. It is never a subcommand. The word form (<code>kbf all-in-one</code>) still works as a hidden alias, but help and errors name the flag.</p>
+  <p><strong>One rule for the command line.</strong> A host's role is a flag, <code>--mode=frontend|storage</code>, or <code>mode = "..."</code> in <code>/etc/kbf/kbf.toml</code>. It is never a subcommand.</p>
 </div>
 
 <ol class="steps">
@@ -15,15 +15,16 @@
 <span class="p">$</span> sudo apt install ./kbf-installer_VERSION_amd64.deb</pre></div>
   </li>
   <li>
-    <h3>Set up a mode <span class="tag tag-planned">specified</span></h3>
-    <p>Installing starts nothing. <code>setup</code> fetches and verifies the first release, writes <code>/etc/kbf/kbf.toml</code>, creates the users and directories, and starts the units. For a single machine:</p>
-    <div class="code"><pre><span class="p">$</span> sudo kbf-installer setup --mode=all-in-one</pre></div>
-    <p>A frontend host needs a Postgres database you provide; <code>setup</code> creates the schema. A storage or daemon host passes <code>--token-file</code> with its enrollment token. The flags are in the <a href="https://github.com/komira-ai/kbf/blob/feature/arch-v2/docs/design/kbf-installer.md">installer contract</a>.</p>
+    <h3>Set up a frontend and a storage node <span class="tag tag-planned">specified</span></h3>
+    <p>Installing starts nothing. <code>setup</code> fetches and verifies the first release, writes <code>/etc/kbf/kbf.toml</code>, creates the users and directories, and starts the units. On the frontend host, then on a storage host:</p>
+    <div class="code"><pre><span class="p">$</span> sudo kbf-installer setup --mode=frontend
+<span class="p">$</span> sudo kbf-installer setup --mode=storage --token-file=TOKEN</pre></div>
+    <p>A frontend host needs a Postgres database you provide; <code>setup</code> creates the schema. A storage host passes <code>--token-file</code> with its enrollment token. The flags are in the <a href="https://github.com/komira-ai/kbf/blob/feature/arch-v2/docs/design/kbf-installer.md">installer contract</a>.</p>
   </li>
   <li>
     <h3>Check the settings <span class="tag tag-ok">works today</span></h3>
     <p>Every mode reads its settings from <code>kbf.toml</code> and takes <code>--check</code>, which prints every missing prerequisite and exits non-zero. All keys are on the <a href="config.html">configuration page</a>.</p>
-    <div class="code"><pre><span class="p">$</span> kbf all-in-one --check</pre></div>
+    <div class="code"><pre><span class="p">$</span> kbf --mode=frontend --check</pre></div>
   </li>
   <li>
     <h3>Point Buck2 at the frontend <span class="tag tag-ok">works today</span></h3>
@@ -41,7 +42,7 @@
   </li>
   <li>
     <h3>Build <span class="tag tag-ok">works today</span></h3>
-    <p>Run a build with remote execution enabled. A second run, on any machine, is answered from the cache.</p>
+    <p>The frontend places each action as a job of the job service with <code>--executor js-agent</code>; no other executor remains. Run a build with remote execution enabled. A second run, on any machine, is answered from the cache.</p>
     <div class="code"><pre><span class="p">$</span> buck2 build //... --prefer-remote</pre></div>
   </li>
 </ol>

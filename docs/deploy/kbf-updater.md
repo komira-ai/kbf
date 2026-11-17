@@ -16,11 +16,13 @@ of the updater finds a roll where it was.
 fe-a     fe.farm.example       frontend    ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample  instance=a base=18000
 fe-b     fe.farm.example       frontend    ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample  instance=b base=18010
 st1      st1.farm.example      storage     ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample
-dm1      dm1.farm.example      daemon      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample  dm1
 ```
 
-The roles are `frontend`, `storage`, `daemon` and `mac-daemon`. A daemon host lists the node id
-of its kbf configuration as the sixth word.
+The roles are `frontend` and `storage`. A host may list the node id of its kbf configuration as
+the sixth word. The words `daemon` and `mac-daemon` (the roles of the hosts of the worker daemon
+that kbf no longer has) are still read, so that an inventory written for an earlier release is
+not refused as a whole, but such a line lists no host: no roll touches it, and a roll that names
+its alias is refused as unknown (`unknown_alias`).
 
 ### A frontend that is a member of a pool
 
@@ -65,41 +67,13 @@ All are flags; none is read from the environment.
 | flag | |
 |---|---|
 | `--state-dir`, `--inventory`, `--proxy-uid`, `--token-file`, `--ssh-key-file`, `--ssh-user`, `--channel` | required |
-| `--operator-api http://<loopback ip>:<port>` | required: the frontend's operator API, for safe-to-stop and the health of storage and daemon hosts. Not a loopback address is refused |
+| `--operator-api http://<loopback ip>:<port>` | required: the frontend's operator API, for safe-to-stop and the health of storage hosts. Not a loopback address is refused |
 | `--socket` | the roll API's socket, for tests and development; in production systemd passes it |
-| `--ssh-connect-timeout-secs`, `--ssh-command-timeout-secs`, `--apply-poll-secs`, `--apply-deadline-secs` | optional bounds in seconds; they default to 10, 900, 5 and 600 |
-| `--drain-deadline-secs` | optional, 1 or more with no upper bound, absent by default. A daemon host's node is drained before its install and its leases are waited for however long they take. With the flag, a deadline that passes stops the waiting only: nothing is installed, the roll stops at the host with `drain_failed` and the node left drained (see [A daemon host's drain](#a-daemon-hosts-drain)). 0 is refused |
+| `--ssh-connect-timeout-secs`, `--ssh-command-timeout-secs` | optional bounds in seconds; they default to 10 and 900 |
 | `--peer-ready-secs`, `--frontend-drain-deadline-secs` | `--peer-ready-secs`: optional, at least 1 (default 30), how long every other member must answer `/readyz` 200 in a row before a member is drained. `--frontend-drain-deadline-secs`: optional, 1 or more with no upper bound, absent by default; a member that was told to drain is waited for until it has exited, however long its executions run. With the flag, a deadline that passes fails the roll with the member left draining. 0 is refused |
 
 The updater reaches each member's operator API on loopback at `127.0.0.1:<base + 2>`, with the
 same token (`--token-file`) as `--operator-api`.
-
-## A daemon host's drain
-
-A daemon host's node is drained at the frontend (`POST /v1/nodes/{id}:drain`) before its install,
-and the roll reads the node's leases every poll until there are none, however long that takes: the
-install restarts the daemon, which would cut the leases it still holds, so it waits. Without
-`--drain-deadline-secs` the drain asks the frontend for no deadline of its own. With the flag, a
-deadline that passes with a lease still held stops the waiting and nothing else: the host is not
-installed, the roll stops at it with `drain_failed` ("`dm still holds N leases after the drain
-deadline of S s; nothing was installed and the leases run on; ...; node dm-node (dm) is left
-drained`"), the node stays drained (cordoned) and its leases run on. To try again, start another
-roll: it drains the node again (a drain of a drained node does nothing) and waits again. To give
-the node back without installing, uncordon it (`POST /v1/nodes/{id}:uncordon`, or `kbf cluster`).
-(A host run by the [agent](#the-agent-mode) keeps a mark of the cordons the agent makes; a cordon
-given back by hand is noticed by the agent, see `--cordon-dir`.)
-The node drain at the frontend is the frontend's cordon and is not changed by this.
-
-The SSH roll gives back only a node whose cordon carries the roll's mark, and the frontend's cordon
-has no owner, so two limits follow; kbf#2166 (the cordon-owner issue) tracks the fix:
-
-- An operator who drains a node during the roll, after the roll's mark is written, has that drain
-  lifted at the give-back: the mark says the cordon is the roll's, and the frontend cannot tell two
-  drains apart.
-- When the frontend does not know the node yet at the drain, the roll drains it with no mark, and
-  the node is left out after the roll. The roll logs one warn line for it (`<node>: left out after
-  the roll: its cordon is not marked as this roll's ...; uncordon it by hand if it should serve`),
-  as it does for a node an operator drained before the roll; there is no other alert.
 
 ## What a roll does with a frontend pool member
 
@@ -181,15 +155,10 @@ member with `swap_abandoned`: abort that roll.
 dials the coordinator and owns that host's update. The roll mode above is unchanged and keeps
 working (until the roll and its ssh path are deleted, in the last step of that design).
 
-The program is a release asset for each platform that runs it: `kbf-updater-<commit>-linux-x86_64.tar.gz`,
-`kbf-updater-<commit>-linux-arm64.tar.gz` and `kbf-updater-<commit>-darwin-arm64.tar.gz`, each with one
-member, `kbf-updater`, attested like every tarball ([../artifacts.md](../artifacts.md)). The macOS one
-is signed ad hoc with the hardened runtime, as the other macOS binaries are; a Mac runs the agent as
-`_kbf-updater` from the property list in `packaging/host-agent/macos`.
-The account `_kbf-updater` and the two directories the agent writes, `/var/db/kbf-updater` (its
-state directory, the account's, mode 700) and `/Library/Logs/kbf-updater` (its logs, the account's,
-mode 755), are made by the operator when the Mac is set up: the Mac provisioning tool that made them
-is removed, and nothing else creates the account.
+The program is a release asset for each Linux platform: `kbf-updater-<commit>-linux-x86_64.tar.gz`
+and `kbf-updater-<commit>-linux-arm64.tar.gz`, each with one member, `kbf-updater`, attested like
+every tarball ([../artifacts.md](../artifacts.md)). A Mac runs no kbf-updater and has no `kbf`
+package to update: its actions run as js-agent jobs.
 
 ```text
 kbf-updater agent --coordinator <dns name>:<port> --channel NAME
@@ -198,7 +167,7 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
                   [--operator-api http://IP:PORT --token-file FILE] [--cordon-dir DIR]
                   [--helper-socket PATH]
                   [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]...
-                  [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
+                  [--heartbeat-secs N] [--health-timeout-secs N]
                   [--health-poll-secs N] [--retry-secs N]
 ```
 
@@ -209,7 +178,7 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   the certificate and the CA are its files. The agent renews the certificate at half its life
   and writes the new one there; `--enroll-frontend` is where. The certificate is the farm CA's `updater`
   certificate: its one DNS name is this node's id and its `urn:kbf:host-role:` is what the host
-  runs (`frontend`, `storage`, `daemon` or `mac-daemon`; a `frontend` host's helper runs the
+  runs (`frontend` or `storage`; the older `daemon` and `mac-daemon` are still read; a `frontend` host's helper runs the
   frontend as a container, see [A frontend host](#a-frontend-host)).
   The agent reads both from it. The files are read for every heartbeat and every call to the
   frontend, so a renewed pair is used from the next one, if it names the same node and role as the
@@ -218,9 +187,9 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   file must.
 - `--client-cert`, `--client-key`, `--ca`: instead of `--state-dir`, files an operator placed.
   Nothing renews them. Not both.
-- `--frontend`: the frontend's worker listener (its `--worker-listen`, the address daemons dial), a
-  DNS name and a port. The node's drain, undrain and status, and a storage host's own storage
-  health, are calls there, made over mutual TLS with the updater's certificate and **no token**;
+- `--frontend`: the frontend's worker listener (its `--worker-listen`, the address storage nodes dial), a
+  DNS name and a port. A storage host's own storage
+  health is a call there, made over mutual TLS with the updater's certificate and **no token**;
   see [the boundary](#the-boundary). The name must be one the frontend's worker certificate (the
   farm CA's `frontend` certificate) covers.
 - `--enroll-frontend`: the frontend's enroll listener (`--enroll-listen`), a DNS name and a port:
@@ -228,31 +197,13 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   required with `--state-dir`.
 - `--channel`: the channel of the helper's allowlist. The version the coordinator names is looked
   up in it by the helper, never fetched by URL.
-- `--cordon-dir`: where the agent records that a cordon on the node is its own: one small file
-  per node and per unit it updates (`cordon-<node>.<unit>`, the unit being `kbf` or the
-  `--service` name), synced before the drain call and removed after the undrain worked. A retry
-  of an update that failed with the node left drained, and an agent restarted in the middle of an
-  update, give such a node back; a node an operator drained is left out. A host the frontend
-  knows no node for (a storage host with no daemon) gets no mark. A node counts as the agent's
-  while any unit's mark is on it, and an undrain by one unit gives the node back only when no
-  other unit's mark remains. Default: the `--state-dir`, else the directory of `--client-key`.
-  The agent checks at start that it can write there and does not start otherwise; with placed
-  files in a root-owned directory under the shipped unit's `ProtectSystem=strict`, name a writable
-  one (the unit's `StateDirectory`, `/var/lib/kbf-updater`, or a path in `ReadWritePaths=`).
-  **A cordon given back by hand** (`:uncordon`, `kbf cluster`) leaves the mark; the agent drops
-  the marks of a node whenever it reads that node serving: at start, at each heartbeat it spends
-  idle, and before an update's drain. The window in which a stale mark still means something is
-  therefore from the hand uncordon to the agent's next look: at most one heartbeat interval while
-  the agent is idle, up to the end of the update when it is in the middle of one, and for as long
-  as the agent is stopped, or the frontend cannot be reached. In that window an operator's new
-  drain of the node reads as the agent's own and is given back by the update that finds it. If
-  the agent is stopped, remove the file by hand: `<cordon dir>/cordon-<node>.<unit>`. The
-  frontend's node read names no cordon (no generation, no time), so nothing finer is possible
-  without changing it.
-- `--daemon-node`: for the agent of a **frontend host** that also runs a daemon: the daemon's node
-  id. The agent drains that node around the frontend's update (with the operator token if the
-  agent has one, else with its certificate, which names its own node only). Without it a frontend
-  host's node is not drained.
+- `--cordon-dir`: the directory of the records of host updates the agent keeps (a deferral and a
+  halt, one file per unit), so that a restart keeps them. The name is from when the agent also
+  kept its node cordons there; it drains no node now. Default: the `--state-dir`, else the
+  directory of `--client-key`. The agent checks at start that it can write there and does not
+  start otherwise; with placed files in a root-owned directory under the shipped unit's
+  `ProtectSystem=strict`, name a writable one (the unit's `StateDirectory`,
+  `/var/lib/kbf-updater`, or a path in `ReadWritePaths=`).
 - `--helper-socket`: the socket of `kbf-host-install --serve` (default
   `/run/kbf-host-install/local.sock`; [host-install.md](host-install.md#the-local-socket)).
 - `--operator-api`, `--token-file`: optional, together: the full
@@ -262,8 +213,8 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   each; see [Services besides kbf](#services-besides-kbf). Without it the agent is a
   `kbf`-only agent.
 - Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--health-timeout-secs` 300,
-  `--health-poll-secs` 5, `--retry-secs` 900. `--drain-deadline-secs` has no default and no
-  upper bound (1 or more): without it the node's leases are waited for however long they take.
+  `--health-poll-secs` 5, `--retry-secs` 900. `--drain-deadline-secs` (1 or more) is accepted
+  and changes nothing: the agent drains no node.
 
 ### A frontend host
 
@@ -284,7 +235,7 @@ ever sent, whatever `KBF_MIN_UP_FRONTEND` says; the gamma job then fails when th
 deadline passes. A storage host is in the same case when `KBF_MIN_UP_STORAGE` is 1 or more (the
 default) and it is the only one. For a farm the coordinator deploys, run two or more frontends. With
 one, update it by hand in a maintenance window, through its helper's socket
-([host-install.md](host-install.md#the-five-requests)), as the socket's account:
+([host-install.md](host-install.md#the-six-requests)), as the socket's account:
 
 ```text
 install kbf=<version> from <channel>
@@ -314,8 +265,7 @@ adds `"pinned": {"commit": "<40 hex>"}` ([The pin](#the-pin)).
 Root pins a host to a release it keeps with `kbf-host-install activate --pin`, and unpins it with
 `kbf-host-install unpin` ([host-install.md, "The emergency command"](host-install.md#the-emergency-command-activate)).
 The pin is the helper's hold file, at a fixed path whatever the agent's flags say:
-`/var/lib/kbf-updater/pin.json` on Linux, `/var/db/kbf-updater/pin.json` on a Mac (the packaged
-agent's state directory).
+`/var/lib/kbf-updater/pin.json` (the packaged agent's state directory).
 
 - While the file is there the agent runs **no order for `kbf`**, whatever the coordinator desires.
   A trial it finds at start is left to the helper (whose deadline puts it back) and not reported
@@ -356,15 +306,7 @@ before it worked:
 1. **Fetch and verify** through the helper (`install`): the release is fetched on the host and
    checked there. An unattested build, one of another commit, or one the channel does not have is
    refused here, and the node has not been touched.
-2. **Drain** the node at the frontend (`:drain`, with the updater's certificate on the frontend's
-   worker listener) and wait until it holds no lease, however long that takes. With
-   `--drain-deadline-secs`, a deadline that passes before that fails the update with the node
-   left drained, nothing switched, and the leases running on; the agent tries the same order
-   again after `--retry-secs`, which drains the node again and waits again. A storage host
-   drains the **daemon part** of its node too when it has one (a `storage-and-daemon` host): its
-   restart would cut the daemon off from its leases, so the drain is asked, and a node the
-   frontend does not know (404) is a storage host without a daemon, which has nothing to drain.
-3. **Switch** (`switch`): the helper puts X on trial and restarts the units. The agent's call
+2. **Switch** (`switch`): the helper puts X on trial and restarts the units. The agent's call
    has no time limit: a frontend host's helper drains the container for as long as it takes
    (`drain_secs` unset), and it serves one request at a time, so it cannot be asked anything
    meanwhile. The agent waits on the open call; a helper that dies closes the socket, which ends
@@ -372,28 +314,21 @@ before it worked:
    revert 10 minutes, the rest 1 minute). A helper that is alive and silent is waited for, bounded
    by the helper's own deadlines (the drain deadline it is configured with, the stop, the readiness
    wait).
-4. **Health**: the node's health check (`node_health`: a storage member is `active` on the build
-   and no blob is known to be owed a copy, read from the frontend's
-   `GET /v1/nodes/{id}/storage-health`; a daemon is connected on it) of X, held drained, for at
-   most `--health-timeout-secs`, and never past the helper's deadline less ten seconds.
-   A daemon is connected to one frontend only, and `--frontend` is the load balancer's name,
-   which picks a frontend per connection: a frontend that does not hold the node answers
-   "not connected" (or 404). The agent therefore asks up to 8 times, each on a new connection,
-   and takes the first answer that says connected; it reports "is not connected" only when
-   none does. A client with `--operator-api` reaches one frontend and asks once.
-5. **Confirm** X if it is healthy. If it is not, **revert**: the helper does that by itself at its
+3. **Health**: the node's health check (`node_health`: a storage member is `active` on the
+   build and no blob is known to be owed a copy, read from the frontend's
+   `GET /v1/nodes/{id}/storage-health`) of X, for at most `--health-timeout-secs`, and never
+   past the helper's deadline less ten seconds.
+4. **Confirm** X if it is healthy. If it is not, **revert**: the helper does that by itself at its
    deadline whatever this process is doing; the agent asks for it at once.
-6. **Undrain** only if the node is healthy: on X after a confirm, or on the release that ran
-   after a revert. A node that is not healthy stays drained.
 
 The result goes in the next heartbeat. A restart of the agent in the middle finds the helper's
-pending marker (`query`) and finishes the trial from step 4; nothing is fetched, drained or
+pending marker (`query`) and finishes the trial from step 3; nothing is fetched or
 switched twice. A target that failed is not tried again before `--retry-secs`, however often
 the coordinator names it.
 
 ### Services besides kbf
 
-An agent given `--service` also updates those services, with the same A/B (install, drain, switch,
+An agent given `--service` also updates those services, with the same A/B (install, switch,
 health, confirm or revert) run with the service's own ports. `NAME` is a service name (lowercase
 letters, digits and `-`, at most 64 bytes; not `kbf`), given once. The settings follow it, separated
 by commas, each at most once:
@@ -402,7 +337,7 @@ by commas, each at most once:
 |---|---|---|
 | `channel=C` | the channel of the helper's allowlist that holds the service's releases | `NAME` (it must be a channel name) |
 | `helper-socket=PATH` | the socket of the helper that installs it (an absolute path with no `..`); required, one per service, and never the agent's `--helper-socket`, whose helper installs `kbf` (an install request names no service, so it would install `kbf` at the service's version) | none: required |
-| `drain=node` or `drain=none` | `node`: the host's node is drained and given back through the frontend, as for `kbf`; `none`: nothing is drained, and no drain call is made | `node` |
+| `drain=node` or `drain=none` | read and changes nothing: the agent drains no node, whichever is given | `node` |
 | `ready-url=http://IP:PORT/PATH` | health is `GET PATH` on that loopback address answering 2xx (the path is `/` if there is none) | the node's health through the frontend, as for `kbf` |
 
 A service's helper is spoken to exactly as `kbf`'s is: `query`, and `install kbf=<version> from
@@ -410,8 +345,8 @@ A service's helper is spoken to exactly as `kbf`'s is: `query`, and `install kbf
 needs a helper of its own that installs that service when asked so; the agent refuses to start with a
 service whose socket is its own `--helper-socket`.
 
-A value holds no comma. `drain=node` and node health need `--frontend` (or the operator token), as
-`kbf` does; a service with `drain=none` and a `ready-url` needs neither. A readiness URL is checked
+A value holds no comma. Node health needs `--frontend` (or the operator token), as
+`kbf` does; a service with a `ready-url` needs neither. A readiness URL is checked
 for the service's word that it serves; it does not say which release answered.
 
 With no `--service`, the heartbeat is the one above with no `services` field and the reply is read
@@ -508,8 +443,8 @@ kbf-updater enroll --frontend <dns name>:<port> --node-id ID --token-file FILE -
 ```
 
 1. On the frontend the operator makes the token (`POST /v1/enroll/tokens`, [../api.md](../api.md)):
-   `{"roles": ["updater"], "node_id": "host-1", "host_role": "daemon"}`, one use. The token fixes
-   the node id and the host role; a token for a node's roles (`storage`, `daemon`) is refused for
+   `{"roles": ["updater"], "node_id": "host-1", "host_role": "storage"}`, one use. The token fixes
+   the node id and the host role; a token for a node's role (`storage`) is refused for
    an updater, and an updater token is refused for any other role, for another node id, a second
    time and after it expired.
    A frontend host is enrolled the same way, with `"host_role": "frontend"` in the token. The word
@@ -529,11 +464,10 @@ kbf-updater enroll --frontend <dns name>:<port> --node-id ID --token-file FILE -
 Revoking the host by its id (`POST /v1/enroll/nodes/{id}/revoke`) revokes its updater row too, so the
 renewal is refused and the certificate runs out at its end. The worker listener's deny list
 (`--worker-deny-list`, a `node` entry) does apply to an updater's node calls, as it does to a
-daemon's, and takes effect at once; without an entry a certificate already issued keeps its
+storage node's, and takes effect at once; without an entry a certificate already issued keeps its
 own-node calls until it expires: seven days by default, thirty at most. A host re-enrolled with
 a `replace` token stops the old key from renewing in the same way and does not cut off a
-certificate already issued. The `deadline_secs` of a self-drain is whatever the host sends; it
-only moves that host's own drain deadline.
+certificate already issued.
 
 The CA's key is the frontend's alone; the coordinator holds none. The units in
 `packaging/host-agent` use this layout ([its README](../../packaging/host-agent/README.md)).
@@ -543,7 +477,7 @@ The CA's key is the frontend's alone; the coordinator holds none. The units in
 The design says the full operator token must not be on hosts, and the agent does not need it. The
 frontend itself serves a host's updater four calls about its own node on the worker listener, the
 listener it already authenticates node certificates on (mutual TLS against `--worker-client-ca`,
-reached by every host that runs a daemon or a storage node):
+reached by every storage node):
 
 | call | |
 |---|---|
@@ -552,9 +486,11 @@ reached by every host that runs a daemon or a storage node):
 | `GET /v1/nodes/{id}` | the node, as the operator API has it |
 | `GET /v1/nodes/{id}/storage-health` | the node's own storage member and two storage-wide numbers |
 
+The agent drains no node.
+
 **The frontend serves these for a certificate with the role `updater` whose one DNS name is `{id}`,
 and nothing else**: another node's id, the cordon, a listing, the members and enrollment routes,
-the update API and every other path are `403`, and so is every call of a daemon, storage, frontend
+the update API and every other path are `403`, and so is every call of a storage, frontend
 or coordinator certificate on these paths. No operator token is involved on the host or the
 frontend, and the worker listener's deny list applies to the node. The shipped units give the agent
 no token. The frontend's certificate for the name in `--frontend` must be the farm CA's `frontend`
@@ -562,7 +498,7 @@ certificate (the agent checks the chain to the farm CA, the name and the role be
 byte), not a public one.
 
 The worker listener offers `h2` and `http/1.1` in its handshake; the agent speaks HTTP/1.1, one
-request per connection, and the daemons' gRPC is unchanged beside it. A frontend that is older than
+request per connection, and the storage nodes' gRPC is unchanged beside it. A frontend that is older than
 this change offers `h2` only and refuses the agent's handshake: update the frontends first.
 
 What remains of the token: `--operator-api` and `--token-file` are an opt-in fallback for a host
@@ -629,13 +565,13 @@ coordinator's `GET /v1/status`, so the whole status need not be read for one nod
 
 ```sh
 kbf-deploy host-status --coordinator https://coordinator.example:8443 \
-    --operator-token-file ~/.kbf/operator.token --node daemon-04 --ca-pem "$(cat farm-ca.pem)"
+    --operator-token-file ~/.kbf/operator.token --node storage-04 --ca-pem "$(cat farm-ca.pem)"
 ```
 
 ```text
-node_id: daemon-04
+node_id: storage-04
 service: kbf
-role: daemon
+role: storage
 platform: linux-x86_64
 version: 2.0
 health: healthy
@@ -747,7 +683,7 @@ agent, helper, frontend and `kbf`, the agent heartbeating to the coordinator and
 node's storage health from the frontend with its certificate alone
 (`crates/kbf-host-install/tests/update_rehearsal_agent.rs`). A release that host cannot take, or
 a version the hosts never report, is never set as the desired version. The rehearsals do not
-cover a drain of a node with leases (the host has no daemon half), the farm's Tailscale network
+cover the farm's Tailscale network
 or its real issuer (the issuer of the OIDC token is a stand-in on loopback, and the minimum of
 storage hosts that must stay up is 0 because the rehearsal's farm has one).
 

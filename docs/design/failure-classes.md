@@ -3,7 +3,7 @@
 When an action fails, the person reading the build log needs one answer first: is this
 mine to fix, or the farm's? This document defines the classes of failure, what the
 farm does today, and what is **proposed** so that a farm problem is never reported as
-the action's own failure. Lease handling is in [daemon.md](daemon.md), outcomes and
+the action's own failure. Lease handling is in `daemon.md`, deleted with kbf-daemon, outcomes and
 retries in [scheduler.md](scheduler.md#outcomes), node reports in
 [capabilities.md](capabilities.md), the simulation in [simulation.md](simulation.md).
 
@@ -474,7 +474,7 @@ those counters when the action ends with SIGKILL (137) or when `crun` reported a
 error and no exit, and reports either kill as `MEMORY_KILL_OWN_LIMIT`;
 a kernel kill by the node's `actions/` limit or the host (`oom_kill` without `oom` in
 the lease) is `MEMORY_KILL_NODE_PRESSURE`, which says nothing about the booking
-([daemon.md](daemon.md), "Cgroups and limits"). A SIGKILL kbf did not send and cannot
+(`daemon.md`, deleted with kbf-daemon, "Cgroups and limits"). A SIGKILL kbf did not send and cannot
 tie to memory (a macOS memory-pressure kill with no record of it) stays Ambiguous
 (1.1).
 
@@ -691,7 +691,7 @@ requeued (decided). Today only half of that holds:
 
 - **The machine suspended.** The drivers' timeout timers run on tokio's monotonic
   `Instant`, which does not advance while the machine sleeps, while the fence clock
-  counts suspension (`CLOCK_BOOTTIME`, `mach_continuous_time`; [daemon.md](daemon.md)).
+  counts suspension (`CLOCK_BOOTTIME`, `mach_continuous_time`; `daemon.md`, deleted with kbf-daemon).
   A suspend past T = 40 s therefore ends in the fence: the run is killed and reported
   lost (`UNAVAILABLE`, `LOST_FENCED`). Past G = 60 s the server has already given the lease up and requeued the
   operation (`js-sched/src/requeue.rs` (jobscheduler)), outside the rerun budget, and the late result

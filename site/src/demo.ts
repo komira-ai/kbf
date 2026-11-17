@@ -1,6 +1,6 @@
 // The demo player: a person's real workflow, replayed. It plays two recorded files on one clock: the cast (the
 // terminal of the run: the typed command, the editor's files and every line the build client printed, at its relative
-// time) and the trace (what the farm did in the same window: leases per daemon, remote runs, cache hits). Every number
+// time) and the trace (what the farm did in the same window: leases per worker, remote runs, cache hits). Every number
 // on the page comes from them; nothing is generated. No inline style or markup from strings: the page's policy allows
 // neither.
 
@@ -64,7 +64,7 @@ function player(T: TraceData, C: CastData, root: HTMLElement): void {
   const fTop = Math.min(100, mid - 82), fH = Math.max(200, 2 * (mid - fTop));
   flow.setAttribute('viewBox', '0 0 990 ' + Math.max(bottom + 24, fTop + fH + 24));
   svg('title', { id: 'flow-t' }, flow, 'How an action moves through kbf');
-  svg('desc', { id: 'flow-d' }, flow, 'Buck2 sends actions to the frontend. Actions answered by the action cache come back from storage. The rest are granted to daemons, which read inputs from storage and write outputs back to it.');
+  svg('desc', { id: 'flow-d' }, flow, 'Buck2 sends actions to the frontend. Actions answered by the action cache come back from storage. The rest are granted to workers, which read inputs from storage and write outputs back to it.');
   svg('path', { class: 'edge', d: 'M150 ' + mid + ' L270 ' + mid }, flow);
   svg('path', { class: 'edge', d: 'M490 ' + (mid - 30) + ' L700 52' }, flow);
   for (let i = 0; i < N; i++) svg('path', { class: 'edge', d: 'M490 ' + mid + ' L700 ' + cy[i] }, flow);
@@ -82,7 +82,7 @@ function player(T: TraceData, C: CastData, root: HTMLElement): void {
   svg('rect', { class: 'node hot', x: 270, y: fTop, width: 220, height: fH, rx: 10 }, front);
   svg('text', { class: 't1', x: 380, y: fTop + 36, 'text-anchor': 'middle' }, front, 'frontend');
   svg('text', { class: 't2', x: 380, y: fTop + 60, 'text-anchor': 'middle' }, front, 'checks the cache,');
-  svg('text', { class: 't2', x: 380, y: fTop + 78, 'text-anchor': 'middle' }, front, 'grants misses to daemons');
+  svg('text', { class: 't2', x: 380, y: fTop + 78, 'text-anchor': 'middle' }, front, 'grants misses to workers');
   svg('rect', { class: 'track', x: 305, y: fTop + fH - 62, width: 150, height: 10, rx: 5 }, front);
   const qbar = svg('rect', { class: 'qbar', x: 305, y: fTop + fH - 62, width: 0, height: 10, rx: 5 }, front);
   const qn = svg('text', { class: 't2', x: 380, y: fTop + fH - 30, 'text-anchor': 'middle' }, front, '0 actions waiting');
@@ -95,13 +95,13 @@ function player(T: TraceData, C: CastData, root: HTMLElement): void {
     const y = LANE0 + i * LANE_H;
     const g = svg('g', { class: 'dn' }, flow);
     svg('rect', { class: 'node', x: 700, y, width: 250, height: 56, rx: 10 }, g);
-    svg('text', { class: 't1', x: 716, y: y + 23 }, g, 'daemon-' + (i + 1));
+    svg('text', { class: 't1', x: 716, y: y + 23 }, g, 'worker-' + (i + 1));
     runs.push(svg('text', { class: 't2', x: 716, y: y + 44 }, g, '0 running'));
     svg('rect', { class: 'track', x: 790, y: y + 34, width: 150, height: 8, rx: 4 }, g);
     bars.push(svg('rect', { class: 'bar', x: 790, y: y + 34, width: 0, height: 8, rx: 4 }, g));
   }
 
-  // Peak running leases of one daemon, for the size of its bar.
+  // Peak running leases of one worker, for the size of its bar.
   let peak = 1;
   const ev: [number, number, number][] = [];
   const cur: number[] = [];

@@ -35,45 +35,39 @@ the package tests) runs in `beta.yml` on every push and never on a pull request;
 
 ## What is built
 
-22 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+17 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of `kbf`
 ([below](#the-kbf-package-deb)), two native Debian packages of `kbf` ([below](#the-native-kbf-package)), one frontend, one update coordinator and one task runner container image per
 Linux architecture ([below](#the-frontend-and-coordinator-images-oci)), one kbf base tree bundle per Linux architecture
-([below](#the-kbf-base-tree-bundle)) and one macOS package of `kbf-installer`
-([below](#the-kbf-installer-package-pkg-macos)), built by one job per platform:
+([below](#the-kbf-base-tree-bundle)), built by one job per platform:
 
 | Asset | Runner | Target |
 |---|---|---|
-| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz`, `kbf-host-install-<commit>-darwin-arm64.tar.gz`, `kbf-updater-<commit>-darwin-arm64.tar.gz`, `kbf-task-bundle-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
-| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz`, `kbf-signer-<commit>-linux-x86_64.tar.gz`, `kbf-task-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu`; `kbf-task` is built for `x86_64-unknown-linux-musl` |
-| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz`, `kbf-signer-<commit>-linux-arm64.tar.gz`, `kbf-task-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu`; `kbf-task` is built for `aarch64-unknown-linux-musl` |
+| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-task-bundle-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
+| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz`, `kbf-signer-<commit>-linux-x86_64.tar.gz`, `kbf-task-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu`; `kbf-task` is built for `x86_64-unknown-linux-musl` |
+| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz`, `kbf-signer-<commit>-linux-arm64.tar.gz`, `kbf-task-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu`; `kbf-task` is built for `aarch64-unknown-linux-musl` |
 
-`kbf` is the one binary with all five modes (`kbf --mode=daemon`, `kbf --mode=all-in-one`,
-`kbf --mode=storage`, and the two modes not built yet; [cluster.md](design/cluster.md) sections 1
-and 5.1), the one a host runs. `kbf-daemon` and `kbf-server` are the separate daemon
-and server binaries (Linux only: a Mac runs `kbf --mode=daemon`, and darwin has no
-`kbf-daemon` tarball; the ones of earlier commits stay where they were published).
+`kbf` is the one binary a host runs, with the modes `frontend` and `storage`
+(`kbf --mode=storage`; [kbf-modes.md](deploy/kbf-modes.md)). `kbf-server` is the separate
+server binary (Linux only). No `kbf` runs on a Mac: the darwin `kbf` tarball holds the same
+binary for the operator's tools, and a Mac action runs as a js-agent job. The `kbf-daemon`
+tarballs of earlier commits stay where they were published; this release has none.
 `kbf-deploy` is the deploy tool (its kits are listed in
 [ARCHITECTURE.md](../ARCHITECTURE.md)), shipped so an operator installs the tool the
 same way as the binaries it installs: by digest, from these attested files, not built
-on the operator's machine. `kbf-installer` is the root tool that sets a Mac up and
-updates it ([kbf-installer.md](design/kbf-installer.md)); it is built, signed, attested
-and released like the others, so a package or an operator takes it by digest from these
-files, for macOS only. It is not a component of the release it installs on a host, and it does
-not update itself (the design's section 1). On Linux a release has no `kbf-installer` tarball
+on the operator's machine. On Linux a release has no `kbf-installer` tarball
 and no `kbf-installer` package: what a Linux host needs of it that is still used (the users,
 the directories, the slice, and the pinned `gh` and trust list that verify attestations) is in
 [the `kbf` package](#the-kbf-package-deb), and the hosts are updated by `kbf-host-install`.
 
 `kbf-host-install` is the root side of the host-driven update: the forced command of the
 key `kbf-updater` holds, which installs a release on the host it runs on
-([deploy/host-install.md](deploy/host-install.md)). `kbf-updater` is the daemon that
+([deploy/host-install.md](deploy/host-install.md)). `kbf-updater` is the program that
 drives it over ssh from the operator's Linux box, and, as `kbf-updater agent`, the host agent a
-Mac runs, so it has Linux and macOS tarballs. Neither
+Linux host runs, so it has Linux tarballs only. Neither
 is a package, and neither is a component of a release: a host or an operator takes the
 tarball by digest, verifies it as every tarball is (below), and places the binary where
-the guide says. Each tarball holds one member, the binary under its own name (the macOS `kbf-task` bundle's holds a layout, [below](#the-macos-kbf-task-bundle)). The macOS
-`kbf-host-install` and `kbf-updater` are signed and checked like the other macOS binaries. `kbf-host-install
+the guide says. Each tarball holds one member, the binary under its own name (the macOS `kbf-task` bundle's holds a layout, [below](#the-macos-kbf-task-bundle)). `kbf-host-install
 --version` prints its name and package version, which is all the release asks of it.
 
 `kbf-signer` is the process that holds the CA key and serves a Unix socket to the frontend
@@ -95,18 +89,18 @@ interpreter and no needed library. The task image
 carries the same file. It writes its pack with `kbf-task-pack` (`crates/kbf-task-pack`), the task pack types
 the frontend ingests with, a crate of pure Rust that does not link the pack index or the object store client.
 
-A Mac gets `kbf-task` only as [the bundle below](#the-macos-kbf-task-bundle); there is no bare `kbf-task` tarball, binary asset or image for a Mac. `kbf-task` has a macOS confine: it runs the Command alone under `/usr/bin/sandbox-exec`, with a profile (`crates/kbf-seatbelt`, also used by the Mac daemon's driver) that denies every network operation but to loopback and Unix sockets for a Command denied the network, and denies, for any Command, reading, writing, renaming and linking each file the profile is given as holding a credential (a task has none of its own after the presigned mode was removed), and renaming the directories above it. It does not limit other writes, nor `mach-lookup` of helper daemons, does not stop DNS (any Unix socket is allowed, and the system resolver is reached through one), and a connect to the node's own non-loopback address was allowed under the denial on the macOS runner. A system that is neither Linux nor macOS has no confine, and `kbf-task` refuses a Command denied the network there (exit 15). The `task-macos` job of `ci.yml` runs `cargo test -p kbf-task` on a hosted Mac, without the test-only feature, after the merge; a pull request runs the same tests in `macos-pr.yml`'s `macos-test`. A repository lint (`crates/kbf-integration-test/tests/no_darwin_task.rs`) allows exactly the bundle and refuses: a bare `kbf-task` asset, package line or image for a Mac (any name but `kbf-task-bundle-<commit>-darwin-arm64`), a `cargo build`, `b` or `install` for a Mac target that would produce `kbf-task`, a Mac runner job that names it other than in a `cargo test`, `check` or `clippy` line, or builds the whole workspace without `--exclude kbf-task`, in any job but the bundle job (`darwin-arm64` of `artifacts.yml`), the bundle made (`cargo xtask package-task-bundle`) by any other job, and any workflow that names the test-only feature `unconfined-for-tests`; a `cargo check`, `clippy` or `test` of it for a Mac target, which ships nothing, is allowed. The backstop is the pin of the release set (the asset table here and the workflow must agree: `crates/kbf-integration-test/tests/release_artifacts`); the lint's text match of workflow jobs is a tripwire.
+A Mac gets `kbf-task` only as [the bundle below](#the-macos-kbf-task-bundle); there is no bare `kbf-task` tarball, binary asset or image for a Mac. `kbf-task` has a macOS confine: it runs the Command alone under `/usr/bin/sandbox-exec`, with a profile (`crates/kbf-seatbelt`) that denies every network operation but to loopback and Unix sockets for a Command denied the network, and denies, for any Command, reading, writing, renaming and linking each file the profile is given as holding a credential (a task has none of its own after the presigned mode was removed), and renaming the directories above it. It does not limit other writes, nor `mach-lookup` of helper daemons, does not stop DNS (any Unix socket is allowed, and the system resolver is reached through one), and a connect to the node's own non-loopback address was allowed under the denial on the macOS runner. A system that is neither Linux nor macOS has no confine, and `kbf-task` refuses a Command denied the network there (exit 15). The `task-macos` job of `ci.yml` runs `cargo test -p kbf-task` on a hosted Mac, without the test-only feature, after the merge; a pull request runs the same tests in `macos-pr.yml`'s `macos-test`. A repository lint (`crates/kbf-integration-test/tests/no_darwin_task.rs`) allows exactly the bundle and refuses: a bare `kbf-task` asset, package line or image for a Mac (any name but `kbf-task-bundle-<commit>-darwin-arm64`), a `cargo build`, `b` or `install` for a Mac target that would produce `kbf-task`, a Mac runner job that names it other than in a `cargo test`, `check` or `clippy` line, or builds the whole workspace without `--exclude kbf-task`, in any job but the bundle job (`darwin-arm64` of `artifacts.yml`), the bundle made (`cargo xtask package-task-bundle`) by any other job, and any workflow that names the test-only feature `unconfined-for-tests`; a `cargo check`, `clippy` or `test` of it for a Mac target, which ships nothing, is allowed. The backstop is the pin of the release set (the asset table here and the workflow must agree: `crates/kbf-integration-test/tests/release_artifacts`); the lint's text match of workflow jobs is a tripwire.
 
 `tierstore` (the hot and cold S3 object store proxy) is no longer built or released by this repository: its source, its
 Linux tarballs and its packaging (the example unit and the flags to fill in) are in
 [komira-ai/tierstore](https://github.com/komira-ai/tierstore). The host updater does not update it: the farm places it,
 taking the tarball from that repository's release and checking it against that repository's release signer.
 
-The packages are the two Linux jobs' debs (one each), container images (three each, and the facts and the SBOM of the task image) and kbf base tree bundle (one each), and the macOS job's `.pkg`:
+The packages are the two Linux jobs' debs (two each), container images (three each, and the facts and the SBOM of the task image) and kbf base tree bundle (one each):
 
 | Asset | Built by | Holds |
 |---|---|---|
-| `kbf-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf` of the tarball of the same name at `/usr/bin/kbf`, the unit of every mode, `kbf.slice`, the users and directories they run with, the trust directory (the pinned `gh` for amd64, the Sigstore trusted root, `installer.conf`), and the host agent's two units, enabled, with the agent's account; it replaces the old `kbf-installer` |
+| `kbf-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf` of the tarball of the same name at `/usr/bin/kbf`, the unit of each mode, `kbf.slice`, the users and directories they run with, the trust directory (the pinned `gh` for amd64, the Sigstore trusted root, `installer.conf`), and the host agent's two units, enabled, with the agent's account; it replaces the old `kbf-installer` |
 | `kbf-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
 | `kbf-native-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the files of the `kbf` deb above without the host agent (no `kbf-host-local.service`, no `kbf-updater-agent.service`, no links that enable them, no agent account), as package `kbf` at the version `<major>.<minor>.<seq>` that `kbf --version --json` names (for example `0.1.7472`); [below](#the-native-kbf-package) |
 | `kbf-native-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
@@ -122,7 +116,6 @@ The packages are the two Linux jobs' debs (one each), container images (three ea
 | `kbf-task-image-<commit>-linux-arm64.cdx.json` | the `linux-arm64` job | the same for arm64 |
 | `kbf-base-tree-<commit>-linux-x86_64.tree.tar` | the `linux-x86_64` job (`cargo xtask base-tree`) | the kbf base tree of the farm's Linux actions, as tierstore manifests and objects: the base layers of the task image flattened, with the `kbf-task` the job built as `/.kbf-tools/kbf-task`, and the tree's facts; [below](#the-kbf-base-tree-bundle) |
 | `kbf-base-tree-<commit>-linux-arm64.tree.tar` | the `linux-arm64` job | the same for arm64, from the arm64 base |
-| `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
 The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
 that drops one of these files from the workflow, packages one that is not listed, or
@@ -189,21 +182,17 @@ for the same `--binary` path the job packages.
 
 The build jobs check out the full history (`fetch-depth: 0`, which the workflow lint holds
 for every job that records the facts), so the facts carry the real `seq` (see `seq` below);
-a shallow local build still says `seq: 0`. The bundle `kbf-installer deploy --bundle` reads
-holds `kbf` and `kbf-daemon` tarballs and their attestations and refuses any other entry: the
-facts file is not packed into a bundle, and a packer that adds it needs a reader that accepts
-it installed first (the deploy order of `seq`, below).
+a shallow local build still says `seq: 0`.
 
-`kbf-server`, `kbf` and (on macOS) `kbf-installer` embed the first 12 characters of the commit they
+`kbf-server` and `kbf` embed the first 12 characters of the commit they
 were built from (`kbf` through the server library it links), and `--version` prints
 `<binary> <package version>+<commit>` (so do the server's start line and the `server`
 field of `GET /v1/nodes`, [api.md](api.md#get-v1nodes)). Before packaging, each Linux job
 checks that `kbf-server`'s `--version` names `GITHUB_SHA` (`cargo xtask build-commit
 check`), and that `kbf`'s does too and that `kbf --version --json` (below) names the same
 commit and a release build (`build-commit check --json`); the macOS job makes the second check
-on the signed `kbf` and `kbf-installer`, the bytes it packages. Those checks run on the binary
-before it is packaged. After packaging, every job opens the `kbf` tarball (and the macOS job
-the `kbf-installer` tarball) it wrote and makes the second check again on the binary inside each, with `cargo
+on the signed `kbf`, the bytes it packages. Those checks run on the binary
+before it is packaged. After packaging, every job opens the `kbf` tarball it wrote and makes the second check again on the binary inside each, with `cargo
 xtask build-commit check-asset <tarball> "$GITHUB_SHA"`: the binary's name and the
 commit are read from the tarball's file name (`<name>-<commit>-<platform>.tar.gz`, and
 the commit must be `GITHUB_SHA`), the tarball must be the one entry `package` writes, and
@@ -211,7 +200,7 @@ the binary extracted from it (to a directory under `target/` that the check remo
 pass `check --json`. So the bytes that ship, not only the bytes that were built, name
 the commit. `KBF_BUILD_COMMIT_OVERRIDE` replaces the commit in a `kbf-server` build (and
 so in `kbf`), for CI tests that need two stamps from one checkout; a build that set it
-here would fail that check. `kbf-installer` takes its commit from the checkout only.
+here would fail that check.
 
 The Linux binaries link glibc dynamically and need the glibc of Ubuntu 24.04 or
 newer.
@@ -243,7 +232,7 @@ sorted by name.
   unknown is not reversible.
 - `profile`: `release` for every asset here (the workflow refuses a `debug` one).
 - `protocol` and `min_protocol`: the newest and the oldest `kbf.worker.v1` version the
-  binary speaks. The daemon half speaks exactly `protocol`; the server half accepts
+  binary speaks. A frontend accepts
   `min_protocol` through `protocol`.
 - `relay`: how far the build carries what its host's installer reports to the frontend. At
   `1` it reads `available` and `release_source` from the installer's `status.json` and sends
@@ -381,12 +370,12 @@ How a bundle is made, and what is checked of it:
   artifact `bundles-linux` or `bundles-darwin-arm64`.
 - **Not an SBOM's.** The SBOM attestation of a tarball carries the whole SBOM and can be
   larger than a bundle may be (below); it is not given to a host. A tarball has exactly
-  one bundle, a package (`kbf`, or `kbf-installer` on a Mac) has exactly one (`<package>.sigstore.json`,
+  one bundle, a package (`kbf`) has exactly one (`<package>.sigstore.json`,
   the same kind of attestation over the one `.deb`), and nothing else has one.
 - **Not in `SHA256SUMS`.** The bundle is made after the sums, from the files they list, so
   they cannot list it. `cargo xtask verify-assets sums` leaves out names that end
   `.sigstore.json`, and `cargo xtask release check` holds the directory to one
-  `<tarball>.sigstore.json` per tarball (and per `.deb` and `.pkg`) the sums list and none for anything else.
+  `<tarball>.sigstore.json` per tarball (and per `.deb`) the sums list and none for anything else.
 - **Its size and shape.** A bundle is one line of JSON (`mediaType` of a Sigstore bundle,
   `dsseEnvelope`, `verificationMaterial`) of at most 256 KiB, the room a host's order
   record has for one. `release check` refuses an empty file, two bundles in one file and
@@ -413,15 +402,14 @@ How a bundle is made, and what is checked of it:
 `kbf` is the package of a Linux host. Installing a newer one is the update of a host
 ([deploy/host-install.md](deploy/host-install.md) is the guide for the update itself). It holds:
 
-- the runtime `/usr/bin/kbf` and the systemd unit of every mode (`kbf-all-in-one.service`,
-  `kbf-daemon.service`, `kbf-frontend.service`, `kbf-storage-and-daemon.service`,
+- the runtime `/usr/bin/kbf` and the systemd unit of each mode (`kbf-frontend.service`,
   `kbf-storage.service`) and `kbf.slice`, which they run in;
 - `/usr/lib/sysusers.d/kbf.conf` (the users `kbf`, `kbf-server`, `kbf-fetch` and `kbf-signer`
   and the group `kbf-signer-clients`) and `/usr/lib/tmpfiles.d/kbf.conf` (`/run/kbf-installer`,
   where the lock is, and `/var/cache/kbf-fetch`): `systemd-sysusers` and `systemd-tmpfiles`
   make them at boot, and no maintainer script does;
 - `/etc/needrestart/conf.d/kbf.conf`, a configuration file a host may edit, which keeps
-  needrestart from restarting a kbf unit in the middle of a build;
+  needrestart from restarting a kbf unit on its own;
 - the host's update agent: `kbf-host-local.service` (the helper's local socket, which installs this
   package, `--layout deb`) and `kbf-updater-agent.service` (the agent), enabled by the package's
   own links in `/usr/lib/systemd/system/multi-user.target.wants/`, and
@@ -447,11 +435,10 @@ Each mode unit runs `kbf boot-check` before it starts `kbf`: the check is the `k
 it). The package depends on no package: a host updates it with a plain `dpkg --install`
 (`kbf-host-install` does, and so does `--migrate-to-package`), which resolves nothing, and a
 dependency the host lacks would leave `kbf` unpacked, unconfigured and then undone. It recommends
-`crun`, `uidmap`, `systemd` and `ca-certificates` (the dependencies the `kbf-installer` package
-had; `crun` and `uidmap` are the container driver's, whose preflight names `crun` when it is
-missing, and `systemd` and `ca-certificates` are on any host that runs these units, but a
-recommendation cannot fail an install where a dependency can) and suggests `postgresql`, for a
-frontend or all-in-one host that keeps its state on the host. It is built, like every other, from
+`crun`, `uidmap`, `systemd` and `ca-certificates` (`crun` and `uidmap` are what a js-agent on
+the host runs its job containers with, and `systemd` and `ca-certificates` are on any host that
+runs these units, but a recommendation cannot fail an install where a dependency can) and
+suggests `postgresql`, for a frontend host that keeps its state on the host. It is built, like every other, from
 the files the job has just built and checked: `cargo xtask pkg-trust`, `pkg-config` and
 `pkg-build` (nfpm, pinned by SHA-256, builds the deb and the rpm twice and the bytes must match),
 and a fresh Ubuntu 24.04 container installs, runs, removes and purges the deb
@@ -767,70 +754,6 @@ directory is a function of the pinned base alone, so it is the same digest in ev
 The frontend publishes the bundle of its release at its start under `--executor js-agent`, as
 [job-service-cutover.md](deploy/job-service-cutover.md) says; nothing in the release workflow writes the object store.
 
-## The kbf-installer package (pkg, macOS)
-
-A Mac gets `kbf-installer` the same way, as one file that holds everything it needs to verify a
-release offline ([packaging/macos/README.md](../packaging/macos/README.md)). The `darwin-arm64`
-job builds it from the signed binary it has just built and checked: the pinned darwin `gh`
-(the 2.102.0 release's `macOS_arm64` zip, checked by SHA-256 before use), the Sigstore trusted
-root that `gh` fetched, and an `installer.conf` from `cargo xtask pkg-trust`, then `cargo xtask
-pkg build` writes the package (the same bytes for the same inputs; `pkgbuild` is not
-deterministic). It installs these entries, all root:wheel, at the paths of the installer's macOS
-layout (`crates/kbf-setup/src/layout.rs`; a test compares the package's paths with it):
-
-| Path | Mode | Layout |
-|---|---|---|
-| `/usr/local/kbf-installer/bin/kbf-installer` | 0755 | the install root, `Layout::install_root` |
-| `/usr/local/kbf-installer/trust/gh` | 0755 | `Layout::gh`: the pinned `gh` that verifies attestations offline |
-| `/usr/local/kbf-installer/trust/trusted_root.jsonl` | 0644 | `Layout::trusted_root` |
-| `/usr/local/kbf-installer/trust/installer.conf` | 0644 | `Layout::settings`, below |
-| `/Library/LaunchDaemons/com.komira.kbf-installer.plist` | 0644 | not loaded, and not running until `/usr/local/etc/kbf/installer.toml` (`Layout::installer_toml`) exists |
-| `/var/db/kbf-installer`, `/Library/Logs/kbf-installer` | 0700, 0755 | the state directory (`Layout::state_dir`) and the job's log directory, empty |
-
-`installer.conf` is exactly `SOURCE_REFS=refs/heads/<branch>`, **the branch the package is
-attested on**, as in the deb: a package built on `main` trusts `main` releases, one built on
-a branch other than `main` (historically `feature/arch-v2`) trusts that branch's. It sets nothing else, so `RUN_AS_UID` and `RUN_AS_GID` are
-the installer's defaults (`nobody`). What is per host is not shipped: `kbf-installer setup`
-writes `installer.toml` (and `kbf.toml`, the tokens, the users) at adopt time.
-
-`cargo xtask pkg-macos-install-test` installs the package as root on the runner
-(`sudo -n installer -pkg ... -target /`) and checks that Apple's `pkgutil` lists the paths this
-repository's reader finds, every file and directory it added is root:wheel with its mode and bytes,
-the job is not loaded and nothing is running, `installer.toml` does not exist, the installed `gh`
-runs and the installed `kbf-installer --version --json` names the commit. Then `cargo xtask
-pkg-macos-asset` makes it the asset `kbf-installer-<commit>-darwin-arm64.pkg` and lists it in
-`SHA256SUMS.darwin-arm64`, refusing it unless it holds exactly the files above (no script, nothing
-else), the binary is byte for byte the one in the tarball `build-commit check-asset` and
-`darwin-asset` checked, `gh` is the pinned one, the trusted root is JSON lines, the property list is
-gated, `installer.conf` trusts the branch it is attested for, and its `PackageInfo` version ends
-`+<the first 12 digits of the commit>`.
-
-It is attested like the deb: build provenance (one subject of the `SHA256SUMS` attestation, and
-alone, with its bundle `kbf-installer-<commit>-darwin-arm64.pkg.sigstore.json` in
-`bundles-darwin-arm64`) and **no SBOM attestation**. The verify job checks both offline and runs
-`cargo xtask pkg-macos-asset --verify-only` on the signed file. The package itself is not signed
-(no Developer ID): Gatekeeper does not open it by double click, and the binary inside is signed ad
-hoc, as the tarballs' are; the verification below is the operator's step.
-
-```text
-gh run download <run-id> -R komira-ai/kbf -n assets-darwin-arm64 -n bundles-darwin-arm64 -n sha256sums-darwin-arm64
-shasum -a 256 --check --strict --ignore-missing SHA256SUMS
-gh attestation verify kbf-installer-<commit>-darwin-arm64.pkg \
-  --bundle kbf-installer-<commit>-darwin-arm64.pkg.sigstore.json \
-  --custom-trusted-root trusted_root.jsonl \
-  --repo komira-ai/kbf \
-  --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
-  --source-ref refs/heads/main \
-  --cert-oidc-issuer https://token.actions.githubusercontent.com \
-  --source-digest <commit> \
-  --predicate-type https://slsa.dev/provenance/v1 \
-  --deny-self-hosted-runners
-sudo installer -pkg kbf-installer-<commit>-darwin-arm64.pkg -target /
-```
-
-(The flags are the installer's, as for the deb.) Installing places files and starts nothing; `sudo
-/usr/local/kbf-installer/bin/kbf-installer setup` configures the host.
-
 ## The macOS kbf-task bundle
 
 The bundle is built and released, and it is the image of a Mac job: `kbf-server`'s executor sends an action that asks for macOS to a Mac worker (`--executor-mac-hosts`, none by default) and submits it with this bundle's manifest digest as the job's image (`--executor-mac-task-bundle`), its entrypoint `kbf-task` run as `--materialize-work=.kbf-tree --stage-and-commit --out-dir .kbf-out` (`crates/kbf-server/src/executor/mac.rs`, `crates/kbf-task/src/materialize.rs`; `docs/design/actions-as-jobs.md`, section 14). No Mac runs one yet: the job service at kbf's pin takes no native job start from the job API and no mount on a Mac (section 14 says what it lacks). It is placed by digest, not as a layer of the toolchain bundle. The `darwin-arm64` job makes that bundle, and no other job does:
@@ -842,7 +765,7 @@ The bundle is built and released, and it is the image of a Mac job: `kbf-server`
 
 Both are in the macOS `SHA256SUMS`, the tarball is attested like every tarball (build provenance, an SBOM
 attestation and its own `.sigstore.json` bundle; [above](#provenance-bundles-verifying-a-tarball-offline)),
-and the tarball is one of the 23. It is not a binary tarball: it holds no member named `kbf-task`, the layout
+and the tarball is one of the 17. It is not a binary tarball: it holds no member named `kbf-task`, the layout
 holds it in a layer.
 
 The steps, in order, each unconditional (`crates/kbf-integration-test/tests/release_artifacts` pins them):
@@ -1055,19 +978,19 @@ fails.
 ## macOS signing: what ad hoc with the hardened runtime gives
 
 `cargo xtask sign-darwin` (crates/xtask/src/darwin.rs) signs each macOS binary the job
-builds (`kbf`, `kbf-deploy`, `kbf-installer`, `kbf-host-install` and `kbf-updater`, one step each) with `codesign --force
+builds (`kbf` and `kbf-deploy`, one step each; `kbf-task` for the bundle, below) with `codesign --force
 --sign - --options runtime`: an ad-hoc signature (no certificate) with the hardened
 runtime. That works without an Apple Developer account, and the job checks it every
 run: `codesign --verify --strict` passes, the signed binary runs (`<binary> --version`
 exits 0 with no `DYLD_*` variable set, on every runner), the code directory's flags are
 exactly `adhoc,runtime`, the signature carries exactly the entitlements the allow
-list `tools/ci/darwin-entitlements.txt` gives the binary (none for `kbf`,
-`kbf-deploy`, `kbf-installer`, `kbf-host-install` or `kbf-updater`; no binary gets one), and the binary's minimum
+list `tools/ci/darwin-entitlements.txt` gives the binary (none for `kbf`
+or `kbf-deploy`; no binary gets one), and the binary's minimum
 macOS is 14.0. After packaging, `cargo xtask darwin-asset` takes the binary back out
 of its tarball, the bytes that ship (refusing a tarball that is not exactly the one
 entry `package` writes), and checks it again: `codesign --verify --strict`, the flags,
 a run of `--version`, and the entitlements against the list. A step for each of the
-four tarballs does this, and the repository lint (`release_artifacts`) refuses a macOS
+tarballs of `kbf` and `kbf-deploy` does this, and the repository lint (`release_artifacts`) refuses a macOS
 binary that is packaged without its own `sign-darwin` before and `darwin-asset` after.
 
 What it gives:
@@ -1106,8 +1029,8 @@ What it constrains:
 - **Only Apple-signed libraries load.** The hardened runtime turns on library
   validation, and with no Team ID of its own the binary may load only libraries Apple
   signed. That is fine for a binary that links and loads only system libraries, as
-  `kbf` does; `kbf-deploy`, `kbf-installer`, `kbf-host-install` and `kbf-updater` are signed the same way,
-  and CI does not list the libraries they load. On a Mac with System Integrity Protection on, a library it linked at start-up that
+  `kbf` does; `kbf-deploy` is signed the same way,
+  and CI does not list the libraries it loads. On a Mac with System Integrity Protection on, a library it linked at start-up that
   Apple did not sign would stop it from starting. CI does not show this: the hosted
   runners have SIP off and library validation off (`vm.cs_library_validation` 0), so
   the check above that runs the signed binary would pass with such a library.

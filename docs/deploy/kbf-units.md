@@ -1,9 +1,8 @@
 # The units of each `kbf` mode
 
 Each mode of `kbf` has one static systemd unit, shipped in the `kbf-installer` package
-(`packaging/linux/units/`: `kbf-frontend.service`, `kbf-storage.service`,
-`kbf-daemon.service`, `kbf-storage-and-daemon.service`, `kbf-all-in-one.service` and the
-shared `kbf.slice`; the modes are described in [All-in-one vs distributed](kbf-modes.md);
+(`packaging/linux/units/`: `kbf-frontend.service`, `kbf-storage.service` and the
+shared `kbf.slice`; the modes are described in [The kbf modes](kbf-modes.md);
 [architecture-v2.md](../design/architecture-v2.md), sections 1 and 11). The files carry no
 host values: the mode's flags are in `/etc/kbf/kbf.toml`, which `kbf-installer setup`
 writes ([kbf-installer-setup.md](kbf-installer-setup.md)), and the units are installed
@@ -13,25 +12,26 @@ file; they were retired, and nothing renders a unit now.
 
 ## Choosing the mode: `--mode`, `kbf.toml`, enrollment
 
-A `kbf` process takes its mode from a flag, never from a word: `kbf --mode=frontend|storage|daemon|storage-and-daemon|all-in-one`,
+A `kbf` process takes its mode from a flag, never from a word: `kbf --mode=frontend|storage`,
 or `mode = "..."` in `/etc/kbf/kbf.toml` (`kbf` alone reads it). The flag wins over the file and
 the start says so on stderr; with neither the start exits 2 naming both. `kbf --mode=<mode> --help`
 lists the mode's flags. There is no `node` mode and no `enroll` word.
 
 - **Flags.** A start that gives flags of its mode (`--cold-store`, `--server`, ...) runs on them
   and does not read the file. (The packaged units give `--mode=<mode>` and read the file.)
-- **`kbf.toml`.** `kbf --mode=storage|daemon|storage-and-daemon` with at most `--config FILE`
+- **`kbf.toml`.** `kbf --mode=storage` with at most `--config FILE`
   reads the host's file. On the first start, with the token file `enroll.token_file`
-  names, it makes its keys, sends the token and a request for the roles the mode needs
-  (`storage` the storage role, `daemon` the daemon role, `storage-and-daemon` both) and writes
+  names, it makes its keys, sends the token and a request for the storage role and writes
   `node.json`; later starts renew the certificates without the token. `[storage]` and `[daemon]`
-  in the file are settings only.
+  in the file are settings only. A removed mode (`daemon`, `storage-and-daemon`, `all-in-one`),
+  by the flag or by `mode =` in the file, exits 2 with a line that points to
+  [kbf-modes.md](kbf-modes.md#the-removed-modes).
 - **Exit 2** (a restart cannot fix it): a bad `kbf.toml`, a missing or open token file, a token
   that does not grant a role the mode needs (the frontend's typed reason is printed), and a
   `node.json` whose roles do not cover the mode (the mode changed after enrollment; the node is
   never enrolled again on its own). **Exit 1** (may pass): the frontend is down or busy, the
   clock is off; the start waits 5 seconds, doubling to 5 minutes, and tries again.
-- **`--check`** (`storage`, `daemon`, `storage-and-daemon`): checks the host and exits without
+- **`--check`** (`storage`): checks the host and exits without
   starting or enrolling anything. 0 for a valid `kbf.toml` with its token file and no `node.json`
   yet, or an enrolled node that covers the mode; 2 for a bad config, a missing token file or a
   `node.json` that does not cover the mode.
@@ -41,14 +41,13 @@ lists the mode's flags. There is no `node` mode and no `enroll` word.
 - **The files.** `crates/kbf-integration-test/tests/package_units.rs` reads every packaged
   unit with the same unit parser the docs check uses (`kbf_unitfile`, systemd's reading:
   continuations, the last assignment wins, an empty assignment resets a list) and holds it to
-  the rules below. Each rule has a mutant in that test (a defect planted in a copy of the real
+  the rules below. Each rule has a negative case in that test (a defect put into a copy of the real
   file that the rule must name), and a rule added without one fails the test.
 - **The host.** `kbf --mode=<mode> --check`, which the units run as an `ExecStartPre=` (and
   every start runs again), reads what only the host knows, as the process that will run: the
   directories above a `file://` `--hot-store` can be entered (`traverse`), the cgroup keeps
-  every CPU and NUMA node of the node (`cpuset`), and a build node's environment holds no
-  `AWS_*` variable and the cold store's key file, if there is one, is owned and moded as its mode
-  needs (`credential`). The code is `crates/kbf-cli/src/preflight`; a problem prints on standard
+  every CPU and NUMA node of the node (`cpuset`), and the cold store's key file, if there is one,
+  is owned and moded as its mode needs (`credential`). The code is `crates/kbf-cli/src/preflight`; a problem prints on standard
   error and exits 2 (a restart cannot fix it) or 75 (it may heal).
 - **The flags.** Whether `kbf` takes a unit's flags is `kbf --mode=<mode> --check`'s
   answer, and `crates/kbf-cli/tests/package_units.rs` parses each packaged unit's flags with
@@ -64,27 +63,20 @@ checked by the package test.
 | `continuation` | a comment line inside a continued directive (below) |
 | `exec` | an `ExecStart=` that runs a program outside the installer's tree, or another mode than the unit's name |
 | `slice` | a unit not in `kbf.slice` |
-| `delegate` | a mode that runs builds without `cpu`, `cpuset`, `memory` and `pids` delegated, or with one of them in `DisableControllers=` |
-| `cpuset` | `AllowedCPUs=` or `AllowedMemoryNodes=` on a mode that runs builds, or on `kbf.slice`: the daemon places leases on every CPU and NUMA node of the node |
-| `caps` | a mode that runs builds (`daemon`, `storage-and-daemon`, `all-in-one`) with `MemoryMax=`, `MemoryHigh=`, `CPUQuota=` or `AllowedCPUs=` on its unit: builds are capped by the daemon's own `actions/memory.max`, and a limit on the unit caps the supervisor with them |
-| `swap` | a mode that runs builds with `MemorySwapMax=` on its unit: its leases live in the unit's cgroup and may swap |
-| `oom` | a mode that runs builds without an integer `OOMScoreAdjust=` below 0, the build containers' score (a host-wide OOM kill takes the highest score first) |
+| `delegate` | a `kbf.slice` with `DisableControllers=` set: a slice cannot delegate, and a controller it disables is off for every unit under it |
+| `cpuset` | `AllowedCPUs=` or `AllowedMemoryNodes=` on `kbf.slice`: the node's own set is a per-host drop-in, never the static file |
+| `swap` | a mode unit without `MemorySwapMax=0`: a storage node or frontend answering from swap slows everything on the host |
 | `credential` | a key given to the unit any way but `kbf.toml`: an `EnvironmentFile=`, an `Environment=` naming a key, secret, token or password, a systemd credential, or an ordering after a MinIO unit |
 | `restart` | a mode unit without `Restart=on-failure`, `RestartSec=5` and, in `[Unit]`, `StartLimitIntervalSec=0`: systemd's defaults (100 ms, 5 starts in 10 s) end a quickly repeating failure in `start-limit-hit` with the unit down. `on-failure` restarts no clean exit, so a frontend that was drained and stopped by an operator stays down |
-| `stop` | a mode that drains on SIGTERM (every mode but `daemon`, which has a finite stop) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
-| `kill-mode` | a mode that runs builds (`daemon`, `storage-and-daemon`, `all-in-one`) without `KillMode=mixed`: with the default `control-group` a stop sends SIGTERM to the actions in their sub-cgroups together with the daemon, and the drain ends at once |
+| `stop` | a mode that drains on SIGTERM without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 
 The test has more rules than these (`install`, `network`, `gate-*`, `user`, `nofile`,
 `notify`, `conflicts`, `memory`, ...); its header lists what each catches.
 
-**`delegate`.** systemd reads `Delegate=` this way (systemd.resource-control(5), and
-`config_parse_delegate` in systemd's `src/core/load-fragment.c`): a boolean delegates
-every controller (`yes`) or none (`no`); a list adds its controllers to the ones
-already delegated; an empty value turns delegation on with no controller. So
-`Delegate=yes` followed by `Delegate=memory` still delegates every controller, cpuset
-among them, and the rule passes it. A slice cannot delegate: systemd enables on
+**`delegate`.** A slice cannot delegate: systemd enables on
 `kbf.slice` every controller a unit under it delegates, unless the slice's
-`DisableControllers=` lists it. The slice sets only `MemoryMin=`.
+`DisableControllers=` lists it. The packaged slice sets no controller and no `MemoryMin=`: that
+value is per host, written into a drop-in.
 
 **`continuation`.** systemd.syntax(7): "When a comment line or lines follow a line
 ending with a backslash, the comment block is ignored, so the continued line is
@@ -99,9 +91,7 @@ one inside.
 
 A mode's flags are its section of `kbf.toml` (`kbf --mode=<mode> --help` lists them;
 `crates/kbf-cli/tests/golden/kbf-<mode>.toml` is one full file per mode); the unit only
-names the mode, the user it runs as, its limits and its restart and stop behavior. A
-daemon's `--server` must name the frontend (the name in the frontend's worker certificate),
-not the node itself: dialing its own address, where nothing listens, it never registers.
+names the mode, the user it runs as, its limits and its restart and stop behavior.
 
 ### A listen address that appears late
 
@@ -110,36 +100,33 @@ on one (a listener's address in `kbf.toml`) can be missing for a few seconds aft
 fails with "address not available". kbf retries that one error, and only that one, for up
 to 90 seconds (250 ms, doubling to 2 s between attempts, each wait logged with the
 address), within the frontend unit's `TimeoutStartSec=420`; every other bind error (address in use,
-permission) is at once fatal. This covers every listener of `frontend`, `storage`,
-`storage-and-daemon` and `all-in-one`. To order a unit after the service that brings the
+permission) is at once fatal. This covers every listener of `frontend` and `storage`. To order a unit after the service that brings the
 address up (`tailscaled.service`, say), put `After=` and `Wants=` in a systemd drop-in on
 the host, `/etc/systemd/system/<unit>.d/after.conf`; the packaged units carry no option for it.
 
 ### A frontend name that does not resolve yet
 
-The frontend's name (a daemon's `--server`, a storage node's `--frontend`) can be a name that a VPN or overlay network's resolver answers, and
+The frontend's name (a storage node's `--frontend`) can be a name that a VPN or overlay network's resolver answers, and
 that resolver may start after `network-online.target`. A failed lookup at start does not end
-either half of `storage-and-daemon`: the storage half's channel to `--frontend` is lazy, so
+`storage`: its channel to `--frontend` is lazy, so
 the lookup is part of its first registration, and a failed registration waits (1 s, doubling
-to 30 s, each wait cut by a random share of up to half, as the daemon's is, so nodes that lost
+to 30 s, each wait cut by a random share of up to half, so nodes that lost
 one frontend do not return in step) and tries again until the frontend answers, before it opens its
-cache; the daemon half resolves `--server` at every connection round, reports a failed
-lookup as a failed attempt, waits and resolves again, and never stops trying. (`daemon`
-does the same.) A node that cannot find its frontend therefore stays up and logs each
+cache. A node that cannot find its frontend therefore stays up and logs each
 failure; it is not restarted by systemd, and needs no restart when the resolver comes up.
 To order the unit after the resolver's service anyway, so the first tries are not
 wasted, use a drop-in on the host (`/etc/systemd/system/<unit>.d/after.conf` with
 `After=tailscaled.service` and `Wants=tailscaled.service`, say).
 
-`storage` and `storage-and-daemon` units are not ordered after a MinIO unit: their cold
+The `storage` unit is not ordered after a MinIO unit: its cold
 store is an `s3://` endpoint that need not be on the host, and `After=` on a unit that
 does not exist does nothing. On a host with a local MinIO, order the unit after it in a drop-in
 (`/etc/systemd/system/<unit>.d/after.conf` with `After=` and `Wants=`). (The converged `kbf-server.service` still starts after `MINIO_UNIT`.)
 
 ### Exit 2 and exit 75: what systemd restarts
 
-A start that fails exits 2 or 75. The `storage`, `storage-and-daemon` and `all-in-one`
-units carry `RestartPreventExitStatus=2` and `RestartSec=5`, so exit 2 stays down and exit 75
+A start that fails exits 2 or 75. The `storage`
+unit carries `RestartPreventExitStatus=2` and `RestartSec=5`, so exit 2 stays down and exit 75
 (`EX_TEMPFAIL`) is started again five seconds later, below systemd's default start limit
 (five starts in ten seconds).
 
@@ -151,8 +138,8 @@ units carry `RestartPreventExitStatus=2` and `RestartSec=5`, so exit 2 stays dow
   or cold-store directory held by a process that is still stopping (its `LOCK`), a file
   system call that failed because the device was busy, read-only or full, and a
   registration whose boot the node's metadata log has set already (`StaleWriter`, below: only a node that did not report its history, or one past the clamp).
-  A frontend or daemon that fails to start is not covered: `frontend` and `kbf-server`
-  exit 2 for every start error, and the daemon half's own codes are unchanged. The
+  A frontend that fails to start is not covered: `frontend` and `kbf-server`
+  exit 2 for every start error. The
   exceptions are the `frontend` mode's state store, below: a Postgres that stays down for
   all of `--state-store-wait-secs` exits 1; and its `file://` `--history-objects`
   directory: a frontend whose directory another process still holds (its `LOCK`) does not
@@ -193,8 +180,7 @@ gets `--state-store`, a `postgres://` URI, from `kbf.toml` (`kbf-installer setup
 as `postgres:///kbf?host=/run/postgresql&user=kbf-server` unless `--database` gives another,
 and makes that role and database on the host), and it has no default: a
 frontend given none exits 2 naming the flag, and `kbf --mode=frontend --check`, which the
-unit runs before the start, exits 2 the same way. (`all-in-one` alone has a default, the
-host's socket, `postgres:///kbf?host=/run/postgresql`.) A `sqlite://` URI still starts in
+unit runs before the start, exits 2 the same way. A `sqlite://` URI still starts in
 this release and logs a warning that SQLite is removed in the next (see the upgrade notes).
 The URI carries no password (kbf refuses one: the command line is readable by every user on
 the node), so the database is reached by the socket or by the server user's own role. The
@@ -238,18 +224,18 @@ it is a roll of one frontend at a time (below).
 **The epoch, and a restore from a backup.** The state store holds the farm's epoch
 (`meta/epoch`), and a frontend that starts keeps it: a restart of a frontend, or the start
 of another one over the same store (several frontends sharing one Postgres), does not change
-it, so a daemon that reconnects keeps the runs of the leases it holds. The ids are kept the
+it, so a worker that reconnects keeps the runs of the leases it holds. The ids are kept the
 same way: a frontend reserves blocks of 1024 operation ids and lease sequences in the store
 and numbers inside them, so a restarted or a second frontend never hands out an id another
 took, and a restart skips the unused rest of its block.
 
-A database restored from a backup holds the epoch of the backup, while the daemons may hold
+A database restored from a backup holds the epoch of the backup, while workers may hold
 leases the lost history granted after it. Raise the epoch so they drop those leases:
 
-1. Restore the database and start the frontend over it. No daemon may reach any frontend
-   of the store until the restart in step 3 is done: keep the daemons' units stopped, or the
-   frontend's worker listener closed. The frontend serves the restored epoch and numbers
-   leases from the restored counters, so a daemon that reaches it meanwhile keeps its runs
+1. Restore the database and start the frontend over it. No worker may reach any frontend
+   of the store until the restart in step 3 is done: keep the frontends that placed work
+   stopped, or the frontend's worker listener closed. The frontend serves the restored epoch and numbers
+   leases from the restored counters, so a worker that reaches it meanwhile keeps its runs
    and can be granted a lease id (epoch and sequence) that the lost history granted to
    another run.
 2. On the frontend's host, run `kbf cluster epoch-bump --token-file F` (`POST
@@ -257,16 +243,16 @@ leases the lost history granted after it. Raise the epoch so they drop those lea
    bump, the one stored now, and the one this frontend serves.
 3. Restart each frontend. A running frontend goes on serving the epoch it started under
    (it logs a warning once its next look at the store finds the newer one); the
-   one that starts after the bump serves the stored one, and a daemon that reaches it kills
+   one that starts after the bump serves the stored one, and a worker that reaches it kills
    the runs of the leases it held and lists none, and the operations run again from the
-   restored queue. Start the daemons' units after it.
+   restored queue.
 
 Bump only when the history was lost or replaced: a bump with no restore costs every run in
 flight.
 
-A SQLite state file (`all-in-one`, or a single frontend) is restored with `kbf-deploy state
+A SQLite state file (a single frontend) is restored with `kbf-deploy state
 restore --apply`, and its start keeps the epoch too, so the same steps follow it: start the
-frontend over the restored file with no daemon able to reach it, run `kbf cluster
+frontend over the restored file with no worker able to reach it, run `kbf cluster
 epoch-bump`, then restart the frontend.
 
 ### Updating a frontend without failing a build
@@ -330,12 +316,12 @@ it out on its own health check and its connections' GOAWAY (the order and each p
    Under `--executor js-agent`, a job still queued on the job service when step 3 closes the
    intake (no host took it) is cancelled and its lease given up, its operation queued again
    for the next frontend: nothing of it ran, and the queue may never move (every host out of
-   service). Its stream is kept while a daemon session of another frontend could run the
+   service). Its stream is kept while a worker of another frontend could run the
    operation (that frontend takes it from the state store and answers it), and ended
    `UNAVAILABLE` when none could, which fails that action (Buck2 never re-attaches). A job a
    host has placed, or is running, is waited for.
-5. The worker streams that are left end `UNAVAILABLE` (daemons dial another frontend through
-   the load balancer, which keeps their leases), and the process exits 0. Only a forced stop
+5. The worker streams that are left end `UNAVAILABLE` (storage nodes register with another
+   frontend through the load balancer), and the process exits 0. Only a forced stop
    (below) leaves client streams open at this step, and ends them `UNAVAILABLE`. It is not undone: what starts in its place is a new process.
 
 No build is cut by the drain: an action that runs for hours is waited for, and the frontend
@@ -351,14 +337,7 @@ to hand its work to: its queued operations that have not started wait with the r
 
 ### Stopping a frontend: TimeoutStopSec=infinity
 
-On SIGTERM kbf's frontend drains (the sequence above; `all-in-one`'s drains at once: it
-refuses new Execute calls, which Buck2 retries elsewhere, and keeps every open Execute and
-WaitExecution stream until its action is done, except a stream whose operation was never
-started, that no worker on this frontend can run and that no other frontend can take,
-which ends UNAVAILABLE when the drain begins: Buck2 retries only
-the opening of a call, so an ended stream fails that action; the daemon half of `all-in-one`
-drains after its server half has no execution open and the process exits when its leases have
-ended and been acknowledged, see [kbf-modes.md](kbf-modes.md#stopping-and-draining)); `--shutdown-timeout-secs` is 0, no
+On SIGTERM kbf's frontend drains (the sequence above). `--shutdown-timeout-secs` is 0, no
 deadline, by default, and a frontend over a state store has no other bound: its
 `--drain-deadline`, when set, only reports. A `--shutdown-timeout-secs` above 0 ends a drain
 that a signal began when it runs out, as a second signal does, and fails the builds still
@@ -366,52 +345,20 @@ open: it is the operator's hard stop, so leave it at 0 unless a stop must be for
 Buck2 never recovers a stream that breaks mid-action, so a stop that ends the drain
 fails every build in flight. systemd kills a unit with SIGKILL when `TimeoutStopSec=`
 runs out, 90 s (`DefaultTimeoutStopSec=`) when the unit gives none. So both units have
-`KillSignal=SIGTERM` and `TimeoutStopSec=infinity` (so do `storage` and
-`storage-and-daemon`: a storage node finishes its large Writes at stop, and systemd's
-90 s default would cut them), and rule `stop` of the package test refuses either
+`KillSignal=SIGTERM` and `TimeoutStopSec=infinity` (a storage node finishes its large Writes
+at stop, and systemd's 90 s default would cut them), and rule `stop` of the package test refuses either
 missing or changed: it reads `TimeoutSec=` too (it sets the stop timeout as well; the
 last of the two wins) and the drop-ins. It asks for the word `infinity`: `0` means no
-timeout to systemd as well, but reads as "at once" to a person. The daemon unit is the same:
-it drains on SIGTERM until every lease has ended, however long that takes (a drain never
-ends because time ran out; `--drain-deadline-secs`, if set, only logs a warning with the
-number of leases still running), so it has `KillSignal=SIGTERM` and
-`TimeoutStopSec=infinity`. A second SIGTERM, or `systemctl kill`, is the operator's hard
-stop for a drain that must end now.
+timeout to systemd as well, but reads as "at once" to a person. A second SIGTERM, or
+`systemctl kill`, is the operator's hard stop for a drain that must end now.
 
-The three units that run the daemon (`daemon`, `storage-and-daemon`, `all-in-one`) also
-set `KillMode=mixed`. The actions run in sub-cgroups of the unit, and the default
-`control-group` sends SIGTERM to every process in it, so a stop would end them within
-seconds and defeat the drain. With `mixed` SIGTERM goes to the daemon alone, which waits
-for the leases; a second signal makes it end the leases still running itself, and systemd
-sends SIGKILL only to what remains after the main process has exited.
+### The storage node and the cold store's key
 
-### storage-and-daemon and the cold store's key
-
-One unit and one process (the daemon half reads and writes the node's storage
-in-process, one cache on the SSD; architecture-v2.md, sections 1 and 10). The unit reads
+One unit and one process (one cache on the SSD; architecture-v2.md, sections 1 and 10). The unit reads
 the cold store's key from no `EnvironmentFile=`: `kbf.toml` names where `kbf` gets it, and
 rule `credential` of the package test refuses every other way of giving a key to a unit.
-On the node, `kbf --mode=storage-and-daemon --check` refuses a key file another user owns
-or others can read (`crates/kbf-cli/src/preflight/credential.rs`).
-
-The design keeps the key from builds by uid (sections 9 and 15): the key file the unit's
-user's alone and each action a subordinate id of that user (the container driver's
-`--userns=nomap`), with a test that an action cannot read the key. That test does not
-exist yet, and the unit runs as the build user, which can read the key from the process's
-environment. So this unit is for a trusted network only, as all-in-one is.
-
-## all-in-one is for a trusted box
-
-`kbf all-in-one` runs builds in the process that holds the farm's state and its cold
-store, as one user. The container driver runs each action as a subordinate id of that
-user (`--userns=nomap`), but no test yet proves an action cannot read what the user
-holds (architecture-v2.md, section 9). Until one does, use it on a trusted single box or
-for development only.
-
-Its cold store is a `file://` directory, the single box's shape (section 11), so
-the unit holds no cold-store key and rule `credential` applies to it. The default
-state store of `kbf all-in-one` is Postgres on the host's socket
-(`postgres:///kbf?host=/run/postgresql`).
+On the node, `kbf --mode=storage --check` refuses a key file another user owns
+or others can read (`crates/kbf-cli/src/preflight/credential.rs`). The unit runs as `kbf-server`.
 
 ## A node's certificate
 
@@ -422,7 +369,7 @@ new modes' mutual TLS from the one CA, each with exactly one role, by this table
 |---|---|---|---|
 | `frontend-worker` | `frontend` | serverAuth, clientAuth (it also calls storage) | the frontend's names |
 | `storage` | `storage` | serverAuth, clientAuth (replication calls) | the node's names: DNS or IP names covering the host of `--advertise-addr` (the bound address without it), which is also the node's instance id; a frontend refuses `Register` and `Heartbeat` from a storage certificate that does not cover it. A wildcard name covers nothing |
-| `daemon` | `daemon` | clientAuth | exactly one DNS name, the node id |
+| `daemon` | `daemon` | clientAuth | exactly one DNS name, the node id (no node of this release holds this role; the row stays so that a certificate of an earlier release can be checked) |
 
 The frontend's REAPI listener, the name clients dial, presents a certificate that is not
 the farm CA's, so it has no row and `verify-cert --row frontend-reapi` is refused (exit 2).
@@ -434,6 +381,8 @@ before a unit is pointed at it:
 kbf-deploy linux verify-cert --row storage --cert storage.pem --ca-cert ca.pem
 kbf-deploy linux verify-cert --row daemon --cert node.pem --ca-cert ca.pem --node-id node-1
 ```
+
+The second line checks a certificate of the `daemon` role, which an earlier release issued.
 
 - `role`: the subjectAltName holds exactly one URI `urn:kbf:role:<role>`, the row's.
   A storage node reads the same URI to admit each call (architecture-v2.md, section 9);
@@ -497,13 +446,12 @@ is not ready yet (a restart may help). `kbf check-args` is gone.
 
 ## Enrollment is part of the start
 
-`kbf --mode=storage`, `--mode=daemon` and `--mode=storage-and-daemon` (or `kbf` alone with
+`kbf --mode=storage` (or `kbf` alone with
 `mode = "..."` in the file; a flag overrides the file and the start says so) enroll the host
 themselves. There is no `node` mode and no `enroll` word.
 
 - First start, with `enroll.token_file` set and no `node.json`: the start makes the key,
-  sends the token and a CSR for the roles the mode needs (storage: storage; daemon: daemon;
-  storage-and-daemon: both) and writes `node.json`. The tables `[storage]` and `[daemon]`
+  sends the token and a CSR for the role the mode needs (storage: storage) and writes `node.json`. The tables `[storage]` and `[daemon]`
   are settings only; they never choose roles.
 - Later starts renew without the token. A token that lacks a needed role, or a `node.json`
   whose roles do not cover the mode, exits 2 and names both; the host is never enrolled
@@ -519,5 +467,5 @@ The `kbf` package installs the unit of each mode; `kbf-installer setup` enables 
 ([kbf-installer-setup.md](kbf-installer-setup.md)); `kbf-deploy linux install-units` is
 retired. There is no uninstall for a mode's unit yet. A node moving from the converged units
 (`kbf-server.service`) to `kbf-storage.service` stops the old ones first
-(`systemctl disable --now kbf-daemon.service kbf-server.service`): both would hold the
+(`systemctl disable --now kbf-server.service`): both would hold the
 same directories.

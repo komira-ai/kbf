@@ -64,7 +64,7 @@ image tag as a job ([containers.md](containers.md#the-frontend)).
 ## Two frontends
 
 `fe-a` and `fe-b` are two containers of the same attested frontend image
-([containers.md](containers.md#verify-and-import): verify and import it first). Each has:
+([containers.md](containers.md#verify-and-import-k3s): verify and import it first). Each has:
 
 - `--network host` and every listener on loopback, with ports of its own. A frontend binds
   `--listen` (REAPI), `--worker-listen`, `--api-listen` (the operator API; off unless given) and

@@ -189,7 +189,7 @@ socket mode 0660. Two controls, the first being the one that matters:
      driver therefore gives every container a user namespace that maps the daemon
      user's subordinate ids and nothing of the daemon user
      (`crates/kbf-driver-container/src/oci/mod.rs`, `DaemonIds::action_mappings`), so
-     no container uid or gid maps to the daemon's ([daemon.md](daemon.md), User
+     no container uid or gid maps to the daemon's (`daemon.md`, deleted with kbf-daemon, User
      namespaces). The helper refuses to start on a Linux node whose daemon uses
      `--driver native`.
 2. **Every connection's caller is checked.** This guards against stray binaries and

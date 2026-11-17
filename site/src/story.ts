@@ -101,7 +101,7 @@ function memPanel(M: MemData): void {
   );
   say(
     'real-oom',
-    'Separately, on the kbf farm itself the daemon logged ' + num(M.oom) + ' of ' + num(M.actions) +
+    'Separately, on the kbf farm itself the earlier daemon logged ' + num(M.oom) + ' of ' + num(M.actions) +
       ' actions in these builds as killed for memory. They are in neither scheme: the peak recorded for a killed action is where it was stopped, not what it needed.',
   );
 

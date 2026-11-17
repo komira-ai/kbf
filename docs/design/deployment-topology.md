@@ -1,5 +1,7 @@
 # Deployment topology
 
+> **kbf-daemon is deleted.** The daemon and its `--server` list are gone with it; sections that say how daemons reach servers are records. Placed actions run only as js-agent jobs, and a storage node runs `kbf --mode=storage`.
+
 This document records the shape the maintainers decided for running kbf with more
 than one `kbf-server`: where servers run, where their durable state lives, how build
 clients reach them, and how daemons reach them. Most of it is **planned**. The
@@ -192,7 +194,7 @@ Daemons do not go through the client front.
   per server, or a list of addresses (or names). The daemon dials them directly,
   over the worker listener's mutual TLS ([worker-protocol.md](worker-protocol.md)).
   This is built: `--server` is repeatable and each host is resolved again on every
-  round of attempts ([daemon.md](daemon.md#reaching-a-server)).
+  round of attempts (`daemon.md`, deleted with kbf-daemon).
 - It holds **one** worker stream, to the leader.
 - **The redirect.** A follower that receives a daemon's session does not serve it:
   it ends the `Session` stream with a status that names the leader, and the daemon
@@ -202,7 +204,7 @@ Daemons do not go through the client front.
   stream ends, or no server names a leader, it tries the next server, and after a
   pass over all of them it waits and starts again, with a backoff that grows to a
   bound and stays there. Only a stop signal ends the daemon. This is built
-  ([daemon.md](daemon.md#reaching-a-server)): the bound is `--reconnect-max-ms`, and
+  (`daemon.md`, deleted with kbf-daemon): the bound is `--reconnect-max-ms`, and
   an `UNAVAILABLE` answer moves the daemon to the next address at once. The redirect
   above is not.
 - **A failover keeps running leases.** `Welcome.epoch` names the replicated log,
@@ -274,7 +276,7 @@ because there a runaway build cannot press on the farm's state. What changes:
 | Readiness | `GET /healthz` and `GET /readyz` on the operator API listener (`--api-listen`; [api.md](../api.md#get-healthz-and-get-readyz)). `/readyz` is 503 once a stop signal arrives, when a read-only store probe fails or times out, and when the server does not hold the scheduler role, a flag a single server always holds. There is one readiness path. The REAPI listener serves `grpc.health.v1.Health` with `/readyz`'s answer, the same for every service name ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)) | two readiness paths: the Raft role sets the leader flag, so `/readyz` is 200 only on the leader; a second path, not yet named, is 200 on any synced server; `grpc.health.v1` gives the same two answers ([above](#build-clients-one-name-routed-by-method)) |
 | Reads and uploads on followers | none: one server serves every call, and the cache commits its own metadata | at three servers, any synced server serves `ByteStream.Read`, `BatchReadBlobs`, `FindMissingBlobs` and `GetActionResult` from its applied state, and writes upload bytes to the object store before sending the leader the metadata commit; a read index where a stronger guarantee is needed ([above](#reads-and-uploads-on-every-server)) |
 | Follower redirect | none: there are no followers, and `kbf.worker.v1` has no redirect | a follower ends a daemon's session with a status naming the leader; one that knows no leader answers `UNAVAILABLE` |
-| Daemon's servers | one or more `--server` URLs, each host resolved again every round (a DNS name may carry a record per server); the daemon tries every address in turn, moving on at once after a refused connection, a TLS failure or `UNAVAILABLE`, and waits a jittered, doubling time, at most `--reconnect-max-ms` (30 s), between failed rounds; it never stops trying ([daemon.md](daemon.md#reaching-a-server)). No redirect is followed: there is none to follow | the daemon follows a follower's redirect and dials the leader it names |
+| Daemon's servers | one or more `--server` URLs, each host resolved again every round (a DNS name may carry a record per server); the daemon tries every address in turn, moving on at once after a refused connection, a TLS failure or `UNAVAILABLE`, and waits a jittered, doubling time, at most `--reconnect-max-ms` (30 s), between failed rounds; it never stops trying (`daemon.md`, deleted with kbf-daemon). No redirect is followed: there is none to follow | the daemon follows a follower's redirect and dials the leader it names |
 | Client front | proven only with `tailscale serve` in its HTTPS mode, on the server's host, in front of a loopback REAPI listener (pull request [#246](https://github.com/komira-ai/kbf/pull/246); see the [Security model](../../ARCHITECTURE.md#security-model)); it routes by nothing, as there is one server | a tailnet ingress and an HTTP/2 proxy that routes by gRPC method, after the probes below pass |
 | REAPI listener TLS | `--reapi-tls-cert` and `--reapi-tls-key` serve the REAPI listener over TLS with a server certificate only; without them it serves plain text. The `--reapi-auth-policy` layer runs on either | the proxy-to-server hop over TLS with an internal-CA certificate on every server whose proxy is on another host, which clients on the private network may also use to reach a server directly The certificate and key are re-read every `--tls-reload-interval-secs`, so a renewal replaces the files and never restarts the server ([tls-renewal.md](../deploy/tls-renewal.md)) |
 | Node registry | in the server's memory: a node whose stream closed stays listed with `connected: false` until the server restarts, and gets no work once it has not been heard from for G; a restart forgets every node. `kbf-alert` exists, but nothing raises alerts yet | durable, as [above](#a-durable-node-registry) |
@@ -309,7 +311,7 @@ what of each decision is on `main`; the rest is **planned**.
 | Question | Decision | Built |
 |---|---|---|
 | What a failover keeps | running leases: `Welcome.epoch` names the replicated log, and daemons resend their results to the new leader ([daemons](#daemons-straight-to-the-servers-one-stream-to-the-leader)) | none: under the in-memory metadata log (tests only) the epoch names the server process, so a restart drops every running lease; under the Raft metadata log it names the log, so a restart drops none, but the new process refuses their results |
-| How the daemon is told the servers | one DNS name with a record per server, or a list of addresses | both: `--server` is repeatable, and each host is resolved again every round ([daemon.md](daemon.md#reaching-a-server)) |
+| How the daemon is told the servers | one DNS name with a record per server, or a list of addresses | both: `--server` is repeatable, and each host is resolved again every round (`daemon.md`, deleted with kbf-daemon) |
 | The redirect's form | a status on the ended `Session` stream naming the leader; a follower that knows no leader answers `UNAVAILABLE` and the daemon tries the next server; daemons retry forever, with a bounded backoff | the daemon's side but the redirect: it moves to the next address on `UNAVAILABLE` and retries forever with a backoff bounded by `--reconnect-max-ms`. No server sends a redirect, and the daemon follows none |
 | Readiness on a follower | the two readiness paths, plus `grpc.health.v1` on the REAPI listener ([build clients](#build-clients-one-name-routed-by-method)) | `grpc.health.v1` on the REAPI listener, with `/readyz`'s one answer ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)); the second readiness path is not |
 | The proxy-to-server hop | TLS with a certificate from an internal CA, which clients may also use to reach the servers directly ([build clients](#build-clients-one-name-routed-by-method)) | the REAPI listener's TLS: `--reapi-tls-cert` and `--reapi-tls-key` serve it with a server certificate, and `grpc.health.v1` is served over that TLS too. No proxy is deployed in front of it yet |

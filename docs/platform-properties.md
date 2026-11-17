@@ -43,10 +43,12 @@ One property sent under two spellings of its name (`gpu` and `GPU`, `OSFamily` a
 through two names (`OSFamily` and `os`, `ISA` and `arch`). A name kbf does not know,
 in any case, is not acted on.
 
-`container-image` is the one exception: it is read by the Linux container driver, not
-by the scheduler, and only in exactly that spelling. `Container-Image` is a name kbf
-does not know, so the action is scheduled as if it named no image, and the container
-driver then refuses it ("the action names no container-image platform property").
+`container-image` is the one exception: it is read by the executor (`--executor js-agent`),
+not by the scheduler, and only in exactly that spelling. It names the base environment the
+Command sees; an action that names an image other than the executor's base image is refused as
+invalid, and one that names none gets the base ([kbf-modes.md](deploy/kbf-modes.md)).
+`Container-Image` is a name kbf does not know, so the action is scheduled as if it named no
+image.
 
 ## Where an action runs
 
@@ -67,7 +69,7 @@ platform(
 )
 ```
 
-An action no kbf daemon can ever run (an `OSFamily` other than Linux or macOS, an `ISA`
+An action no worker can ever run (an `OSFamily` other than Linux or macOS, an `ISA`
 of another architecture) is refused at once with `FAILED_PRECONDITION`. An action that
 no connected worker satisfies now waits: its operation stays `QUEUED`, and its metadata
 carries a `google.rpc.ErrorInfo` (reason `NO_WORKER_CAN_RUN`, domain `kbf`) whose `why`
@@ -94,10 +96,9 @@ with one GPU runs one `gpu=1` action at a time; work that asks for no GPU still
 shares the worker's CPUs and memory beside it.
 
 A worker reports how many GPUs it has in the `gpu` entry of its node report; a report
-without one has none. The daemon counts them on Linux from the PCI functions in
-`/sys/bus/pci/devices`: each NVIDIA or AMD VGA-compatible or 3D controller is one
-GPU. A server's management-controller VGA function and integrated graphics do not
-count. The `gpu` entry is a `kbf-daemon` node's; a macOS action runs as a js-agent job
+without one has none. The virtual workers of the executor report none (a job books no GPU),
+so a `gpu=N` action waits and then fails as described under
+[Where an action runs](#where-an-action-runs). A macOS action runs as a js-agent job
 ([actions-as-jobs.md](design/actions-as-jobs.md) section 14) and books no GPU slot.
 
 In Bazel:
@@ -117,14 +118,12 @@ the memory ladder), or what
 `kbf-book-cpus` and `kbf-book-mem-gib` name, plus its `gpu` GPUs. A `whole_machine`
 lease books every core, byte of memory and GPU of its worker, and runs there alone.
 
-A lease goes only to a worker whose node report lists a driver for its kind: `container`,
-`native` or `fake` (or the test-only `local`) for `action`, `native-whole-machine` for
-`whole_machine` (see
-[capabilities.md](design/capabilities.md#driver-entries)). No `kbf-daemon` runs
-`native-whole-machine` (a Mac runs no `kbf-daemon`; the executor's workers list it), so on a
-farm without such a worker a `whole_machine` action waits with the reason and then fails, as
-described under [Where an action runs](#where-an-action-runs). A macOS action runs as a
-js-agent job ([actions-as-jobs.md](design/actions-as-jobs.md) section 14).
+A lease goes only to a worker whose node report lists a driver for its kind: `container` for
+`action`, `native-whole-machine` for `whole_machine` (see
+[capabilities.md](design/capabilities.md#driver-entries)). The virtual workers of a Linux
+executor list both; on a farm without such a worker an action waits with the reason and then
+fails, as described under [Where an action runs](#where-an-action-runs). A macOS action runs
+as a js-agent job ([actions-as-jobs.md](design/actions-as-jobs.md) section 14).
 
 A `whole_machine` lease waits for a worker that holds no lease. While it waits it holds
 one worker that could run it, and work queued after it at the same or a lower QoS is
@@ -169,27 +168,21 @@ an ordinary `action`, climbing the memory ladder, with no claim on a worker. A r
 needs exactly one action per worker (a benchmark) must not restart the server, and
 a restart during one invalidates it. The setting works on both scheduler cores.
 
-The booking also sets the memory the action may use. The native driver (plain processes on Linux) kills an
-action whose processes together hold more than 150% of its booked memory plus 512 MiB:
-6.5 GiB for the default booking, 12.5 GiB for `kbf-book-mem-gib=8`. A large `swiftc` or
-`ld` step that dies at 2 GiB needs a larger booking. The container driver gives the
-lease the same limit as a hard cap on its RAM (`memory.max`, swap allowed), and its
-CPU weight, from the booking; a lease that keeps pressing that cap while its swap
-keeps rising, and that holds more than 512 MiB or 25% of its booking in swap,
-whichever is more (the node's defaults), is killed as out of memory.
+The booking also sets the memory the action may use. The executor submits the job with the
+memory the farm booked as a hard cap of 1.5 times the booking plus 512 MiB (6.5 GiB for the
+default booking, 12.5 GiB for `kbf-book-mem-gib=8`), so a large `swiftc` or `ld` step that
+dies at 2 GiB needs a larger booking.
 
-The booking is where an action starts, not always where it runs. When a daemon reports
-that the action passed its own memory limit, the server runs it again one rung up a
+The booking is where an action starts, not always where it runs. When a job ends because the
+action passed its own memory limit, the server runs it again one rung up a
 fixed ladder, 4, then 16, then 32 GiB, then a whole host (the largest node that could
 run it, so that no other lease shares it; the rungs are the server's
 `--memory-ladder-gib`). A size named here climbs from where it is: a killed 6 GiB ask
 runs again with 16 GiB. The server remembers the raised booking for the action (its instance name and action digest), so
 the next run of the same action starts there; only a kill at the largest node reaches
 the client, as `FAILED_PRECONDITION` saying the action needs more memory than any node
-offers. A node that kills the action under its own memory pressure reruns it with the
-same booking. See [scheduler.md](design/scheduler.md#memory-kills). Both drivers say
-which memory ran out: the native driver's memory watch and the container driver's
-lease cap are the action's own limit.
+offers. A job the host kills under the host's own memory pressure is rerun with the
+same booking. See [scheduler.md](design/scheduler.md#memory-kills).
 
 ```starlark
 # Bazel: a link step that needs 4 cores and 12 GiB
@@ -212,17 +205,15 @@ ask for a worker whose whole machine has at least that much and book nothing.
 
 ## macOS, Xcode, simulators, VMs and iOS devices
 
-A macOS action runs as a js-agent job, not on a `kbf-daemon`
-([actions-as-jobs.md](design/actions-as-jobs.md) section 14): the Macs run no
-`kbf-daemon`, so no Mac reports the `xcode`, `vm.image`, `vm.slots`, `ios.device` or
-`gpu` entries of a daemon node report, and there is no `simulator` property. The server
-still reads those report keys (the wire fields stay), so an action that names `xcode`,
-`vm.image` or `ios.device` matches no worker: it waits and then fails as described under
-[Where an action runs](#where-an-action-runs). A `vm.image` value without a digest, a
-`vm.slots`, `vm.max_cpus` or `vm.max_mem_gib` key, a value of `ios.device` other than `1`,
-an `ios.device.<attribute>` without `ios.device=1`, and `kbf-lease=vm` are refused with
+A macOS action runs as a js-agent job
+([actions-as-jobs.md](design/actions-as-jobs.md) section 14). No worker reports the `xcode`,
+`vm.image`, `vm.slots`, `ios.device` or `gpu` entries of a node report, and there is no
+`simulator` property. The server still reads those report keys (the wire fields stay), so an
+action that names `xcode`, `vm.image` or `ios.device` matches no worker: it waits and then fails
+as described under [Where an action runs](#where-an-action-runs). A `vm.image` value without a
+digest, a `vm.slots`, `vm.max_cpus` or `vm.max_mem_gib` key, a value of `ios.device` other than
+`1`, an `ios.device.<attribute>` without `ios.device=1`, and `kbf-lease=vm` are refused with
 `INVALID_ARGUMENT`.
-
 
 ## `kbf-network`
 

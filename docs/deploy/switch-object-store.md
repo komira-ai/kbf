@@ -83,9 +83,9 @@ Each member has three names, and the walk uses each where it belongs:
 |---|---|---|
 | member id `<member id>` | `id` in `GET /v1/members` | `safe-to-stop`, `member` |
 | member address | `addr` in `GET /v1/members`: the host's `--advertise-addr`, or the address it binds | the member's row in `status`'s `convergence.nodes` (its `id` is this address) |
-| node id `<node>` | the host's `--node-id`, on a host whose unit also runs a daemon (`storage-and-daemon`) | `drain`, `undrain`, `GET /v1/nodes` |
+| node id `<node>` | the host's `--node-id`, on a host whose unit gives one | `drain`, `undrain`, `GET /v1/nodes` |
 
-A storage host with no daemon has no node id: skip the drain and the undrain for it.
+A storage host whose unit gives no `--node-id` has no node id: skip the drain and the undrain for it.
 
 For each member:
 
@@ -96,7 +96,7 @@ For each member:
    kbf cluster safe-to-stop <member id> --token-file /etc/kbf/api-token
    ```
 
-2. **Drain** the daemon node, and wait until `kbf cluster status` shows its placement `drained`.
+2. **Drain** the node, and wait until `kbf cluster status` shows its placement `drained`.
    The drain has no deadline: it waits for its leases however long they run.
 
    ```text
@@ -200,14 +200,14 @@ switch-object-store.sh --member ID,HOST[,NODE] [--member ...] [--connection NAME
 ```
 
 - `--member ID,HOST[,NODE]`, once per storage member, in the order to walk them: the member id,
-  the host `ssh` reaches it at, and the node id of the daemon its unit also runs (leave it out for
-  a storage host with no daemon).
+  the host `ssh` reaches it at, and the node id its unit names (leave it out for
+  a storage host whose unit names none).
 - `--connection`, `--endpoint`, `--expect-generation`: repoint first, then walk to the generation
   the repoint answered. Without them there is no repoint, and the walk restarts the members onto
   the registry's current generation.
 - `--migrate`: move each unit to `--cold-store registered` in its step (the section above).
   Without it, a unit that names a store URL stops the walk before anything is written.
-- `--unit` (default `kbf-storage-and-daemon.service`), `--token-file` (default
+- `--unit` (default `kbf-storage.service`), `--token-file` (default
   `/etc/kbf/api-token`), `--api` (default `127.0.0.1:8982`), `--poll-secs` (1 to 3600, default
   10), `--for-secs` (the planned-down window, 1 to 86400, default 900).
 
@@ -218,7 +218,7 @@ Before any write it checks every listed member, and stops on the first problem:
   (`NeedDaemonReload=no`);
 - the unit's effective `ExecStart` (what systemd will run) is the member: its `--advertise-addr`,
   or else its `--storage-listen`, is the member's address, and its `--node-id` is the node given
-  (a unit with `--node-id` and no node given is refused: its daemon would be restarted undrained);
+  (a unit with `--node-id` and no node given is refused: its node would be restarted undrained);
 - no drop-in names a store or sets `ExecStart=`: neither one systemd loaded (`DropInPaths`) nor
   any file in a drop-in directory of any of the unit's names (the section above);
 - its `--cold-store` is `registered`, or with `--migrate` a store URL that the rewrite can take
@@ -241,7 +241,7 @@ set -f
 
 API=127.0.0.1:8982
 TOKEN_FILE=/etc/kbf/api-token
-UNIT=kbf-storage-and-daemon.service
+UNIT=kbf-storage.service
 POLL_SECS=10
 FOR_SECS=900
 CONNECTION=

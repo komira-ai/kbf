@@ -1,5 +1,7 @@
 # kbf-installer: contract
 
+> **Daemon modes removed.** `kbf` no longer has the `daemon`, `storage-and-daemon` and `all-in-one` modes, `kbf-daemon` is deleted, and the Mac installer paths, package and cask are deleted: a Mac runs js-agent only. The modes are `frontend` and `storage`. Passages below that name the removed modes, `[daemon]` keys or the Mac install are history.
+
 > **Retired in part.** The proxy's two-slot supervision of frontend children, its update API at
 > `/v1/update/frontend` and the `kbf-installer update` client were removed: `kbf-installer
 > proxy` serves a pool of frontends that run on their own (`[[proxy.frontend]]` tables) and

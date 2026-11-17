@@ -7,7 +7,7 @@ advisories. Do not open a public issue, discussion, or pull request.
 
 1. Go to the repository's **Security** tab.
 2. Choose **Report a vulnerability**.
-3. Describe the problem, the affected component (`kbf-server`, `kbf-daemon`, or
+3. Describe the problem, the affected component (`kbf-server`, `kbf-task`, or
    another crate), the version or commit, and the steps to reproduce it.
 
 If the **Report a vulnerability** button is not shown, private reporting is not

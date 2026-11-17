@@ -24,7 +24,7 @@ web UI" in [api.md](../api.md).
   `kbf-proxy.socket` says otherwise) forwards `/ui` and `/ui/...` to the active frontend's
   operator API, so there is no second port to open. The proxy lets `GET` and `HEAD`
   through to the UI and answers any other method itself with `405`.
-- **Without the proxy** (`frontend` or `all-in-one` mode): the UI is on the operator API's
+- **Without the proxy** (`frontend` mode): the UI is on the operator API's
   address, `--api-listen`. That flag is off unless given, and with it off there is
   nothing to serve the UI on. Bind it where only operators can reach it.
 - **Some pages need history.** Targets and Target read the cross-build routes
@@ -109,7 +109,7 @@ Overview, Nodes and Node; any other value or parameter is a `400`.
 | Log | `/ui/runs/{run_id}/logs/{stream}` | One run's log (`stdout`, `stderr` or `result`) as escaped text, the last 1 MiB (`?from=start` for the first), with a note that names the end shown when it is cut, a link to the other end and a link that downloads the whole log; reached from the Action page |
 
 Nodes, leases and the queue live in the server's memory: after a restart of the frontend
-they are empty until the daemons reconnect, and the pages say so, with the time the
+they are empty until the workers reconnect, and the pages say so, with the time the
 server started and how long it has run (`started_unix_ms` and `uptime_ms` of
 `GET /v1/health`; a page says the time is not known when the server does not send it).
 A value the server

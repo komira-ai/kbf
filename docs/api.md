@@ -19,7 +19,7 @@ operators, a short-lived `rollout` for CI) are **planned**; the token is the one
 operator credential until they land.
 
 Every body is `application/json`, except a blob's bytes and `/metrics`. What the server keeps here is
-**in memory**, like the scheduler's state: a restart forgets it, and each daemon
+**in memory**, like the scheduler's state: a restart forgets it, and each worker
 reports again after its next `Welcome`.
 
 ## Who may write
@@ -27,9 +27,7 @@ reports again after its next `Welcome`.
 A write (cordon, drain, uncordon, a member's state, a deny list entry) can take every node in the fleet out of service, so
 it must come from an operator. Where a request comes from does not show that:
 
-- **Every server host is also a worker.** Build actions run on it, and they can reach
-  loopback: the native driver on Linux enforces no network isolation, and the macOS
-  sandbox allows loopback.
+- **A server host may run other services.** A process on it can reach loopback.
 - **A reverse proxy on the host** (`tailscale serve`, nginx) makes every caller it
   forwards a loopback peer.
 - **A browser on the host** can POST to a loopback address from any page it opens,
@@ -57,12 +55,10 @@ server refuses to start. The token is read once at start: it is never on the com
 line, in the start line or in a log, and a change to the file takes effect at the
 next start.
 
-**Run `kbf-server` as its own user.** Keep the token out of the build actions'
-reach: a build action that can read the file can write. On a host that is also a
-worker, `kbf-server` must run as a different user from `kbf-daemon` and from every
-user leases run as. The native driver runs actions as the daemon's user, so a `0600`
-token file owned by a user the server shares with the daemon is readable by every
-build on that host.
+**Run `kbf-server` as its own user.** Keep the token out of the reach of anything that
+runs actions: a process that can read the file can write. On a host that also runs an
+agent of the job service, `kbf-server` must run as a different user from the agent and from
+every user its jobs run as.
 
 **Through a reverse proxy.** A remote operator reaches the API through a proxy on the
 server's host that terminates TLS (`tailscale serve`, nginx). The proxy is what makes
@@ -117,7 +113,7 @@ What the flag does not do, and what the proxy must do:
   `--proxy-auth-file` and a deny list holding a `serial` or `spki-sha256` entry logs a
   warning at start naming the count. (Enforcing them would need the proxy to forward a
   verified serial and key in a new header; that is the proxy's work, not this flag's.)
-- The storage listener (`kbf storage`, and the in-process one of all-in-one) is not behind
+- The storage listener (`kbf storage`) is not behind
   the proxy: it keeps its own mutual TLS and its own admission.
 - `--reapi-auth-policy mtls` finds no certificate on a proxied REAPI call and refuses every
   call; use another policy behind the proxy until the proxy forwards the identity to it.
@@ -169,24 +165,24 @@ placement, and, after the list, the oldest protocol version among them:
 |---|---|
 | `server.version` | the `kbf-server` build that answers, as `--version` and the start line print it: the package version, `+`, and the commit |
 | `server.commit` | the commit it was built from, 12 hex digits (`git rev-parse --short=12`), or `unknown` for a build without a git checkout |
-| `node_id` | the id its daemon registered with |
+| `node_id` | the id its worker registered with (`js:<frontend id>-<n>` for the executor's virtual workers) |
 | `connected` | whether its newest stream is still open |
-| `protocol` | the `kbf.worker.v1` version the `Welcome` that answered the `Hello` opening its newest stream named: the lesser of the `Hello`'s version and the newest the server speaks, so a daemon whose `Hello` names 5 against a server speaking 3 shows 3 ([worker-protocol.md](design/worker-protocol.md)); `null` if no version is known (a `Hello` naming 0, which is not a version, from a server that accepts it). A `Hello` resent on the stream does not change it, and a node that returns on another version shows the new one. It stays after the stream closes: it is the version the node last spoke |
+| `protocol` | the `kbf.worker.v1` version the `Welcome` that answered the `Hello` opening its newest stream named: the lesser of the `Hello`'s version and the newest the server speaks, so a worker whose `Hello` names 5 against a server speaking 3 shows 3 ([worker-protocol.md](design/worker-protocol.md)); `null` if no version is known (a `Hello` naming 0, which is not a version, from a server that accepts it). A `Hello` resent on the stream does not change it, and a node that returns on another version shows the new one. It stays after the stream closes: it is the version the node last spoke |
 | `blocked_on` | only on a `joining` member, only when the frontend runs with `--auto-promote`: a list of sentences saying what holds its automatic promotion back (a member that has not flushed, a tail epoch not acknowledged, a member down, the settle time). Absent otherwise; an empty answer for a joiner means only its next beat or the next sweep is owed |
 | `oldest_protocol` | the least `protocol` among the listed nodes whose `protocol` is not `null`, connected or not (a node whose stream closed may return on the version it last spoke); `null` if no listed node names one. Nodes that name none are not in it |
 | `protocol_unknown` | how many listed nodes have a `null` `protocol`. They are never counted in `oldest_protocol`, so `oldest_protocol` says "every node but these speaks at least this": a reader that needs every node reads it with `protocol_unknown` equal to 0 |
-| `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a daemon that predates it. An empty string or list is a value the node could not read |
+| `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a worker that predates it or sends none. An empty string or list is a value the node could not read |
 | `software.received_at_unix_ms` | when the server received it, by the server's clock |
 | `software.xcode_builds` | the Xcode builds actions can use on it: only these route work |
-| `software.xcodes` | every installed Xcode, ready or not: `app`, `build` (empty if not known), `state` (`ready`, `license_not_accepted`, `first_launch_not_run`, `metal_toolchain_missing`, `failed`, `not_surveyed` from the daemon's start until its first survey of its Xcodes ends (never advertised; the daemon sends its status again when the survey ends), or `unknown` for a state this server does not know), `reason` (the check that failed and its answer, from the daemon's last survey that changed this Xcode's `DEVELOPER_DIR`, build or state; a survey that differs only in its reason is not sent, so when another check later fails with the same build and state, this is still the earlier check's text) and `fix` (the command an administrator runs on the node, when one is known). Empty from a daemon that predates it |
-| `software.container_images` | the container images the node was pinned to (`kbf-daemon --image`, container driver), as `docker://<repo>@sha256:<digest>`, sorted: each was in its image store, as one architecture's manifest, when the daemon started (a daemon that finds one missing does not start). Status only: no work is placed by image. Empty when none is pinned, on a Mac, and from a daemon that predates it |
-| `needs_attention` | what an operator must do on the node, one line per item: today each installed Xcode that is not ready, as `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`. An Xcode `not_surveyed` keeps the item the same app had in the node's previous status (as when a restarted daemon sends its first status), until a survey reports it; one with no previous item has none. The server also logs each item once at `WARN` (target `kbf_server::attention`) when it appears, and at `INFO` when a status reports it gone (its Xcode ready, changed or removed); a status that repeats an item, or lists its Xcode `not_surveyed`, logs nothing. An item is the same while its Xcode's app, build, state and fix are, so a reason that changes alone is shown here but not logged again. The previous status is kept in the server's memory: after a server restart, each item is logged again when its node reports it; kbf has no alert delivery yet (issue #189) |
-| `lease_count` | how many leases it holds now (granted or running), the number of entries of `GET /v1/nodes/{id}`'s `leases`. In memory like the rest: after a server restart it is 0 until the daemon's leases are granted again |
+| `software.xcodes` | every installed Xcode, ready or not: `app`, `build` (empty if not known), `state` (`ready`, `license_not_accepted`, `first_launch_not_run`, `metal_toolchain_missing`, `failed`, `not_surveyed` from the worker's start until its first survey of its Xcodes ends (never advertised; the worker sends its status again when the survey ends), or `unknown` for a state this server does not know), `reason` (the check that failed and its answer, from the worker's last survey that changed this Xcode's `DEVELOPER_DIR`, build or state; a survey that differs only in its reason is not sent, so when another check later fails with the same build and state, this is still the earlier check's text) and `fix` (the command an administrator runs on the node, when one is known). Empty from a worker that predates it |
+| `software.container_images` | the container images the node was pinned to, as `docker://<repo>@sha256:<digest>`, sorted. Status only: no work is placed by image. Empty when none is pinned and from a worker that sends none |
+| `needs_attention` | what an operator must do on the node, one line per item: today each installed Xcode that is not ready, as `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`. An Xcode `not_surveyed` keeps the item the same app had in the node's previous status (as when a restarted worker sends its first status), until a survey reports it; one with no previous item has none. The server also logs each item once at `WARN` (target `kbf_server::attention`) when it appears, and at `INFO` when a status reports it gone (its Xcode ready, changed or removed); a status that repeats an item, or lists its Xcode `not_surveyed`, logs nothing. An item is the same while its Xcode's app, build, state and fix are, so a reason that changes alone is shown here but not logged again. The previous status is kept in the server's memory: after a server restart, each item is logged again when its node reports it; kbf has no alert delivery yet (issue #189) |
+| `lease_count` | how many leases it holds now (granted or running), the number of entries of `GET /v1/nodes/{id}`'s `leases`. In memory like the rest: after a server restart it is 0 until the worker's leases are granted again |
 | `booked` | what those leases book of its capacity: `{"cpu_millis", "memory_bytes", "gpus", "vms"}`, CPU in thousandths of a core, memory in bytes. A record of the leases' limits, not a measurement of use |
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`, which is left out for a drain with no deadline); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
 
-The list is the nodes this server process has seen, so it says nothing of a daemon that has
+The list is the nodes this server process has seen, so it says nothing of a worker that has
 not connected to it yet: a server that has just started, or one of several frontends that
 share a state store ([design/frontend-proxy.md](design/frontend-proxy.md)), lists only
 those that have registered with it. `oldest_protocol` and `protocol_unknown` describe that list and
@@ -196,7 +192,7 @@ not made by this server.
 
 ## `GET /v1/nodes/{id}`
 
-One node: every field of its entry in `GET /v1/nodes`, three more, a `load` when its daemon
+One node: every field of its entry in `GET /v1/nodes`, three more, a `load` when its worker
 has sent readings, and an `input_cache` when it has sent input cache counts, a read open like the
 list:
 
@@ -219,10 +215,10 @@ list:
 
 ### Node load
 
-`load` is what the node's daemon reports of the CPU and memory its actions use, from the
+`load` is what the node's worker reports of the CPU and memory its actions use, from the
 `node_load` of its heartbeats. The server also hands each accepted reading to the scheduler, which
 places by it only under `--placement-load on`. It is left out when the server has accepted no
-reading of the node (a daemon or runtime that takes none, a failed read, a node another frontend
+reading of the node (a worker that takes none, a failed read, a node another frontend
 holds), and it is in memory: a server restart forgets it.
 
 ```json
@@ -238,18 +234,18 @@ holds), and it is in memory: a server restart forgets it.
 
 | Field | Meaning |
 |---|---|
-| `measured_cpu_millicores` | the CPU the node's actions used, in thousandths of a CPU: the larger of the last two windows between accepted readings, each the cgroup's CPU time over the daemon's clock time. `null` before two windows are known, and when `stale` |
+| `measured_cpu_millicores` | the CPU the node's actions used, in thousandths of a CPU: the larger of the last two windows between accepted readings, each the cgroup's CPU time over the worker's clock time. `null` before two windows are known, and when `stale` |
 | `memory_working_set_bytes` | the actions cgroup's `memory.current` less its inactive file pages, at the last accepted reading |
 | `memory_active_file_bytes` | the cgroup's active file pages at the last accepted reading |
 | `admission_working_set_bytes` | `memory_working_set_bytes` less the active file pages beyond a quarter of the node's `capacity` memory, never below zero: active page cache the kernel has not yet marked reclaimable must not make an idle node look full |
 | `covered` | the leases, as `term.seq`, that ran for the whole window before the last reading |
 | `actions_cpu_limited` | whether the actions cgroup has a CPU quota |
-| `cpu_throttled_usec`, `cpu_pressure_some_total_usec` | cumulative CPU throttled time and CPU pressure (`some` total), in microseconds; telemetry. Left out when the daemon could not read them |
-| `lists` | what the `lease_clocks` and `minutes` lists of the node's readings have come to since its daemon process began (a restarted daemon counts again from 0), so that a dropped record, or an empty feed, can be seen: `clocks` and `minutes` are the records kept, summed over the accepted readings; `dropped` counts the records left out of the two lists and of `covered`, by reason (`invalid`: a lease missing, a minute above 63, a working set above 2^45 bytes, a mean above its peak, a start after the reading; `duplicate`: a repeat of an earlier kept record; `over_cap`: a record past the cap of its list, 96 for the clocks and `covered`, 64 for the minutes); `refused_minutes` counts the minutes carried by readings that were not accepted |
+| `cpu_throttled_usec`, `cpu_pressure_some_total_usec` | cumulative CPU throttled time and CPU pressure (`some` total), in microseconds; telemetry. Left out when the worker could not read them |
+| `lists` | what the `lease_clocks` and `minutes` lists of the node's readings have come to since its worker process began (a restarted worker counts again from 0), so that a dropped record, or an empty feed, can be seen: `clocks` and `minutes` are the records kept, summed over the accepted readings; `dropped` counts the records left out of the two lists and of `covered`, by reason (`invalid`: a lease missing, a minute above 63, a working set above 2^45 bytes, a mean above its peak, a start after the reading; `duplicate`: a repeat of an earlier kept record; `over_cap`: a record past the cap of its list, 96 for the clocks and `covered`, 64 for the minutes); `refused_minutes` counts the minutes carried by readings that were not accepted |
 | `stale` | no reading was accepted for three windows (a window being the time between the last two accepted readings) |
 
-A reading is accepted only if its `seq` is above the last accepted one of the same daemon process;
-a restarted daemon starts again, and its first reading is the new baseline. A reading is dropped
+A reading is accepted only if its `seq` is above the last accepted one of the same worker process;
+a restarted worker starts again, and its first reading is the new baseline. A reading is dropped
 (it counts as absent, and the last accepted one stays the baseline) when its clock or CPU counter
 went back or its clock did not move, when its CPU since the last accepted reading is more than
 four cores per hardware thread of the node's `capacity`, or when its working set is more than four
@@ -264,10 +260,10 @@ never refused, nor its acknowledgement changed, for what its load carries.
 
 `input_cache` is what the node's input cache has done, from the `input_cache` of its heartbeats
 (`Heartbeat.input_cache`, [worker-protocol.md](design/worker-protocol.md)). It is left out when the
-node has sent none (a daemon whose cache is off, a runtime with no cache, a daemon built before the
+node has sent none (a worker whose cache is off, one with no cache, one built before the
 field, a node another frontend holds): absent is not zero. It is in memory: a server restart
-forgets it until the next heartbeat. The counts are cumulative since the daemon process started,
-so a restarted daemon counts again from 0 (a Prometheus counter handles the reset; nothing here
+forgets it until the next heartbeat. The counts are cumulative since the worker process started,
+so a restarted worker counts again from 0 (a Prometheus counter handles the reset; nothing here
 keeps them across it).
 
 ```json
@@ -311,7 +307,7 @@ answered from that frontend while its store cannot be read.
 
 A host's updater ([deploy/kbf-updater.md](deploy/kbf-updater.md#the-boundary)) drains and reads its
 own node without a token. The calls are served by the frontend on its **worker listener**
-(`--worker-listen`, mutual TLS against `--worker-client-ca`, the listener daemons dial), not on the
+(`--worker-listen`, mutual TLS against `--worker-client-ca`, the listener storage nodes dial), not on the
 operator API, and only to a certificate with the role `updater` whose one DNS name is the `{id}` of
 the call:
 
@@ -323,12 +319,12 @@ the call:
 | `GET /v1/nodes/{id}/storage-health` | below |
 
 Everything else is `403`: another node's id, `:cordon`, any other path (the whole operator API
-included), and every call of a certificate that is not an updater's (a daemon's, a storage node's, a
+included), and every call of a certificate that is not an updater's (a storage node's, a
 frontend's), whatever the path; a call with no client certificate does not get past the handshake.
 The id is compared as written: it is 1 to 63 of `a-z`, `0-9` and `-` (not first or last), nothing
 is decoded, and a query string makes the call none of the four. A node on the listener's deny list
 (`--worker-deny-list`, or the `deny/` rows) is refused. `404` for a node the frontend has not seen since it started
-(a storage host without a daemon part has none). The listener offers `h2` and `http/1.1`; the
+(a storage host has none unless a worker registered under that id). The listener offers `h2` and `http/1.1`; the
 updater's client speaks HTTP/1.1 with one request per connection.
 
 **`GET /v1/nodes/{id}/storage-health`** is a storage host's own storage health and nothing else of
@@ -356,8 +352,8 @@ answers `404`.
 The storage members of the current map, as the `Membership` service keeps them
 (`kbf.map.v1.Membership`; [architecture-v2.md](design/architecture-v2.md) section 6),
 in the map's order. A read, open like `GET /v1/nodes`; it takes no write. Storage
-members are not the daemon nodes of `/v1/nodes`: a storage node registers with a
-frontend, a daemon opens a worker stream.
+members are not the nodes of `/v1/nodes`: a storage node registers with a
+frontend, a worker opens a worker stream.
 
 ```json
 { "generation": 7,
@@ -436,7 +432,7 @@ applied: the row is written first, and the frontend's own scheduler follows it, 
 connected to the answering frontend keeps the placement it had. A `503` that follows a write
 the store did take despite the error can leave the row; read the node to see where it stands.
 The same holds for the updater's own-node `:drain` and `:uncordon` below, which a host's
-updater takes as a failed call, not as "no daemon here".
+updater takes as a failed call, not as "no such node".
 
 A cordon names the node, not its stream: a node that reconnects (say, after a reboot)
 is still cordoned. Work that only cordoned nodes could run waits, and its callers are
@@ -447,7 +443,7 @@ wait (`--unservable-wait-secs`) still refuses work that no connected node, cordo
 or not, could run, and the time spent waiting for a cordon does not count toward it.
 A server restart forgets every cordon, as it forgets the rest of the scheduler's
 state, and every start logs a warning that says so. The protocol has no drain
-message yet: the daemon is not told, and the server simply sends it no new `Start`.
+message yet: the worker is not told, and the server simply sends it no new `Start`.
 
 ## `POST /v1/members/{id}`
 
@@ -473,7 +469,7 @@ a connection attempt per write, and an action-cache commit does not move on at a
 refused `UNAVAILABLE`, which a client retries for about a second and a half. After this call the
 map (one new generation, in the answer) has the member `down`, so every router, chain
 primary and repair worker that holds the map sends writes to the other owner and reads
-the member's blobs from it, and a node or daemon that holds an older map reads it like
+the member's blobs from it, and a node that holds an older map reads it like
 any `down` member (the wire has no new state). The member keeps serving what reaches it
 and keeps heartbeating until it stops; a heartbeat does not undo this, until `for_secs` has
 passed: the first heartbeat after that returns it to `active` (a controller that died, or a
@@ -552,7 +548,7 @@ type), because its answer decides whether to stop a host. `kbf cluster safe-to-s
 | Field | Meaning |
 |---|---|
 | `safe` | `true` if the member can go out without a blob being left with one copy |
-| `reasons` | why `safe` is `false`: the worst thing found, one line. Empty when `safe` is `true` for a storage member; for a daemon, one line that says only the daemon was judged |
+| `reasons` | why `safe` is `false`: the worst thing found, one line. Empty when `safe` is `true` for a storage member; for a node with no storage half, one line that says only the node was judged |
 | `planned_down` | whether the member is already planned down (`POST /v1/members/{id}` with `planned_down`). It does not make the stop unsafe: the member is already out of the write path |
 
 `{id}` is a storage member's number (`GET /v1/members` lists them; `2` for member `m2`)
@@ -582,10 +578,10 @@ A node id is judged by the storage member that is the node's storage half, joine
 update controller joins a host to its member: the address the node advertised when it
 enrolled (`GET /v1/enroll/nodes`) is the address one member registered. That member's
 answer is the node's, the same body as asking by the member's number. A node that has no
-storage half is a daemon, which drains in its own stop and needs no permit: a Mac, a Linux
+storage half needs no permit to stop: a Mac, a Linux
 node enrolled with no storage address, and any node of a server without a state store
 (such a server keeps no storage members) answer `200` with `"safe": true` and a `reasons`
-line that says only the daemon was judged. A Linux node that cannot be told from one with a
+line that says only the node was judged. A Linux node that cannot be told from one with a
 member answers `409` with `{"error": ...}` saying why, never safe: the enrollment registry
 does not know it or cannot be read, or its address is no member's or two members'. A
 number is a member's number first, then a node id. `404` with `{"error": ...}` for an
@@ -661,7 +657,7 @@ write it is the primary for fails in that window. The entries are in the map eve
 receives, which `GET /v1/members` does not show.
 
 **What it cuts.** The entry is applied to the storage nodes, the membership service and the
-worker listener: a daemon whose certificate or node is denied here is refused on its stream
+worker listener: a worker whose certificate or node is denied here is refused on its stream
 (`Hello`, `Heartbeat`, `Result`, ...), its open stream ends at its next message, and its blob
 calls on that listener are refused `PERMISSION_DENIED`. The listener checks against the membership's copy of these rows (refreshed by this call before
 it answers, and every beat) beside `--worker-deny-list`; when the copy is more than three sweeps
@@ -757,12 +753,12 @@ over a state store (`kbf frontend` requires one):
    the frontend ends none except one whose operation can never start. That is an operation that has never been started
    and that no live worker can run: no worker on this frontend, and no other frontend to
    take it (`WAITING`: there is no worker that could run it, or at least one that could is
-   cordoned by an operator, or not serving, and no daemon connected to another frontend
+   cordoned by an operator, or not serving, and no worker connected to another frontend
    of the state store could run it; the stream says so in its metadata). Its stream ends
    `UNAVAILABLE` at the end of the load balancer wait, when step 3 begins, naming why. The
    action could never run, so this costs nothing and frees the stop. An
    operation that is only queued (a worker can take it), and one that waits only for the
-   nodes this drain cordoned in step 3, and one that a daemon of another frontend could
+   nodes this drain cordoned in step 3, and one that a worker of another frontend could
    run (the other frontends take it), keep their streams,
    as does any operation that ever had a lease, even one queued again after a lost lease:
    they stay until the operation is done. Ending a stream does not cancel
@@ -771,13 +767,13 @@ over a state store (`kbf frontend` requires one):
    An execution another frontend took is answered from the result it records in the state
    store.
 5. **Close and exit.** The frontend stands down as a retire does (below): the farm is
-   fenced, and the worker streams that are left end `UNAVAILABLE`, so each daemon dials
+   fenced, and the worker streams that are left end `UNAVAILABLE`, so each storage node dials
    another frontend through the load balancer, which keeps its leases (the state store's
    owner rows are authoritative). No Execute or WaitExecution stream is open by now unless a
    second signal or `--shutdown-timeout-secs` forced the stop; the ones that are end
    `UNAVAILABLE` (an action that was still running fails, as Buck2 does not recover a
    stream). Phase `closing`, a few seconds long, and the process exits 0. For a worker
-   listener behind a load balancer that passes TCP through, GOAWAY reaches the daemon's
+   listener behind a load balancer that passes TCP through, GOAWAY reaches the storage node's
    connection and nothing else: this is the step that closes it.
 
 The drain is not undone: the process exits, and what starts in its place is a new
@@ -840,8 +836,8 @@ answers the same status. The retire:
   then stops taking work: the frontend reads no more of the state store's queue, grants nothing,
   claims nothing and writes the requeues the store had refused (for at most the same
   time again);
-- stops the worker listener and ends every worker stream `UNAVAILABLE`, so each daemon
-  dials another frontend, which takes up the leases the daemon lists;
+- stops the worker listener and ends every worker stream `UNAVAILABLE`, so each storage node
+  dials another frontend;
 - turns `/readyz` to `503` (`stopping`) and the health service to `NOT_SERVING`;
 - keeps every open Execute and WaitExecution stream, and answers it from the result another
   frontend records in the state store, for as long as the process lives.
@@ -853,10 +849,10 @@ answers both routes `409` (`this server is not a frontend over a state store`).
 ## `POST /v1/epoch/bump`
 
 Raises the epoch the state store holds by one, for the day the store was restored from a
-backup and the daemons must drop the leases the lost history granted (the steps are in
+backup and the workers must drop the leases the lost history granted (the steps are in
 [kbf-units.md](deploy/kbf-units.md#the-state-store-postgres-for-the-frontend)). A write that
 passes every gate of [Who may write](#who-may-write) and takes no body (or `{}`). The epoch
-is the one `Welcome` names: a daemon that sees an epoch other than the one it knew kills the
+is the one `Welcome` names: a worker that sees an epoch other than the one it knew kills the
 runs of its leases and lists none. A frontend that starts keeps the stored epoch, so a start
 no longer changes it; this call is the one way it changes.
 
@@ -897,9 +893,9 @@ call changes nothing. Every answer carries `Cache-Control: no-store`.
 | `POST /v1/enroll/nodes/{id}/revoke` | revokes a node | `{"id": "...", "denied": [...]}` |
 | `POST /v1/enroll/nodes/{id}:adopt` | records a node provisioned before enrollment | the node, as `GET /v1/enroll/nodes` lists it |
 
-**Create.** The body is `{"roles": ["daemon"], "host_role": null, "max_uses": 1,
+**Create.** The body is `{"roles": ["storage"], "host_role": null, "max_uses": 1,
 "expires_in": 86400, "node_id": "n1", "node_prefix": "rack-", "names": [".example"],
-"replace": false, "label": "rack 4"}`; only `roles` is required (`storage` and `daemon`, one to
+"replace": false, "label": "rack 4"}`; only `roles` is required (`storage`, or the older `daemon`, one to
 two, no repeat; or `updater` alone, below). `max_uses` is 1 to 1000 (default 1); `expires_in` is seconds, at least 1 and at
 most 30 days (default a day); `node_id` and `node_prefix` restrict the node ids the token
 enrolls; `names` restricts the hosts a storage node may advertise (a host, or a suffix that
@@ -919,7 +915,7 @@ is not stored.
 
 **A host's updater** ([deploy/kbf-updater.md](deploy/kbf-updater.md#enrolling-a-host)) enrolls with
 a token whose `roles` is `["updater"]` and nothing else, with `host_role` (`frontend`, `storage`,
-`daemon` or `mac-daemon`: what its certificate says the host runs), the one `node_id` it is for
+with the older `daemon` and `mac-daemon` still read: what its certificate says the host runs), the one `node_id` it is for
 (no `node_prefix`) and one use; each of those is a `400` if wrong, and `host_role` is a `400` on a
 token that does not grant `updater`. Its certificate has the role `updater`; the updater has a
 registry row of its own, beside any node of the same id, and the node listing does not show it.
@@ -944,7 +940,7 @@ and the safe-to-stop check cannot join it to its storage member, both of which g
 address the node advertised when it enrolled. `POST /v1/enroll/nodes/{id}:adopt` writes that
 registry row without enrolling. The body is `{"roles": ["storage"], "advertise":
 "host:7000"}`; `roles` is required, and `advertise` is required for a node with the `storage` role
-and must be absent or empty for any other. The roles are `storage` and `daemon` (not `updater`), and `advertise`
+and must be absent or empty for any other. The roles are `storage` and the older `daemon` (not `updater`), and `advertise`
 follows enrollment's rules (a DNS name or IP address, read in lower case, and a port from 1 to
 65535, not loopback, unspecified, link-local or multicast, and not a name this frontend
 serves). An unknown field, a malformed body or id, or a value enrollment refuses is a
@@ -968,7 +964,7 @@ API. From the frontend's host, with the file `--api-token-file` names:
 ```sh
 T=$(cat <token file>); API=http://127.0.0.1:<port>
 curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
-  -d '{"roles": ["daemon"], "max_uses": 3, "expires_in": 86400, "label": "rack 4"}' \
+  -d '{"roles": ["storage"], "max_uses": 3, "expires_in": 86400, "label": "rack 4"}' \
   $API/v1/enroll/tokens                       # the token string is in this answer only
 curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' $API/v1/enroll/tokens
 curl -X DELETE -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
@@ -1044,7 +1040,7 @@ binding), as `s3://bucket/prefix/?endpoint=...&region=...`, with `conditional-pu
 endpoint, region, bucket, prefix and settings only: **never** the access key id, the secret
 or any other query key (the key pair reaches a node through `ColdStore.GetStoreConfig`, over
 its storage certificate). A farm with nothing registered sends an empty `cold_store`, and a
-daemon-only node is sent none. A storage node that holds none asks once at its next start. A
+node with no storage role is sent none. A storage node that holds none asks once at its next start. A
 registry that cannot be read refuses the call (`StoreUnavailable`) before the token is
 spent. The node uses the `cold_store` it is sent with its own process credentials, so the
 frontend decides which endpoint receives the node's signed requests: the same trust as the
@@ -1066,7 +1062,7 @@ config as that node receives it (roles, `worker_endpoint`, `cas_endpoint`, `stor
 `cold_store`, and the other fields), with the low bit set so it is never 0. It changes
 exactly when something the node is sent changes: a frontend restarted with another
 `--enroll-worker-endpoint`, `--enroll-cas-endpoint` or `--enroll-storage-port`, or a cold
-store registered, changed or taken back (a daemon-only node is not sent the store, so
+store registered, changed or taken back (a node with no storage role is not sent the store, so
 that does not change its generation). A restart with the same flags changes nothing. The
 number is **not ordered**: the node keeps it and `Renew` compares it for equality, so a
 frontend put back to an earlier endpoint sends that configuration again. A node stores
@@ -1117,7 +1113,7 @@ and the log says `membership refresh` failed. Repair: read the key from the log 
 answers; the worker listener then enforces it from the next successful sweep, within one beat.
 A deny written by another frontend is seen within one sweep. A frontend reads the rows just
 before it serves (after the slow steps of its start, such as restoring the farm's state), so a
-restart does not refuse daemons until the first sweep; if that read fails it logs an error and
+restart does not refuse denied nodes until the first sweep; if that read fails it logs an error and
 starts, and the rule above applies. While the copy cannot be used (before that first read, or
 when it is older than three sweeps) `/readyz` fails its `deny_rows` check, and a frontend under
 systemd does not send `READY=1`.
@@ -1145,7 +1141,7 @@ nothing: a unit that still passes it starts as before.
    ```sh
    T=$(cat /etc/kbf/api.token); API=http://127.0.0.1:<api port>
    curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
-     -d '{"roles": ["storage","daemon"], "max_uses": 1, "expires_in": 3600, "node_id": "node-07", "label": "rack 4"}' \
+     -d '{"roles": ["storage"], "max_uses": 1, "expires_in": 3600, "node_id": "node-07", "label": "rack 4"}' \
      $API/v1/enroll/tokens
    # {"token": "kbft1.<id>.<secret>.<pin>", ...}
    ```
@@ -1212,7 +1208,7 @@ no registered member.
 - `nodes`: every registered member in any state (`planned_down` is true for a `down`
   member an operator planned, [above](#post-v1membersid)), with what its newest report says:
   `repair_debts` (the copies it owes), `open_writes` (the `Write` calls, action-cache
-  commits and daemon segment uploads it has open now, an upload from `Begin` until its
+  commits and segment uploads it has open now, an upload from `Begin` until its
   commit ends, as a primary or a replica) and `generation` (the map it held when
   it counted). A value is `null` when the member's report is older than the freshness
   window, when it has not reported, or when it cannot say (an older node does not count its
@@ -1593,16 +1589,14 @@ The cache's upload path in the Prometheus text exposition format (version 0.0.4,
 `Content-Type: text/plain; version=0.0.4; charset=utf-8`): what the CAS services did,
 and how long each stage of a store took. A read, open like `GET /v1/nodes`; it names
 no blob, build or node. Every listener that serves the cache counts into the same
-families: the REAPI listener (clients) and the worker listener (daemons' uploads of
-outputs and reads of inputs). The counts are in memory and start at 0 with the
+families: the REAPI listener (clients) and the worker listener (storage nodes' calls). The counts are in memory and start at 0 with the
 process.
 
-A storage node (`kbf storage`, and the storage half of `kbf storage-and-daemon`) has no
+A storage node (`kbf storage`) has no
 operator API and serves this one route, plain HTTP, on `--metrics-listen <addr>`
 (off unless given; the same open read as above, so bind it where only operators do). It
 answers the families of its own cache, among them `kbf_cache_lost_blobs` and
-`kbf_cache_blob_losses_total`, the node's TLS reloads, and, in
-`kbf storage-and-daemon`, the one cache's fill.
+`kbf_cache_blob_losses_total` and the node's TLS reloads.
 
 Each request family counts from the start of its handler to its answer. A call whose
 caller goes away before the answer counts as an error.
@@ -1667,7 +1661,7 @@ caller goes away before the answer counts as an error.
 | `kbf_prediction_unset_total{reason}` | counter | new operations that got none, by why: the estimator's fallbacks (`missing`, `stale`, `cold`, `corrupt`, `over_cap`) and what the farm does not ask it about (`kind`, `no_os`, `no_subject`); such an operation is charged as it is with `--placement-predictions off` |
 | `kbf_prediction_vs_run_total{axis,bucket}` | counter | with `shadow`: finished runs compared with the prediction made for their operation, once per operation, for a run that succeeded and ran a second or more. `axis` is `cpu` (the cores the run used on average), `mem` (its peak memory) or `life` (its life in whole minutes); `bucket` is `under` (the run used more than predicted), `fit` (at most the prediction and at least half of it) or `over` (less than half of it) |
 | `kbf_placement_cpu_limited_nodes` | gauge | nodes whose latest load reading (not stale) says the actions cgroup has a CPU quota (`actions_cpu_limited`) while `--placement-load` is on: placement charges them by prediction alone, which is a misconfiguration; the server also warns when a node starts to report one (0 with `--placement-load off`) |
-| `kbf_bytes_in_flight`, `kbf_bytes_in_flight_peak` | gauge, gauge | bytes this process holds in memory for requests in flight now (a ByteStream Write's receive buffer or the message in hand, a Read's window, a BatchUpdateBlobs's blobs, a Segments upload's buffer, and the same on a storage node's Write), and the most it has held at once since the process started (never reset). Counted from the allocation of a buffer until the last reference to it is dropped, however the request ended. Not counted: the segment writer's own buffer, the object store's and write tier's internals, and gRPC's copies of a message. Always printed. The daemon does not serve `/metrics` yet |
+| `kbf_bytes_in_flight`, `kbf_bytes_in_flight_peak` | gauge, gauge | bytes this process holds in memory for requests in flight now (a ByteStream Write's receive buffer or the message in hand, a Read's window, a BatchUpdateBlobs's blobs, a Segments upload's buffer, and the same on a storage node's Write), and the most it has held at once since the process started (never reset). Counted from the allocation of a buffer until the last reference to it is dropped, however the request ended. Not counted: the segment writer's own buffer, the object store's and write tier's internals, and gRPC's copies of a message. Always printed. |
 | `kbf_tier_in_flight`, `kbf_tier_wait_seconds`, `kbf_tier_call_seconds` | gauge, histogram | write-tier file calls queued on or running on the blocking pool; the wait of one for a pool thread; and one whole, hand-over to answer. Always printed, 0 without a write tier; a wait near the call time says the pool is full |
 | `kbf_storage_open_write_fds`, `kbf_storage_write_pool_queue`, `kbf_storage_write_pool_direct_total` | gauge, gauge, counter | block files the write tier holds open for writing, as of the last write-pool step (at most `--write-pool-writers` plus one, for the blobs the pool writes); blobs waiting for a pool writer; and blobs the pool sent straight to the object store because its queue (`--write-pool-queue`) was full or the tier did not take them. Always printed, 0 without a write tier |
 | `kbf_input_directories_cached_total` | counter | Directories the input check took from the decoded-directory cache: the blob is touched and its presence checked, nothing is read |
@@ -1697,23 +1691,6 @@ watches.
 | `kbf_write_tier_flushed_copy_bytes` | gauge | flushed copies kept for local reads, in what the budget leaves over |
 | `kbf_write_tier_unflushed_bytes`, `kbf_write_tier_unflushed_blocks` | gauge | acknowledged bytes, and the blocks holding them, not yet in the object store |
 | `kbf_write_tier_oldest_unflushed_seconds` | gauge | the age of the oldest of those blocks (since it was created, or since the restart that recovered it); 0 when there is none |
-
-In `kbf all-in-one`, when the hot store is a directory on the filesystem of `--data-dir`,
-the daemon half's input cache and the server half's hot store are one cache
-([architecture-v2.md](design/architecture-v2.md#10-locality)): the input cache's
-directory is the node's only local copy of a blob, the tier deletes a block once it is
-flushed (so `kbf_write_tier_flushed_copy_bytes` stays 0), and the input cache evicts its
-entries until they and the tier's blocks fit its budget: after each input it fills, and
-within about a second of the tier growing past what the budget leaves it (uploads alone).
-Entries a running lease pins are never evicted, so a hot store budgeted at or above the
-input cache's budget leaves room for those alone (the daemon warns once). These families
-follow; in every other process they are absent.
-
-| Family | Type | What it measures |
-|---|---|---|
-| `kbf_local_cache_input_bytes` | gauge | the input cache's entries |
-| `kbf_local_cache_storage_bytes` | gauge | what local storage holds on that disk: the write tier's blocks |
-| `kbf_local_cache_fill_bytes` | gauge | both, each byte once: what the one budget counts |
 
 **Build history.** With `--history-objects` the server records each attempt and cache hit of
 an invocation a client named, after the call is answered and off its path, and counts what it
@@ -1745,8 +1722,8 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_upload_waits_total` | counter | uploads that found `--pack-inflight-bytes` spent and waited their turn: a burst slowed down, none failed. Rising steadily means the bound is below what clients send |
 | `kbf_pack_upload_refusals_total` | counter | uploads refused RESOURCE_EXHAUSTED because their blobs alone are over `--pack-inflight-bytes` |
 | `kbf_pack_upload_idle_timeouts_total` | counter | ByteStream uploads ended DEADLINE_EXCEEDED because, after their resource name had arrived, no byte of their body arrived for `--pack-upload-idle-timeout`; nothing was stored and their bytes were given back |
-| `kbf_pack_commits_total` | counter | packs recorded in the pack index, whether a daemon stored one (`kbf.worker.v1.PackIndex/CommitPack`) or a build wrote it through a presigned write (also counted in `kbf_pack_untrusted_commits_total`) (a retry of a commit already recorded is not counted again) |
-| `kbf_pack_commit_rejects_total` | counter | commits of a pack refused with nothing recorded, from a daemon or, for a build's pack, any refusal counted in `kbf_pack_untrusted_commit_rejects_total`. For a daemon: the writer was not the caller, the name or the list of blobs was not one a daemon may commit, the pack was not in the store, a sampled blob was not its digest (`--pack-commit-sample`; alert on any), or the pack was recorded before with other contents. A store or an index that failed is UNAVAILABLE to the daemon and is not counted |
+| `kbf_pack_commits_total` | counter | packs recorded in the pack index, whether a caller stored one (`kbf.worker.v1.PackIndex/CommitPack`) or a build wrote it through a presigned write (also counted in `kbf_pack_untrusted_commits_total`) (a retry of a commit already recorded is not counted again) |
+| `kbf_pack_commit_rejects_total` | counter | commits of a pack refused with nothing recorded, from a `CommitPack` caller or, for a build's pack, any refusal counted in `kbf_pack_untrusted_commit_rejects_total`. For a `CommitPack` caller: the writer was not the caller, the name or the list of blobs was not one a caller of the `daemon` role may commit, the pack was not in the store, a sampled blob was not its digest (`--pack-commit-sample`; alert on any), or the pack was recorded before with other contents. A store or an index that failed is UNAVAILABLE to the caller and is not counted |
 | `kbf_pack_untrusted_commits_total` | counter | packs a build wrote through a presigned write that the frontend read, hashed to the last byte and recorded in the pack index (a replay of a commit already recorded is not counted again) |
 | `kbf_pack_untrusted_commit_rejects_total` | counter | commits of such a pack refused with nothing recorded, labelled `reason`: `forbidden` (the key was not the one issued), `shape` (the manifest cannot be a pack's: a cap, an order, a gap, an overlap or a record of no bytes), `footer` (the footer is not the manifest), `mismatch` (a record is not its digest or CRC), `missing` (the pack is not in the store as long as said) or `conflict` (the key was recorded with other contents). A store or an index that failed is not counted. Each refusal also moves `kbf_pack_commit_rejects_total` |
 | `kbf_pack_ingests_total` | counter | runs of a task that `ingest` (presigned writes) or `ingest_put_dir` (a put directory) turned into an action result: the action ran (any exit code), whether or not the result was written to the action cache |
@@ -1775,15 +1752,14 @@ task can leave up to 8 large objects of the large cap (512 MiB) each, 4 GiB, of 
 until a janitor removes them (komira-ai/kbf#1980).
 
 **Legacy reads, on a storage node's `--metrics-listen`.** `kbf_storage_legacy_read_total{kind,source}`
-(counter) counts the reads a storage node (`kbf storage`, `kbf storage-and-daemon`) serves from its
-own copy of the data. Its five rows are always printed, 0 included: `kind="cas",source="bytestream"`
+(counter) counts the reads a storage node (`kbf storage`) serves from its
+own copy of the data. Its rows are always printed, 0 included: `kind="cas",source="bytestream"`
 (a ByteStream `Read` that found its blob, one per call), `kind="cas",source="segments"` (a `Segments`
 `ReadRange` that returned bytes, one per call), `kind="ac",source="action_store"` (an `ActionStore`
 `Get` that found an entry), and `kind="cas",source="in_process"` and `kind="ac",source="in_process"`
-(the same blob and entry reads made by the daemon half of a `storage-and-daemon` process, which reaches
-its own node without a connection). A read that finds nothing, a read of the empty blob,
+(reads made in the node's own process, which reaches its storage without a connection). A read that finds nothing, a read of the empty blob,
 `FindMissingBlobs`, `QueryWriteStatus`, `Segments` `Locate`, every write, and the node's own reads for
-flushing and repair are not counted; a read a frontend or a daemon serves from a pack never reaches a
+flushing and repair are not counted; a read a frontend serves from a pack never reaches a
 node. The sum over all rows staying at 0 is how an operator sees that nothing reads the storage nodes
 any more.
 
@@ -1798,73 +1774,17 @@ under `--job-plain-http`, where the listener has no TLS files.
 | `kbf_job_read_bytes_total` | counter | blob bytes served to jobs |
 | `kbf_job_read_seconds{op}` | histogram | seconds from a job's blob read (`op="get"`, `GET /<hex>/<size>`) or batch (`op="batch"`) to its answer, in fixed buckets from 1 ms to 60 s: one observation per answered request, refusals included; `/locate`, a refused method and a path that names no blob are not in it. A blob too large to read whole is answered when its stream starts, not when its last byte is sent |
 
-**Pack reads by daemons.** A daemon started with `--pack-read` or `--tierstore-endpoint`
-([kbf-modes.md](deploy/kbf-modes.md)) puts the counts of its pack reads in every heartbeat, and
-the frontend its worker stream is on keeps the newest of each node and exports them, one sample
-per node, labelled `node`. They are the counts of the daemon's process: they start again from 0
-when it restarts, as any counter may. A node that sent none (a daemon with neither
-`--pack-read` nor `--tierstore-endpoint`, or one built before the field) has no sample, and with
-no node sending any the families are absent. A node whose stream has closed keeps the counts of
-its last heartbeat until the frontend restarts (a node's other facts are kept the same way); a
-node whose next heartbeat carries none, such as a daemon restarted with neither flag, loses its
-samples. Each read of a blob counts in exactly one of served, elsewhere, unasked, lost, damaged,
-fallback_lost and fallback_damaged. A daemon of a release before the two fallback counts sends
-neither, and a frontend of such a release skips them: `lost` and `damaged` are always reads that
-failed.
-
-| Family | Type | What it measures |
-|---|---|---|
-| `kbf_pack_daemon_served_total{node}`, `kbf_pack_daemon_served_bytes_total{node}` | counter | blobs the node's daemon read from a pack, and their bytes |
-| `kbf_pack_daemon_elsewhere_total{node}` | counter | reads of a blob no pack holds (or that is not asked of the packs, or whose frontend serves no locations): answered by the storage nodes, as before packs |
-| `kbf_pack_daemon_unasked_total{node}` | counter | reads answered by the storage nodes because the packs could not be asked (the pack index or the pack store failed): the daemon is reading around the packs |
-| `kbf_pack_daemon_lost_total{node}` | counter | reads that failed because the pack the index names is gone or too short (UNAVAILABLE to the lease; alert on any) |
-| `kbf_pack_daemon_damaged_total{node}` | counter | reads that failed because the bytes in the pack are not the digest (never served; alert on any) |
-| `kbf_pack_daemon_fallback_lost_total{node}` | counter | reads of a daemon with `--tierstore-endpoint` whose pack its tierstore did not have (a 404, or too short), sent to the storage nodes instead: each read's outcome is theirs (the blob, or their own failure), not the tierstore's. A steady rate is a pack the tierstore's upstream does not hold either |
-| `kbf_pack_daemon_fallback_damaged_total{node}` | counter | reads of a daemon with `--tierstore-endpoint` whose bytes from its tierstore were not the digest (never served), sent to the storage nodes instead: each read's outcome is theirs, not the tierstore's, and each is a damaged copy in that node's tierstore (alert on any) |
-
-**Pack writes by daemons.** A daemon started with `--pack-write` (which needs `--pack-read`;
-[kbf-modes.md](deploy/kbf-modes.md)) also puts the counts of its pack writes in every heartbeat,
-and the frontend keeps and exports them as it does the reads: one sample per node, labelled
-`node`, the counts of the daemon's process (they start again from 0 when it restarts). A node that
-sent none (a daemon without `--pack-write`, or one built before the field) has no sample of these
-families, whether or not it sent read counts, and a node whose next heartbeat carries none loses
-them. The unit is the blob: each blob of the outputs a daemon puts is in a committed pack or was
-written to the storage nodes instead, and counts in exactly one fallback reason then.
-
-| Family | Type | What it measures |
-|---|---|---|
-| `kbf_pack_daemon_packs_written_total{node}`, `kbf_pack_daemon_blobs_packed_total{node}`, `kbf_pack_daemon_packed_bytes_total{node}` | counter | packs the node's daemon stored and had the frontend commit, the blobs in them, and their bytes (footers included) |
-| `kbf_pack_daemon_write_fallbacks_total{node,reason}` | counter | blobs written to the storage nodes instead of into a pack, by `reason`: `off` (the frontend does not take pack commits, or answered UNIMPLEMENTED earlier), `unfit` (over the largest blob a pack holds, not a SHA-256 digest, or over the in-flight budget), `unsupported` (the commit was answered UNIMPLEMENTED), `refused` (the commit was refused for a reason a repeat does not change), `store` (the object store failed the put of the pack), `record` (the commit failed for a reason a repeat may pass), `index` (the pack index failed before the pack was written) |
-| `kbf_pack_daemon_missing_indexed_total{node}`, `kbf_pack_daemon_missing_unasked_total{node}` | counter | digests of a find-missing question the pack index answered, and digests that went to the storage nodes whole because the index could not be asked |
-
-A farm that writes packs has `kbf_pack_daemon_write_fallbacks_total` flat at 0 apart from `off`
-and `unfit`; a rising `store`, `record` or `index` says the packs are failing and outputs are going
-to the storage nodes (nothing is lost: the pack object of a failed commit is unindexed garbage
-under the daemon's own prefix). A pack that was stored and not committed leaves that garbage, and
-its blobs are counted in `record`, not in `blobs_packed`.
-
-**The gate for moving a farm to packs.** The legacy reads are the reads that still go to the storage
-nodes for a blob a pack could hold: the frontend's `kbf_pack_read_fallbacks_total` plus the sum
-over nodes of `kbf_pack_daemon_elsewhere_total`. A farm has moved when that sum has stopped
-rising (`increase()` over a window longer than a build is 0), and `kbf_pack_daemon_unasked_total`,
-`kbf_pack_daemon_lost_total` and `kbf_pack_daemon_damaged_total` have stayed flat throughout
-(the last two at 0). A rising `kbf_pack_daemon_unasked_total` says the packs are being skipped,
-not that nothing is left on the nodes. A read of a blob over 64 MiB, or of one whose digest is
-not SHA-256, is never asked of the packs and always counts in `kbf_pack_daemon_elsewhere_total`,
-so a farm that reads such blobs has a sum that keeps rising: the criterion is that it has stopped
-rising apart from those reads.
-
-**Input cache counts.** A frontend exports what each daemon says its input cache did, from the
+**Input cache counts.** A frontend exports what each worker says its input cache did, from the
 `input_cache` of its heartbeats ([`GET /v1/nodes/{id}`](#input-cache-counts) shows the same), as the
-counters of the daemon's process, one sample per node. They start again from 0 when the daemon
-restarts, as a counter may. A node that sent none (its cache is off, or its daemon predates the
+counters of the worker's process, one sample per node. They start again from 0 when the worker
+restarts, as a counter may. A node that sent none (its cache is off, or its worker predates the
 field) has no sample, and with no node sending any the families are absent; a node whose next
 heartbeat carries none loses its samples. A node whose stream has closed keeps the counts of its
 last heartbeat until the frontend restarts. The unit is the cache entry, not the file name.
 
 | Family | Type | What it measures |
 |---|---|---|
-| `kbf_node_input_cache_fills_total{node}`, `kbf_node_input_cache_fill_bytes_total{node}` | counter | entries the node's daemon wrote into its input cache from the content store (cold fills), and their bytes |
+| `kbf_node_input_cache_fills_total{node}`, `kbf_node_input_cache_fill_bytes_total{node}` | counter | entries the node's worker wrote into its input cache from the content store (cold fills), and their bytes |
 | `kbf_node_input_cache_hits_total{node}`, `kbf_node_input_cache_hit_bytes_total{node}` | counter | entries a lease found in the cache and used, and their bytes |
 | `kbf_node_input_cache_evictions_total{node}`, `kbf_node_input_cache_evicted_bytes_total{node}` | counter | entries evicted for the byte budget or the free-space floor, and their bytes |
 | `kbf_node_input_cache_tree_builds_total{node}`, `kbf_node_input_cache_tree_hits_total{node}`, `kbf_node_input_cache_tree_evictions_total{node}` | counter | the shared tree store's builds, acquires that found the tree built, and evictions; samples only for nodes that have a tree store |
@@ -1909,12 +1829,12 @@ node has a sample of is not written at all.
 | `kbf_node_load_admission_working_set_bytes` | gauge | `node` | `admission_working_set_bytes`: the working set less the active file pages beyond a quarter of the node's memory |
 | `kbf_node_load_stale` | gauge | `node` | 1 when no reading was accepted for three windows, else 0 |
 | `kbf_node_load_actions_cpu_limited` | gauge | `node` | 1 when the actions cgroup has a CPU quota, else 0 |
-| `kbf_node_load_cpu_throttled_seconds_total`, `kbf_node_load_cpu_pressure_some_seconds_total` | counter | `node` | `cpu_throttled_usec` and `cpu_pressure_some_total_usec` in seconds (the view's microseconds over a million, written with six decimals): the cumulative CPU throttled time and CPU pressure (`some` total) of the actions cgroup. They pass through the daemon's cgroup counters, so they can fall if the cgroup is recreated within a session, which Prometheus reads as a counter reset. No sample when the daemon could not read them |
-| `kbf_node_load_clocks_total`, `kbf_node_load_minutes_total` | counter | `node` | `lists.clocks` and `lists.minutes`: the clock and minute records kept, summed over the accepted readings of the daemon's process |
+| `kbf_node_load_cpu_throttled_seconds_total`, `kbf_node_load_cpu_pressure_some_seconds_total` | counter | `node` | `cpu_throttled_usec` and `cpu_pressure_some_total_usec` in seconds (the view's microseconds over a million, written with six decimals): the cumulative CPU throttled time and CPU pressure (`some` total) of the actions cgroup. They pass through the worker's cgroup counters, so they can fall if the cgroup is recreated within a session, which Prometheus reads as a counter reset. No sample when the worker could not read them |
+| `kbf_node_load_clocks_total`, `kbf_node_load_minutes_total` | counter | `node` | `lists.clocks` and `lists.minutes`: the clock and minute records kept, summed over the accepted readings of the worker's process |
 | `kbf_node_load_refused_minutes_total` | counter | `node` | `lists.refused_minutes`: the minutes carried by readings that were not accepted |
 | `kbf_node_load_dropped_total` | counter | `node`, `reason` | `lists.dropped`, one series per reason: `invalid`, `duplicate`, `over_cap` (always all three for a node that has a load) |
 
-The counters of a node are those of its daemon's process: they start again from 0 when it restarts.
+The counters of a node are those of its worker's process: they start again from 0 when it restarts.
 The `covered` list of the view is not exported.
 
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
@@ -1926,14 +1846,14 @@ and `kbf_execute_submit_seconds` (with `kbf_sched_lock_wait_seconds`) split wher
 Execute that spends 10 s or more before its first operation is also logged at `WARN` with its
 action, instance, invocation id and those phase times.
 
-**Reading a slow upload.** Each ByteStream Write sends one blob, so a daemon's output
+**Reading a slow upload.** Each ByteStream Write sends one blob, so a job's output
 tree of N files costs N Writes, but not N segments: the cache groups blobs from
 concurrent Writes and batches into one segment, sealed when it is full or
 `--write-linger` after its first blob, and a blob of `--write-own-segment-bytes` or
 more gets a segment of its own. Over a window, with `rate()`:
 
 - Writes per second is `rate(kbf_bytestream_write_requests_total)`; with
-  `kbf_bytestream_write_in_flight` near the daemon's upload limit, it is that limit
+  `kbf_bytestream_write_in_flight` near the client's upload limit, it is that limit
   over the mean Write latency
   (`rate(kbf_bytestream_write_seconds_sum) / rate(kbf_bytestream_write_seconds_count)`).
 - The mean of each stage (`_sum` over `_count` of `kbf_segment_put_seconds`,
@@ -1953,14 +1873,12 @@ more gets a segment of its own. Over a window, with `rate()`:
 - `kbf_bytestream_write_present_total` against the requests says how many uploads
   were of blobs already held.
 
-The daemon logs the other side, per lease: its phase times (`lease phases:`) and,
-from its transfer engine, what it read and uploaded (`transfers:`), joined on `lease=`
-([daemon.md](design/daemon.md#where-a-leases-time-went)). The server logs, per lease
-report that carries usage (an OK run or any failed one the daemon measured, for
-example an out-of-memory kill, a timeout or a lost run), `action usage:` with the same cgroup fields, the action's
+The server logs, per lease
+report that carries usage (an OK run or any failed one that was measured, for
+example an out-of-memory kill, a timeout or a lost run), `action usage:` with the cgroup fields, the action's
 shape `key`, its `cfg`, the `outcome` and the `lease`, then `booked_millicpus` and
 `booked_memory_bytes`, the lease's grant, to set against what it used, and names the `key` on each
-`lease granted` line ([daemon.md](design/daemon.md#the-servers-action-usage-line)).
+`lease granted` line.
 
 ## `GET /v1/invocations/{id}` and below
 
@@ -2018,7 +1936,7 @@ applies and the routes are as described above.
   action answer, an output's `executable` is `false`, and a cache hit has no listing. An
   attempt's end and the row's outcome are read from the run's class: a failed run's gRPC
   status code and a lost run's cause are not kept (see `restore.rs`). A cgroup counter the
-  daemon could not read is 0.
+  worker could not read is 0.
 - **Pages.** A page token made for a record the recorder held answers `no_record` once
   the record is read back instead, and so does one made for a restored record that has
   since left the 64 MiB cache of restored records. At most 50,000 records are read for one
@@ -2032,7 +1950,7 @@ booking, memory used and limit of a killed run, `booked_millicpus` and
 `booked_memory_bytes` (what the run's lease was granted, for every run, with the
 meaning and the gaps given for the build pages' attempts above; the two routes show the
 same grant), the REAPI times and cgroup `usage` the
-daemon reported, the digests of the action, command, result and logs, and the `shape`
+worker reported, the digests of the action, command, result and logs, and the `shape`
 (its key, `cfg`, target and whether it is a test). A key the record has no value for is
 left out. The run is read from the in-memory record while it is held and from history
 after, in one rendering: the answer is the same before and after a restart. The run's one
@@ -2187,12 +2105,12 @@ own route; then the keys added since (none of the keys above changed):
   `reapi_times` (each of REAPI's nine `ExecutedActionMetadata` times it has, by name
   without `_timestamp`, as its stamped result would carry them: `queued` is the
   operation's first submission, and the worker start and completion are the server's
-  when the daemon sent none) and `usage` (`wall_us`, each cgroup counter the daemon
+  when the worker sent none) and `usage` (`wall_us`, each cgroup counter the worker
   read: `cpu_usage_us`, `cpu_user_us`, `cpu_system_us`, `cpu_periods`,
   `cpu_throttled`, `throttled_us`, `memory_peak_bytes`; `parallelism`, CPU time over
   wall time; `numa_bytes`, `[{"node", "bytes"}]`). A key not measured is left out,
   never zero. `phase_times` says where `input_fetch`, `execution` and `output_upload` of
-  `reapi_times` came from: `measured` (a daemon's own stamps; also what a record written
+  `reapi_times` came from: `measured` (a worker's own stamps; also what a record written
   before the field reads as) or `task_claim` (an executor run: the task claimed three
   durations in its manifest and the frontend laid them out back to back, ending when it read
   the task's pack). For a `task_claim` only the three durations are data; the instants, and
@@ -2264,7 +2182,7 @@ rerun is not a failure (its reruns are in its `attempts`). It takes `?page_size=
 |---|---|
 | `action`, `href`, `instance`, `target`, `mnemonic` | as on `/actions` |
 | `outcome` | as on `/actions`: `{"ok": {"exit_code": 1}}`, `{"failed": {"code", "message"}}`, `{"timed_out": {}}` or `{"refused": {"reason"}}` |
-| `failure` | the last attempt's failure class (`timeout`, `infra`, `invalid`, `out_of_memory`, `node_memory_pressure`, `missing_input`, `lost`) with the daemon's reason text, `{"class", "reason"}`; `null` when the last attempt did not end in a failure (a run that exited non-zero, a refusal) |
+| `failure` | the last attempt's failure class (`timeout`, `infra`, `invalid`, `out_of_memory`, `node_memory_pressure`, `missing_input`, `lost`) with the worker's reason text, `{"class", "reason"}`; `null` when the last attempt did not end in a failure (a run that exited non-zero, a refusal) |
 | `attempts` | every lease, as on `/actions` |
 | `command` | `{"arguments", "environment_names", "working_directory", "platform", "timeout_micros", "output_paths", "truncated"}`, read when the page is answered from the Action and Command blobs. **Unredacted**: arguments are shown as the build sent them. Environment variables are names only, never values. `platform` is the Action's properties, or the Command's when the Action names none; `timeout_micros` is `null` when the Action sets none; `truncated` says strings were dropped from the end (output paths, then names, then arguments) to keep them within 64 KiB. `null` when a blob is not held, was never uploaded or is over 1 MiB |
 | `command_available` | whether `command` is there |
@@ -2447,7 +2365,7 @@ there is nothing to mount it on.
 Not part of the HTTP API: the answer a storage node (`kbf storage`) gives over gRPC to a
 caller that routed a call by an older storage map than the node holds
 ([architecture-v2](design/architecture-v2.md) section 6). It is listed here because
-callers (the frontend, the daemons) and tools read it from the wire.
+callers (the frontend, the other storage nodes) and tools read it from the wire.
 
 **The caller's generation** is on every call: field 1 (`map_generation`) of every
 `kbf.storage.v1` request (`ActionStore.Get`, `Prepare`, `Commit`), and the ASCII metadata

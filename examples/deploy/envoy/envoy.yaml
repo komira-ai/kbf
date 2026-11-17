@@ -4,7 +4,7 @@
 # This is an example, not a production file. It does not terminate TLS: both kbf
 # listeners are passed through as TCP, so
 #   - Buck2 verifies the frontend's REAPI certificate itself, and
-#   - daemons and storage nodes present their client certificates to the frontend
+#   - storage nodes present their client certificates to the frontend
 #     (mutual TLS on the worker port, end to end).
 # The certificates the frontends load must therefore cover the name clients dial.
 #
@@ -34,7 +34,7 @@ static_resources:
                 # (--http2-keepalive-interval-secs), which also keeps NATs awake.
                 idle_timeout: 0s
 
-    # Worker listener: daemons and storage nodes -> frontend. TCP passthrough is
+    # Worker listener: storage nodes -> frontend. TCP passthrough is
     # required here: the frontend asks the peer for a client certificate
     # (--worker-client-ca) and reads its role from it. If Envoy ended TLS on this
     # port the frontend would see no certificate and refuse every call.
@@ -48,8 +48,8 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
                 stat_prefix: worker
                 cluster: frontends_worker
-                # A daemon's session is one connection that lasts for as long as
-                # the daemon runs; never time it out here.
+                # A storage node's session is one connection that lasts for as long
+                # as the node runs; never time it out here.
                 idle_timeout: 0s
 
   clusters:
@@ -118,7 +118,7 @@ static_resources:
           keepalive_interval: 10
           keepalive_probes: 3
       # Same check as above: the worker port of a draining frontend is still up
-      # (daemons keep reporting results to it), but new sessions should go to a
+      # (storage nodes keep their sessions to it), but new sessions should go to a
       # frontend that is not draining.
       health_checks:
         - timeout: 1s

@@ -510,4 +510,4 @@ capabilities.
   [write-path.md](write-path.md) is the first part of that: blocks it wrote stay as a
   read cache after they are flushed. The daemon side, and the one
   transfer engine all bulk blob movement goes through, are designed in
-  [worker-cache.md](worker-cache.md).
+  `worker-cache.md`, deleted with kbf-daemon.

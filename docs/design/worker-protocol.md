@@ -1,9 +1,11 @@
 # The worker protocol: `kbf.worker.v1`
 
+> **kbf-daemon is deleted.** No shipped program opens this `Session` stream any more: placed actions run only as js-agent jobs. The protocol is kept as shipped vocabulary: `kbf-server` still serves `Worker` and the blob services on the worker listener, and every message stays readable. Where this page says the daemon does something, it describes the deleted `kbf-daemon`; its design page (`daemon.md`) is deleted too.
+
 `kbf.worker.v1` is the protocol between `kbf-daemon` and `kbf-server`. Its definition
 is [worker.proto](../../crates/kbf-proto/proto/kbf/worker/v1/worker.proto); this
 document explains the rules both sides keep and why. The scheduler side is in
-[scheduler.md](scheduler.md), the daemon side in [daemon.md](daemon.md).
+[scheduler.md](scheduler.md), the daemon side in `daemon.md`, deleted with kbf-daemon.
 
 ## Shape
 
@@ -323,7 +325,7 @@ call is served as the REAPI listener serves it (the chunking calls of
 `ActionCache` and `Capabilities` answer `UNIMPLEMENTED` on this listener. Today's
 daemon CAS client calls only `ByteStream`; FindMissingBlobs and the batch calls are
 there for the transfer engine planned in
-[worker-cache.md](worker-cache.md#4-the-shared-transfer-engine).
+`worker-cache.md`, deleted with kbf-daemon.
 
 The worker listener also serves `kbf.worker.v1.Segments` (`Begin`, `PutRange`,
 `Commit`, `Locate`, `ReadRange`), each call admitted by the same rule: a daemon uploads
@@ -718,7 +720,7 @@ action cache with the result.
 What software the node runs, for operators: the OS name, version and build, the
 kernel release (Linux), the `kbf-daemon` version, and the container images the daemon was pinned to
 and checked present at start (`container_images`, container driver: see
-[daemon.md](daemon.md#the-container-driver)). It routes no work, so it is not part of the node report and does not change
+`daemon.md`, deleted with kbf-daemon). It routes no work, so it is not part of the node report and does not change
 `report_hash` (see [fleet-updates.md](fleet-updates.md) section 3.1). The daemon reads
 `os-release` and the kernel release. The wire message also has `xcode_builds` and `xcodes`
 fields, which no daemon fills now (the Macs run no `kbf-daemon`); a server still reads them, and a reader skips what it does
@@ -771,7 +773,7 @@ daemon restarts and server restarts:
    same daemon process (`Hello.instance_id`) and that the new session's heartbeat
    leaves out. (Re-adopting running work across a daemon restart is **planned**; today
    a restarted daemon lists nothing, and ends what its predecessor left running
-   before its `Hello`: see [daemon.md](daemon.md#when-the-daemon-is-killed).)
+   before its `Hello`: see `daemon.md`, deleted with kbf-daemon.)
 7. **Only a daemon process speaks for its own leases.** Two processes may register as
    one node: a restarted daemon, or two daemons holding the node's certificate (a
    cloned machine, a second daemon started, a node replaced while the old one runs).
@@ -781,7 +783,7 @@ daemon restarts and server restarts:
    whose stream is no longer acknowledged, has fenced (issue #140). A process that
    was killed fences nothing: its runs are ended by each run's keeper as the process
    dies, and by the next daemon started on the node, before that one's `Hello` (issue
-   #155); see [daemon.md](daemon.md#when-the-daemon-is-killed) for what neither
+   #155); see `daemon.md`, deleted with kbf-daemon for what neither
    reaches. The one exception is a process proven stopped by its successor
    (`Hello.predecessor_instance_id`, its stream closed): its leases go at once.
 
@@ -802,7 +804,7 @@ daemon restarts and server restarts:
   server. The daemon retries forever, with a backoff that grows to a bound. This part
   is built: `--server` is repeatable, each host is resolved again every round, and the
   wait doubles with jitter up to `--reconnect-max-ms` (see
-  [daemon.md](daemon.md#reaching-a-server)); the redirect is planned. On
+  `daemon.md`, deleted with kbf-daemon); the redirect is planned. On
   failover the daemon reconnects to the new leader and keeps its running leases (the
   epoch names the log, above). Its blob calls go to the worker listeners of all the
   servers, with reads spread across them.

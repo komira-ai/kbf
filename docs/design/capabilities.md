@@ -1,5 +1,7 @@
 # Capabilities
 
+> **kbf-daemon is deleted.** The `kbf-daemon` and its `report` module, which this page names as the source of the node report, are gone; `kbf-caps` stays. Placed actions run only as js-agent jobs (the frontend's `--executor js-agent`), on the executor's virtual workers (`crates/kbf-server/src/executor`), and the Macs run js-agent only. Where this page says a daemon detects, reports or runs a driver, it describes the deleted daemon; the report keys, `Role::Daemon` and the wire fields stay readable.
+
 A farm is only useful if each action lands on a machine that can run it. kbf's rule is
 simple: **a daemon finds out what its machine can do by asking the kernel, and reports
 it.** Nobody types hardware facts into a configuration file, so a wrong hand-typed fact
@@ -129,7 +131,7 @@ module), and the server shows it in `GET /v1/nodes` ([api.md](../api.md#get-v1no
 | `os_build` | `os-release` `BUILD_ID`, where set |
 | `kernel` | `/proc/sys/kernel/osrelease` |
 | `daemon_version` | the same |
-| `container_images` | the `--image` values (container driver), sorted, each checked present at start ([daemon.md](daemon.md#the-container-driver)); no work is placed by image |
+| `container_images` | the `--image` values (container driver), sorted, each checked present at start (`daemon.md`, deleted with kbf-daemon); no work is placed by image |
 
 A field that cannot be read is empty; status never stops a node from joining.
 
@@ -290,7 +292,7 @@ naming no `container-image`.
 - The daemon refuses a `Start` for a lease kind no runtime of its serves. Every driver
   on `main` serves `action` only.
 - The container driver reads `container-image` itself, by that exact name (see
-  [daemon.md](daemon.md#the-container-driver)).
+  `daemon.md`, deleted with kbf-daemon).
 - Unknown platform properties are ignored, not refused (see [Unknown keys](#unknown-keys)).
 - Each daemon sends its `NodeStatus` after `Welcome`, and again when its status changes;
   it routes no work.

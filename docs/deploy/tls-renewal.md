@@ -5,8 +5,8 @@
 | Listener | Files | Flags |
 |---|---|---|
 | REAPI (clients) | server certificate, its key | `--reapi-tls-cert`, `--reapi-tls-key` |
-| worker (daemons, mutual TLS) | server certificate, its key, the CA daemon certificates chain to | `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` |
-| storage node (frontends, daemons, other nodes; mutual TLS) | server certificate, its key, the CA callers' certificates chain to | `--storage-tls-cert`, `--storage-tls-key`, `--storage-client-ca` |
+| worker (storage nodes, mutual TLS) | server certificate, its key, the CA storage nodes' certificates chain to | `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` |
+| storage node (frontends, other nodes; mutual TLS) | server certificate, its key, the CA callers' certificates chain to | `--storage-tls-cert`, `--storage-tls-key`, `--storage-client-ca` |
 
 They look at those files every `--tls-reload-interval-secs` (default 30, 1 to 3600).
 To renew, replace the files. Nothing is restarted, and no connection is ended:

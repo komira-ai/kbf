@@ -10,19 +10,17 @@ The design documents under [docs/design](docs/design) go deeper:
 | Document | Covers |
 |---|---|
 | [scheduler.md](docs/design/scheduler.md) | operations, leases, fencing, QoS, placement, accounting |
-| [simulation.md](docs/design/simulation.md) | the scheduler's simulations: what exists, the invariants every step checks, the scenario families to build and the mutants each must catch |
+| [simulation.md](docs/design/simulation.md) | the scheduler's simulations: what exists, the invariants every step checks, the scenario families to build and the defects each must catch |
 | [storage.md](docs/design/storage.md) | the CAS and action cache, segments, metadata, retention, the object store interface |
-| [write-path.md](docs/design/write-path.md) | uploads grouped into shared segments (one PUT and one metadata commit per segment), segment upload from the daemon (an action's outputs as whole segments, one metadata commit) and segment-range fills, a local NVMe/SSD write tier flushed to the object store, what an acknowledgement promises at each step, crash and lost-disk recovery, rollout and tests (grouping built; the rest **planned**) |
+| [write-path.md](docs/design/write-path.md) | uploads grouped into shared segments (one PUT and one metadata commit per segment), segment upload (a client's outputs as whole segments, one metadata commit) and segment-range fills, a local NVMe/SSD write tier flushed to the object store, what an acknowledgement promises at each step, crash and lost-disk recovery, rollout and tests (grouping built; the rest **planned**) |
 | [write-tier-scenarios.md](docs/design/write-tier-scenarios.md) | every failure the local write tier must survive (crash points, store outages of minutes and hours, slow and failing stores, lost commits, disk full, bad sectors, torn tails, eviction and read races, node loss, leader change, clock jumps, the orphan sweep), the invariant each checks and the outcome expected, which run today against the direct path and which wait for the tier, and the simulation seams the tier plugs into (**planned**; the direct-path runs exist) |
 | [metadata-snapshots.md](docs/design/metadata-snapshots.md) | the snapshot encoding of the metadata state, compaction of the single-voter log, starting from a snapshot, version refusal, size and pause at today's scale and 10x, and how the HA design inherits it (**planned**) |
 | [worker-protocol.md](docs/design/worker-protocol.md) | `kbf.worker.v1`: messages and the rules both sides keep |
-| [daemon.md](docs/design/daemon.md) | `kbf-daemon`, the container driver, output collection, limits |
-| [worker-cache.md](docs/design/worker-cache.md) | the daemon's blob traffic: one shared transfer engine (one connection, one in-flight limit, batching, FindMissing before upload), a per-node NVMe input cache linked or cloned into each lease, per-driver safety, eviction, metrics, rollout and tests (the engine without batching, and the container driver's cache, are built) |
 | [capabilities.md](docs/design/capabilities.md) | node reports, ISA levels, matching an action to a node |
 | [fleet-updates.md](docs/design/fleet-updates.md), [fleet-updates-security.md](docs/design/fleet-updates-security.md) | keeping node software current: rolling updates, MDM on Macs, Linux host updates, bare-metal GPU and app-install isolation, the Fleet UI; its security model: threat model, root helpers, signing keys, the MDM gate, enrollment (**planned**) |
 | [updates.md](docs/design/updates.md) | updates by a coordinator and an updater on every host: the heartbeat and its reply, the desired state CI sets with an OIDC token, the per-role limits and the order the coordinator decides by, one host's A/B, the trust (enrollment, mTLS, OIDC, attestation), the failures, and the three PRs (the coordinator is built; the host agent and the deletion of the ssh path are **planned**) |
 | [frontend-proxy.md](docs/design/frontend-proxy.md), [kbf-proxy-api.md](docs/design/kbf-proxy-api.md) | the front door of a frontend host: `kbf-proxy` terminating TLS and balancing each stream over a pool of frontends that share one Postgres state store, the identity headers it sends, a roll that drains, retires and restarts one frontend at a time, release compatibility, and the crate's API, limits and admin API |
-| [deployment-topology.md](docs/design/deployment-topology.md) | where servers run, the Raft log on local disk, the client front that routes reads and uploads to any server and the rest to the leader, daemons dialling the servers directly, the converged topology (servers, object store and daemons on the same hosts), what is built and what is planned, the probes the front must pass (**planned**) |
+| [deployment-topology.md](docs/design/deployment-topology.md) | where servers run, the Raft log on local disk, the client front that routes reads and uploads to any server and the rest to the leader, workers dialling the servers directly, the converged topology (servers, object store and workers on the same hosts), what is built and what is planned, the probes the front must pass (**planned**) |
 | [mdm-backend.md](docs/design/mdm-backend.md) | (**superseded**: the gate it describes, `kbf-mdm-gate`, was never deployed and is deleted; the MDM gate is `hostkeeper-mdm-gate` in komira-ai/hostkeeper) MDM as a pluggable backend behind `kbf-mdm-gate`: the three operations the server uses, erase only by an operator's hardware-key-signed request, macOS 27 update progress, network reachability, moving the MDM, kbf's own configuration management (**planned**) |
 | [invocations.md](docs/design/invocations.md) | a build's id (the client's `tool_invocation_id`), the per-invocation and per-action record, where it is kept and for how long, the read API an agent diagnoses a build with (a failures view with log tails, artifacts, metrics, a one-command `kbf build show` client, read tokens; the agent-facing part is [invocations-api.md](docs/design/invocations-api.md)), the configurable build-page URL and how a buck2 or Bazel user gets the link (**planned**) |
 
@@ -41,34 +39,34 @@ them.
 There is no client-side kbf component. Bazel and Buck2 speak REAPI to `kbf-server`
 directly.
 
-## The two programs
+## The programs
 
-kbf ships three binaries: `kbf` (crate `kbf-cli`), which runs every role of a farm as a
-mode, and the two programs it is built from, `kbf-server` and `kbf-daemon`, which still
-build and run on their own.
+kbf ships two binaries: `kbf` (crate `kbf-cli`), which runs a role of a farm as a mode,
+and `kbf-server`, the program `kbf`'s two modes are built from, which still builds and runs
+on its own.
 
 **`kbf`** takes its mode from `--mode` (or `mode = "..."` in `kbf.toml`; the mode is a
 flag, never a word after `kbf`):
 
 - `frontend`: the REAPI front end. It takes the listener, scheduler, state-store and log
-  flags of `kbf-server`, requires `--storage`, and holds no blob stores;
+  flags of `kbf-server`, requires `--storage`, and holds no blob stores. With `--executor
+  js-agent` it places each action as a job of the jobscheduler's job service (crate
+  `kbf-server`, module `executor`; [kbf-modes.md](docs/deploy/kbf-modes.md));
 - `storage`: the storage node. It takes the store, write and log flags of `kbf-server`
   and no state-store flag: a storage node reaches the state store only through a
-  frontend;
-- `daemon`: the build node, with exactly the flags of `kbf-daemon`;
-- `storage-and-daemon`: the storage node and the daemon in one process, the daemon
-  reading and writing the node's storage in-process;
-- `all-in-one`: the server and the daemon in one process (below).
+  frontend.
 
+The modes `daemon`, `storage-and-daemon` and `all-in-one` were removed; asking for one exits
+2 with a line that says what replaced it ([kbf-modes.md](docs/deploy/kbf-modes.md#the-removed-modes)).
 A mode refuses the flags that belong to another mode. `kbf cluster ...` is not a mode:
 it is a client of the frontend's operator API. Source: `crates/kbf-cli/src/lib.rs`.
 
 **`kbf-server`** (crate `kbf-server`) is the whole server in one process: it serves REAPI to build clients and
-`kbf.worker.v1` to daemons, on two separate listeners. It holds the cache, the
-scheduler and the record of which daemons are connected. Today one process runs every
+`kbf.worker.v1` to storage nodes, on two separate listeners. It holds the cache, the
+scheduler and the record of which workers are connected. Today one process runs every
 role (`--role=all`). The flags are:
 
-- `--listen` (REAPI, default `127.0.0.1:8980`) and `--worker-listen` (daemons, default
+- `--listen` (REAPI, default `127.0.0.1:8980`) and `--worker-listen` (storage nodes, default
   `127.0.0.1:8981`);
 - `--reapi-tls-cert` and `--reapi-tls-key` to serve the REAPI listener over TLS (both,
   or neither for plain text);
@@ -89,7 +87,7 @@ role (`--role=all`). The flags are:
   free space, at most `--hot-store-max-bytes`); and the metadata log's directory,
   `<hot store>/meta` or `--meta-dir`. There is no `memory:` store: a `file://` path on a
   tmpfs is one (storage glossary: [storage-node.md](docs/deploy/storage-node.md#where-the-bytes-live-storage-glossary));
-- `--heartbeat-interval-ms` (default 5000), the interval daemons are asked to
+- `--heartbeat-interval-ms` (default 5000), the interval workers are asked to
   heartbeat at;
 - `--finished-retention-secs` (default 60), how long a finished operation is kept
   for WaitExecution before its name is `NOT_FOUND`;
@@ -100,7 +98,7 @@ role (`--role=all`). The flags are:
 - `--state-store`, where the scheduler keeps its state: `postgres:///kbf?host=/run/postgresql`
   (a database on a local Unix socket, reached as the process's own user; a URL with a
   password is refused) or `sqlite:///absolute/path`. Changes are written before they are
-  acknowledged and replayed at start, and every start is a new epoch, so daemons kill the
+  acknowledged and replayed at start, and every start is a new epoch, so workers kill the
   runs of the leases they held before. Left out, the scheduler's state is in memory and a
   restart loses it ([architecture-v2.md](docs/design/architecture-v2.md) section 4.3);
 - `--invocation-memory` (bytes, default 268435456, 256 MiB), the memory the invocation
@@ -109,34 +107,18 @@ role (`--role=all`). The flags are:
 - `--api-listen`, off unless given: the operator API, HTTP/JSON under `/v1`
   ([docs/api.md](docs/api.md)). Reads are open, so bind it where only operators
   reach it; writes need the token in `--api-token-file` (owner-only file), come from
-  loopback, and carry no `Origin` header. Run `kbf-server` as a user other than
-  `kbf-daemon`'s and its lease users', or builds on the same host can read the token.
+  loopback, and carry no `Origin` header. Run `kbf-server` as a user other than the
+  one the job service's agents and jobs run as, or a job on the same host can read the token.
 
-**`kbf-daemon`** (crate `kbf-daemon`) runs on each worker machine. It opens one
-outbound mutual-TLS stream to a server, reports what the machine is, heartbeats, and
-runs the leases the server starts. It never listens on a port. Execution goes through
-a `Runtime` trait, and the binary's `--driver` flag picks the implementation:
-`container` runs each action in a fresh rootless `crun` container (crate
-`kbf-driver-container`, Linux only; images come from `kbf-image`), `native` runs it as plain processes, on Linux
-(crate `kbf-driver-native`; the Macs run no `kbf-daemon`: a macOS action runs as a js-agent job, [actions-as-jobs.md](docs/design/actions-as-jobs.md) section 14), and `fake` runs nothing, for bring-up. The binary is built
-from crate `kbf-node`, not from the `kbf-daemon` library crate, because the drivers
-depend on that library and a binary in it that named them would be a cycle Cargo
-refuses.
-
-**`kbf all-in-one`** (the mode of the `kbf` binary that crate `kbf-storage-and-daemon` provides the
-library for, Linux only, the container driver only) runs
-both in one process, for a one-node farm: the server half as `kbf-server` starts, then
-the daemon half as `kbf-daemon` starts, each on an async runtime of its own, taking every
-flag of both binaries. The daemon half's control plane is a remote daemon's (mutual TLS
-to the server half's worker listener on loopback); its blobs move through calls into the
-server half's cache and `Segments` handlers (`LocalDataPlane`), with no listener between.
-The scheduler's state is in `--state-store`, which defaults here to the local Postgres
-socket (`postgres:///kbf?host=/run/postgresql`; `sqlite:///absolute/path` is also accepted), so a restart keeps queued operations; the
-in-process plane's admission and `--reserve-cpus` across both halves are not done
-([README](crates/kbf-storage-and-daemon/README.md)). The same crate holds `kbf
-storage-and-daemon`: the storage node (`kbf_server::storage_half`, `kbf storage`'s start
-with the storage it serves kept) and the same daemon half over the same `LocalDataPlane`,
-which knows the store only as `kbf_storage::Storage`.
+**Where an action runs.** A placed action runs only as a job of the jobscheduler's job
+service, submitted by the frontend's executor (`--executor js-agent`, the only value). The
+executor registers virtual workers with the frontend's farm (`js:<frontend id>-<n>` on
+Linux, `js-mac:<frontend id>-<n>` for Macs), so the scheduler books and places leases on
+them as on any worker, and turns each lease into one job. The job is the
+`kbf-task` tool (crate `kbf-task`), which runs the action's Command and commits its outputs
+into a put directory that the frontend then reads once, hashes and records. With no
+`--executor` the frontend builds no executor: it serves the cache and the CAS and places
+nothing.
 
 ## Crates
 
@@ -154,7 +136,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-raft` | yes | a sans-IO Raft core ([ADR 0001](docs/adr/0001-consensus.md)) and its host loop over `Storage`, `Transport` and `Machine` traits, with an in-memory storage |
 | `kbf-invocation` | yes | the invocation record ([invocations.md](docs/design/invocations.md) section 3): each build's header, counters and action rows, built only from events (calls, lease grants, starts, requeues, finishes), its `kbf.invocation.v1` encoding, and the memory bound of section 3.5 (minted, then idle records evicted; then the largest open one closed to new rows, and whatever else does not fit left out) |
 | `kbf-map` | yes | the storage map (generation, members with address, zone, weight and state, rule, replication factor, minimum protocol, deny entries) and weighted rendezvous hashing over it: write owners, read order, and read order across two generations ([architecture-v2](docs/design/architecture-v2.md) sections 6 and 8); depends on `kbf-types` and a fixed-key SipHash only, so the frontend, storage, the daemon and the transfer engine can all use it |
-| `kbf-mapsync` | no | the storage map in motion: the `MapSource` seam a frontend implements (the map it holds and a generation that ticks when it changes), and the `MapHolder` a daemon or a storage node keeps the newest pushed map in, never going back ([architecture-v2](docs/design/architecture-v2.md) section 6); depends on `kbf-map` and tokio's watch channel only |
+| `kbf-mapsync` | no | the storage map in motion: the `MapSource` seam a frontend implements (the map it holds and a generation that ticks when it changes), and the `MapHolder` a storage node keeps the newest pushed map in, never going back ([architecture-v2](docs/design/architecture-v2.md) section 6); depends on `kbf-map` and tokio's watch channel only |
 | `kbf-estimator` | yes | per-key memory and CPU size summaries and estimates learned from earlier runs, with an OOM floor and raise-only state (only the offline replay calls it yet) |
 | `kbf-estimator-replay` | no | the read-only exporter of the farm's run history (`kbf-estimator-replay export`: GET routes only, one JSON line per attempt, one file per UTC day); and a memory-only replay of the export through the real scheduler and `kbf-estimator` (`kbf-estimator-replay replay`); and `kbf-estimator-replay slowdown`, each successful run's wall time against the p10 of its estimator key's quiet runs |
 | `kbf-objstore` | no | the `ObjectStore` trait and the S3 store, re-exported from `objstore-s3` (komira-ai/tierstore), an in-memory store, a local-directory store (`FsStore`, `kbf-server --cold-store=file://...`), the conformance suite, the segment-footer reader |
@@ -173,46 +155,41 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-gate` | no | the fail-closed gate library every CI/CD stage shares ([kbf-cicd](docs/design/kbf-cicd.md) sections 5.2, 7 and 10): the result document (one shape, written RUNNING first and FINISHED on every exit a drop guard or `fail_and_exit` can see), a Prometheus text reader whose absent series is red, the gate verdicts, and the one definition of a release set's hash; its only I/O is the document's atomic write, and the layering test keeps it off the async stack and off other kbf crates |
 | `kbf-storage` | no | the storage boundary ([architecture-v2.md](docs/design/architecture-v2.md) sections 3 and 13): the `Storage` trait (FindMissing, whole-blob read and write, a streamed write, the `Segments` service, the action cache) and its `StorageError`. `kbf-front`'s `CacheStorage` puts the cache behind it and `kbf-server`'s `LocalStore` calls through it; the cache's code is to move here. Depends on no frontend crate: not `kbf-sched`, not `kbf-auth` (`crates/kbf-integration-test/tests/layering.rs`) |
 | `kbf-peer` | no | the role a peer's certificate names ([architecture-v2.md](docs/design/architecture-v2.md) section 9): the one reader of its `urn:kbf:role:<name>` URI subjectAltName (`role_of`), which the storage service's per-endpoint table and the worker listener's per-method table (`kbf-server`'s `worker_roles`) ask; no gRPC, so a tool that checks a certificate can use it too; `uri_values_of`, the URI values of one prefix (the update coordinator reads an updater's host role with it) A fourth role, `updater`, is a host's updater (`urn:kbf:role:updater`, with the host role in `urn:kbf:host-role:<name>` read by `uri_values_of`); the worker listener's role table serves it four HTTP calls about its own node (`kbf-server`'s `node_self`) and no gRPC method. |
-| `kbf-enroll` | no | the node's side of enrollment (`docs/design/install-and-enrollment.md`, sections 4 and 5, on its own branch until it merges): `kbf.toml` with every field validated, the enroll token file, first contact checked against the CA fingerprint in the token (`pin`), `Enroll` and `Renew` over `kbf.enroll.v1` with one key per role made on the node, the answer's checks, the key and certificate files written atomically (`store`), the schedule of renewal, and the cold-store keys a storage node holds in memory only; a library, called by the start of a node mode in `kbf-cli` (`kbf --mode=storage|daemon|storage-and-daemon`) `Config::updater` and `Store::unopened` serve a host's updater, whose role `updater` has its own `updater.key` and `updater.pem` (`kbf-updater enroll`, `docs/deploy/kbf-updater.md`). |
-| `kbf-server` | no | the server: wires front, scheduler and storage together (`start` returns a `ServerHandle`; the `kbf-server` binary is a thin main over it, so a combined binary can run the server in its own process, and `ServerHandle::local` is the server's cache as calls in that process, `LocalStore`; the stores its flags name, `--cold-store`, `--hot-store` and `--meta-dir`, are parsed and resolved in `stores`); the host executor (`executor`, not wired: no flag builds one yet), which runs a placed action on a host leased from the job scheduler's lease server, as a virtual worker of the farm per held lease, with no change to the worker session or the scheduler core |
+| `kbf-enroll` | no | the node's side of enrollment (`docs/design/install-and-enrollment.md`, sections 4 and 5, on its own branch until it merges): `kbf.toml` with every field validated, the enroll token file, first contact checked against the CA fingerprint in the token (`pin`), `Enroll` and `Renew` over `kbf.enroll.v1` with one key per role made on the node, the answer's checks, the key and certificate files written atomically (`store`), the schedule of renewal, and the cold-store keys a storage node holds in memory only; a library, called by the start of a node mode in `kbf-cli` (`kbf --mode=storage`) `Config::updater` and `Store::unopened` serve a host's updater, whose role `updater` has its own `updater.key` and `updater.pem` (`kbf-updater enroll`, `docs/deploy/kbf-updater.md`). |
+| `kbf-server` | no | the server: wires front, scheduler and storage together (`start` returns a `ServerHandle`; the `kbf-server` binary is a thin main over it, so `kbf` can run the server in its own process; the stores its flags name, `--cold-store`, `--hot-store` and `--meta-dir`, are parsed and resolved in `stores`); the executor (`executor`, built by `--executor js-agent`), which runs a placed action as a job of the jobscheduler's job service, as a virtual worker of the farm, with no change to the scheduler core |
 | `kbf-proto` | no | generated code for REAPI, `kbf.worker.v1`, `kbf.storage.v1`, `kbf.log.v1`, `kbf.map.v1` (the storage map's messages, with their conversions to and from `kbf-map` types) and `kbf.update.v1` (self-update: offer, order, status, release fetch) |
 | `kbf-log` | no | the replicated log's entry encoding: `kbf-meta` commands and the control commands (batched farm inputs (a lease grant with the cost admission charged it, left out when it is the default), a result with its action-cache entry, takeover, checkpoint, machine version) to and from `kbf.log.v1`, under the log's format version |
-| `kbf-daemon` | no | the daemon: session loop, lease manager, input and output trees, the input cache |
-| `kbf-transfer` | no | the shared blob transfer engine: the `Cas` trait, and `Transfers`, one per daemon process: one HTTP/2 connection to the worker listener with explicit windows, one in-flight limit and byte budget for every lease, one fetch per digest however many leases ask, FindMissing before every upload, resumed reads after a broken connection, and each lease's `TransferStats` ([worker-cache.md](docs/design/worker-cache.md) section 4) |
-| `kbf-driver-container` | no | the rootless `crun` execution driver |
+| `kbf-transfer` | no | the shared blob transfer engine: the `Cas` trait, and `Transfers`: one HTTP/2 connection to the worker listener with explicit windows, one in-flight limit and byte budget for every caller, one fetch per digest however many callers ask, FindMissing before every upload, resumed reads after a broken connection, and each caller's `TransferStats` |
 | `kbf-image` | no | the node's image source: a digest-verified registry client (hyper over rustls) and the layer unpacker (whiteouts, ownership, in-root path resolution) |
-| `kbf-driver-native` | no | the native execution driver: plain processes on Linux, for the beta smoke farm; a macOS action runs as a js-agent job ([actions-as-jobs.md](docs/design/actions-as-jobs.md) section 14), and the Macs run no `kbf-daemon` |
-| `kbf-node` | no | the worker daemon as a library (flags, the driver `--driver` names, the data directory `--data-dir` (`leases/`, the input cache and the input trees, sized from the filesystem), `start` returning a `NodeHandle`, over the transfer engine; `start_with`, over a data plane the caller makes) and the `kbf-daemon` binary, a thin main over it. Only a combined binary may link both this and `kbf-server` (`kbf-integration-test` `layering`) |
-| `kbf-storage-and-daemon` | no | a library, no binary: `kbf all-in-one` (above), the server and a daemon in one process on one command line of both binaries' flags, run by the `kbf` binary (`kbf-cli`); and `LocalDataPlane`, the daemon's data plane as calls into the server's `LocalStore` on the server half's runtime; and `kbf storage-and-daemon` (`storage_and_daemon`), the storage node and a daemon in one process over the same plane ([README](crates/kbf-storage-and-daemon/README.md)) |
-| `kbf-cas-conformance` | no | the checks every implementation of the daemon's data plane (`kbf_transfer::Cas`) must pass, generic over the implementation (`tests!`); run against the gRPC implementation `kbf_transfer::Transfers`, and in `kbf-all-in-one` against `LocalDataPlane` over a server with a write tier and one without |
-| `kbf-threads` | no | thread and disk sizing for both binaries (disk: a filesystem's size and free space, the floor it keeps free, and the shares a cache, a tree store or a hot store may take: `disk`); thread sizing: on the daemon `--reserve-cpus` (and `--reserve-share`) size the pools and leave the leases the other CPUs, limited to the physical cores (`Topology`); the server has no reserve and uses every CPU it may (one async worker and one hashing thread per logical CPU, tokio's blocking cap); `--async-threads`, `--blocking-threads` and `--cpu-threads` override on both; and the tokio runtime built with them |
+| `kbf-cas-conformance` | no | the checks every implementation of the data plane (`kbf_transfer::Cas`) must pass, generic over the implementation (`tests!`); run against the gRPC implementation `kbf_transfer::Transfers` |
+| `kbf-threads` | no | thread and disk sizing for the server (disk: a filesystem's size and free space, the floor it keeps free, and the shares a cache, a tree store or a hot store may take: `disk`); thread sizing: the server has no reserve and uses every CPU it may (one async worker and one hashing thread per logical CPU, tokio's blocking cap); `--async-threads`, `--blocking-threads` and `--cpu-threads` override it; and the tokio runtime built with them |
 | `kbf-tls` | no | TLS for a server listener whose certificate, key and client CA are files that change while it runs: `TlsSource` re-reads them on an interval (`--tls-reload-interval-secs`) and swaps in a new `rustls` configuration only if the new files make a working one (readable, PEM, key matches certificate, client CA has a usable certificate, leaf not expired), otherwise it keeps the current one and counts the refusal (`kbf_tls_reloads_total`); `Incoming` accepts the connections a tonic server is given, handshaking each under the configuration current at its accept, so a renewal never ends a connection in flight; `peer_certs` and `remote_addr` read a request's peer. `kbf-server` uses it for the REAPI and worker listeners and the storage node's listener (`kbf-storage` reads a caller's certificate through it, `service/admission.rs`) |
 | `mdm-core` | yes | **frozen**, successor `hostkeeper-mdm-core` in komira-ai/hostkeeper: the MDM host layer's renderer: settings, the systemd units and Caddyfile of NanoHUB, the SCEP server, NanoDEP and the proxy, the enrollment and ADE profiles, the pinned upstream tools; bytes from settings text, no I/O; links no other workspace crate ([mdm-host.md](docs/mdm-host.md)) |
 | `host-step` | no | **frozen**, successor `hostkeeper-mdm-step` in komira-ai/hostkeeper: the planner of host steps (directory, file, user, unit action, command) with a dry run by default, over a `Host` that is the machine (`RealHost`, which follows no link on the way) or a fake (`fake::FakeHost`); links no other workspace crate |
 | `mdm-host` | no | **frozen**, successor `hostkeeper-mdm` in komira-ai/hostkeeper: the binary `mdm-host`: `fetch`, `install`, `tls` and `verify` of the MDM on one Linux host, built on `mdm-core` and `host-step`; a binary of its own beside the update coordinator, never part of `kbf`, and links no other workspace crate (`kbf-integration-test`'s `mdm_layering` keeps the three apart); kbf-deploy's `mdm` kit is the older installer it was ported from ([mdm-host.md](docs/mdm-host.md)) |
 | `kbf-host` | no | the one way kbf changes a host, shared by `kbf-deploy` and `kbf-installer`: a plan of steps (write a file, make a directory, remove, run a tool by absolute path with an empty environment, run one and write its filtered output to a file, wait for an HTTP URL), made from queries that change nothing (a query or tool may run as another user, with that user's groups) and printed as `DRY-RUN:` lines by default and carried out only in apply mode; a file or directory step is planned only when the host differs, so a re-run after an apply plans nothing; a root plan applies only as root, from a binary root alone can replace, and a user plan never as root. With the `testkit` feature, a fake host that records each step and query, for other crates' tests |
-| `kbf-installer` | no | the root tool of a host: the host side of a kbf release, shared by `kbf-deploy host ...` (the manual path) and the root helper that applies pulled updates, so a host has one state file and one layout on Linux and macOS ([host-releases.md](docs/deploy/host-releases.md)): `layout` (in `kbf-setup`, re-exported here; releases under `/var/lib/kbf-installer/releases/<commit>/`, the `current` and `previous` links beside them, the platform's state directory, lock and trust directory, in one place), `state` (`state.json`, schema 2, under an exclusive lock, replaced whole by a rename, with `state.json.bak` as the last good copy; the commit-confirm record and the order floor), `release` (`install`, `stage`, `rollback` and `gc`, through `kbf-host`'s plan of steps; a release holds `kbf`, `kbf-daemon` or both), and the offline checks of a release a fetch brought in (the fetch itself is a later change; there is no inbox of release bytes now): `attest` (the pinned `gh attestation verify`, run as an unprivileged user with a cleared environment and a dead proxy), `archive`, `binary` (ELF/Mach-O kind, `--version --json`), `darwin` (quarantine, code signature), `spool` (a directory the unprivileged `kbf` writes, opened without following links and each file judged by its descriptor), `trust` (the root-owned trust list), `settings` and `refusal` (one enum, a stable code per case). Its binary, `kbf-installer`, carries the root helper of the pull-based updates ([pull-updates.md](docs/design/pull-updates.md) section 7; the `helper` module): `run` reads the order records the node's `kbf-update` client writes into the order spool (at most 64, each opened without following a link, read once, expired 1800 s after root first saw it; no socket), acts on activate/confirm/revert orders (an activation goes through a `Fetcher` trait that pulls and verifies the release, and refuses while a trial is pending or a lease is live), restarts the one service named by its own flag, and writes `status.json` (schema 2); `boot-check` runs before each start of the service and reverts a release that keeps failing; `setup` (the `setup` module, in `kbf-setup` and re-exported here; [kbf-installer-setup.md](docs/deploy/kbf-installer-setup.md)) makes a host ready for its mode: the fetch account, `orders/`, the enrollment and first operator tokens, `installer.toml`, the state database's schema on a frontend or all-in-one host, the first release through the `Fetcher`, `kbf.toml`, then the units (a frontend's is enabled, never started); it refuses while the retired helper's layout is on the host |
+| `kbf-installer` | no | the root tool of a host: the host side of a kbf release, shared by `kbf-deploy host ...` (the manual path) and the root helper that applies pulled updates, so a host has one state file and one layout ([host-releases.md](docs/deploy/host-releases.md)): `layout` (in `kbf-setup`, re-exported here; releases under `/var/lib/kbf-installer/releases/<commit>/`, the `current` and `previous` links beside them, the platform's state directory, lock and trust directory, in one place), `state` (`state.json`, schema 2, under an exclusive lock, replaced whole by a rename, with `state.json.bak` as the last good copy; the commit-confirm record and the order floor), `release` (`install`, `stage`, `rollback` and `gc`, through `kbf-host`'s plan of steps; a release holds `kbf`), and the offline checks of a release a fetch brought in (the fetch itself is a later change; there is no inbox of release bytes now): `attest` (the pinned `gh attestation verify`, run as an unprivileged user with a cleared environment and a dead proxy), `archive`, `binary` (the executable's kind, `--version --json`), `spool` (a directory the unprivileged `kbf` writes, opened without following links and each file judged by its descriptor), `trust` (the root-owned trust list), `settings` and `refusal` (one enum, a stable code per case). Its binary, `kbf-installer`, carries the root helper of the pull-based updates ([pull-updates.md](docs/design/pull-updates.md) section 7; the `helper` module): `run` reads the order records the node's `kbf-update` client writes into the order spool (at most 64, each opened without following a link, read once, expired 1800 s after root first saw it; no socket), acts on activate/confirm/revert orders (an activation goes through a `Fetcher` trait that pulls and verifies the release, and refuses while a trial is pending or a lease is live), restarts the one service named by its own flag, and writes `status.json` (schema 2); `boot-check` runs before each start of the service and reverts a release that keeps failing; `setup` (the `setup` module, in `kbf-setup` and re-exported here; [kbf-installer-setup.md](docs/deploy/kbf-installer-setup.md)) makes a host ready for its mode: the fetch account, `orders/`, the enrollment and first operator tokens, `installer.toml`, the state database's schema on a frontend host, the first release through the `Fetcher`, `kbf.toml`, then the units (a frontend's is enabled, never started); it refuses while the retired helper's layout is on the host |
 | `kbf-setup` | no | the library behind `kbf-installer setup`, which `kbf-installer` re-exports under the old paths (`kbf_installer::setup`, `layout`, `installer_toml`, `database`, `exit`, `sha256_hex`, `CommitId`): `setup` (the verb), `layout` (the host's paths per platform), `installer_toml` (the settings file `setup` writes and the proxy verb reads), `database` (the state database's schema step), `exit` (the exit codes), `sha256_hex`, and `CommitId`; it names `kbf-proxy` only in `installer_toml` and `setup/proxy.rs`, and does not depend on `kbf-installer` |
-| `kbf-deploy` | no | the deploy tool; a kit that changes a host does it through `kbf-host`. It reads closed-key `KEY=VALUE` config files; its unit reader (`unit`, re-exported from `kbf-unitfile`) is the one the docs check uses, `template` is strict `@KEY@` substitution, and `https` is a small HTTPS client (rustls with ring, the host's trusted roots). Four kits. `minio`: `buckets` makes buckets, a policy for them and a service account key file through `mc`, with the admin key in `mc`'s environment, never on an argv, and `nodeport` adds a NodePort Service for a MinIO's S3 port through `kubectl`. `linux`: `swap` makes the swapfile ([storage-node.md](docs/deploy/storage-node.md#the-build-swapfile)), `meta-backup` and `meta-verify` back up and check a kbf-server's metadata log, and `verify-cert` checks a certificate against its row of the farm's table; the `kbf` modes' units are the packaged files `kbf-installer` installs ([kbf-units.md](docs/deploy/kbf-units.md)), not this kit's. `mdm`: `fetch` downloads the pinned upstream archives of an Apple MDM (NanoHUB, the SCEP server, NanoDEP, Caddy, lego, mdmctl) as the operator's user and checks each sha256; as root, `install` checks the host and the archives, unpacks the binaries, makes the secrets and the SCEP CA, renders and installs the units and the Caddyfile from compiled-in templates and starts the services; `tls` installs lego's certificate job, its renewal timer and the proxy's reload on renewal, gets the first certificate over DNS-01 and starts the proxy; `push-cert` checks an APNs push certificate and its key, gives them to NanoHUB on loopback and writes the enrollment profile (a property list); `dep` links NanoDEP to Apple Business Manager and defines an ADE profile, refused unless it is supervised, mandatory and not removable; the API calls are printed as steps are and made only with `--apply`; `verify` checks, read only, the services, the listeners, the routes through the HTTPS proxy, the TLS certificate, DNS and the modes of the state and secret files; the `mdm` kit is frozen, its successor `hostkeeper-mdm` in komira-ai/hostkeeper ([mdm-host.md](docs/mdm-host.md)); `pilot`: as the operator's own user, never root, `server-install` checks the host (the bind address on the configured interface, free ports, a server certificate that chains to the CA for the configured name with its own 0600 key, a 0600 S3 key file outside every git work tree, a kbf-server binary for this CPU whose `--help` lists every flag its unit passes) and runs kbf-server as a capped systemd user service, waiting for its start line after a restart, and `buckconfig` writes the buck2 overlay that points one linked worktree at it, never replacing or removing a `.buckconfig.local` it did not write |
+| `kbf-deploy` | no | the deploy tool; a kit that changes a host does it through `kbf-host`. It reads closed-key `KEY=VALUE` config files; its unit reader (`unit`, re-exported from `kbf-unitfile`) is the one the docs check uses, `template` is strict `@KEY@` substitution, and `https` is a small HTTPS client (rustls with ring, the host's trusted roots). Four kits. `minio`: `buckets` makes buckets, a policy for them and a service account key file through `mc`, with the admin key in `mc`'s environment, never on an argv, and `nodeport` adds a NodePort Service for a MinIO's S3 port through `kubectl`. `linux`: `swap` makes the swapfile ([storage-node.md](docs/deploy/storage-node.md#the-swapfile)), `meta-backup` and `meta-verify` back up and check a kbf-server's metadata log, and `verify-cert` checks a certificate against its row of the farm's table; the `kbf` modes' units are the packaged files `kbf-installer` installs ([kbf-units.md](docs/deploy/kbf-units.md)), not this kit's. `mdm`: `fetch` downloads the pinned upstream archives of an Apple MDM (NanoHUB, the SCEP server, NanoDEP, Caddy, lego, mdmctl) as the operator's user and checks each sha256; as root, `install` checks the host and the archives, unpacks the binaries, makes the secrets and the SCEP CA, renders and installs the units and the Caddyfile from compiled-in templates and starts the services; `tls` installs lego's certificate job, its renewal timer and the proxy's reload on renewal, gets the first certificate over DNS-01 and starts the proxy; `push-cert` checks an APNs push certificate and its key, gives them to NanoHUB on loopback and writes the enrollment profile (a property list); `dep` links NanoDEP to Apple Business Manager and defines an ADE profile, refused unless it is supervised, mandatory and not removable; the API calls are printed as steps are and made only with `--apply`; `verify` checks, read only, the services, the listeners, the routes through the HTTPS proxy, the TLS certificate, DNS and the modes of the state and secret files; the `mdm` kit is frozen, its successor `hostkeeper-mdm` in komira-ai/hostkeeper ([mdm-host.md](docs/mdm-host.md)); `pilot`: as the operator's own user, never root, `server-install` checks the host (the bind address on the configured interface, free ports, a server certificate that chains to the CA for the configured name with its own 0600 key, a 0600 S3 key file outside every git work tree, a kbf-server binary for this CPU whose `--help` lists every flag its unit passes) and runs kbf-server as a capped systemd user service, waiting for its start line after a restart, and `buckconfig` writes the buck2 overlay that points one linked worktree at it, never replacing or removing a `.buckconfig.local` it did not write |
 | `kbf-sim` | no | the deterministic simulation kernel |
 | `kbf-integration-test` | no | integration tests, repository lints, the end-to-end harness |
 | `kbf-coverage` | no | the coverage gate CI runs |
 | `kbf-baseline` | no | client-side farm numbers from buck2's own event logs (`--event-log FILE.json-lines.gz`, or `buck2 log show` output): actions by where they ran (remote, remote cache hit, local, local cache, buck2 itself), the build's wall time, nearest-rank p50/p90/p99 and maximum of each action's time and of the farm's reported queue and execution times, the cache hit share and the failed actions, per build and over a set, as a table and as JSON. It reads only the client's log, so the same build against two farms compares line by line |
-| `kbf-bench` | no | times blob uploads to a server's CAS, and reads back, as a daemon stores an action's outputs: a tree generated to a shape from a seed (or read from a directory), sent over the daemon's own CAS client and TLS loader by ByteStream or batch calls, a set number in flight, with FindMissingBlobs optional; reports wall time, blobs/s, MB/s and nearest-rank p50/p90/p99 and maximum per kind of request, as a table and as JSON ([README](crates/kbf-bench/README.md)) |
+| `kbf-bench` | no | times blob uploads to a server's CAS, and reads back, as a client stores an action's outputs: a tree generated to a shape from a seed (or read from a directory), sent over a CAS client and TLS loader by ByteStream or batch calls, a set number in flight, with FindMissingBlobs optional; reports wall time, blobs/s, MB/s and nearest-rank p50/p90/p99 and maximum per kind of request, as a table and as JSON ([README](crates/kbf-bench/README.md)) |
 | `kbf-state-copy` | no | the cutover tool that moves a frontend's SQLite state file into an empty Postgres store, a binary of its own and never part of `kbf` (`kbf-state-copy <state.db> <postgres-url>` is a dry run, `--apply` copies; [state-store-cutover.md](docs/deploy/state-store-cutover.md)): it reads the file through rusqlite alone, read-only and immutable, and refuses a frontend that holds the lock beside it, a write-ahead log that holds writes the file does not, a store that is not empty or whose schema is not the version it was built for, and clocks more than 2 seconds apart; it then copies every row and counter in one transaction with its version kept and its expiry converted from nanoseconds to microseconds, sets the head revision and revision sequence past the highest version, compares row counts and a SHA-256 digest per key family inside the transaction before it commits (a mismatch rolls back) and again on a new connection after; its `cutover` command (an operator-only step) runs that copy and then points the frontend's one state-store setting, the `[scheduler] state-store` key of `kbf.toml` or a `--state-store=` flag of a unit file, at Postgres, keeping the original file byte for byte as `<file>.pre-postgres` and renaming the new text over it, and its `rollback` command renames the backup back (both are dry runs without `--apply`, and neither changes the SQLite file); exit status 0 done, 2 refused, 1 failed |
 | `kbf-alert` | no | alerts with their exact fix; the alert book (raise and resolve with hysteresis) and the outbox, both pure modules; the webhook notifier, which keeps the outbox in a file. Nothing raises alerts yet |
 | `kbf-store` | no | a Raft server's durable state on the local disk, as a `kbf_raft::Storage`: a segmented append-only log of CRC-32C records, the hard state (term, vote) and the newest snapshot, whose segments it covers are removed only once it is durable; a torn tail cut at open, any other damage refused; the first write or fsync error stops the store; all I/O through an `Fs` trait, with a fault-injecting in-memory `FaultFs` for crash tests |
-| `kbf-sim-cell` | no | the whole-cell simulation: one server assembled from `RaftMetaLog`, the scheduler and the `FarmMachine` on a fault-injecting disk, with fake daemons, clients and an object store, checked against properties 1 to 7 of the high-availability design and the write path's properties 8 and 9 after every step, with object-store faults (hang, slow, failures, lost answers), crashes at named points of the write path, the local write tier (`kbf-tier` on a second fault-injecting disk, staged writes, the flusher, reads, crashes at named tier points, a full disk, a bad sector, eviction) checked against the tier's invariants (properties 10 to 13), and a seed sweep that reports every failing seed ([simulation.md](docs/design/simulation.md#8-the-cell-kbf-sim-cell), [write-tier-scenarios.md](docs/design/write-tier-scenarios.md)) |
+| `kbf-sim-cell` | no | the whole-cell simulation: one server assembled from `RaftMetaLog`, the scheduler and the `FarmMachine` on a fault-injecting disk, with fake workers, clients and an object store, checked against properties 1 to 7 of the high-availability design and the write path's properties 8 and 9 after every step, with object-store faults (hang, slow, failures, lost answers), crashes at named points of the write path, the local write tier (`kbf-tier` on a second fault-injecting disk, staged writes, the flusher, reads, crashes at named tier points, a full disk, a bad sector, eviction) checked against the tier's invariants (properties 10 to 13), and a seed sweep that reports every failing seed ([simulation.md](docs/design/simulation.md#8-the-cell-kbf-sim-cell), [write-tier-scenarios.md](docs/design/write-tier-scenarios.md)) |
 | `kbf-ui` | no | the server-rendered pages ([ui-data.md](docs/design/ui-data.md) 6.1 and 8): pages made only from the read API's JSON documents through a `Source` the server gives them, each declaring the routes it reads (its reader refuses any other) and listing the URLs it read; HTML escaped by construction (`html::Html`, no public raw write); every answer with the `Content-Security-Policy` of section 8 and `nosniff`; one embedded token-based stylesheet, no script. Builds (an id lookup), Build and Action; not mounted on the server yet |
 | `kbf-unitfile` | yes | the systemd unit-file reader the deploy docs check, `kbf-deploy`, `kbf-harness` and the packaged-unit tests share: `UnitFile::parse` (sections, `Key=value`, `\` continuations joined with a space, comments skipped, systemd's `WHITESPACE` trimmed), last-assignment-wins reads (`get`, `get_in`, `exec_start`, `flag`), `extend` for a drop-in, and `comments_in_continuations`; no kbf dependency |
 | `tierstore` | no | not a member of this workspace: the generic hot/cold object store, its S3 front and the `tierstore` binary, taken from [komira-ai/tierstore](https://github.com/komira-ai/tierstore) at the revision pinned in the root `Cargo.toml` (`kbf-front` and `kbf-task` use it; the `tierstore` release asset is built and released there) |
 | `tierstore-trees-api` | no | not a member of this workspace: the wire contract of tierstore's trees interface (`trees.proto`, package `tierstore.trees.v1`, and the messages and stubs generated from it), taken from [komira-ai/tierstore](https://github.com/komira-ai/tierstore) at the revision pinned in the root `Cargo.toml`; `kbf-trees-client` uses its client half, and its fake the server half |
 | `tierstore-bench` | no | a measurement tool for tierstore: an S3 client of the instance under test and of the stores behind it, with cells (put-to-ack, cold read, copy lag, tree read), a fault proxy, a versioned result JSON and a CSV of raw samples carrying role names only, and a harness-side request log; every verb built ([README](crates/tierstore-bench/README.md)) |
-| `kbf-pack` | no | the packing client, a library wired into the frontend (`--pack-store-endpoint` and its companions, kbf#1706; with them and `--pack-index` the frontend also takes `CommitPack` from daemons that write packs, kbf#1747) and the daemon (`--pack-read`, kbf#1710; `--pack-write`, which needs `--pack-read`, kbf#1750), all off unless `--pack-store-endpoint` (frontend) or `--pack-read` (daemon) is given: `Packer` owns the write rule (blobs the pack index lacks are cut into packs of at most a byte and a blob limit, each pack written to the object store with a create-only write under `cas/d/<node>/<boot>/<seq>` or `cas/f/<frontend>/<boot>/<seq>`, retried under a new key when a write fails, and recorded in the `kbf-pack-index` pack index only after the store has acknowledged it, so a row never points at a pack that is not stored; a blob too big for a pack is a pack of its own; a record that fails is tried again for the same pack, and when every attempt fails the pack is unreferenced and garbage collection finds it), `check_create_only` (the startup test that a second write of a key is refused), `Reader` (locates blobs through the index, reads each pack with ranged requests, one for blobs within a gap of each other, hashes every blob before returning it, reports a blob that is missing, lost or damaged as the blob's `Fetch`, and tells the index which blobs it served in batches) and `ReadCache` (a bounded on-disk cache of blobs by digest, least recently used out first, written by temporary file and rename into a directory and files only the owner can use, checked by digest on every read, rebuilt from the directory on open), and `Adopter` (the segments storage members flushed before there were packs have the layout of a pack, so it lists the members' cold store, reads each segment's footer and never its records, and records one pack per segment under the segment's own key, in place and with no byte copied: a dry run reports the packs, rows and bytes an apply would add, at most, and reads a sample of blobs back to check footers against bytes, an apply is idempotent on the key, a key held with other contents is a reported conflict, and the report, which is also the checkpoint, is saved after the records of the objects it covers are in the index, so a stopped run resumes after its last key) |
-| `kbf-pack-index` | no | the pack index, which records where each blob lies inside a pack: the `PackIndex` trait the frontend, the daemon and the packing client use, the in-memory index and the conformance suite P1 to P10 both backends pass, and, with the `postgres` feature, `PostgresPackIndex` in two tables of the state schema outside the key/value and feed tables and the commit head, with migration 2 (`schema`), which with the state store's migration 1 is the set a kbf release embeds (`schema::embedded`); it depends on `kbf-state` and on no other crate of the workspace |
+| `kbf-pack` | no | the packing client, a library wired into the frontend (`--pack-store-endpoint` and its companions, kbf#1706; with them and `--pack-index` the frontend also takes `CommitPack`, kbf#1747), all off unless `--pack-store-endpoint` is given: `Packer` owns the write rule (blobs the pack index lacks are cut into packs of at most a byte and a blob limit, each pack written to the object store with a create-only write under `cas/d/<node>/<boot>/<seq>` or `cas/f/<frontend>/<boot>/<seq>`, retried under a new key when a write fails, and recorded in the `kbf-pack-index` pack index only after the store has acknowledged it, so a row never points at a pack that is not stored; a blob too big for a pack is a pack of its own; a record that fails is tried again for the same pack, and when every attempt fails the pack is unreferenced and garbage collection finds it), `check_create_only` (the startup test that a second write of a key is refused), `Reader` (locates blobs through the index, reads each pack with ranged requests, one for blobs within a gap of each other, hashes every blob before returning it, reports a blob that is missing, lost or damaged as the blob's `Fetch`, and tells the index which blobs it served in batches) and `ReadCache` (a bounded on-disk cache of blobs by digest, least recently used out first, written by temporary file and rename into a directory and files only the owner can use, checked by digest on every read, rebuilt from the directory on open), and `Adopter` (the segments storage members flushed before there were packs have the layout of a pack, so it lists the members' cold store, reads each segment's footer and never its records, and records one pack per segment under the segment's own key, in place and with no byte copied: a dry run reports the packs, rows and bytes an apply would add, at most, and reads a sample of blobs back to check footers against bytes, an apply is idempotent on the key, a key held with other contents is a reported conflict, and the report, which is also the checkpoint, is saved after the records of the objects it covers are in the index, so a stopped run resumes after its last key) |
+| `kbf-pack-index` | no | the pack index, which records where each blob lies inside a pack: the `PackIndex` trait the frontend and the packing client use, the in-memory index and the conformance suite P1 to P10 both backends pass, and, with the `postgres` feature, `PostgresPackIndex` in two tables of the state schema outside the key/value and feed tables and the commit head, with migration 2 (`schema`), which with the state store's migration 1 is the set a kbf release embeds (`schema::embedded`); it depends on `kbf-state` and on no other crate of the workspace |
 | `kbf-pack-adopt` | no | the operator tool that runs `Adopter`, a binary of its own and never part of `kbf` ([pack-adopt.md](docs/deploy/pack-adopt.md)): it does nothing unless run, a run is a dry run unless `--mode apply` is given, and the only thing it writes to the object store or the database is the pack index (Postgres, a URL with no password) with `--mode apply`, besides the checkpoint and report files it is told to write; the source is an S3-compatible store (`--source-store-endpoint`, `--source-store-bucket`, `--source-prefix`, `--source-store-region`, a credentials file only its owner can read and never a flag), a `file://` source is refused, and `--mode apply` is refused unless `--pack-store-bucket` names the source bucket; `--checkpoint-file` (written beside and renamed, resumed from, ignored once finished), `--report-json`, `--segments-per-second`, `--footer-concurrency`, `--limit-segments`, `--verify-sample` (20 in a dry run) and `--fail-on-conflict`; exit status 0 done, 2 refused, 1 failed |
-| `kbf-coordinator` | no | the update coordinator ([updates.md](docs/design/updates.md)), a library and a binary: tells each host's updater which version to run, within per-role limits. Updaters dial `POST /v1/heartbeat` over mutual TLS (the farm CA's certificates; the caller is the certificate's `updater` role, its host role in `urn:kbf:host-role:<name>` and its one DNS name as the node id, never the body) and get `nothing` or `update` with a version (`kbf_updater::wire`). The decision (`decide`) is a pure function of the desired state, the heartbeats seen and the time: the host is behind and not updating; its role has room (at most N updating, a host that failed keeps its slot until it heartbeats healthy, and is not told the version it failed again); never the last frontend that is up, and the storage and frontend minimums met by live heartbeats (a host silent for 45 s is down); storage, daemons and Macs before frontends; no order within 30 s of starting; a rollback is a desired version older than the hosts'. The desired state (version, per-role limits, minimums) is the one thing stored, one JSON file replaced atomically; CI sets it with `POST /v1/desired` and a GitHub Actions OIDC token checked by `kbf-oidc` (the operator token is refused), and `GET /v1/status` is read with the operator token. The TLS files are re-read on an interval (`kbf-tls`). The image definition is `packaging/container/kbf-coordinator/Dockerfile`; the hosts' side is `kbf-updater agent` and `kbf-host-install --serve` |
-| `kbf-updater` | no | the core of the optional package that rolls a new kbf version over a farm's hosts, one at a time, frontend first (a library and a stub binary; no listener of its own; the one adapter is `SshInstaller`, the install port over ssh to `kbf-host-install`'s forced command: an argument vector with no shell and the pinned host key in a private 0600 temp file, a version and channel checked against the host's grammar before any process starts, one capped JSON line read against a closed set of shapes that must agree with the exit status, a call bounded by a timeout, and ssh's own failure (exit 255) a distinct unreachable kind of `PortError`; a contract test feeds the host's real answer types to the reader): the API model (`deny_unknown_fields`, a closed error-code set, no source or URL field), the one version rule shared with the host-side wrapper, the root-owned host inventory, the roll state machine over ports (safe-to-stop, install and query, drain, health, clock and a frontend member's own API; the drain is `NodeDrain`, the frontend's cordon, drain and uncordon calls for a daemon host, which is undrained once it runs the target; an operator's own cordon is lifted by it too) with a scripted fake of each, a `mac-daemon` inventory role for a Mac that runs a daemon (rolled as a daemon host, but its install answers `apply_started` and the roll polls the host's `query` apply status, every `--apply-poll-secs` for at most `--apply-deadline-secs`, until it is `done` for the target; a failed apply or the deadline leaves the node drained and names the reason; a synchronous answer from a Mac and `apply_started` from any other role are errors; a restart in `waiting_healthy` polls again and does not install again; a restart after an `already_installed` answer polls too, so a stale `failed` status or none at all ends that roll with the node left drained), and `roll.json`, written by temp file, fsync, rename and directory fsync before every phase change; a restart asks a host in `installing` what it has before installing again, a roll it cannot learn the outcome of is `interrupted` and blocks new rolls until aborted, and an unreadable or self-contradicting record refuses to start the updater; a frontend that is a member of a pool of frontends (an inventory line with `instance=` and `base=`) is rolled first and alone, behind whatever load balancer there is: it drains itself (`POST /v1/frontend/drain`), exits, and is installed on (once per host) and restarted once every other member has answered `/readyz` 200 for `--peer-ready-secs`, and every failure leaves it not serving; a frontend that lists no `instance=` and `base=` is refused before the installer is called (`docs/deploy/kbf-updater.md`). Its agent mode (`kbf-updater agent`, [updates.md](docs/design/updates.md)) is an unprivileged updater on a host that heartbeats to the coordinator over mutual TLS (platform, running version, health, last update, and the target while an A/B runs, on a thread of its own so it goes on through the A/B; the node id and role are read from its own certificate with the reader the coordinator uses, `identity`, and are in no field) and runs the host's A/B when told "update to X" (X is the only thing taken from the reply): `kbf-host-install --serve` fetches and verifies the release on the host, the node is drained (`NodeDrain`) and its leases waited for, the helper puts X on trial, the node's health is asked, X is confirmed or the helper goes back, and the node is undrained only if healthy; a restart in the middle finds the helper's pending marker and does not install twice; the drain, the undrain, the node's status and a storage host's own storage health are calls to the frontend's worker listener over mutual TLS with the host's own `updater` certificate and no token (`kbf-server`'s `node_self` serves those four for the certificate's node id and nothing else); the token flags (`--operator-api`, `--token-file`) are an opt-in fallback. `kbf-updater enroll` gets the certificate with a one-time token (`kbf-enroll`, the host role fixed by the token, the key made on the host) and the agent renews it at half its life through `kbf_enroll::renew` (`docs/deploy/kbf-updater.md`, "Enrolling a host") |
+| `kbf-coordinator` | no | the update coordinator ([updates.md](docs/design/updates.md)), a library and a binary: tells each host's updater which version to run, within per-role limits. Updaters dial `POST /v1/heartbeat` over mutual TLS (the farm CA's certificates; the caller is the certificate's `updater` role, its host role in `urn:kbf:host-role:<name>` and its one DNS name as the node id, never the body) and get `nothing` or `update` with a version (`kbf_updater::wire`). The decision (`decide`) is a pure function of the desired state, the heartbeats seen and the time: the host is behind and not updating; its role has room (at most N updating, a host that failed keeps its slot until it heartbeats healthy, and is not told the version it failed again); never the last frontend that is up, and the storage and frontend minimums met by live heartbeats (a host silent for 45 s is down); hosts that are not frontends before frontends; no order within 30 s of starting; a rollback is a desired version older than the hosts'. The desired state (version, per-role limits, minimums) is the one thing stored, one JSON file replaced atomically; CI sets it with `POST /v1/desired` and a GitHub Actions OIDC token checked by `kbf-oidc` (the operator token is refused), and `GET /v1/status` is read with the operator token. The TLS files are re-read on an interval (`kbf-tls`). The image definition is `packaging/container/kbf-coordinator/Dockerfile`; the hosts' side is `kbf-updater agent` and `kbf-host-install --serve` |
+| `kbf-updater` | no | the core of the optional package that rolls a new kbf version over a farm's hosts, one at a time, frontend first (a library and a stub binary; no listener of its own; the one adapter is `SshInstaller`, the install port over ssh to `kbf-host-install`'s forced command: an argument vector with no shell and the pinned host key in a private 0600 temp file, a version and channel checked against the host's grammar before any process starts, one capped JSON line read against a closed set of shapes that must agree with the exit status, a call bounded by a timeout, and ssh's own failure (exit 255) a distinct unreachable kind of `PortError`; a contract test feeds the host's real answer types to the reader): the API model (`deny_unknown_fields`, a closed error-code set, no source or URL field), the one version rule shared with the host-side wrapper, the root-owned host inventory, the roll state machine over ports (safe-to-stop, install and query, health, clock and a frontend member's own API) with a scripted fake of each (the inventory still reads the roles `daemon` and `mac-daemon` of earlier releases and lists no host for them), and `roll.json`, written by temp file, fsync, rename and directory fsync before every phase change; a restart asks a host in `installing` what it has before installing again, a roll it cannot learn the outcome of is `interrupted` and blocks new rolls until aborted, and an unreadable or self-contradicting record refuses to start the updater; a frontend that is a member of a pool of frontends (an inventory line with `instance=` and `base=`) is rolled first and alone, behind whatever load balancer there is: it drains itself (`POST /v1/frontend/drain`), exits, and is installed on (once per host) and restarted once every other member has answered `/readyz` 200 for `--peer-ready-secs`, and every failure leaves it not serving; a frontend that lists no `instance=` and `base=` is refused before the installer is called (`docs/deploy/kbf-updater.md`). Its agent mode (`kbf-updater agent`, [updates.md](docs/design/updates.md)) is an unprivileged updater on a host that heartbeats to the coordinator over mutual TLS (platform, running version, health, last update, and the target while an A/B runs, on a thread of its own so it goes on through the A/B; the node id and role are read from its own certificate with the reader the coordinator uses, `identity`, and are in no field) and runs the host's A/B when told "update to X" (X is the only thing taken from the reply): `kbf-host-install --serve` fetches and verifies the release on the host, the helper puts X on trial, the node's health is asked, and X is confirmed or the helper goes back; a restart in the middle finds the helper's pending marker and does not install twice; a storage host's own storage health is a call to the frontend's worker listener over mutual TLS with the host's own `updater` certificate and no token (`kbf-server`'s `node_self` serves the node calls for the certificate's node id and nothing else); the token flags (`--operator-api`, `--token-file`) are an opt-in fallback. `kbf-updater enroll` gets the certificate with a one-time token (`kbf-enroll`, the host role fixed by the token, the key made on the host) and the agent renews it at half its life through `kbf_enroll::renew` (`docs/deploy/kbf-updater.md`, "Enrolling a host") |
 
 A test in `kbf-integration-test` reads the dependency graph and fails if a pure crate depends,
 directly or not, on an async runtime, a network crate or a random source, or if its
@@ -238,7 +215,7 @@ machine and its bytes in an object store, packed into segments. The promises it 
   closure check: the result and every blob it names must be present and readable,
   or the lookup is a miss.
 - **Clients never write the action cache.** `UpdateActionResult` is always
-  `PERMISSION_DENIED`; results reach the cache only from a daemon that ran the action.
+  `PERMISSION_DENIED`; results reach the cache only from the frontend, after a job that ran the action ended.
 
 See [storage.md](docs/design/storage.md) and, for the planned write path,
 [write-path.md](docs/design/write-path.md).
@@ -246,22 +223,20 @@ See [storage.md](docs/design/storage.md) and, for the planned write path,
 ### Executing an action
 
 ```
-client                      kbf-server                               kbf-daemon
+client                      kbf frontend                             job service (js-agent)
   | Execute                    |                                         |
   |--------------------------->| 1. AC lookup (closure check): hit -> done
   |                            | 2. Action, Command, input tree in CAS?  |
   |                            |    no -> FAILED_PRECONDITION (MISSING)  |
   |                            | 3. submit: join a running twin, or queue|
-  |<-- QUEUED -----------------| 4. place on a worker, propose the lease |
-  |                            |--- LeaseOffer ------------------------->| (nothing runs)
+  |<-- QUEUED -----------------| 4. place on a virtual worker, propose   |
+  |                            |    the lease                            |
   |                            | 5. lease committed                      |
-  |<-- EXECUTING --------------|--- Start ------------------------------>| run the lease
-  |                            |                                         | fetch inputs (ByteStream)
-  |                            |                                         | run, upload outputs
-  |                            |<-- Result ------------------------------|
-  |                            | 6. holder check, outputs all stored?    |
+  |<-- EXECUTING --------------|--- submit job -------------------------->| kbf-task runs the action,
+  |                            |                                         | writes outputs to its put dir
+  |                            |<-- job ended ---------------------------|
+  |                            | 6. read the pack, hash, outputs stored? |
   |                            | 7. accept, write the AC entry           |
-  |                            |--- ResultAck -------------------------->|
   |<-- done (ExecuteResponse) -|                                         |
 ```
 
@@ -273,11 +248,14 @@ client                      kbf-server                               kbf-daemon
 3. **Submit.** The front hands the request to the scheduler through the `Dispatch`
    trait. If an identical action (same instance name and action digest) is already
    in flight and both may be joined, the caller is attached to it (in-flight dedup).
-4. **Place.** The scheduler grants a lease on a worker with room and asks for the grant
-   to be committed. The daemon is told with a `LeaseOffer`, on which it runs nothing.
-5. **Start.** Only once the grant is committed does the daemon get `Start`.
-6. **Result.** The server accepts a result only from the daemon holding the
-   operation's current lease, and only if every output it names is already stored.
+4. **Place.** The scheduler grants a lease on a worker with room (one of the executor's
+   virtual workers) and asks for the grant to be committed. The executor is told with a
+   `LeaseOffer`, on which it runs nothing.
+5. **Start.** Only once the grant is committed does the executor get `Start` and submit the
+   job.
+6. **Result.** The server accepts a result only for the operation's current lease, and
+   only if every output it names is already stored: the frontend reads the pack the job
+   committed once, hashes it and stores the blobs before it records the result.
 7. **Answer.** An accepted successful result (exit code 0, not `do_not_cache`) is
    written to the action cache *before* the callers are answered.
 
@@ -310,7 +288,7 @@ See [scheduler.md](docs/design/scheduler.md) and
 |---|---|---|
 | CAS index, action cache, farm time | `MetaState` behind `RaftMetaLog`, applied from a single-voter Raft log on local disk (`--meta-dir`, or `<hot store>/meta`); behind `MemoryMetaLog`, in the process's memory, only in tests | the Raft log with three voters |
 | Blob bytes | segments in an object store (in memory, or an S3 bucket) | the same, with garbage collection and multiple stores |
-| Leases, operations, workers | `Scheduler` in the server's memory; with `--state-store` (Postgres or SQLite, through `kbf-state`; all-in-one always has one) each change is written to the store before it is acknowledged and replayed at start; without it a control record "commits" when appended and a restart loses them | the same state machine fed from a replicated control log, kept on the servers' local disks |
+| Leases, operations, workers | `Scheduler` in the server's memory; with `--state-store` (Postgres or SQLite, through `kbf-state`; a frontend always has one) each change is written to the store before it is acknowledged and replayed at start; without it a control record "commits" when appended and a restart loses them | the same state machine fed from a replicated control log, kept on the servers' local disks |
 | Memory kills | the scheduler's `MemoryState`, in the server's memory: each action key's memory floor and the order the floors were raised in, each held operation's memory-killed runs and busy-node reruns, each node's busy-node kill count; it compares with `Eq` | the same, inside the machine fed from the replicated control log |
 | Callers, started leases, node registry | `FarmMachine` (`kbf-server`'s `machine` module) in the server's memory: each caller's record, the finished operations whose callers are kept for the finished retention, the leases whose `Start` was sent, and each node that has registered with whether its newest stream is open and its newest `NodeStatus`; each caller's channel and each node's stream stay beside it in the farm core, which tells the machine when a stream has closed | the same machine fed from the replicated control log |
 | Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | report changes noticed by hash; the node registry kept durable through the replicated control log, with alerts on absent nodes |
@@ -347,7 +325,7 @@ with what exists today and the probes still to run. In short:
 
 - **Servers on storage hosts,** each at a fixed address with a stable DNS name;
   dedicated storage hosts are preferred, and a converged layout (servers, the object
-  store and daemons on the same hosts) is supported. Durable state is a Raft log on
+  store and workers on the same hosts) is supported. Durable state is a Raft log on
   each server's local disk, with its snapshots also copied to the object store: one
   voter first, then three voters on three hosts for high availability (one leader,
   two followers). Elastic or stateless servers are not part of the design.
@@ -371,32 +349,30 @@ with what exists today and the probes still to run. In short:
   `Execute` and `WaitExecution`, and every worker stream, so one place sees all free
   room on all workers and places every action. A follower takes over when it is
   elected. The first deployment is a single server.
-- **Daemons dial the servers directly.** A daemon's worker stream does not go through
+- **Workers dial the servers directly (planned).** A worker's stream does not go through
   the front: it is given the servers as one DNS name with a record per server, or a
   list, dials them over mutual TLS and holds one stream, to the leader. A follower
-  ends a daemon's session with a status naming the leader, or answers `UNAVAILABLE`
-  when it knows none, and the daemon tries the next server; it retries forever, with
-  a bounded backoff (the list, the retry and the backoff are built today; the
-  redirect is not). A failover keeps running leases: the lease epoch names the
-  replicated log, and the daemon resends its results to the new leader. A daemon's
-  blob reads and writes go to the worker listeners too (`--cas`), not through the
-  front, and its reads are spread across all the servers.
+  ends a worker's session with a status naming the leader, or answers `UNAVAILABLE`
+  when it knows none, and the worker tries the next server. A failover keeps running
+  leases: the lease epoch names the replicated log, and the worker resends its results
+  to the new leader. Today the workers of a frontend are its executor's virtual workers,
+  in its own process, and storage nodes dial the worker listener.
 - **Locality comes from placement.** The front sees a request's method but not what
-  it is about, so kbf gets locality inside: daemons report which inputs they hold,
+  it is about, so kbf gets locality inside: workers report which inputs they hold,
   and placement prefers a worker that already has an action's inputs.
 
 What already holds for this shape in the single-server code: the seams above, lease
 ids that carry the granting process's term (the Raft term of the metadata log), a
 scheduler that refuses results from leases it does not hold, a lease epoch in
-`Welcome` that makes a daemon drop leases a restarted server never granted (with
-the Raft log the epoch is the log id, the same at every start, so the daemon keeps
+`Welcome` that makes a worker drop leases a restarted server never granted (with
+the Raft log the epoch is the log id, the same at every start, so the worker keeps
 its runs, and until the scheduler's state is in the log a restart leaves them running
-as orphans whose results are refused), and a daemon protocol in which only the newest
+as orphans whose results are refused), and a worker protocol in which only the newest
 stream of a worker counts. See [scheduler.md](docs/design/scheduler.md#more-than-one-server).
 
 ## Security model
 
-Build clients and daemons reach `kbf-server` by different paths, and each path has its
+Build clients and storage nodes reach `kbf-server` by different paths, and each path has its
 own protection.
 
 **Build clients go through a front.** TLS for Bazel and Buck2 ends at a front that
@@ -440,7 +416,7 @@ not yet probed.
   acceptable on that network (a loopback front, a mesh interface WireGuard already
   encrypts) is the operator's call. A deployment that wants TLS, ours included, turns
   it on in its config: `--reapi-tls-cert` and `--reapi-tls-key` for a REAPI hop that
-  crosses machines, and the three worker TLS flags for daemons on other machines.
+  crosses machines, and the three worker TLS flags for storage nodes on other machines.
   The warning looks at the bind address only: it does not restrict which peers
   connect, and it does not look at `--reapi-auth-policy`.
 - **A front that works: `tailscale serve` in HTTPS mode.** A probe with
@@ -467,47 +443,35 @@ not yet probed.
   the action. That front did not cut them. Another front whose idle timeout is shorter
   than the longest queue wait would cut these streams.
 
-**Daemons do not go through the front.** A daemon's `--server` (repeatable; each
-host resolved again on every round of connection attempts, which never stop) and its
-`--cas` both name the worker listener, not the client front above. The worker listener keeps its own mutual TLS end to end. With
-several servers (**planned**), daemons dial the servers' own names, with no balancer
-in between, a follower redirects them to the leader, and they retry forever
-([deployment-topology.md](docs/design/deployment-topology.md)).
+**Storage nodes do not go through the front.** A storage node's `--frontend` names the worker
+listener, not the client front above. The worker listener keeps its own mutual TLS end to end. With
+several servers (**planned**), nodes dial the servers' own names, with no balancer
+in between ([deployment-topology.md](docs/design/deployment-topology.md)).
 
-- Daemons connect only over mutual TLS (`https://` URLs; the daemon refuses anything
-  else). The server's worker listener serves mutual TLS when given a certificate, key
-  and client CA. A daemon's certificate must name its node id as its one DNS
-  subjectAltName, so a certificate can speak only for its own node, and a deny list
-  (serials, public keys, node ids), looked at again at every `Hello`, `Heartbeat`, `Result`, `NodeStatus` and blob call, refuses
-  leaked or retired certificates without a restart. There is no CRL or OCSP; short
-  certificate lifetimes bound what the list misses. See
+- Nodes connect only over mutual TLS (`https://` URLs). The server's worker listener serves
+  mutual TLS when given a certificate, key and client CA. A node's certificate must name
+  its node id as its one DNS subjectAltName, so a certificate can speak only for its own
+  node, and a deny list (serials, public keys, node ids), looked at again at every
+  call, refuses leaked or retired certificates without a restart. There is no CRL or OCSP;
+  short certificate lifetimes bound what the list misses. See
   [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).
-- **Built: blobs on the worker listener.** The worker listener also serves
-  `ByteStream` (Read, Write, QueryWriteStatus) and `ContentAddressableStorage`
-  (FindMissingBlobs, BatchUpdateBlobs, BatchReadBlobs, GetTree) over the farm's cache. A daemon's real
-  drivers, and the integration cell's daemon, read inputs and write outputs there:
-  `--cas` must be an `https://` URL, normally the same as `--server`, and the daemon
-  presents the same certificate as on its worker stream; plain `http://` is refused
-  at start. Each blob call is admitted on its own: the certificate must carry exactly
-  one DNS subjectAltName (the node), and neither the certificate's serial or public
-  key nor that node may be on the deny list, which is looked at again for every call
-  (its metadata at each call, the file read again only when that changed). A denied
-  daemon is refused PERMISSION_DENIED from its next blob call, on a connection
-  already open too. Nothing else of REAPI is served there (Execute, the action cache and
-  `Capabilities` answer UNIMPLEMENTED), and on a
-  plain-text worker listener every blob call is refused UNAUTHENTICATED. So a daemon
-  needs neither the front nor a REAPI credential. See
+- **Built: roles on the worker listener.** The role is read from the leaf certificate
+  (`urn:kbf:role:<name>`) and each method takes only the roles expected there: a
+  storage node registers, heartbeats and fetches the registered cold store. The calls of the
+  `daemon` role (a worker session and blob calls over the farm's cache) are still served;
+  no program of this release holds that role. Nothing else of REAPI is served there
+  (Execute, the action cache and `Capabilities` answer UNIMPLEMENTED), and on a plain-text
+  worker listener every blob call is refused UNAUTHENTICATED. See
   [worker-protocol.md](docs/design/worker-protocol.md#blobs-on-the-worker-listener).
-- **Not built:** a check that a blob call's node is registered or connected, or that
-  it reads only the inputs of its own leases; any certificate the deny list does not
-  refuse can read every blob whose digest it names, and write blobs.
 
 **Inside the farm:**
 
-- Only the daemon path writes the action cache, and the metadata state machine itself
-  refuses an action-cache write from any role but `Daemon`.
-- Actions run without network (`--network=none`) in rootless containers, as described
-  in [daemon.md](docs/design/daemon.md).
+- Only the frontend writes the action cache, from a result it accepted, and the metadata
+  state machine itself refuses an action-cache write from any role but `Daemon`
+  (the role the frontend's own writes carry).
+- A job runs with the network level the executor names (`--executor-network`, by default an
+  allow-list of the endpoints its host's agent allows) in the job service's own sandbox; the
+  Command sees the job's root file system and no more ([kbf-modes.md](docs/deploy/kbf-modes.md)).
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
@@ -532,14 +496,13 @@ behaviour, a bug fix ships a test that failed before the fix, and the coverage g
   `kbf-objstore`; CI runs it against the in-memory store, the local-directory store,
   and MinIO and RustFS containers, with and without Object Lock.
 - **Real services.** Server tests run the REAPI and worker services over real gRPC,
-  including mutual TLS. The container driver's tests run real rootless `crun` on
-  hosted runners, on x86-64 and arm64.
-- **End to end.** The `integration` workflow starts a cell (an S3 store, one
-  `kbf-server`, one daemon) and builds sample projects with pinned Bazel and Buck2
-  versions, remote-only, twice; the second build must be all remote cache hits. A
-  Buck2 action that sleeps then holds a lease in flight while the node is drained
-  through the operator API, which must list that lease. Its
-  daemon uses a test-only runtime that runs actions as plain processes, so it proves
-  the protocol and the cache path, not isolation.
+  including mutual TLS.
+- **End to end.** The `beta` workflow starts real `kbf` processes as the packaged units
+  start them (a frontend and storage nodes, under certificates of the farm's rows), and the
+  mixed-version test runs the tip (N) and the release before it (N-1) in one farm, both ways,
+  and restarts each storage node as the other version on the files it had. The executor is
+  tested against the real job service and an agent (`executor_real_service_integration`),
+  and `kbf-deploy job-service apply` against a scripted frontend host. These farms run
+  actions only through the executor.
 - **Repository lints.** Workflows may only use hosted runners and pinned actions from
   an allowed set; public text may carry no machine addresses or home paths.

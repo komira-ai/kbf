@@ -4,7 +4,7 @@
 # NOT in this file, on purpose:
 #   - the object store (the cold store). It is configured on the storage nodes
 #     (--cold-store), not on the frontends.
-#   - the storage nodes and the build daemons. They run on bare metal and dial this
+#   - the storage nodes. They run on bare metal and dial this
 #     compose host's published ports 8980 (Buck2) and 8981 (worker listener) by the
 #     farm's DNS name. The frontends dial one storage node (`storage` in the
 #     frontend toml files) and learn the rest from the farm's storage map.

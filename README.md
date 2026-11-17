@@ -10,16 +10,15 @@ kbf is written in Rust. Its programs are named `kbf-*`:
 
 - `kbf-server`: the REAPI v2 service. It serves the action cache and the
   content-addressable storage, and schedules actions onto workers.
-- `kbf-daemon`: the worker. It runs on each build machine, fetches inputs,
-  runs actions in isolation, and uploads outputs. A Linux node runs each action
-  in a rootless container (`--driver container`); `--driver native` runs it
-  as plain processes on Linux. The Macs run no `kbf-daemon`: a macOS action
-  runs as a js-agent job (`docs/design/actions-as-jobs.md`, section 14).
+- `kbf-task`: runs one action's command and stages its outputs. It is the entrypoint of
+  the job a js-agent runs for a placed action; a Linux node and a Mac both run actions
+  only as js-agent jobs of the jobscheduler job service
+  (`docs/design/actions-as-jobs.md`).
 
-`kbf` is a new binary with the modes `frontend`, `storage`, `daemon`, `storage-and-daemon`,
+`kbf` is the binary a host runs, with the modes `frontend` and `storage`,
 chosen with `kbf --mode=<mode>` (or `mode = "..."` in `/etc/kbf/kbf.toml`);
 the programs above remain.
-Smoke test: `kbf --mode=storage-and-daemon --help`
+Smoke test: `kbf --mode=storage --help`
 
 ## Status
 
@@ -31,16 +30,14 @@ breaking changes.
 
 [ARCHITECTURE.md](ARCHITECTURE.md) describes how kbf is put together, and links the
 design documents in [docs/design](docs/design): the scheduler, storage, the worker
-protocol, the daemon and execution, and capabilities.
+protocol, execution, and capabilities.
 
 [docs/artifacts.md](docs/artifacts.md) says which binaries CI builds and attests, and
 how a node verifies one before it runs it.
 
-[docs/deploy/linux-build-host.md](docs/deploy/linux-build-host.md) sets up a Linux
-build host: the daemon's systemd units, swap and memory headroom.
-[docs/deploy/storage-node.md](docs/deploy/storage-node.md) sets up a storage host,
-server-only or converged (server and builds on one host): the server's units, the
-priorities between MinIO, the server and builds, and the memory left to builds.
+[docs/deploy/storage-node.md](docs/deploy/storage-node.md) sets up a storage host:
+the server's unit, the priorities between MinIO and the server, and the memory
+left to the host.
 [docs/deploy/kbf-ui.md](docs/deploy/kbf-ui.md) is the operator guide to the read-only,
 open web UI: how to reach it, how to turn it off, and what it exposes.
 [docs/deploy/frontends-behind-a-load-balancer.md](docs/deploy/frontends-behind-a-load-balancer.md)

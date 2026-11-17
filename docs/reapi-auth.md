@@ -179,8 +179,8 @@ a listener that only trusted people reach.
 ## Where kbf differs from Buildbarn
 
 - **`actionCache.putAuthorizer` is refused.** Clients never write the action cache;
-  UpdateActionResult is PERMISSION_DENIED whatever the policy says. Only the daemon
-  that ran an action writes its result.
+  UpdateActionResult is PERMISSION_DENIED whatever the policy says. Only the frontend
+  that placed an action writes its result.
 - **One policy file for one listener,** with every authorizer at its top level or
   under `contentAddressableStorage` and `actionCache`; Buildbarn spreads them over
   its per-store and scheduler configurations.
