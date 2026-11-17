@@ -15,7 +15,9 @@
 //! `whole_machine` job, which books a whole host and so is never sized.
 //!
 //! A run that commits into a put directory (`--task-out-mode put-dir`, [`TaskOut::PutDir`]) is
-//! another job ([`put_dir_spec`]): no image, its root the action tree as its one layer, the
+//! another job ([`put_dir_spec`]): no image, its root the action tree as its one layer (the
+//! host directory of its manifests, or with `--executor-input-tree provider` tierstore's mount
+//! provider naming its tree list, [`provider_layer`]), the
 //! task tool of the base tree as its program, the put directory mounted read-write at `/out`,
 //! no network, no files and no secret, and needs, and is labelled, as the other. A
 //! `whole_machine` lease cannot be one: the job service gives a whole-host job no layer and no
@@ -43,9 +45,9 @@ use kbf_proto::worker::Start;
 use kbf_types::LeaseId;
 use ring::digest::{SHA256, digest};
 
-use crate::executor::config::Config;
+use crate::executor::config::{Config, InputTree};
 use crate::executor::mac::{MacJob, System, WorkerOs, check_version, mac_argv, mac_spec};
-use crate::executor::out::{PutDirRoots, TASK_IN_TREE, TaskOut};
+use crate::executor::out::{PutDirRoots, TASK_IN_TREE, TaskOut, provider_layer};
 use crate::executor::outcome::Settled;
 use crate::executor::output::Grants;
 use crate::executor::size_class::{SIZE_CLASS_LABEL, SizeClass};
@@ -244,7 +246,7 @@ pub(super) async fn prepare(
              a whole-host job no mount"
                 .to_owned()
         })?;
-        let key = minted(ctx, lease, action, wall).await?;
+        let key = minted(ctx, lease, action, wall, ctx.cfg.input_tree).await?;
         let tree = ctx.inputs.tree(lease).await?;
         let job = PutDirJob {
             roots,
@@ -255,7 +257,8 @@ pub(super) async fn prepare(
         let grants = Grants::of(&spec, []);
         return Ok(Arc::new(Prepared { spec, key, grants }));
     }
-    let key = minted(ctx, lease, action, wall).await?;
+    // A presigned run writes no tree: the form is not read.
+    let key = minted(ctx, lease, action, wall, InputTree::Manifests).await?;
     let pack = ctx
         .presign
         .put_url(&key, wall, ctx.cfg.max_pack_bytes)
@@ -365,7 +368,8 @@ async fn prepare_mac(
             "a Mac action commits into a put directory: give --task-out-root".to_owned(),
         ));
     };
-    let key = minted(ctx, lease, action, wall).await?;
+    // The native runtime takes no mount provider: a Mac job's tree is always its manifests.
+    let key = minted(ctx, lease, action, wall, InputTree::Manifests).await?;
     let tree = ctx.inputs.tree(lease).await?;
     let spec = mac_spec(MacJob {
         job_id: job_id(&ctx.cfg.frontend, lease, 0),
@@ -382,14 +386,15 @@ async fn prepare_mac(
     Ok(Arc::new(Prepared { spec, key, grants }))
 }
 
-/// The key of `lease`'s run, from the frontend's ingest.
+/// The key of `lease`'s run, from the frontend's ingest, its input tree written as `tree` says.
 async fn minted(
     ctx: &Preparer,
     lease: LeaseId,
     action: &Digest,
     wall: Duration,
+    tree: InputTree,
 ) -> Result<PackKey, Settled> {
-    let minted = ctx.ingest.mint(lease, action, wall).await;
+    let minted = ctx.ingest.mint(lease, action, wall, tree).await;
     minted.map_err(|e| match e {
         MintError::Refused(why) => Settled::Invalid(format!("no key for the pack: {why}")),
         MintError::Unavailable(why) => Settled::Infra(format!("no key for the pack: {why}")),
@@ -411,7 +416,8 @@ fn labels(ctx: &Preparer, class: Option<&SizeClass>) -> BTreeMap<String, String>
 }
 
 /// Where a put-directory job reads and writes: the roots, the run's put directory
-/// (`cas/b/<lease>/<nonce>`) and its action tree (the digest, in hex).
+/// (`cas/b/<lease>/<nonce>`) and its action tree (the digest in hex, or with
+/// [`InputTree::Provider`] the key of its tree list).
 struct PutDirJob<'a> {
     roots: &'a PutDirRoots,
     dir: &'a PackKey,
@@ -442,7 +448,10 @@ fn put_dir_spec(
         network: NetworkLevel::None.into(),
         ports: Vec::new(),
         host_ports: Vec::new(),
-        layers: vec![job.roots.layer(job.tree)],
+        layers: vec![match ctx.cfg.input_tree {
+            InputTree::Manifests => job.roots.layer(job.tree),
+            InputTree::Provider => provider_layer(job.tree),
+        }],
         mounts: vec![job.roots.mount(job.dir.as_str())],
         files: Vec::new(),
         priority: 0,

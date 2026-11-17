@@ -467,6 +467,34 @@ whose `tierstore fs` is down has no `<mount>/trees/`, the agent cannot make the 
 resubmits it as today's job (section 6). kbf uses none of js TI's tree inputs (`JobSpec.trees`,
 `JS_TREES_UNATTACHED`, `job_stages_if_unavailable`), per O15.
 
+### 4.7 The tree list: the job's tree from tierstore's mount provider
+
+[code] With `--executor-input-tree provider` (default `manifests`, today's tree of 4.1), the executor writes the action
+tree as **one object** instead of a manifest per directory, and the job's one layer names tierstore's mount provider
+instead of a host directory (jobscheduler's `docs/design/mount-providers.md`, komira-ai/jobscheduler#896):
+
+- **The object** is tierstore's *tree list* (`tierstore::TreeList`, the format tierstore owns and documents: JSON Lines, a header line, then one line per entry sorted by path): every
+  entry of the action tree at its path below the root. The base tree's entries come from its manifests, flattened once
+  when the frontend publishes the bundle (3.3; `BaseTree::listed`); then `work` and every entry of the input root
+  below it, and `.kbf` with `action` and `command`, as in 4.1. A file names its size and mode (0755 if REAPI marks
+  it executable, else 0644) and, if it has bytes, the object they are in (the pack span the index gives, else the
+  whole object `cas/l/<sha256>`, which is written first if it is missing, as in 4.1) and its SHA-256, which the
+  provider checks each fill against; a file of no bytes names neither. Every directory is listed, mode 0755, so an empty one is made too; an
+  empty input root is `work` with nothing below it. The list is read back by tierstore's own reader before it is
+  stored, and stored with one create-only write at `cas/l/<sha256 of its bytes>`: a retry or another run with the
+  same inputs finds it there and writes nothing.
+- **The layer** is `{provider: "tierstore", ref: <that key>}`. jobscheduler places the job only on a host whose agent
+  serves the provider (`mount-provider.tierstore`); the agent hands the ref to tierstore's provider when the job is
+  assigned, and tierstore fetches the list and fills every file in parallel while the container is made. kbf calls no
+  node, and the manifests and the memo of 4.2 are not written for such a job.
+- **What it refuses**, as the manifests do (4.6's `why`): `unrepresentable` for `node_properties`, the input name
+  `.kbf-out`, a list the reader refuses, or more entries than tierstore takes (2^24 - 1; a directory named at several
+  paths of the input root is listed at each); `store` for a failed lookup or write, and for a base tree published
+  without its listing.
+- **macOS** keeps the manifests: the native runtime takes no provider yet (jobscheduler's design, Q4).
+
+The flag selects the path per frontend; the manifests' path is removed once the tree list is the default on the farm.
+
 ## 5. Outputs
 
 ### 5.1 Straight into tierstore: evaluated, not now

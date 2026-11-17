@@ -28,7 +28,7 @@ use crate::executor::traits::{
     ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
     ReadGrant, UntrustedLimits,
 };
-use crate::executor::{Config, Ctx, Deps, Ownership, PackKey, Secret, Twin, build_id};
+use crate::executor::{Config, Ctx, Deps, InputTree, Ownership, PackKey, Secret, Twin, build_id};
 
 pub(super) const GIB: u64 = 1 << 30;
 
@@ -46,7 +46,13 @@ struct Easy;
 
 #[tonic::async_trait]
 impl Ingest for Easy {
-    async fn mint(&self, lease: LeaseId, _: &Digest, _: Duration) -> Result<PackKey, MintError> {
+    async fn mint(
+        &self,
+        lease: LeaseId,
+        _: &Digest,
+        _: Duration,
+        _: InputTree,
+    ) -> Result<PackKey, MintError> {
         Ok(PackKey::new(format!("cas/b/{}/aa-0", build_id(lease))))
     }
 

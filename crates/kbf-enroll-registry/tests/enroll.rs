@@ -737,22 +737,6 @@ fn a_lost_race_is_decided_again_on_fresh_rows() {
     assert_eq!(list_nodes(&*env.store).expect("nodes").len(), 1);
 }
 
-/// Asserts that a store that refuses the enroll's write as written by a superseded handle
-/// (`StoreError::Fenced`) enrolls nothing: the answer is NotSigner, the token is not spent
-/// and no row lands.
-#[test]
-fn a_fenced_handle_enrolls_nothing() {
-    let env = fake();
-    make_token(&env, 1, &spec(&[Daemon], 2));
-    let now = env.now();
-    let req = Req::new(1, "n1", &[Daemon]);
-    let stale = Wrap::new(env.store.clone(), Mode::Fenced);
-    let stale_answer = req.run(&stale, &mut || Ok(issue(&[Daemon], 1, now)));
-    assert_eq!(stale_answer, Err(R::NotSigner));
-    assert_eq!(token(&env, 1).uses, 0);
-    nothing_landed(&env);
-}
-
 // Catches store trouble answered as anything but "try again": a backend failure on a read
 // or a write, a store that never lets the commit through, and rows that do not decode are
 // all StoreUnavailable (retryable), never a success or a permanent refusal.

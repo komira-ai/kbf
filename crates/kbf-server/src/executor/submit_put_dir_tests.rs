@@ -1,6 +1,6 @@
 //! The job of a run that commits into a put directory.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use js_proto::v1::{JobSpec, NetworkLevel};
@@ -8,13 +8,24 @@ use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
 
 use super::{Booking, FRONTEND_LABEL, INSTANCE_LABEL, Settled, job_id, prepare};
+use crate::executor::mac::WorkerOs;
+use crate::executor::out::provider_layer;
 use crate::executor::test_support::{GIB, Harness, built_class};
 use crate::executor::traits::InputsError;
 use crate::executor::{
-    ActionFacts, Ctx, Deps, Inputs, OUT_TARGET, PutDirRoots, ReadGrant, TASK_IN_TREE, TaskOut,
+    ActionFacts, Ctx, DEFAULT_MAC_OS_VERSION, Deps, Ingest, Ingested, InputTree, Inputs, MacPool,
+    MintError, OUT_TARGET, PackKey, PutDirRoots, ReadGrant, System, TASK_IN_TREE, TaskOut,
+    UntrustedLimits, build_id,
 };
 
 const TREE: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+
+/// The key of a tree list, as [`Inputs::tree`] hands it out with [`InputTree::Provider`].
+const LIST_KEY: &str = "cas/l/abababababababababababababababababababababababababababababababab";
+
+/// The macOS `kbf-task` bundle of a release, by its manifest digest.
+const BUNDLE: &str =
+    "kbf-task@sha256:9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a";
 
 fn action() -> Digest {
     Digest {
@@ -23,8 +34,59 @@ fn action() -> Digest {
     }
 }
 
-/// Inputs whose run wrote the action tree [`TREE`], and that never issue a grant.
-struct Treed;
+/// Inputs whose run wrote the action tree `tree`, and that never issue a grant; a Mac action
+/// when `mac`.
+struct Treed {
+    tree: &'static str,
+    mac: bool,
+}
+
+impl Treed {
+    /// A Linux action whose tree is [`TREE`].
+    fn linux() -> Self {
+        Self {
+            tree: TREE,
+            mac: false,
+        }
+    }
+}
+
+/// An ingest that mints the directory of a run and records the form of tree each mint was
+/// asked to write.
+#[derive(Default)]
+struct Recording {
+    asked: Mutex<Vec<InputTree>>,
+}
+
+impl Recording {
+    fn asked(&self) -> Vec<InputTree> {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[tonic::async_trait]
+impl Ingest for Recording {
+    async fn mint(
+        &self,
+        lease: LeaseId,
+        _: &Digest,
+        _: Duration,
+        tree: InputTree,
+    ) -> Result<PackKey, MintError> {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(tree);
+        Ok(PackKey::new(format!("cas/b/{}/aa-0", build_id(lease))))
+    }
+
+    async fn ingest(&self, _: LeaseId, _: &PackKey, _: &Digest, _: &UntrustedLimits) -> Ingested {
+        Ingested::Unavailable("not read here".to_owned())
+    }
+}
 
 #[tonic::async_trait]
 impl Inputs for Treed {
@@ -32,7 +94,10 @@ impl Inputs for Treed {
         Ok(ActionFacts {
             image: format!("registry.test/kbf@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
-            system: crate::executor::System::Linux,
+            system: match self.mac {
+                true => System::Macos { os_version: None },
+                false => System::Linux,
+            },
             size_class: built_class(),
         })
     }
@@ -49,21 +114,56 @@ impl Inputs for Treed {
     }
 
     async fn tree(&self, _: LeaseId) -> Result<String, InputsError> {
-        Ok(TREE.to_owned())
+        Ok(self.tree.to_owned())
     }
 }
 
-/// Prepares the job of lease 7.8 under the put root `/mnt/ts/put`, with `inputs` in place of
-/// the harness's when given.
-async fn prepared(
+/// What a test sets: the form of tree the config asks for, whether the outputs are a put
+/// directory, the worker, and the inputs in place of the harness's.
+struct Case {
+    tree: InputTree,
+    put_dir: bool,
+    on: WorkerOs,
     inputs: Option<Arc<dyn Inputs>>,
     booking: Booking,
-) -> Result<Arc<super::Prepared>, Settled> {
+}
+
+impl Case {
+    /// A Linux put-directory run with the manifests, as `inputs` has it.
+    fn new(inputs: Option<Arc<dyn Inputs>>, booking: Booking) -> Self {
+        Self {
+            tree: InputTree::Manifests,
+            put_dir: true,
+            on: WorkerOs::Linux,
+            inputs,
+            booking,
+        }
+    }
+}
+
+/// Prepares the job of lease 7.8 for `case` under the put root `/mnt/ts/put`, with an ingest
+/// that records what its mint was asked for, which is returned with the job.
+async fn prepared_as(case: Case) -> (Result<Arc<super::Prepared>, Settled>, Vec<InputTree>) {
     let mut harness = Harness::new().await;
     let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
-    harness.cfg.task_out = TaskOut::PutDir(roots);
+    if case.put_dir {
+        harness.cfg.task_out = TaskOut::PutDir(roots);
+    }
+    harness.cfg.input_tree = case.tree;
+    if case.on == WorkerOs::Mac {
+        harness.cfg.mac = Some(MacPool {
+            hosts: 1,
+            bundle: BUNDLE.to_owned(),
+            os_version: DEFAULT_MAC_OS_VERSION,
+            roots: None,
+        });
+    }
+    let ingest = Arc::new(Recording::default());
     let deps = Deps {
-        inputs: inputs.unwrap_or_else(|| Arc::clone(&harness.deps.inputs)),
+        inputs: case
+            .inputs
+            .unwrap_or_else(|| Arc::clone(&harness.deps.inputs)),
+        ingest: Arc::clone(&ingest) as Arc<dyn Ingest>,
         ..harness.deps.clone()
     };
     let ctx = Ctx {
@@ -72,14 +172,24 @@ async fn prepared(
         twin: &harness.twin,
         share: None,
     };
-    prepare(
+    let job = prepare(
         &ctx.preparer(),
-        crate::executor::mac::WorkerOs::Linux,
+        case.on,
         LeaseId::new(7, 8),
         &action(),
-        booking,
+        case.booking,
     )
-    .await
+    .await;
+    (job, ingest.asked())
+}
+
+/// Prepares the job of lease 7.8 under the put root `/mnt/ts/put`, with `inputs` in place of
+/// the harness's when given.
+async fn prepared(
+    inputs: Option<Arc<dyn Inputs>>,
+    booking: Booking,
+) -> Result<Arc<super::Prepared>, Settled> {
+    prepared_as(Case::new(inputs, booking)).await.0
 }
 
 const SHARE: Booking = Booking::Share {
@@ -94,7 +204,7 @@ const SHARE: Booking = Booking::Share {
 /// the class); and that the key it keeps for the ingest is the directory.
 #[tokio::test(start_paused = true)]
 async fn a_put_dir_job_is_the_tree_the_tool_and_the_dir_at_out() {
-    let prepared = prepared(Some(Arc::new(Treed)), SHARE)
+    let prepared = prepared(Some(Arc::new(Treed::linux())), SHARE)
         .await
         .expect("prepared");
     let spec: &JobSpec = &prepared.spec;
@@ -130,7 +240,7 @@ async fn a_put_dir_job_is_the_tree_the_tool_and_the_dir_at_out() {
 /// job service gives a whole-host job no mount.
 #[tokio::test(start_paused = true)]
 async fn a_whole_machine_lease_cannot_commit_into_a_put_dir() {
-    let refused = prepared(Some(Arc::new(Treed)), Booking::WholeHost)
+    let refused = prepared(Some(Arc::new(Treed::linux())), Booking::WholeHost)
         .await
         .err()
         .expect("refused");
@@ -149,4 +259,97 @@ async fn a_run_with_no_tree_is_infrastructure() {
         refused,
         Settled::Infra("no input tree was written for 7.8".to_owned())
     );
+}
+
+/// Asserts that with `--executor-input-tree provider` the job's one layer is tierstore's
+/// provider layer for the key `Inputs::tree` returned, that the ingest's mint was asked for
+/// `InputTree::Provider` once, and that everything else of the job (program, arguments, mount,
+/// network, limits, labels) is the manifests job's. Catches: a provider job that still mounts
+/// the manifests' host directory, a mint never told to write a tree list, and a provider job
+/// that differs from the manifests job in more than its layer.
+#[tokio::test(start_paused = true)]
+async fn a_provider_job_has_the_tree_lists_provider_as_its_one_layer_and_nothing_else_differs() {
+    let (listed, asked) = prepared_as(Case {
+        tree: InputTree::Provider,
+        inputs: Some(Arc::new(Treed {
+            tree: LIST_KEY,
+            mac: false,
+        })),
+        ..Case::new(None, SHARE)
+    })
+    .await;
+    let listed = listed.expect("prepared");
+    assert_eq!(asked, [InputTree::Provider]);
+    assert_eq!(listed.spec.layers, vec![provider_layer(LIST_KEY)]);
+    assert_eq!(listed.key.as_str(), "cas/b/7-8/aa-0");
+
+    let (manifests, asked) = prepared_as(Case::new(Some(Arc::new(Treed::linux())), SHARE)).await;
+    let manifests = manifests.expect("prepared");
+    assert_eq!(asked, [InputTree::Manifests]);
+    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
+    assert_eq!(manifests.spec.layers, vec![roots.layer(TREE)]);
+    assert_eq!(listed.key.as_str(), manifests.key.as_str());
+    // The layers are compared above; the instance label is of each harness's own config.
+    let bare = |job: &super::Prepared| {
+        let mut spec: JobSpec = job.spec.clone();
+        spec.layers.clear();
+        spec.labels.remove(INSTANCE_LABEL);
+        spec
+    };
+    assert_eq!(bare(&listed), bare(&manifests));
+}
+
+/// Asserts that a presigned job (no put directory) asks the mint for `InputTree::Manifests`
+/// even when the config says provider, because it writes no tree. Catches: a presigned run
+/// made to write a tree list nobody reads.
+#[tokio::test(start_paused = true)]
+async fn a_presigned_job_asks_for_manifests_whatever_the_config_says() {
+    let (job, asked) = prepared_as(Case {
+        tree: InputTree::Provider,
+        put_dir: false,
+        ..Case::new(None, SHARE)
+    })
+    .await;
+    job.expect("prepared");
+    assert_eq!(asked, [InputTree::Manifests]);
+}
+
+/// Asserts that a Mac job asks the mint for `InputTree::Manifests` when the config says
+/// provider, and mounts the tree as the host directory of its manifests: the native runtime
+/// takes no provider. Catches: a Mac job given a provider layer its runtime cannot read.
+#[tokio::test(start_paused = true)]
+async fn a_mac_job_asks_for_manifests_even_when_the_config_says_provider() {
+    let (job, asked) = prepared_as(Case {
+        tree: InputTree::Provider,
+        on: WorkerOs::Mac,
+        inputs: Some(Arc::new(Treed {
+            tree: TREE,
+            mac: true,
+        })),
+        ..Case::new(None, SHARE)
+    })
+    .await;
+    let job = job.expect("prepared");
+    assert_eq!(asked, [InputTree::Manifests]);
+    assert!(job.spec.layers.is_empty());
+    let trees: Vec<&str> = job
+        .spec
+        .mounts
+        .iter()
+        .filter_map(|m| match &m.source {
+            Some(js_proto::v1::mount::Source::HostPath(path)) => Some(path.as_str()),
+            _ => None,
+        })
+        .filter(|path| path.contains("/trees/"))
+        .collect();
+    assert_eq!(trees, [format!("/mnt/ts/trees/{TREE}")]);
+}
+
+/// Asserts that a Linux put-directory job on the manifests asks the mint for
+/// `InputTree::Manifests`. Catches: a default that asks for the tree list.
+#[tokio::test(start_paused = true)]
+async fn a_linux_put_dir_job_asks_for_manifests_by_default() {
+    let (job, asked) = prepared_as(Case::new(Some(Arc::new(Treed::linux())), SHARE)).await;
+    job.expect("prepared");
+    assert_eq!(asked, [InputTree::Manifests]);
 }

@@ -24,6 +24,9 @@ use kbf_types::DigestFunction;
 
 use super::*;
 
+/// What a presigned run is minted with: it writes no tree, so the form is never read.
+const TREES: InputTree = InputTree::Manifests;
+
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const KBF_IMAGE: &str =
@@ -265,7 +268,7 @@ async fn a_run_is_prepared_once_and_its_key_write_and_grant_are_handed_out_once(
     let wall = Duration::from_secs(900);
     let key = rig
         .front
-        .mint(lease(), &action_digest(), wall)
+        .mint(lease(), &action_digest(), wall, TREES)
         .await
         .expect("a key");
     assert_eq!(key.as_str(), "cas/b/7-3/aa-0");
@@ -301,7 +304,7 @@ async fn a_write_is_found_by_its_key_and_a_stranger_gets_none() {
     let rig = Rig::new();
     let wall = Duration::from_secs(60);
     rig.front
-        .mint(lease(), &action_digest(), wall)
+        .mint(lease(), &action_digest(), wall, TREES)
         .await
         .expect("a key");
     let other = PackKey::new("cas/b/7-4/bb-0");
@@ -323,14 +326,14 @@ async fn a_write_that_ends_before_the_run_does_is_not_a_key() {
     rig.prepared.answers(Ok(run("cas/b/7-3/aa-0", NOW + 899)));
     let refused = rig
         .front
-        .mint(lease(), &action_digest(), Duration::from_secs(900))
+        .mint(lease(), &action_digest(), Duration::from_secs(900), TREES)
         .await;
     assert!(refused.is_err());
     assert!(rig.front.parked().is_empty());
     rig.prepared.answers(Ok(run("cas/b/7-3/aa-0", NOW + 900)));
     let kept = rig
         .front
-        .mint(lease(), &action_digest(), Duration::from_secs(900))
+        .mint(lease(), &action_digest(), Duration::from_secs(900), TREES)
         .await;
     assert!(kept.is_ok(), "a write good for exactly the wall is enough");
 }
@@ -346,7 +349,7 @@ async fn a_run_that_cannot_be_prepared_is_not_a_key_and_says_why() {
         rig.prepared.answers(Err(why.clone()));
         let refused = rig
             .front
-            .mint(lease(), &action_digest(), Duration::from_secs(60))
+            .mint(lease(), &action_digest(), Duration::from_secs(60), TREES)
             .await;
         let expected = match &why {
             PrepareError::Refused(why) => MintError::Refused(why.clone()),
@@ -360,7 +363,12 @@ async fn a_run_that_cannot_be_prepared_is_not_a_key_and_says_why() {
     };
     let refused = rig
         .front
-        .mint(lease(), &not_a_digest, Duration::from_secs(60))
+        .mint(
+            lease(),
+            &not_a_digest,
+            Duration::from_secs(60),
+            InputTree::Manifests,
+        )
         .await;
     assert!(refused.is_err(), "an action digest that is not one");
     assert_eq!(
@@ -377,7 +385,7 @@ async fn what_a_start_that_ran_out_of_its_window_left_is_dropped_at_the_next_min
     let rig = Rig::new();
     rig.prepared.answers(Ok(run("cas/b/7-3/aa-0", NOW + 100)));
     rig.front
-        .mint(lease(), &action_digest(), Duration::from_secs(10))
+        .mint(lease(), &action_digest(), Duration::from_secs(10), TREES)
         .await
         .expect("a key");
     assert_eq!(rig.front.parked().len(), 1);
@@ -389,6 +397,7 @@ async fn what_a_start_that_ran_out_of_its_window_left_is_dropped_at_the_next_min
             LeaseId::new(7, 9),
             &action_digest(),
             Duration::from_secs(10),
+            TREES,
         )
         .await
         .expect("another key");
@@ -403,13 +412,13 @@ async fn preparing_a_lease_again_replaces_what_was_parked() {
     let rig = Rig::new();
     let wall = Duration::from_secs(60);
     rig.front
-        .mint(lease(), &action_digest(), wall)
+        .mint(lease(), &action_digest(), wall, TREES)
         .await
         .expect("a key");
     rig.prepared.answers(Ok(run("cas/b/7-3/cc-0", NOW + 7_200)));
     let key = rig
         .front
-        .mint(lease(), &action_digest(), wall)
+        .mint(lease(), &action_digest(), wall, TREES)
         .await
         .expect("a key");
     assert_eq!(rig.front.parked().len(), 1);

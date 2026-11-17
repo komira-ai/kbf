@@ -123,7 +123,6 @@ fn a_flag_opened_postgres_store_is_shared_and_keeps_epochs() {
         .bump_epoch()
         .expect("the first frontend's farm writes")
         .expect("a state store");
-    assert!(!first_farm.superseded(), "a start fenced the first");
     assert_marked(first.store.as_ref());
 }
 

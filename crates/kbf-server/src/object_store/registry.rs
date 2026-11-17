@@ -62,8 +62,7 @@ pub enum RegistryError {
     /// A stored row does not decode; the text names its family.
     #[error("the {0} rows are not readable")]
     Corrupt(&'static str),
-    /// The state store failed, or this frontend is no longer its writer
-    /// ([`StoreError::Fenced`]).
+    /// The state store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -226,8 +225,7 @@ fn cold_uri(bind: &BindRow, conn: &ConnRow) -> Result<String, RegistryError> {
 }
 
 impl Registry {
-    /// The registry over `store` (the frontend's fenced handle, so every write checks
-    /// that this frontend still holds the writer role), with secret files in `dir`.
+    /// The registry over `store`, with secret files in `dir`.
     /// Sweeps the files no row names: temp files and versions a crash left.
     ///
     /// # Errors

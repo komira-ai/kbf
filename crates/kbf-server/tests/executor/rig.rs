@@ -15,9 +15,9 @@ use kbf_sched::Request;
 use kbf_server::Farm;
 use kbf_server::executor::rows::ExecRows;
 use kbf_server::executor::{
-    ActionFacts, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, Metrics, MintError,
-    Ownership, PackKey, Presign, PresignError, PutDirRoots, ReadGrant, Secret, SizeClass, TaskOut,
-    UntrustedLimits, build_id,
+    ActionFacts, Config, Deps, Executor, Ingest, Ingested, InputTree, Inputs, InputsError, Metrics,
+    MintError, Ownership, PackKey, Presign, PresignError, PutDirRoots, ReadGrant, Secret,
+    SizeClass, TaskOut, UntrustedLimits, build_id,
 };
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
@@ -185,6 +185,8 @@ pub struct FakeIngest {
     pub calls: Mutex<Vec<(kbf_types::LeaseId, String, UntrustedLimits)>>,
     /// How many keys were minted: each key is new.
     pub minted: AtomicU64,
+    /// The form of input tree each mint was asked to write, in order.
+    pub forms: Mutex<Vec<InputTree>>,
 }
 
 impl FakeIngest {
@@ -197,6 +199,7 @@ impl FakeIngest {
             mint_fails: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
             minted: AtomicU64::new(0),
+            forms: Mutex::new(Vec::new()),
         }
     }
 
@@ -218,7 +221,9 @@ impl Ingest for FakeIngest {
         lease: kbf_types::LeaseId,
         _action: &Digest,
         _wall: Duration,
+        tree: InputTree,
     ) -> Result<PackKey, MintError> {
+        locked(&self.forms).push(tree);
         match locked(&self.mint_fails).take() {
             Some(why) => Err(why),
             None => Ok(PackKey::new(format!(

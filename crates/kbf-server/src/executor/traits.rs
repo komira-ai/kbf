@@ -13,6 +13,7 @@ use std::time::Duration;
 use kbf_proto::reapi::{ActionResult, Digest};
 use kbf_types::LeaseId;
 
+use crate::executor::config::InputTree;
 use crate::executor::mac::System;
 use crate::executor::size_class::SizeClass;
 use crate::executor::task::{PackKey, Secret};
@@ -110,7 +111,9 @@ pub trait Ingest: Send + Sync {
     /// The key `lease` may write the pack of `action` under, good for a run of `wall`. Issued
     /// by the same secret that [`ingest`](Self::ingest) verifies it with: a key the ingest did
     /// not issue for this lease and this action is refused there. Called once for a farm
-    /// lease, before the url and the grant of the same run are asked for.
+    /// lease, before the url and the grant of the same run are asked for. A run that commits
+    /// into a put directory has its input tree written here too, as `tree` says, for
+    /// [`Inputs::tree`]; a presigned run has none, and `tree` is not read.
     ///
     /// # Errors
     /// [`MintError`].
@@ -119,6 +122,7 @@ pub trait Ingest: Send + Sync {
         lease: LeaseId,
         action: &Digest,
         wall: Duration,
+        tree: InputTree,
     ) -> Result<PackKey, MintError>;
 
     /// What `key` holds, for `action`, run under `lease`. Never trusts the pack.
@@ -211,7 +215,9 @@ pub trait Inputs: Send + Sync {
     ) -> Result<ReadGrant, InputsError>;
 
     /// The action tree [`Ingest::mint`] wrote for the run of `lease` that commits into a put
-    /// directory: its root manifest's digest, 64 lowercase hex digits. Handed out once.
+    /// directory, as it was asked to write it: with [`InputTree::Manifests`], its root
+    /// manifest's digest, 64 lowercase hex digits; with [`InputTree::Provider`], the key of its
+    /// tree list. Handed out once.
     ///
     /// # Errors
     /// [`InputsError`]; by default [`InputsError::Unavailable`], for inputs that write no tree.

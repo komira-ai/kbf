@@ -1,6 +1,6 @@
 //! A retire that stands down with requeues the state store has not taken yet.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::future::AbortRegistration;
 use kbf_front::{Backend, Cache, Described, Dispatch, Submission};
@@ -26,8 +26,6 @@ struct Refuses {
     /// How many of the next batches of writes the store refuses (as a failure of the
     /// backend), counting down by one per refusal.
     refuse_next: AtomicUsize,
-    /// Every write answers that a newer writer exists ([`StoreError::Fenced`]).
-    newer_writer: AtomicBool,
     /// Batches of writes the store was asked to apply, refused or not.
     writes_tried: AtomicUsize,
 }
@@ -37,7 +35,6 @@ impl Refuses {
         Arc::new(Self {
             inner: Fake::with_flaw(Arc::new(ManualClock::default()), Flaw::None),
             refuse_next: AtomicUsize::new(0),
-            newer_writer: AtomicBool::new(false),
             writes_tried: AtomicUsize::new(0),
         })
     }
@@ -51,9 +48,6 @@ impl Refuses {
 impl Store for Refuses {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
         self.writes_tried.fetch_add(1, Ordering::SeqCst);
-        if self.newer_writer.load(Ordering::SeqCst) {
-            return Err(StoreError::Fenced);
-        }
         let refused = self
             .refuse_next
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
@@ -294,37 +288,6 @@ async fn a_requeue_the_store_refuses_past_the_deadline_is_logged_and_the_stand_d
     let log = lines.text();
     assert!(log.contains("ERROR"), "{log}");
     assert!(log.contains(&operation), "{log}");
-}
-
-/// Asserts that a retire stops writing once a newer writer exists. A store that says so
-/// (Fenced) on the first attempt is tried exactly once and the retire, whose deadline is
-/// ten minutes, returns at once; and a farm that already learned it from an earlier write
-/// tries none. Either way the log names the operation.
-#[tokio::test]
-async fn a_newer_writer_stops_the_flush_at_once() {
-    let rig = Rig::new();
-    let operation = with_an_unsettled_requeue(&rig).await;
-    assert!(!rig.farm.superseded(), "not fenced yet");
-    rig.store.newer_writer.store(true, Ordering::SeqCst);
-    let lines = capture();
-    let before = rig.store.writes_tried.load(Ordering::SeqCst);
-
-    let run = tokio::time::timeout(Duration::from_secs(20), rig.stand(LONG).release()).await;
-
-    run.expect("not waiting for the deadline");
-    assert!(rig.farm.superseded(), "fenced by the newer writer");
-    assert_eq!(rig.store.writes_tried.load(Ordering::SeqCst), before + 1);
-    assert!(lines.text().contains(&operation), "{}", lines.text());
-
-    // Already known: the next stand down does not try at all.
-    let rig = Rig::new();
-    let _operation = with_an_unsettled_requeue(&rig).await;
-    rig.store.newer_writer.store(true, Ordering::SeqCst);
-    rig.farm.tick().await;
-    let before = rig.store.writes_tried.load(Ordering::SeqCst);
-    let run = tokio::time::timeout(Duration::from_secs(20), rig.stand(LONG).release()).await;
-    run.expect("not waiting for the deadline");
-    assert_eq!(rig.store.writes_tried.load(Ordering::SeqCst), before);
 }
 
 /// Asserts that a flush on a farm that has nothing to write does not wait out the

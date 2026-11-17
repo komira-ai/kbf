@@ -1030,7 +1030,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "js-agent-wire"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=60b75be836ad4c0a3a8f01306aae683b703dda8d#60b75be836ad4c0a3a8f01306aae683b703dda8d"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 dependencies = [
  "js-elastic",
  "js-types",
@@ -1042,7 +1042,7 @@ dependencies = [
 [[package]]
 name = "js-caps"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=60b75be836ad4c0a3a8f01306aae683b703dda8d#60b75be836ad4c0a3a8f01306aae683b703dda8d"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 dependencies = [
  "js-types",
  "thiserror",
@@ -1051,7 +1051,7 @@ dependencies = [
 [[package]]
 name = "js-elastic"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=60b75be836ad4c0a3a8f01306aae683b703dda8d#60b75be836ad4c0a3a8f01306aae683b703dda8d"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 dependencies = [
  "js-types",
  "sha2",
@@ -1061,7 +1061,7 @@ dependencies = [
 [[package]]
 name = "js-proto"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=60b75be836ad4c0a3a8f01306aae683b703dda8d#60b75be836ad4c0a3a8f01306aae683b703dda8d"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 dependencies = [
  "bytes",
  "js-caps",
@@ -1076,7 +1076,7 @@ dependencies = [
 [[package]]
 name = "js-sched"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=60b75be836ad4c0a3a8f01306aae683b703dda8d#60b75be836ad4c0a3a8f01306aae683b703dda8d"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 dependencies = [
  "js-agent-wire",
  "js-caps",
@@ -1090,7 +1090,7 @@ dependencies = [
 [[package]]
 name = "js-sim"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=60b75be836ad4c0a3a8f01306aae683b703dda8d#60b75be836ad4c0a3a8f01306aae683b703dda8d"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 dependencies = [
  "js-types",
  "rand_chacha",
@@ -1100,12 +1100,12 @@ dependencies = [
 [[package]]
 name = "js-sizing"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=60b75be836ad4c0a3a8f01306aae683b703dda8d#60b75be836ad4c0a3a8f01306aae683b703dda8d"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 
 [[package]]
 name = "js-state"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=60b75be836ad4c0a3a8f01306aae683b703dda8d#60b75be836ad4c0a3a8f01306aae683b703dda8d"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 dependencies = [
  "js-testkit",
  "percent-encoding",
@@ -1133,7 +1133,7 @@ dependencies = [
 [[package]]
 name = "js-testkit"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=60b75be836ad4c0a3a8f01306aae683b703dda8d#60b75be836ad4c0a3a8f01306aae683b703dda8d"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 dependencies = [
  "libc",
  "postgres",
@@ -1144,7 +1144,7 @@ dependencies = [
 [[package]]
 name = "js-types"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=60b75be836ad4c0a3a8f01306aae683b703dda8d#60b75be836ad4c0a3a8f01306aae683b703dda8d"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 dependencies = [
  "serde",
  "serde_json",
@@ -1154,7 +1154,7 @@ dependencies = [
 [[package]]
 name = "js-usage"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=60b75be836ad4c0a3a8f01306aae683b703dda8d#60b75be836ad4c0a3a8f01306aae683b703dda8d"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 dependencies = [
  "js-state",
  "js-types",
@@ -1164,7 +1164,7 @@ dependencies = [
 [[package]]
 name = "js-whole"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=60b75be836ad4c0a3a8f01306aae683b703dda8d#60b75be836ad4c0a3a8f01306aae683b703dda8d"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 
 [[package]]
 name = "kbf-alert"
@@ -2096,6 +2096,7 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror",
+ "tierstore",
  "time",
  "tokio",
  "tokio-rustls",
@@ -2855,7 +2856,7 @@ dependencies = [
 [[package]]
 name = "objstore-s3"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=309ad2d71b745f1827f9292976411e25e8b991e9#309ad2d71b745f1827f9292976411e25e8b991e9"
+source = "git+https://github.com/komira-ai/tierstore?rev=9a6718b2f3d75c2dfbaca76e8d85f22085054550#9a6718b2f3d75c2dfbaca76e8d85f22085054550"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3851,7 +3852,7 @@ dependencies = [
 [[package]]
 name = "tierstore"
 version = "0.3.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=309ad2d71b745f1827f9292976411e25e8b991e9#309ad2d71b745f1827f9292976411e25e8b991e9"
+source = "git+https://github.com/komira-ai/tierstore?rev=9a6718b2f3d75c2dfbaca76e8d85f22085054550#9a6718b2f3d75c2dfbaca76e8d85f22085054550"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3915,7 +3916,7 @@ dependencies = [
 [[package]]
 name = "tierstore-trees-api"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=309ad2d71b745f1827f9292976411e25e8b991e9#309ad2d71b745f1827f9292976411e25e8b991e9"
+source = "git+https://github.com/komira-ai/tierstore?rev=9a6718b2f3d75c2dfbaca76e8d85f22085054550#9a6718b2f3d75c2dfbaca76e8d85f22085054550"
 dependencies = [
  "prost",
  "protox 0.10.0",

@@ -15,7 +15,7 @@ use kbf_types::{Answer, FarmTime, OperationId, StateMachine as _, WaiterId, Work
 use tokio::sync::watch;
 use tonic::Status;
 
-use super::durable::{Durable, Held, Progress, StateError, StoredCordon};
+use super::durable::{Held, Progress, StateError, StoredCordon};
 use super::engine::{Adapter, Engine};
 use super::{Farm, NodeAction, State};
 
@@ -128,17 +128,6 @@ impl Farm {
         self.lock().engine.unplaced.insert(lease);
     }
 
-    /// Whether the state store has refused a write of this farm because a newer writer
-    /// holds it.
-    #[must_use]
-    pub fn superseded(&self) -> bool {
-        self.lock()
-            .engine
-            .durable
-            .as_ref()
-            .is_some_and(Durable::superseded)
-    }
-
     /// Worker streams open now.
     #[must_use]
     pub fn open_sessions(&self) -> usize {
@@ -149,9 +138,8 @@ impl Farm {
     /// up while the store did not take the write), so that the successor recovers each
     /// operation queued and not under the lease this process gave up. Works on a fenced
     /// farm, which feeds the scheduler nothing and so would never write them again.
-    /// Tries again every [`FLUSH_LOOK`] until none is left, and stops at once when the
-    /// store says a newer writer holds it (nothing may be written then), or at the
-    /// `deadline`; whatever is left is logged at ERROR, naming the operations. Returns
+    /// Tries again every [`FLUSH_LOOK`] until none is left, or until the `deadline`;
+    /// whatever is left is logged at ERROR, naming the operations. Returns
     /// the operations whose requeues were not written.
     pub async fn flush_unsettled(&self, deadline: Duration) -> Vec<OperationId> {
         let until = tokio::time::Instant::now() + deadline;
@@ -160,7 +148,6 @@ impl Farm {
             let step = self.lock().flush_step();
             match step {
                 Flushed::Settled => return Vec::new(),
-                Flushed::Superseded(left) => break (left, "the state store has a newer writer"),
                 Flushed::Refused(left) => {
                     if tokio::time::Instant::now() >= until {
                         break (
@@ -239,8 +226,6 @@ impl Farm {
 pub(super) enum Flushed {
     /// Every requeue is written.
     Settled,
-    /// A newer writer holds the store: these operations' requeues will not be written.
-    Superseded(Vec<OperationId>),
     /// The store refused again: these operations' requeues are still unwritten.
     Refused(Vec<OperationId>),
 }
@@ -296,19 +281,16 @@ impl Engine {
     /// a fenced farm writes, because the successor's recovery depends on it (see
     /// [`Farm::flush_unsettled`]).
     pub(super) fn flush_step(&mut self, a: &mut dyn Adapter) -> Flushed {
-        let superseded = |state: &Self| state.durable.as_ref().is_some_and(Durable::superseded);
-        if !superseded(self) {
-            self.log_requeues(a);
-        }
+        self.log_requeues(a);
         let left: Vec<OperationId> = self
             .unsettled
             .iter()
             .map(|(requeue, ..)| requeue.operation)
             .collect();
-        match (left.is_empty(), superseded(self)) {
-            (true, _) => Flushed::Settled,
-            (false, true) => Flushed::Superseded(left),
-            (false, false) => Flushed::Refused(left),
+        if left.is_empty() {
+            Flushed::Settled
+        } else {
+            Flushed::Refused(left)
         }
     }
 

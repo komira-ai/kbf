@@ -1,5 +1,5 @@
 //! The action tree's manifest writer: the tierstore tree a job's root file system is read from
-//! (docs/design/actions-as-jobs.md, 4.1 and 4.2).
+//! (docs/design/actions-as-jobs.md, 4.1, 4.2 and 4.7).
 //!
 //! [`TreeWriter::write`] takes an Action's input closure with its `Directory` messages kept
 //! ([`crate::prepare_run::collect_closure_keeping`]) and the kbf base tree ([`BaseTree`]), and
@@ -36,11 +36,19 @@
 //! clock and no longer than its subdirectories' entries; [`TreeWriter::forget`] drops an input
 //! root's entries.
 //!
+//! **The tree list** ([`listing`], [`TreeWriter::write_listing`]) is the same action tree as one
+//! object, tierstore's tree list: every entry at its path, the base tree's included
+//! ([`BaseTree::listed`]), a file with bytes naming its pack span or whole object and its SHA-256, stored
+//! create-only at `cas/l/<sha256 of the list>`. tierstore's mount provider makes a job's tree
+//! from it (`--executor-input-tree provider`).
+//!
 //! The executor's runs that commit into a put directory call it (`--task-out-mode put-dir`),
-//! each run's action tree written over the published base tree before the job is submitted.
+//! each run's action tree written over the published base tree before the job is submitted, as
+//! manifests or as a tree list.
 
 mod base;
 mod encode;
+mod listing;
 mod memo;
 mod place;
 mod retry;
@@ -54,6 +62,7 @@ use kbf_types::Digest;
 use tierstore::{MAX_DEPTH, MAX_ENTRIES, TreeDigest, TreeError};
 
 pub use self::base::{BaseFacts, BaseTree, BaseTreeError, RESERVED_NAMES};
+pub use self::listing::Listing;
 pub use self::place::{HEADS_IN_FLIGHT, LOCATE_CHUNK, LOOKUP_DEADLINE};
 pub use self::retry::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, PutRetry, Sleeper};
 
@@ -171,6 +180,27 @@ pub enum NoTree {
         /// The `Directory`.
         directory: Digest,
     },
+    /// tierstore's reader refuses the tree list of the tree (a name it does not take, a
+    /// list over its size limit): [`TreeWriter::write_listing`] only.
+    #[error("the tree list of the tree is one tierstore refuses: {why}")]
+    ListingRefused {
+        /// What the reader said.
+        why: String,
+    },
+    /// The tree list would hold more entries than the writer takes
+    /// ([`TreeWriter::with_list_entries`], by default [`MAX_ENTRIES`]):
+    /// [`TreeWriter::write_listing`] only.
+    #[error("the tree list has {entries} entries or more, over the {limit} it may have")]
+    ListTooLong {
+        /// The entries listed when the list was given up.
+        entries: u64,
+        /// The most it may have.
+        limit: u64,
+    },
+    /// The base tree was published without its entries listed, so no tree list can name
+    /// them: [`TreeWriter::write_listing`] only.
+    #[error("the kbf base tree is not listed: no tree list can be written")]
+    BaseNotListed,
 }
 
 impl NoTree {
@@ -183,14 +213,17 @@ impl NoTree {
             | Self::RootRefused { .. }
             | Self::TooManyEntries { .. }
             | Self::TooDeep { .. }
-            | Self::ReservedInput { .. } => "unrepresentable",
+            | Self::ReservedInput { .. }
+            | Self::ListingRefused { .. }
+            | Self::ListTooLong { .. } => "unrepresentable",
             Self::Lookup { .. }
             | Self::Deadline
             | Self::WrongLength { .. }
             | Self::Read { .. }
             | Self::Mismatch { .. }
             | Self::Put { .. }
-            | Self::NotKept { .. } => "store",
+            | Self::NotKept { .. }
+            | Self::BaseNotListed => "store",
         }
     }
 }
@@ -216,6 +249,8 @@ pub struct TreeWriter {
     clock: Clock,
     retry: PutRetry,
     memo: Mutex<Memo>,
+    /// The most entries a tree list holds ([`MAX_ENTRIES`] unless a test lowers it).
+    list_entries: u64,
 }
 
 /// The directories of a tree a write builds, children first, each once, and those the memo
@@ -248,7 +283,16 @@ impl TreeWriter {
             clock,
             retry: PutRetry::default(),
             memo: Mutex::new(Memo::new(entries)),
+            list_entries: MAX_ENTRIES,
         }
+    }
+
+    /// This writer, refusing a tree list of more than `entries` entries
+    /// ([`NoTree::ListTooLong`]); [`MAX_ENTRIES`] by default (a test scales it down).
+    #[must_use]
+    pub fn with_list_entries(mut self, entries: u64) -> Self {
+        self.list_entries = entries;
+        self
     }
 
     /// This writer, repeating a write the store answered 503 or a dead connection by `retry`.

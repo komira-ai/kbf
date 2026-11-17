@@ -38,6 +38,8 @@ mod golden;
 mod kept;
 #[path = "action_tree/limits.rs"]
 mod limits;
+#[path = "action_tree/listing.rs"]
+mod listing;
 #[path = "action_tree/memo.rs"]
 mod memo;
 #[path = "action_tree/retry.rs"]

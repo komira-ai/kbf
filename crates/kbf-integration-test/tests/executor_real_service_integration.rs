@@ -52,9 +52,9 @@ use kbf_proto::reapi::Digest;
 use kbf_sched::Request;
 use kbf_server::Farm;
 use kbf_server::executor::{
-    ActionFacts, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, Metrics, MintError,
-    PackKey, Presign, PresignError, ReadGrant, Secret, SizeClass, UntrustedLimits, build_id,
-    job_id,
+    ActionFacts, Config, Deps, Executor, Ingest, Ingested, InputTree, Inputs, InputsError, Metrics,
+    MintError, PackKey, Presign, PresignError, ReadGrant, Secret, SizeClass, UntrustedLimits,
+    build_id, job_id,
 };
 use kbf_types::{ActionKey, LeaseKind, Qos, Resources};
 use tokio::sync::watch;
@@ -147,6 +147,7 @@ impl Ingest for FakeIngest {
         lease: kbf_types::LeaseId,
         _action: &Digest,
         _wall: Duration,
+        _tree: InputTree,
     ) -> Result<PackKey, MintError> {
         Ok(PackKey::new(format!("cas/b/{}/0-0", build_id(lease))))
     }

@@ -20,6 +20,11 @@
 //! of one `--executor-frontend-id` serve beside each other, each keeping the rows of its jobs in
 //! the `--state-store` ([`crate::executor::Ownership`]).
 //!
+//! `--executor-input-tree` chooses what a Linux put-directory job's root is read from: the
+//! action tree's manifests under tierstore's trees (`manifests`, the default), or one tierstore
+//! tree list that tierstore's mount provider makes the tree from (`provider`,
+//! [`crate::executor::InputTree`]).
+//!
 //! The executor speaks to a job service only. The flags of the lease server it once leased
 //! hosts from (`--executor-lease-url`, `--executor-lease-token-file`,
 //! `--executor-lease-ca-file`, `--executor-lease-ttl-secs`, `--executor-class`) are gone, not
@@ -46,8 +51,8 @@ use kbf_types::ImageRef;
 
 use crate::Farm;
 use crate::executor::{
-    Config, DEFAULT_MAC_OS_VERSION, Delivery, Deps, Executor, Front, FrontParts, MacPool, Metrics,
-    Network, Ownership, PutDirParts, PutDirRoots, RunSource, TaskOut,
+    Config, DEFAULT_MAC_OS_VERSION, Delivery, Deps, Executor, Front, FrontParts, InputTree,
+    MacPool, Metrics, Network, Ownership, PutDirParts, PutDirRoots, RunSource, TaskOut,
 };
 
 const KIND: &str = "executor";
@@ -86,6 +91,7 @@ const PREPARE_CONCURRENCY: &str = "executor_prepare_concurrency";
 const NETWORK: &str = "executor_network";
 const OPEN_NETWORK: &str = "executor_allow_open_network";
 const OWNERSHIP: &str = "executor_ownership";
+const INPUT_TREE: &str = "executor_input_tree";
 const LIVE: &str = "executor_live_secs";
 const MAC_HOSTS: &str = "executor_mac_hosts";
 const MAC_BUNDLE: &str = "executor_mac_task_bundle";
@@ -504,6 +510,19 @@ pub(super) fn args() -> Vec<Arg> {
                  or at its end. `shared` needs `--state-store`. \
                  Used only with `--executor js-agent`",
             ),
+        Arg::new(INPUT_TREE)
+            .long("executor-input-tree")
+            .value_name("MODE")
+            .value_parser(["manifests", "provider"])
+            .default_value("manifests")
+            .help(
+                "What a Linux put-directory job's root is read from. `manifests`, the default: \
+                 the action tree's manifests, the job's layer `<mp>/trees/<digest>`. \
+                 `provider`: one tree list of the tree, the job's layer tierstore's mount \
+                 provider, which fetches the tree's files while the job's sandbox is made. \
+                 `provider` needs `--task-out-mode put-dir`. A Mac job's root is always \
+                 `manifests`. Used only with `--executor js-agent`",
+            ),
         number(
             LIVE,
             "executor-live-secs",
@@ -745,6 +764,10 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.ownership = match m.get_one::<String>(OWNERSHIP).map(String::as_str) {
         Some("shared") => Ownership::Shared,
         _ => Ownership::Single,
+    };
+    config.input_tree = match m.get_one::<String>(INPUT_TREE).map(String::as_str) {
+        Some("provider") => InputTree::Provider,
+        _ => InputTree::Manifests,
     };
     config.live = secs(LIVE);
     config.mac = mac_pool(m)?;

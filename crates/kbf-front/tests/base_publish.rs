@@ -21,6 +21,7 @@ use kbf_testkit::dir::TestDir;
 use kbf_tree_bundle::{Built, Dir, Facts, Node, Writer, file_name};
 use kbf_types::{Digest, DigestFunction};
 use sha2::{Digest as _, Sha256};
+use tierstore::{EntryKind, TreeDigest, flatten};
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const PLATFORM: &str = "linux-x86_64";
@@ -139,6 +140,17 @@ struct Release {
 /// directories `top` (empty) and `/.kbf-tools/kbf-task`, which holds `task`. Two releases on
 /// one pin differ in `task` alone.
 fn release(commit: &str, platform: &str, task: &[u8], top: &[&str]) -> Release {
+    release_with_links(commit, platform, task, top, &[])
+}
+
+/// [`release`], with a symbolic link at the top level for each `(name, target)` of `links`.
+fn release_with_links(
+    commit: &str,
+    platform: &str,
+    task: &[u8],
+    top: &[&str],
+    links: &[(&str, &str)],
+) -> Release {
     let mut bin = Dir::new();
     bin.insert("tool", Node::file(TOOL, true));
     let mut usr = Dir::new();
@@ -155,6 +167,14 @@ fn release(commit: &str, platform: &str, task: &[u8], top: &[&str]) -> Release {
     root.insert(".kbf-tools", Node::Dir(tools));
     for name in top {
         root.insert(*name, Node::Dir(Dir::new()));
+    }
+    for (name, target) in links {
+        root.insert(
+            *name,
+            Node::Symlink {
+                target: (*target).to_owned(),
+            },
+        );
     }
     let built = root.build().expect("a tree");
     let facts = Facts {
@@ -189,6 +209,68 @@ fn standard(task: &[u8]) -> Release {
     release(COMMIT, PLATFORM, task, &[])
 }
 
+/// The base tree of the release's root manifest, listed from the manifests the bundle holds.
+fn listed_base(release: &Release) -> BaseTree {
+    let root = &release.built.manifests.last().expect("a root").1;
+    let facts = BaseFacts {
+        entries: release.built.entries,
+        depth: release.built.depth,
+    };
+    let manifests: BTreeMap<&str, &[u8]> = release
+        .built
+        .manifests
+        .iter()
+        .map(|(hex, bytes)| (hex.as_str(), bytes.as_slice()))
+        .collect();
+    BaseTree::new(root, facts)
+        .expect("a base")
+        .listed(|digest| {
+            manifests
+                .get(digest.to_string().as_str())
+                .map(|bytes| bytes.to_vec())
+                .ok_or("not in the bundle")
+        })
+        .expect("listed")
+}
+
+/// Every entry below the release's root, by path, as tierstore flattens the bundle's manifests:
+/// `dir`, `file` or `link -> <target>`.
+fn tree_paths(release: &Release) -> BTreeMap<String, String> {
+    let manifests: BTreeMap<&str, &[u8]> = release
+        .built
+        .manifests
+        .iter()
+        .map(|(hex, bytes)| (hex.as_str(), bytes.as_slice()))
+        .collect();
+    let root = &release.built.manifests.last().expect("a root").1;
+    let flat = flatten(&TreeDigest::of(root), |digest| {
+        manifests
+            .get(digest.to_string().as_str())
+            .map(|bytes| bytes.to_vec())
+            .ok_or("not in the bundle")
+    })
+    .expect("flattened");
+    let mut paths: Vec<String> = Vec::new();
+    let mut found = BTreeMap::new();
+    for entry in &flat {
+        let path = match entry.parent {
+            Some(0) => entry.name.to_string(),
+            Some(parent) => format!("{}/{}", paths[parent as usize], entry.name),
+            None => String::new(),
+        };
+        paths.push(path.clone());
+        let kind = match &entry.kind {
+            EntryKind::Dir { .. } => "dir".to_owned(),
+            EntryKind::File { .. } => "file".to_owned(),
+            EntryKind::Symlink { target } => format!("link -> {target}"),
+        };
+        if entry.parent.is_some() {
+            found.insert(path, kind);
+        }
+    }
+    found
+}
+
 /// A release directory: the bundle, and a sums file that lists it (with a line of another
 /// platform's bundle, as a real one has).
 fn install(dir: &Path, release: &Release) {
@@ -217,7 +299,7 @@ async fn run(
     dir: &Path,
     store: &Arc<Bucket>,
 ) -> Result<kbf_front::base_publish::Published, PublishError> {
-    publish(dir, COMMIT, PLATFORM, store.clone()).await
+    publish(dir, COMMIT, PLATFORM, store.clone(), true).await
 }
 
 /// Asserts that a first publish writes every object of the bundle to `cas/l/<sha256>` with its
@@ -246,11 +328,16 @@ async fn a_first_publish_writes_every_object() {
     assert_eq!(published.root.hash_hex(), release.built.root);
     let root = &release.built.manifests.last().expect("a root").1;
     assert_eq!(published.root.size_bytes, root.len() as u64);
+    // The published base is listed: it equals the base of the root manifest listed from the
+    // bundle's own manifests, which is not the unlisted base of the same root.
+    assert!(published.base.is_listed());
     let facts = BaseFacts {
         entries: release.built.entries,
         depth: release.built.depth,
     };
-    assert_eq!(published.base, BaseTree::new(root, facts).expect("a base"));
+    let unlisted = BaseTree::new(root, facts).expect("a base");
+    assert_ne!(published.base, unlisted);
+    assert_eq!(published.base, listed_base(&release));
 }
 
 /// Asserts that a second release on the same pin (the same base files, another `kbf-task`)
@@ -590,7 +677,7 @@ async fn an_empty_commit_is_refused() {
     install(&dir, &release);
     let store = Arc::new(Bucket::default());
 
-    let error = publish(&dir, "", PLATFORM, store.clone())
+    let error = publish(&dir, "", PLATFORM, store.clone(), true)
         .await
         .expect_err("refused");
 
@@ -753,4 +840,131 @@ async fn an_object_that_is_not_its_name_is_refused() {
         "{error}"
     );
     assert!(store.untouched());
+}
+
+/// Asserts that the published base lists every entry of the bundle's tree at its path: the
+/// bundle's tree has a file two directories down (`usr/bin/tool`), a symbolic link
+/// (`lib` to `usr/lib`) and an empty directory (`tmp`), and the published base equals the
+/// base listed from exactly those manifests. Catches: a listing that stops at the root's
+/// children, drops a link or an empty directory, or lists another tree than the bundle's.
+#[tokio::test]
+async fn the_published_base_lists_every_entry_of_the_bundles_tree() {
+    let dir = scratch("base-publish-lists-tree");
+    let release = release_with_links(COMMIT, PLATFORM, b"kbf-task", &[], &[("lib", "usr/lib")]);
+    install(&dir, &release);
+    let store = Arc::new(Bucket::default());
+
+    let published = run(&dir, &store).await.expect("published");
+
+    let paths = tree_paths(&release);
+    for (path, kind) in [
+        ("usr", "dir"),
+        ("usr/bin", "dir"),
+        ("usr/bin/tool", "file"),
+        ("etc/passwd", "file"),
+        ("tmp", "dir"),
+        (".kbf-tools/kbf-task", "file"),
+        ("lib", "link -> usr/lib"),
+    ] {
+        assert_eq!(paths.get(path).map(String::as_str), Some(kind), "{path}");
+    }
+    assert_eq!(paths.len() as u64, release.built.entries);
+    assert!(published.base.is_listed());
+    assert_eq!(published.base, listed_base(&release));
+}
+
+/// Asserts that a bundle whose root names a subdirectory manifest (`.kbf-tools`) the bundle
+/// does not hold is refused as `PublishError::Base` with `BaseTreeError::Listing`, and the root
+/// is neither written nor attempted. Catches: a base tree published unlisted over a tree that
+/// cannot be listed, and a root named in the store before its listing was checked.
+#[tokio::test]
+async fn a_root_naming_a_manifest_the_bundle_lacks_is_refused_and_not_written() {
+    let dir = scratch("base-publish-missing-manifest");
+    let release = standard(b"kbf-task");
+    let mut writer = Writer::new(Vec::new(), &release.facts).expect("a bundle");
+    for (hex, bytes) in &release.objects {
+        if *hex != release.tools {
+            writer.object(bytes).expect("written");
+        }
+    }
+    let bytes = writer.finish().expect("finished");
+    install_as(&dir, &file_name(COMMIT, PLATFORM), &bytes, &bytes);
+    let store = Arc::new(Bucket::default());
+
+    let error = run(&dir, &store).await.expect_err("refused");
+
+    assert!(
+        matches!(
+            &error,
+            PublishError::Base {
+                source: BaseTreeError::Listing(_),
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(store.object(&release.built.root).is_none());
+    assert!(!store.state().puts.contains(&key(&release.built.root)));
+    assert!(!store.writes().contains(&key(&release.tools)));
+}
+
+/// Asserts that a file of the tree whose bytes begin as a manifest does (`{"v":1,`) but are no
+/// manifest, and that no manifest names, does not break publishing: it is written as any file,
+/// and the published base is the one listed from the real manifests. Catches: a publish that
+/// parses every object that looks like a manifest, or lists a file's bytes as a subtree.
+#[tokio::test]
+async fn a_file_that_starts_like_a_manifest_does_not_break_publishing() {
+    let dir = scratch("base-publish-manifest-like");
+    let like = br#"{"v":1,"this":"is a file of the tree, not a manifest"}"#;
+    let release = standard(like);
+    install(&dir, &release);
+    let store = Arc::new(Bucket::default());
+
+    let published = run(&dir, &store).await.expect("published");
+
+    assert_eq!(published.written, release.objects.len() as u64);
+    assert_eq!(store.object(&release.task).as_deref(), Some(&like[..]));
+    assert!(published.base.is_listed());
+    assert_eq!(published.base, listed_base(&release));
+}
+
+/// Asserts that a publish not asked to list (the manifests' path, `--executor-input-tree
+/// manifests`) hands back the unlisted base of the root, exactly as before tree lists, and
+/// publishes even a bundle whose tree cannot be listed (it lacks the `.kbf-tools` manifest).
+/// Catches: the default path refusing a bundle or keeping manifests for a listing it never
+/// uses.
+#[tokio::test]
+async fn a_publish_not_asked_to_list_leaves_the_base_unlisted() {
+    let dir = scratch("base-publish-not-listed");
+    let release = standard(b"kbf-task");
+    install(&dir, &release);
+    let store = Arc::new(Bucket::default());
+
+    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), false)
+        .await
+        .expect("published");
+
+    let root = &release.built.manifests.last().expect("a root").1;
+    let facts = BaseFacts {
+        entries: release.built.entries,
+        depth: release.built.depth,
+    };
+    assert!(!published.base.is_listed());
+    assert_eq!(published.base, BaseTree::new(root, facts).expect("a base"));
+
+    let lacking = scratch("base-publish-not-listed-lacking");
+    let mut writer = Writer::new(Vec::new(), &release.facts).expect("a bundle");
+    for (hex, bytes) in &release.objects {
+        if *hex != release.tools {
+            writer.object(bytes).expect("written");
+        }
+    }
+    let bytes = writer.finish().expect("finished");
+    install_as(&lacking, &file_name(COMMIT, PLATFORM), &bytes, &bytes);
+    let other = Arc::new(Bucket::default());
+    let published = publish(&lacking, COMMIT, PLATFORM, other.clone(), false)
+        .await
+        .expect("published unlisted");
+    assert!(!published.base.is_listed());
+    assert!(other.object(&release.built.root).is_some());
 }

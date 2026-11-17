@@ -1,6 +1,8 @@
-use js_proto::v1::{Layer, Mount, MountMode, MountPropagation, layer, mount};
+use js_proto::v1::{Layer, Mount, MountMode, MountPropagation, ProviderSource, layer, mount};
 
-use super::{MAX_ROOT_BYTES, OUT_TARGET, PutDirRoots, RootError, TaskOut};
+use super::{
+    MAX_ROOT_BYTES, OUT_TARGET, PROVIDER, PutDirRoots, RootError, TaskOut, provider_layer,
+};
 
 /// Asserts that the trees are the directory beside the put root, under one mount point or `/`.
 #[test]
@@ -73,4 +75,23 @@ fn a_job_gets_the_tree_as_its_layer_and_the_dir_at_out() {
         }
     );
     assert_eq!(OUT_TARGET, "/out");
+}
+
+/// Asserts that the provider layer names tierstore's mount provider and the given key as its
+/// ref and nothing else, whatever the key is, and that the provider's name is `tierstore`.
+/// Catches: a layer that names another provider, swaps provider and ref, or is a host path.
+#[test]
+fn a_provider_layer_names_tierstore_and_the_tree_lists_key() {
+    assert_eq!(PROVIDER, "tierstore");
+    let key = format!("cas/l/{}", "ab".repeat(32));
+    assert_eq!(
+        provider_layer(&key),
+        Layer {
+            source: Some(layer::Source::Provider(ProviderSource {
+                provider: "tierstore".to_owned(),
+                r#ref: key.clone(),
+            })),
+        }
+    );
+    assert_ne!(provider_layer(&key), provider_layer("cas/l/other"));
 }

@@ -5,9 +5,12 @@
 //! In a put directory the task commits its objects as files, and the node's tier store makes
 //! each an object of the store when its rename returns. The job is then submitted with:
 //!
-//! - **One layer**, the read-only action tree `<mp>/trees/<digest>` ([`PutDirRoots::layer`]):
-//!   the job's root, with `work` (`/work`), `.kbf` (`/.kbf`) and the base tree's
-//!   `/.kbf-tools/kbf-task` ([`TASK_IN_TREE`]), the program the job runs. No image.
+//! - **One layer**, the read-only action tree: the job's root, with `work` (`/work`), `.kbf`
+//!   (`/.kbf`) and the base tree's `/.kbf-tools/kbf-task` ([`TASK_IN_TREE`]), the program the
+//!   job runs. No image. The layer is the host directory `<mp>/trees/<digest>` of the tree's
+//!   manifests ([`PutDirRoots::layer`]), or, with `--executor-input-tree provider`, tierstore's
+//!   mount provider ([`PROVIDER`]) given the key of the tree's tree list
+//!   ([`provider_layer`]): the host's agent asks it for the tree when the job is placed.
 //! - **One mount**, the put directory `<mp>/put/cas/b/<lease>/<nonce>` at [`OUT_TARGET`],
 //!   read-write and `no_exec` ([`PutDirRoots::mount`]).
 //!
@@ -15,7 +18,11 @@
 //! mounts both under one mount point, and the host's agent lists them as its mount roots
 //! (`--mount-root put=<mp>/put`, `--mount-root-ro trees=<mp>/trees`).
 
-use js_proto::v1::{Layer, Mount, MountMode, MountPropagation, layer, mount};
+use js_proto::v1::{Layer, Mount, MountMode, MountPropagation, ProviderSource, layer, mount};
+
+/// The mount provider a job's tree is asked of with `--executor-input-tree provider`: the
+/// name tierstore's provider has on every host (`--mount-provider tierstore=<socket>`).
+pub const PROVIDER: &str = "tierstore";
 
 /// Where the put directory is mounted in a job: `kbf-task --out-dir`'s default.
 pub const OUT_TARGET: &str = "/out";
@@ -124,6 +131,18 @@ impl PutDirRoots {
             no_exec: true,
             propagation: MountPropagation::Private.into(),
         }
+    }
+}
+
+/// The job's one layer read from tierstore's mount provider: the tree whose tree list is
+/// stored at `key`.
+#[must_use]
+pub fn provider_layer(key: &str) -> Layer {
+    Layer {
+        source: Some(layer::Source::Provider(ProviderSource {
+            provider: PROVIDER.to_owned(),
+            r#ref: key.to_owned(),
+        })),
     }
 }
 

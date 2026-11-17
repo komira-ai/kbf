@@ -2,9 +2,11 @@
 //! and the job service: what the service is asked to run, and what the frontend is asked to
 //! read once it ran.
 
-use js_proto::v1::{Layer, Mount, MountMode, MountPropagation, NetworkLevel, layer, mount};
+use js_proto::v1::{
+    Layer, Mount, MountMode, MountPropagation, NetworkLevel, ProviderSource, layer, mount,
+};
 use kbf_front::Finished;
-use kbf_server::executor::{PutDirRoots, TASK_IN_TREE, TaskOut};
+use kbf_server::executor::{InputTree, PutDirRoots, TASK_IN_TREE, TaskOut};
 
 use crate::rig::{Rig, TREE};
 
@@ -111,4 +113,66 @@ async fn an_accepted_put_dir_run_is_cached_by_a_frontend_with_no_storage_node() 
     let cached = stored.action_result(&crate::rig::digest_of(5)).await;
     let (_, held) = cached.expect("asked").expect("the result is cached");
     assert_eq!(held, *ran);
+}
+
+/// Asserts the job the service receives for a put-directory run with
+/// `--executor-input-tree provider`, over the client and the fake service: the mint is asked
+/// for a tree list, and the job's one layer is tierstore's mount provider naming the key of
+/// that list, `{provider: "tierstore", ref: <key>}`, with no host path; its mount, its program
+/// and its network are those of the manifests' job. Catches: a provider run submitted with the
+/// manifests' host-path layer (a host the provider serves would not be chosen for it), a
+/// provider other than tierstore, a ref other than the list's key, or a mint asked for
+/// manifests.
+#[tokio::test(start_paused = true)]
+async fn a_provider_run_is_submitted_as_tierstores_provider_naming_the_tree_list() {
+    let key = format!("cas/l/{}", "ab".repeat(32));
+    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
+    let mut rig = Rig::start(&[HOST], 1, |cfg| {
+        cfg.task_out = TaskOut::PutDir(roots);
+        cfg.input_tree = InputTree::Provider;
+    })
+    .await;
+    *rig.inputs.tree.lock().expect("tree") = Ok(key.clone());
+    rig.pump().await;
+    let caller = rig.submit(5);
+    rig.pump().await;
+
+    let jobs = rig.jobs_of(5);
+    assert_eq!(jobs.len(), 1);
+    let job = &jobs[0];
+    let spec = &job.spec;
+    assert_eq!(
+        spec.layers,
+        vec![Layer {
+            source: Some(layer::Source::Provider(ProviderSource {
+                provider: "tierstore".to_owned(),
+                r#ref: key,
+            })),
+        }]
+    );
+    assert_eq!(
+        *rig.ingest.forms.lock().expect("forms"),
+        vec![InputTree::Provider]
+    );
+    let dir = format!(
+        "cas/b/{}/{:032x}-0",
+        job.arg("--lease").expect("a lease"),
+        0
+    );
+    assert_eq!(
+        spec.mounts
+            .iter()
+            .map(|m| m.source.clone())
+            .collect::<Vec<_>>(),
+        vec![Some(mount::Source::HostPath(format!("/mnt/ts/put/{dir}")))]
+    );
+    assert_eq!(spec.image, "");
+    assert_eq!(spec.command, TASK_IN_TREE);
+    assert_eq!(spec.network(), NetworkLevel::None);
+
+    rig.host_finishes(job.id(), HOST, 0);
+    match rig.until_done(&caller, 4).await {
+        Finished::Ran(result) => assert_eq!(result.exit_code, 0),
+        other => panic!("did not run: {other:?}"),
+    }
 }

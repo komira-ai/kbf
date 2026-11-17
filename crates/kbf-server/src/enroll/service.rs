@@ -18,10 +18,9 @@
 //! **Refusals** are exactly [`RefusalReason`]: the status code is `reason.code()` and the
 //! message `reason.message()`, byte for byte, because the node client matches a refusal
 //! only on both. A wrong secret and an unknown id are the same reason with the same work
-//! (the registry compares against a dummy digest). A fenced state-store handle is
-//! [`RefusalReason::NotSigner`] and any other store failure
+//! (the registry compares against a dummy digest). A state-store failure is
 //! [`RefusalReason::StoreUnavailable`]; a CA that cannot sign right now (its signer
-//! process is down, the clock is before the build's floor) is `NotSigner` too, since the
+//! process is down, the clock is before the build's floor) is `NotSigner`, since the
 //! closed set has no other "this process cannot sign" reason and a node retries it.
 //!
 //! **The answer** carries one certificate per role, the CA bundle, the frontend's clock,
@@ -42,7 +41,7 @@ use sha2::{Digest as _, Sha256};
 use tonic::{Request, Response, Status};
 
 use super::ca::Ca;
-use crate::object_store::{ColdStoreView, RegistryError, cold_store_view};
+use crate::object_store::{ColdStoreView, cold_store_view};
 
 /// The longest zone label accepted.
 const MAX_ZONE: usize = 63;
@@ -91,11 +90,8 @@ pub fn status_of(reason: RefusalReason) -> Status {
 }
 
 /// What the registry says when an operator-style call (a read) fails here.
-pub(super) fn registry_reason(error: &registry::RegistryError) -> RefusalReason {
-    match error {
-        registry::RegistryError::Store(kbf_state::StoreError::Fenced) => RefusalReason::NotSigner,
-        _ => RefusalReason::StoreUnavailable,
-    }
+pub(super) fn registry_reason(_error: &registry::RegistryError) -> RefusalReason {
+    RefusalReason::StoreUnavailable
 }
 
 /// The reason a CA failure is told as.
@@ -206,8 +202,7 @@ impl std::fmt::Debug for EnrollService {
 }
 
 impl EnrollService {
-    /// The service over `store`, which must be the frontend's fenced handle (so a
-    /// frontend that has lost the writer role refuses every call with `NotSigner`), and
+    /// The service over `store`, which must be the frontend's state store handle, and
     /// `ca`. `frontend_names` are the names this frontend serves.
     #[must_use]
     pub fn new(
@@ -316,16 +311,12 @@ impl Core {
     /// anything, so a registry that cannot be read refuses the call and spends no token.
     ///
     /// # Errors
-    /// [`RefusalReason::NotSigner`] for a fenced frontend, else
-    /// [`RefusalReason::StoreUnavailable`].
+    /// [`RefusalReason::StoreUnavailable`] when the registry cannot be read.
     pub(super) fn cold(&self) -> Result<ColdStoreView, RefusalReason> {
         cold_store_view(&*self.store).map_err(|error| {
             // The text of a registry error names a row family and never a value.
             tracing::warn!(%error, "the registered cold store could not be read");
-            match error {
-                RegistryError::Store(kbf_state::StoreError::Fenced) => RefusalReason::NotSigner,
-                _ => RefusalReason::StoreUnavailable,
-            }
+            RefusalReason::StoreUnavailable
         })
     }
 

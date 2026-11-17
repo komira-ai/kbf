@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use kbf_front::action_tree::BaseTree;
 use kbf_front::{PackSettings, Packs};
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectKey, ObjectStore as _, PageSize};
 use kbf_pack::{PackKeys, WriterKind};
@@ -131,6 +132,7 @@ fn start(dir: &Path, packs: Packs, state: Option<Arc<dyn Store>>) -> Start {
         packs,
         state,
         slot: Arc::new(std::sync::OnceLock::new()),
+        list: false,
     }
 }
 
@@ -386,9 +388,52 @@ async fn a_release_that_cannot_be_fetched_fails_the_start_naming_the_flag() {
 fn a_start_downloads_under_the_executors_instance_id() {
     let mut config = crate::executor::Config::new("front-1", 1, 2_000, 16 << 30);
     config.instance = "fe-a".to_owned();
+
+    let start = Start::new(&js_flags(config), packs().0, None);
+
+    assert_eq!(start.cache.instance, "fe-a");
+}
+
+/// Asserts that a start lists the base tree exactly when the executor writes tree lists
+/// (`--executor-input-tree provider`), and not with the default manifests. Catches: a frontend
+/// of the manifests' path that keeps and flattens every manifest of the base for nothing, or a
+/// provider frontend whose base is never listed, so every run is unavailable.
+#[test]
+fn a_start_lists_the_base_only_for_tree_lists() {
+    let manifests = crate::executor::Config::new("front-1", 1, 2_000, 16 << 30);
+    let mut provider = manifests.clone();
+    provider.input_tree = crate::executor::InputTree::Provider;
+
+    assert!(!Start::new(&js_flags(manifests), packs().0, None).list);
+    assert!(Start::new(&js_flags(provider), packs().0, None).list);
+}
+
+/// Asserts that a start told to list publishes a listed base into the slot, and one not told
+/// to publishes the base unlisted. Catches: the flag not reaching the publish.
+#[tokio::test]
+async fn a_start_told_to_list_publishes_a_listed_base() {
+    for list in [false, true] {
+        let dir = scratch_dir(if list {
+            "base-tree-listed"
+        } else {
+            "base-tree-unlisted"
+        });
+        bundle_dir(&dir, COMMIT, &["linux-x86_64"]);
+        let mut ready = start(&dir, packs().0, None);
+        ready.list = list;
+        let slot = Arc::clone(&ready.slot);
+
+        let published = ready.publish_as(COMMIT, now).await.expect("published");
+
+        assert_eq!(published.base.is_listed(), list);
+        assert_eq!(slot.get().map(BaseTree::is_listed), Some(list));
+    }
+}
+
+fn js_flags(config: crate::executor::Config) -> super::super::JsAgentFlags {
     let image = format!("docker://registry.test/app@sha256:{}", "ab".repeat(32));
     let image = kbf_types::ImageRef::parse(&image).expect("an image");
-    let js = super::super::JsAgentFlags {
+    super::super::JsAgentFlags {
         config,
         job_url: String::new(),
         token_file: "/nowhere/token".into(),
@@ -401,9 +446,5 @@ fn a_start_downloads_under_the_executors_instance_id() {
         base_tree_timeout: Duration::from_secs(5),
         published: Arc::default(),
         put_retry: Duration::from_secs(5),
-    };
-
-    let start = Start::new(&js, packs().0, None);
-
-    assert_eq!(start.cache.instance, "fe-a");
+    }
 }

@@ -10,7 +10,7 @@
 //!    thread, never held;
 //! 2. **reads it** on a blocking thread, one object at a time, handing each over a channel of
 //!    one place: an object being read, one waiting and one being written are all of it that is in
-//!    memory. Every object is checked against its name as it is read. The facts must be of the
+//!    memory, besides what step 5 keeps. Every object is checked against its name as it is read. The facts must be of the
 //!    asked commit and platform;
 //! 3. **writes each object the store lacks** to `cas/l/<sha256>` ([`large_key`]), in the
 //!    bundle's order, which has every object after the ones it names and the root manifest
@@ -22,7 +22,15 @@
 //!    written, so a root tierstore cannot read or that holds a name an action tree keeps
 //!    ([`BaseTreeError::Reserved`]) is never written, and a bundle with no such object is
 //!    refused. The tree is named by the root alone, so none of the objects written before it
-//!    is reachable from anything.
+//!    is reachable from anything;
+//! 5. **lists the tree** when it is asked to (`list`, for the tree lists of jobs,
+//!    `--executor-input-tree provider`; [`BaseTree::listed`]): every object that begins as a
+//!    tree manifest does (`{"v":1,`) and is no longer than a manifest may be
+//!    ([`MAX_MANIFEST_BYTES`]) is kept while the bundle is read, and the tree is flattened from
+//!    them once the root is read; they are dropped then. A file whose bytes begin the same way is
+//!    kept too, up to that length: the bundle does not say which objects are manifests. A tree
+//!    that cannot be listed is refused before its root is written. Not asked, nothing is kept
+//!    and the base tree is not listed.
 //!
 //! A second release on the same pin writes only its `kbf-task`, its `.kbf-tools` manifest and
 //! its root: every other object costs one length check.
@@ -31,6 +39,7 @@
 //! written before a refusal stay, which is harmless: they are content-named and nothing names
 //! them.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead as _, BufReader, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -43,6 +52,7 @@ use kbf_objstore::ObjectStoreError;
 use kbf_tree_bundle::{BundleError, Facts, Item, ReadError, file_name};
 use kbf_types::{Digest, DigestFunction};
 use sha2::{Digest as _, Sha256};
+use tierstore::MAX_MANIFEST_BYTES;
 use tokio::sync::mpsc;
 
 use crate::action_tree::{BaseFacts, BaseTree, BaseTreeError};
@@ -55,13 +65,17 @@ pub const SUMS: &str = "SHA256SUMS";
 /// in memory (read, waiting, written).
 const CHANNEL: usize = 1;
 
+/// How every tree manifest begins (tierstore's `tree_manifest`, version 1): the objects kept to
+/// list the base tree from.
+const MANIFEST_HEAD: &[u8] = br#"{"v":1,"#;
+
 /// The bytes the bundle is hashed in at a time.
 const READ: usize = 1 << 16;
 
 /// What [`publish`] made.
 #[derive(Clone, Debug)]
 pub struct Published {
-    /// The base tree: its root manifest's children, and its facts.
+    /// The base tree: its root manifest's children, its facts, and every entry listed.
     pub base: BaseTree,
     /// The root manifest's digest: the base tree's name.
     pub root: Digest,
@@ -215,18 +229,20 @@ pub enum PublishError {
 }
 
 /// Publishes the kbf base tree of the release `commit` for `platform` (`linux-x86_64` or
-/// `linux-arm64`) from the bundle in `dir`, into `store`.
+/// `linux-arm64`) from the bundle in `dir`, into `store`, and lists it if `list` says so.
 ///
 /// # Errors
 /// A [`PublishError`], which names what failed: the commit is not known, the sums file or the
 /// bundle is missing, the sums file does not list the bundle or lists other bytes, the bundle is
 /// not one or is of another commit or platform, an object's length at its key is not its own,
-/// the store failed, or the root is missing or not a base tree.
+/// the store failed, or the root is missing or not a base tree, or, with `list`, the tree
+/// cannot be listed.
 pub async fn publish(
     dir: &Path,
     commit: &str,
     platform: &str,
     store: Arc<dyn LargeStore>,
+    list: bool,
 ) -> Result<Published, PublishError> {
     if commit.is_empty() {
         return Err(PublishError::NoCommit);
@@ -247,7 +263,7 @@ pub async fn publish(
         let bundle = bundle.clone();
         blocking(move || hand_over(file, &bundle, &send))
     };
-    let writing = write_all(receive, &*store, &bundle, commit, platform);
+    let writing = write_all(receive, &*store, &bundle, (commit, platform), list);
     let (read, written) = futures::future::join(reading, writing).await;
     // A bundle that is not one is the cause of whatever the writer then found missing.
     read?;
@@ -389,8 +405,8 @@ async fn write_all(
     mut items: mpsc::Receiver<Item>,
     store: &dyn LargeStore,
     path: &Path,
-    commit: &str,
-    platform: &str,
+    (commit, platform): (&str, &str),
+    list: bool,
 ) -> Result<Published, PublishError> {
     let Some(Item::Facts(facts)) = items.recv().await else {
         return Err(PublishError::NoFacts {
@@ -413,9 +429,13 @@ async fn write_all(
     }
     let (mut written, mut held) = (0, 0);
     let mut root = None;
+    let mut manifests: BTreeMap<String, Bytes> = BTreeMap::new();
     while let Some(Item::Object { sha256, bytes }) = items.recv().await {
         let digest = Digest::new(DigestFunction::Sha256, hash_of(&sha256), bytes.len() as u64);
         let bytes = Bytes::from(bytes);
+        if list && bytes.len() <= MAX_MANIFEST_BYTES && bytes.starts_with(MANIFEST_HEAD) {
+            manifests.insert(sha256.clone(), bytes.clone());
+        }
         if sha256 == facts.root {
             // Before it is written: a root that is no base tree is never named in the store.
             let facts = BaseFacts {
@@ -423,10 +443,19 @@ async fn write_all(
                 // A depth no platform's `usize` holds is one no tree passes the limits with.
                 depth: usize::try_from(facts.depth).unwrap_or(usize::MAX),
             };
-            let base = BaseTree::new(&bytes, facts).map_err(|source| PublishError::Base {
-                path: path.to_owned(),
-                source,
-            })?;
+            let base = BaseTree::new(&bytes, facts)
+                .and_then(|base| match list {
+                    true => base.listed(|manifest| match manifests.get(&manifest.to_string()) {
+                        Some(bytes) => Ok(bytes.to_vec()),
+                        None => Err("not in the bundle"),
+                    }),
+                    false => Ok(base),
+                })
+                .map_err(|source| PublishError::Base {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            manifests.clear();
             root = Some((base, digest));
         }
         if put_new(store, &digest, bytes).await? {

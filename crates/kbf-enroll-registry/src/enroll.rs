@@ -283,9 +283,9 @@ fn replay(
 /// `sign` is called again (a wasted signature, never a recorded serial).
 ///
 /// # Errors
-/// The [`RefusalReason`] the frontend sends. A fenced handle is
-/// [`RefusalReason::NotSigner`]; any other store failure, a row that does not decode and
-/// a race lost [`ATTEMPTS`] times are [`RefusalReason::StoreUnavailable`].
+/// The [`RefusalReason`] the frontend sends. A store failure, a row
+/// that does not decode and a race lost [`ATTEMPTS`] times are
+/// [`RefusalReason::StoreUnavailable`].
 pub fn enroll_txn(
     store: &dyn Store,
     req: &EnrollRequest<'_>,

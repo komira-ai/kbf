@@ -55,8 +55,9 @@ fn no_store(mut answer: Response) -> Response {
 /// store's own message.
 fn store_failure(e: &MembershipError) -> (StatusCode, &'static str) {
     match e {
-        MembershipError::Store(StoreError::Fenced | StoreError::Failed(_))
-        | MembershipError::Contended => (StatusCode::SERVICE_UNAVAILABLE, "the state store failed"),
+        MembershipError::Store(StoreError::Failed(_)) | MembershipError::Contended => {
+            (StatusCode::SERVICE_UNAVAILABLE, "the state store failed")
+        }
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "a stored row is unreadable",

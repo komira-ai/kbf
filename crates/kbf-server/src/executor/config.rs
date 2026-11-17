@@ -91,6 +91,21 @@ pub enum Ownership {
     Shared,
 }
 
+/// What a put-directory job's root is read from (`--executor-input-tree`,
+/// docs/design/actions-as-jobs.md, 4.7).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InputTree {
+    /// The action tree written as tierstore tree manifests, the job's layer the host directory
+    /// `<mp>/trees/<digest>` that tierstore's file system serves. The default.
+    #[default]
+    Manifests,
+    /// The action tree written as one tierstore tree list, the job's layer tierstore's
+    /// mount provider with the list's key: the host's agent asks the provider for the tree
+    /// as soon as the job is placed, and its files are fetched while the sandbox is made. A Mac
+    /// job's tree is always [`InputTree::Manifests`]: its runtime takes no provider yet.
+    Provider,
+}
+
 /// The executor's settings. Every duration is an upper or lower bound the executor holds
 /// itself to; [`Config::validate`] refuses a set that breaks the ones the scheduler's
 /// safety rests on.
@@ -198,6 +213,10 @@ pub struct Config {
     pub task_out: TaskOut,
     /// Who owns the jobs ([`Ownership`]; `--executor-ownership`).
     pub ownership: Ownership,
+    /// What a Linux put-directory job's root is read from ([`InputTree`];
+    /// `--executor-input-tree`): [`Config::validate`] refuses [`InputTree::Provider`] without
+    /// a put directory.
+    pub input_tree: InputTree,
     /// How long the liveness row of this process lives after a renewal, on the store's clock
     /// (`--executor-live-secs`): with [`Ownership::Shared`], at least
     /// [`Config::fence_after`] and [`LEADER_LEASE_MARGIN`], so the process has stopped acting
@@ -280,6 +299,13 @@ pub enum ConfigError {
          in no row, so no other frontend could finish it"
     )]
     SharedPresigned,
+    /// Tierstore's mount provider with presigned task outputs: only a put-directory job reads
+    /// its root from a tree.
+    #[error(
+        "--executor-input-tree provider needs --task-out-mode put-dir: only a put-directory \
+         job reads its root from a tree"
+    )]
+    ProviderPresigned,
     /// Shared ownership with no state store to keep the rows in.
     #[error("--executor-ownership shared needs --state-store: the rows of the jobs are kept there")]
     SharedStore,
@@ -328,6 +354,7 @@ impl Config {
             allow_open_network: false,
             task_out: TaskOut::Presigned,
             ownership: Ownership::Single,
+            input_tree: InputTree::Manifests,
             live: SELF_FENCE + LEADER_LEASE_MARGIN,
             mac: None,
         }
@@ -432,6 +459,10 @@ impl Config {
             (
                 !self.shared() || self.task_out != TaskOut::Presigned,
                 ConfigError::SharedPresigned,
+            ),
+            (
+                self.input_tree == InputTree::Manifests || self.task_out != TaskOut::Presigned,
+                ConfigError::ProviderPresigned,
             ),
         ];
         let first = checks
