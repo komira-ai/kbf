@@ -92,6 +92,9 @@ pulldown-cmark.workspace = true
 rustls.workspace = true
 saphyr-parser.workspace = true
 sha2.workspace = true
+# `tests/proxy_support/executor.rs`: the kbf base tree's bundle a frontend's executor publishes.
+kbf-tree-bundle.workspace = true
+kbf-pack-index.workspace = true
 syn.workspace = true
 # The listeners, byte streams, channels and timers of the proxy, deploy and object-store tests.
 tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }

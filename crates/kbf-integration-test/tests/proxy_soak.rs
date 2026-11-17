@@ -9,10 +9,12 @@
 //! directory, one behind each frontend) and two `kbf frontend` processes. The children are
 //! this test binary run through a link named `kbf`, which answers as the real binary's own
 //! `main` before the harness starts (the same trick as `m1.rs`), so the test needs no other
-//! binary built and no service: not Postgres, not MinIO.
+//! binary built. Each frontend keeps its state, and the index of its packs, in a Postgres
+//! database of its own (`KBF_TEST_POSTGRES_URL` names a server the test may create one on).
 //!
 //! The streams are `Execution.Execute` calls, the stream a Buck2 build holds open per action:
-//! no worker runs them, so each is queued on its frontend and the stream stays open and idle.
+//! each frontend's executor submits each one as a job of a job service in this process that
+//! never ends a job ([`proxy_support::executor`]), so the stream stays open and idle.
 //! The frontend counts them itself (`open_executions` of `GET /v1/frontend/drain`), which
 //! makes every figure below the child's own and exact. Every action is in the store behind both
 //! frontends, so either serves any stream.
@@ -44,6 +46,7 @@ use kbf_proxy::Proxy;
 use kbf_proxy::config::Frontend;
 use kbf_proxy::control::NoUpdates;
 use kbf_testkit::dir::TestDir;
+use proxy_support::executor::{Executor, pack_database};
 use proxy_support::{
     Child, Open, actions, api_get, connect, free_base, frontend_args, link_kbf, open_executions,
     own_config, proxy_config, proxy_get, storage_node, store, until, until_ready, within,
@@ -52,13 +55,38 @@ use serde_json::Value;
 
 const LIST: &str = "/v1/proxy/upstreams";
 
-pub fn frontend(dir: &Path, name: &str, node: &Child, base: u16) -> Child {
-    let state = dir.join(name).join("state.db");
-    Child::start(
-        dir,
-        name,
-        &frontend_args(&node.field("storage="), base, &state),
-    )
+/// A `kbf frontend` on the ports from `base` in front of `node`, over the Postgres database
+/// `state` names, with its executor over `executor`.
+pub fn frontend(
+    dir: &Path,
+    name: &str,
+    node: &Child,
+    (base, state): (u16, &str),
+    executor: &Executor,
+) -> Child {
+    // `frontend_args` gives a SQLite file, which this test does not use: its flag is swapped.
+    let mut args = frontend_args(
+        &node.field("storage="),
+        base,
+        &dir.join(name).join("unused.db"),
+    );
+    args.retain(|arg| !arg.starts_with("--state-store="));
+    args.push(format!("--state-store={state}"));
+    args.extend(executor.args(name));
+    Child::start(dir, name, &args)
+}
+
+/// `url` with the password of its user information removed: the flag refuses one, as the
+/// command line is world-readable, and the server the job runs trusts its loopback clients.
+fn without_password(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").expect("a URL");
+    match rest.split_once('@') {
+        Some((user, tail)) => {
+            let user = user.split_once(':').map_or(user, |(name, _)| name);
+            format!("{scheme}://{user}@{tail}")
+        }
+        None => url.to_owned(),
+    }
 }
 
 /// Streams opened before the drain and finished after it.
@@ -104,15 +132,32 @@ fn proxy_count(admin_addr: SocketAddr, name: &str) -> u64 {
 /// only, and that the proxy's counts of the streams are the frontends' own.
 #[test]
 fn a_drain_with_two_hundred_streams_drops_none_and_the_other_frontend_serves_the_new() {
+    // One database for each frontend, dropped after the children.
+    let (database_a, database_b) = (pack_database(), pack_database());
     // Declared first, so it drops last: the children are reaped before it is removed.
     let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "proxy-soak");
     let dir = scratch.path().to_path_buf();
     link_kbf(&dir);
+    // Up before the children and down after them: the job service and the pack store are its.
+    let client_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let executor = client_runtime.block_on(Executor::start(&dir));
 
     let (node_a, node_b) = (storage_node(&dir, "node-a"), storage_node(&dir, "node-b"));
     let base = free_base();
-    let mut a = frontend(&dir, "frontend-a", &node_a, base);
-    let mut b = frontend(&dir, "frontend-b", &node_b, base + 10);
+    let state_a = without_password(&database_a.url());
+    let state_b = without_password(&database_b.url());
+    let mut a = frontend(&dir, "frontend-a", &node_a, (base, &state_a), &executor);
+    let mut b = frontend(
+        &dir,
+        "frontend-b",
+        &node_b,
+        (base + 10, &state_b),
+        &executor,
+    );
     let (api_a, api_b) = (
         format!("127.0.0.1:{}", base + 2),
         format!("127.0.0.1:{}", base + 12),
@@ -139,11 +184,6 @@ fn a_drain_with_two_hundred_streams_drops_none_and_the_other_frontend_serves_the
     let (handle, runner) = Proxy::bind(config, OwnedFd::from(public)).expect("bind");
     let serving = std::thread::spawn(move || runner.run(NoUpdates));
 
-    let client_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("runtime");
     client_runtime.block_on(async {
         // Every action is in the store behind both frontends.
         let (requests, blobs) = actions("soak", OLD + NEW);

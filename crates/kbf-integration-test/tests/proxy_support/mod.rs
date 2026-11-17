@@ -3,6 +3,8 @@
 //! proxy, the `Execute` streams a Buck2 build holds open, and reads of a child's own count
 //! of them. Each test says in its own header what it proves with them.
 
+pub mod executor;
+
 use std::io::{BufReader, Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::Path;
@@ -447,7 +449,12 @@ impl Open {
         send.send_data(framed(request), true).expect("request");
         let response = response.await.map_err(|e| e.to_string())?;
         if let Some(status) = response.headers().get("grpc-status") {
-            return Err(format!("grpc-status {}", status.to_str().unwrap_or("?")));
+            let message = response.headers().get("grpc-message");
+            let message = message.and_then(|m| m.to_str().ok()).unwrap_or_default();
+            return Err(format!(
+                "grpc-status {}: {message}",
+                status.to_str().unwrap_or("?")
+            ));
         }
         let mut body = response.into_body();
         let first = body.data().await.and_then(Result::ok).unwrap_or_default();

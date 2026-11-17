@@ -11,10 +11,11 @@
 //! Postgres test it needs a server and fails without one: `KBF_TEST_POSTGRES_URL` names a server
 //! the test may create a database on.
 //!
-//! The streams are `Execution.Execute` calls, the stream a Buck2 build holds open per action: no
-//! worker runs them, so each is queued on its frontend and the stream stays open and idle. The
+//! The streams are `Execution.Execute` calls, the stream a Buck2 build holds open per action:
+//! each frontend's executor submits each one as a job of a job service in this process that
+//! never ends a job ([`proxy_support::executor`]), so the stream stays open and idle. The
 //! frontend counts them itself (`open_executions` of `GET /v1/frontend/drain`), which makes the
-//! figures below the child's own. No worker means no result: "the Execute completes" here is the
+//! figures below the child's own. No job ends, so no result: "the Execute completes" here is the
 //! client ending it (as Buck2 does when it cancels), and what is proved is that the drain does
 //! not end it, reset it or move it, and that it can end on the drained frontend afterwards.
 //!
@@ -36,8 +37,8 @@ use std::os::fd::OwnedFd;
 use kbf_proxy::Proxy;
 use kbf_proxy::config::Frontend;
 use kbf_proxy::control::NoUpdates;
-use kbf_state::postgres::test_database;
 use kbf_testkit::dir::TestDir;
+use proxy_support::executor::{Executor, pack_database};
 use proxy_support::{
     Child, Open, actions, api_get, connect, free_base, frontend_args, link_kbf, open_executions,
     proxy_config, proxy_get, storage_node, store, until, until_ready, within,
@@ -91,36 +92,57 @@ fn proxy_count(admin_addr: SocketAddr, name: &str) -> u64 {
         .expect("a count")
 }
 
-/// A `kbf frontend` on the ports from `base`, over the Postgres database `flag` names.
-fn frontend(dir: &std::path::Path, name: &str, storage: &str, base: u16, flag: &str) -> Child {
+/// A `kbf frontend` on the ports from `base`, over the Postgres database `flag` names, with its
+/// executor over `executor`.
+fn frontend(
+    dir: &std::path::Path,
+    name: &str,
+    storage: &str,
+    (base, flag): (u16, &str),
+    executor: &Executor,
+) -> Child {
     // `frontend_args` gives a SQLite file, which this test does not use: its flag is swapped.
     let mut args = frontend_args(storage, base, &dir.join(name).join("unused.db"));
     args.retain(|arg| !arg.starts_with("--state-store="));
     args.push(flag.to_owned());
+    args.extend(executor.args(name));
     Child::start(dir, name, &args)
 }
 
 /// Asserts that, with real frontends on a real Postgres database each, a drained frontend keeps
 /// its open `Execute` (no reset, not moved, counted until it ends), that new `Execute`s go to the
 /// other frontend, and that an undrain lists it as `up` again. The open `Execute` ends by the
-/// client cancelling it: no worker runs it, so it has no result of its own to complete with.
+/// client cancelling it: its job never ends, so it has no result of its own to complete with.
 #[test]
 fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
-    // One database for each frontend, with the installer's schema: the frontends share
-    // nothing but the storage node, so each one's state is its own.
-    let (database_a, database_b) = (test_database(), test_database());
+    // One database for each frontend, with the installer's schema and its pack index's: the
+    // frontends share nothing but the storage node, so each one's state is its own.
+    let (database_a, database_b) = (pack_database(), pack_database());
 
     // Declared before the children, so it drops after them: they are reaped before it is removed.
     let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "proxy-pool");
     let dir = scratch.path().to_path_buf();
     link_kbf(&dir);
+    // Up before the children and down after them: the job service and the pack store are its.
+    let client_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let executor = client_runtime.block_on(Executor::start(&dir));
     let node = storage_node(&dir, "node");
     let storage = node.field("storage=");
     let base = free_base();
     let flag_a = format!("--state-store={}", without_password(&database_a.url()));
     let flag_b = format!("--state-store={}", without_password(&database_b.url()));
-    let mut a = frontend(&dir, "frontend-a", &storage, base, &flag_a);
-    let mut b = frontend(&dir, "frontend-b", &storage, base + 10, &flag_b);
+    let mut a = frontend(&dir, "frontend-a", &storage, (base, &flag_a), &executor);
+    let mut b = frontend(
+        &dir,
+        "frontend-b",
+        &storage,
+        (base + 10, &flag_b),
+        &executor,
+    );
     let (api_a, api_b) = (
         format!("127.0.0.1:{}", base + 2),
         format!("127.0.0.1:{}", base + 12),
@@ -151,15 +173,11 @@ fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
     let (handle, runner) = Proxy::bind(proxy, OwnedFd::from(public)).expect("bind");
     let serving = std::thread::spawn(move || runner.run(NoUpdates));
 
-    let client_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("runtime");
     client_runtime.block_on(async {
-        // The actions are in the one store both frontends read.
+        // The actions are uploaded through each frontend: its packs and their index are its own.
         let (requests, blobs) = actions("pool", 3);
-        within("the actions", store(&a.field("reapi="), blobs)).await;
+        within("the actions in A", store(&a.field("reapi="), blobs.clone())).await;
+        within("the actions in B", store(&b.field("reapi="), blobs)).await;
         let (client, driver) = connect(&public_addr.to_string(), &pki.ca_cert).await;
         until_ready(&client).await;
         until("both frontends ready", || {
@@ -174,6 +192,10 @@ fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
             .await
             .expect("the first Execute starts");
         let counts = (open_executions(&api_a), open_executions(&api_b));
+        until("the Execute is a job of the job service", || {
+            executor.jobs() == 1
+        })
+        .await;
         let mut seen = [counts.0, counts.1];
         seen.sort_unstable();
         assert_eq!(seen, [0, 1], "one frontend: {counts:?}");
