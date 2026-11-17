@@ -644,7 +644,7 @@ Preconditions, checked once:
 1. **`js-lease-server`** at a release kbf works with (lower-case labels or the frontend id made lower case at its
    source, one client token across frontends, the body limit; kbf#2287 items 2, 4, 5); servers before clients.
 2. **`js-agent`** on all six nodes as the `.deb` from the apt repository, set by hostkeeper
-   (komira-ai/jobscheduler#841), `--runtime crun`, `uidmap` installed, its flags file holding the egress lines
+   (komira-ai/jobscheduler#841), running crun (a Linux build's only runtime), `uidmap` installed, its flags file holding the egress lines
    `kbf-deploy job-service agent-egress` prints, joined to the farm pool.
 3. The pool books no disk, and kbf no longer asks for it (item 2).
 4. The `cas/b/` janitor is on, on the leader; secrets go as files.

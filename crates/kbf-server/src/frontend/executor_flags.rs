@@ -241,9 +241,11 @@ pub(super) fn args() -> Vec<Arg> {
             // DEFAULT_HOST_MEMORY_GIB, as above.
             .default_value("128")
             .help(
-                "The memory, in GiB, of a virtual worker. Each job needs 1.5 times its booking \
-                 plus 512 MiB, and the bookings of a worker add up to what is left after that. \
-                 A ceiling, as for `--executor-hosts`. Used only with `--executor js-agent`",
+                "The memory, in GiB, of a virtual worker. The farm counts each run as 1.5 times \
+                 its booking plus 512 MiB (what a Mac job needs; a Linux job names no memory and \
+                 the job service sizes it from its class's history), and the bookings of a \
+                 worker add up to what is left after that. A ceiling, as for \
+                 `--executor-hosts`. Used only with `--executor js-agent`",
             ),
         Arg::new(SLOTS)
             .long("executor-host-slots")
