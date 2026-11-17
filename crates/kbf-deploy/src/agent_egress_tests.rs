@@ -28,7 +28,7 @@ task-out-root = "/var/lib/kbf/out"
 /// The head every rendering is.
 const HEAD: &str = "# The egress of kbf's jobs, from /etc/kbf/kbf.toml. Put these lines in \
                     /etc/js-agent/flags on\n# every agent of the farm (the Linux js-agent, \
-                    which runs crun): a put-dir job has no\n# destination, so no --egress-allow \
+                    which runs crun): a put-dir job has no\n# destination, so no allow \
                     line follows.\n--egress=allow-list\n";
 
 /// A put-dir frontend's file renders the ceiling `allow-list` and no destination.

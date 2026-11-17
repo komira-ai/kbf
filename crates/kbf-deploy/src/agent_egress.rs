@@ -47,7 +47,7 @@ pub(crate) fn render(text: &str, file: &Path) -> Result<String, EgressError> {
     Ok(format!(
         "# The egress of kbf's jobs, from {file}. Put these lines in /etc/js-agent/flags on\n\
          # every agent of the farm (the Linux js-agent, which runs crun): a put-dir job has no\n\
-         # destination, so no --egress-allow line follows.\n\
+         # destination, so no allow line follows.\n\
          --egress=allow-list\n"
     ))
 }

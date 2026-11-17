@@ -212,25 +212,57 @@ pub(crate) struct KeptDirectory {
     pub(crate) properties: Option<String>,
 }
 
+/// A decoded `Directory`: its nodes up to the first whose digest is malformed, and that fault.
+#[derive(Debug)]
+pub(crate) struct Parsed {
+    /// The nodes parsed: all of them when there is no fault.
+    pub(crate) kept: KeptDirectory,
+    /// The first malformed digest of a node, files before subdirectories.
+    pub(crate) fault: Option<ClosureError>,
+}
+
 impl KeptDirectory {
     /// The `Directory` held in `blob`, whose digest is `digest`, its nodes' digests parsed.
     ///
+    /// A malformed digest of a node is not an error here but the fault the walk names once it
+    /// has counted the nodes before it ([`Parsed::fault`]): files are counted before
+    /// subdirectories and each list in its order, so a tree that passes the digest limit before
+    /// the malformed node is reached is over the limit, as it was before Directories were
+    /// cached.
+    ///
     /// # Errors
-    /// [`ClosureError::Invalid`]: `blob` does not decode, or a digest in it is malformed.
-    pub(crate) fn parse(digest: &Digest, blob: Bytes) -> Result<Self, ClosureError> {
+    /// [`ClosureError::Invalid`]: `blob` does not decode.
+    pub(crate) fn parse(digest: &Digest, blob: Bytes) -> Result<Parsed, ClosureError> {
         let message =
             reapi::Directory::decode(blob).map_err(|e| invalid("a Directory", digest, &e))?;
         let mut files = Vec::with_capacity(message.files.len());
-        for node in &message.files {
-            let file = named_in(digest, "a file", node.digest.as_ref())?;
-            files.push((node.name.clone(), file, node.is_executable));
-        }
         let mut directories = Vec::with_capacity(message.directories.len());
-        for node in &message.directories {
-            let child = named_in(digest, "a subdirectory", node.digest.as_ref())?;
-            directories.push((node.name.clone(), child));
+        let mut fault = None;
+        for node in &message.files {
+            match named_in(digest, "a file", node.digest.as_ref()) {
+                Ok(file) => files.push((node.name.clone(), file, node.is_executable)),
+                Err(error) => {
+                    fault = Some(error);
+                    break;
+                }
+            }
         }
-        Ok(Self::of(message, files, directories))
+        // A malformed file stops the parse: the subdirectories after it are not reached.
+        let subdirectories = match fault {
+            None => message.directories.as_slice(),
+            Some(_) => &[],
+        };
+        for node in subdirectories {
+            match named_in(digest, "a subdirectory", node.digest.as_ref()) {
+                Ok(child) => directories.push((node.name.clone(), child)),
+                Err(error) => {
+                    fault = Some(error);
+                    break;
+                }
+            }
+        }
+        let kept = Self::of(message, files, directories);
+        Ok(Parsed { kept, fault })
     }
 
     /// The `Directory` `message`, its file and subdirectory nodes already parsed.
@@ -378,13 +410,17 @@ async fn collect(
     let mut files = Vec::new();
     let mut level = vec![root];
     while !level.is_empty() {
-        let directories: Vec<(Digest, KeptDirectory)> = stream::iter(level)
+        let directories: Vec<(Digest, Parsed)> = stream::iter(level)
             .map(|digest| directory(backend, cache, digest))
             .buffered(DIRECTORIES_IN_FLIGHT)
             .try_collect()
             .await?;
         level = Vec::new();
-        for (parent, directory) in directories {
+        for (parent, parsed) in directories {
+            let Parsed {
+                kept: directory,
+                fault,
+            } = parsed;
             for (_, file, _) in &directory.files {
                 if seen.add(*file)? {
                     files.push(*file);
@@ -395,6 +431,10 @@ async fn collect(
                 if queued.insert(*child) {
                     level.push(*child);
                 }
+            }
+            // The nodes before a malformed digest are counted first, as they always were.
+            if let Some(fault) = fault {
+                return Err(fault);
             }
             // Kept in the cache in level order, so what it holds does not depend on which read of
             // a level answered first. The empty Directory is not kept.
@@ -444,29 +484,35 @@ async fn directory(
     backend: &Backend,
     cache: Option<&DirectoryCache>,
     digest: Digest,
-) -> Result<(Digest, KeptDirectory), ClosureError> {
+) -> Result<(Digest, Parsed), ClosureError> {
+    let whole = |kept| Parsed { kept, fault: None };
     if is_empty_blob(&digest) {
-        return Ok((digest, KeptDirectory::default()));
+        return Ok((digest, whole(KeptDirectory::default())));
     }
     if let Some(kept) = remembered(cache, &digest).await {
-        return Ok((digest, kept));
+        return Ok((digest, whole(kept)));
     }
     let blob = read(backend, "a Directory", &digest).await?;
-    let kept = KeptDirectory::parse(&digest, blob.clone())?;
-    if let Some(cache) = cache {
+    let parsed = KeptDirectory::parse(&digest, blob.clone())?;
+    // A Directory with a malformed digest is never stored: the walk fails on it.
+    if let Some(cache) = cache
+        && parsed.fault.is_none()
+    {
         cache.store(&digest, &blob).await;
     }
-    Ok((digest, kept))
+    Ok((digest, parsed))
 }
 
-/// The Directory `digest` as `cache` holds it: in memory, or as a blob on its disk that decodes.
+/// The Directory `digest` as `cache` holds it: in memory, or as a blob on its disk that decodes
+/// with no malformed digest.
 async fn remembered(cache: Option<&DirectoryCache>, digest: &Digest) -> Option<KeptDirectory> {
     let cache = cache?;
     if let Some(kept) = cache.recent(digest) {
         return Some(kept);
     }
     let blob = cache.stored(digest).await?;
-    KeptDirectory::parse(digest, blob).ok()
+    let parsed = KeptDirectory::parse(digest, blob).ok()?;
+    parsed.fault.is_none().then_some(parsed.kept)
 }
 
 /// The blob `digest`, which the store holds or the closure is not one.

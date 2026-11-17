@@ -149,7 +149,7 @@ reaches no address, so the lines name no destination:
 ```text
 # The egress of kbf's jobs, from /etc/kbf/kbf.toml. Put these lines in /etc/js-agent/flags on
 # every agent of the farm (the Linux js-agent, which runs crun): a put-dir job has no
-# destination, so no --egress-allow line follows.
+# destination, so no allow line follows.
 --egress=allow-list
 ```
 

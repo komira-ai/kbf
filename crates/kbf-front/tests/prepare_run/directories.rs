@@ -236,6 +236,50 @@ async fn an_undecodable_directory_is_the_same_error_and_is_not_cached() {
     }
 }
 
+/// Asserts that a `Directory` naming a subdirectory with no digest is the same error with a
+/// cache every time it is asked for, and is kept neither in memory nor on the disk.
+#[tokio::test]
+async fn a_directory_with_a_malformed_digest_is_the_same_error_and_is_not_cached() {
+    let parts = Parts::new();
+    let message = kbf_proto::reapi::Directory {
+        directories: vec![kbf_proto::reapi::DirectoryNode {
+            name: "d".to_owned(),
+            digest: None,
+        }],
+        ..Default::default()
+    };
+    let bytes = Bytes::from(prost::Message::encode_to_vec(&message));
+    let root = kbf_segments::sha256(&bytes);
+    let action = action_of(Some(&parts.command), Some(&root));
+    let store = Watched::holding(vec![
+        (root, bytes),
+        action.clone(),
+        parts.blob(&parts.command),
+    ])
+    .await;
+    let dir = scratch("malformed-digest");
+    let cache = DirectoryCache::open(dir.path(), DIRECTORY_MEMORY_BYTES, 1 << 20);
+    let prep = prep_over(&store, &Arc::new(cache.expect("a cache")));
+    for _ in 0..2 {
+        forget_reads(&store);
+        let error = prep
+            .prepare_put_dir(LEASE, &action.0, now(), WALL)
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(
+                &error,
+                PrepareError::Closure(ClosureError::Invalid { what: "a subdirectory", digest, .. })
+                    if *digest == root
+            ),
+            "{error}"
+        );
+        assert_eq!(store.reads(), read_set_of(&action.0, &root));
+    }
+    let stored = std::fs::read_dir(dir.path()).expect("the cache directory");
+    assert_eq!(stored.count(), 0, "nothing is stored on the disk");
+}
+
 fn read_set_of(action: &Digest, directory: &Digest) -> Vec<Digest> {
     let mut reads = vec![*action, *directory];
     reads.sort();
