@@ -243,7 +243,7 @@ pub(crate) fn render(text: &str, file: &Path) -> Result<String, EgressError> {
     }
     let mut out = format!(
         "# The egress of kbf's tasks, from {file}. Put these lines in /etc/js-agent/flags on\n\
-         # every agent of the farm (js-agent --runtime crun): a job of kbf's reaches these and\n\
+         # every agent of the farm (the Linux js-agent, which runs crun): a job of kbf's reaches these and\n\
          # nothing else.\n\
          --egress=allow-list\n"
     );

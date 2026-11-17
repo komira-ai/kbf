@@ -91,32 +91,27 @@ async fn an_action_without_a_timeout_gets_the_default() {
     assert_eq!(job.spec.wall_limit_seconds, Some(3_300));
 }
 
-/// Catches a hard memory cap other than the container driver's (a plain booking would let a
-/// job use half again what the farm booked; a bigger cap would overbook the host): two jobs
-/// of 1 GiB booked on a worker of exactly their caps (2 GiB each) are both submitted with that
-/// cap as the memory they need, and the worker takes no third.
+/// Catches the farm's booking leaking into what a Linux job asks the job service for, or no
+/// longer pacing what a worker sends: two runs of 1 GiB booked on a worker whose shape holds
+/// exactly their hard caps (2 GiB each) are both submitted naming no memory and no CPU (the
+/// service sizes each from its class's history), and the worker takes no third.
 #[tokio::test(start_paused = true)]
-async fn the_hard_caps_of_the_booked_runs_fill_the_shape_exactly() {
+async fn the_booked_runs_fill_the_shape_and_their_jobs_name_no_size() {
     let mut rig = Rig::shaped(&[HOST], 1, 4, |_| {}).await;
     rig.pump().await;
     let callers = [rig.submit(1), rig.submit(2)];
     rig.pump().await;
     let jobs = rig.jobs();
     assert_eq!(jobs.len(), 2, "the caps did not fit the shape: {jobs:?}");
+    assert_eq!(
+        2 * Config::hard_memory(GIB),
+        4 * GIB,
+        "the caps are the shape"
+    );
     for job in &jobs {
         let needs = job.spec.needs.as_ref().expect("needs");
-        assert_eq!(needs.memory_bytes, Config::hard_memory(GIB), "{job:?}");
+        assert_eq!((needs.cpu_millis, needs.memory_bytes), (0, 0), "{job:?}");
     }
-    let caps: u64 = jobs
-        .iter()
-        .map(|job| {
-            job.spec
-                .needs
-                .as_ref()
-                .map_or(0, |needs| needs.memory_bytes)
-        })
-        .sum();
-    assert_eq!(caps, 4 * GIB, "the caps are not the shape");
     let third = rig.submit(3);
     rig.advance(Duration::from_secs(5)).await;
     rig.pump().await;

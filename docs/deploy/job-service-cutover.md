@@ -134,7 +134,7 @@ release republishes its own tree, finding most objects held.
 The executor submits every job with the network level `--executor-network` names, by default
 `allow-list`: a task PUTs its packs to the tier store's proxy and reads its inputs from the
 frontend's job-facing read listener, and nothing else. A farm agent runs such a job only if its own
-ceiling is `allow-list` (`--egress allow-list`, on `--runtime crun`), and the job reaches only the
+ceiling is `allow-list` (`--egress allow-list`, on a Linux agent, which runs crun), and the job reaches only the
 endpoints its `--egress-allow` lines name. An agent with the default ceiling, `none`, is never
 given kbf's jobs. kbf asks for `open` only when the frontend is given `--executor-network open`
 with `--executor-allow-open-network`. An agent that cannot check the limits of its job network
@@ -153,7 +153,7 @@ says `task-put-endpoint = "http://192.0.2.10:9000"` and
 
 ```text
 # The egress of kbf's tasks, from /etc/kbf/kbf.toml. Put these lines in /etc/js-agent/flags on
-# every agent of the farm (js-agent --runtime crun): a job of kbf's reaches these and
+# every agent of the farm (the Linux js-agent, which runs crun): a job of kbf's reaches these and
 # nothing else.
 --egress=allow-list
 # task-put-endpoint = http://192.0.2.10:9000

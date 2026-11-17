@@ -55,6 +55,7 @@ mod probe;
 pub mod rows;
 mod runs;
 mod share;
+mod size_class;
 mod submit;
 mod task;
 mod traits;
@@ -89,6 +90,7 @@ pub use mac::{
 };
 pub use metrics::Metrics;
 pub use out::{MAX_ROOT_BYTES, OUT_TARGET, PutDirRoots, RootError, TASK_IN_TREE, TaskOut};
+pub use size_class::SizeClass;
 pub use submit::job_id;
 pub use task::{Delivery, PackKey, Secret, TaskArgs, build_id};
 pub use traits::{

@@ -2,7 +2,7 @@
 //! the stand-in programs of `kbf_integration_test::js_stand_in` in place of `crun`, `ip`, `nft`
 //! and `nsenter`.
 //!
-//! **Why root, and what it touches.** The released agent runs jobs with `--runtime crun` only
+//! **Why root, and what it touches.** The released Linux agent runs jobs with `crun` only
 //! as root, and checks the host before it registers: a job user with subordinate ids,
 //! `newuidmap` and `newgidmap`, a cgroup version 2 subtree delegated to it, a state root and a
 //! scratch root owned by root under directories only root can write, and (where the kernel
@@ -420,7 +420,6 @@ impl RealAgent {
             ("--pool", "kbf-tests".to_owned()),
             ("--token-file", path(&node.join)),
             ("--host-id", node.host.clone()),
-            ("--runtime", "crun".to_owned()),
             ("--job-user", node.user.name.clone()),
             ("--crun-bin", path(&node.bin.join("crun"))),
             ("--state-root", path(&node.state_root)),

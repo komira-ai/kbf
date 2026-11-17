@@ -45,6 +45,7 @@ async fn rig(macs: usize) -> Rig {
         image: crate::rig::IMAGE.to_owned(),
         timeout: Some(std::time::Duration::from_secs(60)),
         system: System::Macos { os_version: None },
+        size_class: crate::rig::built_class(),
     });
     rig
 }

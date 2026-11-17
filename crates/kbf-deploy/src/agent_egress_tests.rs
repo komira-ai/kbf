@@ -29,8 +29,8 @@ task-read-url = "https://192.0.2.20:8444"
 
 /// The head every rendering starts with.
 const HEAD: &str = "# The egress of kbf's tasks, from /etc/kbf/kbf.toml. Put these lines in \
-                    /etc/js-agent/flags on\n# every agent of the farm (js-agent --runtime \
-                    crun): a job of kbf's reaches these and\n# nothing else.\n\
+                    /etc/js-agent/flags on\n# every agent of the farm (the Linux js-agent, \
+                    which runs crun): a job of kbf's reaches these and\n# nothing else.\n\
                     --egress=allow-list\n";
 
 /// The rendered lines name exactly the tier store's proxy and the read listener, under the

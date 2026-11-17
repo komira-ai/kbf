@@ -144,10 +144,16 @@ action's `os_version` above it is refused) and `--executor-mac-task-out-root` (t
 put directory on the Macs, `--task-out-root` by default); a macOS action becomes a job of a
 Mac's native runtime (docs/design/actions-as-jobs.md, section 14), which the job service at
 kbf's pin cannot run yet. A Linux job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
-the job's arguments are the tool's flags and nothing is mounted into the container. It needs the
-cores and memory the farm booked (the memory as the hard cap a daemon would set, 1.5 times the
-booking plus 512 MiB), a host of `os=linux` and `--executor-arch` (default `x86_64`) that runs
-containers, and a wall limit of the action's timeout plus the run margin. It books no disk: the
+the job's arguments are the tool's flags and nothing is mounted into the container. It names no
+cores and no memory: it carries a `size-class` label, the action's build target and whether it is
+a test run (`root//crates/kbf-server:kbf-server` built is `root.crates.kbf-server.kbf-server.build`,
+its test run `….test`; an action whose output paths name no target is `shape.` and its shape key),
+and the job service books it what the past runs of that class used, or, for a class with too few
+runs, its cold size (jobscheduler's `docs/design/sizing.md`, section 7.7). A Mac job still names
+the cores and memory the farm booked (the memory as the hard cap a daemon would set, 1.5 times
+the booking plus 512 MiB), with the same label. A job needs a host of `os=linux` and
+`--executor-arch` (default `x86_64`) that runs containers, and a wall limit of the action's
+timeout plus the run margin. It books no disk: the
 job carries no `disk_bytes`, so the job service places it on a host whatever scratch disk that
 host reports, and the job writes to its host's scratch with no quota. The kbf image is built from
 the base environment the actions' Commands see (`--executor-base-image`); both are named by
