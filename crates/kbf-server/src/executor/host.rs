@@ -14,7 +14,7 @@
 //! What this worker does not send the farm, and why that is safe:
 //!
 //! - A certificate check: nothing here is a peer; the job service's token is the credential.
-//! - The storage map: the task reads through a grant, not the map.
+//! - The storage map: the task reads its inputs from its tree, not through the map.
 //! - Pack read and write counts: the task's reads and its one pack are counted by the
 //!   frontend's own ingest.
 //! - `Welcome.pack_commit` and `placement_load`: nothing here commits a pack through

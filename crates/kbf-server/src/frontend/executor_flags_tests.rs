@@ -46,7 +46,7 @@ const BASE: &str =
 const KBF: &str =
     "registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
-const JS: [&str; 12] = [
+const JS: [&str; 10] = [
     "--executor=js-agent",
     "--executor-job-url=http://127.0.0.1:7",
     "--executor-job-token-file=/etc/token",
@@ -57,9 +57,6 @@ const JS: [&str; 12] = [
     "--executor-base-image=registry.test/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
     "--executor-base-tree=/opt/kbf/base-tree",
-    "--executor-insecure-argv-secrets",
-    // Still a setting of the executor, though no flag gives it the mode that reads it.
-    "--executor-allow-plain-http-put",
 ];
 
 /// The name of a flag given as `--name=value`.
@@ -113,16 +110,11 @@ fn the_deleted_daemon_executor_and_unknown_ones_are_refused_naming_why() {
 }
 
 /// Catches settings tripping a frontend with no executor: with no `--executor` every setting of
-/// the job service may stay in `kbf.toml`, the one that lets secrets travel as arguments too,
-/// and none is read.
+/// the job service may stay in `kbf.toml`, and none is read.
 #[test]
 fn no_executor_keeps_the_job_services_settings_unread() {
-    // The warning is made (its arguments are only evaluated under a subscriber).
-    let _logged =
-        tracing::subscriber::set_default(tracing_subscriber::fmt().with_test_writer().finish());
     let mut all: Vec<&str> = JS.to_vec();
     all.remove(0);
-    assert!(all.contains(&"--executor-insecure-argv-secrets"));
     // A tag, which the js-agent parse refuses: with no executor it must never be read.
     all.retain(|flag| !flag.starts_with("--executor-base-image"));
     all.push("--executor-base-image=registry.test/base:22.04");
@@ -170,15 +162,9 @@ fn js_agent_names_each_flag_it_needs() {
     }
 }
 
-/// Catches `js-agent` running without having been told that the secrets travel as arguments,
-/// and without the packs the ingest reads.
+/// Catches `js-agent` running without the packs the ingest reads.
 #[test]
-fn js_agent_needs_the_secrets_opt_in_and_the_packs() {
-    let mut all = JS.to_vec();
-    all.retain(|flag| *flag != "--executor-insecure-argv-secrets");
-    let why = parsed(argv(&all)).expect_err("refused");
-    assert!(why.contains("--executor-insecure-argv-secrets"), "{why}");
-
+fn js_agent_needs_the_packs() {
     let mut bare: Vec<String> = argv(&JS)
         .into_iter()
         .filter(|flag| !flag.contains("pack-store") && flag != "--pack-index")
@@ -222,9 +208,6 @@ fn js_agent_settings_become_the_executors_config() {
     let flags = js_with(&[
         "--executor-host-slots=4",
         "--executor-arch=arm64",
-        "--executor-work-dir=/scratch",
-        "--executor-allow-plain-http-put",
-        "--executor-allow-plain-http-grant",
         "--executor-run-margin-secs=120",
         "--executor-max-run-secs=1800",
         "--executor-default-timeout-secs=900",
@@ -248,10 +231,6 @@ fn js_agent_settings_become_the_executors_config() {
     assert_eq!(config.memory_bytes, 32 << 30);
     assert_eq!(config.slots, 4);
     assert_eq!(config.arch, "arm64");
-    assert_eq!(config.work_dir.as_deref(), Some("/scratch"));
-    assert!(config.allow_plain_http_put);
-    assert!(config.allow_plain_http_grant);
-    assert!(config.insecure_argv_secrets);
     assert_eq!(config.run_margin, Duration::from_secs(120));
     assert_eq!(config.max_run, Duration::from_secs(1800));
     assert_eq!(config.default_timeout, Duration::from_secs(900));
@@ -262,45 +241,15 @@ fn js_agent_settings_become_the_executors_config() {
     assert_eq!(config.failed_stderr_log_bytes, 2048);
 }
 
-/// Catches `--executor-locate` not becoming the executor's setting, or being on by default: it
-/// is off unless given, and given with `--executor js-agent` it is the config's `locate`.
-#[test]
-fn executor_locate_is_off_unless_given_and_becomes_the_config() {
-    let off = js_with(&[]).expect("flags");
-    assert!(!off.executor.js.expect("js-agent").config.locate);
-    let on = js_with(&["--executor-locate"]).expect("flags");
-    assert!(on.executor.js.expect("js-agent").config.locate);
-}
-
-/// Catches `--executor-locate` accepted where nothing reads it: with no executor no task command
-/// line is built, so it would do nothing and is refused when the flags are read, naming both
-/// flags.
-#[test]
-fn locate_with_no_executor_is_refused_at_start() {
-    let why = parsed(argv(&["--executor-locate"])).expect_err("refused");
-    assert!(why.contains("--executor-locate"), "{why}");
-    assert!(why.contains("--executor js-agent"), "{why}");
-    parsed(argv(&[])).expect("no executor without the flag still parses");
-}
-
 /// Catches a flag default that has drifted from the executor's own: the defaults are written
 /// as text in the flags and are the config's.
 #[test]
 fn the_defaults_are_the_executors_own() {
-    let all: Vec<&str> = JS
-        .iter()
-        .copied()
-        .filter(|flag| *flag != "--executor-allow-plain-http-put")
-        .collect();
-    let flags = parsed(argv(&all)).expect("flags");
+    let flags = js_with(&[]).expect("flags");
     let config = flags.executor.js.expect("js-agent").config;
     let own = Config::new("front-1", 2, 8_000, 32 << 30);
     assert_eq!(config.slots, own.slots);
     assert_eq!(config.arch, own.arch);
-    assert_eq!(config.work_dir, own.work_dir);
-    assert_eq!(config.allow_plain_http_put, own.allow_plain_http_put);
-    assert_eq!(config.allow_plain_http_grant, own.allow_plain_http_grant);
-    assert!(!config.allow_plain_http_grant, "off by default");
     assert_eq!(config.run_margin, own.run_margin);
     assert_eq!(config.max_run, own.max_run);
     assert_eq!(config.default_timeout, own.default_timeout);
@@ -308,9 +257,6 @@ fn the_defaults_are_the_executors_own() {
     assert_eq!(config.prepare_limit, own.prepare_limit);
     assert_eq!(config.prepare_concurrency, own.prepare_concurrency);
     assert_eq!(config.failed_stderr_log_bytes, own.failed_stderr_log_bytes);
-    assert_eq!(own.delivery, config.delivery);
-    assert_eq!(config.network, own.network);
-    assert_eq!(config.allow_open_network, own.allow_open_network);
 }
 
 /// Catches an image that is taken when it is not pinned by digest, or dropped when it is: for
@@ -382,7 +328,7 @@ fn the_flags_of_the_host_preloaded_tool_are_gone() {
 /// each is refused at the flags, naming the flag.
 #[test]
 fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
-    let cases: [(&[&str], &str); 5] = [
+    let cases: [(&[&str], &str); 4] = [
         (&["--executor-job-url=ftp://x"], "--executor-job-url"),
         (
             &["--executor-job-url=http://jobs.example:80"],
@@ -396,7 +342,6 @@ fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
             &["--executor-job-ca-file=/etc/ca.pem"],
             "--executor-job-ca-file",
         ),
-        (&["--executor-work-dir=scratch"], "--executor-work-dir"),
     ];
     for (more, flag) in cases {
         let why = refused(more);
@@ -516,70 +461,6 @@ async fn the_client_is_built_from_a_private_token_and_a_ca_that_is_a_certificate
     assert!(why.contains("--executor-job-url"), "{why}");
 }
 
-/// [`JS`] without the insecure flag, and with `more`.
-fn js_without_insecure(more: &[&str]) -> Result<FrontendFlags, String> {
-    let mut all: Vec<&str> = JS
-        .iter()
-        .copied()
-        .filter(|flag| *flag != "--executor-insecure-argv-secrets")
-        .collect();
-    all.extend(more);
-    parsed(argv(&all))
-}
-
-fn delivery_of(flags: FrontendFlags) -> crate::executor::Delivery {
-    flags.executor.js.expect("js-agent").config.delivery
-}
-
-/// Catches a default that is not today's: with no `--executor-secret-delivery` the secrets
-/// travel as arguments, and the insecure flag is still what allows it.
-#[test]
-fn argv_is_the_default_delivery_and_still_needs_the_insecure_flag() {
-    let flags = js_with(&[]).expect("flags");
-    assert_eq!(delivery_of(flags), crate::executor::Delivery::InsecureArgv);
-    let flags = js_with(&["--executor-secret-delivery=argv"]).expect("flags");
-    assert_eq!(delivery_of(flags), crate::executor::Delivery::InsecureArgv);
-    let why = js_without_insecure(&["--executor-secret-delivery=argv"]).expect_err("refused");
-    assert!(why.contains("--executor-insecure-argv-secrets"), "{why}");
-}
-
-/// Catches `files` demanding the opt-in that exists for secrets in arguments: it parses
-/// without the insecure flag and holds the delivery and nothing in `insecure_argv_secrets`.
-#[test]
-fn files_mode_needs_no_insecure_flag() {
-    let flags = js_without_insecure(&["--executor-secret-delivery=files"]).expect("flags");
-    let config = flags.executor.js.expect("js-agent").config;
-    assert_eq!(config.delivery, crate::executor::Delivery::Files);
-    assert!(!config.insecure_argv_secrets);
-}
-
-/// Catches the contradiction being accepted: the operator says the secrets go as files and also
-/// that they may go as arguments.
-#[test]
-fn files_mode_refuses_the_insecure_flag() {
-    let why = refused(&["--executor-secret-delivery=files"]);
-    assert!(why.contains("--executor-secret-delivery"), "{why}");
-    assert!(why.contains("--executor-insecure-argv-secrets"), "{why}");
-}
-
-/// Catches a value that is neither delivery being read as one of them.
-#[test]
-fn an_unknown_delivery_is_refused() {
-    let why = js_without_insecure(&["--executor-secret-delivery=env"]).expect_err("refused");
-    assert!(why.contains("--executor-secret-delivery"), "{why}");
-}
-
-/// Catches a delivery that would do nothing being accepted: with no executor no
-/// task command line is built, so `files` is refused, naming the flag; the default `argv`
-/// stays accepted (it is what every unit that names nothing has).
-#[test]
-fn no_executor_refuses_the_files_delivery() {
-    let why = parsed(argv(&["--executor-secret-delivery=files"])).expect_err("refused");
-    assert!(why.contains("--executor-secret-delivery"), "{why}");
-    let flags = parsed(argv(&["--executor-secret-delivery=argv"])).expect("flags");
-    assert!(flags.executor.js.is_none());
-}
-
 /// Catches `--executor-output-disk-bytes` still being read: a job books no disk, so the flag
 /// that sized its scratch is gone, and a frontend given it, as `--flag=value` or as
 /// `--flag value`, with `--executor js-agent` or with no executor, is refused when the command line is parsed, with clap's unknown-argument
@@ -659,86 +540,35 @@ fn old_lease_flags_are_refused_and_job_flags_are_required() {
     assert!(none.js.is_none());
 }
 
-/// Catches `--executor-network` not becoming the executor's network, an open network taken on
-/// one flag, or a stray opt-in: each level names its network; `open` alone is refused when the
-/// flags are read, the message naming both flags; `open` with `--executor-allow-open-network`
-/// is accepted; the opt-in with another level is refused naming it; a level that is not one is
-/// refused naming the flag; and with no executor neither flag is read.
+/// Catches the flags of the presigned path being read again, or refused without saying why:
+/// each of the eight, given a value, or given bare as the switches once were, with
+/// `--executor js-agent` or with no executor, is refused when the command line is parsed, naming
+/// the flag, the release that removed it and that the flag is to be deleted. The same command
+/// line without them parses, so the refusal is the flag's.
 #[test]
-fn executor_network_is_the_jobs_network_and_open_needs_its_opt_in() {
-    let network = |more: &[&str]| {
-        let flags = js_with(more).expect("flags");
-        let config = flags.executor.js.expect("js-agent").config;
-        (config.network, config.allow_open_network)
-    };
-    assert_eq!(network(&[]), (Network::AllowList, false));
-    assert_eq!(
-        network(&["--executor-network=allow-list"]),
-        (Network::AllowList, false)
-    );
-    assert_eq!(
-        network(&["--executor-network=none"]),
-        (Network::None, false)
-    );
-    assert_eq!(
-        network(&["--executor-network=open", "--executor-allow-open-network"]),
-        (Network::Open, true)
-    );
-    let first = |why: String| why.lines().next().unwrap_or_default().to_owned();
-    assert_eq!(
-        first(refused(&["--executor-network=open"])),
-        "error: --executor js-agent: --executor-network open lets every job reach any address: give \
-         --executor-allow-open-network as well to say so"
-    );
-    for level in ["allow-list", "none"] {
-        let flag = format!("--executor-network={level}");
-        let why = first(refused(&[&flag, "--executor-allow-open-network"]));
-        assert_eq!(
-            why,
-            "error: --executor js-agent: --executor-allow-open-network is only for --executor-network \
-             open: drop it",
-            "{level}"
-        );
+fn the_flags_of_the_presigned_path_are_refused_naming_the_release() {
+    for gone in super::REMOVED {
+        let flag = format!("--{gone}=x");
+        for why in [
+            refused(&[&flag]),
+            parsed(argv(&[&flag])).expect_err("refused"),
+        ] {
+            assert!(
+                why.contains(&format!(
+                    "invalid value 'x' for '--{gone} <VALUE>': the flag was removed in this \
+                     release (kbf-server 0."
+                )),
+                "{gone}: {why}"
+            );
+            assert!(why.contains("delete the flag"), "{gone}: {why}");
+            assert!(why.contains("presigned path"), "{gone}: {why}");
+        }
+        let bare = format!("--{gone}");
+        let why = refused(&[&bare]);
+        assert!(why.contains(&bare), "{gone}: {why}");
     }
-    assert!(
-        refused(&["--executor-allow-open-network"]).contains("only for --executor-network open")
-    );
-    let why = refused(&["--executor-network=wide"]);
-    assert!(why.contains("--executor-network"), "{why}");
-    let bare = parsed(argv(&["--executor-network=open"])).expect("ignored with no executor");
-    assert!(bare.executor.js.is_none());
-}
-
-/// Catches an open job network taken without a line in the log: the network every job gets is
-/// logged when the flags are read, `open` as a warning that names both flags and the
-/// allow-list (the default) at info, naming the level.
-#[test]
-fn the_job_network_is_logged_at_start() {
-    let log = crate::test_log::capture();
-    js_with(&["--executor-network=open", "--executor-allow-open-network"]).expect("flags");
-    let text = log.text();
-    let open: Vec<&str> = text.lines().filter(|l| l.contains("WARN")).collect();
-    assert_eq!(open.len(), 1, "{text}");
-    assert!(
-        open[0].contains(
-            "--executor-network open with --executor-allow-open-network: every job may reach \
-             any address but those its host's agent always denies"
-        ),
-        "{text}"
-    );
-    drop(log);
-    let log = crate::test_log::capture();
-    js_with(&[]).expect("flags");
-    let text = log.text();
-    let line = text
-        .lines()
-        .find(|l| l.contains("--executor-network: the network of every job"))
-        .unwrap_or_else(|| panic!("no network line in {text}"));
-    assert!(
-        line.contains("INFO") && line.contains("network=AllowList"),
-        "{line}"
-    );
-    assert!(!text.contains("WARN"), "{text}");
+    js_with(&[]).expect("js-agent without them parses");
+    parsed(argv(&[])).expect("no executor without them parses");
 }
 
 /// Catches a log excerpt that cannot be bounded or turned off, or one allowed past the output a

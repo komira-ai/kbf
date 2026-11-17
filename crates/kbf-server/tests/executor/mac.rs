@@ -3,7 +3,7 @@
 
 use js_proto::v1::{ExecMode, MountMode, mount};
 use kbf_server::executor::{
-    DEFAULT_MAC_OS_VERSION, MAC_OUT_TARGET, MacPool, PutDirRoots, System, TREE_TARGET, TaskOut,
+    DEFAULT_MAC_OS_VERSION, MAC_OUT_TARGET, MacPool, PutDirRoots, System, TREE_TARGET,
 };
 use kbf_types::LeaseKind;
 
@@ -23,7 +23,7 @@ fn mac_needs() -> kbf_caps::Request {
 async fn rig(macs: usize) -> Rig {
     let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
     let rig = Rig::start(&["host-1"], 1, |cfg| {
-        cfg.task_out = TaskOut::PutDir(roots);
+        cfg.task_out = Some(roots);
         cfg.mac = (macs > 0).then(|| MacPool {
             hosts: macs,
             bundle: BUNDLE.to_owned(),

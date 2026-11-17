@@ -1,29 +1,33 @@
 //! The executor as the frontend builds it: from the `--executor` flags, over the frontend's own
-//! seams (the ingest of the packs, the CAS, the key mint) and the real farm, against a job
-//! service in this process. An action is placed, its job is submitted with the task tool's exact
-//! command line, image and limits, the pack the task wrote is ingested by the frontend's code,
-//! the result reaches the caller, and stopping leaves nothing to cancel.
+//! seams (the ingest of the put directories, the CAS, the directory mint) and the real farm,
+//! against a job service in this process. An action is placed, its job is submitted with the
+//! task tool's exact command line, its tree and its put directory, the pack the task committed
+//! is ingested by the frontend's code, the result reaches the caller, and stopping leaves
+//! nothing to cancel.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use js_proto::v1::{NetworkLevel, mount};
+use kbf_front::action_tree::{BaseFacts, BaseTree};
+use kbf_front::prepare_run::{ClosureLimits, collect_closure_keeping};
 use kbf_front::{
     Backend, Cache, CacheStorage, Described, Dispatch as _, Finished, PackKeyMint, PackSettings,
     Packs, SegmentsConfig, Stage, Submission, VerifiedBlob,
 };
 use kbf_job_client::fake::{Call, FakeJobServer, TOKEN};
 use kbf_objstore::{Capabilities, MemoryStore, ObjectKey, ObjectStore as _};
-use kbf_pack::{PackKeys, Slot, TaskManifest, Timing, Usage, WriterKind, write_pack};
+use kbf_pack::{PackKeys, TaskManifest, Timing, Usage, WriterKind, write_pack};
 use kbf_pack_index::PackIndex;
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_proto::reapi::platform::Property;
-use kbf_proto::reapi::{Action, Command, Platform};
+use kbf_proto::reapi::{Action, Command, Directory, Platform};
 use kbf_sched::Request;
 use kbf_server::Farm;
 use kbf_server::executor::{
-    Metrics, PrepareError, PreparedRun, RunPrepare, RunSource, Running, Secret, TaskOut,
+    Metrics, MintedDir, PrepareError, PreparedPutDir, RunPrepare, RunSource, Running, TASK_IN_TREE,
 };
 use kbf_server::frontend;
 use kbf_state::ManualClock;
@@ -37,38 +41,68 @@ const KBF_IMAGE: &str =
     "registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// Prepares a run as the frontend does: a key minted under the secret the ingest verifies with,
-/// one write url for exactly that key, and a grant, good a while past the run's wall.
+/// The root manifest of the base tree: one symlink.
+const BASE_ROOT: &[u8] =
+    br#"{"v":1,"children":[{"name":"bin","kind":"symlink","target":"usr/bin"}]}"#;
+
+/// Prepares a run as the frontend does: the input closure of the action read from the CAS, and a
+/// put directory minted under the secret the ingest verifies with, good a while past the run's
+/// wall.
 struct Preparing {
     mint: PackKeyMint,
+    backend: Backend,
     asked: Mutex<Vec<(String, Digest, Duration)>>,
+}
+
+impl Preparing {
+    /// The directory of `lease`'s run of `action` and the second its keys stop being good at.
+    fn directory(
+        &self,
+        lease: &str,
+        action: &Digest,
+        (now, wall): (SystemTime, Duration),
+    ) -> Result<(String, u64), PrepareError> {
+        self.asked
+            .lock()
+            .expect("asked")
+            .push((lease.to_owned(), *action, wall));
+        let dir = self
+            .mint
+            .mint_put_dir(lease, action, now)
+            .map_err(|e| PrepareError::Refused(e.to_string()))?;
+        let since = now.duration_since(UNIX_EPOCH).expect("after the epoch");
+        Ok((dir.dir().to_owned(), since.as_secs() + wall.as_secs() + 600))
+    }
 }
 
 #[tonic::async_trait]
 impl RunPrepare for Preparing {
-    async fn prepare_run(
+    async fn prepare_put_dir(
         &self,
         lease: &str,
         action: &Digest,
         now: SystemTime,
         wall: Duration,
-    ) -> Result<PreparedRun, PrepareError> {
-        self.asked
-            .lock()
-            .expect("asked")
-            .push((lease.to_owned(), *action, wall));
-        let key = self
-            .mint
-            .mint(lease, action, now, Slot::Pack(0))
-            .map_err(|e| PrepareError::Refused(e.to_string()))?;
-        let since = now.duration_since(UNIX_EPOCH).expect("after the epoch");
-        Ok(PreparedRun {
-            put_url: Secret::new(format!("http://tier.test/{}?sig=put", key.key())),
-            key: key.key().to_owned(),
-            grant_url: "https://grant.test:9400".to_owned(),
-            grant_token: Secret::new("read-token"),
-            not_after: since.as_secs() + wall.as_secs() + 600,
+    ) -> Result<PreparedPutDir, PrepareError> {
+        let (dir, not_after) = self.directory(lease, action, (now, wall))?;
+        let kept = collect_closure_keeping(&self.backend, action, ClosureLimits::DEFAULT).await;
+        let kept = kept.map_err(|e| PrepareError::Unavailable(e.to_string()))?;
+        Ok(PreparedPutDir {
+            dir,
+            kept,
+            not_after,
         })
+    }
+
+    async fn mint_put_dir(
+        &self,
+        lease: &str,
+        action: &Digest,
+        now: SystemTime,
+        wall: Duration,
+    ) -> Result<MintedDir, PrepareError> {
+        let (dir, not_after) = self.directory(lease, action, (now, wall))?;
+        Ok(MintedDir { dir, not_after })
     }
 }
 
@@ -77,11 +111,11 @@ fn wire(digest: &Digest) -> kbf_proto::reapi::Digest {
 }
 
 /// Catches an executor that does not work end to end as the frontend builds it. The flags
-/// become the executor's config; the action is read from the CAS for its image and timeout; the
-/// job is submitted with the task tool's command line, the secrets the preparation made, the
-/// kbf image, the action's wall and the frontend's label; a pack the task wrote under the issued
-/// key is ingested by the frontend's own code into the result the caller gets; and stopping the
-/// executor cancels no job, as none is left to cancel.
+/// become the executor's config; the action is read from the CAS for its timeout; the job is
+/// submitted with the task tool's command line, no image, the tree as its layer, the put
+/// directory the preparation made mounted at `/out`, the action's wall and the frontend's label;
+/// a pack the task committed in that directory is ingested by the frontend's own code into the
+/// result the caller gets; and stopping the executor cancels no job, as none is left to cancel.
 #[tokio::test(start_paused = true)]
 async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams() {
     // The cache lingers before it writes a batch, on the clock: the blobs are stored while it
@@ -98,8 +132,10 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         }
     };
     let command = store(Command::default().encode_to_vec()).await;
+    let root = store(Directory::default().encode_to_vec()).await;
     let action = Action {
         command_digest: Some(wire(&command)),
+        input_root_digest: Some(wire(&root)),
         platform: Some(Platform {
             properties: vec![Property {
                 name: "container-image".to_owned(),
@@ -142,24 +178,28 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         "--executor-host-cpus=2".to_owned(),
         "--executor-host-memory-gib=16".to_owned(),
         "--executor-host-slots=2".to_owned(),
-        "--executor-insecure-argv-secrets".to_owned(),
         format!("--executor-base-image={IMAGE}"),
         format!("--executor-kbf-image={KBF_IMAGE}"),
         "--executor-base-tree=/nowhere/base-tree".to_owned(),
         "--executor-base-tree-url=".to_owned(),
-        "--executor-allow-plain-http-put".to_owned(),
-        "--executor-work-dir=/scratch".to_owned(),
     ];
     let matches = frontend::command()
         .try_get_matches_from(argv)
         .expect("flags");
     let flags = frontend::parse(&matches).expect("a frontend's flags");
-    let mut js = flags.executor.js.expect("js-agent");
-    // No flag gives the executor the mode this test runs any more (the frontend refuses
-    // `--task-out-mode presigned`): its settings are set here, over what the flags made.
-    js.config.task_out = TaskOut::Presigned;
+    let js = flags.executor.js.expect("js-agent");
+    // The base tree the frontend publishes before it starts the executor.
+    let base = BaseTree::new(
+        BASE_ROOT,
+        BaseFacts {
+            entries: 1,
+            depth: 1,
+        },
+    )
+    .expect("a base");
+    js.published.set(base).expect("set once");
 
-    // The frontend's seams: packs over an object store, the CAS of a node, the key mint.
+    // The frontend's seams: packs over an object store, the CAS of a node, the directory mint.
     let objects = Arc::new(MemoryStore::new(Capabilities {
         conditional_put: true,
         object_lock: false,
@@ -173,15 +213,16 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         Arc::clone(&node),
         SegmentsConfig::DEFAULT,
     ));
+    let backend = Backend::remote_over(storage, Some(packs.clone()));
     let preparing = Arc::new(Preparing {
         mint: PackKeyMint::new(SECRET).expect("a mint"),
+        backend: backend.clone(),
         asked: Mutex::new(Vec::new()),
     });
     let source = RunSource {
         mint: PackKeyMint::new(SECRET).expect("a mint"),
         prepare: preparing.clone(),
     };
-    let backend = Backend::remote_over(storage, Some(packs.clone()));
     let front = js.front(packs, backend, source);
 
     let farm = Arc::new(Farm::new(
@@ -243,50 +284,50 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         Duration::from_secs(90 + 300),
         "the action's timeout and the margin"
     );
-    let key = format!("cas/b/{build}/");
-    let args = spec.args.clone();
-    let url = args[args.iter().position(|a| a == "--pack-url").expect("a url") + 1].clone();
-    let pack_key = url
-        .strip_prefix("http://tier.test/")
-        .and_then(|rest| rest.split('?').next())
-        .expect("the preparation's url")
+    let source = spec.mounts.first().and_then(|m| m.source.clone());
+    let Some(mount::Source::HostPath(out)) = source else {
+        panic!("no host directory mounted: {:?}", spec.mounts);
+    };
+    let pack_dir = out
+        .strip_prefix("/mnt/ts/put/")
+        .expect("under the put root")
         .to_owned();
-    assert!(pack_key.starts_with(&key), "{pack_key}");
+    assert!(
+        pack_dir.starts_with(&format!("cas/b/{build}/")),
+        "{pack_dir}"
+    );
     let expected: Vec<String> = [
+        "--tree",
+        "--stage-and-commit",
+        "--out-dir",
+        "/out",
         "--action",
         &format!("{}/{}", action.hash_hex(), action.size_bytes),
         "--lease",
         &build,
-        "--grant-url",
-        "https://grant.test:9400",
         "--deadline-ms",
         "90000",
-        "--insecure-argv-secrets",
-        "--pack-url",
-        &format!("http://tier.test/{pack_key}?sig=put"),
-        "--grant-token",
-        "read-token",
-        "--work-dir",
-        "/scratch",
-        "--allow-plain-http-put",
+        "--object-format",
+        "one-pass",
     ]
     .iter()
     .map(ToString::to_string)
     .collect();
-    assert_eq!(args, expected);
-    // The job is the kbf image, not the base the action names, with its entrypoint (the task
-    // tool) kept: the command is empty, and the secrets are arguments, not files.
-    assert_eq!(spec.image, KBF_IMAGE);
-    assert_eq!(spec.command, "");
+    assert_eq!(spec.args, expected);
+    // The job has no image: the tree is its root, and the task tool in it is its command. It
+    // has no file and no network.
+    assert_eq!(spec.image, "");
+    assert_eq!(spec.command, TASK_IN_TREE);
     assert!(spec.files.is_empty(), "{:?}", spec.files);
+    assert_eq!(spec.network(), NetworkLevel::None);
     assert_eq!(spec.wall_limit_seconds, Some(390));
     assert_eq!(
         spec.labels.get("kbf-frontend").map(String::as_str),
         Some("front-1")
     );
 
-    // The task writes its pack under the key it was issued, and exits 0: the action ran, and
-    // exited 5.
+    // The task commits its pack in the directory it was issued, and exits 0: the action ran,
+    // and exited 5.
     let manifest = TaskManifest {
         lease: build.clone(),
         action,
@@ -304,7 +345,7 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         objects: None,
     };
     let pack = write_pack(&manifest, &[]).expect("a pack");
-    let object = ObjectKey::new(pack_key).expect("an object key");
+    let object = ObjectKey::new(format!("{pack_dir}/pack")).expect("an object key");
     objects
         .put_new(&object, Bytes::from(pack), None)
         .await

@@ -8,10 +8,6 @@
 //!
 //! The companions are the frontend's own. They are not refused without `--executor`, so a
 //! `kbf.toml` that names the job service starts with or without the executor.
-//! `--executor-insecure-argv-secrets` too: it is ignored with a warning, since nothing reads it
-//! there. The two whose absence of an executor would make them silently do nothing for a
-//! reason of their own, `--executor-secret-delivery files` and `--executor-locate`, are
-//! refused.
 //!
 //! With `--executor-ownership single`, the default, the executor runs on exactly one frontend:
 //! any frontends that open the same state store are several, so the executor itself looks for
@@ -35,6 +31,14 @@
 //! quota. `--executor-output-disk-bytes`, the scratch a job once asked for its outputs, is gone
 //! the same way: a frontend started with it fails at start, naming it.
 //!
+//! A put-directory job is given no secret and no network, so the flags of the executor's
+//! presigned path were removed with it: `--executor-secret-delivery`,
+//! `--executor-insecure-argv-secrets`, `--executor-work-dir`, `--executor-allow-plain-http-put`,
+//! `--executor-allow-plain-http-grant`, `--executor-locate`, `--executor-network` and
+//! `--executor-allow-open-network`. Each still exists as a hidden flag that refuses any value
+//! at start, naming the release that removed it, so that a `kbf.toml` copied from an older
+//! template is told to delete the line and not "unknown key".
+//!
 //! Every secret is a file: the job service's token (mode 0600 or 0400) and its CA certificate.
 
 use std::error::Error;
@@ -43,7 +47,8 @@ use std::str::FromStr as _;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use clap::{Arg, ArgAction, ArgMatches};
+use clap::builder::ValueParser;
+use clap::{Arg, ArgMatches};
 use kbf_front::action_tree::{BaseTree, DEFAULT_TOTAL, PutRetry};
 use kbf_front::{Backend, Packs};
 use kbf_job_client::{Client, Origin, Token};
@@ -51,8 +56,8 @@ use kbf_types::ImageRef;
 
 use crate::Farm;
 use crate::executor::{
-    Config, DEFAULT_MAC_OS_VERSION, Delivery, Deps, Executor, Front, FrontParts, InputTree,
-    MacPool, Metrics, Network, Ownership, PutDirParts, PutDirRoots, RunSource, TaskOut,
+    Config, DEFAULT_MAC_OS_VERSION, Deps, Executor, Front, FrontParts, InputTree, MacPool, Metrics,
+    Ownership, PutDirParts, PutDirRoots, RunSource,
 };
 
 const KIND: &str = "executor";
@@ -65,12 +70,6 @@ const CPUS: &str = "executor_host_cpus";
 const MEMORY_GIB: &str = "executor_host_memory_gib";
 const SLOTS: &str = "executor_host_slots";
 const ARCH: &str = "executor_arch";
-const WORK_DIR: &str = "executor_work_dir";
-const PLAIN_PUT: &str = "executor_allow_plain_http_put";
-const PLAIN_GRANT: &str = "executor_allow_plain_http_grant";
-const LOCATE: &str = "executor_locate";
-const INSECURE: &str = "executor_insecure_argv_secrets";
-const DELIVERY: &str = "executor_secret_delivery";
 const BASE_IMAGE: &str = "executor_base_image";
 const KBF_IMAGE: &str = "executor_kbf_image";
 const BASE_TREE: &str = "executor_base_tree";
@@ -88,8 +87,6 @@ const CALL_TIMEOUT: &str = "executor_call_timeout_secs";
 const POLL: &str = "executor_poll_ms";
 const PREPARE_LIMIT: &str = "executor_prepare_limit_secs";
 const PREPARE_CONCURRENCY: &str = "executor_prepare_concurrency";
-const NETWORK: &str = "executor_network";
-const OPEN_NETWORK: &str = "executor_allow_open_network";
 const OWNERSHIP: &str = "executor_ownership";
 const INPUT_TREE: &str = "executor_input_tree";
 const LIVE: &str = "executor_live_secs";
@@ -147,16 +144,49 @@ fn number(id: &'static str, long: &'static str, help: &'static str, default: &'s
         .help(help)
 }
 
-fn switch(id: &'static str, long: &'static str, help: &'static str) -> Arg {
-    Arg::new(id)
-        .long(long)
-        .action(ArgAction::SetTrue)
-        .help(help)
+/// The flags of the presigned path that was removed, by long name: they only refuse.
+const REMOVED: [&str; 8] = [
+    "executor-secret-delivery",
+    "executor-insecure-argv-secrets",
+    "executor-work-dir",
+    "executor-allow-plain-http-put",
+    "executor-allow-plain-http-grant",
+    "executor-locate",
+    "executor-network",
+    "executor-allow-open-network",
+];
+
+/// What a start that gives one of the removed flags is told, after clap's `invalid value ... for
+/// '--<flag> <VALUE>'`, which names the flag.
+const REMOVED_WHY: &str = concat!(
+    "the flag was removed in this release (kbf-server ",
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("KBF_BUILD_COMMIT"),
+    ") with the executor's presigned path, the only code that read it: a put-directory job is \
+     given no secret and no network; delete the flag",
+);
+
+/// The removed flags, each refusing any value with [`REMOVED_WHY`], hidden from `--help`.
+fn removed() -> impl Iterator<Item = Arg> {
+    REMOVED.into_iter().map(|long| {
+        Arg::new(long)
+            .long(long)
+            .hide(true)
+            .value_name("VALUE")
+            .help("Removed with the executor's presigned path. Any value is refused at start")
+            .value_parser(ValueParser::new(refuse))
+    })
+}
+
+/// The parser of a removed flag: it takes no value.
+fn refuse(_: &str) -> Result<String, &'static str> {
+    Err(REMOVED_WHY)
 }
 
 /// The flags.
 pub(super) fn args() -> Vec<Arg> {
-    vec![
+    let mut all = vec![
         Arg::new(KIND)
             .long("executor")
             .value_name("KIND")
@@ -169,9 +199,8 @@ pub(super) fn args() -> Vec<Arg> {
                  (`--executor-job-url`, `--executor-job-token-file`, and \
                  `--executor-job-ca-file` for https), \
                  `--executor-frontend-id`, the release's base tree bundles \
-                 (`--executor-base-tree`), the packs (`--pack-store-endpoint`) and the secret \
-                 delivery (`--executor-secret-delivery`, with \
-                 `--executor-insecure-argv-secrets` for its default `argv`); the virtual \
+                 (`--executor-base-tree`), the packs (`--pack-store-endpoint`) and the put \
+                 directories of the runs (`--task-secret-file`, `--task-out-root`); the virtual \
                  workers' shape (`--executor-hosts`, `--executor-host-cpus`, \
                  `--executor-host-memory-gib`) has defaults. The executor runs \
                  on exactly one frontend: a second frontend that has jobs on the same job \
@@ -179,7 +208,7 @@ pub(super) fn args() -> Vec<Arg> {
                  A frontend stopped cancels its jobs; a killed frontend's jobs run \
                  to their wall limit, unless a later `js-agent` start cancels them. Left out, \
                  no executor is built and no job service is contacted, whatever the other \
-                 `--executor-*` flags say; `--executor-insecure-argv-secrets` is then ignored",
+                 `--executor-*` flags say",
             ),
         text(
             FRONTEND,
@@ -274,61 +303,6 @@ pub(super) fn args() -> Vec<Arg> {
                  only with `--executor js-agent`",
             ),
         text(
-            WORK_DIR,
-            "executor-work-dir",
-            "DIR",
-            "Where the task tool works in the container, if not in its own default: the kbf \
-             image must have a writable directory there. Used only with `--executor js-agent`",
-        ),
-        switch(
-            PLAIN_PUT,
-            "executor-allow-plain-http-put",
-            "Lets the task write its pack to an `http://` url, until the store serves TLS. The \
-             reads stay https unless `--executor-allow-plain-http-grant` says otherwise. Used \
-             only with `--executor js-agent`",
-        ),
-        switch(
-            PLAIN_GRANT,
-            "executor-allow-plain-http-grant",
-            "Lets the task read its inputs through a read grant served over `http://`: an \
-             `http://` `--task-read-url` is accepted, and the task tool is given \
-             `--allow-plain-http-grant`. The read token then crosses the job network in clear, so \
-             this is for a farm on its own network. Off by default, and an `http://` read url is \
-             refused without it. Used only with `--executor js-agent`",
-        ),
-        switch(
-            LOCATE,
-            "executor-locate",
-            "Has the task tool ask the read listener where each input is kept (`GET /locate`). \
-             The answer names no store and no grant (tierstore v0.3.29 removed the store read \
-             grants), so the task still reads every input through the listener, as without the \
-             flag; every byte is checked against its digest. Off by default. Used only with \
-             `--executor js-agent`, and refused without it",
-        ),
-        switch(
-            INSECURE,
-            "executor-insecure-argv-secrets",
-            "Says the secrets of a task (the presigned write url, the read token) may travel as \
-             arguments of the job, where the action can read them from `/proc` and the engine's \
-             inspect shows them. It is what the default `--executor-secret-delivery argv` needs, \
-             and `--executor-secret-delivery files` refuses it. Off by default",
-        ),
-        Arg::new(DELIVERY)
-            .long("executor-secret-delivery")
-            .value_name("MODE")
-            .value_parser(["argv", "files"])
-            .default_value("argv")
-            .help(
-                "How the secrets of a task (the presigned write url, the read token) reach it. \
-                 `argv`, the default, passes them as arguments of the job and needs \
-                 `--executor-insecure-argv-secrets`. `files` passes each as a file of the job, \
-                 which its host writes read-only at `/run/js-files`: no argument holds a \
-                 secret, and `--executor-insecure-argv-secrets` is refused with it; a host whose \
-                 agent cannot write files refuses to start the job, and the farm runs the \
-                 action again. `files` is refused without `--executor js-agent`, which builds the \
-                 command line",
-            ),
-        text(
             BASE_IMAGE,
             "executor-base-image",
             "IMAGE",
@@ -415,7 +389,7 @@ pub(super) fn args() -> Vec<Arg> {
             .default_value("512")
             .help(
                 "The most bytes of a failed job's standard error the frontend writes to its \
-                 log, at WARN, with the job's secrets redacted: the end of the stream. 0 writes \
+                 log, at WARN: the end of the stream. 0 writes \
                  none. The whole output (up to 8 KiB with standard output) goes with the result \
                  either way. Used only with `--executor js-agent`",
             ),
@@ -472,28 +446,6 @@ pub(super) fn args() -> Vec<Arg> {
                  together slows each until none is ready inside its window; the ones past this \
                  wait their turn. Used only with `--executor js-agent`",
             ),
-        Arg::new(NETWORK)
-            .long("executor-network")
-            .value_name("LEVEL")
-            .value_parser(["none", "allow-list", "open"])
-            .default_value("allow-list")
-            .help(
-                "The network every job is given on its host. `allow-list`, the default, is the \
-                 endpoints the host's agent is set up to allow and nothing else: the task \
-                 reaches the read listener and the pack store only once each agent allows them, \
-                 and a host whose agent cannot check those limits refuses the job \
-                 (`egress-unchecked`), which the farm runs again. `none` is no route out: every \
-                 action fails, as the task can reach neither. `open` is any address but those \
-                 the agent always denies, and needs `--executor-allow-open-network`. Used only \
-                 with `--executor js-agent`",
-            ),
-        switch(
-            OPEN_NETWORK,
-            "executor-allow-open-network",
-            "Says jobs may be given an open network: what `--executor-network open` needs, and \
-             refused with any other `--executor-network`. Off by default. Used only with \
-             `--executor js-agent`",
-        ),
         Arg::new(OWNERSHIP)
             .long("executor-ownership")
             .value_name("MODE")
@@ -573,7 +525,9 @@ pub(super) fn args() -> Vec<Arg> {
              job mounts its put directory under it and its action tree from the `trees` \
              directory beside it. Used only with `--executor-mac-hosts`, refused without it",
         ),
-    ]
+    ];
+    all.extend(removed());
+    all
 }
 
 /// What `--executor js-agent` and its companions say.
@@ -640,27 +594,8 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
             ));
         }
         None => {
-            // Every setting of the executor may stay in `kbf.toml` without it, this one too:
-            // nothing reads it here.
-            if m.get_flag(INSECURE) {
-                tracing::warn!(
-                    "--executor-insecure-argv-secrets is ignored: it is for --executor js-agent, and this frontend has no executor"
-                );
-            }
-            if delivery(m) == Delivery::Files {
-                return Err(
-                    "--executor-secret-delivery files is for --executor js-agent: without an \
-                     executor no task command line is built, so it would do nothing"
-                        .to_owned(),
-                );
-            }
-            if m.get_flag(LOCATE) {
-                return Err(
-                    "--executor-locate is for --executor js-agent: without an executor no task \
-                     command line is built, so it would do nothing"
-                        .to_owned(),
-                );
-            }
+            // Every setting of the executor may stay in `kbf.toml` without it: nothing reads it
+            // here.
             return Ok(ExecutorFlags::default());
         }
     }
@@ -672,35 +607,10 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
     if !missing.is_empty() {
         return Err(format!("--executor js-agent needs {}", missing.join(", ")));
     }
-    let files = delivery(m) == Delivery::Files;
-    if files && m.get_flag(INSECURE) {
-        return Err(
-            "--executor-secret-delivery files sends no secret in arguments: drop \
-             --executor-insecure-argv-secrets"
-                .to_owned(),
-        );
-    }
-    if !files && !m.get_flag(INSECURE) {
-        return Err(
-            "--executor js-agent needs --executor-insecure-argv-secrets, which \
-                    lets the secrets of a task travel as arguments where the action can read \
-                    them, or --executor-secret-delivery files"
-                .to_owned(),
-        );
-    }
     // The settings are judged together ([`Config::validate`]) once the flags beside these have
     // set what follows from them, the outputs' put directory among them (`executor_bind`): a
     // judgement here would see the default outputs, which shared ownership refuses.
     let js = js_agent_flags(m)?;
-    // The network every action's command will have, logged at start: an open one, which the
-    // operator asked for twice, as a warning.
-    match js.config.network {
-        Network::Open => tracing::warn!(
-            "--executor-network open with --executor-allow-open-network: every job may reach \
-             any address but those its host's agent always denies"
-        ),
-        network => tracing::info!(?network, "--executor-network: the network of every job"),
-    }
     Ok(ExecutorFlags { js: Some(js) })
 }
 
@@ -737,19 +647,6 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     );
     config.slots = count(SLOTS);
     config.arch = one(ARCH);
-    config.work_dir = m.get_one::<String>(WORK_DIR).cloned();
-    if config
-        .work_dir
-        .as_deref()
-        .is_some_and(|d| !d.starts_with('/'))
-    {
-        return Err("--executor-work-dir is not an absolute path".to_owned());
-    }
-    config.allow_plain_http_put = m.get_flag(PLAIN_PUT);
-    config.allow_plain_http_grant = m.get_flag(PLAIN_GRANT);
-    config.locate = m.get_flag(LOCATE);
-    config.insecure_argv_secrets = m.get_flag(INSECURE);
-    config.delivery = delivery(m);
     config.run_margin = secs(MARGIN);
     config.failed_stderr_log_bytes = usize::try_from(count(FAILED_STDERR_LOG))
         .map_err(|e| format!("--executor-failed-stderr-log-bytes: {e}"))?;
@@ -759,8 +656,6 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.poll = Duration::from_millis(count(POLL));
     config.prepare_limit = secs(PREPARE_LIMIT);
     config.prepare_concurrency = usize::try_from(count(PREPARE_CONCURRENCY)).unwrap_or(usize::MAX);
-    config.network = network(m);
-    config.allow_open_network = m.get_flag(OPEN_NETWORK);
     config.ownership = match m.get_one::<String>(OWNERSHIP).map(String::as_str) {
         Some("shared") => Ownership::Shared,
         _ => Ownership::Single,
@@ -831,23 +726,6 @@ fn mac_pool(m: &ArgMatches) -> Result<Option<MacPool>, String> {
     }))
 }
 
-/// The delivery `--executor-secret-delivery` names.
-fn delivery(m: &ArgMatches) -> Delivery {
-    match m.get_one::<String>(DELIVERY).map(String::as_str) {
-        Some("files") => Delivery::Files,
-        _ => Delivery::InsecureArgv,
-    }
-}
-
-/// The network `--executor-network` names.
-fn network(m: &ArgMatches) -> Network {
-    match m.get_one::<String>(NETWORK).map(String::as_str) {
-        Some("none") => Network::None,
-        Some("open") => Network::Open,
-        _ => Network::AllowList,
-    }
-}
-
 /// The image the flag `long` (argument `id`) names: by digest, with or without the `docker://`
 /// scheme of the `container-image` property.
 fn image(m: &ArgMatches, id: &str, long: &str) -> Result<ImageRef, String> {
@@ -861,17 +739,12 @@ fn image(m: &ArgMatches, id: &str, long: &str) -> Result<ImageRef, String> {
 
 impl JsAgentFlags {
     /// The executor's seams over the frontend's own `packs`, CAS `backend` (built over the same
-    /// packs) and `source` of keys, writes and grants; with `--task-out-mode put-dir`, writing
-    /// each run's action tree over the base tree [`JsAgentFlags::published`] holds.
+    /// packs) and `source` of keys and put directories, writing each run's action tree over the
+    /// base tree [`JsAgentFlags::published`] holds.
     #[must_use]
     pub fn front(&self, packs: Packs, backend: Backend, source: RunSource) -> Front {
-        let put_dir = match self.config.task_out {
-            TaskOut::PutDir(_) => Some(
-                PutDirParts::new(&packs, &backend, Arc::clone(&self.published))
-                    .with_put_retry(PutRetry::new(self.put_retry)),
-            ),
-            TaskOut::Presigned => None,
-        };
+        let put_dir = PutDirParts::new(&packs, &backend, Arc::clone(&self.published))
+            .with_put_retry(PutRetry::new(self.put_retry));
         Front::new(FrontParts {
             packs,
             backend,
@@ -922,7 +795,6 @@ impl JsAgentFlags {
             farm,
             client: self.client()?,
             ingest: front.clone(),
-            presign: front.clone(),
             inputs: front,
             metrics,
             store,

@@ -3,25 +3,22 @@
 //! A farm lease is one job ([`job_id`]): its id is the farm lease's build id, with the hash of
 //! the frontend's id before it and an attempt after it, so a submit sent again with the job its
 //! task kept, after its answer was lost, names the job already made, and the service answers
-//! from it (design section 5.3). The job is the kbf image, whose entrypoint is the
-//! task tool, run with the tool's flags; it names no CPU, memory or disk, so the job service
-//! books it what the history of its size class says, or, for a `whole_machine` lease, it needs
-//! the whole host and nothing beside it ([`Booking`]), of a Linux host of the configured
-//! architecture in a container, for the action's timeout and the run margin. The read grant and
-//! the presigned `PUT` travel as the job's files, or as arguments where the operator allowed it
-//! (`insecure_argv_secrets`). Two labels name the frontend and the process, by which a
+//! from it (design section 5.3). Two labels name the frontend and the process, by which a
 //! restarted frontend finds the jobs of an earlier one; a third, `size-class`, names the
 //! action's class ([`crate::executor::size_class`]), its target and kind, except on a
 //! `whole_machine` job, which books a whole host and so is never sized.
 //!
-//! A run that commits into a put directory (`--task-out-mode put-dir`, [`TaskOut::PutDir`]) is
-//! another job ([`put_dir_spec`]): no image, its root the action tree as its one layer (the
-//! host directory of its manifests, or with `--executor-input-tree provider` tierstore's mount
-//! provider naming its tree list, [`provider_layer`]), the
-//! task tool of the base tree as its program, the put directory mounted read-write at `/out`,
-//! no network, no files and no secret, and needs, and is labelled, as the other. A
-//! `whole_machine` lease cannot be one: the job service gives a whole-host job no layer and no
-//! mount, so it is refused as the caller's.
+//! A Linux run commits into a put directory (`--task-out-root`, [`Config::task_out`]) and is a
+//! job ([`put_dir_spec`]): no image, its root the action tree as its one layer (the host
+//! directory of its manifests, or with `--executor-input-tree provider` tierstore's mount
+//! provider naming its tree list, [`provider_layer`]), the task tool of the base tree as its
+//! program, the put directory mounted read-write at `/out`, no network, no files and no secret.
+//! It names no CPU, memory or disk, so the job service books it what the history of its size
+//! class says, or, for a `whole_machine` lease, it needs the whole host and nothing beside it
+//! ([`Booking`]); it is of a Linux host of the configured architecture in a container, for the
+//! action's timeout and the run margin. A `whole_machine` lease cannot be one: the job service
+//! gives a whole-host job no layer and no mount, so it is refused as the caller's. An executor
+//! given no roots refuses every run as the caller's, naming `--task-out-root`.
 //!
 //! An action whose platform asks for a Mac is a Mac job ([`crate::executor::mac`]): the
 //! release's `kbf-task` bundle, the tree and the put directory mounted under `/work`, no layer, of
@@ -33,7 +30,7 @@
 //! An action whose platform asks for another system than the worker it was placed on stands
 //! for is refused as the caller's ([`same_system`]).
 //!
-//! A [`JobSpec`] holds the secrets: it is sent and kept, never logged or put in an error.
+//! A [`JobSpec`] is sent and kept, and never logged.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -47,13 +44,12 @@ use ring::digest::{SHA256, digest};
 
 use crate::executor::config::{Config, InputTree};
 use crate::executor::mac::{MacJob, System, WorkerOs, check_version, mac_argv, mac_spec};
-use crate::executor::out::{PutDirRoots, TASK_IN_TREE, TaskOut, provider_layer};
+use crate::executor::out::{PutDirRoots, TASK_IN_TREE, provider_layer};
 use crate::executor::outcome::Settled;
-use crate::executor::output::Grants;
 use crate::executor::size_class::{SIZE_CLASS_LABEL, SizeClass};
-use crate::executor::task::{PackKey, TaskArgs, build_id, put_dir_argv};
-use crate::executor::traits::{InputsError, MintError, PresignError};
-use crate::executor::{Ctx, Ingest, Inputs, Presign};
+use crate::executor::task::{PackKey, build_id, put_dir_argv};
+use crate::executor::traits::{InputsError, MintError};
+use crate::executor::{Ctx, Ingest, Inputs};
 
 /// The label every job of this executor carries, valued with the frontend's id: how a
 /// restarted frontend finds the jobs it made.
@@ -90,8 +86,6 @@ pub fn job_id(frontend: &str, lease: LeaseId, attempt: u32) -> String {
 pub(super) struct Prepared {
     pub(super) spec: JobSpec,
     pub(super) key: PackKey,
-    /// What the job was handed that its attached output must never show.
-    pub(super) grants: Grants,
 }
 
 impl From<InputsError> for Settled {
@@ -100,13 +94,6 @@ impl From<InputsError> for Settled {
             InputsError::Invalid(why) => Self::Invalid(why),
             InputsError::Unavailable(why) => Self::Infra(why),
         }
-    }
-}
-
-impl From<PresignError> for Settled {
-    fn from(error: PresignError) -> Self {
-        let (PresignError::Refused(why) | PresignError::Unavailable(why)) = error;
-        Self::Infra(format!("no url for the pack: {why}"))
     }
 }
 
@@ -204,7 +191,6 @@ pub(super) struct Preparer {
     pub(super) cfg: Config,
     inputs: Arc<dyn Inputs>,
     ingest: Arc<dyn Ingest>,
-    presign: Arc<dyn Presign>,
 }
 
 impl Ctx<'_> {
@@ -214,12 +200,12 @@ impl Ctx<'_> {
             cfg: self.cfg.clone(),
             inputs: Arc::clone(&self.deps.inputs),
             ingest: Arc::clone(&self.deps.ingest),
-            presign: Arc::clone(&self.deps.presign),
         }
     }
 }
 
-/// The job of `lease`, which runs `action` with `booking` on a worker of `on`, with its pack key.
+/// The job of `lease`, which runs `action` with `booking` on a worker of `on`, with its put
+/// directory.
 pub(super) async fn prepare(
     ctx: &Preparer,
     on: WorkerOs,
@@ -234,84 +220,36 @@ pub(super) async fn prepare(
     require(timeout <= ctx.cfg.max_run, || {
         format!("the action's timeout {timeout:?} is over the executor's limit")
     })?;
-    let image = pinned(&facts.image)?;
+    pinned(&facts.image)?;
     let wall = ctx.cfg.wall(timeout);
     if let System::Macos { os_version } = facts.system {
         let times = (timeout, wall);
         return prepare_mac(ctx, lease, action, booking, times, os_version, class).await;
     }
-    if let TaskOut::PutDir(roots) = &ctx.cfg.task_out {
-        require(booking != Booking::WholeHost, || {
-            "a whole_machine action cannot commit into a put directory: the job service gives \
-             a whole-host job no mount"
-                .to_owned()
-        })?;
-        let key = minted(ctx, lease, action, wall, ctx.cfg.input_tree).await?;
-        let tree = ctx.inputs.tree(lease).await?;
-        let job = PutDirJob {
-            roots,
-            dir: &key,
-            tree: &tree,
-        };
-        let spec = put_dir_spec(ctx, &job, lease, action, (timeout, wall), (booking, class));
-        let grants = Grants::of(&spec, []);
-        return Ok(Arc::new(Prepared { spec, key, grants }));
-    }
-    // A presigned run writes no tree: the form is not read.
-    let key = minted(ctx, lease, action, wall, InputTree::Manifests).await?;
-    let pack = ctx
-        .presign
-        .put_url(&key, wall, ctx.cfg.max_pack_bytes)
-        .await?;
-    // The signed url is the task's write permission: sent in clear only if the operator
-    // said the store does not serve TLS yet.
-    if !ctx.cfg.allow_plain_http_put && !pack.expose().starts_with("https://") {
-        return Err(Settled::Infra("the pack url is not https".to_owned()));
-    }
-    let grant = ctx.inputs.read_grant(lease, action, wall).await?;
-    // The bearer token goes to the task: not over a scheme that sends it in clear, unless the
-    // operator said the job network is trusted for it.
-    if !ctx.cfg.allow_plain_http_grant && !grant.url.starts_with("https://") {
-        return Err(Settled::Infra(
-            "the read grant is not served over https".to_owned(),
-        ));
-    }
-    let args = TaskArgs {
-        action,
-        lease,
-        grant_url: &grant.url,
-        grant_token: &grant.token,
-        pack_url: &pack,
-        deadline: timeout,
-        work_dir: ctx.cfg.work_dir.as_deref(),
-        allow_plain_http_put: ctx.cfg.allow_plain_http_put,
-        allow_plain_http_grant: ctx.cfg.allow_plain_http_grant,
-        locate: ctx.cfg.locate,
+    let Some(roots) = &ctx.cfg.task_out else {
+        return Err(no_roots("a Linux action"));
     };
-    let spec = JobSpec {
-        job_id: job_id(&ctx.cfg.frontend, lease, 0),
-        image,
-        // Empty: the image's own entrypoint, the task tool, runs with the arguments.
-        command: String::new(),
-        args: args.argv(ctx.cfg.delivery),
-        env: BTreeMap::new(),
-        needs: Some(booking.needs()),
-        constraints: Some(ctx.cfg.constraints()),
-        wall_limit_seconds: Some(wall_seconds(wall)),
-        // The operator's level, by default the allow-list: the task tool reaches the read
-        // listener and the store, the endpoints the host's agent allows, and nothing else.
-        // Never left unspecified, which the service reads as none.
-        network: ctx.cfg.network.level().into(),
-        ports: Vec::new(),
-        host_ports: Vec::new(),
-        layers: Vec::new(),
-        mounts: Vec::new(),
-        files: args.files(ctx.cfg.delivery),
-        priority: 0,
-        labels: labels(ctx, booking.class(class)),
+    require(booking != Booking::WholeHost, || {
+        "a whole_machine action cannot commit into a put directory: the job service gives a \
+         whole-host job no mount"
+            .to_owned()
+    })?;
+    let key = minted(ctx, lease, action, wall, ctx.cfg.input_tree).await?;
+    let tree = ctx.inputs.tree(lease).await?;
+    let job = PutDirJob {
+        roots,
+        dir: &key,
+        tree: &tree,
     };
-    let grants = Grants::of(&spec, [pack.expose(), grant.token.expose()]);
-    Ok(Arc::new(Prepared { spec, key, grants }))
+    let spec = put_dir_spec(ctx, &job, lease, action, (timeout, wall), (booking, class));
+    Ok(Arc::new(Prepared { spec, key }))
+}
+
+/// The refusal of a run of `what` when the executor was given no roots for the put directories.
+fn no_roots(what: &str) -> Settled {
+    Settled::Invalid(format!(
+        "{what} commits into a put directory: give --task-out-root"
+    ))
 }
 
 /// Refuses an action placed on a worker of another system than its platform asks for: an action
@@ -363,10 +301,8 @@ async fn prepare_mac(
                 .to_owned(),
         ));
     };
-    let TaskOut::PutDir(linux) = &ctx.cfg.task_out else {
-        return Err(Settled::Invalid(
-            "a Mac action commits into a put directory: give --task-out-root".to_owned(),
-        ));
+    let Some(linux) = &ctx.cfg.task_out else {
+        return Err(no_roots("a Mac action"));
     };
     // The native runtime takes no mount provider: a Mac job's tree is always its manifests.
     let key = minted(ctx, lease, action, wall, InputTree::Manifests).await?;
@@ -382,11 +318,10 @@ async fn prepare_mac(
         wall_seconds: wall_seconds(wall),
         labels: labels(ctx, Some(class)),
     });
-    let grants = Grants::of(&spec, []);
-    Ok(Arc::new(Prepared { spec, key, grants }))
+    Ok(Arc::new(Prepared { spec, key }))
 }
 
-/// The key of `lease`'s run, from the frontend's ingest, its input tree written as `tree` says.
+/// The put directory of `lease`'s run, from the frontend's ingest, its input tree written as `tree` says.
 async fn minted(
     ctx: &Preparer,
     lease: LeaseId,
@@ -396,8 +331,8 @@ async fn minted(
 ) -> Result<PackKey, Settled> {
     let minted = ctx.ingest.mint(lease, action, wall, tree).await;
     minted.map_err(|e| match e {
-        MintError::Refused(why) => Settled::Invalid(format!("no key for the pack: {why}")),
-        MintError::Unavailable(why) => Settled::Infra(format!("no key for the pack: {why}")),
+        MintError::Refused(why) => Settled::Invalid(format!("no put directory: {why}")),
+        MintError::Unavailable(why) => Settled::Infra(format!("no put directory: {why}")),
     })
 }
 

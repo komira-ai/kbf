@@ -34,7 +34,7 @@
 //! skips it and counts it ([`ExecRows::unknown_rows`]), and a single read finds none. A row
 //! that has a known version and is not what it says is [`RowsError::Corrupt`].
 //!
-//! A row never holds a presigned URL, a read token or a file or environment value of a job.
+//! A row never holds a file or environment value of a job.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

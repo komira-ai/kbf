@@ -3,8 +3,8 @@
 //! Each trait has a real implementation, [`Front`](crate::executor::Front), which is built from
 //! what the frontend owns: the packs, a CAS backend over the same packs, the key mint and the
 //! preparation of a run. It maps this module's types to the frontend's one for one: the build id
-//! of a farm lease ([`build_id`](crate::executor::build_id)) for the lease, a key the mint
-//! issued for [`PackKey`], [`UntrustedLimits`] filled out with the frontend's own bounds for the
+//! of a farm lease ([`build_id`](crate::executor::build_id)) for the lease, a put directory the
+//! mint issued for [`PackKey`], [`UntrustedLimits`] filled out with the frontend's own bounds for the
 //! fields it does not have, and the frontend's reasons for [`RejectReason`]. The tests have fakes.
 
 use std::fmt;
@@ -16,7 +16,7 @@ use kbf_types::LeaseId;
 use crate::executor::config::InputTree;
 use crate::executor::mac::System;
 use crate::executor::size_class::SizeClass;
-use crate::executor::task::{PackKey, Secret};
+use crate::executor::task::PackKey;
 
 /// The bounds the frontend holds a pack an untrusted task wrote to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,12 +91,12 @@ pub enum Ingested {
     Unavailable(String),
 }
 
-/// Why a pack key was not issued, and whose to fix: the same run asked again gives the same
+/// Why a put directory was not issued, and whose to fix: the same run asked again gives the same
 /// answer when it is refused, and may give another when the store was unavailable.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MintError {
     /// The job cannot be prepared as asked (an input missing or over budget, a digest that is
-    /// not one, a configuration that does not sign): the caller's to fix, and settled as such.
+    /// not one, a lease no key can carry): the caller's to fix, and settled as such.
     #[error("{0}")]
     Refused(String),
     /// The store could not answer: the farm runs the action again.
@@ -104,16 +104,15 @@ pub enum MintError {
     Unavailable(String),
 }
 
-/// Issues, reads, verifies and commits the pack a task wrote. Called after a run ended with
+/// Issues, reads, verifies and commits what a task wrote. Called after a run ended with
 /// the task tool's exit 0, and never with a lock of the farm held.
 #[tonic::async_trait]
 pub trait Ingest: Send + Sync {
-    /// The key `lease` may write the pack of `action` under, good for a run of `wall`. Issued
-    /// by the same secret that [`ingest`](Self::ingest) verifies it with: a key the ingest did
-    /// not issue for this lease and this action is refused there. Called once for a farm
-    /// lease, before the url and the grant of the same run are asked for. A run that commits
-    /// into a put directory has its input tree written here too, as `tree` says, for
-    /// [`Inputs::tree`]; a presigned run has none, and `tree` is not read.
+    /// The put directory `lease` may commit the run of `action` into, good for a run of `wall`.
+    /// Issued by the same secret that [`ingest`](Self::ingest) verifies it with: a directory the
+    /// ingest did not issue for this lease and this action is refused there. Called once for a
+    /// farm lease. The run's input tree is written here too, as `tree` says, for
+    /// [`Inputs::tree`].
     ///
     /// # Errors
     /// [`MintError`].
@@ -135,30 +134,6 @@ pub trait Ingest: Send + Sync {
     ) -> Ingested;
 }
 
-/// Why a presigned `PUT` was not minted.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PresignError {
-    /// The store will not sign this (an expiry above its ceiling, a key outside its prefix).
-    Refused(String),
-    /// The store could not be reached.
-    Unavailable(String),
-}
-
-/// Mints the one-shot, create-only `PUT` url a task writes its pack to. The url is a secret.
-#[tonic::async_trait]
-pub trait Presign: Send + Sync {
-    /// A url for `key` that stays good for `expires`, for an object of at most `max_bytes`.
-    ///
-    /// # Errors
-    /// [`PresignError`].
-    async fn put_url(
-        &self,
-        key: &PackKey,
-        expires: Duration,
-        max_bytes: u64,
-    ) -> Result<Secret, PresignError>;
-}
-
 /// What the executor reads of an action before it runs one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionFacts {
@@ -175,26 +150,17 @@ pub struct ActionFacts {
     pub size_class: SizeClass,
 }
 
-/// What a task reads its inputs with.
-#[derive(Clone, Debug)]
-pub struct ReadGrant {
-    /// The base url of the read endpoint (an IP literal: the job network has no DNS).
-    pub url: String,
-    /// The bearer token.
-    pub token: Secret,
-}
-
 /// Why the inputs of an action could not be had.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputsError {
     /// The action cannot run here, whatever is tried again: an image that is not the
     /// served base. The caller's to fix.
     Invalid(String),
-    /// The CAS or the grant service could not be reached.
+    /// The CAS could not be reached, or no tree was written for the run.
     Unavailable(String),
 }
 
-/// The CAS read of an action and the read grant of its task.
+/// The CAS read of an action and the action tree of its run.
 #[tonic::async_trait]
 pub trait Inputs: Send + Sync {
     /// The image and timeout of `action`.
@@ -202,17 +168,6 @@ pub trait Inputs: Send + Sync {
     /// # Errors
     /// [`InputsError`].
     async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError>;
-
-    /// A grant that reads the closure of `action` for `lease` for `expires`.
-    ///
-    /// # Errors
-    /// [`InputsError`].
-    async fn read_grant(
-        &self,
-        lease: LeaseId,
-        action: &Digest,
-        expires: Duration,
-    ) -> Result<ReadGrant, InputsError>;
 
     /// The action tree [`Ingest::mint`] wrote for the run of `lease` that commits into a put
     /// directory, as it was asked to write it: with [`InputTree::Manifests`], its root

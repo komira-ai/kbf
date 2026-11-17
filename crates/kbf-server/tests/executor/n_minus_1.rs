@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use kbf_server::executor::rows::ExecRows;
-use kbf_server::executor::{Config, Deps, Executor, Ownership, PutDirRoots, TaskOut};
+use kbf_server::executor::{Config, Deps, Executor, Ownership};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{Cond, ManualClock, Store, Txn};
 
@@ -40,7 +40,6 @@ async fn a_shared_executor_over_a_store_with_no_exec_rows_writes_its_own_and_fin
 
     let cfg = Config {
         ownership: Ownership::Shared,
-        task_out: TaskOut::PutDir(PutDirRoots::new("/mnt/ts/put").expect("roots")),
         instance: fresh_instance(),
         ..rig.cfg.clone()
     };
@@ -48,7 +47,6 @@ async fn a_shared_executor_over_a_store_with_no_exec_rows_writes_its_own_and_fin
         farm: Arc::clone(&rig.farm),
         client: rig.fake.client().expect("a client"),
         ingest: rig.ingest.clone(),
-        presign: rig.presign.clone(),
         inputs: rig.inputs.clone(),
         metrics: Arc::clone(&rig.metrics),
         store: Some(Arc::clone(&store)),

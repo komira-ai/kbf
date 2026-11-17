@@ -5,7 +5,6 @@ use std::time::Duration;
 use js_proto::v1::JobState;
 use kbf_front::Finished;
 use kbf_job_client::fake::Fault;
-use kbf_types::LeaseKind;
 
 use crate::rig::{Posted, Rig, cancels, submits};
 
@@ -36,11 +35,10 @@ async fn queued(rig: &mut Rig, tag: u8, seen: &[String]) -> Posted {
 
 /// Catches an executor that does not use the job service the way its design says (the lease
 /// client itself is kept out of the executor by the layering test): over actions that run, a
-/// whole-machine action, a submit whose answer is lost, a lease the farm gives up and a restart
-/// of the executor, every call it makes is one of `SubmitJob`, `GetJob`, `ListJobs`,
-/// `CancelJob` and `GetResult`, and each of the five is made (so the check is not about an
-/// empty list). The lost answer makes one job, sent twice; the whole-machine action is one job
-/// too, through the same calls.
+/// submit whose answer is lost, a lease the farm gives up and a restart of the executor, every
+/// call it makes is one of `SubmitJob`, `GetJob`, `ListJobs`, `CancelJob` and `GetResult`, and
+/// each of the five is made (so the check is not about an empty list). The lost answer makes
+/// one job, sent twice.
 #[tokio::test(start_paused = true)]
 async fn no_lease_call_remains() {
     let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
@@ -54,19 +52,6 @@ async fn no_lease_call_remains() {
         assert!(matches!(rig.until_done(caller, 8).await, Finished::Ran(_)));
     }
     assert_eq!(rig.ingest.calls.lock().expect("calls").len(), 2);
-
-    // A whole-machine action is one job, of the whole host, submitted and read as any other.
-    let whole = rig.submit_kind(3, LeaseKind::WholeMachine);
-    let job = queued(&mut rig, 3, &[]).await;
-    assert!(
-        job.spec
-            .needs
-            .as_ref()
-            .is_some_and(|needs| needs.whole_host)
-    );
-    rig.host_finishes(job.id(), HOST, 0);
-    assert!(matches!(rig.until_done(&whole, 8).await, Finished::Ran(_)));
-    assert_eq!(rig.jobs_of(3).len(), 1);
 
     // A submit whose answer is lost makes one job, which is sent again under its id.
     let lost = rig.submit(4);

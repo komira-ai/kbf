@@ -25,10 +25,11 @@ use crate::executor::rows::{ExecRows, Held};
 use crate::executor::share::Share;
 use crate::executor::size_class::SizeClass;
 use crate::executor::traits::{
-    ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
-    ReadGrant, UntrustedLimits,
+    ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, UntrustedLimits,
 };
-use crate::executor::{Config, Ctx, Deps, InputTree, Ownership, PackKey, Secret, Twin, build_id};
+use crate::executor::{
+    Config, Ctx, Deps, InputTree, Ownership, PackKey, PutDirRoots, Twin, build_id,
+};
 
 pub(super) const GIB: u64 = 1 << 30;
 
@@ -62,13 +63,6 @@ impl Ingest for Easy {
 }
 
 #[tonic::async_trait]
-impl Presign for Easy {
-    async fn put_url(&self, key: &PackKey, _: Duration, _: u64) -> Result<Secret, PresignError> {
-        Ok(Secret::new(format!("https://store.test/{key}")))
-    }
-}
-
-#[tonic::async_trait]
 impl Inputs for Easy {
     async fn action(&self, _: &Digest) -> Result<ActionFacts, InputsError> {
         Ok(ActionFacts {
@@ -79,16 +73,8 @@ impl Inputs for Easy {
         })
     }
 
-    async fn read_grant(
-        &self,
-        _: LeaseId,
-        _: &Digest,
-        _: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Ok(ReadGrant {
-            url: "https://grant.test:9400".to_owned(),
-            token: Secret::new("token"),
-        })
+    async fn tree(&self, _: LeaseId) -> Result<String, InputsError> {
+        Ok("ab".repeat(32))
     }
 }
 
@@ -145,12 +131,11 @@ impl Harness {
         ));
         let mut cfg = Config::new("front", 1, 2_000, 16 * GIB);
         cfg.slots = 2;
-        cfg.insecure_argv_secrets = true;
+        cfg.task_out = Some(PutDirRoots::new("/mnt/ts/put").expect("roots"));
         let deps = Deps {
             farm: Arc::clone(&farm),
             client: fake.client().expect("a client"),
             ingest: Arc::new(Easy),
-            presign: Arc::new(Easy),
             inputs: Arc::new(Easy),
             metrics: Arc::default(),
             store: None,

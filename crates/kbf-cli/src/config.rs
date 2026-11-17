@@ -257,6 +257,8 @@ const GROUPS: &[(&str, &[&str])] = &[
         &[
             "task-closure-max-bytes",
             "task-closure-max-digests",
+            "task-directory-cache-bytes",
+            "task-directory-cache-dir",
             "task-janitor-dry-run",
             "task-janitor-grace-secs",
             "task-janitor-interval-secs",
@@ -286,7 +288,9 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         // Where the frontend runs placed actions (`kbf_server::frontend`'s `executor_flags`):
-        // jobs of the job scheduler's job service.
+        // jobs of the job scheduler's job service. The flags of the presigned path that was
+        // removed stay listed, so that a file that still sets one is refused naming its flag
+        // and the release, not as an unknown key.
         "executor",
         &[
             "executor",

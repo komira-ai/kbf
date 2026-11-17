@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use js_proto::v1::{JobFile, JobResult, JobState, JobTimes, Needs, NetworkLevel, ResultReason};
+use js_proto::v1::{JobResult, JobState, JobTimes, Needs, NetworkLevel, ResultReason};
 use kbf_job_client::fake::Call;
 use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
@@ -13,8 +13,8 @@ use super::{
 };
 use crate::executor::outcome::{Verdict, judge};
 use crate::executor::test_support::{GIB, Harness, built_class};
-use crate::executor::traits::{InputsError, PresignError};
-use crate::executor::{ActionFacts, Ctx, Delivery, Deps, Inputs, ReadGrant, Secret, build_id};
+use crate::executor::traits::InputsError;
+use crate::executor::{ActionFacts, Ctx, Deps, Inputs, build_id};
 
 const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -106,15 +106,6 @@ fn what_could_not_be_read_is_classed_by_whose_fault_it_is() {
         Settled::from(InputsError::Unavailable("down".to_owned())),
         Settled::Infra("down".to_owned())
     );
-    for error in [
-        PresignError::Refused("ceiling".to_owned()),
-        PresignError::Unavailable("ceiling".to_owned()),
-    ] {
-        let Settled::Infra(why) = Settled::from(error) else {
-            panic!("not infra");
-        };
-        assert!(why.contains("ceiling"), "{why}");
-    }
     assert_eq!(require(true, || unreachable!()), Ok(()));
     assert_eq!(
         require(false, || "no".to_owned()),
@@ -145,16 +136,8 @@ impl Inputs for Timed {
         })
     }
 
-    async fn read_grant(
-        &self,
-        _: LeaseId,
-        _: &Digest,
-        _: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Ok(ReadGrant {
-            url: "https://grant.test:9400".to_owned(),
-            token: Secret::new("the-token"),
-        })
+    async fn tree(&self, _: LeaseId) -> Result<String, InputsError> {
+        Ok("cd".repeat(32))
     }
 }
 
@@ -285,9 +268,8 @@ fn arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 /// Catches a job asking for the wrong thing of the service: it names no CPU, no memory and no
 /// disk, whatever the farm booked, so the service sizes it from its class's history; it runs
-/// on a Linux container host of the configured architecture, with the allow-listed network, the
-/// image's own entrypoint, and labels naming the frontend, the process and the action's size
-/// class; and its id is the lease's, attempt 0.
+/// on a Linux container host of the configured architecture, with no network, and labels naming
+/// the frontend, the process and the action's size class; and its id is the lease's, attempt 0.
 #[tokio::test(start_paused = true)]
 async fn prepare_builds_the_job_the_service_is_asked_for() {
     let harness = Harness::new().await;
@@ -295,11 +277,6 @@ async fn prepare_builds_the_job_the_service_is_asked_for() {
     let built = prepared(&harness, None, BOOKING).await.expect("prepared");
     let spec = &built.spec;
     assert_eq!(spec.job_id, job_id(&cfg.frontend, LeaseId::new(7, 8), 0));
-    assert_eq!(
-        spec.image,
-        format!("registry.test/app@sha256:{}", "ab".repeat(32))
-    );
-    assert_eq!(spec.command, "");
     assert!(spec.env.is_empty());
     assert_eq!(
         spec.needs,
@@ -307,7 +284,7 @@ async fn prepare_builds_the_job_the_service_is_asked_for() {
         "no CPU, memory, disk or GPU, and not the whole host"
     );
     assert_eq!(spec.constraints.as_ref(), Some(&cfg.constraints()));
-    assert_eq!(spec.network(), NetworkLevel::AllowList);
+    assert_eq!(spec.network(), NetworkLevel::None);
     assert!(spec.ports.is_empty());
     assert_eq!(spec.labels.len(), 3);
     assert_eq!(
@@ -353,97 +330,21 @@ fn a_start_books_the_whole_host_only_for_a_whole_machine_lease() {
     }
 }
 
-/// Catches a whole-host job the service would refuse, or one that differs from a shared job
-/// in more than its needs and its class: it needs the whole host and nothing else (no CPU,
-/// memory, disk or GPU, which the service refuses beside `whole_host`) and carries no size
-/// class (it is never sized, and its runs would teach the class a whole host's use); its id,
-/// image, command, environment, constraints, wall limit, network, ports, priority and other
-/// labels are those of the same lease's shared job, and its arguments name the same lease and
-/// action (the pack url in them is minted again for each prepare).
-#[tokio::test(start_paused = true)]
-async fn a_whole_host_job_needs_the_whole_host_alone() {
-    let harness = Harness::new().await;
-    let whole = prepared(&harness, None, Booking::WholeHost)
-        .await
-        .expect("prepared");
-    let shared = prepared(&harness, None, BOOKING).await.expect("prepared");
+/// Catches a whole-host need the service would refuse, or one that is sized: it needs the whole
+/// host and nothing else (no CPU, memory, disk or GPU, which the service refuses beside
+/// `whole_host`) and carries no size class (it is never sized, and its runs would teach the
+/// class a whole host's use), where a share needs nothing named and carries its class.
+#[test]
+fn a_whole_host_needs_the_whole_host_alone_and_is_never_sized() {
+    let class = built_class();
     assert_eq!(
-        whole.spec.needs,
-        Some(Needs {
+        Booking::WholeHost.needs(),
+        Needs {
             whole_host: true,
             ..Needs::default()
-        })
+        }
     );
-    assert_eq!(shared.spec.needs, Some(Needs::default()));
-    assert_eq!(whole.spec.labels.get("size-class"), None);
-    assert!(shared.spec.labels.contains_key("size-class"));
-    let without_needs = |spec: &js_proto::v1::JobSpec| js_proto::v1::JobSpec {
-        needs: None,
-        labels: spec
-            .labels
-            .iter()
-            .filter(|(key, _)| *key != "size-class")
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-        // The grant and the pack url are made again for each prepare.
-        args: Vec::new(),
-        files: Vec::new(),
-        ..spec.clone()
-    };
-    assert_eq!(without_needs(&whole.spec), without_needs(&shared.spec));
-    assert_eq!(arg(&whole.spec.args, "--lease"), Some("7-8"));
-    assert_eq!(
-        arg(&whole.spec.args, "--action"),
-        arg(&shared.spec.args, "--action")
-    );
-}
-
-/// Catches the secrets travelling the way the operator did not choose: under `Files` the
-/// presigned url and the read token are the contents of the job's two files and no argument
-/// holds either; under `InsecureArgv` the arguments hold them and the job has no files.
-#[tokio::test(start_paused = true)]
-async fn the_secrets_travel_as_the_delivery_says() {
-    let mut harness = Harness::new().await;
-    harness.cfg.delivery = Delivery::Files;
-    harness.cfg.insecure_argv_secrets = false;
-    let files = prepared(&harness, Some(Timed(None)), BOOKING)
-        .await
-        .expect("prepared");
-    let url = format!("https://store.test/{}", files.key);
-    assert_eq!(
-        files.spec.files,
-        vec![
-            JobFile {
-                name: "pack-url".to_owned(),
-                contents: url.clone(),
-            },
-            JobFile {
-                name: "grant-token".to_owned(),
-                contents: "the-token".to_owned(),
-            },
-        ]
-    );
-    for arg in &files.spec.args {
-        assert!(
-            arg != "the-token" && !arg.contains("store.test"),
-            "an argument holds a secret: {arg}"
-        );
-    }
-    assert!(arg(&files.spec.args, "--pack-url-file").is_some());
-    assert!(arg(&files.spec.args, "--grant-token-file").is_some());
-
-    harness.cfg.delivery = Delivery::InsecureArgv;
-    harness.cfg.insecure_argv_secrets = true;
-    let argv = prepared(&harness, Some(Timed(None)), BOOKING)
-        .await
-        .expect("prepared");
-    assert!(argv.spec.files.is_empty());
-    assert_eq!(arg(&argv.spec.args, "--pack-url"), Some(url.as_str()));
-    assert_eq!(arg(&argv.spec.args, "--grant-token"), Some("the-token"));
-    assert!(
-        argv.spec
-            .args
-            .iter()
-            .any(|a| a == "--insecure-argv-secrets")
-    );
+    assert_eq!(Booking::WholeHost.class(&class), None);
+    assert_eq!(BOOKING.needs(), Needs::default());
+    assert_eq!(BOOKING.class(&class), Some(&class));
 }

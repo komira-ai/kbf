@@ -532,19 +532,38 @@ fn each_modes_golden_matches_the_flag_definitions() {
     );
 }
 
-/// Catches `--executor-locate` missing from the frontend's `kbf.toml`, or on in it: the template
-/// generated from the flag definitions (not the golden file) names the key, off, and the golden
-/// file carries the same line.
+/// Catches a removed executor key (the settings of the presigned path, which the template once
+/// wrote as live lines) read again as a setting, or refused like any unknown key without saying
+/// that it was removed: each of the eight in `[executor]` exits 2 naming its flag, the release
+/// and that the key is to be deleted.
 #[test]
-fn kbf_toml_golden_names_executor_locate() {
-    let template = kbf_cli::config_template("frontend").expect("a mode");
-    let golden = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/kbf-frontend.toml"),
-    )
-    .expect("golden");
-    for text in [&template, &golden] {
-        let lines = text.lines().filter(|l| l.starts_with("executor-locate"));
-        assert_eq!(lines.collect::<Vec<_>>(), ["executor-locate = false"]);
+fn a_removed_presigned_path_key_is_refused_naming_the_release() {
+    let dir = scratch("presigned-path-key");
+    for (key, value) in [
+        ("executor-secret-delivery", "\"argv\""),
+        ("executor-insecure-argv-secrets", "true"),
+        ("executor-work-dir", "\"/scratch\""),
+        ("executor-allow-plain-http-put", "true"),
+        ("executor-allow-plain-http-grant", "false"),
+        ("executor-locate", "false"),
+        ("executor-network", "\"allow-list\""),
+        ("executor-allow-open-network", "false"),
+    ] {
+        let body = format!("{FRONTEND_FILE}\n[executor]\n{key} = {value}\n");
+        let path = file(&dir, &body, 0o600);
+        let err =
+            kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None).expect_err(key);
+        assert_eq!(err.exit_code(), 2, "{key}");
+        let msg = err.to_string();
+        let shown = value.trim_matches('"');
+        assert!(
+            msg.contains(&format!(
+                "invalid value '{shown}' for '--{key} <VALUE>': the flag was removed in this \
+                 release (kbf-server "
+            )),
+            "{key}: {msg}"
+        );
+        assert!(msg.contains("delete the flag"), "{key}: {msg}");
     }
 }
 

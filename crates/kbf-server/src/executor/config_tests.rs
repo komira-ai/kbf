@@ -4,30 +4,25 @@ use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, START_GRACE, START_VALI
 
 use js_proto::v1::ExecMode;
 
-use super::{
-    Config, ConfigError, Delivery, HARD_CAP_PAD, InputTree, Ownership, PRESIGN_LIMIT, TaskOut,
-};
+use super::{Config, ConfigError, HARD_CAP_PAD, InputTree, KEY_LIMIT, Ownership};
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
 use crate::executor::PutDirRoots;
 
 const GIB: u64 = 1 << 30;
 
 fn base() -> Config {
-    Config {
-        insecure_argv_secrets: true,
-        ..Config::new("front-1", 2, 16_000, 64 * GIB)
-    }
+    Config::new("front-1", 2, 16_000, 64 * GIB)
 }
 
-/// Catches a default set that the executor itself refuses (a start that fails at once), and
-/// secrets in arguments that nobody asked for: a config built from the defaults is refused
-/// until the operator says the secrets may travel as arguments, and is valid once they do.
+/// Catches a default set that the executor itself refuses (a start that fails at once), and a
+/// default that gives runs somewhere to commit that nobody named: a config built from the
+/// defaults is valid, has no put-directory roots, and has the longest key ceiling.
 #[test]
-fn the_defaults_are_valid_once_the_operator_allows_argv_secrets() {
-    let defaults = Config::new("front-1", 2, 16_000, 64 * GIB);
-    assert!(!defaults.insecure_argv_secrets);
-    assert_eq!(defaults.validate(), Err(ConfigError::InsecureArgv));
-    assert_eq!(base().validate(), Ok(()));
+fn the_defaults_are_valid_and_name_no_put_directory_roots() {
+    let defaults = base();
+    assert_eq!(defaults.validate(), Ok(()));
+    assert_eq!(defaults.task_out, None);
+    assert_eq!(defaults.key_ceiling, KEY_LIMIT);
 }
 
 /// Catches the heartbeat interval returning to 5 s: a `Start` names the newest heartbeat the
@@ -183,17 +178,17 @@ fn each_unsafe_setting_is_refused_by_name() {
         ),
         (
             Config {
-                presign_ceiling: Duration::from_secs(3299),
+                key_ceiling: Duration::from_secs(3299),
                 ..base()
             },
-            ConfigError::Presign,
+            ConfigError::KeyCeiling,
         ),
         (
             Config {
-                presign_ceiling: PRESIGN_LIMIT + Duration::from_secs(1),
+                key_ceiling: KEY_LIMIT + Duration::from_secs(1),
                 ..base()
             },
-            ConfigError::PresignLimit,
+            ConfigError::KeyLimit,
         ),
         (
             Config {
@@ -215,13 +210,6 @@ fn each_unsafe_setting_is_refused_by_name() {
                 ..base()
             },
             ConfigError::Bounds,
-        ),
-        (
-            Config {
-                insecure_argv_secrets: false,
-                ..base()
-            },
-            ConfigError::InsecureArgv,
         ),
     ];
     for (config, want) in rows {
@@ -298,39 +286,9 @@ fn the_hello_reports_a_container_and_whole_machine_host_and_nothing_else() {
     assert_eq!(reported.capacity.memory_bytes, 40 * GIB);
 }
 
-/// Catches the insecure flag demanded of a delivery that sends no secret in arguments, and
-/// dropped from the one that does: `argv` is refused without it, `files` is valid without it.
-#[test]
-fn files_mode_needs_no_insecure_flag_and_argv_mode_still_does() {
-    let files = Config {
-        delivery: Delivery::Files,
-        insecure_argv_secrets: false,
-        ..base()
-    };
-    assert_eq!(files.validate(), Ok(()));
-    let argv = Config {
-        delivery: Delivery::InsecureArgv,
-        insecure_argv_secrets: false,
-        ..base()
-    };
-    assert_eq!(argv.validate(), Err(ConfigError::InsecureArgv));
-}
-
-/// Catches the parser being the only guard against the contradiction: a config that says the
-/// secrets travel as files and also that they may travel as arguments is refused by name.
-#[test]
-fn files_delivery_refuses_the_insecure_opt_in() {
-    let both = Config {
-        delivery: Delivery::Files,
-        insecure_argv_secrets: true,
-        ..base()
-    };
-    assert_eq!(both.validate(), Err(ConfigError::InsecureWithFiles));
-}
-
 /// Catches a job that asks its host for the wrong system, architecture or way to run: a job
 /// asks for linux, the architecture the config names (not a fixed one) and a container, and
-/// for nothing else, whatever the delivery of the secrets.
+/// for nothing else.
 #[test]
 fn a_job_asks_for_a_linux_host_of_the_configured_arch_that_runs_containers() {
     let wanted = |config: &Config| {
@@ -347,8 +305,6 @@ fn a_job_asks_for_a_linux_host_of_the_configured_arch_that_runs_containers() {
     );
     let arm = Config {
         arch: "aarch64".to_owned(),
-        delivery: Delivery::Files,
-        insecure_argv_secrets: false,
         ..base()
     };
     assert_eq!(
@@ -382,12 +338,12 @@ fn each_config_gets_an_instance_id_of_its_own() {
     assert!(one.instance.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
-/// A config of shared ownership that is valid: output through put directories, which shared
-/// ownership needs, and the default liveness time.
+/// A config of shared ownership that is valid: put directories under roots, and the default
+/// liveness time.
 fn shared() -> Config {
     Config {
         ownership: Ownership::Shared,
-        task_out: TaskOut::PutDir(PutDirRoots::new("/mnt/ts/put").expect("roots")),
+        task_out: Some(PutDirRoots::new("/mnt/ts/put").expect("roots")),
         ..base()
     }
 }
@@ -405,30 +361,6 @@ fn the_defaults_are_single_ownership_and_a_live_time_of_the_fence_plus_the_margi
     assert_eq!(config.live, config.fence_after + LEADER_LEASE_MARGIN);
     assert!(shared().shared());
     assert_eq!(shared().validate(), Ok(()));
-}
-
-/// Catches shared ownership accepted with presigned task outputs, where a job's write url is
-/// in no row and no other frontend could finish the job: shared with the presigned mode is
-/// refused with a message that names both flags, the same config with put directories is
-/// valid, and single ownership still takes presigned outputs.
-#[test]
-fn shared_with_presigned_is_refused() {
-    let presigned = Config {
-        task_out: TaskOut::Presigned,
-        ..shared()
-    };
-    assert_eq!(presigned.validate(), Err(ConfigError::SharedPresigned));
-    assert_eq!(
-        ConfigError::SharedPresigned.to_string(),
-        "--executor-ownership shared needs --task-out-mode put-dir: a presigned job's URL is \
-         in no row, so no other frontend could finish it"
-    );
-    assert_eq!(shared().validate(), Ok(()));
-    let single = Config {
-        task_out: TaskOut::Presigned,
-        ..base()
-    };
-    assert_eq!(single.validate(), Ok(()));
 }
 
 /// Catches a liveness time under which a row may expire while its process still acts, and an
@@ -471,23 +403,6 @@ fn single_ownership_does_not_judge_the_live_time() {
         let config = Config { live, ..base() };
         assert_eq!(config.validate(), Ok(()), "{live:?}");
     }
-}
-
-/// Catches the wrong refusal when a shared config breaks the liveness rule and the output
-/// rule together: the liveness time is reported first, and the output mode once it is fixed.
-#[test]
-fn a_shared_config_with_both_faults_names_the_live_time_first() {
-    let both = Config {
-        live: Duration::from_secs(1),
-        task_out: TaskOut::Presigned,
-        ..shared()
-    };
-    assert_eq!(both.validate(), Err(ConfigError::Live));
-    let fixed = Config {
-        live: Duration::from_secs(45),
-        ..both
-    };
-    assert_eq!(fixed.validate(), Err(ConfigError::SharedPresigned));
 }
 
 /// Catches a worker name that two live processes of one frontend id could both register: a
@@ -556,9 +471,18 @@ fn mac_worker_names_carry_the_instance_only_in_shared_mode() {
 }
 
 /// Catches an operator message that names the wrong flag or drops the number: the text of
-/// the liveness and the state-store refusals, whole.
+/// the liveness, state-store and key-ceiling refusals, whole.
 #[test]
-fn the_messages_of_the_shared_refusals_name_the_flags() {
+fn the_messages_of_the_refusals_name_the_flags_and_the_numbers() {
+    assert_eq!(
+        ConfigError::KeyCeiling.to_string(),
+        "the longest job's wall limit exceeds the key ceiling"
+    );
+    assert_eq!(
+        ConfigError::KeyLimit.to_string(),
+        "the key ceiling and the longest job's wall limit must be at most 4 hours"
+    );
+    assert_eq!(KEY_LIMIT, Duration::from_secs(4 * 3600));
     assert_eq!(
         ConfigError::Live.to_string(),
         "--executor-live-secs must be at least the fence time plus 5 s with \
@@ -648,48 +572,16 @@ const BUNDLE: &str =
     "kbf-task@sha256:9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a";
 
 /// Asserts the default of `--executor-input-tree`: `Config::new` and `InputTree::default()` are
-/// `Manifests`, and the default config is valid with either task-out mode. Catches: a default
+/// `Manifests`, and the default config is valid with or without roots. Catches: a default
 /// that turns the tree list on for every frontend that never asked for it.
 #[test]
 fn the_default_input_tree_is_manifests() {
     assert_eq!(base().input_tree, InputTree::Manifests);
     assert_eq!(InputTree::default(), InputTree::Manifests);
     let put_dir = Config {
-        task_out: TaskOut::PutDir(PutDirRoots::new("/mnt/ts/put").expect("roots")),
+        task_out: Some(PutDirRoots::new("/mnt/ts/put").expect("roots")),
         ..base()
     };
     assert_eq!(put_dir.input_tree, InputTree::Manifests);
     assert_eq!(put_dir.validate(), Ok(()));
-}
-
-/// Asserts that the provider with presigned task outputs is refused as
-/// `ConfigError::ProviderPresigned` with its exact message naming both flags, that the same
-/// config with a put directory validates, and that presigned outputs with the manifests still
-/// validate. Catches: a provider tree accepted where no job reads its root from a tree, and a
-/// refusal that does not say which flag to change.
-#[test]
-fn the_provider_input_tree_needs_put_dir_outputs() {
-    let presigned = Config {
-        task_out: TaskOut::Presigned,
-        input_tree: InputTree::Provider,
-        ..base()
-    };
-    assert_eq!(presigned.validate(), Err(ConfigError::ProviderPresigned));
-    assert_eq!(
-        ConfigError::ProviderPresigned.to_string(),
-        "--executor-input-tree provider needs --task-out-mode put-dir: only a put-directory \
-         job reads its root from a tree"
-    );
-    let put_dir = Config {
-        task_out: TaskOut::PutDir(PutDirRoots::new("/mnt/ts/put").expect("roots")),
-        input_tree: InputTree::Provider,
-        ..base()
-    };
-    assert_eq!(put_dir.validate(), Ok(()));
-    let manifests = Config {
-        task_out: TaskOut::Presigned,
-        input_tree: InputTree::Manifests,
-        ..base()
-    };
-    assert_eq!(manifests.validate(), Ok(()));
 }

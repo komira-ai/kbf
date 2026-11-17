@@ -1,7 +1,7 @@
 //! The harness: a farm, a job service, an executor, and fakes for what the executor reads
 //! from the rest of the server.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -16,8 +16,7 @@ use kbf_server::Farm;
 use kbf_server::executor::rows::ExecRows;
 use kbf_server::executor::{
     ActionFacts, Config, Deps, Executor, Ingest, Ingested, InputTree, Inputs, InputsError, Metrics,
-    MintError, Ownership, PackKey, Presign, PresignError, PutDirRoots, ReadGrant, Secret,
-    SizeClass, TaskOut, UntrustedLimits, build_id,
+    MintError, Ownership, PackKey, PutDirRoots, SizeClass, UntrustedLimits, build_id,
 };
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
@@ -39,10 +38,9 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// What the executor reads of an action, and the grant of its task.
+/// What the executor reads of an action, and the tree of its put-directory run.
 pub struct FakeInputs {
     pub facts: Mutex<Result<ActionFacts, InputsError>>,
-    pub grant: Mutex<Result<ReadGrant, InputsError>>,
     /// The action tree of a put-directory run.
     pub tree: Mutex<Result<String, InputsError>>,
     pub looked_up: Mutex<Vec<String>>,
@@ -59,10 +57,6 @@ impl FakeInputs {
                 timeout: Some(Duration::from_secs(60)),
                 system: kbf_server::executor::System::Linux,
                 size_class: built_class(),
-            })),
-            grant: Mutex::new(Ok(ReadGrant {
-                url: "https://grant.test:9400".to_owned(),
-                token: Secret::new("read-token-0001"),
             })),
             tree: Mutex::new(Ok(TREE.to_owned())),
             looked_up: Mutex::new(Vec::new()),
@@ -82,15 +76,6 @@ impl Inputs for FakeInputs {
         locked(&self.facts).clone()
     }
 
-    async fn read_grant(
-        &self,
-        _lease: kbf_types::LeaseId,
-        _action: &Digest,
-        _expires: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        locked(&self.grant).clone()
-    }
-
     async fn tree(&self, _lease: kbf_types::LeaseId) -> Result<String, InputsError> {
         locked(&self.tree).clone()
     }
@@ -98,79 +83,6 @@ impl Inputs for FakeInputs {
 
 /// The action tree the fake inputs give a put-directory run.
 pub const TREE: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
-
-/// One url the store minted.
-#[derive(Clone, Debug)]
-pub struct Minted {
-    pub key: String,
-    pub expires: Duration,
-    pub max_bytes: u64,
-}
-
-/// A store that signs a url for any key, and takes a `PUT` of a key once.
-pub struct FakePresign {
-    pub minted: Mutex<Vec<Minted>>,
-    pub written: Mutex<BTreeSet<String>>,
-    pub fail: Mutex<Option<PresignError>>,
-    /// While set, the urls are `http://`: a store that does not serve TLS.
-    pub plain: AtomicBool,
-}
-
-impl FakePresign {
-    fn new() -> Self {
-        Self {
-            minted: Mutex::new(Vec::new()),
-            written: Mutex::new(BTreeSet::new()),
-            fail: Mutex::new(None),
-            plain: AtomicBool::new(false),
-        }
-    }
-
-    /// The `PUT` of a task to `url`: refused if the key was written before, as a create-only
-    /// store refuses it.
-    pub fn put(&self, url: &str) -> Result<(), &'static str> {
-        let key = url
-            .strip_prefix("https://store.test/")
-            .or_else(|| url.strip_prefix("http://store.test/"))
-            .and_then(|rest| rest.split('?').next())
-            .expect("a url this store minted");
-        match locked(&self.written).insert(key.to_owned()) {
-            true => Ok(()),
-            false => Err("412 the key exists"),
-        }
-    }
-
-    pub fn keys(&self) -> Vec<String> {
-        locked(&self.minted).iter().map(|m| m.key.clone()).collect()
-    }
-}
-
-#[tonic::async_trait]
-impl Presign for FakePresign {
-    async fn put_url(
-        &self,
-        key: &PackKey,
-        expires: Duration,
-        max_bytes: u64,
-    ) -> Result<Secret, PresignError> {
-        if let Some(error) = locked(&self.fail).clone() {
-            return Err(error);
-        }
-        locked(&self.minted).push(Minted {
-            key: key.to_string(),
-            expires,
-            max_bytes,
-        });
-        let scheme = if self.plain.load(Ordering::Relaxed) {
-            "http"
-        } else {
-            "https"
-        };
-        Ok(Secret::new(format!(
-            "{scheme}://store.test/{key}?sig=s3cr3t"
-        )))
-    }
-}
 
 /// What the frontend makes of a pack: scripted, then the default.
 pub struct FakeIngest {
@@ -187,6 +99,8 @@ pub struct FakeIngest {
     pub minted: AtomicU64,
     /// The form of input tree each mint was asked to write, in order.
     pub forms: Mutex<Vec<InputTree>>,
+    /// The wall each mint was asked to keep its directory good for, in order.
+    pub walls: Mutex<Vec<Duration>>,
 }
 
 impl FakeIngest {
@@ -200,6 +114,7 @@ impl FakeIngest {
             calls: Mutex::new(Vec::new()),
             minted: AtomicU64::new(0),
             forms: Mutex::new(Vec::new()),
+            walls: Mutex::new(Vec::new()),
         }
     }
 
@@ -220,10 +135,11 @@ impl Ingest for FakeIngest {
         &self,
         lease: kbf_types::LeaseId,
         _action: &Digest,
-        _wall: Duration,
+        wall: Duration,
         tree: InputTree,
     ) -> Result<PackKey, MintError> {
         locked(&self.forms).push(tree);
+        locked(&self.walls).push(wall);
         match locked(&self.mint_fails).take() {
             Some(why) => Err(why),
             None => Ok(PackKey::new(format!(
@@ -327,7 +243,6 @@ pub struct Rig {
     pub exec: Executor,
     pub cfg: Config,
     pub inputs: Arc<FakeInputs>,
-    pub presign: Arc<FakePresign>,
     pub ingest: Arc<FakeIngest>,
     pub metrics: Arc<Metrics>,
     _hold: ClockHold,
@@ -439,20 +354,16 @@ impl Rig {
         let api = fake.client().expect("a client");
         let mut cfg = Config::new("front-1", workers, 2_000, gib * GIB);
         cfg.slots = 2;
-        cfg.insecure_argv_secrets = true;
+        cfg.task_out = Some(PutDirRoots::new("/mnt/ts/put").expect("roots"));
         adjust(&mut cfg);
         let farm = Arc::new(Farm::new(
             cache.clone(),
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,
         ));
-        let (inputs, presign, ingest) = (
-            Arc::new(FakeInputs::new()),
-            Arc::new(FakePresign::new()),
-            Arc::new(FakeIngest::new()),
-        );
+        let (inputs, ingest) = (Arc::new(FakeInputs::new()), Arc::new(FakeIngest::new()));
         let metrics = Arc::new(Metrics::default());
-        let exec = Self::executor(&fake, &farm, &cfg, &inputs, &presign, &ingest, &metrics);
+        let exec = Self::executor(&fake, &farm, &cfg, &inputs, &ingest, &metrics);
         Self {
             fake,
             api,
@@ -460,7 +371,6 @@ impl Rig {
             exec,
             cfg,
             inputs,
-            presign,
             ingest,
             metrics,
             _hold: hold,
@@ -472,7 +382,6 @@ impl Rig {
         farm: &Arc<Farm>,
         cfg: &Config,
         inputs: &Arc<FakeInputs>,
-        presign: &Arc<FakePresign>,
         ingest: &Arc<FakeIngest>,
         metrics: &Arc<Metrics>,
     ) -> Executor {
@@ -480,7 +389,6 @@ impl Rig {
             farm: Arc::clone(farm),
             client: fake.client().expect("a client"),
             ingest: ingest.clone(),
-            presign: presign.clone(),
             inputs: inputs.clone(),
             metrics: Arc::clone(metrics),
             store: None,
@@ -503,7 +411,6 @@ impl Rig {
             farm: Arc::clone(&self.farm),
             client: self.fake.client().expect("a client"),
             ingest: self.ingest.clone(),
-            presign: self.presign.clone(),
             inputs: self.inputs.clone(),
             metrics: Arc::clone(&self.metrics),
             store: Some(Arc::clone(&shared.store) as Arc<dyn Store>),
@@ -511,12 +418,11 @@ impl Rig {
         Executor::new(cfg, deps).expect("a valid shared config")
     }
 
-    /// The config of this rig as a shared executor has it: its tasks write into a put
-    /// directory, as a presigned write is refused with shared ownership.
+    /// The config of this rig as a shared executor has it: shared ownership, its tasks writing
+    /// into a put directory.
     pub fn shared_config(&self) -> Config {
         let mut cfg = self.cfg.clone();
         cfg.ownership = Ownership::Shared;
-        cfg.task_out = TaskOut::PutDir(PutDirRoots::new("/mnt/ts/put").expect("roots"));
         cfg
     }
 
@@ -531,7 +437,6 @@ impl Rig {
             &self.farm,
             &cfg,
             &self.inputs,
-            &self.presign,
             &self.ingest,
             &self.metrics,
         )
@@ -616,8 +521,8 @@ impl Rig {
         }
     }
 
-    /// Every job the job service holds, with what it was submitted as (file contents
-    /// included), in the order they were recorded.
+    /// Every job the job service holds, with what it was submitted as, in the order they were
+    /// recorded.
     pub fn jobs(&self) -> Vec<Posted> {
         self.fake
             .jobs()
@@ -791,8 +696,7 @@ pub async fn settle() {
     }
 }
 
-/// A job as the job service holds it, and the spec it was submitted with (file contents
-/// included).
+/// A job as the job service holds it, and the spec it was submitted with.
 #[derive(Clone, Debug)]
 pub struct Posted {
     pub job: Job,
@@ -815,11 +719,5 @@ impl Posted {
         let args = &self.spec.args;
         let at = args.iter().position(|a| a == flag)?;
         args.get(at + 1).map(String::as_str)
-    }
-
-    /// The contents of the file `name` of the job.
-    pub fn file(&self, name: &str) -> Option<&str> {
-        let file = self.spec.files.iter().find(|file| file.name == name)?;
-        Some(file.contents.as_str())
     }
 }

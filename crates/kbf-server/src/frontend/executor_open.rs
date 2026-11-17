@@ -22,7 +22,7 @@ pub(super) struct ExecutorParts {
 /// The executor `--executor js-agent` describes, over `farm`, with the metrics it counts into;
 /// none when `--executor` is left out, which builds nothing and contacts no job service. The seams are the
 /// frontend's own: the ingest of the packs, the CAS `backend` over the same packs, and the
-/// `source` of the keys, writes and grants. The rows of `--executor-ownership shared` are kept
+/// `source` of the put directories. The rows of `--executor-ownership shared` are kept
 /// in `store`, the frontend's state store.
 ///
 /// # Errors

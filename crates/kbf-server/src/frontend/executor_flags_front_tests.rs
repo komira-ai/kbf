@@ -1,4 +1,4 @@
-//! The executor's seams [`JsAgentFlags::front`] makes, by the output mode.
+//! The executor's seams [`JsAgentFlags::front`] makes.
 
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -14,34 +14,41 @@ use kbf_types::LeaseId;
 
 use super::*;
 use crate::executor::{
-    Ingest as _, InputTree, MintError, PrepareError, PreparedRun, PutDirRoots, RunPrepare, Secret,
+    Ingest as _, InputTree, MintError, MintedDir, PrepareError, PreparedPutDir, PutDirRoots,
+    RunPrepare,
 };
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 
-/// A preparation of presigned runs only, which counts the runs it is asked for.
+/// A preparation that refuses every run, and counts the put directories it is asked for.
 #[derive(Default)]
-struct Presigned {
+struct Refusing {
     asked: Mutex<usize>,
 }
 
+const REFUSED: &str = "this test preparation refuses every run";
+
 #[tonic::async_trait]
-impl RunPrepare for Presigned {
-    async fn prepare_run(
+impl RunPrepare for Refusing {
+    async fn prepare_put_dir(
         &self,
         _: &str,
         _: &kbf_types::Digest,
         _: SystemTime,
         _: Duration,
-    ) -> Result<PreparedRun, PrepareError> {
+    ) -> Result<PreparedPutDir, PrepareError> {
         *self.asked.lock().expect("a count") += 1;
-        Ok(PreparedRun {
-            key: "cas/b/7-3/aa-0".to_owned(),
-            put_url: Secret::new("https://store.test/put"),
-            grant_url: "https://grant.test:9400".to_owned(),
-            grant_token: Secret::new("token"),
-            not_after: u64::MAX,
-        })
+        Err(PrepareError::Refused(REFUSED.to_owned()))
+    }
+
+    async fn mint_put_dir(
+        &self,
+        _: &str,
+        _: &kbf_types::Digest,
+        _: SystemTime,
+        _: Duration,
+    ) -> Result<MintedDir, PrepareError> {
+        Err(PrepareError::Refused(REFUSED.to_owned()))
     }
 }
 
@@ -55,9 +62,9 @@ fn base() -> kbf_front::action_tree::BaseTree {
     kbf_front::action_tree::BaseTree::new(root, facts).expect("a base")
 }
 
-fn flags(out: TaskOut) -> JsAgentFlags {
+fn flags() -> JsAgentFlags {
     let mut config = Config::new("front-1", 1, 2_000, 16 << 30);
-    config.task_out = out;
+    config.task_out = Some(PutDirRoots::new("/mnt/ts/put").expect("roots"));
     let image = format!("docker://registry.test/app@sha256:{}", "ab".repeat(32));
     JsAgentFlags {
         config,
@@ -93,10 +100,10 @@ fn packs_and_backend() -> (Packs, Backend) {
     (packs, backend)
 }
 
-/// The key a front of `flags` mints for lease 7.3, and how many presigned runs it asked for.
+/// The key a front of `flags` mints for lease 7.3, and how many put directories it asked for.
 async fn minted(flags: &JsAgentFlags) -> (Result<String, MintError>, usize) {
     let (packs, backend) = packs_and_backend();
-    let prepare = Arc::new(Presigned::default());
+    let prepare = Arc::new(Refusing::default());
     let source = RunSource {
         mint: PackKeyMint::new(SECRET).expect("a mint"),
         prepare: prepare.clone(),
@@ -118,32 +125,22 @@ async fn minted(flags: &JsAgentFlags) -> (Result<String, MintError>, usize) {
     (key.map(|key| key.as_str().to_owned()), asked)
 }
 
-/// Asserts that a front of presigned writes prepares a presigned run, and that a front of put
-/// directories writes over the base its flags publish: none before it is set, and then it asks
-/// its preparation for a put directory (which a preparation of presigned runs only refuses),
-/// never for a presigned run.
+/// Asserts that a front writes over the base its flags publish: none before it is set, so the
+/// mint is unavailable and the preparation is not asked, and then it asks its preparation for a
+/// put directory and passes on what the preparation says.
 #[tokio::test]
-async fn the_front_mints_by_the_output_mode() {
-    let (key, asked) = minted(&flags(TaskOut::Presigned)).await;
-    assert_eq!((key, asked), (Ok("cas/b/7-3/aa-0".to_owned()), 1));
-
-    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
-    let put_dir = flags(TaskOut::PutDir(roots));
-    let (key, asked) = minted(&put_dir).await;
+async fn the_front_mints_over_the_base_its_flags_publish() {
+    let flags = flags();
+    let (key, asked) = minted(&flags).await;
     assert!(
         matches!(&key, Err(MintError::Unavailable(why)) if why.contains("base tree")),
         "{key:?}"
     );
     assert_eq!(asked, 0);
-    put_dir.published.set(base()).expect("set once");
-    let (key, asked) = minted(&put_dir).await;
-    assert_eq!(
-        key,
-        Err(MintError::Refused(
-            "this preparation makes no put directory".to_owned()
-        ))
-    );
-    assert_eq!(asked, 0);
+    flags.published.set(base()).expect("set once");
+    let (key, asked) = minted(&flags).await;
+    assert_eq!(key, Err(MintError::Refused(REFUSED.to_owned())));
+    assert_eq!(asked, 1);
 }
 
 /// What `flags.build` makes over `store`, with a token file and a plain job url of its own.
@@ -156,13 +153,12 @@ fn built(
     let token = dir.path().join("token");
     std::fs::write(&token, "a-token-of-printable-bytes-0123456789\n").expect("written");
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("mode");
-    flags.config.insecure_argv_secrets = true;
     flags.token_file = token;
     flags.job_url = "http://127.0.0.1:7".to_owned();
     let (packs, backend) = packs_and_backend();
     let source = RunSource {
         mint: PackKeyMint::new(SECRET).expect("a mint"),
-        prepare: Arc::new(Presigned::default()),
+        prepare: Arc::new(Refusing::default()),
     };
     let front = flags.front(packs, backend, source);
     let farm = Arc::new(crate::Farm::new(
@@ -178,9 +174,8 @@ fn built(
 /// no store (the rows are not kept), and shared ownership builds over a store.
 #[tokio::test]
 async fn shared_ownership_without_a_state_store_is_refused_at_the_build() {
-    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
     let shared = || {
-        let mut flags = flags(TaskOut::PutDir(roots.clone()));
+        let mut flags = flags();
         flags.config.ownership = Ownership::Shared;
         flags
     };
@@ -194,6 +189,6 @@ async fn shared_ownership_without_a_state_store_is_refused_at_the_build() {
         kbf_state::fake::Flaw::None,
     ));
     assert!(built(shared(), Some(Arc::clone(&store))).is_ok());
-    assert!(built(flags(TaskOut::Presigned), None).is_ok());
-    assert!(built(flags(TaskOut::Presigned), Some(store)).is_ok());
+    assert!(built(flags(), None).is_ok());
+    assert!(built(flags(), Some(store)).is_ok());
 }

@@ -350,17 +350,14 @@ async fn a_job_conflict_on_resubmit_is_infra_and_flags_a_twin() {
     assert_eq!(harness.fake.jobs().len(), 1);
 }
 
-/// Catches a whole-machine action that the executor's workers are never given, or that is
-/// submitted as a share of a host. The `Hello` a worker registers with lists `container` and
-/// `native-whole-machine` and no other driver, so the scheduler places `action` and
-/// `whole_machine` leases on it and no VM lease. A `whole_machine` `Start` is one submit, of a
-/// job that needs the whole host and nothing beside it (the CPU and memory the `Start` carries
-/// are the worker's whole capacity, not a host's), and is otherwise the job a container
-/// action's `Start` makes: the same image, command, environment, constraints, network, wall
-/// limit and labels, but for the size class, which the whole host never carries, and as many
-/// arguments (theirs name each its own lease). The task follows the job as any other's.
+/// Catches a whole-machine lease that is submitted as a job, or that settles other than as the
+/// caller's. The `Hello` a worker registers with lists `container` and `native-whole-machine`
+/// and no other driver, so the scheduler places `action` and `whole_machine` leases on it and
+/// no VM lease. A job commits into a put directory, and the job service gives a whole-host job
+/// no mount, so a `whole_machine` `Start` is settled as the caller's with nothing submitted,
+/// while the `Start` beside it is one submit of a share, followed as any job.
 #[tokio::test(start_paused = true)]
-async fn a_whole_machine_action_submits_a_whole_host_job() {
+async fn a_whole_machine_lease_is_refused_and_a_share_beside_it_is_submitted() {
     let harness = Harness::new().await;
     let hello = harness.cfg.hello(
         crate::executor::mac::WorkerOs::Linux,
@@ -401,66 +398,42 @@ async fn a_whole_machine_action_submits_a_whole_host_job() {
     tell_start(&messages, start(1, 2));
     step(&harness, &mut worker).await;
     let specs = submitted_specs(&harness);
-    assert_eq!(specs.len(), 2, "{specs:?}");
-    let (whole, shared) = (&specs[0], &specs[1]);
-    assert_eq!(whole.job_id, job_id("front", LeaseId::new(1, 1), 0));
-    assert_eq!(
-        whole.needs,
-        Some(Needs {
-            whole_host: true,
-            ..Needs::default()
-        })
-    );
+    assert_eq!(specs.len(), 1, "{specs:?}");
+    let shared = &specs[0];
+    assert_eq!(shared.job_id, job_id("front", LeaseId::new(1, 2), 0));
     assert!(shared.needs.as_ref().is_some_and(|needs| !needs.whole_host));
-    // The whole host is never sized, so it carries no class; the share carries its own.
-    assert_eq!(whole.labels.get("size-class"), None);
     assert_eq!(
         shared.labels.get("size-class").map(String::as_str),
         Some("root.pkg.t.build")
     );
-    let without_needs = |spec: &JobSpec| JobSpec {
-        job_id: String::new(),
-        needs: None,
-        labels: spec
-            .labels
-            .iter()
-            .filter(|(key, _)| *key != "size-class")
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-        // The arguments and files name the lease, the grant and the pack url, which are the
-        // lease's own: they are compared without the lease's values.
-        args: Vec::new(),
-        files: Vec::new(),
-        ..spec.clone()
-    };
-    assert_eq!(without_needs(whole), without_needs(shared));
-    assert_eq!(whole.args.len(), shared.args.len());
+    assert_eq!(
+        status_of(reported(&worker, LeaseId::new(1, 1))),
+        (
+            Code::InvalidArgument as i32,
+            "a whole_machine action cannot commit into a put directory: the job service gives a \
+             whole-host job no mount"
+        )
+    );
     let Some(Stage::Running(running)) = worker
         .tasks
-        .get(&LeaseId::new(1, 1))
+        .get(&LeaseId::new(1, 2))
         .map(|task| &task.stage)
     else {
-        panic!("the whole-host task is not running");
+        panic!("the share's task is not running");
     };
-    assert_eq!(running.job, whole.job_id);
-    assert_eq!(counted(&harness, "kbf_executor_jobs_submitted_total"), 2);
+    assert_eq!(running.job, shared.job_id);
+    assert_eq!(counted(&harness, "kbf_executor_jobs_submitted_total"), 1);
 }
 
-/// Catches a whole-host job that the service could not ready a host for being answered as
-/// the action's failure, or followed by a second job of the same lease: it ends the lease as
-/// an infrastructure failure, by the outcome table's row for `exclusive-not-ready`, and the
-/// farm runs the action again as a new lease.
+/// Catches a job that the service could not ready a host for being answered as the action's
+/// failure, or followed by a second job of the same lease: it ends the lease as an
+/// infrastructure failure, by the outcome table's row for `exclusive-not-ready`, and the farm
+/// runs the action again as a new lease.
 #[tokio::test(start_paused = true)]
-async fn a_whole_host_job_whose_host_was_not_readied_is_an_infrastructure_failure() {
+async fn a_job_whose_host_was_not_readied_is_an_infrastructure_failure() {
     let harness = Harness::new().await;
     let (mut worker, messages) = harness.worker();
-    tell_start(
-        &messages,
-        Start {
-            kind: "whole_machine".to_owned(),
-            ..start(1, 1)
-        },
-    );
+    tell_start(&messages, start(1, 1));
     step(&harness, &mut worker).await;
     let id = job_of(&worker, LeaseId::new(1, 1));
     assert!(harness.fake.place(&id, HOST));
@@ -717,17 +690,6 @@ fn result_calls(calls: &[Call]) -> usize {
         .count()
 }
 
-/// The value after `flag` in the arguments the job `id` was submitted with.
-fn arg_of(harness: &Harness, id: &str, flag: &str) -> String {
-    let spec = harness.fake.submitted(id).expect("the job was submitted");
-    let at = spec
-        .args
-        .iter()
-        .position(|arg| arg == flag)
-        .expect("the flag");
-    spec.args[at + 1].clone()
-}
-
 /// Catches a failed job's output not reaching its result, or reaching the log: the tails
 /// `GetResult` answered go with the result as its stdout and stderr, beside the unchanged
 /// reason, the log holds their lengths (and the end of the standard error, not the standard output), and no `GetLogs` is made for output already in
@@ -770,45 +732,6 @@ async fn a_failed_job_s_output_goes_with_its_result() {
     );
     let calls = calls_since(&harness, before);
     assert_eq!((result_calls(&calls), logs_calls(&calls)), (1, 0));
-}
-
-/// Catches a grant of the job reaching its attached output: the pack url and the read token
-/// the job was handed, written at the start, in the middle, and where the cap cuts, are each
-/// replaced, and no piece of either longer than the marker is left.
-#[tokio::test(start_paused = true)]
-async fn the_grants_of_a_job_never_appear_in_its_output() {
-    let harness = Harness::new().await;
-    let (mut worker, messages) = harness.worker();
-    let id = running_job(&harness, &mut worker, &messages).await;
-    let url = arg_of(&harness, &id, "--pack-url");
-    let token = arg_of(&harness, &id, "--grant-token");
-    // stdout over half the cap, so each stream keeps its last 4096 bytes; redacted, stderr
-    // is 16 bytes over that, which cuts five bytes into the marker of its url.
-    let stdout = format!("{url} {token}{} {url}", "o".repeat(4096));
-    let stderr = format!("{token}-{url}{}{token}-mid-{token}", "e".repeat(4066));
-    assert!(
-        harness
-            .fake
-            .write_logs(&id, stdout.as_bytes(), stderr.as_bytes())
-    );
-    assert!(harness.fake.finish(&id, 1));
-    step(&harness, &mut worker).await;
-    let result = reported(&worker, LeaseId::new(1, 1));
-    let output = output_of(result).expect("an output");
-    let window = "[redacted]".len() + 1;
-    for secret in [&url, &token] {
-        for text in output.values().chain([&status_of(result).1.to_owned()]) {
-            assert!(!text.contains(secret.as_str()));
-            for at in 0..=secret.len().saturating_sub(window) {
-                let piece = &secret[at..(at + window).min(secret.len())];
-                assert!(!text.contains(piece), "{piece:?} is in the output");
-            }
-        }
-    }
-    assert!(output["stderr"].starts_with("cted]e"));
-    assert!(output["stderr"].ends_with("e[redacted]-mid-[redacted]"));
-    assert!(output["stdout"].ends_with("o [redacted]"));
-    assert_eq!(output["truncated"], "true");
 }
 
 /// Catches output over the cap being attached whole or by its head, and a cut inside a

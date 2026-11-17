@@ -18,6 +18,12 @@
 //! removed; the flag still takes the word, so that a configuration that names it is refused with
 //! a message that says what changed and not with a bare unknown value.
 //!
+//! Each run's closure walk reads the input Directories through a cache keyed by digest, in
+//! memory (256 MiB) and, with `--task-directory-cache-dir` and `--task-directory-cache-bytes`
+//! (each needs the other), on disk as well: a Directory is verified against its digest on every
+//! read, so the directory holds nothing that is trusted. A directory that cannot be opened
+//! fails the start, naming the flag and the path.
+//!
 //! The secret is a file and never a flag, as a command line is world-readable. The secret file
 //! holds one secret of at least 32 bytes (surrounding white space is dropped), owned by the
 //! server's user and readable by it alone: the mint of the put directories is made from it, and
@@ -30,7 +36,7 @@ use std::time::Duration;
 
 use clap::builder::ValueParser;
 use clap::{Arg, ArgMatches};
-use kbf_front::prepare_run::{ClosureLimits, PutDirPrep};
+use kbf_front::prepare_run::{ClosureLimits, DirectoryCache, PutDirPrep};
 use kbf_front::{Backend, MintError, PackKeyMint};
 use zeroize::Zeroizing;
 
@@ -48,6 +54,8 @@ const OUT_FORMAT: &str = "task_out_format";
 const MAX_OBJECT_ENTRIES: &str = "task_max_object_entries";
 const MAX_OBJECT_MANIFEST: &str = "task_max_object_manifest_bytes";
 const OBJECT_PER_ENTRY: &str = "task_object_bytes_per_entry";
+const DIRECTORY_DIR: &str = "task_directory_cache_dir";
+const DIRECTORY_BYTES: &str = "task_directory_cache_bytes";
 const ONE_PASS: &str = "one-pass";
 const PRESIGNED: &str = "presigned";
 const PUT_DIR: &str = "put-dir";
@@ -125,13 +133,13 @@ fn refuse(_: &str) -> Result<String, &'static str> {
     Err(REMOVED_WHY)
 }
 
-/// The eleven flags of the put directory and the ten removed ones.
+/// The thirteen flags of the put directory and the ten removed ones.
 pub(super) fn args() -> Vec<Arg> {
     live().into_iter().chain(removed()).collect()
 }
 
-/// The eleven flags that are read.
-fn live() -> [Arg; 11] {
+/// The thirteen flags that are read.
+fn live() -> [Arg; 13] {
     [
         Arg::new(SECRET)
             .long("task-secret-file")
@@ -251,6 +259,30 @@ fn live() -> [Arg; 11] {
                  directory entry (about 130 bytes) and its line of the file index, which names \
                  a path. See `--task-max-object-manifest-bytes`",
             ),
+        Arg::new(DIRECTORY_DIR)
+            .long("task-directory-cache-dir")
+            .value_name("DIR")
+            .value_parser(clap::value_parser!(PathBuf))
+            .requires(DIRECTORY_BYTES)
+            .help(
+                "A directory this process owns where the input Directories the closure walk \
+                 decodes are kept on disk, one file each by digest, checked by SHA-256 on every \
+                 read, so that a restart or a Directory pushed out of memory is read from the \
+                 disk and not from the store. At most `--task-directory-cache-bytes` of them \
+                 are kept, the least recently used removed first. One process per directory: \
+                 nothing else may write there. Needs `--task-directory-cache-bytes`. Left out, \
+                 the Directories are kept in memory only (256 MiB). Used only with \
+                 `--task-secret-file`",
+            ),
+        Arg::new(DIRECTORY_BYTES)
+            .long("task-directory-cache-bytes")
+            .value_name("BYTES")
+            .value_parser(clap::value_parser!(u64).range(1..))
+            .requires(DIRECTORY_DIR)
+            .help(
+                "The most bytes of Directories `--task-directory-cache-dir` holds. Needs \
+                 `--task-directory-cache-dir`. Used only with `--task-secret-file`",
+            ),
         Arg::new(OUT_FORMAT)
             .long("task-out-format")
             .value_name("FORMAT")
@@ -289,6 +321,10 @@ pub struct PutDirFlags {
     pub object_bytes_per_entry: u64,
     /// `--task-closure-max-bytes`.
     pub max_bytes: u64,
+    /// `--task-directory-cache-dir` and `--task-directory-cache-bytes`, which come together:
+    /// the directory and the most bytes of Directories it holds. `None` keeps the Directories in
+    /// memory only.
+    pub directory_cache: Option<(PathBuf, u64)>,
 }
 
 /// The setting the flags in `m` make: `None` unless `--task-secret-file` is given (clap makes it
@@ -323,16 +359,21 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<PutDirFlags>, String
             .copied()
             .unwrap_or_default(),
         max_bytes: m.get_one::<u64>(MAX_BYTES).copied().unwrap_or_default(),
+        directory_cache: m
+            .get_one::<PathBuf>(DIRECTORY_DIR)
+            .cloned()
+            .zip(m.get_one::<u64>(DIRECTORY_BYTES).copied()),
     }))
 }
 
 impl PutDirFlags {
     /// The preparer these flags describe, reading the store through `backend`: the secret file
-    /// is read and the mint made. Nothing is sent.
+    /// is read, the mint made and the cache of Directories opened. Nothing is sent.
     ///
     /// # Errors
-    /// [`TaskFlagError`]: the file is missing, not owned by this user or readable by others, or
-    /// the secret is under 32 bytes.
+    /// [`TaskFlagError`]: the file is missing, not owned by this user or readable by others, the
+    /// secret is under 32 bytes, or the directory of `--task-directory-cache-dir` cannot be
+    /// opened.
     pub fn open(&self, backend: Backend) -> Result<PutDirPrep, TaskFlagError> {
         let secret = Zeroizing::new(read_owner_only(&self.secret_file, MAX_FILE_BYTES)?);
         let mint = PackKeyMint::new(secret.trim_ascii())?;
@@ -340,7 +381,20 @@ impl PutDirFlags {
             max_digests: self.max_digests,
             max_bytes: self.max_bytes,
         };
-        Ok(PutDirPrep::new(backend, mint, self.url_slack, limits))
+        let directories = match &self.directory_cache {
+            Some((dir, bytes)) => DirectoryCache::open(
+                dir.clone(),
+                kbf_front::prepare_run::DIRECTORY_MEMORY_BYTES,
+                *bytes,
+            )
+            .map_err(|source| TaskFlagError::Directories {
+                path: dir.clone(),
+                source,
+            })?,
+            None => DirectoryCache::in_memory(kbf_front::prepare_run::DIRECTORY_MEMORY_BYTES),
+        };
+        Ok(PutDirPrep::new(backend, mint, self.url_slack, limits)
+            .with_directories(Arc::new(directories)))
     }
 }
 
@@ -374,6 +428,14 @@ pub enum TaskFlagError {
     /// The secret is too short for the mint of the put directories.
     #[error("--task-secret-file: {0}")]
     Mint(#[from] MintError),
+    /// The directory of the cache of Directories cannot be opened.
+    #[error("--task-directory-cache-dir {}: {source}", .path.display())]
+    Directories {
+        /// The directory the flag names.
+        path: PathBuf,
+        /// What the cache said.
+        source: kbf_pack::CacheError,
+    },
 }
 
 #[cfg(test)]

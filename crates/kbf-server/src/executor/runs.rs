@@ -20,7 +20,7 @@
 //! restarts loses its tasks with its farm; with single ownership the jobs it left are cancelled
 //! by the next one (`pool::adopt_jobs`), and with shared ownership they run on, each named by
 //! the `exec/` row written before its submit (`share.rs`). A job built again under the same id
-//! would differ (a new key and url) and be refused as a conflict, never run twice.
+//! would differ (a new put directory) and be refused as a conflict, never run twice.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +40,7 @@ use crate::executor::metrics::{IngestEnd, Metrics, RunEnd};
 use crate::executor::outcome::{
     Settled, Verdict, drained, forgotten, judge, ran, refused, result_of,
 };
-use crate::executor::output::{Grants, Output, Tail};
+use crate::executor::output::{Output, Tail};
 use crate::executor::phases::{Mark, Timeline};
 use crate::executor::share::Rowed;
 use crate::executor::submit::{Booking, Prepared, prepare};
@@ -87,7 +87,7 @@ pub(super) struct Waiting {
     beat: Option<Instant>,
     /// A share of a host, or the whole host for a `whole_machine` lease.
     booking: Booking,
-    /// The job, kept from the first try: a read of the CAS, a url and a grant are not made
+    /// The job, kept from the first try: a read of the CAS and the put directory are not made
     /// again on each pass, and a submit sent again sends the same job.
     prepared: Option<Arc<Prepared>>,
     /// A submit was sent whose answer was lost: the job may exist.
@@ -105,8 +105,6 @@ impl Waiting {
 pub(super) struct Running {
     pub(super) job: String,
     key: PackKey,
-    /// What the job was handed, redacted from its output if it does not end well.
-    grants: Arc<Grants>,
 }
 
 pub(super) struct Reporting {
@@ -448,7 +446,7 @@ impl HostWorker {
         deadline: Instant,
         begin: bool,
     ) -> Submitted {
-        // What preparing reads (the CAS, the store, the grant service) is not the job
+        // What preparing reads (the CAS and the store) is not the job
         // service's, and it can take longer than the window: a tree of many files is
         // published into the store first. It runs on a task of its own, so the pass waits for
         // it one poll at most and goes on to the other workers:
@@ -464,7 +462,7 @@ impl HostWorker {
                 Preparing::Failed(settled) => return Submitted::Settled(settled),
             },
         };
-        // The CAS read, the url and the grant each took as long as the store took: the window
+        // The CAS read and the preparation each took as long as the store took: the window
         // is judged by the clock now, the last moment before the submit.
         let now = ctx.now();
         if now >= deadline {
@@ -495,7 +493,6 @@ impl HostWorker {
                 Submitted::Running(Running {
                     job: job.id,
                     key: prepared.key.clone(),
-                    grants: Arc::new(prepared.grants.clone()),
                 })
             }
             Err(error) => match refused(&error) {
@@ -525,15 +522,14 @@ impl HostWorker {
     /// pass for a budget and a call, not a call per job; the next pass begins after the last
     /// task read, so every task is read in turn.
     pub(super) async fn poll(&mut self, ctx: &Ctx<'_>, now: Instant) {
-        // The action and the key of a running task, for the ingest if its job ended well, and
-        // its grants, for its output if it did not.
-        type Read = Option<(Digest, PackKey, Arc<Grants>)>;
+        // The action and the key of a running task, for the ingest if its job ended well.
+        type Read = Option<(Digest, PackKey)>;
         let mut jobs: Vec<(LeaseId, String, Read)> = self
             .tasks
             .iter()
             .filter_map(|(lease, task)| match &task.stage {
                 Stage::Running(r) => {
-                    let read = Some((task.action.clone(), r.key.clone(), Arc::clone(&r.grants)));
+                    let read = Some((task.action.clone(), r.key.clone()));
                     Some((*lease, r.job.clone(), read))
                 }
                 Stage::Withdrawing(job) => Some((*lease, job.clone(), None)),
@@ -595,7 +591,7 @@ impl HostWorker {
         now: Instant,
         lease: LeaseId,
         id: &str,
-        (action, key, grants): (Digest, PackKey, Arc<Grants>),
+        (action, key): (Digest, PackKey),
     ) {
         let answer = ctx.api().get_job(id).await;
         self.heard(ctx, &answer);
@@ -639,7 +635,7 @@ impl HostWorker {
         let result = match result {
             Ok(result) => result,
             Err(error) if not_found(&error) => {
-                let output = self.output(ctx, lease, id, None, &grants).await;
+                let output = self.output(ctx, lease, id, None).await;
                 self.settle_failed(lease, &forgotten(), &output, now, &ctx.deps.metrics);
                 return;
             }
@@ -651,7 +647,7 @@ impl HostWorker {
         self.stamp(lease, Mark::Ended, now, ctx);
         match judge(&job, &result) {
             Verdict::Settled(settled) => {
-                let output = self.output(ctx, lease, id, Some(&result), &grants).await;
+                let output = self.output(ctx, lease, id, Some(&result)).await;
                 self.settle_failed(lease, &settled, &output, now, &ctx.deps.metrics);
             }
             Verdict::Ingest => self.ingest(ctx, lease, action, key),
@@ -659,15 +655,14 @@ impl HostWorker {
     }
 
     /// The output of job `id`, which did not end well: the tails of its `result` if they hold
-    /// any, else one `GetLogs`; redacted of `grants` and cut to the cap. The lengths are logged,
-    /// and the end of the standard error, redacted, as a second line at WARN.
+    /// any, else one `GetLogs`; cut to the cap. The lengths are logged, and the end of the
+    /// standard error as a second line at WARN.
     async fn output(
         &mut self,
         ctx: &Ctx<'_>,
         lease: LeaseId,
         id: &str,
         result: Option<&js_proto::v1::JobResult>,
-        grants: &Grants,
     ) -> Output {
         let tail = match result.and_then(Tail::of_result) {
             Some(tail) => Ok(tail),
@@ -678,7 +673,7 @@ impl HostWorker {
             }
         };
         let output = match tail {
-            Ok(tail) => Output::of(&tail, grants),
+            Ok(tail) => Output::of(&tail),
             Err(error) => Output::unread(&error),
         };
         tracing::info!(

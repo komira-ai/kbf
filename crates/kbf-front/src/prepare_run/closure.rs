@@ -23,6 +23,12 @@
 //! digests parsed, for the action tree's manifest writer ([`crate::action_tree`]): the walk the
 //! frontend makes before every submit stays the only walk. What it keeps is bounded by the same
 //! [`ClosureLimits`], and is dropped with the [`KeptClosure`].
+//!
+//! The walk may read its `Directory` messages through a [`DirectoryCache`]: a `Directory` the
+//! cache holds (in memory, or as a verified blob on its disk) is not read from the store, and one
+//! it does not hold is read from the store, decoded and then kept in the cache. The files and the
+//! Command are asked of the store (`FindMissing`) either way, so a cache never makes a closure
+//! complete that the store cannot serve.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -37,6 +43,7 @@ use prost::Message as _;
 use crate::backend::Backend;
 use crate::cache::is_empty_blob;
 use crate::grants::Scope;
+use crate::prepare_run::DirectoryCache;
 use crate::wire;
 
 /// The most Directory blobs of one level read at once.
@@ -206,6 +213,26 @@ pub(crate) struct KeptDirectory {
 }
 
 impl KeptDirectory {
+    /// The `Directory` held in `blob`, whose digest is `digest`, its nodes' digests parsed.
+    ///
+    /// # Errors
+    /// [`ClosureError::Invalid`]: `blob` does not decode, or a digest in it is malformed.
+    pub(crate) fn parse(digest: &Digest, blob: Bytes) -> Result<Self, ClosureError> {
+        let message =
+            reapi::Directory::decode(blob).map_err(|e| invalid("a Directory", digest, &e))?;
+        let mut files = Vec::with_capacity(message.files.len());
+        for node in &message.files {
+            let file = named_in(digest, "a file", node.digest.as_ref())?;
+            files.push((node.name.clone(), file, node.is_executable));
+        }
+        let mut directories = Vec::with_capacity(message.directories.len());
+        for node in &message.directories {
+            let child = named_in(digest, "a subdirectory", node.digest.as_ref())?;
+            directories.push((node.name.clone(), child));
+        }
+        Ok(Self::of(message, files, directories))
+    }
+
     /// The `Directory` `message`, its file and subdirectory nodes already parsed.
     fn of(
         message: reapi::Directory,
@@ -282,7 +309,7 @@ pub async fn collect_closure(
     action: &Digest,
     limits: ClosureLimits,
 ) -> Result<InputClosure, ClosureError> {
-    let (closure, _, _) = collect(backend, action, limits, false).await?;
+    let (closure, _, _) = collect(backend, action, limits, false, None).await?;
     Ok(closure)
 }
 
@@ -295,7 +322,20 @@ pub async fn collect_closure_keeping(
     action: &Digest,
     limits: ClosureLimits,
 ) -> Result<KeptClosure, ClosureError> {
-    let (closure, root, directories) = collect(backend, action, limits, true).await?;
+    keeping_through(backend, action, limits, None).await
+}
+
+/// [`collect_closure_keeping`], reading each `Directory` through `cache` when there is one.
+///
+/// # Errors
+/// As [`collect_closure`].
+pub(crate) async fn keeping_through(
+    backend: &Backend,
+    action: &Digest,
+    limits: ClosureLimits,
+    cache: Option<&DirectoryCache>,
+) -> Result<KeptClosure, ClosureError> {
+    let (closure, root, directories) = collect(backend, action, limits, true, cache).await?;
     Ok(KeptClosure {
         closure,
         root,
@@ -309,6 +349,7 @@ async fn collect(
     action: &Digest,
     limits: ClosureLimits,
     keep: bool,
+    cache: Option<&DirectoryCache>,
 ) -> Result<(InputClosure, Digest, BTreeMap<Digest, KeptDirectory>), ClosureError> {
     let blob = read(backend, "the Action", action).await?;
     let decoded = reapi::Action::decode(blob).map_err(|e| invalid("the Action", action, &e))?;
@@ -337,37 +378,34 @@ async fn collect(
     let mut files = Vec::new();
     let mut level = vec![root];
     while !level.is_empty() {
-        let directories: Vec<(Digest, reapi::Directory)> = stream::iter(level)
-            .map(|digest| directory(backend, digest))
+        let directories: Vec<(Digest, KeptDirectory)> = stream::iter(level)
+            .map(|digest| directory(backend, cache, digest))
             .buffered(DIRECTORIES_IN_FLIGHT)
             .try_collect()
             .await?;
         level = Vec::new();
         for (parent, directory) in directories {
-            // Parsed nodes are kept only when asked: the walk before every submit holds none.
-            let mut kept_files = Vec::new();
-            let mut kept_directories = Vec::new();
-            for node in &directory.files {
-                let file = named_in(&parent, "a file", node.digest.as_ref())?;
-                if seen.add(file)? {
-                    files.push(file);
-                }
-                if keep {
-                    kept_files.push((node.name.clone(), file, node.is_executable));
+            for (_, file, _) in &directory.files {
+                if seen.add(*file)? {
+                    files.push(*file);
                 }
             }
-            for node in &directory.directories {
-                let child = named_in(&parent, "a subdirectory", node.digest.as_ref())?;
-                seen.add(child)?;
-                if queued.insert(child) {
-                    level.push(child);
-                }
-                if keep {
-                    kept_directories.push((node.name.clone(), child));
+            for (_, child) in &directory.directories {
+                seen.add(*child)?;
+                if queued.insert(*child) {
+                    level.push(*child);
                 }
             }
+            // Kept in the cache in level order, so what it holds does not depend on which read of
+            // a level answered first. The empty Directory is not kept.
+            if let Some(cache) = cache
+                && !is_empty_blob(&parent)
+            {
+                cache.remember(parent, &directory);
+            }
+            // The parsed nodes are kept only when asked: the walk before every submit holds
+            // none past its level.
             if keep {
-                let directory = KeptDirectory::of(directory, kept_files, kept_directories);
                 kept.insert(parent, directory);
             }
         }
@@ -399,18 +437,36 @@ fn invalid(what: &'static str, digest: &Digest, why: &impl std::fmt::Display) ->
     }
 }
 
-/// The Directory blob `digest` and its decoded content; the empty blob is the empty Directory.
+/// The Directory `digest` and its parsed content: from `cache` when it holds it, else read from
+/// the store and decoded, and its blob kept on the disk half of `cache`. The empty blob is the
+/// empty Directory and is not read or kept.
 async fn directory(
     backend: &Backend,
+    cache: Option<&DirectoryCache>,
     digest: Digest,
-) -> Result<(Digest, reapi::Directory), ClosureError> {
+) -> Result<(Digest, KeptDirectory), ClosureError> {
     if is_empty_blob(&digest) {
-        return Ok((digest, reapi::Directory::default()));
+        return Ok((digest, KeptDirectory::default()));
+    }
+    if let Some(kept) = remembered(cache, &digest).await {
+        return Ok((digest, kept));
     }
     let blob = read(backend, "a Directory", &digest).await?;
-    let decoded =
-        reapi::Directory::decode(blob).map_err(|e| invalid("a Directory", &digest, &e))?;
-    Ok((digest, decoded))
+    let kept = KeptDirectory::parse(&digest, blob.clone())?;
+    if let Some(cache) = cache {
+        cache.store(&digest, &blob).await;
+    }
+    Ok((digest, kept))
+}
+
+/// The Directory `digest` as `cache` holds it: in memory, or as a blob on its disk that decodes.
+async fn remembered(cache: Option<&DirectoryCache>, digest: &Digest) -> Option<KeptDirectory> {
+    let cache = cache?;
+    if let Some(kept) = cache.recent(digest) {
+        return Some(kept);
+    }
+    let blob = cache.stored(digest).await?;
+    KeptDirectory::parse(digest, blob).ok()
 }
 
 /// The blob `digest`, which the store holds or the closure is not one.

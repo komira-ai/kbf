@@ -5,7 +5,7 @@ use std::sync::Arc;
 use js_proto::v1::{Job, JobSpec, JobState, Needs};
 use kbf_job_client::fake::{Call, Fault};
 use kbf_server::executor::{Config, ConfigError, Deps, Executor};
-use kbf_types::{LeaseKind, WorkerId};
+use kbf_types::WorkerId;
 use tonic::Code;
 
 use crate::rig::{GIB, IMAGE, Rig, cancels, submits};
@@ -67,7 +67,6 @@ async fn building_an_executor_asks_the_job_service_for_nothing() {
         farm: rig.farm.clone(),
         client: rig.fake.client().expect("a client"),
         ingest: rig.ingest.clone(),
-        presign: rig.presign.clone(),
         inputs: rig.inputs.clone(),
         metrics: Arc::default(),
         store: None,
@@ -83,12 +82,10 @@ async fn building_an_executor_asks_the_job_service_for_nothing() {
 
 /// Catches a pool that registers one worker twice or none at all: each of the frontend's
 /// workers is a node of its own, `js:<frontend>-<n>`, of the declared cores and memory on
-/// linux and the declared architecture, that takes ordinary and whole-machine actions: a
-/// whole-machine action becomes one job of the whole host, and an ordinary action submitted
-/// after it still becomes a job (that a whole-machine action books its worker whole is held by
-/// `whole.rs`).
+/// linux and the declared architecture, that takes an ordinary action as one job (that a
+/// whole-machine action is refused is held by `whole.rs`).
 #[tokio::test(start_paused = true)]
-async fn each_worker_is_a_node_of_the_declared_shape_that_takes_whole_machine_actions_too() {
+async fn each_worker_is_a_node_of_the_declared_shape_that_takes_an_action() {
     let mut rig = Rig::start(&["node1", "node2", "node3"], 2, |cfg| {
         cfg.cpu_millis = 8_000
     })
@@ -119,16 +116,11 @@ async fn each_worker_is_a_node_of_the_declared_shape_that_takes_whole_machine_ac
             "{name}"
         );
     }
-    let whole = rig.submit_kind(1, LeaseKind::WholeMachine);
-    rig.pump().await;
-    let jobs = rig.jobs_of(1);
-    assert_eq!(jobs.len(), 1, "{jobs:?}");
-    assert!(jobs[0].spec.needs.as_ref().is_some_and(|n| n.whole_host));
     let action = rig.submit(2);
     rig.pump().await;
     assert_eq!(rig.jobs_of(2).len(), 1);
-    assert_eq!(rig.jobs().len(), 2);
-    drop((whole, action));
+    assert_eq!(rig.jobs().len(), 1);
+    drop(action);
 }
 
 /// Catches a worker that takes more actions than the slots it declared: with two slots and

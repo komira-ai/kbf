@@ -1,6 +1,6 @@
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -12,20 +12,16 @@ use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
-use kbf_pack::{
-    OutputDirectory, PackKeys, Slot, TaskManifest, Timing, Usage, WriterKind, write_pack,
-};
+use kbf_pack::{PackKeys, TaskManifest, Timing, Usage, WriterKind, write_pack};
 use kbf_pack_index::PackIndex;
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_proto::reapi::platform::Property;
-use kbf_proto::reapi::{self, Directory, FileNode, Platform, Tree};
+use kbf_proto::reapi::{self, Directory, FileNode, Platform};
 use kbf_state::ManualClock;
+use kbf_storage::Storage;
 use kbf_types::DigestFunction;
 
 use super::*;
-
-/// What a presigned run is minted with: it writes no tree, so the form is never read.
-const TREES: InputTree = InputTree::Manifests;
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -50,49 +46,29 @@ fn wire(digest: &kbf_types::Digest) -> Digest {
     kbf_front::digest_to_proto(digest)
 }
 
-/// Answers what it is told and remembers what it was asked.
-struct Prepared {
-    answer: Mutex<Result<PreparedRun, PrepareError>>,
-    asked: Mutex<Vec<(String, kbf_types::Digest, SystemTime, Duration)>>,
-}
-
-impl Prepared {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            answer: Mutex::new(Ok(run("cas/b/7-3/aa-0", NOW + 7_200))),
-            asked: Mutex::new(Vec::new()),
-        })
-    }
-
-    fn answers(&self, answer: Result<PreparedRun, PrepareError>) {
-        *self.answer.lock().unwrap() = answer;
-    }
-}
+/// A preparation that makes no put directory, for the tests that never prepare a run.
+struct Unprepared;
 
 #[tonic::async_trait]
-impl RunPrepare for Prepared {
-    async fn prepare_run(
+impl RunPrepare for Unprepared {
+    async fn prepare_put_dir(
         &self,
-        lease: &str,
-        action: &kbf_types::Digest,
-        now: SystemTime,
-        wall: Duration,
-    ) -> Result<PreparedRun, PrepareError> {
-        self.asked
-            .lock()
-            .unwrap()
-            .push((lease.to_owned(), *action, now, wall));
-        self.answer.lock().unwrap().clone()
+        _: &str,
+        _: &kbf_types::Digest,
+        _: SystemTime,
+        _: Duration,
+    ) -> Result<PreparedPutDir, PrepareError> {
+        Err(PrepareError::Refused("no run is prepared here".to_owned()))
     }
-}
 
-fn run(key: &str, not_after: u64) -> PreparedRun {
-    PreparedRun {
-        key: key.to_owned(),
-        put_url: Secret::new(format!("http://store.test/{key}?sig=put")),
-        grant_url: "https://grant.test:9400".to_owned(),
-        grant_token: Secret::new("grant-token"),
-        not_after,
+    async fn mint_put_dir(
+        &self,
+        _: &str,
+        _: &kbf_types::Digest,
+        _: SystemTime,
+        _: Duration,
+    ) -> Result<MintedDir, PrepareError> {
+        Err(PrepareError::Refused("no run is prepared here".to_owned()))
     }
 }
 
@@ -100,6 +76,8 @@ fn run(key: &str, not_after: u64) -> PreparedRun {
 struct Flaky {
     inner: MemoryStore,
     fail_reads: AtomicBool,
+    /// How many objects were put.
+    puts: AtomicUsize,
 }
 
 impl ObjectStore for Flaky {
@@ -113,6 +91,7 @@ impl ObjectStore for Flaky {
         body: Bytes,
         retain_until: Option<SystemTime>,
     ) -> Result<(), ObjectStoreError> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
         self.inner.put_new(key, body, retain_until).await
     }
 
@@ -152,7 +131,6 @@ impl ObjectStore for Flaky {
 /// CAS over a node's cache, and the real key mint.
 struct Rig {
     front: Front,
-    prepared: Arc<Prepared>,
     store: Arc<Flaky>,
     cache: Arc<Cache<MemoryMetaLog, MemoryStore>>,
     mint: PackKeyMint,
@@ -160,16 +138,25 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
-        let prepared = Prepared::new();
-        Self::over(prepared.clone(), prepared, |_, _| None)
+        Self::over(Arc::new(Unprepared), |packs, backend| {
+            PutDirParts::new(packs, backend, Arc::default())
+        })
     }
 
     /// The rig whose preparation is `prepare`, with the put-directory parts `put_dir` makes of
     /// the packs and the CAS.
     fn over(
-        prepared: Arc<Prepared>,
         prepare: Arc<dyn RunPrepare>,
-        put_dir: impl FnOnce(&Packs, &Backend) -> Option<PutDirParts>,
+        put_dir: impl FnOnce(&Packs, &Backend) -> PutDirParts,
+    ) -> Self {
+        Self::reading_through(prepare, put_dir, |node| node)
+    }
+
+    /// As [`Rig::over`], the CAS read through the storage `wrap` makes of the node's.
+    fn reading_through(
+        prepare: Arc<dyn RunPrepare>,
+        put_dir: impl FnOnce(&Packs, &Backend) -> PutDirParts,
+        wrap: impl FnOnce(Arc<dyn Storage>) -> Arc<dyn Storage>,
     ) -> Self {
         CLOCK.with(|c| c.set(NOW));
         let store = Arc::new(Flaky {
@@ -178,6 +165,7 @@ impl Rig {
                 object_lock: false,
             }),
             fail_reads: AtomicBool::new(false),
+            puts: AtomicUsize::new(0),
         });
         let index: Arc<dyn PackIndex> =
             Arc::new(MemoryPackIndex::new(Arc::new(ManualClock::default())));
@@ -189,7 +177,7 @@ impl Rig {
             Arc::clone(&cache),
             SegmentsConfig::DEFAULT,
         ));
-        let backend = Backend::remote_over(node, Some(packs.clone()));
+        let backend = Backend::remote_over(wrap(node), Some(packs.clone()));
         let put_dir = put_dir(&packs, &backend);
         let front = Front::with_clock(
             FrontParts {
@@ -205,7 +193,6 @@ impl Rig {
         );
         Self {
             front,
-            prepared,
             store,
             cache,
             mint: PackKeyMint::new(SECRET).expect("a mint"),
@@ -257,172 +244,6 @@ fn seconds(n: i64) -> prost_types::Duration {
 
 fn action_digest() -> Digest {
     wire(&kbf_types::Digest::new(DigestFunction::Sha256, [9; 32], 5))
-}
-
-/// Catches a run whose key, write and grant are not the ones the frontend prepared for its
-/// lease: the preparation is asked once with the farm lease's build id, the action, the time and
-/// the run's wall, and each of the three is handed out once.
-#[tokio::test]
-async fn a_run_is_prepared_once_and_its_key_write_and_grant_are_handed_out_once() {
-    let rig = Rig::new();
-    let wall = Duration::from_secs(900);
-    let key = rig
-        .front
-        .mint(lease(), &action_digest(), wall, TREES)
-        .await
-        .expect("a key");
-    assert_eq!(key.as_str(), "cas/b/7-3/aa-0");
-    let asked = rig.prepared.asked.lock().unwrap().clone();
-    let action = kbf_types::Digest::new(DigestFunction::Sha256, [9; 32], 5);
-    assert_eq!(asked, [("7-3".to_owned(), action, clock(), wall)]);
-
-    let url = rig
-        .front
-        .put_url(&key, wall, 1 << 20)
-        .await
-        .expect("the write");
-    assert_eq!(url.expose(), "http://store.test/cas/b/7-3/aa-0?sig=put");
-    let again = rig.front.put_url(&key, wall, 1 << 20).await;
-    assert!(matches!(again, Err(PresignError::Refused(_))));
-
-    let grant = rig
-        .front
-        .read_grant(lease(), &action_digest(), wall)
-        .await
-        .expect("the grant");
-    assert_eq!(grant.url, "https://grant.test:9400");
-    assert_eq!(grant.token.expose(), "grant-token");
-    let again = rig.front.read_grant(lease(), &action_digest(), wall).await;
-    assert!(matches!(again, Err(InputsError::Unavailable(_))));
-    assert!(rig.front.parked().is_empty(), "nothing is kept once used");
-}
-
-/// Catches a write url handed to a run it was not prepared for: the url is found by the key it
-/// signs, and a key nobody prepared gets none.
-#[tokio::test]
-async fn a_write_is_found_by_its_key_and_a_stranger_gets_none() {
-    let rig = Rig::new();
-    let wall = Duration::from_secs(60);
-    rig.front
-        .mint(lease(), &action_digest(), wall, TREES)
-        .await
-        .expect("a key");
-    let other = PackKey::new("cas/b/7-4/bb-0");
-    let refused = rig.front.put_url(&other, wall, 1).await;
-    assert!(matches!(refused, Err(PresignError::Refused(_))));
-    let grant = rig
-        .front
-        .read_grant(LeaseId::new(7, 4), &action_digest(), wall)
-        .await;
-    assert!(matches!(grant, Err(InputsError::Unavailable(_))));
-    assert_eq!(rig.front.parked().len(), 1, "the prepared run is kept");
-}
-
-/// Catches a write and a grant that stop working before the run's wall time does: the run
-/// would start and be refused its inputs or its upload, and the farm would run it again.
-#[tokio::test]
-async fn a_write_that_ends_before_the_run_does_is_not_a_key() {
-    let rig = Rig::new();
-    rig.prepared.answers(Ok(run("cas/b/7-3/aa-0", NOW + 899)));
-    let refused = rig
-        .front
-        .mint(lease(), &action_digest(), Duration::from_secs(900), TREES)
-        .await;
-    assert!(refused.is_err());
-    assert!(rig.front.parked().is_empty());
-    rig.prepared.answers(Ok(run("cas/b/7-3/aa-0", NOW + 900)));
-    let kept = rig
-        .front
-        .mint(lease(), &action_digest(), Duration::from_secs(900), TREES)
-        .await;
-    assert!(kept.is_ok(), "a write good for exactly the wall is enough");
-}
-
-/// Catches a preparation that fails being taken for a key, and its reason being lost.
-#[tokio::test]
-async fn a_run_that_cannot_be_prepared_is_not_a_key_and_says_why() {
-    let rig = Rig::new();
-    for why in [
-        PrepareError::Refused("an input is not held".to_owned()),
-        PrepareError::Unavailable("the store is down".to_owned()),
-    ] {
-        rig.prepared.answers(Err(why.clone()));
-        let refused = rig
-            .front
-            .mint(lease(), &action_digest(), Duration::from_secs(60), TREES)
-            .await;
-        let expected = match &why {
-            PrepareError::Refused(why) => MintError::Refused(why.clone()),
-            PrepareError::Unavailable(why) => MintError::Unavailable(why.clone()),
-        };
-        assert_eq!(refused.err(), Some(expected));
-    }
-    let not_a_digest = reapi::Digest {
-        hash: "xyz".to_owned(),
-        size_bytes: 1,
-    };
-    let refused = rig
-        .front
-        .mint(
-            lease(),
-            &not_a_digest,
-            Duration::from_secs(60),
-            InputTree::Manifests,
-        )
-        .await;
-    assert!(refused.is_err(), "an action digest that is not one");
-    assert_eq!(
-        rig.prepared.asked.lock().unwrap().len(),
-        2,
-        "and it is not prepared"
-    );
-}
-
-/// Catches runs that were prepared and never started (a `Start` that ran out of its window)
-/// being kept for ever: what a later mint finds past its expiry is dropped.
-#[tokio::test]
-async fn what_a_start_that_ran_out_of_its_window_left_is_dropped_at_the_next_mint() {
-    let rig = Rig::new();
-    rig.prepared.answers(Ok(run("cas/b/7-3/aa-0", NOW + 100)));
-    rig.front
-        .mint(lease(), &action_digest(), Duration::from_secs(10), TREES)
-        .await
-        .expect("a key");
-    assert_eq!(rig.front.parked().len(), 1);
-    CLOCK.with(|c| c.set(NOW + 101));
-    rig.prepared
-        .answers(Ok(run("cas/b/7-9/bb-0", NOW + 100_000)));
-    rig.front
-        .mint(
-            LeaseId::new(7, 9),
-            &action_digest(),
-            Duration::from_secs(10),
-            TREES,
-        )
-        .await
-        .expect("another key");
-    let kept: Vec<_> = rig.front.parked().keys().copied().collect();
-    assert_eq!(kept, [LeaseId::new(7, 9)]);
-}
-
-/// Catches a farm lease whose run is prepared twice (the Start came again) keeping two sets of
-/// secrets: the second preparation replaces the first.
-#[tokio::test]
-async fn preparing_a_lease_again_replaces_what_was_parked() {
-    let rig = Rig::new();
-    let wall = Duration::from_secs(60);
-    rig.front
-        .mint(lease(), &action_digest(), wall, TREES)
-        .await
-        .expect("a key");
-    rig.prepared.answers(Ok(run("cas/b/7-3/cc-0", NOW + 7_200)));
-    let key = rig
-        .front
-        .mint(lease(), &action_digest(), wall, TREES)
-        .await
-        .expect("a key");
-    assert_eq!(rig.front.parked().len(), 1);
-    assert!(rig.front.put_url(&key, wall, 1).await.is_ok());
 }
 
 /// Catches an action's run being launched from anything but the kbf image, and a timeout that is
@@ -645,14 +466,14 @@ async fn an_action_the_cas_cannot_give_is_unavailable_and_one_that_is_malformed_
     );
 }
 
-/// The key the real mint issues for the build, the action and the time.
+/// The put directory the real mint issues for the build, the action and the time.
 fn issued(rig: &Rig, build: &str, action: &Digest) -> PackKey {
     let action = super::cas_digest(action).expect("a digest");
-    let key = rig
+    let dir = rig
         .mint
-        .mint(build, &action, clock(), Slot::Pack(0))
-        .expect("a key");
-    PackKey::new(key.key())
+        .mint_put_dir(build, &action, clock())
+        .expect("a dir");
+    PackKey::new(dir.dir())
 }
 
 fn limits() -> UntrustedLimits {
@@ -665,9 +486,9 @@ fn limits() -> UntrustedLimits {
     }
 }
 
-/// Catches an ingest that is not the frontend's: a key the real mint issued for this lease and
-/// action, whose pack is not in the store, is refused as missing; a key of another lease and
-/// text that is no key are not the issued one.
+/// Catches an ingest that is not the frontend's: a put directory the real mint issued for this
+/// lease and action, which holds no pack, is refused as missing; a directory of another lease
+/// and text that is no directory are not the issued one.
 #[tokio::test]
 async fn a_pack_that_is_not_there_or_a_key_that_is_not_the_issued_one_is_refused() {
     let rig = Rig::new();
@@ -721,9 +542,9 @@ async fn a_store_that_cannot_be_read_is_unavailable_and_not_a_refusal() {
 }
 
 /// Catches an ingest through the seam that does not give the executor the result the frontend
-/// rebuilt: a pack the task wrote under the issued key is read, checked and turned into the
-/// action's result, with its exit code, and the frontend caches it when the action exited 0 and
-/// not when it failed.
+/// rebuilt: a pack the task committed in the issued directory is read, checked and turned into
+/// the action's result, with its exit code, and the frontend caches it when the action exited
+/// 0 and not when it failed.
 #[tokio::test]
 async fn a_pack_under_the_issued_key_becomes_the_actions_result() {
     let rig = Rig::new();
@@ -738,27 +559,11 @@ async fn a_pack_under_the_issued_key_becomes_the_actions_result() {
             .await;
         let key = issued(&rig, &build, &action);
         let manifest = TaskManifest {
-            lease: build,
-            action: super::cas_digest(&action).expect("a digest"),
             exit_code,
-            stdout: None,
-            stderr: None,
-            output_files: Vec::new(),
-            output_directories: Vec::new(),
-            output_symlinks: Vec::new(),
-            timing: Timing::default(),
-            usage: Usage::default(),
-            packs: 1,
-            large: vec![],
-            inputs: None,
-            objects: None,
+            ..manifest_of(&build, &action)
         };
         let pack = write_pack(&manifest, &[]).expect("a pack");
-        let object = ObjectKey::new(key.as_str().to_owned()).expect("an object key");
-        rig.store
-            .put_new(&object, Bytes::from(pack), None)
-            .await
-            .expect("written");
+        put_pack(&rig, &key, pack).await;
         let done = rig.front.ingest(lease, &key, &action, &limits()).await;
         let Ingested::Ran {
             result,
@@ -815,9 +620,10 @@ fn manifest_of(build: &str, action: &Digest) -> TaskManifest {
     }
 }
 
-/// Writes `pack` to the object store under `key`, as the task's `PUT` does.
-async fn put_pack(rig: &Rig, key: &PackKey, pack: Vec<u8>) {
-    let object = ObjectKey::new(key.as_str().to_owned()).expect("an object key");
+/// Writes `pack` to the object store as pack 0 of the put directory `dir`, as the node's store
+/// does when the task commits it.
+async fn put_pack(rig: &Rig, dir: &PackKey, pack: Vec<u8>) {
+    let object = ObjectKey::new(format!("{dir}/pack")).expect("an object key");
     rig.store
         .put_new(&object, Bytes::from(pack), None)
         .await
@@ -892,46 +698,11 @@ async fn the_actions_platform_wins_over_the_commands() {
     // Were the Command's platform the one read, the other image would be refused.
 }
 
-/// Catches the ingest handed a backend that cannot read the packs (a tree that only the pack
-/// holds is then unavailable, and every task with an output directory is retried for ever): the
-/// pack of a task whose output directory's tree and file are in the pack alone is ingested into
-/// a result, and cached.
-#[tokio::test]
-async fn a_tree_that_only_the_pack_holds_is_read_through_the_same_packs() {
-    let rig = Rig::new();
-    let action = rig.action(|_| {}, |_| {}).await;
-    let file = b"a file inside the output directory".to_vec();
-    let file_digest = VerifiedBlob::hashed(Bytes::from(file.clone())).digest();
-    let tree = Tree {
-        root: Some(Directory {
-            files: vec![FileNode {
-                name: "f".to_owned(),
-                digest: Some(wire(&file_digest)),
-                ..FileNode::default()
-            }],
-            ..Directory::default()
-        }),
-        ..Tree::default()
-    };
-    let tree = prost::Message::encode_to_vec(&tree);
-    let mut manifest = manifest_of("7-3", &action);
-    manifest.output_directories = vec![OutputDirectory {
-        path: "out".to_owned(),
-        tree: VerifiedBlob::hashed(Bytes::from(tree.clone())).digest(),
-    }];
-    let pack = write_pack(&manifest, &[&tree, &file]).expect("a pack");
-    let key = issued(&rig, "7-3", &action);
-    put_pack(&rig, &key, pack).await;
-    let done = rig.front.ingest(lease(), &key, &action, &limits()).await;
-    let Ingested::Ran { result, cached } = done else {
-        panic!("not ingested: {done:?}");
-    };
-    assert_eq!(result.output_directories.len(), 1);
-    assert!(cached, "the result was not cached");
-}
-
 #[path = "front_put_dir_tests.rs"]
 mod put_dir;
+
+#[path = "front_cache_tests.rs"]
+mod cache;
 
 #[path = "front_twice_tests.rs"]
 mod twice;

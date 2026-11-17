@@ -11,7 +11,6 @@
 mod classes;
 mod drain;
 mod driver;
-mod files;
 mod jobs;
 mod keys;
 mod mac;

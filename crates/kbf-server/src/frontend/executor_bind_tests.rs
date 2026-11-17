@@ -5,11 +5,11 @@
 use std::time::Duration;
 
 use super::super::{FrontendFlags, command, parse};
-use crate::executor::{PutDirRoots, TaskOut};
+use crate::executor::PutDirRoots;
 
 /// A frontend that runs placed actions on hosts, with everything it needs and nothing it can
 /// do without: the packs, and the put directories of the runs.
-const BASE: [&str; 20] = [
+const BASE: [&str; 19] = [
     "frontend",
     "--storage=http://127.0.0.1:1",
     "--state-store=postgres:///kbf?host=/run/postgresql",
@@ -27,7 +27,6 @@ const BASE: [&str; 20] = [
     "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
     "--executor-base-tree=/nowhere/base-tree",
     "--executor-base-tree-url=",
-    "--executor-insecure-argv-secrets",
     "--executor-host-cpus=8",
     "--executor-host-memory-gib=32",
 ];
@@ -114,7 +113,7 @@ fn the_longest_run_must_fit_the_keys_ceiling_less_the_slack() {
     };
     let flags = parsed(argv(&[], &with("--executor-max-run-secs=4100"))).expect("fits");
     let config = flags.executor.js.expect("js-agent").config;
-    assert_eq!(config.presign_ceiling, Duration::from_secs(4_400));
+    assert_eq!(config.key_ceiling, Duration::from_secs(4_400));
     // One second more does not.
     let why = refused(&[], &with("--executor-max-run-secs=4101"));
     assert!(
@@ -163,7 +162,7 @@ fn the_task_flags_are_the_executors_settings() {
     let js = flags.executor.js.expect("js-agent");
     let config = js.config;
     assert_eq!(js.put_retry, Duration::from_secs(60));
-    assert_eq!(config.task_out, TaskOut::PutDir(roots));
+    assert_eq!(config.task_out, Some(roots));
     assert_eq!(config.max_object_entries, put_dir.max_object_entries);
     assert_eq!(
         config.max_object_manifest_bytes,
@@ -173,7 +172,7 @@ fn the_task_flags_are_the_executors_settings() {
         config.object_bytes_per_entry,
         put_dir.object_bytes_per_entry
     );
-    assert_eq!(config.presign_ceiling, Duration::from_secs(14_400 - 600));
+    assert_eq!(config.key_ceiling, Duration::from_secs(14_400 - 600));
 }
 
 /// Asserts that `--task-put-retry-secs` reaches the executor's flags and is 60 s by default.

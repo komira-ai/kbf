@@ -1,21 +1,29 @@
-//! What a task is given to write to, and what bounds it.
+//! What a task is given to write to (its put directory), and what bounds it.
 
 use std::time::Duration;
 
+use js_proto::v1::mount;
 use kbf_front::Finished;
 use kbf_server::executor::Config;
 
-use crate::rig::{GIB, Rig};
+use crate::rig::{GIB, Posted, Rig};
 
 const HOST: &str = "host-1";
 
-/// Catches a pack key that two jobs can share (a counter, the attempt number, a value kept
-/// per process): a zombie of the first job, which still holds its url, would write the key
-/// the second job must create, and the create-only store would refuse the second job's own
-/// pack. Each submit draws a key of its own, so the zombie's late write lands on a key nobody
-/// reads, and the job that is read is never refused.
+/// The host directory a job commits into: its one read-write mount's host path.
+fn out_dir(posted: &Posted) -> String {
+    match posted.spec.mounts.first().and_then(|m| m.source.clone()) {
+        Some(mount::Source::HostPath(path)) => path,
+        other => panic!("no host directory mounted: {other:?}"),
+    }
+}
+
+/// Catches a put directory that two jobs can share (a counter, the attempt number, a value kept
+/// per process): a zombie of the first job, which still holds its mount, would write into the
+/// directory the second job commits into. Each submit draws a directory of its own under its
+/// lease's build id, and the directory the frontend reads is the rerun's, not the zombie's.
 #[tokio::test(start_paused = true)]
-async fn a_zombie_write_cannot_land_on_the_key_of_its_rerun() {
+async fn a_zombie_write_cannot_land_in_the_directory_of_its_rerun() {
     let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
     rig.pump().await;
     let caller = rig.submit(1);
@@ -25,40 +33,31 @@ async fn a_zombie_write_cannot_land_on_the_key_of_its_rerun() {
     rig.host_finishes(first.id(), HOST, 12);
     rig.pump().await;
     let second = rig.jobs_of(1).remove(1);
-    let (zombie_url, url) = (
-        first.arg("--pack-url").expect("a url").to_owned(),
-        second.arg("--pack-url").expect("a url").to_owned(),
-    );
-    assert_ne!(zombie_url, url);
-    let keys = rig.presign.keys();
-    assert_eq!(keys.len(), 2);
-    assert_ne!(keys[0], keys[1]);
-    for (key, posted) in keys.iter().zip([&first, &second]) {
+    let (zombie, dir) = (out_dir(&first), out_dir(&second));
+    assert_ne!(zombie, dir);
+    for (path, posted) in [&zombie, &dir].into_iter().zip([&first, &second]) {
         let lease = posted.arg("--lease").expect("a lease");
         assert!(
-            key.starts_with(&format!("cas/b/{lease}/")) && key.ends_with("-0"),
-            "{key} for lease {lease}"
+            path.starts_with(&format!("/mnt/ts/put/cas/b/{lease}/")) && path.ends_with("-0"),
+            "{path} for lease {lease}"
         );
     }
-    // The zombie writes first, and the rerun still creates its own key.
-    assert_eq!(rig.presign.put(&zombie_url), Ok(()));
-    assert_eq!(rig.presign.put(&url), Ok(()));
-    assert!(rig.presign.put(&url).is_err(), "the store is create-only");
     rig.host_finishes(second.id(), HOST, 0);
     assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
     let read = rig.ingest.calls.lock().expect("calls").clone();
     assert_eq!(read.len(), 1);
     assert_eq!(
-        read[0].1, keys[1],
-        "the rerun's pack is read, not the zombie's"
+        format!("/mnt/ts/put/{}", read[0].1),
+        dir,
+        "the rerun's directory is read, not the zombie's"
     );
 }
 
-/// Catches a url that outlives the job it was minted for by more than the margin, or one that
-/// dies before the job does (the whole task holds it): it is good for the job's wall limit,
-/// the action's timeout plus the margin, and the job's wall limit is the same number.
+/// Catches a put directory that outlives the job it was minted for by more than the margin, or
+/// one that dies before the job does (the whole task holds it): the mint is asked for the job's
+/// wall limit, the action's timeout plus the margin, and the job's wall limit is the same number.
 #[tokio::test(start_paused = true)]
-async fn the_url_and_the_wall_time_are_the_actions_timeout_plus_the_margin() {
+async fn the_directory_and_the_wall_time_are_the_actions_timeout_plus_the_margin() {
     let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
     rig.pump().await;
     let timeout = Duration::from_secs(1_800);
@@ -67,7 +66,7 @@ async fn the_url_and_the_wall_time_are_the_actions_timeout_plus_the_margin() {
     rig.pump().await;
     let job = rig.jobs_of(1).remove(0);
     let wall = timeout + rig.cfg.run_margin;
-    assert_eq!(rig.presign.minted.lock().expect("minted")[0].expires, wall);
+    assert_eq!(*rig.ingest.walls.lock().expect("walls"), vec![wall]);
     assert_eq!(job.spec.wall_limit_seconds, Some(wall.as_secs()));
     assert_eq!(job.arg("--deadline-ms"), Some("1800000"));
 }

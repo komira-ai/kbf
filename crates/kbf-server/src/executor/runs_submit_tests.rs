@@ -17,10 +17,9 @@ use tokio::time::Instant;
 use tonic::Code;
 
 use super::{Stage, counted, reported, status_of, step, submitted_specs, tell_start};
-use crate::executor::Secret;
 use crate::executor::host::HostWorker;
 use crate::executor::test_support::{Harness, Log, built_class, start};
-use crate::executor::traits::{ActionFacts, Inputs, InputsError, ReadGrant};
+use crate::executor::traits::{ActionFacts, Inputs, InputsError};
 
 /// An action read that ends at `until`, on the test's held clock: the prepare of a task
 /// takes exactly as long as the test says. It says when the read has begun (`begun`), so the
@@ -43,16 +42,8 @@ impl Inputs for ReadUntil {
         })
     }
 
-    async fn read_grant(
-        &self,
-        _: LeaseId,
-        _: &Digest,
-        _: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Ok(ReadGrant {
-            url: "https://grant.test:9400".to_owned(),
-            token: Secret::new("token"),
-        })
+    async fn tree(&self, _: LeaseId) -> Result<String, InputsError> {
+        Ok("ab".repeat(32))
     }
 }
 
@@ -242,16 +233,8 @@ impl Inputs for Arc<Gate> {
         })
     }
 
-    async fn read_grant(
-        &self,
-        _: LeaseId,
-        _: &Digest,
-        _: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Ok(ReadGrant {
-            url: "https://grant.test:9400".to_owned(),
-            token: Secret::new("token"),
-        })
+    async fn tree(&self, _: LeaseId) -> Result<String, InputsError> {
+        Ok("ab".repeat(32))
     }
 }
 

@@ -1,24 +1,17 @@
-//! The executor's seams, over what the frontend owns: [`Front`] implements [`Ingest`],
-//! [`Presign`] and [`Inputs`].
+//! The executor's seams, over what the frontend owns: [`Front`] implements [`Ingest`] and
+//! [`Inputs`].
 //!
-//! - **Ingest** is [`kbf_front::ingest`] over the frontend's [`Packs`], a [`Backend`] built over
-//!   the same packs (the Action it reads to decide on caching may be a blob the frontend keeps
-//!   in a pack), and the [`PackKeyMint`] that issued the key. The lease it is given is the farm
-//!   lease's build id ([`build_id`]), the same string the task tool is told with `--lease`.
-//! - **The key, the write and the grant** come from one call of the frontend's run preparation
-//!   ([`RunPrepare`], which the frontend implements over `prepare_run_for` of
-//!   `kbf_front::prepare_run`): the pack key, one presigned `PUT` of exactly that key, and the
-//!   read grant. The executor asks for them in three steps ([`Ingest::mint`], then
-//!   [`Presign::put_url`], then [`Inputs::read_grant`]), so what the one call returned is parked
-//!   under the farm lease and handed out once. The write host and the size cap are the
-//!   preparation's: it signs for one store endpoint and the signer limits the object. A run
-//!   that cannot be prepared is the caller's ([`MintError::Refused`]) unless the store could
-//!   not be read ([`MintError::Unavailable`]): see [`PrepareFault`].
-//! - **A put directory** (`--task-out-mode put-dir`, [`FrontParts::put_dir`]): the preparation
-//!   mints the run's put directory and collects its closure ([`RunPrepare::prepare_put_dir`]),
-//!   and [`Ingest::mint`] writes the action tree over the published base tree ([`TreeWriter`])
-//!   and parks its digest, which [`Inputs::tree`] hands out once. No write is signed and no
-//!   grant issued. The ingest is [`kbf_front::ingest_put_dir`] of the directory.
+//! - **A put directory** ([`FrontParts::put_dir`]): a run commits its objects into a directory
+//!   the frontend mints for it. The preparation ([`RunPrepare`]) mints the run's put directory
+//!   and collects its closure ([`RunPrepare::prepare_put_dir`]), and [`Ingest::mint`] writes the
+//!   action tree over the published base tree ([`TreeWriter`]) and parks its digest, which
+//!   [`Inputs::tree`] hands out once. The lease it is given is the farm lease's build id
+//!   ([`build_id`]), the same string the task tool is told with `--lease`. The ingest is
+//!   [`kbf_front::ingest_put_dir_with`] of the directory, over the frontend's [`Packs`] and a
+//!   [`Backend`] built over the same packs (the Action it reads to check the outputs may be a
+//!   blob the frontend keeps in a pack). A run that cannot be prepared is the caller's
+//!   ([`MintError::Refused`]) unless the store could not be read ([`MintError::Unavailable`]):
+//!   see [`PrepareFault`].
 //! - **The action's facts** are read from the Action and the Command in the CAS: the
 //!   `container-image` platform property, which names the BASE environment the Command sees and
 //!   must be, by digest, the base the executor serves (an action that names none uses it); and
@@ -27,50 +20,51 @@
 //!   launched and no entrypoint is looked for. The platform's system is read too (`OSFamily`
 //!   or `os`, and a Mac's `os_version`), as the farm reads it: a Mac action becomes a Mac job
 //!   ([`crate::executor::mac`]).
+//! - **Two caches, by digest**, so that a warm prepare does no store call (`front_cache.rs`).
+//!   Each is bounded by its entries, the oldest going first. Both live and die with the `Front`
+//!   and the base and kbf images it is pinned to. The action trees remembered are those of an
+//!   action and a form ([`InputTree`]): the tree's name, good for
+//!   [`kbf_front::action_tree::MEMO_TTL`] on the frontend's clock, since a tree names the pack
+//!   spans and whole objects its files are held in, and the writer's own memo keeps a place for
+//!   no longer than that. A hit skips the
+//!   closure, the lookup of the places and every write; only the run's put directory is minted
+//!   ([`RunPrepare::mint_put_dir`]). The facts remembered are those of an action's digest, which
+//!   never expire: the Action, the Command and the platform they name are named by their
+//!   digests, so what they say cannot change. Only a read that succeeded is remembered.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::action_tree::{BaseTree, PutRetry, TreeWriter};
+use kbf_front::action_tree::{BaseTree, MEMO_TTL, PutRetry, TreeWriter};
 use kbf_front::prepare_run::{
     KeptClosure, PrepareError as RunPrepError, PrepareFault, PutDirPrep, PutDirRun,
 };
-use kbf_front::{Backend, Described, IssuedPackKey, IssuedPutDir, PackKeyMint, Packs};
+use kbf_front::{Backend, Described, IssuedPutDir, PackKeyMint, Packs};
 use kbf_proto::reapi::{self, Action, Command, Digest};
 use kbf_types::{DigestFunction, ImageRef, LeaseId};
 use std::sync::Arc;
 
 use crate::action_usage::Shape;
 use crate::executor::config::InputTree;
+use crate::executor::front_cache::Bounded;
 use crate::executor::mac::System;
 use crate::executor::size_class::SizeClass;
-use crate::executor::task::{PackKey, Secret, build_id};
+use crate::executor::task::{PackKey, build_id};
 use crate::executor::traits::{
-    ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
-    ReadGrant, RejectReason, UntrustedLimits,
+    ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, RejectReason, UntrustedLimits,
 };
 
-/// What the frontend's run preparation gives one run (`RunInputs` of
-/// `kbf_front::prepare_run`, as values).
-#[derive(Clone)]
-pub struct PreparedRun {
-    /// The pack key the task may write: `cas/b/<build>/<nonce>-0`.
-    pub key: String,
-    /// One presigned `PUT` of exactly [`PreparedRun::key`].
-    pub put_url: Secret,
-    /// The base url of the read listener.
-    pub grant_url: String,
-    /// The bearer token of the read grant.
-    pub grant_token: Secret,
-    /// The Unix second the write and the grant stop working at.
-    pub not_after: u64,
-}
+/// The most action trees [`Front`] remembers.
+const TREE_ENTRIES: usize = 100_000;
+
+/// The most action facts [`Front`] remembers.
+const FACTS_ENTRIES: usize = 100_000;
 
 /// Why a run could not be prepared.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PrepareError {
-    /// The inputs are not all held, are over budget, or the wall is over the presign ceiling.
+    /// The inputs are not all held, are over budget, or the wall is over the key ceiling.
     #[error("{0}")]
     Refused(String),
     /// The store could not answer.
@@ -78,40 +72,35 @@ pub enum PrepareError {
     Unavailable(String),
 }
 
-/// The frontend's preparation of a run: the key, the write and the grant.
+/// The frontend's preparation of a run: its put directory, and the closure of its inputs.
 #[tonic::async_trait]
 pub trait RunPrepare: Send + Sync {
-    /// The inputs of the run of `action` on `lease` (a build id), started at `now`, which may
-    /// take `wall`: the write and the grant are good for it.
-    ///
-    /// # Errors
-    /// [`PrepareError`].
-    async fn prepare_run(
-        &self,
-        lease: &str,
-        action: &kbf_types::Digest,
-        now: SystemTime,
-        wall: Duration,
-    ) -> Result<PreparedRun, PrepareError>;
-
     /// The run of `action` on `lease`, started at `now`, which may take `wall`, that commits
     /// into a put directory: the directory and the closure its action tree is written from.
     ///
     /// # Errors
-    /// [`PrepareError`]; by default [`PrepareError::Refused`], for a preparation that makes no
-    /// put directory.
+    /// [`PrepareError`].
     async fn prepare_put_dir(
         &self,
         lease: &str,
         action: &kbf_types::Digest,
         now: SystemTime,
         wall: Duration,
-    ) -> Result<PreparedPutDir, PrepareError> {
-        let _ = (lease, action, now, wall);
-        Err(PrepareError::Refused(
-            "this preparation makes no put directory".to_owned(),
-        ))
-    }
+    ) -> Result<PreparedPutDir, PrepareError>;
+
+    /// The put directory of the run alone, for a run whose action tree is cached: no closure is
+    /// collected. The same checks and errors as [`RunPrepare::prepare_put_dir`] without the
+    /// closure.
+    ///
+    /// # Errors
+    /// [`PrepareError`].
+    async fn mint_put_dir(
+        &self,
+        lease: &str,
+        action: &kbf_types::Digest,
+        now: SystemTime,
+        wall: Duration,
+    ) -> Result<MintedDir, PrepareError>;
 }
 
 /// What the frontend's run preparation gives a run that commits into a put directory
@@ -126,6 +115,16 @@ pub struct PreparedPutDir {
     pub not_after: u64,
 }
 
+/// What the frontend's run preparation gives a run whose action tree is cached
+/// (`MintedPutDir` of `kbf_front::prepare_run`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MintedDir {
+    /// The put directory, `cas/b/<build>/<nonce>`.
+    pub dir: String,
+    /// The Unix second the directory's keys stop being good for the run at.
+    pub not_after: u64,
+}
+
 impl From<PrepareError> for MintError {
     fn from(error: PrepareError) -> Self {
         match error {
@@ -135,24 +134,9 @@ impl From<PrepareError> for MintError {
     }
 }
 
-/// The frontend's real preparation, [`PutDirPrep`], as the executor asks for it: it makes the
-/// directory and the closure, and no key, write or grant, so a run that asks for those is
-/// refused.
+/// The frontend's real preparation, [`PutDirPrep`], as the executor asks for it.
 #[tonic::async_trait]
 impl RunPrepare for PutDirPrep {
-    async fn prepare_run(
-        &self,
-        _lease: &str,
-        _action: &kbf_types::Digest,
-        _now: SystemTime,
-        _wall: Duration,
-    ) -> Result<PreparedRun, PrepareError> {
-        Err(PrepareError::Refused(
-            "this preparation makes no presigned write: runs commit into put directories"
-                .to_owned(),
-        ))
-    }
-
     async fn prepare_put_dir(
         &self,
         lease: &str,
@@ -164,6 +148,22 @@ impl RunPrepare for PutDirPrep {
             .await
             .map(prepared_put_dir)
             .map_err(prepare_error)
+    }
+
+    async fn mint_put_dir(
+        &self,
+        lease: &str,
+        action: &kbf_types::Digest,
+        now: SystemTime,
+        wall: Duration,
+    ) -> Result<MintedDir, PrepareError> {
+        let minted = PutDirPrep::mint_put_dir(self, lease, action, now, wall)
+            .await
+            .map_err(prepare_error)?;
+        Ok(MintedDir {
+            dir: minted.dir.dir().to_owned(),
+            not_after: minted.not_after,
+        })
     }
 }
 
@@ -190,7 +190,7 @@ fn prepare_error(error: RunPrepError) -> PrepareError {
 pub struct RunSource {
     /// The mint that issues the keys and verifies them in the ingest.
     pub mint: PackKeyMint,
-    /// The preparation of a run's write and read grant.
+    /// The preparation of a run's put directory.
     pub prepare: Arc<dyn RunPrepare>,
 }
 
@@ -212,22 +212,21 @@ pub struct FrontParts {
     pub packs: Packs,
     /// The frontend's CAS, built over the same packs.
     pub backend: Backend,
-    /// The mint that issued the keys and verifies them.
+    /// The mint that issued the put directories and verifies them.
     pub mint: PackKeyMint,
     /// The preparation of a run.
     pub prepare: Arc<dyn RunPrepare>,
     /// The base environment this executor serves, pinned by digest: the one image an action's
     /// `container-image` may name (an action that names none gets it).
     pub base_image: ImageRef,
-    /// The kbf image, pinned by digest, built from [`FrontParts::base_image`]: the image every
-    /// run of presigned writes is launched from.
+    /// The kbf image, pinned by digest, built from [`FrontParts::base_image`]: the image the
+    /// facts of every action name.
     pub kbf_image: ImageRef,
-    /// With `--task-out-mode put-dir`, how the action trees are written; `None` for presigned
-    /// writes.
-    pub put_dir: Option<PutDirParts>,
+    /// How the action trees are written.
+    pub put_dir: PutDirParts,
 }
 
-/// What a frontend whose tasks commit into put directories writes their action trees with.
+/// What the frontend writes the action trees of the runs' put directories with.
 pub struct PutDirParts {
     /// The writer of the action trees, over the frontend's CAS and packs.
     pub writer: TreeWriter,
@@ -255,22 +254,12 @@ impl PutDirParts {
     }
 }
 
-/// What [`Front`] holds of one run between the three steps.
+/// What [`Front`] holds of one run between [`Ingest::mint`] and [`Inputs::tree`].
 struct Parked {
-    key: String,
-    put_url: Option<Secret>,
-    grant: Option<ReadGrant>,
-    /// The action tree of a put-directory run: its digest in hex, or its tree list's key.
-    tree: Option<String>,
-    /// When the write and the grant stop working: the entry is dropped after.
+    /// The action tree of the run: its digest in hex, or its tree list's key.
+    tree: String,
+    /// When the directory's keys stop being good: the entry is dropped after.
     not_after: u64,
-}
-
-impl Parked {
-    /// Whether something of the run is still to be handed out.
-    fn holds_any(&self) -> bool {
-        self.put_url.is_some() || self.grant.is_some() || self.tree.is_some()
-    }
 }
 
 /// The executor's seams over the frontend.
@@ -278,7 +267,14 @@ pub struct Front {
     parts: FrontParts,
     now: fn() -> SystemTime,
     parked: Mutex<BTreeMap<LeaseId, Parked>>,
+    /// The name of the action tree written for an action in a form, and when it stops being
+    /// good.
+    trees: Mutex<Trees>,
+    /// The facts of an action, by the digest of its Action.
+    facts: Mutex<Bounded<(String, i64), ActionFacts>>,
 }
+
+type Trees = Bounded<(kbf_types::Digest, InputTree), (String, SystemTime)>;
 
 impl Front {
     /// The seams over `parts`.
@@ -299,11 +295,55 @@ impl Front {
             parts,
             now,
             parked: Mutex::new(BTreeMap::new()),
+            trees: Mutex::new(Bounded::new(TREE_ENTRIES)),
+            facts: Mutex::new(Bounded::new(FACTS_ENTRIES)),
+        }
+    }
+
+    /// These seams remembering at most `trees` action trees and `facts` actions' facts.
+    #[cfg(test)]
+    fn with_bounds(self, trees: usize, facts: usize) -> Self {
+        Self {
+            trees: Mutex::new(Bounded::new(trees)),
+            facts: Mutex::new(Bounded::new(facts)),
+            ..self
         }
     }
 
     fn parked(&self) -> MutexGuard<'_, BTreeMap<LeaseId, Parked>> {
         self.parked.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn trees(&self) -> MutexGuard<'_, Trees> {
+        self.trees.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn facts(&self) -> MutexGuard<'_, Bounded<(String, i64), ActionFacts>> {
+        self.facts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The name of the action tree remembered for `action` in `form`, if it is good at `now`.
+    fn remembered_tree(
+        &self,
+        action: &kbf_types::Digest,
+        form: InputTree,
+        now: SystemTime,
+    ) -> Option<String> {
+        let (tree, expires) = self.trees().get(&(*action, form))?;
+        (now < expires).then_some(tree)
+    }
+
+    /// Remembers `tree` as the action tree of `action` in `form`, written at `now`.
+    fn remember_tree(
+        &self,
+        action: &kbf_types::Digest,
+        form: InputTree,
+        now: SystemTime,
+        tree: &str,
+    ) {
+        let expires = now.checked_add(MEMO_TTL).unwrap_or(now);
+        self.trees()
+            .put((*action, form), (tree.to_owned(), expires));
     }
 
     /// The message `digest` is, read from the CAS.
@@ -345,39 +385,7 @@ impl Ingest for Front {
     ) -> Result<PackKey, MintError> {
         let action = cas_digest(action).map_err(MintError::Refused)?;
         let now = (self.now)();
-        if let Some(put_dir) = &self.parts.put_dir {
-            return (self.mint_put_dir(put_dir, lease, &action, (now, wall), tree)).await;
-        }
-        let prepared = self
-            .parts
-            .prepare
-            .prepare_run(&build_id(lease), &action, now, wall)
-            .await
-            .map_err(MintError::from)?;
-        let needed = seconds(now).saturating_add(wall.as_secs());
-        if prepared.not_after < needed {
-            return Err(MintError::Refused(
-                "the write and the grant end before the run's wall time does".to_owned(),
-            ));
-        }
-        let key = PackKey::new(prepared.key.clone());
-        let mut parked = self.parked();
-        // What a start that ran out of its window left behind.
-        parked.retain(|_, run| run.not_after >= seconds(now));
-        parked.insert(
-            lease,
-            Parked {
-                key: prepared.key,
-                put_url: Some(prepared.put_url),
-                grant: Some(ReadGrant {
-                    url: prepared.grant_url,
-                    token: prepared.grant_token,
-                }),
-                tree: None,
-                not_after: prepared.not_after,
-            },
-        );
-        Ok(key)
+        self.mint_put_dir(lease, &action, (now, wall), tree).await
     }
 
     async fn ingest(
@@ -389,11 +397,7 @@ impl Ingest for Front {
     ) -> Ingested {
         // The key is read first: a key that is not one issued is the wrong key, whatever the
         // action's digest.
-        let key = match &self.parts.put_dir {
-            Some(_) => put_dir_of(key).map(Issued::PutDir),
-            None => issued_of(key).map(Issued::Key),
-        };
-        let Some(key) = key else {
+        let Some(dir) = put_dir_of(key) else {
             return Ingested::Reject(RejectReason::WrongKey);
         };
         let action = match cas_digest(action) {
@@ -409,17 +413,10 @@ impl Ingest for Front {
             ..kbf_front::UntrustedLimits::default()
         };
         let (packs, backend, mint) = (&self.parts.packs, &self.parts.backend, &self.parts.mint);
+        let writer = Some(&self.parts.put_dir.writer);
+        let ingest = kbf_front::ingest_put_dir_with;
         let build = build_id(lease);
-        let done = match key {
-            Issued::PutDir(dir) => {
-                let writer = self.parts.put_dir.as_ref().map(|parts| &parts.writer);
-                let ingest = kbf_front::ingest_put_dir_with;
-                ingest(packs, backend, mint, &build, &dir, &action, &limits, writer).await
-            }
-            Issued::Key(key) => {
-                kbf_front::ingest(packs, backend, mint, &build, &key, &action, &limits).await
-            }
-        };
+        let done = ingest(packs, backend, mint, &build, &dir, &action, &limits, writer).await;
         match done {
             kbf_front::Ingested::Ran { result, cached } => Ingested::Ran { result, cached },
             kbf_front::Ingested::Reject(why) => Ingested::Reject(reason(why)),
@@ -428,83 +425,91 @@ impl Ingest for Front {
     }
 }
 
-/// What the frontend issued a run: a key, or a put directory.
-enum Issued {
-    Key(IssuedPackKey),
-    PutDir(IssuedPutDir),
-}
-
-/// The key the frontend issued, from its text `cas/b/<build>/<nonce>`.
-fn issued_of(key: &PackKey) -> Option<IssuedPackKey> {
-    let (build, nonce) = key.as_str().strip_prefix("cas/b/")?.split_once('/')?;
-    IssuedPackKey::new(build, nonce).ok()
-}
-
 /// The put directory the frontend issued, from its text `cas/b/<build>/<nonce>`.
 fn put_dir_of(key: &PackKey) -> Option<IssuedPutDir> {
     let (build, nonce) = key.as_str().strip_prefix("cas/b/")?.split_once('/')?;
     IssuedPutDir::new(build, nonce).ok()
 }
 
+/// Refuses a put directory whose keys end before the run's wall time (`wall` from `now`) does.
+fn lasts(not_after: u64, now: SystemTime, wall: Duration) -> Result<(), MintError> {
+    let needed = seconds(now).saturating_add(wall.as_secs());
+    match not_after < needed {
+        true => Err(MintError::Refused(
+            "the put directory's keys end before the run's wall time does".to_owned(),
+        )),
+        false => Ok(()),
+    }
+}
+
 impl Front {
-    /// [`Ingest::mint`] of a run that commits into a put directory: the directory, and the
-    /// action tree written over the base tree as `form` says (its manifests, or its tree
-    /// list) and parked for [`Inputs::tree`].
+    /// [`Ingest::mint`]: the put directory of the run, and the action tree written over the base
+    /// tree as `form` says (its manifests, or its tree list) and parked for [`Inputs::tree`].
+    /// An action tree remembered for the action in this form is not written again: only the
+    /// directory is minted.
     async fn mint_put_dir(
         &self,
-        put_dir: &PutDirParts,
         lease: LeaseId,
         action: &kbf_types::Digest,
         (now, wall): (SystemTime, Duration),
         form: InputTree,
     ) -> Result<PackKey, MintError> {
+        let put_dir = &self.parts.put_dir;
         // Before anything is read or minted: without the base no tree can be written.
         let Some(base) = put_dir.base.get() else {
             return Err(MintError::Unavailable(
                 "the kbf base tree is not published: no action tree can be written".to_owned(),
             ));
         };
-        let prepared = self
-            .parts
-            .prepare
-            .prepare_put_dir(&build_id(lease), action, now, wall)
-            .await
-            .map_err(MintError::from)?;
-        let needed = seconds(now).saturating_add(wall.as_secs());
-        if prepared.not_after < needed {
-            return Err(MintError::Refused(
-                "the put directory's keys end before the run's wall time does".to_owned(),
-            ));
-        }
-        let writer = &put_dir.writer;
-        let tree = match form {
-            InputTree::Manifests => {
-                (writer.write(&prepared.kept, base).await).map(|tree| tree.digest().to_string())
+        let build = build_id(lease);
+        let prepare = &self.parts.prepare;
+        let (dir, not_after, tree) = match self.remembered_tree(action, form, now) {
+            Some(tree) => {
+                let minted = prepare.mint_put_dir(&build, action, now, wall).await;
+                let minted = minted.map_err(MintError::from)?;
+                lasts(minted.not_after, now, wall)?;
+                (minted.dir, minted.not_after, tree)
             }
-            InputTree::Provider => (writer.write_listing(&prepared.kept, base).await)
-                .map(|listing| listing.key().to_owned()),
+            None => {
+                let prepared = prepare.prepare_put_dir(&build, action, now, wall).await;
+                let prepared = prepared.map_err(MintError::from)?;
+                lasts(prepared.not_after, now, wall)?;
+                let tree = write_tree(put_dir, base, &prepared.kept, form).await?;
+                self.remember_tree(action, form, now, &tree);
+                (prepared.dir, prepared.not_after, tree)
+            }
         };
-        let tree = tree.map_err(|no| {
-            let why = format!("no action tree: {no}");
-            match no.why() {
-                "store" => MintError::Unavailable(why),
-                _ => MintError::Refused(why),
-            }
-        })?;
         let mut parked = self.parked();
         parked.retain(|_, run| run.not_after >= seconds(now));
-        parked.insert(
-            lease,
-            Parked {
-                key: prepared.dir.clone(),
-                put_url: None,
-                grant: None,
-                tree: Some(tree),
-                not_after: prepared.not_after,
-            },
-        );
-        Ok(PackKey::new(prepared.dir))
+        parked.insert(lease, Parked { tree, not_after });
+        Ok(PackKey::new(dir))
     }
+}
+
+/// The action tree of `kept` written over `base` as `form` says: its root manifest's digest in
+/// hex, or its tree list's key.
+async fn write_tree(
+    put_dir: &PutDirParts,
+    base: &BaseTree,
+    kept: &KeptClosure,
+    form: InputTree,
+) -> Result<String, MintError> {
+    let writer = &put_dir.writer;
+    let tree = match form {
+        InputTree::Manifests => {
+            (writer.write(kept, base).await).map(|tree| tree.digest().to_string())
+        }
+        InputTree::Provider => {
+            (writer.write_listing(kept, base).await).map(|listing| listing.key().to_owned())
+        }
+    };
+    tree.map_err(|no| {
+        let why = format!("no action tree: {no}");
+        match no.why() {
+            "store" => MintError::Unavailable(why),
+            _ => MintError::Refused(why),
+        }
+    })
 }
 
 fn reason(why: kbf_front::RejectReason) -> RejectReason {
@@ -522,30 +527,32 @@ fn reason(why: kbf_front::RejectReason) -> RejectReason {
     }
 }
 
-#[tonic::async_trait]
-impl Presign for Front {
-    async fn put_url(
-        &self,
-        key: &PackKey,
-        _expires: Duration,
-        _max_bytes: u64,
-    ) -> Result<Secret, PresignError> {
-        let mut parked = self.parked();
-        let url = parked
-            .values_mut()
-            .find(|run| run.key == key.as_str())
-            .and_then(|run| run.put_url.take());
-        parked.retain(|_, run| run.holds_any());
-        url.ok_or_else(|| PresignError::Refused(format!("no write was prepared for {key}")))
-    }
-}
-
 /// The name of the platform property that names the image.
 const IMAGE_PROPERTY: &str = "container-image";
 
 #[tonic::async_trait]
 impl Inputs for Front {
     async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
+        let key = (action.hash.clone(), action.size_bytes);
+        let remembered = self.facts().get(&key);
+        if let Some(facts) = remembered {
+            return Ok(facts);
+        }
+        let facts = self.read_facts(action).await?;
+        self.facts().put(key, facts.clone());
+        Ok(facts)
+    }
+
+    async fn tree(&self, lease: LeaseId) -> Result<String, InputsError> {
+        let run = self.parked().remove(&lease);
+        run.map(|run| run.tree)
+            .ok_or_else(|| InputsError::Unavailable(format!("no tree was written for {lease}")))
+    }
+}
+
+impl Front {
+    /// The facts of `action`, read from the CAS.
+    async fn read_facts(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
         let digest = cas_digest(action).map_err(InputsError::Invalid)?;
         let action: Action = self.read("action", &digest).await?;
         let command = action
@@ -567,25 +574,6 @@ impl Inputs for Front {
             system,
             size_class: SizeClass::of_action(&shape),
         })
-    }
-
-    async fn read_grant(
-        &self,
-        lease: LeaseId,
-        _action: &Digest,
-        _expires: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        let mut parked = self.parked();
-        let grant = parked.get_mut(&lease).and_then(|run| run.grant.take());
-        parked.retain(|_, run| run.holds_any());
-        grant.ok_or_else(|| InputsError::Unavailable(format!("no grant was prepared for {lease}")))
-    }
-
-    async fn tree(&self, lease: LeaseId) -> Result<String, InputsError> {
-        let mut parked = self.parked();
-        let tree = parked.get_mut(&lease).and_then(|run| run.tree.take());
-        parked.retain(|_, run| run.holds_any());
-        tree.ok_or_else(|| InputsError::Unavailable(format!("no tree was written for {lease}")))
     }
 }
 

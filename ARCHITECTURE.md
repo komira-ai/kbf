@@ -470,9 +470,8 @@ in between ([deployment-topology.md](docs/design/deployment-topology.md)).
 - Only the frontend writes the action cache, from a result it accepted, and the metadata
   state machine itself refuses an action-cache write from any role but `Daemon`
   (the role the frontend's own writes carry).
-- A job runs with the network level the executor names (`--executor-network`, by default an
-  allow-list of the endpoints its host's agent allows) in the job service's own sandbox; the
-  Command sees the job's root file system and no more ([kbf-modes.md](docs/deploy/kbf-modes.md)).
+- A job runs with no network in the job service's own sandbox; the Command sees its mounted
+  tree and its put directory and no more ([kbf-modes.md](docs/deploy/kbf-modes.md)).
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 

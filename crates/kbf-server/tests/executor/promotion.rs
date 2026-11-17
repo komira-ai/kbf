@@ -1,13 +1,15 @@
-//! The promotion rule: the frontend reads a job's pack, and promotes its outputs, only from a
-//! clean result (the job and its result succeeded, for the job's exit, with exit code 0). A
-//! job that wrote its whole pack and then ended any other way has its pack left unread.
+//! The promotion rule: the frontend reads a job's put directory, and promotes its outputs, only
+//! from a clean result (the job and its result succeeded, for the job's exit, with exit code 0).
+//! A job that committed its outputs and then ended any other way has its directory left unread.
 //!
 //! The fake job service ends a job by exit code only, so every other ending is scripted: the
 //! answers to the executor's next read of the job and of its result are replaced by ones that
 //! say how it ended.
 
 use bytes::Bytes;
-use js_proto::v1::{GetJobResponse, GetResultResponse, Job, JobResult, JobState, ResultReason};
+use js_proto::v1::{
+    GetJobResponse, GetResultResponse, Job, JobResult, JobState, ResultReason, mount,
+};
 use kbf_front::Finished;
 use kbf_job_client::fake::Fault;
 use prost::Message as _;
@@ -17,7 +19,7 @@ use crate::rig::{Posted, Rig};
 
 const HOST: &str = "host-1";
 
-/// How the first job of the action ends, after it wrote its whole pack.
+/// How the first job of the action ends, after it committed its outputs.
 #[derive(Debug)]
 enum Ending {
     /// The task tool exits nonzero, as the fake ends a job.
@@ -37,17 +39,15 @@ enum Then {
     TimedOut,
 }
 
-/// The key of the pack `job` may write, from the url it was handed.
-fn pack_key(job: &Posted) -> String {
-    let url = job
-        .file("pack-url")
-        .or_else(|| job.arg("--pack-url"))
-        .expect("a pack url");
-    let key = url
-        .strip_prefix("https://store.test/")
-        .and_then(|rest| rest.split('?').next())
-        .expect("a url of the fake store");
-    key.to_owned()
+/// The key of the put directory `job` commits into, from the host path it mounts at `/out`.
+fn dir_key(job: &Posted) -> String {
+    let source = job.spec.mounts.first().and_then(|m| m.source.clone());
+    let Some(mount::Source::HostPath(path)) = source else {
+        panic!("no host directory mounted: {:?}", job.spec.mounts);
+    };
+    path.strip_prefix("/mnt/ts/put/")
+        .expect("a directory under the put root")
+        .to_owned()
 }
 
 /// The keys the frontend was asked to read, in order.
@@ -86,11 +86,11 @@ fn script(
     );
 }
 
-/// Catches a pack the job already wrote in full being read, and its outputs promoted, from a
+/// Catches a directory the job already committed into being read, and its outputs promoted, from a
 /// result that is not clean: a nonzero exit of the task tool, a cancel by someone else, the
 /// wall limit, the memory limit, and a job that says it succeeded with a result that has no
 /// exit code, a nonzero one, a reason other than its exit, or a state other than succeeded.
-/// For each, the first job's key is written and never read; the action runs again (or, for
+/// For each, the first job's directory is never read; the action runs again (or, for
 /// the wall limit, is answered `DEADLINE_EXCEEDED`), and only the rerun's clean end is read.
 #[tokio::test(start_paused = true)]
 async fn outputs_are_promoted_only_from_a_clean_result() {
@@ -134,13 +134,7 @@ async fn outputs_are_promoted_only_from_a_clean_result() {
         let caller = rig.submit(1);
         rig.pump().await;
         let first = rig.jobs_of(1).remove(0);
-        let written = pack_key(&first);
-        let url = format!("https://store.test/{written}");
-        assert_eq!(
-            rig.presign.put(&url),
-            Ok(()),
-            "{ending:?}: the pack is written"
-        );
+        let written = dir_key(&first);
         match &ending {
             Ending::Exits(code) => rig.host_finishes(first.id(), HOST, *code),
             Ending::Cancelled => {
@@ -170,7 +164,7 @@ async fn outputs_are_promoted_only_from_a_clean_result() {
         );
         let jobs = rig.jobs_of(1);
         assert_eq!(jobs.len(), 2, "{ending:?} was not run again: {jobs:?}");
-        let rerun = pack_key(&jobs[1]);
+        let rerun = dir_key(&jobs[1]);
         assert_ne!(rerun, written, "{ending:?}");
         rig.host_finishes(jobs[1].id(), HOST, 0);
         match rig.until_done(&caller, 4).await {
@@ -181,19 +175,17 @@ async fn outputs_are_promoted_only_from_a_clean_result() {
     }
 }
 
-/// Catches the clean result not being promoted: a job that wrote its pack and ended with the
+/// Catches the clean result not being promoted: a job that committed its outputs and ended with the
 /// job and its result succeeded, for its exit, with exit code 0, has exactly that key read,
 /// once, and the caller is answered from it without a rerun.
 #[tokio::test(start_paused = true)]
-async fn the_clean_result_promotes_the_pack_it_wrote() {
+async fn the_clean_result_promotes_the_directory_it_committed() {
     let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
     rig.pump().await;
     let caller = rig.submit(1);
     rig.pump().await;
     let job = rig.jobs_of(1).remove(0);
-    let written = pack_key(&job);
-    let url = format!("https://store.test/{written}");
-    assert_eq!(rig.presign.put(&url), Ok(()));
+    let written = dir_key(&job);
     rig.host_runs(job.id(), HOST);
     script(
         &rig,

@@ -3,10 +3,10 @@
 
 use std::time::Duration;
 
-use js_proto::v1::{JobState, NetworkLevel};
+use js_proto::v1::{JobState, mount};
 use kbf_front::Finished;
 use kbf_job_client::fake::Fault;
-use kbf_server::executor::{Config, ConfigError, InputsError, Network, PresignError};
+use kbf_server::executor::{Config, InputsError, TASK_IN_TREE};
 use tonic::Code;
 
 use crate::rig::{Rig, cancels, hex, settle, submits};
@@ -20,11 +20,11 @@ fn code(finished: &Finished) -> Code {
     }
 }
 
-/// Catches an action that does not run end to end: submitted as a job of the kbf image, read
+/// Catches an action that does not run end to end: submitted as a job, read
 /// back at its exit, ingested, reported, acknowledged and answered to the caller, with the
-/// task given what it needs (the image without its scheme, the secrets as arguments, the pack
-/// under `cas/b`, a url good for the job's wall time) and the job service asked, in order,
-/// for one `SubmitJob`, reads of the job, and one `GetResult` when it had ended.
+/// task given what it needs (no image, the tree as its root, its put directory under `cas/b`
+/// mounted at `/out`, the mint asked for the job's wall time) and the job service asked, in
+/// order, for one `SubmitJob`, reads of the job, and one `GetResult` when it had ended.
 #[tokio::test(start_paused = true)]
 async fn an_action_runs_end_to_end() {
     let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
@@ -38,37 +38,30 @@ async fn an_action_runs_end_to_end() {
     let job = &jobs[0];
     assert_eq!(job.state(), JobState::Queued);
     assert_eq!(job.arg("--action"), Some(format!("{}/7", hex(7)).as_str()));
-    // The kbf image keeps the task tool as its entrypoint: the arguments are its flags, with
-    // no path in front, and the job's command is left empty.
-    assert_eq!(job.spec.args[0], "--action");
-    assert!(job.spec.command.is_empty());
-    assert_eq!(
-        job.spec.image,
-        crate::rig::IMAGE.trim_start_matches("docker://")
-    );
-    assert_eq!(job.arg("--grant-token"), Some("read-token-0001"));
-    assert_eq!(job.arg("--grant-url"), Some("https://grant.test:9400"));
-    assert!(
-        job.spec
-            .args
-            .contains(&"--insecure-argv-secrets".to_owned())
-    );
-    let url = job.arg("--pack-url").expect("a pack url");
+    // The tree holds the task tool as the job's command: the arguments are its flags, with no
+    // path in front, and the job has no image.
+    assert_eq!(job.spec.args[0], "--tree");
+    assert_eq!(job.spec.command, TASK_IN_TREE);
+    assert!(job.spec.image.is_empty());
     let lease = job.arg("--lease").expect("a lease");
-    assert!(
-        url.starts_with(&format!("https://store.test/cas/b/{lease}/")),
-        "{url}"
-    );
     assert!(!lease.contains('.'), "{lease}");
     assert!(
         job.id().ends_with(&format!("-{lease}-0")),
         "the job's id is made from the farm lease: {}",
         job.id()
     );
-    let minted = rig.presign.minted.lock().expect("minted").clone();
-    assert_eq!(minted.len(), 1);
-    assert_eq!(minted[0].max_bytes, 128 << 20);
-    assert_eq!(minted[0].expires, Duration::from_secs(60 + 300));
+    let source = job.spec.mounts.first().and_then(|m| m.source.clone());
+    let Some(mount::Source::HostPath(out)) = source else {
+        panic!("no host directory mounted: {:?}", job.spec.mounts);
+    };
+    let dir = out
+        .strip_prefix("/mnt/ts/put/")
+        .expect("under the put root");
+    assert!(dir.starts_with(&format!("cas/b/{lease}/")), "{dir}");
+    assert_eq!(
+        *rig.ingest.walls.lock().expect("walls"),
+        vec![Duration::from_secs(60 + 300)]
+    );
     assert_eq!(job.spec.wall_limit_seconds, Some(360));
     let id = job.id().to_owned();
     rig.host_finishes(&id, HOST, 0);
@@ -79,7 +72,7 @@ async fn an_action_runs_end_to_end() {
     assert_eq!(result.exit_code, 0);
     let calls = rig.ingest.calls.lock().expect("calls").clone();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].1, minted[0].key);
+    assert_eq!(calls[0].1, dir);
     assert_eq!(calls[0].2.max_pack_bytes, 128 << 20);
     let methods: Vec<_> = rig
         .methods()
@@ -113,7 +106,7 @@ async fn an_action_runs_end_to_end() {
 /// Catches a `Start` whose submit the job service does not take at first (it answers
 /// UNAVAILABLE, and then takes the job but loses the answer) being failed or lost instead of
 /// retried: the same job is sent again on the next passes, inside the window, and lands as one
-/// job. The CAS is read and the url made once, however many passes it waited.
+/// job. The CAS is read and the directory minted once, however many passes it waited.
 #[tokio::test(start_paused = true)]
 async fn a_start_waits_for_room_inside_its_window() {
     let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
@@ -146,15 +139,19 @@ async fn a_start_waits_for_room_inside_its_window() {
         2
     );
     assert_eq!(rig.counter("kbf_executor_late_starts_total"), 0);
-    // Read once, however many passes it waited: the CAS is not read, and no url or grant is
-    // made, on each pass of the window.
+    // Read once, however many passes it waited: the CAS is not read, and no directory is
+    // minted, on each pass of the window.
     let reads = rig.inputs.looked_up.lock().expect("looked up").clone();
     assert_eq!(
         reads.iter().filter(|h| **h == hex(3)).count(),
         1,
         "{reads:?}"
     );
-    assert_eq!(rig.presign.keys().len(), 1, "a url was made again");
+    assert_eq!(
+        rig.ingest.walls.lock().expect("walls").len(),
+        1,
+        "a directory was minted again"
+    );
     let id = jobs[0].id().to_owned();
     rig.host_finishes(&id, HOST, 0);
     assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
@@ -316,49 +313,33 @@ async fn an_action_that_cannot_run_here_is_refused_to_its_caller() {
     }
 }
 
-/// Catches what the farm could not get (the CAS, the store) being the caller's error: it is
+/// Catches what the farm could not get (the CAS) being the caller's error: it is
 /// infrastructure, so the farm runs the action again, three times in all, and answers INTERNAL
 /// only when its budget is spent. No job is submitted without a task to run.
 #[tokio::test(start_paused = true)]
 async fn what_the_farm_could_not_read_is_rerun_not_refused() {
-    use std::sync::atomic::Ordering;
-    for (what, fail) in [("cas", true), ("store", false)] {
-        let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
-        rig.pump().await;
-        match fail {
-            true => {
-                *rig.inputs.facts.lock().expect("facts") =
-                    Err(InputsError::Unavailable("cas down".to_owned()));
-            }
-            false => {
-                *rig.presign.fail.lock().expect("fail") =
-                    Some(PresignError::Refused("over the ceiling".to_owned()));
-            }
-        }
-        let caller = rig.submit(5);
-        let finished = rig.until_done(&caller, 3).await;
-        assert_eq!(code(&finished), Code::Internal, "{what}: {finished:?}");
-        assert!(rig.jobs().is_empty(), "{what}: a job was submitted");
-        // The CAS is read once for each try; the store's url is asked for after the key is
-        // minted, so a try that failed at the store minted a key.
-        let tries = match fail {
-            true => rig.inputs.looked_up.lock().expect("looked up").len(),
-            false => usize::try_from(rig.ingest.minted.load(Ordering::SeqCst)).expect("a count"),
-        };
-        assert_eq!(
-            tries, 3,
-            "{what}: the action was tried once and rerun twice"
-        );
-    }
-}
-
-/// Catches a read grant the service refuses for the action (it cannot be read by this
-/// farm at all) being rerun: it is answered INVALID_ARGUMENT at once.
-#[tokio::test(start_paused = true)]
-async fn a_grant_that_cannot_be_given_is_the_callers_to_fix() {
     let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
     rig.pump().await;
-    *rig.inputs.grant.lock().expect("grant") = Err(InputsError::Invalid("no grant".to_owned()));
+    *rig.inputs.facts.lock().expect("facts") = Err(InputsError::Unavailable("cas down".to_owned()));
+    let caller = rig.submit(5);
+    let finished = rig.until_done(&caller, 3).await;
+    assert_eq!(code(&finished), Code::Internal, "{finished:?}");
+    assert!(rig.jobs().is_empty(), "a job was submitted");
+    // The CAS is read once for each try.
+    assert_eq!(
+        rig.inputs.looked_up.lock().expect("looked up").len(),
+        3,
+        "the action was tried once and rerun twice"
+    );
+}
+
+/// Catches an action tree the farm refuses to give for the action (it cannot be read by this
+/// farm at all) being rerun: it is answered INVALID_ARGUMENT at once.
+#[tokio::test(start_paused = true)]
+async fn a_tree_that_cannot_be_given_is_the_callers_to_fix() {
+    let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
+    rig.pump().await;
+    *rig.inputs.tree.lock().expect("tree") = Err(InputsError::Invalid("no tree".to_owned()));
     let caller = rig.submit(5);
     let finished = rig.until_done(&caller, 3).await;
     assert_eq!(code(&finished), Code::InvalidArgument);
@@ -377,46 +358,6 @@ async fn one_job(adjust: impl FnOnce(&mut Config)) -> (Rig, crate::rig::Caller, 
     assert_eq!(jobs.len(), 1, "{jobs:?}");
     let id = jobs[0].id().to_owned();
     (rig, caller, id)
-}
-
-/// Catches a job submitted with its network left unspecified, which the job service reads as
-/// none (no route out, so the task reaches neither the read listener nor the store and every
-/// action fails): with the default config the `JobSpec` that reaches the service names the
-/// allow-list, as a number too, not the unspecified 0 nor none's 1.
-#[tokio::test(start_paused = true)]
-async fn the_default_job_asks_for_the_allow_list_network() {
-    let (rig, _caller, _id) = one_job(|_| {}).await;
-    assert_eq!(rig.cfg.network, Network::AllowList);
-    let sent = submits(&rig.fake.calls());
-    assert_eq!(sent.len(), 1, "{sent:?}");
-    assert_eq!(sent[0].network(), NetworkLevel::AllowList);
-    assert_eq!(
-        sent[0].network, 2,
-        "the wire value of NETWORK_LEVEL_ALLOW_LIST"
-    );
-    assert_eq!(rig.jobs()[0].spec.network(), NetworkLevel::AllowList);
-}
-
-/// Catches `--executor-network` not reaching the job, or one value standing for another: each
-/// of the three levels is the network of the job the service is sent, and none is ever
-/// unspecified.
-#[tokio::test(start_paused = true)]
-async fn each_configured_network_is_the_jobs_network() {
-    for (network, open, level) in [
-        (Network::None, false, NetworkLevel::None),
-        (Network::AllowList, false, NetworkLevel::AllowList),
-        (Network::Open, true, NetworkLevel::Open),
-    ] {
-        let (rig, _caller, _id) = one_job(|cfg| {
-            cfg.network = network;
-            cfg.allow_open_network = open;
-        })
-        .await;
-        let sent = submits(&rig.fake.calls());
-        assert_eq!(sent.len(), 1, "{network:?}: {sent:?}");
-        assert_eq!(sent[0].network(), level, "{network:?}");
-        assert_ne!(sent[0].network(), NetworkLevel::Unspecified, "{network:?}");
-    }
 }
 
 /// Catches a start the host's agent refused (`AGENT_REFUSED`) being answered as the action's
@@ -460,52 +401,4 @@ async fn a_start_the_agent_refused_is_infrastructure_and_rerun() {
             "{detail:?}: {finished:?}"
         );
     }
-}
-
-/// Catches an open network for the jobs that the operator did not ask for twice, or an opt-in
-/// left set that would open it on a later edit of one flag: `open` alone is refused with a
-/// message that names both flags, `open` with `allow_open_network` is accepted, and the
-/// opt-in with the allow-list or none is refused. The default is the allow-list, opt-in off.
-#[test]
-fn an_open_network_needs_its_own_opt_in() {
-    let base = || Config {
-        insecure_argv_secrets: true,
-        ..Config::new("front-1", 1, 2_000, 16 << 30)
-    };
-    assert_eq!(base().network, Network::AllowList);
-    assert!(!base().allow_open_network);
-    let open = Config {
-        network: Network::Open,
-        ..base()
-    };
-    let refused = open.validate().expect_err("open alone");
-    assert_eq!(refused, ConfigError::OpenNetwork);
-    assert_eq!(
-        refused.to_string(),
-        "--executor-network open lets every job reach any address: give \
-         --executor-allow-open-network as well to say so"
-    );
-    let allowed = Config {
-        allow_open_network: true,
-        ..open
-    };
-    assert_eq!(allowed.validate(), Ok(()));
-    for network in [Network::AllowList, Network::None] {
-        let stray = Config {
-            network,
-            allow_open_network: true,
-            ..base()
-        };
-        assert_eq!(
-            stray.validate(),
-            Err(ConfigError::OpenNetworkUnused),
-            "{network:?}"
-        );
-        let plain = Config { network, ..base() };
-        assert_eq!(plain.validate(), Ok(()), "{network:?}");
-    }
-    assert_eq!(
-        ConfigError::OpenNetworkUnused.to_string(),
-        "--executor-allow-open-network is only for --executor-network open: drop it"
-    );
 }

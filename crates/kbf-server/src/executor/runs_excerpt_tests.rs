@@ -1,7 +1,7 @@
 //! The end of a failed job's standard error in the frontend's log: the line at WARN, its bound,
 //! and what never reaches it.
 
-use super::{arg_of, running_job, step};
+use super::{running_job, step};
 use crate::executor::test_support::{Harness, Log};
 
 /// What a failed job wrote to standard error, which a log reader needs to see why it failed.
@@ -61,28 +61,4 @@ async fn the_excerpt_is_bounded_by_its_config_key() {
     let text = failed_with(&off, b"", DIED).await;
     assert!(text.contains("stderr_bytes=75"), "{text}");
     assert!(!text.contains("Permission denied"), "{text}");
-}
-
-/// Catches a grant of the job reaching the log through the excerpt: the pack url and the read
-/// token the job was handed, written to standard error, are each replaced by the marker.
-#[tokio::test(start_paused = true)]
-async fn the_excerpt_holds_none_of_the_jobs_grants() {
-    let harness = Harness::new().await;
-    let (mut worker, messages) = harness.worker();
-    let id = running_job(&harness, &mut worker, &messages).await;
-    let url = arg_of(&harness, &id, "--pack-url");
-    let token = arg_of(&harness, &id, "--grant-token");
-    let stderr = format!("put {url} refused with {token}\n");
-    assert!(harness.fake.write_logs(&id, b"", stderr.as_bytes()));
-    assert!(harness.fake.finish(&id, 13));
-    let log = Log::default();
-    let guard = log.install();
-    step(&harness, &mut worker).await;
-    drop(guard);
-    let text = log.text();
-    assert!(
-        text.contains(r#"stderr="put [redacted] refused with [redacted]""#),
-        "{text}"
-    );
-    assert!(!text.contains(&url) && !text.contains(&token), "{text}");
 }

@@ -12,7 +12,7 @@ use super::*;
 
 /// The base of the rig with every entry below its root listed, from the manifests the farm
 /// holds.
-fn listed_base(rig: &Rig) -> BaseTree {
+pub(super) fn listed_base(rig: &Rig) -> BaseTree {
     rig.base
         .tree
         .clone()
@@ -34,7 +34,7 @@ fn limited(rig: &Rig, entries: u64) -> TreeWriter {
 }
 
 /// Writes the list of the Action over `root` over the rig's listed base.
-async fn list(rig: &Rig, root: &Digest) -> Result<Listing, NoTree> {
+pub(super) async fn list(rig: &Rig, root: &Digest) -> Result<Listing, NoTree> {
     let kept = rig.kept(root).await;
     rig.writer.write_listing(&kept, &listed_base(rig)).await
 }

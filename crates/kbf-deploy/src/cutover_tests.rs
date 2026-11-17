@@ -22,7 +22,7 @@ pub(crate) fn ready_config() -> String {
          executor-base-image = \"registry.example/base@sha256:{d}\"\n\
          executor-kbf-image = \"docker://{KBF_IMAGE}\"\n\
          executor-base-tree = \"/opt/kbf/base-tree\"\n\
-         executor-secret-delivery = \"files\"\nexecutor-host-slots = 8\n\n[packs]\n\
+         executor-host-slots = 8\n\n[packs]\n\
          pack-read = true\n",
         d = "ff".repeat(32)
     )
@@ -128,7 +128,6 @@ fn the_plan_of_a_ready_file_prints_now_and_then() {
          \x20 executor-base-image = \"registry.example/base@sha256:{d}\"\n\
          \x20 executor-kbf-image = \"docker://{KBF_IMAGE}\"\n\
          \x20 executor-base-tree = \"/opt/kbf/base-tree\"\n\
-         \x20 executor-secret-delivery = \"files\"\n\
          to switch: kbf-deploy job-service apply with these flags and the restart's (a dry \
          run without --apply)\n",
         config = config.display(),
@@ -164,33 +163,34 @@ fn a_file_that_lacks_the_kept_keys_fails_after_the_plan() {
         format!(
             "FAIL: not ready: [executor] in {} lacks executor-frontend-id (a text value); \
              executor-base-image (a text value); executor-kbf-image (a text value); \
-             executor-base-tree (a text value); the secret \
-             delivery: executor-secret-delivery = \"files\", or executor-insecure-argv-secrets = \
-             true for \"argv\"\n",
+             executor-base-tree (a text value)\n",
             config.display()
         )
     );
 }
 
-/// Behaviour: the secret delivery is kept as `argv` with its opt-in, and both at once is
-/// what the executor refuses, so it is missing.
+/// Behaviour: a file without the keys of the removed presigned path is ready, and each key of
+/// it that the file still holds is missing, named for deletion, whatever its value; an empty
+/// frontend id is missing too.
 #[test]
-fn the_secret_delivery_is_read_as_the_executor_reads_it() {
+fn a_removed_key_is_missing_until_it_is_deleted() {
     let table =
         |extra: &str| Executor::parse(Path::new("k"), &format!("[executor]\n{extra}")).unwrap();
-    let argv = Readiness::of(&table("executor-insecure-argv-secrets = true\n"));
-    assert!(
-        argv.kept
-            .iter()
-            .any(|k| k.contains("accepted by executor-insecure-argv-secrets"))
-    );
-    let both = Readiness::of(&table(
-        "executor-insecure-argv-secrets = true\nexecutor-secret-delivery = \"files\"\n",
-    ));
-    assert!(
-        both.missing.iter().any(|m| m.contains("refused with")),
-        "{both:?}"
-    );
+    for key in super::REMOVED {
+        for value in ["true", "\"files\""] {
+            let held = Readiness::of(&table(&format!("{key} = {value}\n")));
+            let want = format!("the deletion of {key}: the frontend refuses the flag");
+            assert!(
+                held.missing.iter().any(|m| m.starts_with(&want)),
+                "{key}: {held:?}"
+            );
+        }
+        let clear = Readiness::of(&table(""));
+        assert!(
+            clear.missing.iter().all(|m| !m.contains(key)),
+            "{key}: {clear:?}"
+        );
+    }
     let empty_id = Readiness::of(&table("executor-frontend-id = \"\"\n"));
     assert!(
         empty_id

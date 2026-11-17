@@ -153,7 +153,7 @@ fn ready_config(base_tree: &std::path::Path) -> String {
          executor-base-image = \"registry.example/base@sha256:{base}\"\n\
          executor-kbf-image = \"docker://{kbf}\"\n\
          executor-base-tree = \"{base_tree}\"\n\
-         executor-secret-delivery = \"files\"\nexecutor-host-slots = 8\n\n[packs]\n\
+         executor-host-slots = 8\n\n[packs]\n\
          pack-read = true\n",
         base = "ff".repeat(32),
         kbf = image(),

@@ -36,9 +36,8 @@ pub enum JobService {
     /// when it refuses the token. Only reads.
     Check(CheckArgs),
     /// Print the egress lines of a farm agent's flags file (`/etc/js-agent/flags`) from the
-    /// frontend's `kbf.toml`: the allow-list ceiling and one `--egress-allow` for the tier
-    /// store's proxy, the read listener and, with `executor-locate`, the store a task reads
-    /// from. Only reads.
+    /// frontend's `kbf.toml`: the `--egress=allow-list` ceiling and no `--egress-allow` line,
+    /// as a put-dir job reaches no address. Only reads.
     AgentEgress(crate::agent_egress::AgentEgressArgs),
     /// Print what switching the frontend's executor onto the job service sets in the
     /// `[executor]` table of its `kbf.toml`: each key now and then, and the executor flags.

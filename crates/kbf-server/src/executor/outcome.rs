@@ -38,7 +38,7 @@
 //! | failed to start exclusive-not-ready | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
 //! | failed to start input-unavailable | `infra` | `UNAVAILABLE`: a host path the job named could not be read on its host, rerun |
 //! | failed to start host-unsafe | `infra` | `UNAVAILABLE`: rerun, as the farm's own retry policy says |
-//! | failed to start egress-unchecked | `infra` | `UNAVAILABLE`: the host's agent could not check the limits of the job's network (`--executor-network`), rerun |
+//! | failed to start egress-unchecked | `infra` | `UNAVAILABLE`: the host's agent could not check the limits of the job's network, rerun |
 //! | failed to start, any other code or detail | `infra` | `UNAVAILABLE`: rerun |
 //! | in a state this server does not know | `infra` | `UNAVAILABLE`: rerun |
 //! | refused at submit no-capable-host | `invalid` | `INVALID_ARGUMENT`: nothing could ever run it |
@@ -49,14 +49,13 @@
 //! | refused at submit with a code this server does not know | `infra` | `UNAVAILABLE`: rerun |
 //! | refused at submit otherwise | `infra` | `UNAVAILABLE`: rerun |
 //!
-//! A message to the farm names the code, never the job: a job carries the arguments, which
-//! may hold the pack url and the read token. The agent's detail of a start it refused is a
-//! code (`quota-unavailable`, ...) or text that can quote those arguments: only the code is
+//! A message to the farm names the code, never the job: a job carries the arguments and the
+//! mounts. The agent's detail of a start it refused is a
+//! code (`quota-unavailable`, ...) or text that can quote those: only the code is
 //! read, from the start of the detail, and only the detail's length is logged.
 //!
 //! What a job that did not end well wrote goes with its `Result` as a detail of the status,
-//! redacted of the job's grants and cut to a cap ([`output`](super::output)); the code and the
-//! message above are unchanged by it.
+//! cut to a cap ([`output`](super::output)); the code and the message above are unchanged by it.
 //!
 //! A job this executor cancelled is not judged here: the farm cancelled its lease and owes
 //! itself no result, so the task is dropped once the service has answered the cancel.

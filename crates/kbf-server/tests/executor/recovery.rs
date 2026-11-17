@@ -173,7 +173,6 @@ async fn the_fence_cancels_every_job_and_falls_silent() {
 #[test]
 fn a_fence_time_that_leaves_no_margin_under_the_farms_grace_is_refused() {
     let mut cfg = Config::new("front", 1, 2_000, 16 * GIB);
-    cfg.insecure_argv_secrets = true;
     cfg.fence_after = LEASE_GRACE - LEADER_LEASE_MARGIN - cfg.poll;
     assert_eq!(cfg.validate(), Err(ConfigError::Fence));
     cfg.fence_after = LEASE_GRACE;

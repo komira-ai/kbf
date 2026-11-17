@@ -69,7 +69,7 @@
 //! file or CA file) ([`crate::job_service`]).
 //! `job-service agent-egress` only reads: it prints the egress lines of a farm agent's flags
 //! file from the frontend's `kbf.toml`, and exits 0, or 2 refused (`REFUSED: ...` on stderr: the
-//! file cannot be read, or lacks or misstates a destination) ([`crate::agent_egress`]).
+//! file cannot be read or is not TOML) ([`crate::agent_egress`]).
 //! `job-service plan` only reads the frontend's `kbf.toml` (never the token): it prints what the
 //! switch onto the job service sets, and exits 0, 1 the file lacks a key the executor needs
 //! (`FAIL: ...` on stderr, after the plan), or 2 refused ([`crate::cutover`]). `job-service

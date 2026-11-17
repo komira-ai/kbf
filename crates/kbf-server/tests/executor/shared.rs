@@ -220,7 +220,6 @@ async fn shared_with_no_store_is_refused() {
         farm: rig.farm.clone(),
         client: rig.fake.client().expect("a client"),
         ingest: rig.ingest.clone(),
-        presign: rig.presign.clone(),
         inputs: rig.inputs.clone(),
         metrics: Arc::default(),
         store: None,

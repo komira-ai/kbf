@@ -7,7 +7,8 @@
 //! `https` URL, removed for an `http` one) and the shape of the virtual workers
 //! (`executor-hosts`, `executor-host-cpus`, `executor-host-memory-gib`, `executor-host-slots`).
 //! Every other key of the file is kept as it is, and the executor's other needs
-//! (`executor-frontend-id`, the two images, the secret delivery) must already be there:
+//! (`executor-frontend-id`, the two images, the base tree) must already be there, and the keys
+//! of the executor's presigned path, which the frontend refuses, must not be:
 //! [`Readiness`] names the ones that are not.
 //!
 //! - `plan` reads the file and prints, for each key, what it holds now and what the switch
@@ -55,6 +56,19 @@ const KEPT: [&str; 4] = [
     "executor-base-image",
     "executor-kbf-image",
     "executor-base-tree",
+];
+
+/// The keys of the executor's presigned path, whose flags were removed: the frontend refuses a
+/// file that holds one, so the file must not.
+const REMOVED: [&str; 8] = [
+    "executor-secret-delivery",
+    "executor-insecure-argv-secrets",
+    "executor-work-dir",
+    "executor-allow-plain-http-put",
+    "executor-allow-plain-http-grant",
+    "executor-locate",
+    "executor-network",
+    "executor-allow-open-network",
 ];
 
 /// The job service and the virtual workers: the flags `plan` and `apply` share.
@@ -297,9 +311,10 @@ impl Executor {
 /// What the executor needs that the switch does not set, as the file holds it.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Readiness {
-    /// The keys of [`KEPT`] the file has, and how the job's secrets are delivered.
+    /// The keys of [`KEPT`] the file has.
     pub(crate) kept: Vec<String>,
-    /// What the file lacks, each with what to add.
+    /// What the file lacks, each with what to add, and each removed key it still holds, with
+    /// what to delete.
     pub(crate) missing: Vec<String>,
 }
 
@@ -313,25 +328,13 @@ impl Readiness {
                 _ => missing.push(format!("{key} (a text value)")),
             }
         }
-        let files = table.value("executor-secret-delivery") == Value::Text("files".to_owned());
-        let argv_accepted = table.value("executor-insecure-argv-secrets") == Value::Switch(true);
-        match (files, argv_accepted) {
-            (true, false) => kept.push("executor-secret-delivery = \"files\"".to_owned()),
-            (false, true) => kept.push(
-                "executor-secret-delivery = \"argv\", accepted by \
-                 executor-insecure-argv-secrets = true"
-                    .to_owned(),
-            ),
-            (true, true) => missing.push(
-                "a secret delivery the executor takes: executor-insecure-argv-secrets is \
-                 refused with executor-secret-delivery = \"files\""
-                    .to_owned(),
-            ),
-            (false, false) => missing.push(
-                "the secret delivery: executor-secret-delivery = \"files\", or \
-                 executor-insecure-argv-secrets = true for \"argv\""
-                    .to_owned(),
-            ),
+        for key in REMOVED {
+            if table.0.contains_key(key) {
+                missing.push(format!(
+                    "the deletion of {key}: the frontend refuses the flag, which the \
+                     executor's presigned path removed"
+                ));
+            }
         }
         Readiness { kept, missing }
     }

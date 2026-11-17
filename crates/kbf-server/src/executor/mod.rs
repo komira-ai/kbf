@@ -33,7 +33,7 @@
 //! end. A process that ends with jobs open hands its workers back for another to take up.
 //!
 //! The frontend builds one only for `--executor js-agent` (`frontend/executor_flags.rs`), over
-//! [`Front`], which implements the three seams ([`Ingest`], [`Presign`], [`Inputs`]) with the
+//! [`Front`], which implements the two seams ([`Ingest`], [`Inputs`]) with the
 //! frontend's own packs, CAS, key mint and run preparation, and steps it from
 //! [`FrontendHandle::serve`](crate::frontend::FrontendHandle::serve) until the frontend stops.
 
@@ -41,6 +41,7 @@ mod api;
 mod config;
 mod driver;
 mod front;
+mod front_cache;
 mod host;
 mod mac;
 mod metrics;
@@ -77,23 +78,21 @@ use pool::{Adopted, Adoption};
 use share::Share;
 use submit::{FRONTEND_LABEL, INSTANCE_LABEL};
 
-pub use config::{Config, ConfigError, InputTree, Network, Ownership};
+pub use config::{Config, ConfigError, InputTree, Ownership};
 pub use driver::Running;
 pub use front::{
-    Front, FrontParts, PrepareError, PreparedPutDir, PreparedRun, PutDirParts, RunPrepare,
-    RunSource,
+    Front, FrontParts, MintedDir, PrepareError, PreparedPutDir, PutDirParts, RunPrepare, RunSource,
 };
 pub use mac::{
     DEFAULT_MAC_OS_VERSION, MAC_OS, MAC_OUT_TARGET, MacPool, MacPoolError, System, TREE_TARGET,
 };
 pub use metrics::Metrics;
-pub use out::{MAX_ROOT_BYTES, OUT_TARGET, PutDirRoots, RootError, TASK_IN_TREE, TaskOut};
+pub use out::{MAX_ROOT_BYTES, OUT_TARGET, PutDirRoots, RootError, TASK_IN_TREE};
 pub use size_class::SizeClass;
 pub use submit::job_id;
-pub use task::{Delivery, PackKey, Secret, TaskArgs, build_id};
+pub use task::{PackKey, build_id};
 pub use traits::{
-    ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
-    ReadGrant, RejectReason, UntrustedLimits,
+    ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, RejectReason, UntrustedLimits,
 };
 
 /// What the executor is built over.
@@ -105,9 +104,7 @@ pub struct Deps {
     pub client: Client,
     /// The frontend's read of a task's pack.
     pub ingest: Arc<dyn Ingest>,
-    /// The store's presigned `PUT`.
-    pub presign: Arc<dyn Presign>,
-    /// The CAS read of an action, and the read grant.
+    /// The CAS read of an action, and the action tree of a run.
     pub inputs: Arc<dyn Inputs>,
     /// What the executor counts.
     pub metrics: Arc<Metrics>,
