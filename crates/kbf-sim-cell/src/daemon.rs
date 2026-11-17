@@ -391,16 +391,19 @@ mod tests {
         d.apply(input(0, Event::Start));
         d.apply(message(1, welcome(1)));
         d.apply(message(2, start(1, 1)));
-        d.apply(input(30_000, Event::Timer { tag: T_POLL }));
+        d.apply(input(9_000, Event::Timer { tag: T_POLL }));
         assert!(d.reported().contains(&LeaseId::new(1, 1)));
+        // Reported but not yet acknowledged, the lease is still held.
+        d.apply(message(9_000, start(1, 1)));
+        assert!(runs(&d).is_empty(), "an unacknowledged lease ran again");
         d.apply(message(
-            30_001,
+            9_001,
             Msg::ResultAck {
                 lease: LeaseId::new(1, 1),
                 accepted: true,
             },
         ));
-        d.apply(message(30_002, start(1, 1)));
+        d.apply(message(9_002, start(1, 1)));
         assert!(runs(&d).is_empty(), "an acknowledged lease ran again");
 
         // On a daemon whose Hello was confirmed at 0 ms, contact is lost from 40 s on.
@@ -413,6 +416,12 @@ mod tests {
         d.apply(message(1, welcome(1)));
         d.apply(message(39_999, start(1, 2)));
         assert_eq!(runs(&d), [LeaseId::new(1, 2)]);
+        d.apply(message(39_999, start(1, 2)));
+        assert_eq!(
+            runs(&d),
+            [LeaseId::new(1, 2)],
+            "a running lease started twice"
+        );
         d.apply(message(40_000, start(1, 3)));
         assert_eq!(runs(&d), [LeaseId::new(1, 2)], "taken with contact lost");
     }

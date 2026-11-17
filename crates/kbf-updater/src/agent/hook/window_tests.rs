@@ -84,10 +84,6 @@ fn a_crash_between_the_placement_and_the_drain_does_not_hand_the_node_to_the_upd
         if operator {
             node.operator_drains();
         }
-        *node.undrain_error.lock().unwrap() = Some(PortError::other("called"));
-        if serving_at_end {
-            *node.undrain_error.lock().unwrap() = None;
-        }
         for step in [Step::Prepare, Step::Cutover, Step::Verify, Step::Cleanup] {
             assert_eq!(
                 rig.run(step).outcome,
@@ -96,6 +92,11 @@ fn a_crash_between_the_placement_and_the_drain_does_not_hand_the_node_to_the_upd
             );
         }
         assert_eq!(node.is_serving(), serving_at_end, "{kill} {operator}");
+        assert_eq!(
+            *node.undrain_calls.lock().unwrap() > 0,
+            !operator,
+            "the node is given back only when the update drained it: {kill} {operator}"
+        );
         let want = if operator { Was::Out } else { Was::In };
         assert_eq!(rig.record().expect("a record").placement, Some(want));
     }

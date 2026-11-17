@@ -284,18 +284,6 @@ impl FakeInstaller {
             .set(alias, first.into_iter().map(answer).collect(), answer(then));
     }
 
-    /// As [`FakeInstaller::script_install`], with the answer each install gives.
-    pub fn script_install_answers(
-        &self,
-        alias: &str,
-        first: Vec<Result<InstallAnswer, PortError>>,
-        then: Result<InstallAnswer, PortError>,
-    ) {
-        let answer = |r: Result<InstallAnswer, PortError>| r.map(Some);
-        self.installs
-            .set(alias, first.into_iter().map(answer).collect(), answer(then));
-    }
-
     /// Answers of `query` for a host: `first` in order, then what the host has installed.
     pub fn script_query(&self, alias: &str, first: Vec<Result<Installed, PortError>>) {
         self.queries
@@ -467,8 +455,6 @@ impl FrontendControl for FakeFrontend {
 pub struct FakeHealth {
     log: Log,
     script: Arc<Script<Result<Health, PortError>>>,
-    /// Answers for a host the roll holds drained; unscripted hosts answer as `script` does.
-    held: Arc<Script<Option<Result<Health, PortError>>>>,
 }
 
 impl FakeHealth {
@@ -476,7 +462,6 @@ impl FakeHealth {
         FakeHealth {
             log: log.clone(),
             script: Arc::new(Script::new(Ok(Health::Healthy))),
-            held: Arc::new(Script::new(None)),
         }
     }
 
@@ -487,17 +472,6 @@ impl FakeHealth {
         then: Result<Health, PortError>,
     ) {
         self.script.set(alias, first, then);
-    }
-
-    /// The answers of `check_held` for a host: `first` in order, then `then`.
-    pub fn script_held(
-        &self,
-        alias: &str,
-        first: Vec<Result<Health, PortError>>,
-        then: Result<Health, PortError>,
-    ) {
-        self.held
-            .set(alias, first.into_iter().map(Some).collect(), Some(then));
     }
 }
 
@@ -511,11 +485,8 @@ impl HealthCheck for FakeHealth {
         self.script.next(&host.alias)
     }
 
-    fn check_held(&self, host: &Host, _target: &Version) -> Result<Health, PortError> {
-        self.log.push(Event::Health(host.alias.clone()));
-        self.held
-            .next(&host.alias)
-            .unwrap_or_else(|| self.script.next(&host.alias))
+    fn check_held(&self, host: &Host, target: &Version) -> Result<Health, PortError> {
+        self.check(host, target)
     }
 }
 
@@ -718,5 +689,28 @@ mod tests {
         ];
         assert_eq!(log.touching("a"), kinds);
         assert_eq!(log.touching("b").len(), 7);
+    }
+
+    /// The fake health check answers a check of a drained host as it answers any check, in the
+    /// order scripted, and logs each against the host.
+    #[test]
+    fn the_fake_health_check_answers_a_held_check_as_a_check() {
+        let log = Log::default();
+        let health = FakeHealth::new(&log);
+        let a = host("a");
+        let v = Version::parse("1.0.0").unwrap();
+        let no = PortError("no".into());
+        health.script(
+            "a",
+            vec![Err(no.clone())],
+            Ok(Health::Waiting("w".to_owned())),
+        );
+        assert_eq!(health.check_held(&a, &v), Err(no));
+        assert_eq!(
+            health.check_held(&a, &v),
+            Ok(Health::Waiting("w".to_owned()))
+        );
+        assert_eq!(health.check(&a, &v), Ok(Health::Waiting("w".to_owned())));
+        assert_eq!(log.touching("a").len(), 3);
     }
 }
