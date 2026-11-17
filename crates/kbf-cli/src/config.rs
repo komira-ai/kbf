@@ -320,6 +320,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "executor-host-memory-gib",
             "executor-host-slots",
             "executor-hosts",
+            "executor-input-tree",
             "executor-insecure-argv-secrets",
             "executor-job-ca-file",
             "executor-job-token-file",

@@ -75,6 +75,8 @@ executor-host-memory-gib = 128
 executor-host-slots = 8
 # How many virtual workers the farm places actions on, each of the shape below: how many actions of which size the farm may have in flight as jobs. A ceiling on what this frontend admits, not the hardware: the job service decides which host runs each job and holds the real capacity, so set it lower only to cap this frontend. Used only with `--executor js-agent`
 executor-hosts = 4
+# What a Linux put-directory job's root is read from. `manifests`, the default: the action tree's manifests, the job's layer `<mp>/trees/<digest>`. `provider`: one tree list of the tree, the job's layer tierstore's mount provider, which fetches the tree's files while the job's sandbox is made. `provider` needs `--task-out-mode put-dir`. A Mac job's root is always `manifests`. Used only with `--executor js-agent`
+executor-input-tree = "manifests"
 # Says the secrets of a task (the presigned write url, the read token) may travel as arguments of the job, where the action can read them from `/proc` and the engine's inspect shows them. It is what the default `--executor-secret-delivery argv` needs, and `--executor-secret-delivery files` refuses it. Off by default
 executor-insecure-argv-secrets = false
 # The CA certificate (PEM) the job service's certificate chains to: the only trust anchor, no system roots are consulted. Needed for an `https` job service and refused for an `http` one. Used only with `--executor js-agent`

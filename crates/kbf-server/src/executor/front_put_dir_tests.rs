@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 use kbf_front::action_tree::{BaseFacts, BaseTree};
 use kbf_front::prepare_run::{ClosureLimits, collect_closure_keeping};
+use tierstore::TreeDigest;
 
 use super::*;
 
@@ -62,11 +63,14 @@ impl RunPrepare for DirPrep {
     }
 }
 
+/// The root manifest of the base tree: one symlink.
+const BASE_ROOT: &[u8] =
+    br#"{"v":1,"children":[{"name":"bin","kind":"symlink","target":"usr/bin"}]}"#;
+
 /// A base tree of one symlink.
 fn base() -> BaseTree {
-    let root = br#"{"v":1,"children":[{"name":"bin","kind":"symlink","target":"usr/bin"}]}"#;
     BaseTree::new(
-        root,
+        BASE_ROOT,
         BaseFacts {
             entries: 1,
             depth: 1,
@@ -75,11 +79,14 @@ fn base() -> BaseTree {
     .expect("a base")
 }
 
-/// [`base`] with every entry below its root listed, as a tree list needs it: it holds no
-/// directory, so no manifest is fetched.
+/// [`base`] with every entry below its root listed, as a tree list needs it: the root is
+/// the only manifest, since it holds no directory.
 fn listed_base() -> BaseTree {
     base()
-        .listed(|_| Err::<Vec<u8>, String>("no manifest below the root".to_owned()))
+        .listed(|digest| match *digest == TreeDigest::of(BASE_ROOT) {
+            true => Ok(BASE_ROOT.to_vec()),
+            false => Err(format!("no manifest {digest} below the root")),
+        })
         .expect("a listed base")
 }
 
@@ -345,8 +352,7 @@ async fn a_provider_run_gets_the_key_of_a_stored_tree_list_once() {
         .await
         .expect("read");
     // The tierstore tree-list API: adjust to the pinned crate.
-    let list = tierstore::parse_tree_list(&bytes, &tierstore::TreeDigest::of(&bytes))
-        .expect("a tree list");
+    let list = tierstore::parse_tree_list(&bytes, &TreeDigest::of(&bytes)).expect("a tree list");
     assert_eq!(tierstore::tree_list_key(&bytes), key);
     let paths: Vec<&str> = list.entries.iter().map(|e| e.path.as_str()).collect();
     for want in [

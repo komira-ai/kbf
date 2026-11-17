@@ -211,6 +211,15 @@ network line for it: nothing is made, so nothing is unusual.
 of `/run/js-files` and `/scratch` no longer exist for a job. Its confinement code (`crates/kbf-task/src/sandbox.rs`) is
 reached only by `kbf-task --probe-confinement`, which prints `probe sandbox:`.
 
+`--executor-input-tree` says what a Linux put-directory job's root is read from: `manifests`, the
+default, writes the action tree as tierstore manifests and gives the job the host directory
+`<mp>/trees/<digest>`; `provider` writes it as one tierstore tree list (`cas/l/<sha256>`) and gives
+the job tierstore's mount provider, which the host's agent asks for the tree as soon as the job is
+assigned (docs/design/actions-as-jobs.md, 4.7). `provider` needs `--task-out-mode put-dir` and a pool
+whose hosts serve the provider (`--mount-provider tierstore=<socket>` on their agents); a job no host
+can serve is refused by the job service and the farm sees an infrastructure failure. A Mac job always
+reads manifests.
+
 `--executor-ownership` says who owns the jobs: `single`, the default, is what the next paragraph
 describes, and `shared` lets several frontends of one `--executor-frontend-id` run beside each
 other over one `--state-store`. With `shared` the frontend starts only if `--state-store` is
