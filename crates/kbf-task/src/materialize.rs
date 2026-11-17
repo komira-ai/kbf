@@ -3,11 +3,12 @@
 //!
 //! The action's tree is mounted read-only (`TREE`, which may itself be a symlink to it, and is
 //! followed; nothing under it is) and holds what [`crate::tree`] reads: `.kbf/action`,
-//! `.kbf/command` and `work`. The task reads and checks the Action and the Command as a tree job
-//! does, requires `TREE/work` to be a directory, and only then touches the job root, so a
+//! `.kbf/command` and `kbf-work` (`work` in a tree an older frontend wrote; the name found is the
+//! name used below). The task reads and checks the Action and the Command as a tree job
+//! does, requires `TREE/kbf-work` to be a directory, and only then touches the job root, so a
 //! refusal leaves nothing behind. It then:
 //!
-//! 1. makes `<root>/work` (an existing one is refused) and copies `TREE/work` into it, walking
+//! 1. makes `<root>/kbf-work` (an existing one is refused) and copies `TREE/kbf-work` into it, walking
 //!    depth first without following symlinks, with an explicit stack, so a hostile tree cannot
 //!    overflow the stack. Each directory is made mode 0755; each regular file is copied with
 //!    [`std::fs::copy`], which on macOS first tries an APFS clone (`fclonefileat`) and falls back
@@ -15,17 +16,17 @@
 //!    and copied elsewhere; the copy gets mode 0755 if the source has any execute bit, else 0644;
 //!    each symlink is recreated with the same target, which is neither checked nor followed, as
 //!    in the tree. A fifo, socket or device is refused ([`FetchError::Invalid`] naming its path
-//!    relative to `work`). Every copy is private: the Command may write an input, and an output
+//!    relative to `kbf-work`). Every copy is private: the Command may write an input, and an output
 //!    may name an input path, without touching the tree. These failures are exit 10;
 //! 2. makes the run directory `<root>/.kbf-run` as a tree job does (exit 11);
-//! 3. runs the Command in `<root>/work`, collects its outputs and commits the one object into
+//! 3. runs the Command in `<root>/kbf-work`, collects its outputs and commits the one object into
 //!    the put directory, exactly as [`crate::tree::execute_out_dir`] does.
 //!
 //! The root is a parameter of every function here (the binary passes the current directory), so
 //! tests never change directory. The manifest's advisory `inputs` is `from: fetch` (no new
 //! source is named, which would change the manifest's format) with `files` the regular files
-//! copied (symlinks are not counted), `directories` the directories made under `work` (`work`
-//! itself is not counted), and `bytes_written_scratch` the bytes of the regular files.
+//! copied (symlinks are not counted), `directories` the directories made under `kbf-work`
+//! (`kbf-work` itself is not counted), and `bytes_written_scratch` the bytes of the regular files.
 
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -38,14 +39,14 @@ use crate::inputs::Inputs;
 use crate::message::FetchError;
 use crate::out_dir::OutDir;
 use crate::task::{Cli, Failure, check_lease, collected, exit_code, millis};
-use crate::tree::{INPUT_ROOT, input_root, make_run_dir, read_tree};
+use crate::tree::{input_root, input_root_name, make_run_dir, read_tree};
 
-/// What a copy of the tree's `work` counted.
+/// What a copy of the tree's `kbf-work` counted.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Copied {
     /// Regular files copied.
     files: u64,
-    /// Directories made under `work`.
+    /// Directories made under `kbf-work`.
     directories: u64,
     /// Bytes of the regular files.
     bytes: u64,
@@ -78,7 +79,7 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), FetchError> {
 fn copy_tree(from: &Path, to: &Path) -> Result<Copied, FetchError> {
     let mut copied = Copied::default();
     make_dir(to)?;
-    // (source, destination, path relative to `work` for a message), each a directory already made.
+    // (source, destination, path relative to the input root for a message), each a directory already made.
     let mut pending = vec![(from.to_owned(), to.to_owned(), PathBuf::new())];
     while let Some((src, dst, rel)) = pending.pop() {
         for entry in std::fs::read_dir(&src).map_err(io_at(&src))? {
@@ -109,15 +110,17 @@ fn copy_tree(from: &Path, to: &Path) -> Result<Copied, FetchError> {
     Ok(copied)
 }
 
-/// Reads the Action and the Command from `tree`, checks its `work`, copies it to `<root>/work`
-/// and makes the run directory, in this order, so a refused Action, Command or `work` leaves
+/// Reads the Action and the Command from `tree`, checks its `kbf-work`, copies it to
+/// `<root>/kbf-work` and makes the run directory, in this order, so a refused Action, Command or
+/// `kbf-work` leaves
 /// nothing behind.
 fn read(cli: &Cli, tree: &Path, root: &Path) -> Result<Inputs, Failure> {
     let reading = Instant::now();
     let (action, command, network) = read_tree(cli, tree)?;
-    input_root(&tree.join(INPUT_ROOT))?;
-    let work = root.join(INPUT_ROOT);
-    let copied = copy_tree(&tree.join(INPUT_ROOT), &work)?;
+    let name = input_root_name(tree);
+    input_root(&tree.join(name))?;
+    let work = root.join(name);
+    let copied = copy_tree(&tree.join(name), &work)?;
     let run_dir = make_run_dir(root)?;
     Ok(Inputs {
         action,

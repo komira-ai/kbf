@@ -13,7 +13,7 @@
 //! - **`.kbf`**, a manifest of two files, `action` and `command`, the Action's and the
 //!   Command's blobs;
 //! - **the action tree's root**: every child of the base tree's root manifest as it is, and
-//!   beside them `work` (the input root's manifest) and `.kbf`. The base's subtrees are named,
+//!   beside them `kbf-work` ([`INPUT_ROOT`], the input root's manifest) and `.kbf`. The base's subtrees are named,
 //!   never read or written.
 //!
 //! Each manifest is stored with a create-only write to `cas/l/<sha256>`; an existing key is
@@ -69,7 +69,7 @@ use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use kbf_types::Digest;
 use tierstore::{MAX_DEPTH, MAX_ENTRIES, TreeDigest, TreeError};
 
-pub use self::base::{BaseFacts, BaseTree, BaseTreeError, RESERVED_NAMES};
+pub use self::base::{BaseFacts, BaseTree, BaseTreeError, INPUT_ROOT, RESERVED_NAMES};
 pub use self::listing::Listing;
 pub use self::place::{HEADS_IN_FLIGHT, LOCATE_CHUNK, LOOKUP_DEADLINE};
 pub use self::places::PLACE_ENTRIES;
@@ -95,7 +95,7 @@ pub const MEMO_TTL: Duration = Duration::from_secs(600);
 /// input root (docs/design/jobs-on-jobscheduler-and-tierstore.md, section 6).
 pub const RESERVED_INPUT_NAMES: [&str; 1] = [".kbf-out"];
 
-/// The entries an action tree adds to the base's and the input root's: `work`, `.kbf`, and
+/// The entries an action tree adds to the base's and the input root's: `kbf-work`, `.kbf`, and
 /// `.kbf`'s `action` and `command`.
 const ADDED_ENTRIES: u64 = 4;
 
@@ -127,7 +127,7 @@ pub enum NoTree {
         error: TreeError,
     },
     /// The action tree, the base tree's entries counted with the input root's and
-    /// the four the action tree adds (`work`, `.kbf` and its two files), has more entries than tierstore takes.
+    /// the four the action tree adds (`kbf-work`, `.kbf` and its two files), has more entries than tierstore takes.
     #[error("the action tree has {entries} entries, over tierstore's {MAX_ENTRIES}")]
     TooManyEntries {
         /// The entries it has (at most `u64::MAX`).
@@ -382,7 +382,7 @@ impl TreeWriter {
             encode::file("command", &command, false, source(&places, &command)),
         ])?;
         let mut children = base.children.clone();
-        children.push(encode::dir("work", &manifests[kept.root()]));
+        children.push(encode::dir(INPUT_ROOT, &manifests[kept.root()]));
         children.push(encode::dir(".kbf", &kbf.digest));
         let root = top(children)?;
         self.write_whole(unlocated, now).await?;

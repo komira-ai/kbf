@@ -3,7 +3,7 @@
 //!
 //! [`TreeWriter::write_listing`] lists the action tree [`TreeWriter::write`] would write as
 //! manifests, as one tierstore tree list ([`TreeList`]): every entry of the
-//! base tree ([`BaseTree::listed`]) at its path, `work` and every entry of the input root below
+//! base tree ([`BaseTree::listed`]) at its path, `kbf-work` and every entry of the input root below
 //! it, and `.kbf` with `action` and `command`. A file with bytes names the object they are in (a
 //! span of a pack, or the whole object `cas/l/<sha256>`) and its SHA-256, which the provider
 //! checks the bytes against; a file of no bytes names neither. Every directory is listed, so an
@@ -29,7 +29,7 @@ use tierstore::{
 };
 
 use super::place::{self, Place};
-use super::{BaseTree, NoTree, TreeWriter, reserved_input};
+use super::{BaseTree, INPUT_ROOT, NoTree, TreeWriter, reserved_input};
 use crate::large_backfill::large_key;
 use crate::prepare_run::KeptClosure;
 
@@ -135,7 +135,7 @@ impl TreeWriter {
         let closure = kept.closure();
         let (action, command) = (*closure.action(), *closure.command());
         let mut entries: Vec<Entry> = listed.to_vec();
-        entries.push(dir("work"));
+        entries.push(dir(INPUT_ROOT));
         entries.push(dir(".kbf"));
         entries.push(file(".kbf/action", &action, false));
         entries.push(file(".kbf/command", &command, false));
@@ -190,7 +190,7 @@ fn file(path: &str, digest: &Digest, exec: bool) -> Entry {
     }
 }
 
-/// Lists every entry below `kept`'s input root under `work/`: each directory at each path it
+/// Lists every entry below `kept`'s input root under `kbf-work/`: each directory at each path it
 /// is found at, before what it holds.
 ///
 /// # Errors
@@ -199,7 +199,7 @@ fn file(path: &str, digest: &Digest, exec: bool) -> Entry {
 /// at each): checked after each directory, the input root's too, so a list is never longer
 /// than one directory over the limit.
 fn walk(kept: &KeptClosure, entries: &mut Vec<Entry>, limit: u64) -> Result<(), NoTree> {
-    let mut stack = vec![("work".to_owned(), *kept.root())];
+    let mut stack = vec![(INPUT_ROOT.to_owned(), *kept.root())];
     while let Some((path, digest)) = stack.pop() {
         let directory = kept
             .directory(&digest)

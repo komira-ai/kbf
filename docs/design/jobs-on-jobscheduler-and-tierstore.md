@@ -38,7 +38,7 @@ repository is named with that repository.
 
 **Before submit (frontend).**
 1. TreeWriter writes the input tree manifests as create-only objects, memoised (`crates/kbf-front/src/action_tree.rs`;
-   nothing calls it yet). The root is the base tree, `work`, and `.kbf/{action,command}`.
+   nothing calls it yet). The root is the base tree, `kbf-work`, and `.kbf/{action,command}`.
 2. The frontend mints one key set per lease attempt: the prefix `cas/b/<build>/<nonce>/`. The names under it are
    `pack` and `L0..L3`, and, for an action that needs more, `pack1..pack7` and `L4..L7`: the bounds
    of today's plan, up to 8 packs and 8 large objects, `pack` (today's pack 0, which holds the manifest) committed
@@ -50,7 +50,7 @@ repository is named with that repository.
    network level (default allow-list) and `files` holding the read grant and the PUT URLs
    (`crates/kbf-server/src/executor/submit.rs`).
    - Linux: the job's root is one read-only layer, the host path `<mp>/trees/<digest>` (`JobSpec.layers`), under the
-     job's writable scratch, so the tree's `work` is `/work` and its `.kbf` is `/.kbf`, where `kbf-task --tree /`
+     job's writable scratch, so the tree's `kbf-work` is `/kbf-work` and its `.kbf` is `/.kbf`, where `kbf-task --tree /`
      reads them (`crates/kbf-task/src/tree.rs`; actions-as-jobs 3.1). The output mount is
      `<mp>/put/cas/b/<build>/<nonce>` at `/out`, READ_WRITE, `no_exec`.
    - Mac: `/work` is built by kbf-task (section 6). The output mount is the same host path at `/work/.kbf-out`.
@@ -67,7 +67,7 @@ both host paths with `openat2` beneath its mount-root descriptors. Each lookup r
   file is created.
 
 **Unpack, run.** kbf-task `--tree` reads `/.kbf/action` and `/.kbf/command` and checks the digests. Input files fill
-lazily on first open: a cache hit is local, a miss is a ranged fill. The Command runs in `/work`. Writes go to the
+lazily on first open: a cache hit is local, a miss is a ranged fill. The Command runs in `/kbf-work`. Writes go to the
 overlay upper on local scratch, so rename, rm -rf and mmap never touch tierstore.
 
 **Pack.**
@@ -195,8 +195,8 @@ Requirement for job-rootfs build item 8 (an end-to-end run on one Linux node, a 
   - Key minting changes from `<nonce>-<k>` to `<nonce>/<name>`, keeping the mint minute in the nonce for the
     janitor; the ingest's MAC check and the janitor, which reads a key's age from its `-<k>` or `-L<i>` name
     (`crates/kbf-server/src/frontend/janitor.rs`), learn the new layout.
-  - A reserved-name check: an input root with a child `.kbf-out` is rejected (today's reserved names are `work`,
-    `.kbf` and `.kbf-run`, `crates/kbf-front/src/action_tree/base.rs`).
+  - A reserved-name check: an input root with a child `.kbf-out` is rejected (today's reserved names are `kbf-work`,
+    `.kbf`, `.kbf-run` and the older trees' `work`, `crates/kbf-front/src/action_tree/base.rs`).
   - A new `ingest_put_dir` replaces `ingest_set`: it reads footer and record 0 only.
   - Pack-index rule: first recorded location for a digest wins, as the index already does
     (`crates/kbf-pack-index/src/lib.rs`). New: a failed hash-verified fill drops that location.
@@ -313,14 +313,14 @@ What this design adds to an action with about 5 outputs and about 200 KB, compar
   enforces read-only on `trees/`.
 - Inputs (built in kbf, `kbf-task --materialize-work`, `crates/kbf-task/src/materialize.rs`): the tree is mounted
   read-only at `/work/.kbf-tree`, which the Mac agent, as designed (jobscheduler `docs/design/job-rootfs.md`, 5.2),
-  makes `exec/.kbf-tree`, and kbf-task copies its `work` into `exec/work`: `std::fs::copy`, an APFS clone where the
+  makes `exec/.kbf-tree`, and kbf-task copies its `kbf-work` into `exec/kbf-work`: `std::fs::copy`, an APFS clone where the
   source and `exec/` share a volume and a byte copy otherwise. This replaces the earlier design of one symlink per
   input file into the tree: every copy is private, so an action may open an input for writing and an output may name
   an input path. The cost is the copy of the input tree, not about 40 us per file.
 - Outputs: the host path `<mp>/put/cas/b/<build>/<nonce>` is mounted at `/work/.kbf-out` (`exec/.kbf-out`, as the
   agent makes a mount, with a Seatbelt write grant) and kbf-task commits into it (`--out-dir .kbf-out`).
   `process-exec` is denied because the mount sets `no_exec`, as on Linux (job-rootfs 5.2 and 5.4; designed in
-  jobscheduler, not built there). Both names are beside `exec/work`, not in the input root, so no input name is
+  jobscheduler, not built there). Both names are beside `exec/kbf-work`, not in the input root, so no input name is
   reserved for them.
 - NFS has no open handle count. The commit therefore requires the expected digest in the source name. kbf-task always
   supplies it. A short or unflushed file fails with EBADMSG instead of being published.

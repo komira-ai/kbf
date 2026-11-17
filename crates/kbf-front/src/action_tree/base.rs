@@ -10,8 +10,16 @@ use super::encode::{self, Child};
 use super::listing::{Entry, entries_of};
 
 /// The top-level names every action tree adds or `kbf-task` makes, which a base tree must not
-/// hold: the input root, the Action and Command, and `kbf-task`'s run directory.
-pub const RESERVED_NAMES: [&str; 3] = ["work", ".kbf", ".kbf-run"];
+/// hold: the input root ([`INPUT_ROOT`]), the Action and Command, `kbf-task`'s run directory,
+/// and `work`, the input root of the trees older frontends wrote, which `kbf-task` reads when a
+/// tree has no [`INPUT_ROOT`].
+pub const RESERVED_NAMES: [&str; 4] = [INPUT_ROOT, ".kbf", ".kbf-run", "work"];
+
+/// The name of the input root at the top of every action tree: `/kbf-work` in a job, the
+/// Command's exec root. A path of 9 bytes, so a tool that rewrites the exec root in place for a
+/// path of at least 8 bytes (a debug-info relocation of a coverage build) can, where `/work` was
+/// too short for it.
+pub const INPUT_ROOT: &str = "kbf-work";
 
 /// What the kbf base tree's bundle says of the whole base tree, which its root manifest alone
 /// does not: the action tree's limits are counted with them.
