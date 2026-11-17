@@ -38,12 +38,16 @@ a host whose `kbf.toml` still names one does not start. What replaces them:
 - **One host** that was `all-in-one` runs a `frontend` and a `storage` node as separate
   processes, with the job service on its own; see "Growing from one host to many" below.
 
+The flags of the worker session are retired: `--heartbeat-interval-ms`, `--vm-host-floor-cpus`,
+`--vm-host-floor-mem-gib` and `--pack-commit-sample` are accepted, ignored and warned about at
+start, for one release, so a unit that still carries them starts.
+
 The vocabulary of the removed modes stays readable, so older data and certificates are still
 understood: the role `daemon` (`urn:kbf:role:daemon`), the host roles `daemon` and `mac-daemon`,
 and every protobuf message.
 
 **`frontend`.** It serves REAPI (Execute, the scheduler, operations) and, when `--worker-listen` is
-given, the worker listener's work streams. Storage nodes connect to that listener, so a
+given, the worker listener (storage nodes' `Membership` calls and a host updater's node calls). Storage nodes connect to that listener, so a
 frontend that has a storage node gives the flag; a frontend with none (`--executor js-agent` and no storage
 node) binds no worker port. It routes each cache call to a storage node. It holds no blobs
 and refuses every flag of a store. `--storage` is the URL of one storage node, and is required
@@ -59,13 +63,8 @@ the TLS flags the frontend keeps the farm's storage map and routes every call by
 
 `--pack-index` (off by default; the `pack-index` key of `[scheduler]` in `kbf.toml`) opens
 the pack index at start: two tables of the Postgres state store (`pack` and `blob`) that
-say which pack holds each blob and where. The worker listener then answers
-`kbf.worker.v1.PackIndex/Locate` from the index (certificates with the `daemon` role only, which
-no program of this release holds; without the flag the service is not registered and the call is
-UNIMPLEMENTED). Unless the frontend is also given the pack store flags below, nothing else reads
-or writes them. It needs a
-`postgres://` state store whose schema
-has the tables, which `kbf-installer setup` and the update step create, and a `sqlite://`
+say which pack holds each blob and where. The `kbf.worker.v1.PackIndex` service is not served. Unless the frontend is also given the pack store flags below, nothing else reads
+or writes them. It needs a `postgres://` state store whose schema has the tables, which `kbf-installer setup` and the update step create, and a `sqlite://`
 state store is refused with a line that says so (exit 2). With the flag off no pack table is
 touched. The tables are an additive schema step: a kbf of the previous release keeps running
 on the migrated schema.
@@ -95,11 +94,9 @@ action again. With no pack flags the nodes check the entry alone, as before.
 `--pack-bytes` (default 32 MiB) is the length at which a pack is closed, `--pack-writer`
 (default `frontend`) names the frontend in its pack keys, `--pack-store-region` (default
 `us-east-1`) is the signing region, and `--pack-cache-dir` with `--pack-cache-bytes` keeps
-the blobs read from packs on a local disk. `kbf.worker.v1.PackIndex/CommitPack`, with which a
-caller of the `daemon` role commits a pack it wrote, is still served by a frontend with the pack
-index and these flags, and no program of this release calls it; `--pack-commit-sample` (default 2;
-at most 16384, which checks every blob; 0 checks none) is the number of blobs of such a pack the
-frontend re-hashes before it records it. At start the frontend checks that the store
+the blobs read from packs on a local disk. A build's job writes its pack through a presigned
+write and the frontend records it after re-hashing it; no other caller commits a pack. `--pack-commit-sample` is retired: accepted, ignored
+and warned about at start, for one release. At start the frontend checks that the store
 refuses to replace an object, and does not serve if it does not. `GET /metrics` gains the
 `kbf_pack_*` families. Left out, no object store is built or contacted and the frontend
 serves exactly as before.

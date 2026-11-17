@@ -1,5 +1,7 @@
 # Distribution: kbf, kbf-installer and the package
 
+> **Status: kbf-daemon is deleted.** Where this page describes the daemon, the `daemon`, `storage-and-daemon` or `all-in-one` modes or a Mac daemon, it records the design as it was written. Placed actions now run only as js-agent jobs of the job service, storage nodes run `kbf --mode=storage`, and Macs run js-agent only ([kbf-modes.md](../deploy/kbf-modes.md#the-removed-modes)).
+
 > **Retired in part.** The proxy's update API at `/v1/update/frontend`, its two-slot
 > supervision of frontend children and the `kbf-installer update` client were removed; a
 > pool of frontends behind the proxy is rolled as a package by `kbf-updater`. kbf also runs no

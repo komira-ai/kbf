@@ -19,8 +19,8 @@ kbf keeps two kinds of data for your build tool.
   not, the lookup is a miss and the action runs again.
 
 Clients never write the action cache. `UpdateActionResult` is refused with
-`PERMISSION_DENIED`. Only the daemon that ran an action stores its result, and only after
-all its outputs are stored.
+`PERMISSION_DENIED`. Only the frontend stores a result, from the one it accepted for an action it
+placed, and only after all its outputs are stored.
 
 Two facts follow for hardware. Blob bytes can be rebuilt from the cold store (below), but
 action cache entries live only in the node's metadata log. A node that loses its log
@@ -167,8 +167,7 @@ With a hot store, the write path changes:
    segment to the cold store, reads the footer back, and commits that the object is
    flushed. Only then is the blob in the cold store.
 4. A flushed block stays on the hot store as a read cache until space is needed. Only
-   flushed copies are evicted. (Under `kbf all-in-one` the one cache keeps no flushed copies
-   on the hot store, so there this step does not hold.)
+   flushed copies are evicted.
 
 | Moment | What survives |
 |---|---|
@@ -188,9 +187,9 @@ holds within `--ram-drain-deadline`; `SIGKILL` and a power loss do not.
 The flush starts at most about 31 seconds after the block is opened (the 30-second seal
 delay plus the next once-a-second flusher round; a block that reaches 128 MiB is sealed
 sooner), then takes one put, and longer while the cold store is down. No flag changes these
-timings. `kbf storage` and `kbf storage-and-daemon` flush the tier when they stop, after
-their calls end, within `--ram-drain-deadline`; what the deadline leaves is flushed by the
-next start. `kbf-server` and `kbf-all-in-one` do not flush it at shutdown. A block left on
+timings. `kbf --mode=storage` flushes the tier when it stops, after
+its calls end, within `--ram-drain-deadline`; what the deadline leaves is flushed by the
+next start. A block left on
 the hot store holds acknowledged bytes the cold store does not have yet, so do not delete a
 hot store you have not drained.
 

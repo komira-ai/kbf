@@ -87,8 +87,9 @@ role (`--role=all`). The flags are:
   free space, at most `--hot-store-max-bytes`); and the metadata log's directory,
   `<hot store>/meta` or `--meta-dir`. There is no `memory:` store: a `file://` path on a
   tmpfs is one (storage glossary: [storage-node.md](docs/deploy/storage-node.md#where-the-bytes-live-storage-glossary));
-- `--heartbeat-interval-ms` (default 5000), the interval workers are asked to
-  heartbeat at;
+- `--heartbeat-interval-ms`, `--vm-host-floor-cpus`, `--vm-host-floor-mem-gib` and
+  `--pack-commit-sample`, retired flags of the worker session: accepted, ignored and warned
+  about at start;
 - `--finished-retention-secs` (default 60), how long a finished operation is kept
   for WaitExecution before its name is `NOT_FOUND`;
 - `--shutdown-timeout-secs` (default 0, no deadline), how long a stop (SIGINT or SIGTERM) waits
@@ -457,9 +458,9 @@ in between ([deployment-topology.md](docs/design/deployment-topology.md)).
   [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).
 - **Built: roles on the worker listener.** The role is read from the leaf certificate
   (`urn:kbf:role:<name>`) and each method takes only the roles expected there: a
-  storage node registers, heartbeats and fetches the registered cold store. The calls of the
-  `daemon` role (a worker session and blob calls over the farm's cache) are still served;
-  no program of this release holds that role. Nothing else of REAPI is served there
+  storage node registers, heartbeats and fetches the registered cold store. The `daemon` role
+  (`urn:kbf:role:daemon`) is still read from a certificate, and no
+  program of this release holds it. Nothing else of REAPI is served there
   (Execute, the action cache and `Capabilities` answer UNIMPLEMENTED), and on a plain-text
   worker listener every blob call is refused UNAUTHENTICATED. See
   [worker-protocol.md](docs/design/worker-protocol.md#blobs-on-the-worker-listener).

@@ -1,5 +1,7 @@
 # One binary, three subcommands, two modes
 
+> **Status: kbf-daemon is deleted.** Where this page describes the daemon, the `daemon`, `storage-and-daemon` or `all-in-one` modes or a Mac daemon, it records the design as it was written. Placed actions now run only as js-agent jobs of the job service, storage nodes run `kbf --mode=storage`, and Macs run js-agent only ([kbf-modes.md](../deploy/kbf-modes.md#the-removed-modes)).
+
 > **Superseded by [architecture-v2.md](architecture-v2.md).** kbf is now four parts (frontend, state store, storage, daemon) with a stateless frontend behind a load balancer, digest-sharded storage and no elected leader, so the leader-elected scheduler (5.2), the Raft join protocol and voter selection (5.3) and Envoy routing (6) are replaced. Carried over: the two tested modes, trusted-network and isolated-storage (3.1, 3.2), peer fetch, the flush race and hot blobs (4.3), `TierDown`/`TierUp` with the dwell and `--hot-store-abandon` (4.4), and the `Takeover` epoch idea. The rest of this file is kept as history.
 
 Status: design, nothing built. Revised again on 2026-10-15 for the owner's decisions on subcommands, discovery and staged routing, and for the answers to the open questions (section 10). Labels: **[F]** fact checked against `main` while writing this revision, **[F#744]** carried from the first draft of this document and not re-checked, **[I]** inference, **[D]** owner decision (2026-10-15), **[V]** verify before building on it.

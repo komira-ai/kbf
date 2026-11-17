@@ -1,5 +1,7 @@
 # N frontends: a leaderless executor
 
+> **Status: kbf-daemon is deleted.** Where this page describes the daemon, the `daemon`, `storage-and-daemon` or `all-in-one` modes or a Mac daemon, it records the design as it was written. Placed actions now run only as js-agent jobs of the job service, storage nodes run `kbf --mode=storage`, and Macs run js-agent only ([kbf-modes.md](../deploy/kbf-modes.md#the-removed-modes)).
+
 Status: **DESIGN, for the owner's review. Nothing here is built.** A living document: it is changed in the pull request that
 changes the thing it describes.
 

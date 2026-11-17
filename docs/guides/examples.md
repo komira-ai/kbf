@@ -98,9 +98,9 @@ Make it one with `--extra_execution_platforms=//:linux_x86_64`, or with
 and does not choose where an action runs. These flags are Bazel's, not kbf's. If you do not
 want platform targets, `--remote_default_exec_properties` above is simpler.
 
-The `container-image` value in the `.bazelrc` above applies to Linux workers only; a Mac
-worker ignores it (see [The container image](#the-container-image)). The `macos_arm64`
-platform therefore does not set it.
+The `container-image` value in the `.bazelrc` above applies to Linux actions only; an action
+that runs on a Mac ignores it (see [The container image](#the-container-image)). The
+`macos_arm64` platform therefore does not set it.
 
 ## Buck2
 
@@ -178,7 +178,7 @@ remote_execution_properties = {"OSFamily": "Darwin", "ISA": "arm-a64"},
 
 Buck2 has one remote execution service per checkout, so every remote action of a checkout
 goes to the one `engine_address`. kbf routes each action by its `OSFamily`, so a Linux
-action goes to a Linux worker and a Darwin action to a Mac.
+action goes to a Linux host and a Darwin action to a Mac.
 
 ## Authentication behind the bundled proxy
 
@@ -207,7 +207,7 @@ examples use:
 |---|---|---|
 | `OSFamily` | `linux`, or `darwin`, `macos`, `macosx`, `osx` | The operating system of the worker. |
 | `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; or `arm-a64`, `arm64`, `aarch64`; or an ISA level such as `x86-64-v3` | The CPU architecture of the worker. |
-| `container-image` | `docker://<repo>@sha256:<digest>` | The image a Linux action runs in. |
+| `container-image` | `docker://<repo>@sha256:<digest>` | The base image a Linux action's Command sees; it must be the frontend's base image. |
 | `kbf-book-cpus` | whole number, 1 or more | Cores the action books. |
 | `kbf-book-mem-gib` | whole number, 1 or more | GiB of memory the action books. |
 
@@ -218,7 +218,7 @@ Rules for the names and values:
   accepted as `ISA`. A name sent twice, in any two spellings, is refused with
   `INVALID_ARGUMENT`.
 - `container-image` is the exception: it is read only in exactly that spelling.
-  `Container-Image` is ignored, and the container driver then refuses the action.
+  `Container-Image` is ignored, and the action gets the frontend's base image.
 - An action that names no OS, no architecture and no ISA level goes where
   `--default-platform` says, `linux/x86_64` by default. Name `OSFamily` and `ISA` so a
   Mac and a Linux box are never confused.
@@ -228,22 +228,20 @@ Rules for the names and values:
 
 ### The container image
 
-A Linux container action names its image by digest:
+A Linux action may name the base environment its Command sees, by digest:
 
 ```text
 container-image=docker://registry.example.com/build@sha256:<digest>
 ```
 
-- Use the digest of **one architecture's manifest**, not the digest of the multi-architecture
-  image index. kbf refuses an index with "name the per-architecture manifest digest".
+- The frontend is started with one base image, `--executor-base-image`, pinned by digest. An
+  action that names another image is refused as invalid, and one that names none gets the base
+  image.
 - A tag is refused: an image is named only by digest, so one action digest never means two
   sets of bytes.
 - The digest is `sha256:` and 64 lowercase hex digits.
-- A node fetches the image from the registry by that digest, checks every byte against it,
-  and unpacks it once. A daemon started with `--image docker://...@sha256:<digest>` has the
-  image ready before the first action.
-- Only the container driver, which Linux workers use, reads `container-image`. Mac workers
-  run actions as plain processes and ignore it.
+- An action that runs on a Mac ignores `container-image`: a Mac's agent runs the release's
+  `kbf-task` bundle.
 
 ### Memory booking
 
@@ -259,11 +257,11 @@ Write `N` in plain digits with no sign or leading zero: `+4` and `04` are refuse
 because each would book the same as `4` under a different action digest. Either key may be
 given alone. The scheduler places the action only where that much is free.
 
-The booking is also the action's memory limit. The native driver (plain processes on Linux) kills an action
-whose processes together hold more than 150% of the booked memory plus 512 MiB: 12.5 GiB
-for `kbf-book-mem-gib=8`. The container driver sets a hard cap from the booking.
+A job needs 1.5 times its memory booking plus 512 MiB of its worker (a virtual worker of the
+frontend's executor, `--executor-host-memory-gib`), and the bookings of a worker add up to what
+is left after that: 12.5 GiB for `kbf-book-mem-gib=8`.
 
-When a worker reports that an action ran past its own memory limit, the server runs it
+When the job service reports that an action ran past its memory limit, the server runs it
 again one step up the memory ladder (4, 16, 32 GiB, then a whole host) and remembers the
 raised booking for that action, so the next run starts there. A large `swiftc` or `ld`
 step that dies at the default needs a larger `kbf-book-mem-gib`. Both keys are part of the
@@ -271,58 +269,52 @@ action digest, so changing a booking reruns the action once.
 
 Neither key is allowed on a `kbf-lease=whole_machine` action, which books the whole worker.
 
-## All-in-one on one machine
+## A frontend and a storage node on one machine
 
-`kbf all-in-one` runs the REAPI service, the scheduler, the storage and a daemon in one
-process. It is for a trusted single box or for development: builds run beside the farm's
-state and its cold store, as one user. It is Linux only and uses the container driver only;
-elsewhere `kbf all-in-one` exits with status 2.
+A small farm is two processes of `kbf`, a `frontend` and a `storage` node, with the job service
+on its own. They can share a machine for a trusted single box or for development; the storage
+node holds the blobs and the metadata log, the frontend serves REAPI, schedules and places each
+action as a job of the job service (`--executor js-agent`). `kbf --mode=frontend --help` and
+`kbf --mode=storage --help` list every flag; the modes are described in
+[kbf-modes.md](../deploy/kbf-modes.md), and a one-host layout in
+[single-host.md](../deploy/single-host.md).
 
-This is the flag set kbf's unit template uses, with the certificate files you need as
-placeholders. `--server=https://localhost:8981` is checked against the worker certificate,
-so `worker.pem` must name `localhost` (or add `--tls-server-name`). How to make the CA and
-the node's certificate is in [kbf-modes.md](../deploy/kbf-modes.md#a-nodes-certificate).
+The storage node (the certificates a node needs on a farm are listed in
+[kbf-units.md](../deploy/kbf-units.md)):
 
 ```text
-kbf all-in-one \
+kbf --mode=storage \
     --cold-store=file:///var/lib/kbf/cold \
     --meta-dir=/var/lib/kbf/meta \
-    --listen=127.0.0.1:8980 \
-    --worker-listen=127.0.0.1:8981 \
-    --worker-tls-cert=/etc/kbf/worker.pem \
-    --worker-tls-key=/etc/kbf/worker.key \
-    --worker-client-ca=/etc/kbf/ca.pem \
-    --api-listen=127.0.0.1:8982 \
-    --api-token-file=/etc/kbf/api-token \
-    --driver=container \
-    --oci-runtime=/usr/bin/crun \
-    --server=https://localhost:8981 \
-    --ca-cert=/etc/kbf/ca.pem \
-    --cert=/etc/kbf/node.pem \
-    --key=/etc/kbf/node.key \
-    --node-id=node-1 \
-    --data-dir=/var/lib/kbf
+    --storage-listen=127.0.0.1:8982
 ```
 
-- `--listen` is the REAPI address your clients use. It serves plain text here. Without
-  `--reapi-tls-cert` and `--reapi-tls-key` it serves plain text on any address, and off
-  loopback the start line warns.
-- `--worker-listen` is where the daemon half connects, over mutual TLS with the three
-  `--worker-*` certificate flags. `--server`, `--ca-cert`, `--cert` and `--key` are the
-  daemon half's side of that connection.
+The frontend:
+
+```text
+kbf --mode=frontend \
+    --listen=127.0.0.1:8980 \
+    --storage=http://127.0.0.1:8982 \
+    --state-store=postgres:///kbf?host=/run/postgresql \
+    --api-listen=127.0.0.1:8983 \
+    --api-token-file=/etc/kbf/api-token \
+    --executor=js-agent
+```
+
+The executor needs more flags (`--executor-job-url`, `--executor-job-token-file`, the base image
+and base tree); they are listed in [kbf-modes.md](../deploy/kbf-modes.md) and
+[job-service-cutover.md](../deploy/job-service-cutover.md).
+
+- `--listen` is the REAPI address your clients use. Without `--reapi-tls-cert` and
+  `--reapi-tls-key` it serves plain text on any address, and off loopback the start line warns.
+- Without the TLS flags the storage node serves plain text and its address must be loopback;
+  off one machine, give both processes the certificate flags.
 - `--cold-store=file://...` is a directory, so the box needs no S3 service and holds no key.
-  Add `--hot-store=file:///fast/kbf` to put a fast disk in front of it. In all-in-one the
-  single cache keeps no flushed copies on the hot store, so it holds only blobs not yet
-  flushed.
-- `--state-store` names the scheduler's state; the default is Postgres on the host's socket.
-  A `sqlite://` store still starts in this release and logs a warning that it is removed in
-  the next.
+  Add `--hot-store=file:///fast/kbf` to the storage node to put a fast disk in front of it.
+- `--state-store` names the scheduler's state: a Postgres URL. A `sqlite://` store still starts in
+  this release and logs a warning that it is removed in the next.
 - `--api-token-file` must be a file of mode 0600 or 0400 holding one token of at least 32
   characters. The operator API refuses writes without it.
-- The daemon runs rootless containers with `crun`. It needs the user's subordinate ids,
-  `newuidmap` and `newgidmap` on `PATH`, and a delegated cgroup; its unit sets
-  `Delegate=yes`. [kbf-modes.md](../deploy/kbf-modes.md) has the unit and its checks.
-- `kbf --mode=all-in-one --help` lists every flag.
 
 The client side, on the same machine:
 
@@ -346,7 +338,7 @@ build:kbf --remote_default_exec_properties=container-image=docker://registry.exa
   tls = false
 ```
 
-An all-in-one farm on an arm64 machine should start with `--default-platform=none`, or its
+A farm whose job hosts are arm64 machines should start with `--default-platform=none`, or its
 actions must name `ISA=arm64`; the default places an action that names no platform on
 `linux/x86_64`.
 

@@ -1,5 +1,7 @@
 # Pull-based updates: hosts update themselves over the session they already hold
 
+> **Status: kbf-daemon is deleted.** Where this page describes the daemon, the `daemon`, `storage-and-daemon` or `all-in-one` modes or a Mac daemon, it records the design as it was written. Placed actions now run only as js-agent jobs of the job service, storage nodes run `kbf --mode=storage`, and Macs run js-agent only ([kbf-modes.md](../deploy/kbf-modes.md#the-removed-modes)).
+
 Retired: the node update client (`kbf-update`, the daemon's `update_status` reporting and the `--update-dir` and `--orders-dir` flags) was deleted; the flags parse, do nothing and warn for one release. Passages below that describe that client are history.
 
 Status: design; the wire contract (section 5) is frozen. Built or in review: `kbf-installer` (merged), `kbf-update` (the node client, #908) and `kbf-helper` (the root helper, #929). The rest is built in the units of section 11.

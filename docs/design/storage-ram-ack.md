@@ -1,5 +1,7 @@
 # Acknowledging a storage write from RAM on both owners
 
+> **Status: kbf-daemon is deleted.** Where this page describes the daemon, the `daemon`, `storage-and-daemon` or `all-in-one` modes or a Mac daemon, it records the design as it was written. Placed actions now run only as js-agent jobs of the job service, storage nodes run `kbf --mode=storage`, and Macs run js-agent only ([kbf-modes.md](../deploy/kbf-modes.md#the-removed-modes)).
+
 **Built behind `--ram-ack-bytes`, which defaults to 0 (off).** PRs 1 to 6 of the plan below
 are in; turning it on by default is PR 7 and waits for an explicit go. With the flag at 0,
 the default, "Today" is exactly what the code does: a write is acknowledged after it is

@@ -19,8 +19,8 @@ operators, a short-lived `rollout` for CI) are **planned**; the token is the one
 operator credential until they land.
 
 Every body is `application/json`, except a blob's bytes and `/metrics`. What the server keeps here is
-**in memory**, like the scheduler's state: a restart forgets it, and each worker
-reports again after its next `Welcome`.
+**in memory**, like the scheduler's state: a restart forgets it, and a node
+reports again with its next report.
 
 ## Who may write
 
@@ -182,6 +182,8 @@ placement, and, after the list, the oldest protocol version among them:
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`, which is left out for a drain with no deadline); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
 
+The `software` fields (`xcodes`, `xcode_builds`, `container_images`, `daemon_version`) and `needs_attention` are shipped fields of the node status; the programs of this release send no node status, so they are `null` or empty on every node today.
+
 The list is the nodes this server process has seen, so it says nothing of a worker that has
 not connected to it yet: a server that has just started, or one of several frontends that
 share a state store ([design/frontend-proxy.md](design/frontend-proxy.md)), lists only
@@ -219,7 +221,8 @@ list:
 `node_load` of its heartbeats. The server also hands each accepted reading to the scheduler, which
 places by it only under `--placement-load on`. It is left out when the server has accepted no
 reading of the node (a worker that takes none, a failed read, a node another frontend
-holds), and it is in memory: a server restart forgets it.
+holds), and it is in memory: a server restart forgets it. The field is shipped and documented
+here; no worker of this release reports a load, so it is absent on every node today.
 
 ```json
 "load": { "measured_cpu_millicores": 2500, "memory_working_set_bytes": 1000,
@@ -262,7 +265,8 @@ never refused, nor its acknowledgement changed, for what its load carries.
 (`Heartbeat.input_cache`, [worker-protocol.md](design/worker-protocol.md)). It is left out when the
 node has sent none (a worker whose cache is off, one with no cache, one built before the
 field, a node another frontend holds): absent is not zero. It is in memory: a server restart
-forgets it until the next heartbeat. The counts are cumulative since the worker process started,
+forgets it until the next heartbeat. The field is shipped and documented here; no worker of this
+release reports input cache counts, so it is absent on every node today. The counts are cumulative since the worker process started,
 so a restarted worker counts again from 0 (a Prometheus counter handles the reset; nothing here
 keeps them across it).
 

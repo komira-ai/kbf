@@ -455,7 +455,7 @@ registration's included, before any placement round:
 A worker whose phase is not `serving` is held back from placement as a cordoned one
 is: work only it could run waits, naming it and its phase (`mac-1 (quarantined)`),
 and is not refused for it. Of the plan's rule "a node that misses the preparation
-timeout is quarantined" ([fleet-updates.md](fleet-updates.md#102-isolation-layers)),
+timeout is quarantined" ([fleet-updates.md](fleet-updates.md), isolation layers),
 only the requeue is built: a worker silent past the grace is not quarantined by the
 server; its daemon, if it returns, finds the lease cancelled and cleans up.
 

@@ -1,6 +1,6 @@
 # The worker protocol: `kbf.worker.v1`
 
-> **kbf-daemon is deleted.** No shipped program opens this `Session` stream any more: placed actions run only as js-agent jobs. The protocol is kept as shipped vocabulary: `kbf-server` still serves `Worker` and the blob services on the worker listener, and every message stays readable. Where this page says the daemon does something, it describes the deleted `kbf-daemon`; its design page (`daemon.md`) is deleted too.
+> **kbf-daemon is deleted.** No shipped program opens this `Session` stream any more: placed actions run only as js-agent jobs. The protocol is kept as shipped vocabulary: `kbf-server` serves neither the `Session` stream nor the daemon's blob, `PackIndex` and map-push services, and every message stays defined in the `.proto`. Where this page says the daemon does something, it describes the deleted `kbf-daemon`; its design page (`daemon.md`) is deleted too.
 
 `kbf.worker.v1` is the protocol between `kbf-daemon` and `kbf-server`. Its definition
 is [worker.proto](../../crates/kbf-proto/proto/kbf/worker/v1/worker.proto); this
@@ -101,7 +101,7 @@ measures can show an overload, and the limit of its reserve (`--reserve-cpus`) o
 `off` ignore the field. The write happens off the async workers after the `Welcome` is taken and
 before the stream's first `Heartbeat`, and a failed write is logged and does not end the stream.
 Until the first `Welcome` the limit written at start stays. See
-[linux-build-host.md](../deploy/linux-build-host.md#the-limit-under-placement-by-measured-load---actions-cpu-max).
+`linux-build-host.md`, deleted with kbf-daemon.
 
 **Only the first `Hello` of a stream registers the node.** It opens a new session, and
 from then on every `Start` for this node goes to this stream. A `Hello` resent on the
@@ -270,7 +270,7 @@ leaves the map and its blobs move to other owners.
 
 **The file is the worker listener's only.** The storage nodes' own listeners do not read
 it. What they refuse is the storage map's deny list, which the operator writes with
-`POST /v1/denied` ([api.md](../api.md#post-v1denied-and-delete-v1denied)): the same three
+`POST /v1/denied` ([api.md](../api.md#get-v1denied-post-v1denied-and-delete-v1denied)): the same three
 kinds of entry, applied to every storage endpoint and to the membership service, and
 carried to the nodes in the map (the file is not). An entry in the file does not stop a
 storage node's data-plane calls; an entry in the map does. The reverse also holds: this

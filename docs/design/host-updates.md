@@ -589,6 +589,8 @@ Derivations (each margin is 300 s, Question 16; `drain_wait` 3600 s, stop grace 
 
 ### 4.3 kbf-daemon: the kbf hook (today's behaviour)
 
+> **Status: kbf-daemon is deleted.** This section records the hook the daemon had. No host runs a `kbf-daemon` unit now; a storage node is updated as `kbf --mode=storage` and a Mac runs js-agent only ([kbf-modes.md](../deploy/kbf-modes.md#the-removed-modes)).
+
 The kbf daemon becomes a hook like the others: `kbf update-hook <step>` does what `agent/update.rs:89-250` does today, split at the five steps, with no change in behaviour. The declaration for kbf has `hook.user = "root"` today (the helper is root, `kbf-host-local.service`), with the rights of 3.4 narrowed as far as the units it restarts allow.
 
 | step | what it does (today's code) |

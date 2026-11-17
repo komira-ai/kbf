@@ -1,5 +1,7 @@
 # CI/CD for kbf: beta, gamma, prod, and the walk back
 
+> **Status: kbf-daemon is deleted.** Where this page describes the daemon, the `daemon`, `storage-and-daemon` or `all-in-one` modes or a Mac daemon, it records the design as it was written. Placed actions now run only as js-agent jobs of the job service, storage nodes run `kbf --mode=storage`, and Macs run js-agent only ([kbf-modes.md](../deploy/kbf-modes.md#the-removed-modes)).
+
 Status: design. Nothing in this page is built except where it says **[F]** (read in the tree). **[P]** is a proposal.
 **[V]** is something to verify by measurement before relying on it. Open pull requests and issues are named by number;
 re-check their state before acting on this page, because the table in section 12 rots first.
