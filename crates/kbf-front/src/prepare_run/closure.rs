@@ -1,11 +1,20 @@
 //! The input closure of an Action: every digest a task must be able to read to run it.
 //!
 //! [`collect_closure`] reads the Action, then the input root `Directory` and every `Directory`
-//! under it through the frontend's own read path ([`Backend::read_blob`]), and asks the store
+//! under it, level by level, and asks the store
 //! ([`Backend::find_missing`]) whether the Command and every file the tree names are held. The
 //! answer is the set of the input root's tree (its Directory blobs and its files) beside the
 //! Action and the Command.
 //!
+//! - **Directories from their rows first.** Each level asks the Directory rows of the pack
+//!   index for all of its Directories at once ([`Backend::directories`]), and reads only the
+//!   ones without a row through the frontend's own read path ([`Backend::read_blob`], which
+//!   checks the bytes against the digest); those are then recorded as rows
+//!   ([`Backend::record_directories`]), so the next walk of the same tree, on any frontend over
+//!   the same database, reads none of them from the object store. A row is the Directory's own
+//!   bytes (content-addressed), so the walk is the same with rows or without. When the rows
+//!   cannot be read the level is read from the blobs, and a record that fails is logged and
+//!   the walk goes on: the rows make a walk faster and never decide its answer.
 //! - **Complete or an error.** A blob that is not held is [`ClosureError::Missing`], never a
 //!   smaller closure: a run whose inputs cannot all be read is not started.
 //! - **Bounded.** The tree is cut off as soon as it holds more digests, or more bytes of
@@ -337,11 +346,7 @@ async fn collect(
     let mut files = Vec::new();
     let mut level = vec![root];
     while !level.is_empty() {
-        let directories: Vec<(Digest, reapi::Directory)> = stream::iter(level)
-            .map(|digest| directory(backend, digest))
-            .buffered(DIRECTORIES_IN_FLIGHT)
-            .try_collect()
-            .await?;
+        let directories = read_level(backend, level).await?;
         level = Vec::new();
         for (parent, directory) in directories {
             // Parsed nodes are kept only when asked: the walk before every submit holds none.
@@ -399,18 +404,58 @@ fn invalid(what: &'static str, digest: &Digest, why: &impl std::fmt::Display) ->
     }
 }
 
-/// The Directory blob `digest` and its decoded content; the empty blob is the empty Directory.
+/// The Directories of one level, in order, decoded: from their rows where the pack index has
+/// them, else from their blobs, which are then recorded as rows.
+async fn read_level(
+    backend: &Backend,
+    level: Vec<Digest>,
+) -> Result<Vec<(Digest, reapi::Directory)>, ClosureError> {
+    let rows = match backend.directories(&level).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "the Directory rows could not be read: reading the blobs");
+            vec![None; level.len()]
+        }
+    };
+    let read: Vec<(Digest, reapi::Directory, Option<Bytes>)> =
+        stream::iter(level.into_iter().zip(rows))
+            .map(|(digest, row)| directory(backend, digest, row))
+            .buffered(DIRECTORIES_IN_FLIGHT)
+            .try_collect()
+            .await?;
+    let fresh: Vec<(Digest, Bytes)> = read
+        .iter()
+        .filter_map(|(digest, _, blob)| Some((*digest, blob.clone()?)))
+        .collect();
+    if !fresh.is_empty()
+        && let Err(error) = backend.record_directories(fresh).await
+    {
+        tracing::warn!(%error, "the Directories read could not be recorded as rows");
+    }
+    Ok(read
+        .into_iter()
+        .map(|(digest, directory, _)| (digest, directory))
+        .collect())
+}
+
+/// The Directory `digest` decoded, from `row` (its bytes from the Directory rows) when there
+/// is one, else from its blob, which is handed back to be recorded. The empty blob is the
+/// empty Directory, with nothing to read or record.
 async fn directory(
     backend: &Backend,
     digest: Digest,
-) -> Result<(Digest, reapi::Directory), ClosureError> {
+    row: Option<Bytes>,
+) -> Result<(Digest, reapi::Directory, Option<Bytes>), ClosureError> {
     if is_empty_blob(&digest) {
-        return Ok((digest, reapi::Directory::default()));
+        return Ok((digest, reapi::Directory::default(), None));
     }
-    let blob = read(backend, "a Directory", &digest).await?;
+    let (bytes, fresh) = match row {
+        Some(body) => (body, false),
+        None => (read(backend, "a Directory", &digest).await?, true),
+    };
     let decoded =
-        reapi::Directory::decode(blob).map_err(|e| invalid("a Directory", &digest, &e))?;
-    Ok((digest, decoded))
+        reapi::Directory::decode(bytes.clone()).map_err(|e| invalid("a Directory", &digest, &e))?;
+    Ok((digest, decoded, fresh.then_some(bytes)))
 }
 
 /// The blob `digest`, which the store holds or the closure is not one.

@@ -23,6 +23,7 @@ mod backend;
 mod bytestream;
 mod cas;
 mod denied;
+mod directories;
 mod empty_blob;
 mod large;
 mod rig;

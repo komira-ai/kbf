@@ -11,11 +11,11 @@ publish.workspace = true
 # The Postgres index (`postgres` module) and the migration that makes its tables (`schema`).
 # Off by default: a crate that only reads or records through the `PackIndex` trait carries
 # no database client.
-postgres = ["dep:postgres", "kbf-state/postgres"]
+postgres = ["dep:postgres", "dep:sha2", "kbf-state/postgres"]
 # The in-memory index, the conformance suite and, with `postgres`, the suite's Postgres
 # factory. Test-only: a production build carries none of it. A crate that tests against the
 # in-memory index enables it in its `[dev-dependencies]` entry for kbf-pack-index.
-test-support = ["kbf-state/test-support"]
+test-support = ["dep:sha2", "kbf-state/test-support"]
 # A test database with the pack tables (`schema::test_database`).
 test-database = ["postgres", "kbf-state/test-database"]
 
@@ -23,6 +23,9 @@ test-database = ["postgres", "kbf-state/test-database"]
 # `Clock`, `StoreTime`, `StoreError`; with `postgres`, the connections and the migration runner.
 kbf-state.workspace = true
 postgres = { workspace = true, optional = true }
+# The check that a Directory row's bytes are its digest (`directory`), in the indexes that keep
+# rows (`postgres`, `test-support`).
+sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
@@ -33,7 +36,7 @@ kbf-pack-index = { workspace = true, features = ["postgres", "test-support", "te
 kbf-state = { workspace = true, features = ["test-database", "test-support"] }
 # The test server's URL (`database::server_url`) for the Postgres tests.
 kbf-testkit = { workspace = true, features = ["postgres"] }
-# The identity of the migration file the tests pin.
+# The identity of the migration files the tests pin, and the digests of Directory bodies.
 sha2.workspace = true
 
 [lints]

@@ -7,9 +7,10 @@
 //! they may create and drop in.
 #![cfg(feature = "postgres")]
 
-use kbf_pack_index::PackIndex;
+use kbf_pack_index::action::ActionStore;
 use kbf_pack_index::postgres::PostgresPackIndex;
 use kbf_pack_index::schema::{self, SQL};
+use kbf_pack_index::{BlobDigest, NewPack, PackBlob, PackIndex};
 use kbf_state::postgres::schema as state_schema;
 use kbf_state::postgres::{PostgresConfig, PostgresStore, TestDatabase};
 use postgres::{Client, NoTls};
@@ -99,11 +100,9 @@ fn a_database_the_old_runner_migrated_takes_the_action_cache_migration_alone() {
     let (db, config) = a_database_the_old_runner_migrated();
     let mut client = Client::connect(&db.url(), NoTls).expect("connects");
     let before = recorded(&mut client);
-    let out = state_schema::apply(&config, &schema::embedded(), schema::latest()).expect("applies");
-    assert_eq!(
-        (out.from, out.to, out.ran),
-        (Some(2), schema::latest(), vec![3])
-    );
+    let upto = schema::ACTION_CACHE_VERSION;
+    let out = state_schema::apply(&config, &schema::embedded(), upto).expect("applies");
+    assert_eq!((out.from, out.to, out.ran), (Some(2), upto, vec![3]));
     let after = recorded(&mut client);
     assert_eq!(after[..2], before[..]);
     let names: Vec<(i32, &str, &str)> = after
@@ -111,4 +110,53 @@ fn a_database_the_old_runner_migrated_takes_the_action_cache_migration_alone() {
         .map(|(v, n, k, _)| (*v, n.as_str(), k.as_str()))
         .collect();
     assert_eq!(names[2..], [(3, "action_cache", "expand")]);
+}
+
+/// Asserts that a database at the action cache's migration (the release before the Directory
+/// rows) is brought to the release's latest by running the directory migration alone: the
+/// earlier rows are untouched, the new row is `directory`, an expand step, and the pack and
+/// action rows written before are still read.
+#[test]
+fn a_database_at_the_action_cache_takes_the_directory_migration_alone() {
+    let (db, config) = a_database_the_old_runner_migrated();
+    state_schema::apply(&config, &schema::embedded(), schema::ACTION_CACHE_VERSION)
+        .expect("the release before the directory rows");
+    let blob = BlobDigest {
+        hash: [9; 32],
+        size: 10,
+    };
+    let pack = NewPack {
+        key: "cas/f/fe/1/1".to_owned(),
+        writer: "f/fe".to_owned(),
+        size: 26,
+        blobs: vec![PackBlob {
+            digest: blob,
+            offset: 0,
+        }],
+    };
+    let index = PostgresPackIndex::open(&config).expect("opens at migration 3");
+    index
+        .put_action(&blob, b"result", std::slice::from_ref(&pack))
+        .expect("the older release writes");
+    let mut client = Client::connect(&db.url(), NoTls).expect("connects");
+    let before = recorded(&mut client);
+    let out = state_schema::apply(&config, &schema::embedded(), schema::latest()).expect("applies");
+    assert_eq!(
+        (out.from, out.to, out.ran),
+        (Some(3), schema::latest(), vec![4])
+    );
+    let located = index.locate(&[blob]).expect("locates after the migration");
+    assert_eq!(
+        located[0].as_ref().map(|l| l.pack_key.as_str()),
+        Some("cas/f/fe/1/1")
+    );
+    let action = index.get_action(&blob).expect("reads after the migration");
+    assert_eq!(action.map(|a| a.result), Some(b"result".to_vec()));
+    let after = recorded(&mut client);
+    assert_eq!(after[..3], before[..]);
+    let names: Vec<(i32, &str, &str)> = after
+        .iter()
+        .map(|(v, n, k, _)| (*v, n.as_str(), k.as_str()))
+        .collect();
+    assert_eq!(names[3..], [(4, "directory", "expand")]);
 }

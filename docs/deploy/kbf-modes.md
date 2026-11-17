@@ -70,7 +70,10 @@ touched. The tables are an additive schema step: a kbf of the previous release k
 on the migrated schema.
 
 **Packs** (off by default; the `[packs]` table of `kbf.toml`). With
-`--pack-store-endpoint` (an `http://host:port` S3-compatible object store),
+`--pack-store-endpoint` (an `http://host:port` S3-compatible object store; given more than once,
+or as an array in `kbf.toml`, it is one store reached through each endpoint in turn, such as the
+tierstores of the farm's nodes in front of one bucket, and a request that could not connect is
+sent to the next),
 `--pack-store-bucket` and `--pack-store-credentials-file` (JSON
 `{"access_key_id": "...", "secret_access_key": "..."}`, mode 0600 or 0400; the secret is never
 a flag), and `--pack-index`, the frontend keeps the blobs clients upload in packs: many blobs
@@ -591,6 +594,11 @@ What it does itself, with those three:
   installer's migration 3 (`kbf-installer`), which must have run before the frontend starts: a
   frontend over a database at migration 2 starts and fails each action-cache call `NotMigrated`.
   A cache that is empty at the start is a valid cache; nothing is imported from storage nodes.
+- **Directory rows.** The walk of an action's input tree before its job is submitted reads each
+  level of Directories from the `directory` table of the state store (installer migration 4) with
+  one query, and reads only the Directories without a row from their packs, recording them as
+  rows; see `docs/design/metadata-in-postgres.md`. A database at migration 3 starts and every
+  walk reads the blobs.
 - **Readiness.** `GET /readyz` and `grpc.health.v1` fail when the state store does not answer a
   read and when the job service does not answer a read of a job (`executor` in the failing
   list). Nothing probes the object store or any storage node: an object store that is down is

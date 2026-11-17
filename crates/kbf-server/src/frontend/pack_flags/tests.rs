@@ -112,7 +112,7 @@ fn the_flags_make_the_setting() {
     assert_eq!(
         plain,
         PackFlags {
-            endpoint: "http://127.0.0.1:9".to_owned(),
+            endpoints: vec!["http://127.0.0.1:9".to_owned()],
             bucket: "kbf-packs".to_owned(),
             region: "us-east-1".to_owned(),
             credentials_file: PathBuf::from("/etc/kbf/pack.json"),
@@ -141,6 +141,26 @@ fn the_flags_make_the_setting() {
     assert_eq!(
         set.cache,
         Some((PathBuf::from("/var/cache/packs"), 1_000_000))
+    );
+}
+
+/// Asserts that `--pack-store-endpoint` may be given more than once, for one store reached
+/// through several endpoints, and that the setting keeps them in the order given.
+#[test]
+fn the_endpoint_may_be_given_more_than_once() {
+    let mut more = STORE.to_vec();
+    more.extend([
+        "--pack-store-endpoint=http://127.0.0.1:10",
+        "--pack-store-endpoint=http://127.0.0.1:11",
+    ]);
+    let set = parsed(&more).expect("parses").packs.expect("packs");
+    assert_eq!(
+        set.endpoints,
+        [
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:10",
+            "http://127.0.0.1:11"
+        ]
     );
 }
 
@@ -225,7 +245,7 @@ fn the_credentials_come_from_a_private_file() {
 /// The flags of a pack store in `dir`.
 fn flags(dir: &Path) -> PackFlags {
     PackFlags {
-        endpoint: "http://127.0.0.1:9".to_owned(),
+        endpoints: vec!["http://127.0.0.1:9".to_owned()],
         bucket: "kbf-packs".to_owned(),
         region: "us-east-1".to_owned(),
         credentials_file: file(dir, "pack-credentials.json", KEYS, 0o600),
@@ -243,8 +263,9 @@ fn index() -> Arc<dyn PackIndex> {
 
 /// Asserts that the flags open into packs (nothing is sent to the store to do it) that carry
 /// the room for uploads and the idle timeout the flags say, with a cache when there is one, and
-/// that each thing the flags name that cannot be used is refused naming its flag: an endpoint
-/// the store client does not take, a writer name a key cannot hold, a cache directory that
+/// over two endpoints of one store, and that each thing the flags name that cannot be used is
+/// refused naming its flag: an endpoint the store client does not take, an endpoint given twice,
+/// no endpoint at all, a writer name a key cannot hold, a cache directory that
 /// cannot be made, a credentials file that is not there.
 #[test]
 fn the_flags_open_into_packs_or_are_refused_by_flag() {
@@ -258,8 +279,23 @@ fn the_flags_open_into_packs_or_are_refused_by_flag() {
     assert!(dir.path().join("cache").is_dir());
 
     let mut tls = flags(dir.path());
-    tls.endpoint = "https://127.0.0.1:9".to_owned();
+    tls.endpoints = vec!["https://127.0.0.1:9".to_owned()];
     let said = tls.open(index()).expect_err("refused").to_string();
+    assert!(said.starts_with("--pack-store-endpoint: "), "{said}");
+
+    let mut two = flags(dir.path());
+    two.endpoints.push("http://127.0.0.1:10".to_owned());
+    two.open(index()).expect("two endpoints of one store open");
+
+    let mut twice = flags(dir.path());
+    twice.endpoints.push("http://127.0.0.1:9".to_owned());
+    let said = twice.open(index()).expect_err("refused").to_string();
+    assert!(said.starts_with("--pack-store-endpoint: "), "{said}");
+    assert!(said.contains("given twice"), "{said}");
+
+    let mut none = flags(dir.path());
+    none.endpoints.clear();
+    let said = none.open(index()).expect_err("refused").to_string();
     assert!(said.starts_with("--pack-store-endpoint: "), "{said}");
 
     let mut slash = flags(dir.path());
