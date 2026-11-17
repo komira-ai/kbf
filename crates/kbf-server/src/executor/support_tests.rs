@@ -23,6 +23,7 @@ use crate::Farm;
 use crate::executor::host::HostWorker;
 use crate::executor::rows::{ExecRows, Held};
 use crate::executor::share::Share;
+use crate::executor::size_class::SizeClass;
 use crate::executor::traits::{
     ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
     ReadGrant, UntrustedLimits,
@@ -30,6 +31,12 @@ use crate::executor::traits::{
 use crate::executor::{Config, Ctx, Deps, Ownership, PackKey, Secret, Twin, build_id};
 
 pub(super) const GIB: u64 = 1 << 30;
+
+/// The class of a build of `root//pkg:t`: `root.pkg.t.build`.
+pub(super) fn built_class() -> SizeClass {
+    let out = "buck-out/v2/art/root/7a3c1e9f0b2d4c68/pkg/__t__/o".to_owned();
+    SizeClass::of_action(&crate::action_usage::Shape::of(&["cc".to_owned()], &[out]))
+}
 
 /// The one host of the fake job service.
 pub(super) const HOST: &str = "host-1";
@@ -62,6 +69,7 @@ impl Inputs for Easy {
             image: format!("registry.test/app@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
             system: crate::executor::System::Linux,
+            size_class: built_class(),
         })
     }
 

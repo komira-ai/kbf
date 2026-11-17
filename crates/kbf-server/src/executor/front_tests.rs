@@ -418,6 +418,7 @@ async fn preparing_a_lease_again_replaces_what_was_parked() {
 
 /// Catches an action's run being launched from anything but the kbf image, and a timeout that is
 /// not the action's: an action that names the served base runs from the kbf image, by digest.
+/// Its Command names no argv and no output, so its class is the shape of an empty Command.
 #[tokio::test]
 async fn an_action_runs_from_the_kbf_image_by_digest_and_has_its_timeout() {
     let rig = Rig::new();
@@ -437,6 +438,7 @@ async fn an_action_runs_from_the_kbf_image_by_digest_and_has_its_timeout() {
             image: KBF_IMAGE.to_owned(),
             timeout: Some(Duration::from_secs(90)),
             system: crate::executor::System::Linux,
+            size_class: SizeClass::of_action(&Shape::of(&[], &[])),
         }
     );
 }
@@ -971,3 +973,6 @@ async fn the_actions_system_is_read_as_the_farm_reads_it() {
     let refused = rig.front.action(&bad).await.expect_err("refused");
     assert!(matches!(&refused, InputsError::Invalid(why) if why.contains("windows")));
 }
+
+#[path = "front_class_tests.rs"]
+mod class;

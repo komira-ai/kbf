@@ -65,7 +65,11 @@ async fn a_job_mounts_nothing_and_holds_no_secret_outside_its_flags() {
     assert!(spec.files.is_empty());
     assert_eq!(spec.network(), NetworkLevel::AllowList);
     let labels = &spec.labels;
-    assert_eq!(labels.len(), 2, "{labels:?}");
+    assert_eq!(labels.len(), 3, "{labels:?}");
+    assert_eq!(
+        labels.get("size-class").map(String::as_str),
+        Some("root.pkg.t.build")
+    );
     assert_eq!(
         labels.get("kbf-frontend").map(String::as_str),
         Some("front-1")
@@ -329,15 +333,15 @@ async fn only_hosts_of_the_reported_system_and_architecture_take_the_job() {
 
 /// Catches a job that asks the job service for disk: neither a shared job nor a whole-host job
 /// carries `disk_bytes` (unset, not zero, so the service has no disk to place it by), whatever
-/// the host reports. The shared job still needs its CPU and memory, so the check is not about
-/// an empty `needs`.
+/// the host reports. The shared job names no CPU and no memory either (the service sizes it
+/// from its class), and is not the whole host.
 #[tokio::test(start_paused = true)]
 async fn no_job_books_disk() {
     let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
     let shared = submitted(&mut rig).await;
     let needs = shared.spec.needs.as_ref().expect("needs");
     assert_eq!(needs.disk_bytes, None, "{needs:?}");
-    assert!(needs.cpu_millis > 0 && needs.memory_bytes > 0, "{needs:?}");
+    assert_eq!((needs.cpu_millis, needs.memory_bytes), (0, 0), "{needs:?}");
     assert!(!needs.whole_host, "{needs:?}");
 
     let mut rig = Rig::start(&[HOST], 1, |_| {}).await;

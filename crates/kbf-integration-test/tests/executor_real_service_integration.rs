@@ -53,7 +53,8 @@ use kbf_sched::Request;
 use kbf_server::Farm;
 use kbf_server::executor::{
     ActionFacts, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, Metrics, MintError,
-    PackKey, Presign, PresignError, ReadGrant, Secret, UntrustedLimits, build_id, job_id,
+    PackKey, Presign, PresignError, ReadGrant, Secret, SizeClass, UntrustedLimits, build_id,
+    job_id,
 };
 use kbf_types::{ActionKey, LeaseKind, Qos, Resources};
 use tokio::sync::watch;
@@ -68,6 +69,16 @@ const FRONTEND: &str = "front-1";
 /// The digest of the action of `tag`: hash `[tag; 32]`, size `tag`.
 fn digest_of(tag: u8) -> kbf_types::Digest {
     kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [tag; 32], u64::from(tag))
+}
+
+/// The size class of every action here, a build of `root//pkg:t`: the job names no CPU and no
+/// memory, so the real service books it its cold size from the class's (empty) history.
+fn class() -> SizeClass {
+    let out = "buck-out/v2/art/root/7a3c1e9f0b2d4c68/pkg/__t__/o".to_owned();
+    SizeClass::of_action(&kbf_server::action_usage::Shape::of(
+        &["cc".to_owned()],
+        &[out],
+    ))
 }
 
 /// The hash of the action of `tag`, as the task tool's `--action` names it.
@@ -91,6 +102,7 @@ impl Inputs for FakeInputs {
             image: image(),
             timeout: Some(timeout.unwrap_or(Duration::from_secs(60))),
             system: kbf_server::executor::System::Linux,
+            size_class: class(),
         })
     }
 

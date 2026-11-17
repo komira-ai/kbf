@@ -39,9 +39,10 @@ pub const PRESIGN_LIMIT: Duration = Duration::from_secs(4 * 3600);
 const HEARTBEAT: Duration = Duration::from_secs(1);
 
 /// What the container driver adds to 1.5 times a booking for the hard memory cap of a run
-/// (`kbf-driver-container`, `cgroup.rs`). A job needs the memory it is sent and its host caps
-/// it there, so the executor sends the same number and an out-of-memory job is the same event
-/// as an out-of-memory run on a daemon.
+/// (`kbf-driver-container`, `cgroup.rs`). A Mac job needs the memory it is sent and its host
+/// caps it there, so the executor sends the same number and an out-of-memory job is the same
+/// event as an out-of-memory run on a daemon. A Linux job names no memory: the job service
+/// sizes it from its class's history.
 const HARD_CAP_PAD: u64 = 512 << 20;
 
 /// The network a job of the executor is given on its host (`--executor-network`): the
@@ -492,9 +493,10 @@ impl Config {
 
     /// How many whole GiB of memory the farm may book on a virtual worker.
     ///
-    /// A job needs 1.5 times its booking plus [`HARD_CAP_PAD`]. Booking `m` bytes over at most
-    /// `slots` jobs needs `1.5 m + slots * pad`, which stays within the shape, so what the farm
-    /// has in flight on one worker fits a host of that shape.
+    /// A Mac job needs 1.5 times its booking plus [`HARD_CAP_PAD`]. Booking `m` bytes over at
+    /// most `slots` jobs needs `1.5 m + slots * pad`, which stays within the shape, so what the
+    /// farm has in flight on one worker fits a host of that shape. A Linux job's own size is the
+    /// job service's (its class's history); the farm's booking only paces how many it sends.
     #[must_use]
     pub fn booked_memory_gib(&self) -> u64 {
         let usable = self
@@ -503,7 +505,7 @@ impl Config {
         usable / 3 * 2 / GIB
     }
 
-    /// The hard memory cap of a job the farm booked `booking` bytes for: what the job needs.
+    /// The hard memory cap of a Mac job the farm booked `booking` bytes for: what the job needs.
     #[must_use]
     pub fn hard_memory(booking: u64) -> u64 {
         booking.saturating_mul(3) / 2 + HARD_CAP_PAD

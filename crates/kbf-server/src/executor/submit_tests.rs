@@ -12,11 +12,9 @@ use super::{
     wall_seconds,
 };
 use crate::executor::outcome::{Verdict, judge};
-use crate::executor::test_support::{GIB, Harness};
+use crate::executor::test_support::{GIB, Harness, built_class};
 use crate::executor::traits::{InputsError, PresignError};
-use crate::executor::{
-    ActionFacts, Config, Ctx, Delivery, Deps, Inputs, ReadGrant, Secret, build_id,
-};
+use crate::executor::{ActionFacts, Ctx, Delivery, Deps, Inputs, ReadGrant, Secret, build_id};
 
 const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -143,6 +141,7 @@ impl Inputs for Timed {
             image: format!("registry.test/app@sha256:{DIGEST}"),
             timeout: self.0,
             system: crate::executor::System::Linux,
+            size_class: built_class(),
         })
     }
 
@@ -284,11 +283,11 @@ fn arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.get(at + 1).map(String::as_str)
 }
 
-/// Catches a job asking for the wrong thing of the service: its needs are what the farm
-/// booked (at least one millicpu) and the hard memory cap, and no disk; it runs
+/// Catches a job asking for the wrong thing of the service: it names no CPU, no memory and no
+/// disk, whatever the farm booked, so the service sizes it from its class's history; it runs
 /// on a Linux container host of the configured architecture, with the allow-listed network, the
-/// image's own entrypoint, and labels naming the frontend and the process; and its id is the
-/// lease's, attempt 0.
+/// image's own entrypoint, and labels naming the frontend, the process and the action's size
+/// class; and its id is the lease's, attempt 0.
 #[tokio::test(start_paused = true)]
 async fn prepare_builds_the_job_the_service_is_asked_for() {
     let harness = Harness::new().await;
@@ -302,15 +301,19 @@ async fn prepare_builds_the_job_the_service_is_asked_for() {
     );
     assert_eq!(spec.command, "");
     assert!(spec.env.is_empty());
-    let needs = spec.needs.as_ref().expect("needs");
-    assert_eq!(needs.cpu_millis, 1_500);
-    assert_eq!(needs.memory_bytes, Config::hard_memory(GIB));
-    assert_eq!(needs.disk_bytes, None, "a job books no disk");
-    assert_eq!((needs.gpus, needs.whole_host), (0, false));
+    assert_eq!(
+        spec.needs,
+        Some(Needs::default()),
+        "no CPU, memory, disk or GPU, and not the whole host"
+    );
     assert_eq!(spec.constraints.as_ref(), Some(&cfg.constraints()));
     assert_eq!(spec.network(), NetworkLevel::AllowList);
     assert!(spec.ports.is_empty());
-    assert_eq!(spec.labels.len(), 2);
+    assert_eq!(spec.labels.len(), 3);
+    assert_eq!(
+        spec.labels.get("size-class").map(String::as_str),
+        Some("root.pkg.t.build")
+    );
     assert_eq!(
         spec.labels.get(FRONTEND_LABEL).map(String::as_str),
         Some(cfg.frontend.as_str())
@@ -321,13 +324,6 @@ async fn prepare_builds_the_job_the_service_is_asked_for() {
     );
     assert_eq!(arg(&spec.args, "--lease"), Some("7-8"));
     assert!(built.key.as_str().contains(&build_id(LeaseId::new(7, 8))));
-
-    let none = Booking::Share {
-        millicpus: 0,
-        memory_bytes: GIB,
-    };
-    let idle = prepared(&harness, None, none).await.expect("prepared");
-    assert_eq!(idle.spec.needs.as_ref().map(|n| n.cpu_millis), Some(1));
 }
 
 /// Catches a `Start` read as the wrong booking: only the kind `whole_machine`, spelt as the
@@ -358,10 +354,12 @@ fn a_start_books_the_whole_host_only_for_a_whole_machine_lease() {
 }
 
 /// Catches a whole-host job the service would refuse, or one that differs from a shared job
-/// in more than its needs: it needs the whole host and nothing else (no CPU, memory, disk or
-/// GPU, which the service refuses beside `whole_host`); its id, image, command, environment, constraints, wall limit, network, ports,
-/// priority and labels are those of the same lease's shared job, and its arguments name the
-/// same lease and action (the pack url in them is minted again for each prepare).
+/// in more than its needs and its class: it needs the whole host and nothing else (no CPU,
+/// memory, disk or GPU, which the service refuses beside `whole_host`) and carries no size
+/// class (it is never sized, and its runs would teach the class a whole host's use); its id,
+/// image, command, environment, constraints, wall limit, network, ports, priority and other
+/// labels are those of the same lease's shared job, and its arguments name the same lease and
+/// action (the pack url in them is minted again for each prepare).
 #[tokio::test(start_paused = true)]
 async fn a_whole_host_job_needs_the_whole_host_alone() {
     let harness = Harness::new().await;
@@ -376,10 +374,17 @@ async fn a_whole_host_job_needs_the_whole_host_alone() {
             ..Needs::default()
         })
     );
-    let shared_needs = shared.spec.needs.clone().expect("needs");
-    assert!(shared_needs.cpu_millis > 0 && !shared_needs.whole_host);
+    assert_eq!(shared.spec.needs, Some(Needs::default()));
+    assert_eq!(whole.spec.labels.get("size-class"), None);
+    assert!(shared.spec.labels.contains_key("size-class"));
     let without_needs = |spec: &js_proto::v1::JobSpec| js_proto::v1::JobSpec {
         needs: None,
+        labels: spec
+            .labels
+            .iter()
+            .filter(|(key, _)| *key != "size-class")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
         // The grant and the pack url are made again for each prepare.
         args: Vec::new(),
         files: Vec::new(),

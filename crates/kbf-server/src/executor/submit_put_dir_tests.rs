@@ -8,7 +8,7 @@ use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
 
 use super::{Booking, FRONTEND_LABEL, INSTANCE_LABEL, Settled, job_id, prepare};
-use crate::executor::test_support::{GIB, Harness};
+use crate::executor::test_support::{GIB, Harness, built_class};
 use crate::executor::traits::InputsError;
 use crate::executor::{
     ActionFacts, Ctx, Deps, Inputs, OUT_TARGET, PutDirRoots, ReadGrant, TASK_IN_TREE, TaskOut,
@@ -33,6 +33,7 @@ impl Inputs for Treed {
             image: format!("registry.test/kbf@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
             system: crate::executor::System::Linux,
+            size_class: built_class(),
         })
     }
 
@@ -89,7 +90,8 @@ const SHARE: Booking = Booking::Share {
 /// Asserts the job of a put-directory run: no image, the action tree as its one layer, the
 /// base tree's task tool as its program with the put-directory flags, the run's directory at
 /// `/out` read-write, no network, no file, no host port, the wall limit and the labels of any
-/// job; and that the key it keeps for the ingest is the directory.
+/// job, the size class included, and no CPU, memory or disk named (the service sizes it from
+/// the class); and that the key it keeps for the ingest is the directory.
 #[tokio::test(start_paused = true)]
 async fn a_put_dir_job_is_the_tree_the_tool_and_the_dir_at_out() {
     let prepared = prepared(Some(Arc::new(Treed)), SHARE)
@@ -120,7 +122,8 @@ async fn a_put_dir_job_is_the_tree_the_tool_and_the_dir_at_out() {
     assert_eq!(spec.wall_limit_seconds, Some(20 + 300));
     assert_eq!(spec.labels[FRONTEND_LABEL], "front");
     assert!(spec.labels.contains_key(INSTANCE_LABEL));
-    assert_eq!(spec.needs.as_ref().map(|n| n.whole_host), Some(false));
+    assert_eq!(spec.labels["size-class"], "root.pkg.t.build");
+    assert_eq!(spec.needs, Some(js_proto::v1::Needs::default()));
 }
 
 /// Asserts that a whole-machine lease is refused as the caller's before a key is minted: the

@@ -14,6 +14,7 @@ use kbf_proto::reapi::{ActionResult, Digest};
 use kbf_types::LeaseId;
 
 use crate::executor::mac::System;
+use crate::executor::size_class::SizeClass;
 use crate::executor::task::{PackKey, Secret};
 
 /// The bounds the frontend holds a pack an untrusted task wrote to.
@@ -165,6 +166,9 @@ pub struct ActionFacts {
     /// The system the action's platform asks for: a Linux host, or a Mac
     /// ([`crate::executor::mac`]).
     pub system: System,
+    /// The class the job service sizes the action's job by: its target and kind, read from
+    /// its `Command` ([`SizeClass::of_action`]).
+    pub size_class: SizeClass,
 }
 
 /// What a task reads its inputs with.

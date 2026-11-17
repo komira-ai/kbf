@@ -4,24 +4,29 @@
 //! the frontend's id before it and an attempt after it, so a submit sent again with the job its
 //! task kept, after its answer was lost, names the job already made, and the service answers
 //! from it (design section 5.3). The job is the kbf image, whose entrypoint is the
-//! task tool, run with the tool's flags; it needs what the farm booked, with the hard memory cap
-//! a daemon would set and no disk, or, for a `whole_machine`
-//! lease, the whole host and nothing beside it ([`Booking`]), of a Linux host of the
-//! configured architecture in a container, for the action's timeout and the run margin. The
-//! read grant and the presigned `PUT` travel as the job's files, or as arguments where the
-//! operator allowed it (`insecure_argv_secrets`). Two labels name the frontend and the
-//! process, by which a restarted frontend finds the jobs of an earlier one.
+//! task tool, run with the tool's flags; it names no CPU, memory or disk, so the job service
+//! books it what the history of its size class says, or, for a `whole_machine` lease, it needs
+//! the whole host and nothing beside it ([`Booking`]), of a Linux host of the configured
+//! architecture in a container, for the action's timeout and the run margin. The read grant and
+//! the presigned `PUT` travel as the job's files, or as arguments where the operator allowed it
+//! (`insecure_argv_secrets`). Two labels name the frontend and the process, by which a
+//! restarted frontend finds the jobs of an earlier one; a third, `size-class`, names the
+//! action's class ([`crate::executor::size_class`]), its target and kind, except on a
+//! `whole_machine` job, which books a whole host and so is never sized.
 //!
 //! A run that commits into a put directory (`--task-out-mode put-dir`, [`TaskOut::PutDir`]) is
 //! another job ([`put_dir_spec`]): no image, its root the action tree as its one layer, the
 //! task tool of the base tree as its program, the put directory mounted read-write at `/out`,
-//! no network, no files and no secret. A `whole_machine` lease cannot be one: the job service
-//! gives a whole-host job no layer and no mount, so it is refused as the caller's.
+//! no network, no files and no secret, and needs, and is labelled, as the other. A
+//! `whole_machine` lease cannot be one: the job service gives a whole-host job no layer and no
+//! mount, so it is refused as the caller's.
 //!
 //! An action whose platform asks for a Mac is a Mac job ([`crate::executor::mac`]): the
 //! release's `kbf-task` bundle, the tree and the put directory mounted under `/work`, no layer, of
-//! a Mac in the native runtime. It is refused as the caller's on an executor with no Macs, and
-//! as for Linux for a `whole_machine` lease.
+//! a Mac in the native runtime. It needs what the farm booked ([`named_needs`]) and carries the
+//! class's label: the job service takes the size of a class with no history from the largest
+//! host it knows, a Linux host, which a Mac may not hold. It is refused as the caller's on an
+//! executor with no Macs, and as for Linux for a `whole_machine` lease.
 //!
 //! An action whose platform asks for another system than the worker it was placed on stands
 //! for is refused as the caller's ([`same_system`]).
@@ -43,6 +48,7 @@ use crate::executor::mac::{MacJob, System, WorkerOs, check_version, mac_argv, ma
 use crate::executor::out::{PutDirRoots, TASK_IN_TREE, TaskOut};
 use crate::executor::outcome::Settled;
 use crate::executor::output::Grants;
+use crate::executor::size_class::{SIZE_CLASS_LABEL, SizeClass};
 use crate::executor::task::{PackKey, TaskArgs, build_id, put_dir_argv};
 use crate::executor::traits::{InputsError, MintError, PresignError};
 use crate::executor::{Ctx, Ingest, Inputs, Presign};
@@ -137,7 +143,8 @@ const WHOLE_MACHINE: &str = "whole_machine";
 /// What a `Start` asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Booking {
-    /// A share of a host: the CPU and memory the farm booked.
+    /// A share of a host: the CPU and memory the farm booked. A Linux job names neither and is
+    /// sized by the job service; a Mac job names both ([`named_needs`]).
     Share { millicpus: u64, memory_bytes: u64 },
     /// A `whole_machine` lease: the whole host, with no other job beside it. The CPU and
     /// memory the `Start` carries are the virtual worker's whole capacity, not a host's, and
@@ -158,29 +165,33 @@ impl Booking {
         }
     }
 
-    /// What the job needs. A share needs at least one thousandth of a CPU and the hard memory
-    /// cap of its booking, and no disk: the pool books none, so the job service places the job
-    /// on any host whatever disk it reports, and the job writes to its host's scratch with no
-    /// quota. The whole host is asked for alone: the job service takes a whole-host job only
-    /// with no other need, and the host's cores and memory are all the job's.
+    /// What a Linux job needs. A share names no CPU, no memory and no disk: the job service
+    /// books the CPU and the memory from the history of the job's size class (its label), and
+    /// the pool books no disk, so the job is placed on any host whatever disk it reports and
+    /// writes to its host's scratch with no quota. The whole host is asked for alone: the job
+    /// service takes a whole-host job only with no other need, and the host's cores and memory
+    /// are all the job's.
     fn needs(self) -> Needs {
-        match self {
-            Self::Share {
-                millicpus,
-                memory_bytes,
-            } => Needs {
-                cpu_millis: millicpus.max(1),
-                memory_bytes: Config::hard_memory(memory_bytes),
-                disk_bytes: None,
-                gpus: 0,
-                gpu_class: String::new(),
-                whole_host: false,
-            },
-            Self::WholeHost => Needs {
-                whole_host: true,
-                ..Needs::default()
-            },
+        Needs {
+            whole_host: self == Self::WholeHost,
+            ..Needs::default()
         }
+    }
+
+    /// The class to label the job with: `class` for a share, none for the whole host, which
+    /// is never sized and whose runs would teach the class a whole host's use.
+    fn class(self, class: &SizeClass) -> Option<&SizeClass> {
+        (self != Self::WholeHost).then_some(class)
+    }
+}
+
+/// What a Mac job needs: at least one thousandth of a CPU and the hard memory cap of the
+/// `memory_bytes` the farm booked, and no disk.
+fn named_needs(millicpus: u64, memory_bytes: u64) -> Needs {
+    Needs {
+        cpu_millis: millicpus.max(1),
+        memory_bytes: Config::hard_memory(memory_bytes),
+        ..Needs::default()
     }
 }
 
@@ -216,6 +227,7 @@ pub(super) async fn prepare(
 ) -> Result<Arc<Prepared>, Settled> {
     let facts = ctx.inputs.action(action).await?;
     same_system(on, facts.system)?;
+    let class = &facts.size_class;
     let timeout = facts.timeout.unwrap_or(ctx.cfg.default_timeout);
     require(timeout <= ctx.cfg.max_run, || {
         format!("the action's timeout {timeout:?} is over the executor's limit")
@@ -223,7 +235,8 @@ pub(super) async fn prepare(
     let image = pinned(&facts.image)?;
     let wall = ctx.cfg.wall(timeout);
     if let System::Macos { os_version } = facts.system {
-        return prepare_mac(ctx, lease, action, booking, (timeout, wall), os_version).await;
+        let times = (timeout, wall);
+        return prepare_mac(ctx, lease, action, booking, times, os_version, class).await;
     }
     if let TaskOut::PutDir(roots) = &ctx.cfg.task_out {
         require(booking != Booking::WholeHost, || {
@@ -238,7 +251,7 @@ pub(super) async fn prepare(
             dir: &key,
             tree: &tree,
         };
-        let spec = put_dir_spec(ctx, &job, lease, action, timeout, wall, booking);
+        let spec = put_dir_spec(ctx, &job, lease, action, (timeout, wall), (booking, class));
         let grants = Grants::of(&spec, []);
         return Ok(Arc::new(Prepared { spec, key, grants }));
     }
@@ -292,7 +305,7 @@ pub(super) async fn prepare(
         mounts: Vec::new(),
         files: args.files(ctx.cfg.delivery),
         priority: 0,
-        labels: labels(ctx),
+        labels: labels(ctx, booking.class(class)),
     };
     let grants = Grants::of(&spec, [pack.expose(), grant.token.expose()]);
     Ok(Arc::new(Prepared { spec, key, grants }))
@@ -317,9 +330,9 @@ fn same_system(on: WorkerOs, system: System) -> Result<(), Settled> {
 }
 
 /// The Mac job of `lease`, which runs `action` with `booking` for `times` (the timeout and the
-/// wall limit): refused as the caller's when this executor has no Macs, when the action asks
-/// for a newer macOS than they run, when it is a `whole_machine` lease, or when its outputs do
-/// not go into a put directory.
+/// wall limit), labelled with `class`: refused as the caller's when this executor has no Macs,
+/// when the action asks for a newer macOS than they run, when it is a `whole_machine` lease, or
+/// when its outputs do not go into a put directory.
 async fn prepare_mac(
     ctx: &Preparer,
     lease: LeaseId,
@@ -327,6 +340,7 @@ async fn prepare_mac(
     booking: Booking,
     (timeout, wall): (Duration, Duration),
     os_version: Option<u32>,
+    class: &SizeClass,
 ) -> Result<Arc<Prepared>, Settled> {
     let Some(pool) = &ctx.cfg.mac else {
         return Err(Settled::Invalid(
@@ -335,11 +349,17 @@ async fn prepare_mac(
         ));
     };
     check_version(os_version, pool).map_err(Settled::Invalid)?;
-    require(booking != Booking::WholeHost, || {
-        "a whole_machine action cannot run on a Mac of the job service: it commits into a put \
-         directory, and a whole-host job has no mount"
-            .to_owned()
-    })?;
+    let Booking::Share {
+        millicpus,
+        memory_bytes,
+    } = booking
+    else {
+        return Err(Settled::Invalid(
+            "a whole_machine action cannot run on a Mac of the job service: it commits into a \
+             put directory, and a whole-host job has no mount"
+                .to_owned(),
+        ));
+    };
     let TaskOut::PutDir(linux) = &ctx.cfg.task_out else {
         return Err(Settled::Invalid(
             "a Mac action commits into a put directory: give --task-out-root".to_owned(),
@@ -354,9 +374,9 @@ async fn prepare_mac(
         dir: key.as_str(),
         tree: &tree,
         args: mac_argv(action, lease, timeout),
-        needs: booking.needs(),
+        needs: named_needs(millicpus, memory_bytes),
         wall_seconds: wall_seconds(wall),
-        labels: labels(ctx),
+        labels: labels(ctx, Some(class)),
     });
     let grants = Grants::of(&spec, []);
     Ok(Arc::new(Prepared { spec, key, grants }))
@@ -376,13 +396,16 @@ async fn minted(
     })
 }
 
-/// The labels of every job: the frontend's id and this process's.
-fn labels(ctx: &Preparer) -> BTreeMap<String, String> {
+/// The labels of a job: the frontend's id and this process's, and its size class if it has
+/// one.
+fn labels(ctx: &Preparer, class: Option<&SizeClass>) -> BTreeMap<String, String> {
+    let class = class.map(|class| (SIZE_CLASS_LABEL, class.as_str()));
     [
         (FRONTEND_LABEL, ctx.cfg.frontend.as_str()),
         (INSTANCE_LABEL, ctx.cfg.instance.as_str()),
     ]
     .into_iter()
+    .chain(class)
     .map(|(key, value)| (key.to_owned(), value.to_owned()))
     .collect()
 }
@@ -395,16 +418,15 @@ struct PutDirJob<'a> {
     tree: &'a str,
 }
 
-/// The job of `lease`'s run of `job`: the tree is the root, the tool of the base tree runs, the
-/// directory is at `/out`, and nothing else is given.
+/// The job of `lease`'s run of `job`, with its booking and size class: the tree is the root,
+/// the tool of the base tree runs, the directory is at `/out`, and nothing else is given.
 fn put_dir_spec(
     ctx: &Preparer,
     job: &PutDirJob<'_>,
     lease: LeaseId,
     action: &Digest,
-    timeout: Duration,
-    wall: Duration,
-    booking: Booking,
+    (timeout, wall): (Duration, Duration),
+    (booking, class): (Booking, &SizeClass),
 ) -> JobSpec {
     JobSpec {
         job_id: job_id(&ctx.cfg.frontend, lease, 0),
@@ -424,7 +446,7 @@ fn put_dir_spec(
         mounts: vec![job.roots.mount(job.dir.as_str())],
         files: Vec::new(),
         priority: 0,
-        labels: labels(ctx),
+        labels: labels(ctx, booking.class(class)),
     }
 }
 

@@ -9,11 +9,11 @@ use kbf_types::LeaseId;
 
 use super::{Booking, FRONTEND_LABEL, INSTANCE_LABEL, Settled, job_id, prepare};
 use crate::executor::mac::{WorkerOs, mac_argv};
-use crate::executor::test_support::{GIB, Harness};
+use crate::executor::test_support::{GIB, Harness, built_class};
 use crate::executor::traits::InputsError;
 use crate::executor::{
-    ActionFacts, Ctx, DEFAULT_MAC_OS_VERSION, Deps, Inputs, MAC_OUT_TARGET, MacPool, PutDirRoots,
-    ReadGrant, System, TREE_TARGET, TaskOut,
+    ActionFacts, Config, Ctx, DEFAULT_MAC_OS_VERSION, Deps, Inputs, MAC_OUT_TARGET, MacPool,
+    PutDirRoots, ReadGrant, System, TREE_TARGET, TaskOut,
 };
 
 const TREE: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -46,6 +46,7 @@ impl Inputs for Mac {
                     os_version: self.os_version,
                 },
             },
+            size_class: built_class(),
         })
     }
 
@@ -151,8 +152,10 @@ fn host_path(mount: &js_proto::v1::Mount) -> &str {
 /// Asserts the job of a Mac action: the release's task bundle as its image, its entrypoint
 /// run (no command), no layer, the Mac flags, the tree read-only at `/work/.kbf-tree` and the run's put directory read-write at
 /// `/work/.kbf-out` under the Linux roots, `os=macos`, `arch=arm64` in the native runtime, the
-/// share booked, no network, no file, the wall limit and the labels of any job; and that the
-/// key kept for the ingest is the directory. Catches a Mac action sent as a Linux container job.
+/// share booked (the CPU and the hard memory cap, named: the service's cold size is a Linux
+/// host's), no network, no file, the wall limit and the labels of any job, the size class
+/// included; and that the key kept for the ingest is the directory. Catches a Mac action sent as
+/// a Linux container job, or left to a size no Mac may hold.
 #[tokio::test(start_paused = true)]
 async fn a_mac_action_is_a_native_job_with_the_tree_and_the_put_directory_under_work() {
     let prepared = prepared(Case {
@@ -198,8 +201,30 @@ async fn a_mac_action_is_a_native_job_with_the_tree_and_the_put_directory_under_
     assert_eq!(spec.wall_limit_seconds, Some(20 + 300));
     assert_eq!(spec.labels[FRONTEND_LABEL], "front");
     assert!(spec.labels.contains_key(INSTANCE_LABEL));
+    assert_eq!(spec.labels["size-class"], "root.pkg.t.build");
     let needs = spec.needs.as_ref().expect("needs");
-    assert_eq!((needs.cpu_millis, needs.whole_host), (1_500, false));
+    assert_eq!(
+        (needs.cpu_millis, needs.memory_bytes, needs.whole_host),
+        (1_500, Config::hard_memory(GIB), false)
+    );
+    assert_eq!(needs.disk_bytes, None, "a job books no disk");
+}
+
+/// Asserts that a Mac share the farm booked no CPU for still names one thousandth of a CPU.
+/// Catches a Mac job that names no CPU, which the service would size from a Linux host.
+#[tokio::test(start_paused = true)]
+async fn a_mac_share_of_no_cpu_names_one_millicpu() {
+    let prepared = prepared(Case {
+        booking: Booking::Share {
+            millicpus: 0,
+            memory_bytes: GIB,
+        },
+        ..Case::default()
+    })
+    .await
+    .expect("prepared");
+    let needs = prepared.spec.needs.as_ref().expect("needs");
+    assert_eq!(needs.cpu_millis, 1);
 }
 
 /// Asserts that a pool that names its own roots mounts the tree and the put directory under

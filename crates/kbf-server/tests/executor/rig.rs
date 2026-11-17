@@ -16,7 +16,7 @@ use kbf_server::Farm;
 use kbf_server::executor::rows::ExecRows;
 use kbf_server::executor::{
     ActionFacts, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, Metrics, MintError,
-    Ownership, PackKey, Presign, PresignError, PutDirRoots, ReadGrant, Secret, TaskOut,
+    Ownership, PackKey, Presign, PresignError, PutDirRoots, ReadGrant, Secret, SizeClass, TaskOut,
     UntrustedLimits, build_id,
 };
 use kbf_state::fake::{Fake, Flaw};
@@ -25,6 +25,14 @@ use kbf_types::{ActionKey, LeaseKind, Qos, Resources};
 use tokio::sync::watch;
 
 pub const GIB: u64 = 1 << 30;
+/// The class of a build of `root//pkg:t`, which every action of the fake inputs is:
+/// `root.pkg.t.build`.
+pub fn built_class() -> SizeClass {
+    let out = "buck-out/v2/art/root/7a3c1e9f0b2d4c68/pkg/__t__/o".to_owned();
+    let shape = kbf_server::action_usage::Shape::of(&["cc".to_owned()], &[out]);
+    SizeClass::of_action(&shape)
+}
+
 pub const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -50,6 +58,7 @@ impl FakeInputs {
                 image: IMAGE.to_owned(),
                 timeout: Some(Duration::from_secs(60)),
                 system: kbf_server::executor::System::Linux,
+                size_class: built_class(),
             })),
             grant: Mutex::new(Ok(ReadGrant {
                 url: "https://grant.test:9400".to_owned(),
