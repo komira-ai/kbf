@@ -13,8 +13,7 @@
 //! very transaction. A frontend that finds another name or counter, because the daemon
 //! said `Hello` elsewhere meanwhile, writes nothing and fails with
 //! [`StateError::StaleOwner`]. That error is about one node: it drops what the frontend
-//! holds for that node and nothing else, and does not mark the frontend as superseded as
-//! a refusal of the store as `Fenced` does ([`kbf_state::StoreError::Fenced`]).
+//! holds for that node and nothing else.
 //!
 //! A node this frontend never claimed (a lease taken up by a request that joined its
 //! operation, before its daemon said `Hello` here) has no counter to check: a write for it

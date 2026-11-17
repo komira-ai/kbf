@@ -113,7 +113,7 @@ pub(crate) fn prepare_with(
 
 impl Prepared {
     /// The service, the listener and the API over the open state store `store` (the
-    /// frontend's fenced handle). Must be called inside a Tokio runtime. With `members`, a
+    /// frontend's handle). Must be called inside a Tokio runtime. With `members`, a
     /// node revoke refreshes the membership map at once ([`EnrollApi::with_members`]).
     ///
     /// # Errors

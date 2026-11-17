@@ -22,7 +22,7 @@ pub enum RegistryError {
     /// Other writers kept winning the compare-and-set.
     #[error("gave up after {} attempts against other writers", crate::ATTEMPTS)]
     Contended,
-    /// The state store failed or this handle is fenced.
+    /// The state store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -85,13 +85,11 @@ impl From<RefusalReason> for Fail {
     }
 }
 
-/// A fenced handle is not the signer (default 4: there is no `enroll/signer` row); any
-/// other store failure (a failed call, a lost connection, a trimmed change feed) is the
+/// Every store failure (a failed call, a lost connection, a trimmed change feed) is the
 /// store being unavailable.
 impl From<StoreError> for Fail {
     fn from(e: StoreError) -> Self {
         match e {
-            StoreError::Fenced => Self(RefusalReason::NotSigner),
             StoreError::Failed(_)
             | StoreError::Disconnected(_)
             | StoreError::StaleCursor { .. } => Self(RefusalReason::StoreUnavailable),
@@ -112,12 +110,11 @@ mod tests {
     use super::*;
     use kbf_state::Revision;
 
-    /// Every store failure other than fencing, the two the store gained with the connection
-    /// loss and the trimmed feed included, is answered StoreUnavailable; fencing is NotSigner.
+    /// Every store failure, the two the store gained with the connection loss and the
+    /// trimmed feed included, is answered StoreUnavailable.
     #[test]
     fn each_store_error_maps_to_its_refusal() {
         let cases = [
-            (StoreError::Fenced, RefusalReason::NotSigner),
             (
                 StoreError::Failed("down".to_owned()),
                 RefusalReason::StoreUnavailable,

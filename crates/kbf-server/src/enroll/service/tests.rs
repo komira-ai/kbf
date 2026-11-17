@@ -1,12 +1,10 @@
 //! `Enroll` through the service: what is checked in which order, what a refusal looks like
 //! on the wire, and what an answer holds. Each test names the defect it catches.
 
-use std::num::NonZeroUsize;
-
 use kbf_enroll_registry::{list_nodes, list_tokens};
 use kbf_proto::kbf::enroll::v1 as pb;
 use kbf_proto::kbf::enroll::v1::enroll_server::Enroll as _;
-use kbf_state::{Cond, Revision, ScanRange, Store, StoreError, Txn};
+use kbf_state::StoreError;
 use kbf_types::{RefusalReason, Role, TokenId};
 use rcgen::PublicKeyData as _;
 use tonic::{Code, Request, Status};
@@ -14,8 +12,8 @@ use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 use super::*;
 use crate::enroll::testkit::{
-    FRONTEND, Farm, START, WritesFenced, csr_bad_signature, csr_oversized, csr_rsa, enroll_request,
-    farm, farm_at, key, node, spec, token,
+    FRONTEND, Farm, START, csr_bad_signature, csr_oversized, csr_rsa, enroll_request, farm,
+    farm_at, key, node, spec, token,
 };
 
 const ADVERTISE: &str = "s1.nodes.test:8983";
@@ -65,17 +63,13 @@ fn every_reason_becomes_a_status_with_exactly_its_code_and_message() {
     }
 }
 
-/// A store failure is `StoreUnavailable` and a fenced handle `NotSigner`.
+/// A registry failure of any kind is `StoreUnavailable`.
 ///
-/// Catches: a fenced frontend telling nodes to retry as if the store were down (they would
-/// hammer a frontend that can never answer), and the reverse.
+/// Catches: a store failure or a contended write told to a node as a refusal that is not
+/// retryable.
 #[test]
-fn a_fenced_store_is_not_signer_and_any_other_store_failure_is_store_unavailable() {
+fn a_registry_failure_is_store_unavailable() {
     use kbf_enroll_registry::RegistryError;
-    assert_eq!(
-        registry_reason(&RegistryError::Store(StoreError::Fenced)),
-        RefusalReason::NotSigner
-    );
     assert_eq!(
         registry_reason(&RegistryError::Store(StoreError::Failed("down".to_owned()))),
         RefusalReason::StoreUnavailable
@@ -410,65 +404,6 @@ async fn a_malformed_request_is_refused_before_the_store_is_read() {
         assert!(!name.is_empty());
     }
     assert_eq!(uses(&farm), 0);
-}
-
-/// Asserts that a frontend whose store refuses its writes as a superseded handle's answers
-/// `NotSigner` to an enroll request, and records no node.
-#[tokio::test]
-async fn a_fenced_frontend_answers_not_signer() {
-    let farm = farm("enroll-fenced");
-    let stale: Arc<dyn Store> = Arc::new(WritesFenced(Arc::clone(&farm.store)));
-    let service = crate::enroll::testkit::service_over(&stale, &farm.ca);
-    let tok = token(&farm, 1, &spec(&[Role::Daemon]));
-    let (request, _) = enroll_request(&tok, "node-01", &[Role::Daemon], "");
-    let status = refused(
-        service
-            .enroll(Request::new(request))
-            .await
-            .map(tonic::Response::into_inner),
-    );
-    assert_is(&status, RefusalReason::NotSigner);
-    assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
-}
-
-/// Asserts that the store which refuses writes as a superseded handle's answers `get`,
-/// `scan_prefix`, `scan_range`, `changes`, `commit_stats` and `now` as the store underneath
-/// does, and answers `StoreError::Fenced` to `apply_batch` and to `reap_expired`.
-#[test]
-fn a_store_that_refuses_writes_reads_as_the_store_underneath_does() {
-    let farm = farm("enroll-fenced-reads");
-    let inner = Arc::clone(&farm.store);
-    let outer = WritesFenced(Arc::clone(&inner));
-    let prefix = "fenced-reads/";
-    let key = "fenced-reads/key";
-    let write = inner
-        .apply_batch(vec![Txn::new().put(key, "v", Cond::Any)])
-        .expect("write");
-    write[0].as_ref().expect("committed");
-
-    let seen = outer.get(key).expect("outer get");
-    let held = inner.get(key).expect("inner get");
-    assert_eq!(seen, held);
-    let seen = outer.scan_prefix(prefix).expect("outer scan_prefix");
-    let held = inner.scan_prefix(prefix).expect("inner scan_prefix");
-    assert_eq!(seen, held);
-    let seen = outer
-        .scan_range(ScanRange::new(prefix, NonZeroUsize::MIN))
-        .expect("outer scan_range");
-    let held = inner
-        .scan_range(ScanRange::new(prefix, NonZeroUsize::MIN))
-        .expect("inner scan_range");
-    assert_eq!(seen, held);
-    let seen = outer.changes(Revision::ZERO, 10).expect("outer changes");
-    let held = inner.changes(Revision::ZERO, 10).expect("inner changes");
-    assert_eq!(seen, held);
-    assert_eq!(outer.commit_stats(), inner.commit_stats());
-    assert_eq!(outer.now(), inner.now());
-
-    let batch = outer.apply_batch(vec![Txn::new()]);
-    assert_eq!(batch, Err(StoreError::Fenced));
-    let reap = outer.reap_expired();
-    assert_eq!(reap, Err(StoreError::Fenced));
 }
 
 /// A CA that cannot sign now (the clock is before the build's floor) is `NotSigner`, and

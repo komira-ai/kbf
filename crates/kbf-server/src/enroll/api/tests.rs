@@ -1,5 +1,5 @@
 //! The enrollment API, through its handlers: the gate on every route, the secret shown
-//! once, revocation seen by the registry, the writer fence. Each test names the defect it
+//! once, revocation seen by the registry. Each test names the defect it
 //! catches.
 
 use std::io;
@@ -21,7 +21,6 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 
 use super::*;
-use crate::enroll::testkit::WritesFenced;
 use crate::enroll::{OsRandom, PinError, PinSource, Random};
 
 const BEARER: &str = "operator-token-0123456789abcdef0123456789";
@@ -90,18 +89,7 @@ fn state_with(token: Option<ApiToken>, api: Option<EnrollApi>) -> Arc<EnrollStat
 }
 
 fn state_over(store: Arc<dyn Store>) -> Arc<EnrollState> {
-    state_over_from(store, 0)
-}
-
-/// As `state_over`, with the random source's counter starting at `start`: two frontends
-/// over one store must not draw the same token id, which the registry refuses as a
-/// duplicate before the fence is reached.
-fn state_over_from(store: Arc<dyn Store>, start: u8) -> Arc<EnrollState> {
-    let api = api(
-        store,
-        Arc::new(Counting(AtomicU8::new(start))),
-        Ok(ca_pin()),
-    );
+    let api = api(store, Arc::new(Counting(AtomicU8::new(0))), Ok(ca_pin()));
     state_with(Some(ApiToken::for_tests(BEARER)), Some(api))
 }
 
@@ -638,64 +626,6 @@ async fn adopt_answers_the_row_and_refuses_what_enrollment_refuses() {
         1,
         "a refused adopt left a row"
     );
-
-    // A stale handle's adopt lands nothing and is told so, as a stale revoke is.
-    let stale = state_with(
-        Some(ApiToken::for_tests(BEARER)),
-        Some(api(
-            Arc::new(WritesFenced(store.clone())),
-            Arc::new(Counting(AtomicU8::new(9))),
-            Ok(ca_pin()),
-        )),
-    );
-    let (code, _) = text(adopt(&stale, "s3", r#"{"roles":["daemon"]}"#).await).await;
-    assert_eq!(code, StatusCode::CONFLICT);
-    assert_eq!(list_nodes(&*store).expect("nodes").len(), 1);
-}
-
-/// Asserts that a store that refuses every write as one of a superseded handle
-/// (`StoreError::Fenced`) is answered with 409 "not the signer", not as a 500 or as
-/// success: a stale handle's create, DELETE and revoke land nothing; the calls through a
-/// handle the store lets write, the control, succeed; reads are not refused. The two
-/// frontends draw from different random streams (see `state_over_from`).
-#[tokio::test]
-async fn a_stale_frontend_cannot_write() {
-    let inner = fake();
-    let as_store = || -> Arc<dyn Store> { inner.clone() };
-    let stale: Arc<dyn Store> = Arc::new(WritesFenced(as_store()));
-    let newer = as_store();
-    let (old_state, new_state) = (state_over_from(stale, 100), state_over(newer.clone()));
-
-    let created = make(&new_state, r#"{"roles":["daemon"]}"#).await;
-    enroll(&*newer, &created, "n1").expect("enroll through the current writer");
-
-    let create_body = r#"{"roles":["daemon"]}"#.to_owned();
-    for route in [
-        Route::Create(create_body),
-        Route::RevokeToken(created.info.id.clone()),
-        Route::RevokeNode("n1".into()),
-    ] {
-        let (code, body) = text(ok(&old_state, &route).await).await;
-        assert_eq!(code, StatusCode::CONFLICT, "{route:?}: {body}");
-        assert!(body.contains("not the signer"), "{body}");
-    }
-    let tokens = list_tokens(&*inner).expect("tokens");
-    assert_eq!(tokens.len(), 1, "the stale create landed");
-    assert!(tokens[0].revoked_at.is_none(), "the stale DELETE landed");
-    let nodes = list_nodes(&*inner).expect("nodes");
-    assert!(nodes[0].revoked_at.is_none(), "the stale revoke landed");
-    for route in [Route::List, Route::Nodes] {
-        assert_eq!(ok(&old_state, &route).await.status(), StatusCode::OK);
-    }
-    // The control: the same calls through the current writer.
-    let fresh = make(&new_state, r#"{"roles":["daemon"]}"#).await;
-    assert_ne!(fresh.info.id, created.info.id);
-    assert_eq!(
-        ok(&new_state, &Route::RevokeNode("n1".into()))
-            .await
-            .status(),
-        StatusCode::OK
-    );
 }
 
 // Catches a create that accepts what the registry or the grammar refuses, or answers a bad
@@ -829,10 +759,6 @@ async fn each_registry_failure_has_its_own_status() {
                 floor: kbf_state::Revision(5),
             }),
             StatusCode::SERVICE_UNAVAILABLE,
-        ),
-        (
-            RegistryError::Store(StoreError::Fenced),
-            StatusCode::CONFLICT,
         ),
     ];
     for (failure, want) in table {

@@ -6,7 +6,6 @@
 use kbf_estimator::Bounds;
 use kbf_invocation::Evidence;
 use kbf_sched::{Prediction, Request, Scheduler};
-use std::sync::atomic::Ordering;
 
 use kbf_types::{Failure, LeaseId, LeaseKind, OperationId, Outcome, WaiterId, WorkerId};
 
@@ -181,12 +180,8 @@ impl Engine {
 
     /// Writes the lowered key floors waiting for the store; those it refuses stay.
     pub(super) fn write_key_floors(&mut self, a: &dyn Adapter) {
-        let Some(durable) = self
-            .durable
-            .as_ref()
-            .filter(|d| !self.fenced && !d.fenced.load(Ordering::SeqCst))
-        else {
-            // No store to write to, or a newer writer holds it: nothing is kept.
+        let Some(durable) = self.durable.as_ref().filter(|_| !self.fenced) else {
+            // No store to write to, or the farm is fenced: nothing is kept.
             self.unwritten_floors.clear();
             return;
         };
@@ -218,16 +213,9 @@ impl Engine {
         else {
             return;
         };
-        if durable.fenced.load(Ordering::SeqCst) {
-            return;
-        }
         let mut refused = Vec::new();
         for chunk in rows.chunks(BATCH) {
             if let Err(error) = durable.put_estimates(chunk) {
-                // A newer writer holds the store: nothing more is written, nor kept.
-                if durable.superseded_by(&error) {
-                    return;
-                }
                 tracing::warn!(%error, "size summaries were not written");
                 refused.extend_from_slice(chunk);
             }

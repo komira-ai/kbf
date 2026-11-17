@@ -286,14 +286,6 @@ async fn an_unreachable_store_keeps_its_error_and_holds_the_record() {
     }
 }
 
-/// Asserts that a write refused because a newer writer fenced the store keeps both ERROR
-/// lines and counts one dropped write, no lost race.
-#[tokio::test(start_paused = true)]
-async fn a_fenced_refusal_keeps_its_errors_and_counts_a_drop() {
-    let refused = refused_with(StateError::Store(StoreError::Fenced)).await;
-    assert_dropped(&refused, "fenced");
-}
-
 /// Asserts that a write refused because the node belongs to another frontend now keeps
 /// both ERROR lines and counts one dropped write, no lost race.
 #[tokio::test(start_paused = true)]

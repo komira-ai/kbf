@@ -548,28 +548,28 @@ fn a_failed_store_is_the_stores_error() {
     struct Down;
     impl Store for Down {
         fn apply_batch(&self, _: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
-            Err(StoreError::Fenced)
+            Err(StoreError::Failed("down".to_owned()))
         }
         fn get(&self, _: &str) -> Result<Option<Versioned>, StoreError> {
-            Err(StoreError::Fenced)
+            Err(StoreError::Failed("down".to_owned()))
         }
         fn scan_prefix(&self, _: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
-            Err(StoreError::Fenced)
+            Err(StoreError::Failed("down".to_owned()))
         }
         fn scan_range(
             &self,
             _: kbf_state::ScanRange<'_>,
         ) -> Result<kbf_state::ScanPage, StoreError> {
-            Err(StoreError::Fenced)
+            Err(StoreError::Failed("down".to_owned()))
         }
         fn changes(&self, _: Revision, _: usize) -> Result<kbf_state::Changes, StoreError> {
-            Err(StoreError::Fenced)
+            Err(StoreError::Failed("down".to_owned()))
         }
         fn trim_feed(&self, _: Revision) -> Result<u64, StoreError> {
-            Err(StoreError::Fenced)
+            Err(StoreError::Failed("down".to_owned()))
         }
         fn reap_expired(&self) -> Result<usize, StoreError> {
-            Err(StoreError::Fenced)
+            Err(StoreError::Failed("down".to_owned()))
         }
         fn commit_stats(&self) -> kbf_state::CommitStats {
             kbf_state::CommitStats::default()
@@ -579,17 +579,17 @@ fn a_failed_store_is_the_stores_error() {
         }
     }
     let rows = ExecRows::new(Arc::new(Down));
-    let fenced = Err(RowsError::Store(StoreError::Fenced));
-    assert_eq!(rows.leave("a"), fenced);
-    assert_eq!(rows.liveness("a").map(drop), fenced);
-    assert_eq!(rows.live_instances().map(drop), fenced);
-    assert_eq!(rows.workers().map(drop), fenced);
-    assert_eq!(rows.jobs("w").map(drop), fenced);
+    let down = Err(RowsError::Store(StoreError::Failed("down".to_owned())));
+    assert_eq!(rows.leave("a"), down);
+    assert_eq!(rows.liveness("a").map(drop), down);
+    assert_eq!(rows.live_instances().map(drop), down);
+    assert_eq!(rows.workers().map(drop), down);
+    assert_eq!(rows.jobs("w").map(drop), down);
     let held = Held {
         worker: "w".to_owned(),
         version: Version(1),
     };
-    assert_eq!(rows.insert_job(&held, "j", &job_row(1)).map(drop), fenced);
+    assert_eq!(rows.insert_job(&held, "j", &job_row(1)).map(drop), down);
 }
 
 /// A repeat of a job insert for a worker whose row is gone is a lost worker, not a row that

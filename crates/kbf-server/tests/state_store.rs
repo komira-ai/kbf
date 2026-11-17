@@ -78,11 +78,8 @@ type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, Status>>;
 struct Flaky {
     inner: Inner,
     down: AtomicBool,
-    fenced: AtomicBool,
     /// How many more writes take before the store goes down; negative for no limit.
     allow: AtomicI64,
-    /// How many writes have been tried, taken or refused.
-    attempts: AtomicUsize,
     /// Every write applies, then fails `Failed`: the store took it and said it did not.
     lie: AtomicBool,
     /// As `lie`, for writes that put a `lease/` row only (a grant).
@@ -181,9 +178,7 @@ impl Flaky {
         Self {
             inner,
             down: AtomicBool::new(false),
-            fenced: AtomicBool::new(false),
             allow: AtomicI64::new(-1),
-            attempts: AtomicUsize::new(0),
             lie: AtomicBool::new(false),
             lie_lease: AtomicBool::new(false),
             fail_queue_get: AtomicI64::new(0),
@@ -191,11 +186,6 @@ impl Flaky {
             applied: std::sync::Mutex::new(Vec::new()),
             clock: None,
         }
-    }
-
-    /// The store refuses writes as a superseded handle's: every write fails `Fenced`.
-    fn set_fenced(&self) {
-        self.fenced.store(true, Ordering::SeqCst);
     }
 
     /// Set once the SQLite store this wraps is dropped; none over the fake.
@@ -249,7 +239,6 @@ impl Flaky {
 
 impl Store for Flaky {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
-        self.attempts.fetch_add(1, Ordering::SeqCst);
         if self.allow.load(Ordering::SeqCst) == 0 {
             self.down.store(true, Ordering::SeqCst);
         } else if self.allow.load(Ordering::SeqCst) > 0 {
@@ -257,9 +246,6 @@ impl Store for Flaky {
         }
         if self.down.load(Ordering::SeqCst) {
             return Err(StoreError::Failed("the store is down".to_owned()));
-        }
-        if self.fenced.load(Ordering::SeqCst) {
-            return Err(StoreError::Fenced);
         }
         let text = format!("{batch:?}");
         let applied = self.inner.store().apply_batch(batch)?;
@@ -717,28 +703,6 @@ async fn nothing_is_granted_while_the_store_is_down() {
         "no lease sequence was spent while the store was down"
     );
     assert_eq!(disk.rows("lease/"), 1);
-}
-
-/// Catches: a superseded scheduler (its writes fail Fenced) treated as a store outage
-/// (pinging forever, answering UNAVAILABLE so clients retry it) or still granting work: it
-/// must answer FAILED_PRECONDITION, grant nothing, and stay refusing when writes could
-/// again succeed.
-#[tokio::test(start_paused = true)]
-async fn a_superseded_scheduler_refuses_work_and_does_not_wait_for_the_store() {
-    let disk = Disk::new();
-    let farm = disk.farm(EpochPolicy::Keep);
-    let (stream, mut inbox) = register(&farm);
-    disk.store.set_fenced();
-    let refused = submit(&farm, request(1)).expect_err("refused");
-    assert_eq!(refused.code(), Code::FailedPrecondition);
-    farm.tick().await;
-    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
-    assert!(
-        starts(&mut inbox).is_empty(),
-        "a superseded scheduler granted"
-    );
-    assert_eq!(disk.rows("op/"), 0);
-    assert_eq!(disk.rows("lease/"), 0);
 }
 
 /// Catches: a lease given up while the store is never told of.
@@ -1687,36 +1651,6 @@ async fn a_request_after_the_retention_of_a_held_finish_does_not_retake_the_oper
     );
 }
 
-/// Catches: a retry that goes on after a newer writer holds the store (the old scheduler
-/// would write its stale rows over its successor's the moment a write landed, or keep the
-/// store busy for ever): the first refusal that says `Fenced` ends it. No write is tried
-/// after that, whatever feeds the farm, and none lands.
-#[tokio::test(start_paused = true)]
-async fn a_fenced_store_ends_the_retry_of_a_refused_result() {
-    let disk = Disk::new();
-    let (farm, ticket, lease) = running(&disk).await;
-    disk.store.set_down(true);
-    assert!(!accepted(&farm, lease).await);
-    farm.tick().await;
-    disk.store.set_down(false);
-    disk.store.set_fenced();
-    // The farm learns it was superseded from the write it retries.
-    farm.tick().await;
-    let rows = disk.all_rows();
-    let tried = disk.store.attempts.load(Ordering::SeqCst);
-    for _ in 0..3 {
-        farm.tick().await;
-        let _ = farm.report(&node(), invalid(lease)).await;
-    }
-    assert_eq!(
-        disk.store.attempts.load(Ordering::SeqCst),
-        tried,
-        "a write was tried after the store fenced the farm"
-    );
-    assert_eq!(disk.all_rows(), rows, "a write landed after the fence");
-    assert!(!matches!(*ticket.stage.borrow(), Stage::Done(_)));
-}
-
 /// Two operations running on one node, and the leases they hold.
 async fn running_two(disk: &Disk) -> (TestFarm, [kbf_front::Ticket; 2], [LeaseId; 2]) {
     let farm = disk.farm(EpochPolicy::Keep);
@@ -1815,28 +1749,6 @@ async fn held_records_are_written_in_the_order_they_committed() {
     assert!(applied_at(&disk, leases[0]) < applied_at(&disk, leases[1]));
 }
 
-/// Catches: held records written after a fence: with two held, the first refusal says
-/// `Fenced` and the second is never tried.
-#[tokio::test(start_paused = true)]
-async fn a_fence_ends_the_pass_over_the_held_records() {
-    let disk = Disk::new();
-    let (farm, _tickets, leases) = running_two(&disk).await;
-    disk.store.set_down(true);
-    assert!(!accepted(&farm, leases[0]).await);
-    assert!(!accepted(&farm, leases[1]).await);
-    disk.store.set_down(false);
-    disk.store.set_fenced();
-    let before = disk.store.attempts.load(Ordering::SeqCst);
-    farm.tick().await;
-    assert_eq!(
-        disk.store.attempts.load(Ordering::SeqCst) - before,
-        2,
-        "the outage ping, then the first record only"
-    );
-    assert_eq!((disk.rows("lease/"), disk.rows("op/")), (2, 2));
-    assert_eq!(disk.rows("done/"), 0, "a result landed after the fence");
-}
-
 /// Catches: an unbounded backlog: past the cap a new record is dropped, counted.
 #[tokio::test(start_paused = true)]
 async fn records_held_past_the_cap_are_dropped_and_counted() {
@@ -1913,28 +1825,6 @@ async fn a_stale_record_in_the_feed_does_not_drop_a_written_answers_detail() {
     assert!(lost_races(&farm) >= 1, "the grant was not refused");
     let row = farm.ended(OperationId(0)).expect("read").expect("a row");
     assert_eq!(row, Finished::Failed(status), "the row is what was sent");
-}
-
-/// Asserts that a finish is not written when the store refuses the farm's writes as a
-/// superseded handle's: the farm takes the worker's result, and its transaction (the
-/// operation's rows removed, the result put) is refused as a whole. The store keeps the
-/// operation's lease and op rows and no result.
-#[tokio::test(start_paused = true)]
-async fn a_fenced_farm_cannot_finish_an_operation() {
-    let disk = Disk::new();
-    let old = disk.farm(EpochPolicy::Keep);
-    let (_, mut inbox) = register(&old);
-    submit(&old, request(1)).expect("submitted");
-    let [lease] = starts(&mut inbox)[..] else {
-        panic!("one lease expected");
-    };
-    disk.store.set_fenced();
-    assert!(
-        !accepted(&old, lease).await,
-        "a fenced farm took the result"
-    );
-    assert_eq!(disk.rows("done/"), 0, "a result landed past the fence");
-    assert_eq!((disk.rows("lease/"), disk.rows("op/")), (1, 1));
 }
 
 /// Rows written so far, as the store's applied log prints them.

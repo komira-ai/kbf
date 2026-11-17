@@ -34,8 +34,6 @@ struct Flaky {
     refuse_est: AtomicBool,
     /// The next this many transactions that write an `est/` row are refused.
     refuse_est_first: std::sync::atomic::AtomicU32,
-    /// Transactions that write an `est/` row are refused as the work of a superseded writer.
-    fence_est: AtomicBool,
     /// Transactions that write an `est/` row, refused or not.
     est_writes: std::sync::atomic::AtomicU32,
     /// Scans of the `est/` prefix, and whether they fail.
@@ -53,7 +51,6 @@ impl Flaky {
             before_op_read: std::sync::Mutex::new(None),
             refuse_est: AtomicBool::new(false),
             refuse_est_first: std::sync::atomic::AtomicU32::new(0),
-            fence_est: AtomicBool::new(false),
             est_writes: std::sync::atomic::AtomicU32::new(0),
             est_scans: std::sync::atomic::AtomicU32::new(0),
             fail_est_scan: AtomicBool::new(false),
@@ -76,9 +73,6 @@ impl Store for Flaky {
         });
         if writes_est {
             self.est_writes.fetch_add(1, Ordering::SeqCst);
-            if self.fence_est.load(Ordering::SeqCst) {
-                return Err(StoreError::Fenced);
-            }
             let first = self.refuse_est_first.load(Ordering::SeqCst);
             if first > 0 {
                 self.refuse_est_first.store(first - 1, Ordering::SeqCst);
@@ -2111,25 +2105,15 @@ fn a_store_that_refuses_the_size_rows_still_settles_the_requeue() {
     assert!(held.iter().any(|(k, _)| *k == key));
 }
 
-/// Catches: a refused flush aborting the farm's tick path with an outage flag, and a
-/// fenced farm writing size rows at all.
+/// Catches: a fenced farm writing size rows at all.
 #[test]
-fn a_fenced_farm_writes_no_size_rows_and_a_refused_batch_is_kept_for_later() {
+fn a_fenced_farm_writes_no_size_rows() {
     let store = Flaky::new();
     let (farm, key) = farm_with_a_kill(&store);
     let row = (key.clone(), size_row(&key, today()));
     farm.lock().fenced = true;
     farm.lock().write_estimates(std::slice::from_ref(&row));
     farm.lock().flush_learned();
-    assert!(store.scan_prefix("est/").expect("scan").is_empty());
-    farm.lock().fenced = false;
-    farm.lock()
-        .durable
-        .as_ref()
-        .expect("a store")
-        .fenced
-        .store(true, Ordering::SeqCst);
-    farm.lock().write_estimates(std::slice::from_ref(&row));
     assert!(store.scan_prefix("est/").expect("scan").is_empty());
 }
 
@@ -2461,38 +2445,6 @@ fn a_refused_sweep_batch_does_not_stop_the_others() {
         (SWEEP_ROWS, false)
     );
     assert!(store.scan_prefix("est/").expect("scan").is_empty());
-}
-
-/// Catches: an idle old writer that goes on trying to write size rows to a store a newer
-/// writer holds (every tick would send a refused transaction), and its refused rows kept
-/// for a retry that cannot succeed.
-#[test]
-fn a_fenced_refusal_of_size_rows_ends_the_writing() {
-    let store = Flaky::new();
-    let (farm, key) = farm_with_a_kill(&store);
-    let row = (key.clone(), size_row(&key, today()));
-    store.fence_est.store(true, Ordering::SeqCst);
-    farm.lock().write_estimates(std::slice::from_ref(&row));
-    assert_eq!(store.est_writes.load(Ordering::SeqCst), 1);
-    let fenced = farm
-        .lock()
-        .durable
-        .as_ref()
-        .expect("a store")
-        .fenced
-        .load(Ordering::SeqCst);
-    assert!(fenced, "the refusal is remembered");
-    // Later ticks send nothing, and nothing is waiting to be written.
-    let mut state = farm.lock();
-    state
-        .side
-        .learned
-        .clock(kbf_types::FarmTime::from_millis(60_000));
-    state.flush_learned();
-    state.write_estimates(std::slice::from_ref(&row));
-    assert!(state.side.learned.due().is_empty());
-    drop(state);
-    assert_eq!(store.est_writes.load(Ordering::SeqCst), 1);
 }
 
 /// Catches: a sweep that commits nothing, because the store refuses every batch, asking to

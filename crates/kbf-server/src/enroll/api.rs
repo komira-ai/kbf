@@ -17,11 +17,10 @@
 //! what these routes list is the farm's door. A server without `--api-token-file` has them
 //! off, and one without enrollment answers 404 to a caller who passed the gate.
 //!
-//! The routes call `kbf-enroll-registry` over the frontend's state store handle, which the
-//! caller passes already fenced: a frontend that has lost the writer role writes nothing and
-//! answers 409 (`NotSigner` on the enroll wire). The store's calls block, so each runs on
-//! the blocking pool. The CA pin comes from a [`PinSource`] and the bytes of a token from a
-//! [`Random`]; nothing here reads the CA or draws its own randomness.
+//! The routes call `kbf-enroll-registry` over the frontend's state store handle. The
+//! store's calls block, so each runs on the blocking pool. The CA pin comes from a
+//! [`PinSource`] and the bytes of a token from a [`Random`]; nothing here reads the CA or
+//! draws its own randomness.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,8 +59,7 @@ pub const NODES: &str = "/v1/enroll/nodes";
 /// What the registry records as the writer of a token or a revocation made here.
 const OPERATOR: &str = "operator-api";
 
-/// What the routes need: the frontend's state store handle (fenced, so every write checks
-/// that this frontend still holds the writer role), the source of the CA pin and the
+/// What the routes need: the frontend's state store handle, the source of the CA pin and the
 /// source of random bytes.
 pub struct EnrollApi {
     store: Arc<dyn Store>,
@@ -76,7 +74,7 @@ pub struct EnrollApi {
 }
 
 impl EnrollApi {
-    /// The API over `store`, which must be the frontend's fenced handle.
+    /// The API over `store`, which must be the frontend's state store handle.
     #[must_use]
     pub fn new(store: Arc<dyn Store>, pins: Arc<dyn PinSource>, random: Arc<dyn Random>) -> Self {
         Self {
@@ -136,11 +134,6 @@ impl From<RegistryError> for Failure {
             RegistryError::Contended => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "other writers kept winning; try again",
-            ),
-            RegistryError::Store(StoreError::Fenced) => Self::new(
-                StatusCode::CONFLICT,
-                "this frontend is not the signer: it no longer holds the writer role; \
-                 call the current frontend",
             ),
             RegistryError::Store(
                 StoreError::Failed(_)

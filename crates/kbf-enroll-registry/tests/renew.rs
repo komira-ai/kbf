@@ -438,21 +438,15 @@ fn a_revoke_racing_a_renewal_wins() {
     );
 }
 
-/// Asserts that a renew over a store that refuses writes as a superseded handle's answers
-/// `NotSigner`, and over a store whose reads fail, whose writes fail or whose writes keep
-/// conflicting answers `StoreUnavailable`, with the node row unchanged.
+/// Asserts that a renew over a store whose reads fail, whose writes fail or whose writes
+/// keep conflicting answers `StoreUnavailable`, with the node row unchanged.
 #[test]
-fn trouble_in_the_store_is_unavailable_and_a_fenced_handle_is_not_the_signer() {
+fn trouble_in_the_store_is_unavailable() {
     let env = fake();
     enrolled(&env, "n1", 1, &[Daemon]);
     env.advance(DAY);
     let now = env.now();
     let mut sign = || Ok(renewed(&[Daemon], 1, 2, now));
-    let stale = Wrap::new(env.store.clone(), Mode::Fenced);
-    assert_eq!(
-        renew_with(&stale, &env, "n1", 1, &[Daemon], now, "a", &mut sign),
-        Err(R::NotSigner)
-    );
     let reads = Wrap::new(env.store.clone(), Mode::FailGet);
     assert_eq!(
         renew_with(&reads, &env, "n1", 1, &[Daemon], now, "a", &mut sign),

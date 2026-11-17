@@ -486,10 +486,9 @@ enum Attempt {
     Stale,
     /// The write is for a daemon's node that another frontend owns now: it is dropped, as
     /// a stale write is, and trying again cannot help. The node's other writes, held or to
-    /// come, meet the same refusal; the store as a whole is not superseded.
+    /// come, meet the same refusal.
     Disowned,
-    /// The write cannot be encoded, or a newer writer holds the store: trying again
-    /// cannot help.
+    /// The write cannot be encoded: trying again cannot help.
     Dropped,
 }
 
@@ -575,10 +574,6 @@ pub(super) struct Durable {
     /// A write failed because the store could not be reached, and none has been taken
     /// since ([`Engine::watch_store`] tells the scheduler).
     pub(super) unreachable: AtomicBool,
-    /// A write failed because another writer holds a newer generation of the store: this
-    /// scheduler was superseded and takes no more work. Never cleared; unlike an outage,
-    /// the store coming back does not end it.
-    pub(super) fenced: AtomicBool,
     /// The operation ids this handle reserved last ([`Durable::reserve_operation`]):
     /// numbered inside it, and no other frontend takes one of them.
     ops: Mutex<Range<u64>>,
@@ -709,7 +704,6 @@ impl Durable {
             codec,
             ext,
             unreachable: AtomicBool::new(false),
-            fenced: AtomicBool::new(false),
             ops: Mutex::new(0..0),
             frontend: first,
             owners: Mutex::new(BTreeMap::new()),
@@ -899,12 +893,7 @@ impl Durable {
             }
             match self.commit(txn) {
                 Ok(()) => changed += chunk.len(),
-                Err(error) => {
-                    tracing::warn!(%error, "a batch of size summaries was not swept");
-                    if self.superseded_by(&error) {
-                        break;
-                    }
-                }
+                Err(error) => tracing::warn!(%error, "a batch of size summaries was not swept"),
             }
         }
         // A sweep that committed nothing does not ask for another tick: a store that
@@ -1155,28 +1144,12 @@ impl Durable {
 
     /// Records what a refused write says about the store. Only a store that cannot be
     /// reached is an outage; a write that lost a compare-and-set, or found its row gone,
-    /// is the store working; a write the store fenced means another writer holds a newer
-    /// generation, which no return of the store undoes. Not generic, unlike
-    /// [`Engine::durably`], so every caller's runs count toward the same function.
+    /// is the store working. Not generic, unlike [`Engine::durably`], so every caller's runs
+    /// count toward the same function.
     fn note_failure(&self, error: &StateError) {
-        if let StateError::Store(cause) = error {
-            let flag = if matches!(cause, StoreError::Fenced) {
-                &self.fenced
-            } else {
-                &self.unreachable
-            };
-            flag.store(true, Ordering::SeqCst);
+        if let StateError::Store(_) = error {
+            self.unreachable.store(true, Ordering::SeqCst);
         }
-    }
-
-    /// Whether `error` says a newer writer holds the store; if so, this handle is fenced
-    /// from now on, as after any other write the store refused for it.
-    pub(super) fn superseded_by(&self, error: &StateError) -> bool {
-        let fenced = matches!(error, StateError::Store(StoreError::Fenced));
-        if fenced {
-            self.fenced.store(true, Ordering::SeqCst);
-        }
-        fenced
     }
 
     /// Test builds only: the next attempt that names `what` ([`Engine::attempt`]) is
@@ -1193,12 +1166,6 @@ impl Durable {
         let mut refusals = self.refusals.lock().unwrap_or_else(PoisonError::into_inner);
         let at = refusals.iter().position(|(named, _)| *named == what)?;
         Some(refusals.remove(at).1)
-    }
-
-    /// Whether a write was refused because a newer writer holds the store: nothing this
-    /// handle writes can succeed any more.
-    pub(super) fn superseded(&self) -> bool {
-        self.fenced.load(Ordering::SeqCst)
     }
 
     /// A write that tells whether the store takes writes again.
@@ -1318,23 +1285,13 @@ impl Engine {
                 }
                 durable.note_failure(&error);
                 match error {
-                    StateError::Store(cause) if !matches!(cause, StoreError::Fenced) => {
-                        Attempt::Transient
-                    }
+                    StateError::Store(_) => Attempt::Transient,
                     StateError::Missing(_) | StateError::Conflict(_) => Attempt::Stale,
                     StateError::StaleOwner(_) => Attempt::Disowned,
                     _ => Attempt::Dropped,
                 }
             }
         }
-    }
-
-    /// A newer writer holds the state store ([`Durable::fenced`]): nothing more is
-    /// written to it.
-    fn superseded(&self) -> bool {
-        self.durable
-            .as_ref()
-            .is_some_and(|d| d.fenced.load(Ordering::SeqCst))
     }
 
     /// Writes the held-back effects of committed records to the state store, oldest
@@ -1346,24 +1303,10 @@ impl Engine {
     /// remaining effects, as a refused record always did; so does one for a node another
     /// frontend owns now ([`StateError::StaleOwner`]), and so does each later effect for
     /// that node, one by one, as it meets the same refusal; the effects of other nodes are
-    /// written as before. Once a newer writer fences the store, everything held is dropped
-    /// and nothing is written.
+    /// written as before.
     pub(super) fn release_unwritten(&mut self, a: &mut dyn Adapter) -> Vec<Effect> {
         let mut ready = Vec::new();
         loop {
-            if self.superseded() {
-                let held: usize = self.unwritten.iter().map(VecDeque::len).sum();
-                if held > 0 {
-                    self.write_drops += held as u64;
-                    tracing::error!(held, "a newer writer holds the store: held effects dropped");
-                }
-                // Only the held answers' details go: an answer already written and in
-                // `ready` is settled with its own after this returns.
-                for batch in std::mem::take(&mut self.unwritten) {
-                    self.forget_details(a, batch);
-                }
-                return ready;
-            }
             let Some(front) = self.unwritten.front() else {
                 return ready;
             };
@@ -1478,16 +1421,6 @@ impl Engine {
         let Some(durable) = &self.durable else {
             return;
         };
-        if durable.fenced.load(Ordering::SeqCst) {
-            // Superseded: the store is reachable but this scheduler may not write it, so
-            // it stays unavailable (no grant, no lease given up) and never pings back.
-            if !self.store_down {
-                tracing::error!("the state store has a newer writer: this scheduler takes no work");
-                self.store_down = true;
-                self.sched.store_unavailable();
-            }
-            return;
-        }
         if durable.unreachable.load(Ordering::SeqCst) && !self.store_down {
             tracing::warn!("the state store is unavailable: no lease is given up or granted");
             self.store_down = true;
@@ -1762,15 +1695,6 @@ impl Engine {
             Ok(())
         });
         if !taken {
-            if self
-                .durable
-                .as_ref()
-                .is_some_and(|d| d.fenced.load(Ordering::SeqCst))
-            {
-                return Err(Status::failed_precondition(
-                    "this scheduler was superseded by a newer writer of the state store",
-                ));
-            }
             return Err(Status::unavailable(
                 "the scheduler's state store did not take the request",
             ));

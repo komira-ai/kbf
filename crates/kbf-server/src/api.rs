@@ -86,7 +86,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use kbf_map::{DenyEntry, Map, MemberId, MemberState};
-use kbf_state::{Store, StoreError};
+use kbf_state::Store;
 use kbf_types::WorkerId;
 use serde::{Deserialize, Serialize};
 
@@ -308,11 +308,10 @@ fn epoch_answer(
 }
 
 /// The status a failed epoch bump answers with: a store that is down, or that other
-/// writers kept changing the epoch of, is to be tried again; a frontend that a newer writer
-/// superseded (409) or a row that cannot be read is not.
+/// writers kept changing the epoch of, is to be tried again; a row that cannot be read is
+/// not.
 const fn epoch_failure(e: &StateError) -> StatusCode {
     match e {
-        StateError::Store(StoreError::Fenced) => StatusCode::CONFLICT,
         StateError::Store(_) | StateError::Conflict(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -1131,9 +1130,8 @@ mod tests {
 
     /// Asserts that an epoch bump answers the epochs before and after it and the epoch
     /// this frontend serves, that a server with no state store says so (404), and that a
-    /// store that is down or kept changing under the bump is to be tried again (503),
-    /// that a frontend a newer writer superseded is refused (409), and that a row that
-    /// cannot be read and a panicked task are ours (500).
+    /// store that is down or kept changing under the bump is to be tried again (503), and
+    /// that a row that cannot be read and a panicked task are ours (500).
     #[tokio::test]
     async fn an_epoch_bump_answers_each_outcome_with_its_status() {
         let bumped = EpochBump {
@@ -1156,7 +1154,6 @@ mod tests {
         let failures = [
             (StateError::Store(down), StatusCode::SERVICE_UNAVAILABLE),
             (StateError::Conflict(lost), StatusCode::SERVICE_UNAVAILABLE),
-            (StateError::Store(StoreError::Fenced), StatusCode::CONFLICT),
             (
                 StateError::Missing("meta/epoch".to_owned()),
                 StatusCode::INTERNAL_SERVER_ERROR,
