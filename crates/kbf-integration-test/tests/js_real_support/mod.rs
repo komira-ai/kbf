@@ -22,7 +22,7 @@
 //! server kills and reaps the process; its directory goes after.
 //!
 //! [`RealJobServer::start_placing`] runs it for jobs that run: the same flags (the server's one
-//! placement, js-sched, places the jobs) and the pool [`AGENT_POOL`], whose hosts
+//! placement places the jobs) and the pool [`AGENT_POOL`], whose hosts
 //! heartbeat four times a second, and no host of its own: the hosts are the agents a test
 //! starts ([`agent`]), and a job is placed on the next heartbeat of one of them.
 
@@ -69,8 +69,8 @@ arch = "x86_64"
 /// The pool of [`RealJobServer::start_placing`]: the hosts are agents, which heartbeat every
 /// 250 ms (so a queued job is placed soon after it is submitted) and are lost after 5 s of
 /// silence; each is booked as two cores, 4 GiB of memory and 1 GiB of disk, which a hosted
-/// runner offers (a job of the executor asks for half again its farm booking and 512 MiB of
-/// memory, at most 3.5 GiB here, and for no disk). Its capabilities are what the scheduler holds
+/// runner offers (a job of the executor names no CPU and no memory, and no disk: the service
+/// sizes it from the history of its size class). Its capabilities are what the scheduler holds
 /// a host to when it admits a job: a job of the executor runs in a container (`exec`) with an
 /// allow-listed network (`egress`), a job that asks for disk (none here does) needs `disk-gib`
 /// (a whole GiB at least), and a host joins only if it reports them.

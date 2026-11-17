@@ -1,5 +1,7 @@
 # The worker protocol: `kbf.worker.v1`
 
+> **Superseded by [direct-js.md](direct-js.md):** kbf no longer schedules and holds no leases or virtual workers; the executor reads each action's job back from the job service by polling `GetJob`. This page records the earlier design.
+
 > **kbf-daemon is deleted.** No shipped program opens this `Session` stream any more: placed actions run only as js-agent jobs. The protocol is kept as shipped vocabulary: `kbf-server` serves neither the `Session` stream nor the daemon's blob, `PackIndex` and map-push services, and every message stays defined in the `.proto`. Where this page says the daemon does something, it describes the deleted `kbf-daemon`; its design page (`daemon.md`) is deleted too.
 
 `kbf.worker.v1` is the protocol between `kbf-daemon` and `kbf-server`. Its definition

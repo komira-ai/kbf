@@ -135,19 +135,8 @@ impl Rig {
             worker: loopback(base + 1),
             reapi_tls: None,
             worker_tls: None,
-            tick: Duration::from_millis(50),
-            unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-            default_platform: kbf_front::DefaultPlatform::NONE,
-            qos_allowed: kbf_front::QosAllow::DEFAULT,
-            memory_ladder: kbf_server::MemoryLadder::default(),
-            memory_climb: true,
-            learned_sizes: kbf_server::LearnedSizes::Off,
-            exclusive_actions: false,
-            placement_load: kbf_server::PlacementLoad::Off,
-            placement_predictions: kbf_server::PlacementPredictions::Off,
-            usage_profiles: kbf_server::UsageProfiles::Off,
-            whole_node: None,
-            finished_retention: kbf_sched::FINISHED_RETENTION,
+            executor: None,
+            finished_retention: kbf_server::executor::FINISHED_RETENTION,
             shutdown_timeout: Duration::from_secs(10),
             streams: kbf_server::StreamTiming::default(),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
@@ -429,14 +418,10 @@ async fn a_write_to_the_ui_is_a_405() {
 async fn no_other_route_opens_without_credentials() {
     let rig = Rig::start("closed").await;
     let routes = [
-        "/v1/nodes",
-        "/v1/nodes/n1:drain",
         "/v1/status",
         "/v1/blobs/abc-1",
         "/v1/invocations/i1",
         "/v1/invocations/i1/actions",
-        "/v1/leases",
-        "/v1/queue",
         "/v1/storage",
         "/v1/health",
         "/v1/update",
@@ -457,7 +442,7 @@ async fn no_other_route_opens_without_credentials() {
     }
     // A wrong token is a failure the proxy rate-limits per address (a burst of ten), so a
     // few only.
-    for path in ["/v1/nodes", "/v1/blobs/abc-1", "/metrics"] {
+    for path in ["/v1/status", "/v1/blobs/abc-1", "/metrics"] {
         let wrong = rig
             .send(
                 Ipv4Addr::LOCALHOST,
@@ -468,7 +453,7 @@ async fn no_other_route_opens_without_credentials() {
             .await;
         assert_eq!(wrong.status, 401, "{path} wrong token");
     }
-    let served = rig.operator("GET", "/v1/nodes").await;
+    let served = rig.operator("GET", "/v1/frontend/drain").await;
     assert_eq!(served.status, 200, "{}", served.head);
     assert_eq!(rig.operator("GET", "/v1/ui").await.status, 404);
 

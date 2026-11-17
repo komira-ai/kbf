@@ -11,7 +11,7 @@
 //!   manifests ([`PutDirRoots::layer`]), or, with `--executor-input-tree provider`, tierstore's
 //!   mount provider ([`PROVIDER`]) given the key of the tree's tree list
 //!   ([`provider_layer`]): the host's agent asks it for the tree when the job is placed.
-//! - **One mount**, the put directory `<mp>/put/cas/b/<lease>/<nonce>` at [`OUT_TARGET`],
+//! - **One mount**, the put directory `<mp>/put/cas/b/<build>/<nonce>` at [`OUT_TARGET`],
 //!   read-write and `no_exec` ([`PutDirRoots::mount`]).
 //!
 //! `<mp>/put` is `--task-out-root`, and `<mp>/trees` the directory beside it: the tier store
@@ -119,7 +119,7 @@ impl PutDirRoots {
         }
     }
 
-    /// The job's one mount: the put directory `dir` (`cas/b/<lease>/<nonce>`) under the put
+    /// The job's one mount: the put directory `dir` (`cas/b/<build>/<nonce>`) under the put
     /// root, at [`OUT_TARGET`], read-write, no file in it executable.
     #[must_use]
     pub fn mount(&self, dir: &str) -> Mount {

@@ -1,31 +1,19 @@
-//! The restart banner's start time on the Overview, Nodes, Node, Leases and Queue pages:
+//! The restart banner's start time on the Overview page:
 //! what it says for each answer `GET /v1/health` can give, and that a page never fails
 //! (or is read as healthy) because of it. Each test names the defect it catches.
 
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::{Started, note, rfc3339};
 use crate::html::Html;
-use crate::pages::sched_farm;
-use crate::tests::{Fake, HOSTILE, STARTED_MS, STARTED_SAYS, body, fleet_farm, health_doc, render};
+use crate::tests::{Fake, STARTED_MS, STARTED_SAYS, body, fleet_farm, health_doc, render};
 
 /// Every page that carries the banner.
-const PAGES: [&str; 6] = [
-    "/ui",
-    "/ui/nodes",
-    "/ui/nodes/mac-1",
-    "/ui/leases",
-    "/ui/leases?node=node-a",
-    "/ui/queue",
-];
+const PAGES: [&str; 1] = ["/ui"];
 
 /// The read API that answers `path`, new.
-fn farm_for(path: &str) -> Fake {
-    if path.starts_with("/ui/leases") || path == "/ui/queue" {
-        sched_farm()
-    } else {
-        fleet_farm()
-    }
+fn farm_for(_path: &str) -> Fake {
+    fleet_farm()
 }
 
 /// The words of the banner's start note on a page, as the page wrote them.
@@ -52,63 +40,6 @@ fn every_page_of_the_banner_says_when_the_server_started() {
             "{path}: {html}"
         );
         assert!(!html.contains("is not known"), "{path}");
-    }
-}
-
-/// Catches: a banner that fails its page or invents a time when the server does not give
-/// one: `/v1/health` down, answering an error status, answering a document with the start
-/// time of another type, an empty one (an older server), and one that is not an object
-/// (a string).
-/// The page is `200`, says that the time is not known, and says why; what it says of why
-/// is escaped. The Overview is excluded where its own health read is the page (it is `502`
-/// then, as before). Catches: the read's failure made the page's; an `unwrap` of the key;
-/// the reason not written; written raw.
-#[test]
-fn a_page_without_a_start_time_says_so_and_still_renders() {
-    /// What the case is called, how `/v1/health` answers (`None`: it is down) and what the
-    /// page says of why.
-    type Variant = (&'static str, Option<(u16, Value)>, &'static str);
-    let variants: [Variant; 5] = [
-        ("down", None, "/v1/health: connection refused"),
-        (
-            "an error status",
-            Some((503, json!({"error": "overloaded"}))),
-            "/v1/health answered 503: overloaded",
-        ),
-        (
-            "a start time of another type",
-            Some((200, json!({"started_unix_ms": HOSTILE}))),
-            "/v1/health answered a document this page cannot read",
-        ),
-        (
-            "an empty document",
-            Some((200, json!({}))),
-            "/v1/health does not say",
-        ),
-        (
-            "a string",
-            Some((200, json!("up"))),
-            "/v1/health answered a document this page cannot read",
-        ),
-    ];
-    for path in PAGES.into_iter().filter(|p| *p != "/ui") {
-        for (what, health, says) in &variants {
-            let farm = farm_for(path);
-            let fake = match health {
-                None => farm.down("/v1/health"),
-                Some((status, doc)) => farm.with("/v1/health", *status, doc.to_string()),
-            };
-            let a = render(&fake, path);
-            let html = body(&a);
-            assert_eq!(a.status(), 200, "{path} {what}: {html}");
-            assert!(
-                html.contains("When this server started is not known: "),
-                "{path} {what}: {html}"
-            );
-            assert!(html.contains(says), "{path} {what}: {html}");
-            assert!(!html.contains("This server started"), "{path} {what}");
-            assert!(!html.contains("<script"), "{path} {what}: raw markup");
-        }
     }
 }
 
@@ -165,33 +96,11 @@ fn extreme_start_times_render_without_panic() {
     let mut epoch = health_doc();
     epoch["started_unix_ms"] = json!(0);
     epoch["uptime_ms"] = json!(0);
-    let html = body(&render(
-        &sched_farm().json("/v1/health", &epoch),
-        "/ui/queue",
-    ));
+    let html = body(&render(&fleet_farm().json("/v1/health", &epoch), "/ui"));
     assert!(
         html.contains("This server started at 1970-01-01T00:00:00Z, 0 ms ago by its own clock."),
         "{html}"
     );
-}
-
-/// Catches: a read of `/v1/health` for a page that shows none of what the banner is
-/// about: a Leases, Queue, Nodes or Node page whose own read failed. Only the failed route
-/// is asked, and the answer stays the API's. Catches: the health read moved before the
-/// page's own; made unconditional.
-#[test]
-fn a_failed_page_does_not_read_the_start_time() {
-    for (path, route) in [
-        ("/ui/leases", "/v1/leases"),
-        ("/ui/queue", "/v1/queue"),
-        ("/ui/nodes", "/v1/nodes"),
-        ("/ui/nodes/mac-1", "/v1/nodes/mac-1"),
-    ] {
-        let fake = farm_for(path).with(route, 503, r#"{"error": "busy"}"#);
-        let a = render(&fake, path);
-        assert_eq!(a.status(), 503, "{path}");
-        assert_eq!(fake.seen(), [route], "{path}");
-    }
 }
 
 /// Catches: the banner's wording or formatting wrong, written straight (not through a

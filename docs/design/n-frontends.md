@@ -1,5 +1,7 @@
 # N frontends: a leaderless executor
 
+> **Superseded by [direct-js.md](direct-js.md):** kbf no longer schedules. There are no virtual workers, no lease epoch and no `--executor-ownership` modes (the flag is retired and ignored); over a state store, `exec/op/` and `exec/live/` rows let any frontend answer an operation by name and take up the operations of a process that is gone. This page records the earlier design.
+
 > **Status: kbf-daemon is deleted.** Where this page describes the daemon, the `daemon`, `storage-and-daemon` or `all-in-one` modes or a Mac daemon, it records the design as it was written. Placed actions now run only as js-agent jobs of the job service, storage nodes run `kbf --mode=storage`, and Macs run js-agent only ([kbf-modes.md](../deploy/kbf-modes.md#the-removed-modes)).
 
 Status: **DESIGN, partly built.** Built: the row API and its model search (PR 3) and shared ownership part 1 (PR 4:

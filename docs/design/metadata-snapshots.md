@@ -441,7 +441,7 @@ the 88 MB measured at A, so read the per-entry row as about 3% low.
 
 There is no production index to measure yet. The sizing therefore starts from the
 pilot rate in the code: about 4 operations a second (the comment on
-`FINISHED_RETENTION`, `crates/kbf-sched/src/scheduler.rs`). It takes that rate as a
+`FINISHED_RETENTION` in the farm scheduler, which is deleted: [direct-js.md](direct-js.md)). It takes that rate as a
 **ceiling**: held around the clock, every operation an executed, cacheable action
 that writes one action entry (closure of 5) and 3 new blobs. The 3 is an estimate:
 the Action and Command blobs, about 1.9 outputs, with stdout and stderr mostly

@@ -44,12 +44,12 @@ async fn session(worker: SocketAddr, claims: &[(&str, String)]) -> Result<(), to
     }
 }
 
-/// One POST of a cordon of an unknown node with `headers`; the status code (404 is "past
+/// One POST to the state of an unknown member with `headers`; the status code (404 is "past
 /// every gate").
-async fn cordon(api: SocketAddr, headers: &[(&str, &str)]) -> u16 {
+async fn write(api: SocketAddr, headers: &[(&str, &str)]) -> u16 {
     let mut stream = TcpStream::connect(api).await.expect("connect to the API");
     let mut request = String::from(
-        "POST /v1/nodes/ghost:cordon HTTP/1.1\r\nHost: kbf\r\nContent-Length: 0\r\n\
+        "POST /v1/members/ghost HTTP/1.1\r\nHost: kbf\r\nContent-Length: 0\r\n\
          Content-Type: application/json\r\n",
     );
     for (name, value) in headers {
@@ -114,16 +114,16 @@ async fn a_frontend_behind_the_proxy_takes_its_identity_and_gates_writes() {
     );
 
     let bearer = format!("Bearer {TOKEN}");
-    assert_eq!(cordon(front.api, &[("Authorization", &bearer)]).await, 403);
+    assert_eq!(write(front.api, &[("Authorization", &bearer)]).await, 403);
     assert_eq!(
-        cordon(front.api, &[("x-kbf-proxy-auth", &presented)]).await,
+        write(front.api, &[("x-kbf-proxy-auth", &presented)]).await,
         401
     );
     let through = [
         ("x-kbf-proxy-auth", presented.as_str()),
         ("Authorization", &bearer),
     ];
-    assert_eq!(cordon(front.api, &through).await, 404);
+    assert_eq!(write(front.api, &through).await, 404);
 }
 
 /// The status of a REAPI ByteStream read for an absent blob carrying `claims` as headers.

@@ -50,14 +50,14 @@ carries it, build the image yourself from the `kbf` binary with
 
 What runs where:
 
-- **Frontends** run `kbf --mode=frontend`: REAPI, the scheduler, the worker listener and
+- **Frontends** run `kbf --mode=frontend`: REAPI, the executor (one job of the job service for each Execute that misses the cache), the worker listener and
   the operator API. A frontend holds no blobs and refuses every store flag. It keeps its
   scheduler state in the Postgres state store, and it passes cache calls on to the
   storage nodes (`--storage` is required; with the storage client flags it dials them
   over mutual TLS).
-- **Build hosts** run no kbf process. A placed action is a job of the jobscheduler's job
+- **Build hosts** run no kbf process. Every action that misses the cache is a job of the jobscheduler's job
   service, submitted by the frontend started with `--executor js-agent`
-  ([kbf-modes.md](kbf-modes.md)); that executor runs on exactly one frontend.
+  ([kbf-modes.md](kbf-modes.md)); every frontend of the farm can run the executor.
 - **Storage nodes** (`storage`) hold the blobs on local disk and
   flush to the cold store, which is one object store the whole farm shares. The cold
   store is configured on the storage nodes with `--cold-store`
@@ -71,7 +71,7 @@ What runs where:
   is refused. With several frontends the load balancer stops sending new connections to
   the one being replaced, and the others keep serving.
 - **Availability.** A frontend that crashes or is replaced takes only the connections
-  it held. The queue and the leases are in Postgres, so the others carry on, and a
+  it held. Each unfinished operation's row (`exec/op/`) is in Postgres, so another frontend takes its job up and answers a client that reattaches, and a
   storage node that was talking to the lost frontend reconnects to the load balancer and lands
   on another.
 
@@ -100,9 +100,10 @@ Several frontends over one store are supported on `main` today:
   used replaces the generation row with the marker. That is a cold cutover; the order
   to do it in is in [state-store-cutover.md](state-store-cutover.md#moving-to-frontends-that-share-the-store).
   A new database needs nothing.
-- Frontends keep the farm's epoch across a start, and reserve blocks of operation ids
-  and lease sequences in the store, so a second frontend never hands out an id another
-  took ([kbf-units.md](kbf-units.md), "The epoch, and a restore from a backup").
+- Frontends reserve blocks of operation ids in the store (`meta/next_op`), so a second
+  frontend never hands out an id another took, and each keeps a liveness row (`exec/live/`):
+  once it has expired, another frontend takes up the operations of the one that is gone
+  ([direct-js.md](../design/direct-js.md) section 3).
 
 The Postgres URL carries no password (kbf refuses one). The client speaks TLS to Postgres
 when the URL asks for it (`sslmode=require`, or `verify-ca`/`verify-full` with
@@ -154,11 +155,10 @@ frontend is ready and `503` when it is not, with a body that lists each failing 
 ([api.md](../api.md#get-healthz-and-get-readyz)). The checks are `stopping`, `leader`
 and `store`.
 
-The REAPI cluster asks `GET /readyz/reapi` instead: `/readyz` and, in addition, at least one
-connected worker (check `no_worker`). A frontend that restarted while every worker stayed on
-the other one would otherwise take Execute calls it cannot place, and they would wait for as
-long as it is up. The worker and enrollment clusters keep `/readyz`, since a frontend gets its
-first worker through them.
+The REAPI cluster asks `GET /readyz/reapi` instead: `/readyz` and, in addition, that the frontend has an executor
+(check `no_executor`). A frontend built with no executor answers every Execute that misses the
+action cache `FAILED_PRECONDITION`, so the check keeps those calls off it. The enrollment cluster keeps
+`/readyz`.
 
 **Readiness drops during a drain.** From the moment a frontend receives SIGTERM or
 SIGINT, or `POST /v1/frontend/drain` is called, `/readyz` answers `503` (`stopping`) and
@@ -235,7 +235,7 @@ While the old and the new frontend run side by side they read one store, so a re
 changes the store's schema in two steps (expand first, contract a release later); the
 upgrade order (store, storage one at a time, frontends) is in
 [architecture-v2.md](../design/architecture-v2.md). A node that dropped its session
-to A reconnects through the load balancer, and a start does not change the epoch.
+to A reconnects through the load balancer.
 
 **Target, not built yet:** a rollout tool that runs these steps (drain, wait for exit,
 replace, wait for ready, next) for the container deployment. Today the steps are the

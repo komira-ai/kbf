@@ -107,19 +107,8 @@ fn start_denying(with_proxy: bool, deny_list: Option<DenyList>) -> Server_ {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        tick: Duration::from_millis(50),
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
@@ -350,7 +339,7 @@ async fn an_operator_write_through_the_proxy_needs_the_token() {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            http_status(api, "POST", "/v1/nodes/ghost:cordon", &all).await
+            http_status(api, "POST", "/v1/members/ghost", &all).await
         }
     };
     assert_eq!(
@@ -384,7 +373,10 @@ async fn an_operator_write_through_the_proxy_needs_the_token() {
         403,
         "a malformed identity"
     );
-    assert_eq!(http_status(server.api, "GET", "/v1/nodes", &[]).await, 200);
+    assert_eq!(
+        http_status(server.api, "GET", "/v1/frontend/drain", &[]).await,
+        200
+    );
     assert_eq!(http_status(server.api, "GET", "/healthz", &[]).await, 200);
 }
 
@@ -395,7 +387,7 @@ async fn without_the_flag_nothing_changes() {
     let server = start(false);
     let bearer = format!("Bearer {TOKEN}");
     let json = ("Content-Type", "application/json");
-    let path = "/v1/nodes/ghost:cordon";
+    let path = "/v1/members/ghost";
     let secret = presented_secret();
     assert_eq!(
         http_status(
@@ -818,7 +810,7 @@ async fn the_binary_serves_behind_the_proxy_when_given_the_flag() {
 
     let bearer = format!("Bearer {TOKEN}");
     let json = ("Content-Type", "application/json");
-    let path = "/v1/nodes/ghost:cordon";
+    let path = "/v1/members/ghost";
     let local = http_status(api, "POST", path, &[json, ("Authorization", &bearer)]).await;
     assert_eq!(local, 403, "a local caller without the secret");
     let secret = presented_secret();

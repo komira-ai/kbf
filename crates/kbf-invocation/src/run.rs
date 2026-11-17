@@ -3,7 +3,7 @@
 //! attempt what its lease's report measured. In memory only: `kbf.invocation.v1`
 //! does not carry them yet.
 
-use kbf_sched::RequeueReason;
+use crate::RequeueReason;
 use kbf_types::Failure;
 
 use crate::event::WallTime;

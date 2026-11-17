@@ -15,13 +15,9 @@ mod builds;
 mod failures;
 #[cfg(test)]
 pub(crate) mod history_fixtures;
-mod leases;
 mod log;
-mod nodes;
 mod overview;
-mod queue;
 mod refresh;
-mod sched;
 mod started;
 mod storage;
 mod strip;
@@ -32,8 +28,6 @@ mod targets;
 pub(crate) use builds::BUILDS;
 pub(crate) use builds::builds;
 #[cfg(test)]
-pub(crate) use nodes::{NODE, NODES};
-pub(crate) use nodes::{node, nodes};
 #[cfg(test)]
 pub(crate) use overview::OVERVIEW;
 pub(crate) use overview::overview;
@@ -45,16 +39,8 @@ pub(crate) use action::{ACTION, LOG_SHOWN_MAX_BYTES};
 pub(crate) use build::BUILD;
 pub(crate) use build::build;
 #[cfg(test)]
-pub(crate) use leases::LEASES;
-pub(crate) use leases::leases;
-#[cfg(test)]
 pub(crate) use log::LOG;
 pub(crate) use log::{STREAMS, log_page, run_log};
-#[cfg(test)]
-pub(crate) use queue::QUEUE;
-pub(crate) use queue::queue;
-#[cfg(test)]
-pub(crate) use sched::fixtures::sched_farm;
 #[cfg(test)]
 pub(crate) use storage::STORAGE;
 pub(crate) use storage::storage;
@@ -70,9 +56,8 @@ pub(crate) const BUILDS_PATH: &str = "/ui/builds";
 
 /// Every page, for the contract test.
 #[cfg(test)]
-pub(crate) const PAGES: [&Page; 12] = [
-    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &LOG, &NODES, &NODE, &LEASES, &QUEUE, &TARGETS, &TARGET,
-    &STORAGE,
+pub(crate) const PAGES: [&Page; 8] = [
+    &OVERVIEW, &BUILDS, &BUILD, &ACTION, &LOG, &TARGETS, &TARGET, &STORAGE,
 ];
 
 /// What a path segment keeps unencoded: RFC 3986's unreserved characters.

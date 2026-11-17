@@ -1,113 +1,149 @@
-//! The task that steps an [`Executor`] while the frontend serves, and stops it when the
-//! frontend does.
+//! The task that keeps an [`Executor`]'s place in the state store while the frontend serves:
+//! it renews the process's liveness row every quarter of [`Config::live`], and every half of it
+//! takes up the unfinished operations of processes whose liveness row has expired
+//! ([`Rows::orphans`]). On [`Running::stop`] the liveness row is deleted, so the frontends that
+//! go on take up at once what this process leaves. An executor with no state store has nothing
+//! to keep, and its task only waits for the stop.
 //!
-//! The executor is stepped every [`Executor::poll`], a pass run to its end. Before the first
-//! pass, and every [`Executor::rival_check`] after, it asks the job service whether another
-//! frontend has live jobs: with single ownership the executor runs on exactly one frontend, and
-//! a second one stops, its jobs cancelled, and says so ([`Running::failed`]); with shared
-//! ownership there is no rival, and nothing is asked. On [`Running::stop`] the farm is told each
-//! worker takes no more work and every job is cancelled, or, with shared ownership, each worker
-//! is handed back with its jobs running ([`Executor::shutdown`]).
+//! [`Config::live`]: crate::executor::Config::live
+//! [`Rows::orphans`]: crate::executor::rows::Rows::orphans
 
-use tokio::sync::{oneshot, watch};
+use std::sync::Arc;
+
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 
-use crate::executor::Executor;
+use crate::executor::run::{self, Op, Start};
+use crate::executor::{Executor, Inner};
 
-/// An executor stepping in a task of its own.
+/// An executor's task beside the frontend. Dropped without [`Running::stop`], it ends its task:
+/// a server whose serving future is dropped leaves its liveness row to expire.
 pub struct Running {
     stop: watch::Sender<bool>,
-    failed: oneshot::Receiver<String>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl Running {
-    /// Steps `executor` until [`stop`](Self::stop), or until another frontend is found to have
-    /// jobs.
+    /// Keeps `executor`'s place in the state store until [`stop`](Self::stop).
     #[must_use]
-    pub fn spawn(executor: Executor) -> Self {
+    pub fn spawn(executor: &Executor) -> Self {
         let (stop, stopped) = watch::channel(false);
-        let (fail, failed) = oneshot::channel();
-        let task = tokio::spawn(drive(executor, stopped, fail));
-        Self { stop, failed, task }
-    }
-
-    /// Why the executor stopped by itself: completes if it did, never while it runs on.
-    pub async fn failed(&mut self) -> String {
-        match (&mut self.failed).await {
-            Ok(why) => why,
-            // The task ended with no reason given: it broke.
-            Err(_) => "the executor's task ended without a reason".to_owned(),
+        let task = tokio::spawn(drive(Arc::clone(executor.inner()), stopped));
+        Self {
+            stop,
+            task: Some(task),
         }
     }
 
-    /// Stops the executor and waits until its jobs are cancelled.
-    pub async fn stop(self) {
+    /// Stops the task and deletes the liveness row. Nothing is cancelled: an operation still
+    /// open is taken up by another frontend of the store.
+    pub async fn stop(mut self) {
         let _ = self.stop.send(true);
-        if let Err(e) = self.task.await {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        if let Err(e) = task.await {
             tracing::error!(error = %e, "the executor's task ended abnormally");
         }
     }
 }
 
-async fn drive(
-    mut executor: Executor,
-    mut stopped: watch::Receiver<bool>,
-    failed: oneshot::Sender<String>,
-) {
-    let mut next_check = Instant::now();
-    loop {
-        if Instant::now() >= next_check {
-            next_check = Instant::now() + executor.rival_check();
-            if let Some(why) = executor.rival().await {
-                tracing::error!(%why, "another frontend has jobs: the executor runs on exactly one frontend");
-                let _ = failed.send(why);
-                break;
-            }
-        }
-        executor.step().await;
-        if let Some(why) = executor.twin() {
-            tracing::error!(%why, "another process runs under this frontend's id");
-            let _ = failed.send(why.to_owned());
-            break;
-        }
-        tokio::select! {
-            _ = stopped.changed() => break,
-            () = sleep(executor.poll()) => {}
-        }
+async fn drive(inner: Arc<Inner>, mut stopped: watch::Receiver<bool>) {
+    if inner.rows.is_none() {
+        let _ = stopped.wait_for(|stop| *stop).await;
+        return;
     }
-    executor.shutdown().await;
+    let beat = inner.cfg.live / 4;
+    let sweep = inner.cfg.live / 2;
+    let mut swept = Instant::now();
+    keep(&inner, true).await;
+    loop {
+        tokio::select! {
+            _ = stopped.wait_for(|stop| *stop) => break,
+            () = sleep(beat) => {}
+        }
+        let due = swept.elapsed() >= sweep;
+        if due {
+            swept = Instant::now();
+        }
+        keep(&inner, due).await;
+    }
+    let inner_for_leave = Arc::clone(&inner);
+    let left =
+        tokio::task::spawn_blocking(move || inner_for_leave.rows.as_ref().map(|rows| rows.leave()))
+            .await;
+    if let Ok(Some(Err(error))) = left {
+        tracing::warn!(%error, "the liveness row could not be deleted: it expires on its own");
+    }
+}
+
+/// Renews the liveness row and, when `sweep`, takes up the operations of gone processes.
+async fn keep(inner: &Arc<Inner>, sweep: bool) {
+    let live = inner.cfg.live;
+    let held = Arc::clone(inner);
+    let swept = tokio::task::spawn_blocking(move || {
+        let rows = held.rows.as_ref()?;
+        if let Err(error) = rows.beat(live) {
+            tracing::warn!(%error, "the liveness row could not be renewed");
+        }
+        if !sweep {
+            return Some(Vec::new());
+        }
+        let orphans = match rows.orphans() {
+            Ok(orphans) => orphans,
+            Err(error) => {
+                tracing::warn!(%error, "the operations of gone frontends could not be read");
+                return Some(Vec::new());
+            }
+        };
+        let claimed = orphans.into_iter().filter_map(|orphan| match rows.claim(&orphan) {
+            Ok(row) => Some((orphan.operation, row)),
+            Err(error) => {
+                tracing::info!(operation = %orphan.operation, %error, "another frontend took the operation up");
+                None
+            }
+        });
+        Some(claimed.collect())
+    })
+    .await;
+    let Ok(Some(claimed)) = swept else {
+        return;
+    };
+    for (operation, row) in claimed {
+        let key = match row.action_key() {
+            Ok(key) => key,
+            Err(why) => {
+                tracing::warn!(%operation, %why, "an operation row names no action: it is left");
+                continue;
+            }
+        };
+        let cancel = {
+            let mut ops = inner.ops();
+            if ops.is_open(operation) {
+                continue;
+            }
+            ops.open(operation, key.clone()).1
+        };
+        inner.deps.metrics.reattached();
+        let op = Op::new(operation, key, row.whole_machine, false);
+        tokio::spawn(run::run(
+            Arc::clone(inner),
+            op,
+            Start::Attached(row),
+            cancel,
+        ));
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn running(task: JoinHandle<()>) -> (Running, oneshot::Sender<String>) {
-        let (stop, _stopped) = watch::channel(false);
-        let (fail, failed) = oneshot::channel();
-        (Running { stop, failed, task }, fail)
-    }
-
-    /// Catches a task that ends with nothing said being waited on for ever: the frontend that
-    /// is told it ended stops with an error instead of serving without its executor.
-    #[tokio::test]
-    async fn a_task_that_ended_without_a_reason_is_told_as_such() {
-        let (mut running, fail) = running(tokio::spawn(async {}));
-        drop(fail);
-        assert_eq!(
-            running.failed().await,
-            "the executor's task ended without a reason"
-        );
-        running.stop().await;
-    }
-
-    /// Catches a task that broke taking the stop down with it: the stop returns, and the break
-    /// is in the log.
-    #[tokio::test]
-    async fn a_task_that_broke_does_not_stop_the_stop() {
-        let (running, _fail) = running(tokio::spawn(async { panic!("the executor broke") }));
-        running.stop().await;
-    }
-}
+#[path = "driver_tests.rs"]
+mod tests;

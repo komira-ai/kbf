@@ -1,21 +1,65 @@
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use js_proto::v1::{
     Job, JobResult, JobState, Refusal, RefusalCode, ResultReason, StartFailureCode,
 };
+use kbf_front::ERROR_DOMAIN;
 use kbf_job_client::{Broken, Error, Stuck, Undecodable, Unsent};
-use kbf_proto::google::rpc;
-use kbf_proto::reapi::{ActionResult, Digest};
-use kbf_proto::worker::{Lost, MemoryKill};
-use kbf_types::LeaseId;
+use kbf_proto::google::rpc::ErrorInfo;
+use prost::Message;
 use tonic::Code;
 
-use super::{Settled, Verdict, forgotten, judge, ran, refused, result_of};
-use crate::executor::test_support::Log;
+use super::{OUT_OF_MEMORY_REASON, RESUBMITS, Settled, Verdict, forgotten, judge, refused};
+
+/// What a test's log holds, as text.
+#[derive(Clone, Default)]
+struct Log(Arc<Mutex<Vec<u8>>>);
+
+struct LogWriter(Log);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        (self.0)
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Log {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> LogWriter {
+        LogWriter(self.clone())
+    }
+}
+
+impl Log {
+    fn text(&self) -> String {
+        let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Runs `f` with everything it logs written here.
+    fn capture<T>(&self, f: impl FnOnce() -> T) -> T {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f)
+    }
+}
 
 fn job(state: JobState, failure: StartFailureCode, detail: &str) -> Job {
     Job {
-        id: "k0123abcd-4-9-0".to_owned(),
+        id: "k0123abcd-4-9".to_owned(),
         state: state.into(),
         start_failure: failure.into(),
         start_failure_detail: detail.to_owned(),
@@ -247,30 +291,24 @@ fn cases() -> Vec<(&'static str, Case)> {
     ]
 }
 
-/// What the code answers for `case`, and whether it flags a twin.
-fn answer(case: &Case) -> (Verdict, bool) {
+/// What the code answers for `case`.
+fn answer(case: &Case) -> Verdict {
     match case {
-        Case::Judged(judged) => (judge(&judged.0, &judged.1), false),
-        Case::Forgotten => (Verdict::Settled(forgotten()), false),
-        Case::Refused(error) => {
-            let decided = refused(error).expect("a refusal that decides");
-            (Verdict::Settled(decided.settled), decided.twin)
-        }
+        Case::Judged(judged) => judge(&judged.0, &judged.1),
+        Case::Forgotten => Verdict::Settled(forgotten()),
+        Case::Refused(error) => Verdict::Settled(refused(error).expect("a refusal that decides")),
     }
 }
 
 /// The class word of the table for an answer.
-fn class_of(verdict: &Verdict, twin: bool) -> &'static str {
-    match (verdict, twin) {
-        (_, true) => "twin",
-        (Verdict::Ingest, _) => "ingest",
-        (Verdict::Settled(Settled::Infra(_)), _) => "infra",
-        (Verdict::Settled(Settled::Timeout), _) => "timeout",
-        (Verdict::Settled(Settled::OutOfMemory), _) => "out-of-memory",
-        (Verdict::Settled(Settled::Lost(Lost::Fenced)), _) => "fenced",
-        (Verdict::Settled(Settled::Lost(Lost::DaemonRestarted)), _) => "restarted",
-        (Verdict::Settled(Settled::Lost(other)), _) => panic!("a loss the table lacks: {other:?}"),
-        (Verdict::Settled(Settled::Invalid(_)), _) => "invalid",
+fn class_of(verdict: &Verdict) -> &'static str {
+    match verdict {
+        Verdict::Ingest => "ingest",
+        Verdict::Settled(Settled::Infra(_)) => "infra",
+        Verdict::Settled(Settled::Timeout) => "timeout",
+        Verdict::Settled(Settled::OutOfMemory) => "out-of-memory",
+        Verdict::Settled(Settled::Lost(_)) => "lost",
+        Verdict::Settled(Settled::Invalid(_)) => "invalid",
     }
 }
 
@@ -292,15 +330,11 @@ fn doc_rows() -> Vec<(String, String)> {
         .collect()
 }
 
-fn code_of(result: &kbf_proto::worker::Result) -> i32 {
-    result.status.as_ref().expect("a status").code
-}
-
 /// Catches an ending of a job being mapped to a class other than the one the doc table at the
 /// top of `outcome.rs` states, a row of the table with no case here, or a case with no row:
 /// every row is built as a job, a refusal or a forgotten job, the code's answer is named by
 /// its class, and each must equal the doc's. Each settled answer also becomes the status the
-/// farm classifies by (and the `lost` and `memory_kill` fields it reads in place of one).
+/// callers are answered with, and is run again exactly when its class says so.
 #[test]
 fn each_job_end_maps_to_one_failure_class() {
     let rows = doc_rows();
@@ -319,16 +353,9 @@ fn each_job_end_maps_to_one_failure_class() {
         Vec::<&&str>::new(),
         "cases with no row"
     );
-    let (lease, action) = (
-        LeaseId::new(4, 9),
-        Digest {
-            hash: "cd".repeat(32),
-            size_bytes: 5,
-        },
-    );
     for (what, case) in &cases {
-        let (verdict, twin) = answer(case);
-        let class = class_of(&verdict, twin);
+        let verdict = answer(case);
+        let class = class_of(&verdict);
         let (_, doc_class) = rows
             .iter()
             .find(|(row, _)| row == what)
@@ -337,22 +364,15 @@ fn each_job_end_maps_to_one_failure_class() {
         let Verdict::Settled(settled) = verdict else {
             continue;
         };
-        let result = result_of(lease, &action, &settled);
-        let (code, lost, memory_kill) = match class {
-            "infra" | "twin" => (Code::Unavailable, 0, 0),
-            "fenced" => (Code::Unavailable, Lost::Fenced as i32, 0),
-            "restarted" => (Code::Unavailable, Lost::DaemonRestarted as i32, 0),
-            "timeout" => (Code::DeadlineExceeded, 0, 0),
-            "out-of-memory" => (Code::ResourceExhausted, 0, MemoryKill::OwnLimit as i32),
-            "invalid" => (Code::InvalidArgument, 0, 0),
+        let (code, retried) = match class {
+            "infra" | "lost" => (Code::Unavailable, true),
+            "timeout" => (Code::DeadlineExceeded, false),
+            "out-of-memory" => (Code::FailedPrecondition, true),
+            "invalid" => (Code::InvalidArgument, false),
             other => panic!("{what}: {other}"),
         };
-        assert_eq!(code_of(&result), code as i32, "{what}");
-        assert_eq!(
-            (result.lost, result.memory_kill),
-            (lost, memory_kill),
-            "{what}"
-        );
+        assert_eq!(settled.status().code, code as i32, "{what}");
+        assert_eq!(settled.retried(), retried, "{what}");
     }
 }
 
@@ -370,32 +390,18 @@ fn a_submit_whose_answer_is_not_known_decides_nothing() {
     let listing = [Error::TooMany(3), Error::Stuck(Stuck::EmptyPages(1))];
     for error in listing {
         let decided = refused(&error).expect("a refusal that decides");
-        assert!(matches!(decided.settled, Settled::Infra(_)), "{error}");
-        assert!(!decided.twin, "{error}");
+        assert!(matches!(decided, Settled::Infra(_)), "{error}");
     }
 }
 
-/// Catches a host's detail text reaching the farm or the log: an agent's detail of a start it
-/// refused can quote the arguments of the job (the pack url and the read token). The farm is
-/// told the fixed phrase of the class, in full, and the log holds the length of the detail
+/// Catches a host's detail text reaching the answer or the log: an agent's detail of a start it
+/// refused can quote the arguments of the job (the pack url and the read token). The callers
+/// are told the fixed phrase of the class, in full, and the log holds the length of the detail
 /// and never its text.
 #[test]
-fn a_start_failure_detail_never_reaches_the_result_or_the_log() {
-    let (lease, action) = (
-        LeaseId::new(4, 9),
-        Digest {
-            hash: "cd".repeat(32),
-            size_bytes: 5,
-        },
-    );
+fn a_start_failure_detail_never_reaches_the_answer_or_the_log() {
     let quoted = "--pack-url https://store/key?sig=MARKER-SECRET";
-    let status = |code: Code, message: &str| {
-        Some(rpc::Status {
-            code: code as i32,
-            message: message.to_owned(),
-            details: Vec::new(),
-        })
-    };
+    let status = |code: Code, message: &str| (code as i32, message.to_owned());
     let log = Log::default();
     for (code, expected) in [
         (
@@ -419,14 +425,14 @@ fn a_start_failure_detail_never_reaches_the_result_or_the_log() {
         let Verdict::Settled(settled) = verdict else {
             panic!("{code}: not settled");
         };
-        let result = result_of(lease, &action, &settled);
-        assert_eq!(result.status, expected, "{code}");
+        let answered = settled.status();
+        assert_eq!((answered.code, answered.message), expected, "{code}");
     }
     let text = log.text();
     assert!(!text.contains("MARKER-SECRET"), "{text}");
     assert!(!text.contains("--pack-url"), "{text}");
     assert!(text.contains("detail_bytes"), "{text}");
-    assert!(text.contains("k0123abcd-4-9-0"), "{text}");
+    assert!(text.contains("k0123abcd-4-9"), "{text}");
 }
 
 /// Catches an agent's detail being read as more than its leading code: `quota-unavailable-ish`
@@ -438,7 +444,7 @@ fn an_agent_detail_is_read_by_its_leading_code_only() {
     for same in ["quota-unavailable", "quota-unavailable: scratch said no"] {
         assert_eq!(
             judged(same),
-            Verdict::Settled(Settled::Lost(Lost::Fenced)),
+            Verdict::Settled(Settled::Lost("the host's scratch quota is out of order")),
             "{same}"
         );
     }
@@ -534,7 +540,7 @@ fn only_a_clean_result_is_ingested() {
 
 /// Catches a job that succeeded with a result that is not clean being answered with a message
 /// that does not say which part of the result was wrong: each is the whole message, as the
-/// farm and the operator read it.
+/// caller and the operator read it.
 #[test]
 fn a_result_that_is_not_clean_is_named_in_full() {
     let judged = |result: JobResult| infra(judge(&ended(JobState::Succeeded), &result));
@@ -574,65 +580,49 @@ fn a_result_that_is_not_clean_is_named_in_full() {
     }
 }
 
-/// Catches a class that reaches the farm as another: the status code, and the two fields
-/// the farm reads in place of it (`memory_kill`, `lost`), for each way a job is settled.
+/// Catches a class answered as another: the status code and message of each way a run is
+/// settled, whether it is run again, and, for the memory kill at the last attempt, the
+/// `ErrorInfo` detail a client tells it by.
 #[test]
-fn a_settled_run_becomes_the_result_the_farm_classifies() {
-    let (lease, action) = (
-        LeaseId::new(4, 9),
-        Digest {
-            hash: "cd".repeat(32),
-            size_bytes: 5,
-        },
-    );
-    let of = |settled| result_of(lease, &action, &settled);
-    let infra = of(Settled::Infra("disk".to_owned()));
-    assert_eq!(code_of(&infra), Code::Unavailable as i32);
-    assert_eq!((infra.memory_kill, infra.lost), (0, 0));
-    assert_eq!(infra.status.as_ref().expect("a status").message, "disk");
-    assert_eq!(infra.lease_id.map(|l| (l.term, l.seq)), Some((4, 9)));
-    assert_eq!(infra.action_digest.as_ref(), Some(&action));
-    assert!(infra.action_result.is_none());
+fn a_settled_run_becomes_the_status_the_callers_are_answered_with() {
+    let infra = Settled::Infra("disk".to_owned());
+    assert_eq!(infra.status().code, Code::Unavailable as i32);
+    assert_eq!(infra.status().message, "disk");
+    assert!(infra.status().details.is_empty());
 
-    let timeout = of(Settled::Timeout);
-    assert_eq!(code_of(&timeout), Code::DeadlineExceeded as i32);
+    let lost = Settled::Lost("the job was lost with its host");
+    assert_eq!(lost.status().code, Code::Unavailable as i32);
+    assert_eq!(lost.status().message, "the job was lost with its host");
 
-    let oom = of(Settled::OutOfMemory);
-    assert_eq!(code_of(&oom), Code::ResourceExhausted as i32);
-    assert_eq!(oom.memory_kill, MemoryKill::OwnLimit as i32);
-
-    let lost = of(Settled::Lost(Lost::Fenced));
-    assert_eq!(code_of(&lost), Code::Unavailable as i32);
-    assert_eq!(lost.lost, Lost::Fenced as i32);
     assert_eq!(
-        of(Settled::Lost(Lost::DaemonRestarted)).lost,
-        Lost::DaemonRestarted as i32
+        Settled::Timeout.status().code,
+        Code::DeadlineExceeded as i32
     );
 
-    let invalid = of(Settled::Invalid("no image".to_owned()));
-    assert_eq!(code_of(&invalid), Code::InvalidArgument as i32);
+    let invalid = Settled::Invalid("no image".to_owned());
+    assert_eq!(invalid.status().code, Code::InvalidArgument as i32);
+    assert_eq!(invalid.status().message, "no image");
+
+    let oom = Settled::OutOfMemory.status();
+    assert_eq!(oom.code, Code::FailedPrecondition as i32);
+    let [detail] = oom.details.as_slice() else {
+        panic!("one detail: {:?}", oom.details);
+    };
+    let info = ErrorInfo::decode(detail.value.as_slice()).expect("an ErrorInfo");
+    assert_eq!(info.reason, OUT_OF_MEMORY_REASON);
+    assert_eq!(info.domain, ERROR_DOMAIN);
 }
 
-/// Catches a result that ran with a status (it would not be OK) or without the action digest
-/// the farm checks it against.
+/// Catches an ending run again that should be answered at once, or the reverse: the farm's
+/// endings (infrastructure, lost, killed at the memory limit) are submitted again, the action's
+/// own timeout and an action that cannot run here are answered, and an operation has two more
+/// attempts than its first.
 #[test]
-fn a_result_that_ran_is_ok_and_names_its_action() {
-    let (lease, action) = (
-        LeaseId::new(4, 9),
-        Digest {
-            hash: "cd".repeat(32),
-            size_bytes: 5,
-        },
-    );
-    let result = ran(
-        lease,
-        &action,
-        ActionResult {
-            exit_code: 2,
-            ..ActionResult::default()
-        },
-    );
-    assert!(result.status.is_none());
-    assert_eq!(result.action_result.map(|r| r.exit_code), Some(2));
-    assert_eq!(result.action_digest.as_ref(), Some(&action));
+fn only_an_ending_of_the_farms_is_run_again() {
+    assert!(Settled::Infra(String::new()).retried());
+    assert!(Settled::Lost("gone").retried());
+    assert!(Settled::OutOfMemory.retried());
+    assert!(!Settled::Timeout.retried());
+    assert!(!Settled::Invalid(String::new()).retried());
+    assert_eq!(RESUBMITS, 2);
 }

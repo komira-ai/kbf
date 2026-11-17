@@ -1,6 +1,6 @@
-//! The flags that choose where placed actions run: `--executor` and its companions.
+//! The flags of the executor: `--executor` and its companions.
 //!
-//! `--executor js-agent` runs each action the farm places as a job of the job scheduler's job
+//! `--executor js-agent` runs each Execute as a job of the job scheduler's job
 //! service ([`crate::executor`]); it is the only executor there is. Without `--executor` no
 //! executor is built, no job service is dialled and none of the companions is read: the
 //! frontend serves its cache and CAS alone. `--executor kbf-daemon`, which named the deleted
@@ -13,12 +13,19 @@
 //! reason of their own, `--executor-secret-delivery files` and `--executor-locate`, are
 //! refused.
 //!
-//! With `--executor-ownership single`, the default, the executor runs on exactly one frontend:
-//! any frontends that open the same state store are several, so the executor itself looks for
-//! another frontend's jobs on the job service and stops if it finds one
-//! ([`crate::executor::Running`]). With `--executor-ownership shared` any number of frontends
-//! of one `--executor-frontend-id` serve beside each other, each keeping the rows of its jobs in
-//! the `--state-store` ([`crate::executor::Ownership`]).
+//! Every Execute is one job of the job service, submitted at once and read back every
+//! `--executor-poll-ms` ([`crate::executor::Executor`]): there are no virtual workers, no slots
+//! and no ownership modes. Over a `--state-store` each frontend keeps a row for every operation
+//! and a liveness row that lives `--executor-live-secs`; once a frontend's row has expired,
+//! another frontend of the store takes up its unfinished operations. Every frontend of one farm
+//! gives the same `--executor-frontend-id`.
+//!
+//! Seven flags of the virtual workers and their ownership (`--executor-hosts`,
+//! `--executor-host-cpus`, `--executor-host-memory-gib`, `--executor-host-slots`,
+//! `--executor-prepare-concurrency`, `--executor-ownership`, `--executor-mac-hosts`) are
+//! retired: they parse with a value, are hidden from `--help`, are read by nothing, and each
+//! one given logs one warning at start ([`ExecutorFlags::warn_retired`]), so a `kbf.toml` or a
+//! unit written before the removal still starts.
 //!
 //! `--executor-input-tree` chooses what a Linux put-directory job's root is read from: the
 //! action tree's manifests under tierstore's trees (`manifests`, the default), or one tierstore
@@ -45,14 +52,13 @@ use std::time::Duration;
 
 use clap::{Arg, ArgAction, ArgMatches};
 use kbf_front::action_tree::{BaseTree, DEFAULT_TOTAL, PutRetry};
-use kbf_front::{Backend, Packs};
+use kbf_front::{Backend, Packs, Recorder};
 use kbf_job_client::{Client, Origin, Token};
 use kbf_types::ImageRef;
 
-use crate::Farm;
 use crate::executor::{
     Config, DEFAULT_MAC_OS_VERSION, Delivery, Deps, Executor, Front, FrontParts, InputTree,
-    MacPool, Metrics, Network, Ownership, PutDirParts, PutDirRoots, RunSource, TaskOut,
+    MacPool, Metrics, Network, PutDirParts, PutDirRoots, RunSource, TaskOut,
 };
 
 const KIND: &str = "executor";
@@ -60,10 +66,6 @@ const FRONTEND: &str = "executor_frontend_id";
 const JOB_URL: &str = "executor_job_url";
 const TOKEN_FILE: &str = "executor_job_token_file";
 const CA_FILE: &str = "executor_job_ca_file";
-const HOSTS: &str = "executor_hosts";
-const CPUS: &str = "executor_host_cpus";
-const MEMORY_GIB: &str = "executor_host_memory_gib";
-const SLOTS: &str = "executor_host_slots";
 const ARCH: &str = "executor_arch";
 const WORK_DIR: &str = "executor_work_dir";
 const PLAIN_PUT: &str = "executor_allow_plain_http_put";
@@ -87,30 +89,39 @@ const DEFAULT_TIMEOUT: &str = "executor_default_timeout_secs";
 const CALL_TIMEOUT: &str = "executor_call_timeout_secs";
 const POLL: &str = "executor_poll_ms";
 const PREPARE_LIMIT: &str = "executor_prepare_limit_secs";
-const PREPARE_CONCURRENCY: &str = "executor_prepare_concurrency";
 const NETWORK: &str = "executor_network";
 const OPEN_NETWORK: &str = "executor_allow_open_network";
-const OWNERSHIP: &str = "executor_ownership";
 const INPUT_TREE: &str = "executor_input_tree";
 const LIVE: &str = "executor_live_secs";
-const MAC_HOSTS: &str = "executor_mac_hosts";
 const MAC_BUNDLE: &str = "executor_mac_task_bundle";
 const MAC_OS_VERSION: &str = "executor_mac_os_version";
 const MAC_OUT_ROOT: &str = "executor_mac_task_out_root";
 
-/// The virtual workers when `--executor-hosts` is left out. Clap takes the default as the
-/// literal in the flag; the default-flags test checks it against this number.
-#[cfg(test)]
-const DEFAULT_HOSTS: usize = 4;
+/// The retired flags: argument id, flag and value name. Values are not checked.
+const RETIRED: [(&str, &str, &str); 7] = [
+    ("executor_hosts", "--executor-hosts", "WORKERS"),
+    ("executor_host_cpus", "--executor-host-cpus", "CORES"),
+    (
+        "executor_host_memory_gib",
+        "--executor-host-memory-gib",
+        "GIB",
+    ),
+    ("executor_host_slots", "--executor-host-slots", "RUNS"),
+    (
+        "executor_prepare_concurrency",
+        "--executor-prepare-concurrency",
+        "COUNT",
+    ),
+    ("executor_ownership", "--executor-ownership", "MODE"),
+    ("executor_mac_hosts", "--executor-mac-hosts", "WORKERS"),
+];
 
-/// The cores of a virtual worker when `--executor-host-cpus` is left out (test-only, as above).
-#[cfg(test)]
-const DEFAULT_HOST_CPUS: u64 = 32;
+/// The default of `--executor-live-secs` as clap takes it, a literal; the default-flags test
+/// checks it against [`LIVE`].
+const DEFAULT_LIVE_SECS: &str = "20";
 
-/// The GiB of a virtual worker when `--executor-host-memory-gib` is left out (test-only, as
-/// above).
-#[cfg(test)]
-const DEFAULT_HOST_MEMORY_GIB: u64 = 128;
+/// The default of `--executor-poll-ms` as clap takes it.
+const DEFAULT_POLL_MS: &str = "250";
 
 /// The flags a `js-agent` executor cannot do without, in the order their absence is named.
 const REQUIRED: [(&str, &str); 6] = [
@@ -156,44 +167,33 @@ fn switch(id: &'static str, long: &'static str, help: &'static str) -> Arg {
 
 /// The flags.
 pub(super) fn args() -> Vec<Arg> {
-    vec![
+    let mut args = vec![
         Arg::new(KIND)
             .long("executor")
             .value_name("KIND")
             .value_parser(clap::value_parser!(String))
             .help(
-                "Where the farm runs the actions it places: `js-agent`, the only value, runs \
-                 each as a job of the job scheduler's job service, in the kbf \
-                 image (`--executor-kbf-image`, built from `--executor-base-image`), whose \
-                 task tool runs the action inside it; it needs the job service's flags \
+                "Where the frontend runs the actions it is asked to execute: `js-agent`, the \
+                 only value, runs each Execute as a job of the job scheduler's job service, in \
+                 the kbf image (`--executor-kbf-image`, built from `--executor-base-image`), \
+                 whose task tool runs the action inside it; it needs the job service's flags \
                  (`--executor-job-url`, `--executor-job-token-file`, and \
-                 `--executor-job-ca-file` for https), \
-                 `--executor-frontend-id`, the release's base tree bundles \
-                 (`--executor-base-tree`), the packs (`--pack-store-endpoint`) and the secret \
-                 delivery (`--executor-secret-delivery`, with \
-                 `--executor-insecure-argv-secrets` for its default `argv`); the virtual \
-                 workers' shape (`--executor-hosts`, `--executor-host-cpus`, \
-                 `--executor-host-memory-gib`) has defaults. The executor runs \
-                 on exactly one frontend: a second frontend that has jobs on the same job \
-                 service stops. A restart of the frontend fails the builds in flight. \
-                 A frontend stopped cancels its jobs; a killed frontend's jobs run \
-                 to their wall limit, unless a later `js-agent` start cancels them. Left out, \
-                 no executor is built and no job service is contacted, whatever the other \
-                 `--executor-*` flags say; `--executor-insecure-argv-secrets` is then ignored",
+                 `--executor-job-ca-file` for https), `--executor-frontend-id`, the release's \
+                 base tree bundles (`--executor-base-tree`), the packs \
+                 (`--pack-store-endpoint`) and the secret delivery \
+                 (`--executor-secret-delivery`, with `--executor-insecure-argv-secrets` for its \
+                 default `argv`). Left out, no executor is built and no job service is \
+                 contacted, whatever the other `--executor-*` flags say; \
+                 `--executor-insecure-argv-secrets` is then ignored",
             ),
         text(
             FRONTEND,
             "executor-frontend-id",
             "ID",
-            "The name of this frontend on the job service: the value of the `kbf-frontend` \
-             label on its jobs, by which a restarted frontend finds and cancels the ones an \
-             earlier process left, hashed into every job id, and the name of its virtual \
-             workers (`js:<ID>-<n>`, and `js-mac:<ID>-<n>` for the Macs; with \
-             `--executor-ownership shared`, `<ID>.<the first 8 characters of the process's \
-             instance>` in place of `<ID>`). 1 to 63 of letters, digits, `-`, `_` and `.`. It \
-             must be different for each frontend (not copied with the config), except that \
-             the frontends of one `--executor-ownership shared` group give the same one. Used \
-             only with `--executor js-agent`",
+            "The name every frontend of the farm gives: the value of the `kbf-frontend` label \
+             of every job, hashed into the job ids. 1 to 63 of letters, digits, `-`, `_` and \
+             `.`. It is the same for every frontend of one farm, not unique to each. Used only \
+             with `--executor js-agent`",
         ),
         text(
             JOB_URL,
@@ -216,52 +216,6 @@ pub(super) fn args() -> Vec<Arg> {
              anchor, no system roots are consulted. Needed for an `https` job service and \
              refused for an `http` one. Used only with `--executor js-agent`",
         ),
-        Arg::new(HOSTS)
-            .long("executor-hosts")
-            .value_name("WORKERS")
-            .value_parser(clap::value_parser!(usize))
-            // DEFAULT_HOSTS, as above.
-            .default_value("4")
-            .help(
-                "How many virtual workers the farm places actions on, each of the shape below: \
-                 how many actions of which size the farm may have in flight as jobs. A ceiling \
-                 on what this frontend admits, not the hardware: the job service decides which \
-                 host runs each job and holds the real capacity, so set it lower only to cap \
-                 this frontend. Used only with `--executor js-agent`",
-            ),
-        Arg::new(CPUS)
-            .long("executor-host-cpus")
-            .value_name("CORES")
-            .value_parser(clap::value_parser!(u64).range(1..))
-            // DEFAULT_HOST_CPUS, as above.
-            .default_value("32")
-            .help(
-                "The CPU cores of a virtual worker: the most the farm books on it at once. At \
-                 least 1. A ceiling, as for `--executor-hosts`. Used only with `--executor \
-                 js-agent`",
-            ),
-        Arg::new(MEMORY_GIB)
-            .long("executor-host-memory-gib")
-            .value_name("GIB")
-            .value_parser(clap::value_parser!(u64).range(1..))
-            // DEFAULT_HOST_MEMORY_GIB, as above.
-            .default_value("128")
-            .help(
-                "The memory, in GiB, of a virtual worker. The farm counts each run as 1.5 times \
-                 its booking plus 512 MiB (what a Mac job needs; a Linux job names no memory and \
-                 the job service sizes it from its class's history), and the bookings of a \
-                 worker add up to what is left after that. A ceiling, as for \
-                 `--executor-hosts`. Used only with `--executor js-agent`",
-            ),
-        Arg::new(SLOTS)
-            .long("executor-host-slots")
-            .value_name("RUNS")
-            .value_parser(clap::value_parser!(u64).range(1..=256))
-            .default_value("8")
-            .help(
-                "The most actions a virtual worker has in flight at once, reported to the farm \
-                 as its action slots. Used only with `--executor js-agent`",
-            ),
         Arg::new(ARCH)
             .long("executor-arch")
             .value_name("ARCH")
@@ -269,8 +223,7 @@ pub(super) fn args() -> Vec<Arg> {
             .default_value("x86_64")
             .help(
                 "The CPU architecture of the Linux hosts. Every job of a Linux action asks for \
-                 a host of `os=linux`, this `arch` and containers, and the virtual workers \
-                 report them to the farm (the Macs' are `arm64`, `--executor-mac-hosts`). Used \
+                 a host of `os=linux`, this `arch` and containers (the Macs' are `arm64`). Used \
                  only with `--executor js-agent`",
             ),
         text(
@@ -324,8 +277,7 @@ pub(super) fn args() -> Vec<Arg> {
                  `--executor-insecure-argv-secrets`. `files` passes each as a file of the job, \
                  which its host writes read-only at `/run/js-files`: no argument holds a \
                  secret, and `--executor-insecure-argv-secrets` is refused with it; a host whose \
-                 agent cannot write files refuses to start the job, and the farm runs the \
-                 action again. `files` is refused without `--executor js-agent`, which builds the \
+                 agent cannot write files refuses to start the job. `files` is refused without `--executor js-agent`, which builds the \
                  command line",
             ),
         text(
@@ -437,41 +389,27 @@ pub(super) fn args() -> Vec<Arg> {
             CALL_TIMEOUT,
             "executor-call-timeout-secs",
             "How long one call to the job service may take before it counts as unanswered, in \
-             seconds. Under the fence time. Used only with `--executor js-agent`",
+             seconds. Used only with `--executor js-agent`",
             "5",
         ),
         Arg::new(POLL)
             .long("executor-poll-ms")
             .value_name("MILLISECONDS")
             .value_parser(clap::value_parser!(u64).range(100..=10_000))
-            .default_value("1000")
+            .default_value(DEFAULT_POLL_MS)
             .help(
-                "How often the executor polls the job service for its jobs, in milliseconds: \
-                 100 to 10000. Together with the fence time it must stay under the scheduler's \
-                 re-dispatch grace, which is checked at start. Used only with `--executor \
-                 js-agent`",
+                "How often each operation's job is read back from the job service, and a \
+                 submit whose answer was lost is sent again, in milliseconds: 100 to 10000. \
+                 Used only with `--executor js-agent`",
             ),
         number(
             PREPARE_LIMIT,
             "executor-prepare-limit-secs",
             "How long the inputs of one run (its action, its input tree published into the \
-             store, its keys) may take to prepare, in seconds. The `Start`'s own window ends \
-             only the submit, not the preparation, which goes on until this limit so the tree \
-             it publishes is there for the run the farm starts next. Used only with \
-             `--executor js-agent`",
+             store, its keys) may take to prepare, in seconds; a run whose preparation takes \
+             longer ends as an infrastructure failure. Used only with `--executor js-agent`",
             "300",
         ),
-        Arg::new(PREPARE_CONCURRENCY)
-            .long("executor-prepare-concurrency")
-            .value_name("COUNT")
-            .value_parser(clap::value_parser!(u64).range(1..))
-            .default_value("4")
-            .help(
-                "How many runs of one virtual worker prepare their inputs at once. The farm \
-                 gives a worker a full set of `Start`s at one instant, and preparing them all \
-                 together slows each until none is ready inside its window; the ones past this \
-                 wait their turn. Used only with `--executor js-agent`",
-            ),
         Arg::new(NETWORK)
             .long("executor-network")
             .value_name("LEVEL")
@@ -482,7 +420,7 @@ pub(super) fn args() -> Vec<Arg> {
                  endpoints the host's agent is set up to allow and nothing else: the task \
                  reaches the read listener and the pack store only once each agent allows them, \
                  and a host whose agent cannot check those limits refuses the job \
-                 (`egress-unchecked`), which the farm runs again. `none` is no route out: every \
+                 (`egress-unchecked`). `none` is no route out: every \
                  action fails, as the task can reach neither. `open` is any address but those \
                  the agent always denies, and needs `--executor-allow-open-network`. Used only \
                  with `--executor js-agent`",
@@ -494,22 +432,6 @@ pub(super) fn args() -> Vec<Arg> {
              refused with any other `--executor-network`. Off by default. Used only with \
              `--executor js-agent`",
         ),
-        Arg::new(OWNERSHIP)
-            .long("executor-ownership")
-            .value_name("MODE")
-            .value_parser(["single", "shared"])
-            .default_value("single")
-            .help(
-                "Who owns the jobs. `single`, the default, runs the executor on exactly one \
-                 frontend per `--executor-frontend-id`: it stops if another frontend has jobs, \
-                 cancels at start the jobs an earlier process left, and cancels its jobs when it \
-                 ends. `shared` lets any number of frontends of one `--executor-frontend-id` \
-                 serve beside each other over one `--state-store`: each keeps the rows of its \
-                 jobs there, and cancels a job only when the farm withdraws it (a lease or the \
-                 worker's whole stream), never at start \
-                 or at its end. `shared` needs `--state-store`. \
-                 Used only with `--executor js-agent`",
-            ),
         Arg::new(INPUT_TREE)
             .long("executor-input-tree")
             .value_name("MODE")
@@ -526,32 +448,22 @@ pub(super) fn args() -> Vec<Arg> {
         number(
             LIVE,
             "executor-live-secs",
-            "How long the liveness row of a frontend lives after its last renewal, on the state \
-             store's clock, with `--executor-ownership shared`: at least the fence time (40 s) \
-             and 5 s. Used only with `--executor js-agent`",
-            "45",
+            "How long the liveness row of this process lives in the state store after its \
+             last renewal, on the store's clock, in seconds. Once it has expired, another \
+             frontend of the store takes up this process's unfinished operations. Read only \
+             with `--state-store`. Used only with `--executor js-agent`",
+            DEFAULT_LIVE_SECS,
         ),
-        Arg::new(MAC_HOSTS)
-            .long("executor-mac-hosts")
-            .value_name("WORKERS")
-            .value_parser(clap::value_parser!(usize))
-            .default_value("0")
-            .help(
-                "How many virtual workers stand for the job service's Macs, each of the shape \
-                 of `--executor-host-*`, reporting `os=macos` and `arch=arm64`: the farm places \
-                 an action whose platform asks for macOS on them, and each becomes a job of a \
-                 Mac's native runtime that runs `--executor-mac-task-bundle`. 0, the default, \
-                 registers none, and the farm places no macOS action on this executor. Needs \
-                 `--executor-mac-task-bundle`. Used only with `--executor js-agent`",
-            ),
         text(
             MAC_BUNDLE,
             "executor-mac-task-bundle",
             "NAME@sha256:HEX",
             "The release's macOS `kbf-task` bundle, by its manifest digest (the one entry of \
              the `index.json` of `kbf-task-bundle-<commit>-darwin-arm64.tar.gz`): the image of \
-             a Mac job, whose entrypoint `kbf-task` runs. Needed with `--executor-mac-hosts`, \
-             refused without it",
+             a Mac job, whose entrypoint `kbf-task` runs. It enables the Macs: without it no \
+             action whose platform asks for macOS is run, and `--executor-mac-os-version` \
+             and `--executor-mac-task-out-root` are refused. Used only with `--executor \
+             js-agent`",
         ),
         Arg::new(MAC_OS_VERSION)
             .long("executor-mac-os-version")
@@ -563,7 +475,7 @@ pub(super) fn args() -> Vec<Arg> {
                 "The least major macOS every Mac of the job service runs. An action's \
                  `os_version` is the least it takes (`26` means 26 or newer), and one that asks \
                  for a newer macOS than this is refused, naming both: the job service cannot be \
-                 asked for a version. Used only with `--executor-mac-hosts`",
+                 asked for a version. Used only with `--executor-mac-task-bundle`",
             ),
         text(
             MAC_OUT_ROOT,
@@ -571,9 +483,29 @@ pub(super) fn args() -> Vec<Arg> {
             "PATH",
             "The tier store's put directory on the Macs, if it is not `--task-out-root`: a Mac \
              job mounts its put directory under it and its action tree from the `trees` \
-             directory beside it. Used only with `--executor-mac-hosts`, refused without it",
+             directory beside it. Used only with `--executor-mac-task-bundle`, refused without \
+             it",
         ),
-    ]
+    ];
+    args.extend(RETIRED.into_iter().map(|(id, long, value)| {
+        Arg::new(id)
+            .long(&long[2..])
+            .value_name(value)
+            .hide(true)
+            .help("Retired: no longer read, every Execute is a job of the job service")
+    }));
+    args
+}
+
+/// One line for each retired flag `m` was given, naming it.
+fn retired_warnings(m: &ArgMatches) -> Vec<String> {
+    RETIRED
+        .into_iter()
+        .filter(|(id, _, _)| m.contains_id(id))
+        .map(|(_, long, _)| {
+            format!("{long} is no longer read: every Execute is a job of the job service")
+        })
+        .collect()
 }
 
 /// What `--executor js-agent` and its companions say.
@@ -614,6 +546,17 @@ pub struct JsAgentFlags {
 pub struct ExecutorFlags {
     /// The settings of `js-agent`; `None` when `--executor` is left out.
     pub js: Option<JsAgentFlags>,
+    /// One line for each retired flag that was given, naming it.
+    pub retired: Vec<String>,
+}
+
+impl ExecutorFlags {
+    /// Logs a warning for each retired flag that was given: call it once, at start.
+    pub fn warn_retired(&self) {
+        for line in &self.retired {
+            tracing::warn!("{line}");
+        }
+    }
 }
 
 /// The setting the flags in `m` make.
@@ -624,6 +567,7 @@ pub struct ExecutorFlags {
 /// service URL that is not one or does not agree with the CA flag, or a base or kbf image that
 /// is not pinned by digest or is the same image twice.
 pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
+    let retired = retired_warnings(m);
     match m.get_one::<String>(KIND).map(String::as_str) {
         Some("js-agent") => {}
         Some("kbf-daemon") => {
@@ -661,7 +605,7 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
                         .to_owned(),
                 );
             }
-            return Ok(ExecutorFlags::default());
+            return Ok(ExecutorFlags { js: None, retired });
         }
     }
     let missing: Vec<&str> = REQUIRED
@@ -689,8 +633,7 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
         );
     }
     // The settings are judged together ([`Config::validate`]) once the flags beside these have
-    // set what follows from them, the outputs' put directory among them (`executor_bind`): a
-    // judgement here would see the default outputs, which shared ownership refuses.
+    // set what follows from them, the outputs' put directory among them (`executor_bind`).
     let js = js_agent_flags(m)?;
     // The network every action's command will have, logged at start: an open one, which the
     // operator asked for twice, as a warning.
@@ -701,7 +644,10 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
         ),
         network => tracing::info!(?network, "--executor-network: the network of every job"),
     }
-    Ok(ExecutorFlags { js: Some(js) })
+    Ok(ExecutorFlags {
+        js: Some(js),
+        retired,
+    })
 }
 
 fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
@@ -728,14 +674,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
              from the base, which keeps the task tool as its entrypoint"
         ));
     }
-    let hosts = m.get_one::<usize>(HOSTS).copied().unwrap_or_default();
-    let mut config = Config::new(
-        &one(FRONTEND),
-        hosts,
-        count(CPUS).saturating_mul(1_000),
-        count(MEMORY_GIB).saturating_mul(1 << 30),
-    );
-    config.slots = count(SLOTS);
+    let mut config = Config::new(&one(FRONTEND));
     config.arch = one(ARCH);
     config.work_dir = m.get_one::<String>(WORK_DIR).cloned();
     if config
@@ -758,13 +697,8 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.call_timeout = secs(CALL_TIMEOUT);
     config.poll = Duration::from_millis(count(POLL));
     config.prepare_limit = secs(PREPARE_LIMIT);
-    config.prepare_concurrency = usize::try_from(count(PREPARE_CONCURRENCY)).unwrap_or(usize::MAX);
     config.network = network(m);
     config.allow_open_network = m.get_flag(OPEN_NETWORK);
-    config.ownership = match m.get_one::<String>(OWNERSHIP).map(String::as_str) {
-        Some("shared") => Ownership::Shared,
-        _ => Ownership::Single,
-    };
     config.input_tree = match m.get_one::<String>(INPUT_TREE).map(String::as_str) {
         Some("provider") => InputTree::Provider,
         _ => InputTree::Manifests,
@@ -793,35 +727,29 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     })
 }
 
-/// The Macs `--executor-mac-*` declare: none without `--executor-mac-hosts`, which needs
-/// `--executor-mac-task-bundle`.
+/// The Macs `--executor-mac-*` declare: none without `--executor-mac-task-bundle`, which the
+/// other two need.
 fn mac_pool(m: &ArgMatches) -> Result<Option<MacPool>, String> {
-    let hosts = m.get_one::<usize>(MAC_HOSTS).copied().unwrap_or_default();
-    let bundle = m.get_one::<String>(MAC_BUNDLE).cloned();
     let out_root = m.get_one::<String>(MAC_OUT_ROOT);
-    if hosts == 0 {
-        return match (bundle.is_some(), out_root.is_some()) {
-            (false, false) => Ok(None),
-            _ => Err(
-                "--executor-mac-task-bundle and --executor-mac-task-out-root are for \
-                 --executor-mac-hosts: with no Mac worker they would do nothing"
+    let Some(bundle) = m.get_one::<String>(MAC_BUNDLE).cloned() else {
+        let given = m.contains_id(MAC_OUT_ROOT)
+            || m.value_source(MAC_OS_VERSION)
+                .is_some_and(|source| source == clap::parser::ValueSource::CommandLine);
+        return match given {
+            false => Ok(None),
+            true => Err(
+                "--executor-mac-os-version and --executor-mac-task-out-root are for \
+                 --executor-mac-task-bundle: without the bundle no Mac is used and they would \
+                 do nothing"
                     .to_owned(),
             ),
         };
-    }
-    let Some(bundle) = bundle else {
-        return Err(
-            "--executor-mac-hosts needs --executor-mac-task-bundle, the release's kbf-task \
-             bundle for the Macs"
-                .to_owned(),
-        );
     };
     let roots = out_root
         .map(|root| PutDirRoots::new(root))
         .transpose()
         .map_err(|e| format!("--executor-mac-task-out-root: {e}"))?;
     Ok(Some(MacPool {
-        hosts,
         bundle,
         os_version: m
             .get_one::<u32>(MAC_OS_VERSION)
@@ -905,30 +833,34 @@ impl JsAgentFlags {
         Ok(Client::new(config).map_err(|e| format!("--executor-job-url: {e}"))?)
     }
 
-    /// The executor these flags describe, over `farm` and the seams `front`, counting into
-    /// `metrics`, keeping the rows of `--executor-ownership shared` in `store`. The job service
-    /// is not contacted until it is stepped.
+    /// The executor these flags describe, over the seams `front`, counting into `metrics`,
+    /// recording the operations' events into `recorder`, answering a finished operation by
+    /// name from memory for `finished_retention`, and keeping the operations' rows in `store`
+    /// (none without a state store). The job service is not contacted until it is stepped.
     ///
     /// # Errors
-    /// As [`JsAgentFlags::client`], and `--executor-ownership shared` with no `store`.
+    /// As [`JsAgentFlags::client`], and a setting that breaks a rule ([`Config::validate`]).
     pub fn build(
         &self,
-        farm: Arc<Farm>,
         front: Arc<Front>,
         metrics: Arc<Metrics>,
         store: Option<Arc<dyn kbf_state::Store>>,
+        recorder: Recorder,
+        finished_retention: Duration,
     ) -> Result<Executor, Box<dyn Error>> {
         let deps = Deps {
-            farm,
             client: self.client()?,
             ingest: front.clone(),
             presign: front.clone(),
             inputs: front,
             metrics,
             store,
+            recorder,
         };
+        let mut config = self.config.clone();
+        config.finished_retention = finished_retention;
         // The flags were checked when they were parsed.
-        Ok(Executor::new(self.config.clone(), deps)?)
+        Ok(Executor::new(config, deps)?)
     }
 }
 

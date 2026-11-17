@@ -10,7 +10,6 @@ use kbf_pack_index::postgres::PostgresPackIndex;
 use kbf_pack_index::{PackIndex, PackIndexError};
 use kbf_state::Store;
 
-use crate::farm::{EpochPolicy, StateError};
 use crate::members::MembershipConfig;
 
 /// A `--state-store` value: Postgres (`docs/design/frontend-proxy.md`, section 11) or,
@@ -175,30 +174,13 @@ impl clap::builder::TypedValueParser for StateStoreParser {
 
 /// What a start on a `sqlite://` store logs, once: SQLite is on its way out.
 const SQLITE_REMOVED: &str = "the SQLite state store is removed in the next release: move the \
-     scheduler's state to Postgres before upgrading (see the upgrade notes)";
+     state to Postgres before upgrading (see the upgrade notes)";
 
 fn has_password(url: &PostgresUrl) -> bool {
     url.config.has_password()
 }
 
 impl StateStoreUri {
-    /// What an [`open`](Self::open) does with the store's epoch: it keeps it, so a restart
-    /// of a frontend, or the start of another one over the same Postgres, does not make
-    /// the workers drop the runs of the leases they hold. A fresh store has no epoch to
-    /// keep: it is given a first one no other store's is likely to equal (`Durable::open`),
-    /// and when several frontends open an empty store together they end with one.
-    ///
-    /// The epoch changes when an operator raises it (`POST /v1/epoch/bump`,
-    /// [`Farm::bump_epoch`](crate::Farm::bump_epoch)), which a restore of the store from a
-    /// backup calls for: the frontends that start after it serve the new epoch, and the
-    /// workers drop the leases a lost history granted.
-    #[must_use]
-    pub const fn epoch_policy(&self) -> EpochPolicy {
-        match self {
-            Self::Sqlite(_) | Self::Postgres(_) => EpochPolicy::Keep,
-        }
-    }
-
     /// What names the store, for two processes to agree they mean the same one: a SQLite
     /// store's file, a Postgres store's URL without a password.
     #[must_use]
@@ -212,7 +194,7 @@ impl StateStoreUri {
     /// Opens the store as a frontend that shares it with others.
     ///
     /// A Postgres store takes no generation: any number of frontends open it and write,
-    /// each conditionally on the rows it read (the transitions of `farm::durable`), and none
+    /// each conditionally on the rows it read (the executor's rows, `crate::executor::rows`), and none
     /// fences another. What the open does write is the generation row, once: it ensures
     /// that `meta/generation` holds [`kbf_state::SHARED_WRITERS`], with a write conditional
     /// on the row read, so frontends that open together agree. A store that holds the marker
@@ -263,7 +245,6 @@ impl StateStoreUri {
         };
         Ok(StateStore {
             store,
-            epoch: self.epoch_policy(),
             // The defaults; a start sets the --member-* flags (`start::with_members`).
             members: MembershipConfig::default(),
             history: None,
@@ -420,12 +401,22 @@ fn open_sqlite(path: &Path) -> Result<Arc<dyn Store>, StateError> {
     Ok(Arc::new(store))
 }
 
-/// An open state store, and what a start does with its epoch.
+/// Why the state store could not be opened or read.
+#[derive(Debug, thiserror::Error)]
+pub enum StateError {
+    /// The backend failed.
+    #[error(transparent)]
+    Store(#[from] kbf_state::StoreError),
+    /// The store could not be opened: its file is held by another process or is not a
+    /// state store, or its directory cannot be made.
+    #[error("the state store cannot be opened: {0}")]
+    Open(String),
+}
+
+/// An open state store.
 pub struct StateStore {
     /// The store.
     pub store: Arc<dyn Store>,
-    /// The epoch the start takes.
-    pub epoch: EpochPolicy,
     /// How long storage members live and dwell in the store ([`crate::members`]).
     pub members: MembershipConfig,
     /// Build history to write, if `--history-objects` names where: it keeps its index

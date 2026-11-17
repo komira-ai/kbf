@@ -16,9 +16,7 @@
 //!    run unless `--drain-deadline-secs` is given, then `restart frontend=<instance>` to the
 //!    host's `kbf-host-install` over ssh with the updater's key (the forced command; the same
 //!    request and argument vector `kbf-updater` sends), then a wait for `GET /readyz` 200.
-//! 5. A wait for the first virtual worker, `GET /v1/nodes/js:<frontend id>-0` 200: the
-//!    executor of the job service is the one running.
-//! 6. The canary ([`crate::canary`]): one job through the job service, checked to succeed.
+//! 5. The canary ([`crate::canary`]): one job through the job service, checked to succeed.
 //!
 //! A frontend whose operator API refuses the connection before the drain is not running: it is
 //! not drained, and the restart starts it.
@@ -119,7 +117,7 @@ pub struct Restart {
     /// executions run; none is cut.
     #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) drain_deadline_secs: Option<u64>,
-    /// How long to wait for the restarted frontend to be ready, and for its first worker.
+    /// How long to wait for the restarted frontend to be ready.
     #[arg(long, value_name = "SECS", default_value_t = 300,
           value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) ready_deadline_secs: u64,
@@ -610,10 +608,8 @@ pub(crate) async fn apply(
     let new = cutover_edit::rewritten(&file, &old, &settings)?;
     cutover_edit::require_no_backup(&file)?;
     let canary = canary_of(&table, now_secs);
-    let frontend = canary.frontend.clone();
     let check = CheckArgs::of(&a.target);
     let staged = cutover_edit::beside(&file, cutover_edit::STAGED_SUFFIX);
-    let workers = api_url(a.restart.api, &format!("/v1/nodes/js:{frontend}-0"))?;
     let mut steps = vec![
         Step::Check(check.clone()),
         Step::Stage {
@@ -626,11 +622,6 @@ pub(crate) async fn apply(
     ];
     let switched = steps.len();
     steps.extend(restart);
-    steps.push(Step::Await {
-        url: workers,
-        asks: asks(a.restart.ready_deadline_secs, a.restart.poll_secs),
-        what: "the executor of the job service registered its first worker",
-    });
     steps.push(Step::Canary {
         canary,
         asks: asks(a.canary_deadline_secs, a.restart.poll_secs),

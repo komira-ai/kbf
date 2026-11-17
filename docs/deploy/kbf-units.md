@@ -221,39 +221,12 @@ warning. The proxy of `docs/design/frontend-proxy.md` swaps nothing in its place
 over frontends that run on their own. An update of a frontend is a restart; behind the proxy
 it is a roll of one frontend at a time (below).
 
-**The epoch, and a restore from a backup.** The state store holds the farm's epoch
-(`meta/epoch`), and a frontend that starts keeps it: a restart of a frontend, or the start
-of another one over the same store (several frontends sharing one Postgres), does not change
-it, so a worker that reconnects keeps the runs of the leases it holds. The ids are kept the
-same way: a frontend reserves blocks of 1024 operation ids and lease sequences in the store
-and numbers inside them, so a restarted or a second frontend never hands out an id another
-took, and a restart skips the unused rest of its block.
-
-A database restored from a backup holds the epoch of the backup, while workers may hold
-leases the lost history granted after it. Raise the epoch so they drop those leases:
-
-1. Restore the database and start the frontend over it. No worker may reach any frontend
-   of the store until the restart in step 3 is done: keep the frontends that placed work
-   stopped, or the frontend's worker listener closed. The frontend serves the restored epoch and numbers
-   leases from the restored counters, so a worker that reaches it meanwhile keeps its runs
-   and can be granted a lease id (epoch and sequence) that the lost history granted to
-   another run.
-2. On the frontend's host, run `kbf cluster epoch-bump --token-file F` (`POST
-   /v1/epoch/bump`, [api.md](../api.md#post-v1epochbump)). It answers the epoch before the
-   bump, the one stored now, and the one this frontend serves.
-3. Restart each frontend. A running frontend goes on serving the epoch it started under
-   (it logs a warning once its next look at the store finds the newer one); the
-   one that starts after the bump serves the stored one, and a worker that reaches it kills
-   the runs of the leases it held and lists none, and the operations run again from the
-   restored queue.
-
-Bump only when the history was lost or replaced: a bump with no restore costs every run in
-flight.
-
-A SQLite state file (a single frontend) is restored with `kbf-deploy state
-restore --apply`, and its start keeps the epoch too, so the same steps follow it: start the
-frontend over the restored file with no worker able to reach it, run `kbf cluster
-epoch-bump`, then restart the frontend.
+**Operation ids, and a restore from a backup.** With a state store, the ids of a frontend's
+operations come from the store's shared counter, so a restarted frontend, or a second one over
+the same store, never hands out an id another took. kbf holds no leases and no worker epoch
+(every Execute is a job of the job service), so a restore from a backup has no step beyond
+restoring: restore the database (a SQLite state file with `kbf-deploy state restore --apply`)
+and start the frontend over it.
 
 ### Updating a frontend without failing a build
 
@@ -306,20 +279,17 @@ it out on its own health check and its connections' GOAWAY (the order and each p
    `periodSeconds` times `failureThreshold` plus the endpoints' propagation. Unary calls
    have no client retry, which is why they are served here.
 3. New Execute calls are refused `UNAVAILABLE` (Buck2 retries them), the frontend takes no
-   more queued work from the state store and places none on its nodes, and the REAPI,
+   more work from the state store, and the REAPI,
    worker and operator API listeners are sent GOAWAY.
 4. The frontend waits until no execution is open, however long that takes. There is no
    default deadline. `--drain-deadline` (seconds, at least 1, no upper bound) only reports:
    when it passes with executions open, the frontend logs a WARN with their count and sets
    `deadline_passed` in `GET /v1/frontend/drain`, and goes on waiting with the process up and
    every stream open, whether a stop signal or `POST /v1/frontend/drain` began the drain.
-   Under `--executor js-agent`, a job still queued on the job service when step 3 closes the
-   intake (no host took it) is cancelled and its lease given up, its operation queued again
-   for the next frontend: nothing of it ran, and the queue may never move (every host out of
-   service). Its stream is kept while a worker of another frontend could run the
-   operation (that frontend takes it from the state store and answers it), and ended
-   `UNAVAILABLE` when none could, which fails that action (Buck2 never re-attaches). A job a
-   host has placed, or is running, is waited for.
+   Nothing is cancelled by the drain, nor by a stop: the jobs of the operations still open run on
+   in the job service, and the frontend waits for each to end. A stream that a forced stop cuts is
+   ended `UNAVAILABLE`, and its job is left to run; over a state store another frontend takes the
+   operation up ([direct-js.md](../design/direct-js.md) section 3).
 5. The worker streams that are left end `UNAVAILABLE` (storage nodes register with another
    frontend through the load balancer), and the process exits 0. Only a forced stop
    (below) leaves client streams open at this step, and ends them `UNAVAILABLE`. It is not undone: what starts in its place is a new process.

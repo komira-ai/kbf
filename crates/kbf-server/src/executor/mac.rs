@@ -2,16 +2,13 @@
 //! macOS hosts, run by their agent's native runtime (a user of the agent's pool, under its
 //! `sandbox-exec` profile), (docs/design/actions-as-jobs.md, section 14).
 //!
-//! # Which actions, and where the farm places them
+//! # Which actions
 //!
 //! An action asks for a Mac by its platform: `OSFamily` `macos` (or `darwin`, `macosx`, `osx`)
-//! or `os=macos`, read as the farm reads it ([`kbf_caps::Request::from_platform`]); every other
-//! action is a Linux one ([`System::of`]). The farm places a Mac action only on a worker that
-//! reports `os=macos`, so the executor registers a second set of virtual workers for the Macs
-//! ([`MacPool`], `--executor-mac-hosts`, none by default), `js-mac:<frontend>-<n>`, each of the
-//! shape the Linux ones declare, reporting `os=macos`, `arch=arm64` and the one driver `native`.
-//! `native` serves an `action` lease only: no `whole_machine` lease is placed on a Mac worker,
-//! as a put-directory job cannot be one.
+//! or `os=macos` ([`kbf_caps::Request::from_platform`]); every other action is a Linux one
+//! ([`System::of`]). A Mac action becomes a Mac job when the executor has Macs ([`MacPool`],
+//! given by `--executor-mac-task-bundle`, none by default), and is refused as the caller's when
+//! it has none, or when it asks for a whole machine: a put-directory job cannot be one.
 //!
 //! `os_version` is read too, by the platform-tags rule: `os_version=26` means macOS 26 or
 //! newer. The job service has no constraint on a host's system version, so the executor holds
@@ -32,13 +29,13 @@
 //!   must name an image, and a Mac's agent runs only a bundle's program.
 //! - **Two mounts**, each at `/work/<name>`, which a Mac's agent makes `exec/<name>`: the action
 //!   tree `<mp>/trees/<digest>` read-only at [`TREE_TARGET`], and the put directory
-//!   `<mp>/put/cas/b/<lease>/<nonce>` read-write at [`MAC_OUT_TARGET`]. Both `no_exec`: the
+//!   `<mp>/put/cas/b/<run>/<nonce>` read-write at [`MAC_OUT_TARGET`]. Both `no_exec`: the
 //!   task copies the inputs out of the tree into `exec/work` (APFS clones where the volume
 //!   allows), runs the Command there, and commits its one object into the put directory, as a
 //!   Linux job does. `<mp>` is the Macs' own (`--executor-mac-task-out-root`, by default
 //!   `--task-out-root`).
-//! - `os=macos`, `arch=arm64`, `exec=sandbox-exec`, the share the farm booked, no network, no
-//!   file and no secret.
+//! - `os=macos`, `arch=arm64`, `exec=sandbox-exec`, no CPU and no memory (the job service sizes
+//!   it from its class's history), no network, no file and no secret.
 //!
 //! The job service at kbf's pin does not yet run such a job on a Mac (it takes no native start
 //! from the job API, and its Macs do not take mounts); a pool of no Macs, the default, sends
@@ -52,19 +49,15 @@ use js_proto::v1::{
     NetworkLevel, mount,
 };
 use kbf_proto::reapi::{Digest, Platform};
-use kbf_types::LeaseId;
 
 use crate::executor::out::PutDirRoots;
-use crate::executor::task::build_id;
+use crate::executor::task::{RunId, build_id};
 
-/// The `os` a Mac reports, as the farm and the job service spell it.
+/// The `os` of a Mac, as the job service spells it.
 pub const MAC_OS: &str = "macos";
 
 /// The architecture of every Mac: kbf's macOS release is `macos-arm64` only.
 pub(super) const MAC_ARCH: &str = "arm64";
-
-/// The one driver a Mac worker reports: it serves an `action` lease (`LeaseKind::drivers`).
-pub(super) const MAC_DRIVER: &str = "native";
 
 /// Where a Mac job's action tree is mounted, read-only: `exec/.kbf-tree` on the Mac.
 pub const TREE_TARGET: &str = "/work/.kbf-tree";
@@ -74,17 +67,6 @@ pub const MAC_OUT_TARGET: &str = "/work/.kbf-out";
 
 /// The least macOS a Mac of the pool runs when `--executor-mac-os-version` is left out.
 pub const DEFAULT_MAC_OS_VERSION: u32 = 26;
-
-/// The hosts a virtual worker stands for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WorkerOs {
-    /// The job service's Linux hosts: `js:<frontend>-<n>` (with shared ownership,
-    /// `js:<frontend>.<instance>-<n>`, [`Config::worker_of`](super::Config::worker_of)).
-    Linux,
-    /// Its Macs: `js-mac:<frontend>-<n>` (with shared ownership,
-    /// `js-mac:<frontend>.<instance>-<n>`).
-    Mac,
-}
 
 /// The system an action asks for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -104,10 +86,10 @@ const OS_VERSION: &str = "os_version";
 
 impl System {
     /// The system `platform` (the Action's, or else the Command's) asks for: macOS when it names
-    /// `os=macos` the way the farm reads it, else Linux.
+    /// `os=macos`, else Linux.
     ///
     /// # Errors
-    /// A platform the farm refuses, or an `os_version` of a Mac action that is not a version
+    /// A platform that does not parse, or an `os_version` of a Mac action that is not a version
     /// (`<major>[.<minor>[.<patch>]]`, digits).
     pub fn of(platform: Option<&Platform>) -> Result<Self, String> {
         let properties = platform.map_or(&[][..], |p| p.properties.as_slice());
@@ -139,13 +121,10 @@ fn major(value: &str) -> Result<u32, String> {
     }
 }
 
-/// The Macs of the executor: how many virtual workers stand for them, the task tool's bundle, the
-/// least macOS each runs and the tier store's roots there.
+/// The Macs of the executor: the task tool's bundle, the least macOS each runs and the tier
+/// store's roots there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MacPool {
-    /// How many Mac virtual workers the farm places on (`--executor-mac-hosts`), each of the
-    /// shape the Linux ones declare.
-    pub hosts: usize,
     /// The release's `kbf-task` bundle, `NAME@sha256:<64 hex>` by its darwin manifest digest
     /// (`--executor-mac-task-bundle`): a Mac job's image.
     pub bundle: String,
@@ -159,9 +138,6 @@ pub struct MacPool {
 /// Why a [`MacPool`] is refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MacPoolError {
-    /// A pool of no worker: leave the pool out instead.
-    #[error("a pool of Macs needs at least one virtual worker")]
-    NoHosts,
     /// A bundle that is not pinned by a digest.
     #[error("the Macs' task bundle {0:?} is not pinned by an @sha256 digest (NAME@sha256:HEX)")]
     Bundle(String),
@@ -176,9 +152,6 @@ impl MacPool {
     /// # Errors
     /// The first [`MacPoolError`].
     pub fn validate(&self) -> Result<(), MacPoolError> {
-        if self.hosts == 0 {
-            return Err(MacPoolError::NoHosts);
-        }
         if !pinned(&self.bundle) {
             return Err(MacPoolError::Bundle(self.bundle.clone()));
         }
@@ -233,12 +206,12 @@ pub(super) fn mac_constraints() -> Constraints {
     }
 }
 
-/// The flags of the task tool for the Mac run of `action` on `lease`: the inputs are copied out
+/// The flags of the task tool for the Mac run of `action` on `run`: the inputs are copied out
 /// of the tree at `exec/.kbf-tree` (`--materialize-work`), the object is committed into
 /// `exec/.kbf-out`, and the action may run for `deadline`. Both paths are relative to the
 /// task's working directory, `exec/`.
 #[must_use]
-pub(super) fn mac_argv(action: &Digest, lease: LeaseId, deadline: Duration) -> Vec<String> {
+pub(super) fn mac_argv(action: &Digest, run: RunId, deadline: Duration) -> Vec<String> {
     let in_exec = |target: &str| target.trim_start_matches("/work/").to_owned();
     vec![
         format!("--materialize-work={}", in_exec(TREE_TARGET)),
@@ -248,7 +221,7 @@ pub(super) fn mac_argv(action: &Digest, lease: LeaseId, deadline: Duration) -> V
         "--action".to_owned(),
         format!("{}/{}", action.hash, action.size_bytes),
         "--lease".to_owned(),
-        build_id(lease),
+        build_id(run),
         "--deadline-ms".to_owned(),
         deadline.as_millis().to_string(),
         "--object-format".to_owned(),
@@ -276,7 +249,7 @@ pub(super) struct MacJob<'a> {
     pub(super) pool: &'a MacPool,
     /// The tier store's roots on the Macs.
     pub(super) roots: &'a PutDirRoots,
-    /// The run's put directory, `cas/b/<lease>/<nonce>`.
+    /// The run's put directory, `cas/b/<run>/<nonce>`.
     pub(super) dir: &'a str,
     /// The run's action tree, its digest in hex.
     pub(super) tree: &'a str,

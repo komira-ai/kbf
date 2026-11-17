@@ -19,17 +19,15 @@
 //! `golden_corpus.rs` holds the other half: entries earlier builds wrote, read by this one.
 
 use std::num::NonZeroU64;
-use std::time::UNIX_EPOCH;
 
 use kbf_log::{
-    Bootstrap, Checkpoint, DecodeError, FarmBatch, FarmInput, FarmLogId, Format, LogCommand,
-    MachineVersion, Report, Takeover, decode, encode,
+    Bootstrap, DecodeError, FarmLogId, Format, LogCommand, MachineVersion, decode, encode,
 };
 use kbf_meta::{
     ActionRecord, Closure, Command, Epoch, Generation, Location, NodeWriter, ObjectId, Role,
     ServerId, StagedPut, StoreId, TierId, Touch, UnreachableReason, Writer,
 };
-use kbf_types::{Digest, DigestFunction, Failure, FarmTime, LeaseId, OperationId, Outcome};
+use kbf_types::{Digest, DigestFunction, FarmTime};
 
 /// A field after an entry that no message of this build names: number 1000, a varint, 1.
 const LATER_FIELD: [u8; 3] = [0xc0, 0x3e, 0x01];
@@ -139,39 +137,15 @@ fn meta_commands() -> Vec<Command> {
     ]
 }
 
-/// One entry of every other kind: the log's first command, a farm batch, a worker's report,
-/// a new leader's first command, a determinism check and a raise of the machine version.
+/// One entry of every other kind: the log's first command and a raise of the machine
+/// version.
 fn other_entries() -> Vec<LogCommand> {
     let bootstrap = Bootstrap {
         log_id: FarmLogId::new(nz(1)),
         store_prefix: "kbf/0000000000000001/".to_owned(),
     };
-    let farm = FarmBatch {
-        now: FarmTime::from_millis(1),
-        wall: UNIX_EPOCH,
-        inputs: vec![FarmInput::Tick],
-    };
-    let report = Report {
-        now: FarmTime::from_millis(1),
-        operation: OperationId(3),
-        lease: LeaseId::new(1, 2),
-        outcome: Outcome::Failed(Failure::Timeout),
-        action_entry: None,
-    };
-    let takeover = Takeover {
-        term: nz(7),
-        now: FarmTime::from_millis(9),
-    };
-    let checkpoint = Checkpoint {
-        index: 5,
-        digest: [0xab; 32],
-    };
     vec![
         LogCommand::Bootstrap(bootstrap),
-        LogCommand::Farm(farm),
-        LogCommand::Report(report),
-        LogCommand::Takeover(takeover),
-        LogCommand::Checkpoint(checkpoint),
         LogCommand::MachineVersion(MachineVersion::V5),
     ]
 }
@@ -185,7 +159,7 @@ fn every_kind() -> Vec<LogCommand> {
 }
 
 /// How many kinds of entry this build writes: the numbers `kind` gives are below it.
-const KINDS: usize = 26;
+const KINDS: usize = 22;
 
 /// The place of an entry's kind among the kinds. Nothing in the match is a wildcard: a kind
 /// added to the log without a place here does not compile. Its place is the next number, and
@@ -213,18 +187,14 @@ fn kind(command: &LogCommand) -> usize {
         LogCommand::Meta(Command::RebuildProgress { .. }) => 18,
         LogCommand::Meta(Command::RebuildDone) => 19,
         LogCommand::Bootstrap(_) => 20,
-        LogCommand::Farm(_) => 21,
-        LogCommand::Report(_) => 22,
-        LogCommand::Takeover(_) => 23,
-        LogCommand::Checkpoint(_) => 24,
-        LogCommand::MachineVersion(_) => 25,
+        LogCommand::MachineVersion(_) => 21,
         LogCommand::Unknown => unreachable!("an entry this build writes is never unknown"),
     }
 }
 
 /// Asserts that the fixture holds an entry of every kind this build writes, each kind once:
-/// the twenty metadata commands, the first command of a log, a farm batch, a report, a
-/// takeover, a checkpoint and a raise of the machine version.
+/// the twenty metadata commands, the first command of a log and a raise of the machine
+/// version.
 #[test]
 fn the_fixture_holds_one_entry_of_every_kind() {
     let mut seen = [0; KINDS];

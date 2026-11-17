@@ -4,11 +4,11 @@
 
 mod support;
 
+use kbf_invocation::RequeueReason;
 use kbf_invocation::{
     CallKind, Ended, EndedKind, Event, ExecuteAnswer, IDLE_AFTER, LeaseEnd, Metadata, Outcome,
     Records, Run, WallTime,
 };
-use kbf_sched::RequeueReason;
 use kbf_types::{Failure, LostWhy, OperationId};
 use support::*;
 
@@ -75,8 +75,8 @@ fn each_attempt_settles_once_at_its_end() {
     );
 }
 
-/// Catches: a requeue for a reason the worker reports (a memory kill, a lost run, an
-/// infra fault) settled before its report, so the record has no run block for the very
+/// Catches: a requeue for a reason the worker reports (a memory kill, a lost run) settled
+/// before its report, so the record has no run block for the very
 /// run that was killed; and the report that follows not settling it.
 #[test]
 fn a_requeue_the_worker_reports_settles_when_its_report_arrives() {
@@ -86,7 +86,6 @@ fn a_requeue_the_worker_reports_settles_when_its_report_arrives() {
             raised: 2,
         },
         RequeueReason::NodeMemoryPressure,
-        RequeueReason::Infra,
         RequeueReason::Lost(LostWhy::Fenced),
     ] {
         let mut r = Records::new();
@@ -382,4 +381,21 @@ fn an_end_names_the_correlated_id_its_record_holds() {
     };
     assert_eq!(correlated(&got[6]), [Some("corr-1".to_owned())]);
     assert_eq!(correlated(&got[7]), [None], "an empty id is none");
+}
+
+/// Catches an attempt the executor ran again for an infrastructure ending left waiting for a
+/// report that never comes, so the history never mints its run id: it settles when it is
+/// given up.
+#[test]
+fn an_infra_requeue_settles_when_it_is_given_up() {
+    let mut r = Records::new();
+    let got = ended(
+        &mut r,
+        [
+            queued("a", t(0), 1, 1),
+            granted(1, 1, "job-a", t(1)),
+            requeued(1, 1, RequeueReason::Infra, t(2)),
+        ],
+    );
+    assert_eq!(got[2], [one("a", 0, Some(0), EndedKind::Requeued, t(2))]);
 }

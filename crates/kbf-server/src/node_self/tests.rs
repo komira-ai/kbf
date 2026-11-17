@@ -1,4 +1,4 @@
-//! The four node calls of a host's updater: their shapes, who is admitted to them, and what the
+//! The one node call of a host's updater: their shapes, who is admitted to them, and what the
 //! handlers do without the listener's layer. The real listener, with a real updater client, is
 //! `tests/updater_node_calls.rs`.
 
@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::Request;
-use kbf_front::{Backend, Cache};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
 use rcgen::{CertificateParams, KeyPair, SanType};
@@ -16,49 +15,31 @@ use super::*;
 use crate::DenyList;
 use crate::proxy_auth::Identity;
 
-fn call(method: &str, uri: &str) -> Option<(String, Kind)> {
+fn call(method: &str, uri: &str) -> Option<String> {
     let method: Method = method.parse().expect("a method");
     let uri: Uri = uri.parse().expect("a uri");
-    node_call(&method, &uri).map(|c| (c.node.to_owned(), c.kind))
+    node_call(&method, &uri).map(|c| c.node.to_owned())
 }
 
-/// The four calls, and only those shapes: the node's id and which call it is are returned, and
-/// nothing else (another verb, method, query, spelling or extra segment) names a node.
+/// The one call, and only that shape: the node's id is returned, and nothing else (another
+/// verb, method, query, spelling or extra segment, or one of the removed drain, uncordon and
+/// status calls) names a node.
 #[test]
-fn the_node_calls_of_an_updater_are_four_exact_shapes() {
-    for (method, uri, node, kind) in [
-        ("POST", "/v1/nodes/host-1:drain", "host-1", Kind::Drain),
-        (
-            "POST",
-            "/v1/nodes/host-1:uncordon",
-            "host-1",
-            Kind::Uncordon,
-        ),
-        ("GET", "/v1/nodes/host-1", "host-1", Kind::Status),
-        (
-            "GET",
-            "/v1/nodes/host-1/storage-health",
-            "host-1",
-            Kind::StorageHealth,
-        ),
-        (
-            "GET",
-            "http://frontend.test/v1/nodes/host-1",
-            "host-1",
-            Kind::Status,
-        ),
-        ("GET", "/v1/nodes/9", "9", Kind::Status),
+fn the_node_call_of_an_updater_is_one_exact_shape() {
+    for (method, uri, node) in [
+        ("GET", "/v1/nodes/host-1/storage-health", "host-1"),
+        ("GET", "http://frontend.test/v1/nodes/9/storage-health", "9"),
     ] {
-        assert_eq!(
-            call(method, uri),
-            Some((node.to_owned(), kind)),
-            "{method} {uri}"
-        );
+        assert_eq!(call(method, uri), Some(node.to_owned()), "{method} {uri}");
     }
-    let longest = format!("/v1/nodes/{}", "a".repeat(63));
-    assert_eq!(call("GET", &longest).map(|c| c.0.len()), Some(63));
-    let long = format!("/v1/nodes/{}", "a".repeat(64));
+    let longest = format!("/v1/nodes/{}/storage-health", "a".repeat(63));
+    assert_eq!(call("GET", &longest).map(|c| c.len()), Some(63));
+    let long = format!("/v1/nodes/{}/storage-health", "a".repeat(64));
     for (method, uri) in [
+        ("POST", "/v1/nodes/host-1:drain"),
+        ("POST", "/v1/nodes/host-1:uncordon"),
+        ("GET", "/v1/nodes/host-1"),
+        ("GET", "/v1/nodes/9"),
         ("GET", "/v1/nodes"),
         ("GET", "/v1/nodes/"),
         ("GET", "/v1/nodes/host-1/"),
@@ -77,6 +58,14 @@ fn the_node_calls_of_an_updater_are_four_exact_shapes() {
         ("POST", "/v1/nodes/:drain"),
         ("GET", "/v1/nodes/host-1?x=1"),
         ("POST", "/v1/nodes/host-1:drain?x=1"),
+        ("GET", "/v1/nodes/HOST-1/storage-health"),
+        ("GET", "/v1/nodes/host_1/storage-health"),
+        ("GET", "/v1/nodes/host.1/storage-health"),
+        ("GET", "/v1/nodes/-host/storage-health"),
+        ("GET", "/v1/nodes/host-/storage-health"),
+        ("GET", "/v1/nodes/host%2D1/storage-health"),
+        ("GET", "/v1/nodes//storage-health"),
+        ("GET", "/v1/nodes/host-1/storage-health?x=1"),
         ("GET", "/v1/nodes/HOST-1"),
         ("GET", "/v1/nodes/host_1"),
         ("GET", "/v1/nodes/host.1"),
@@ -121,11 +110,8 @@ fn presents(der: Vec<u8>) -> Presented {
     Presented::Leaf(Some(der))
 }
 
-fn drain_of(node: &str) -> NodeCall<'_> {
-    NodeCall {
-        node,
-        kind: Kind::Drain,
-    }
+fn call_of(node: &str) -> NodeCall<'_> {
+    NodeCall { node }
 }
 
 /// An updater certificate is admitted for the node it names and for no other, and the call
@@ -133,28 +119,12 @@ fn drain_of(node: &str) -> NodeCall<'_> {
 #[test]
 fn an_updater_certificate_is_admitted_for_its_own_node_only() {
     let own = presents(der(Some("updater"), &["node-a"]));
-    for kind in [
-        Kind::Drain,
-        Kind::Uncordon,
-        Kind::Status,
-        Kind::StorageHealth,
-    ] {
-        let call = NodeCall {
-            node: "node-a",
-            kind,
-        };
-        let admitted = admit(Admission::Certified, &call, &own).expect("admitted");
-        assert_eq!(admitted.node(), "node-a", "{kind:?}");
-        let other = NodeCall {
-            node: "node-b",
-            kind,
-        };
-        assert_eq!(
-            admit(Admission::Certified, &other, &own).expect_err("another node"),
-            StatusCode::FORBIDDEN,
-            "{kind:?}"
-        );
-    }
+    let admitted = admit(Admission::Certified, &call_of("node-a"), &own).expect("admitted");
+    assert_eq!(admitted.node(), "node-a");
+    assert_eq!(
+        admit(Admission::Certified, &call_of("node-b"), &own).expect_err("another node"),
+        StatusCode::FORBIDDEN
+    );
 }
 
 /// Every other certificate is refused, and a call with none is unauthenticated: a node, a
@@ -163,7 +133,7 @@ fn an_updater_certificate_is_admitted_for_its_own_node_only() {
 /// at all, plain text, and the identity a proxy forwarded.
 #[test]
 fn nothing_but_an_updater_certificate_is_admitted() {
-    let call = drain_of("node-a");
+    let call = call_of("node-a");
     for role in ["daemon", "storage", "frontend", "coordinator", "nonsense"] {
         let presented = presents(der(Some(role), &["node-a"]));
         assert_eq!(
@@ -210,14 +180,6 @@ fn nothing_but_an_updater_certificate_is_admitted() {
     }
 }
 
-fn farm() -> Arc<Farm> {
-    Arc::new(Farm::new(
-        Backend::from(Arc::new(Cache::memory())),
-        kbf_sched::UNSERVABLE_WAIT,
-        kbf_sched::FINISHED_RETENTION,
-    ))
-}
-
 fn updater_of(node: &str) -> UpdaterCall {
     UpdaterCall {
         node: node.to_owned(),
@@ -226,7 +188,7 @@ fn updater_of(node: &str) -> UpdaterCall {
 }
 
 /// The router's answer to `method uri` with `body`, from the updater `who` if given (the
-/// listener's layer puts it there), over a farm that knows no node.
+/// listener's layer puts it there), over a server that keeps no members.
 async fn ask(
     peers: Peers,
     who: Option<UpdaterCall>,
@@ -234,7 +196,7 @@ async fn ask(
     uri: &str,
     body: &str,
 ) -> (StatusCode, serde_json::Value) {
-    let mut router = routes(farm(), None, None, peers).into_axum_router();
+    let mut router = routes(None, None, peers).into_axum_router();
     let mut request = Request::builder()
         .method(method)
         .uri(uri)
@@ -259,104 +221,50 @@ fn open() -> Peers {
 }
 
 /// A call that did not pass the layer (no admitted updater with it), or that names another
-/// node than the one admitted, is refused by the handlers too, whichever of the four it is:
-/// by the node they were told, and (with a certificate check on the listener) by the
-/// certificate as well.
+/// node than the one admitted, is refused by the handler too: by the node it was told, and
+/// (with a certificate check on the listener) by the certificate as well.
 #[tokio::test]
 async fn a_handler_serves_only_the_node_the_layer_admitted() {
-    for (method, uri) in [
-        ("POST", "/v1/nodes/node-a:drain"),
-        ("POST", "/v1/nodes/node-a:uncordon"),
-        ("GET", "/v1/nodes/node-a"),
-        ("GET", "/v1/nodes/node-a/storage-health"),
+    let (method, uri) = ("GET", "/v1/nodes/node-a/storage-health");
+    let (code, _) = ask(open(), None, method, uri, "").await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "unadmitted");
+    let (code, _) = ask(open(), Some(updater_of("node-b")), method, uri, "").await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "another node");
+    // Where the listener checks no certificate against the node, the node the layer
+    // admitted is all that stands between an updater and another node's call.
+    let unchecked = Peers::Unauthenticated;
+    let (code, _) = ask(unchecked, Some(updater_of("node-b")), method, uri, "").await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "another node, unchecked");
+}
+
+/// The calls of the removed node placement (status, drain, uncordon, cordon) are routes of no
+/// shape here: whoever asks, as the node itself, they reach no handler of the router and fall
+/// to the gRPC base's answer (`unimplemented`, grpc-status 12), never to a node's status or a
+/// drain. The storage health of a server with no members is a 404.
+#[tokio::test]
+async fn the_removed_node_calls_are_not_routes_and_storage_health_needs_members() {
+    for (method, uri, body) in [
+        ("GET", "/v1/nodes/node-a", ""),
+        ("POST", "/v1/nodes/node-a:drain", ""),
+        ("POST", "/v1/nodes/node-a:drain", r#"{"deadline_secs": 5}"#),
+        ("POST", "/v1/nodes/node-a:uncordon", ""),
+        ("POST", "/v1/nodes/node-a:cordon", ""),
+        ("POST", "/v1/nodes/node-a", ""),
     ] {
-        let (code, _) = ask(open(), None, method, uri, "").await;
-        assert_eq!(code, StatusCode::FORBIDDEN, "{method} {uri} unadmitted");
-        let (code, _) = ask(open(), Some(updater_of("node-b")), method, uri, "").await;
-        assert_eq!(code, StatusCode::FORBIDDEN, "{method} {uri} another node");
-        // Where the listener checks no certificate against the node, the node the layer
-        // admitted is all that stands between an updater and another node's call.
-        let unchecked = Peers::Unauthenticated;
-        let (code, _) = ask(unchecked, Some(updater_of("node-b")), method, uri, "").await;
-        assert_eq!(
-            code,
-            StatusCode::FORBIDDEN,
-            "{method} {uri} another node, unchecked"
-        );
+        let mut router = routes(None, None, open()).into_axum_router();
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::from(body.to_owned()))
+            .expect("a request");
+        request.extensions_mut().insert(updater_of("node-a"));
+        let answer = router.call(request).await.expect("an answer");
+        let grpc = answer.headers().get("grpc-status").map(|v| v.as_bytes());
+        assert_eq!(grpc, Some(&b"12"[..]), "{method} {uri} {body}");
     }
-}
-
-/// A node the farm does not know is a 404 for its status, its drain and its uncordon, a verb
-/// that is not one of the two is a 404 whoever asks, a bad drain body is a 400, and the
-/// storage health of a server with no members is a 404.
-#[tokio::test]
-async fn the_handlers_answer_what_the_farm_says() {
-    let who = || Some(updater_of("node-a"));
-    for (method, uri, body, want) in [
-        ("GET", "/v1/nodes/node-a", "", StatusCode::NOT_FOUND),
-        ("POST", "/v1/nodes/node-a:drain", "", StatusCode::NOT_FOUND),
-        (
-            "POST",
-            "/v1/nodes/node-a:drain",
-            r#"{"deadline_secs": 5}"#,
-            StatusCode::NOT_FOUND,
-        ),
-        (
-            "POST",
-            "/v1/nodes/node-a:uncordon",
-            "",
-            StatusCode::NOT_FOUND,
-        ),
-        (
-            "POST",
-            "/v1/nodes/node-a:drain",
-            "not json",
-            StatusCode::BAD_REQUEST,
-        ),
-        ("POST", "/v1/nodes/node-a:cordon", "", StatusCode::NOT_FOUND),
-        (
-            "GET",
-            "/v1/nodes/node-a/storage-health",
-            "",
-            StatusCode::NOT_FOUND,
-        ),
-    ] {
-        let (code, said) = ask(open(), who(), method, uri, body).await;
-        assert_eq!(code, want, "{method} {uri} {body}: {said}");
-    }
-    let (_, said) = ask(open(), who(), "POST", "/v1/nodes/node-a:cordon", "").await;
-    assert_eq!(said["error"], "no_action");
-}
-
-/// A call with no `:verb` at all reaches the handler only through the route of the node (the
-/// layer refuses it first); the handler refuses it as an unknown action.
-#[tokio::test]
-async fn a_post_to_a_bare_node_is_an_unknown_action() {
-    let (code, said) = ask(
-        open(),
-        Some(updater_of("node-a")),
-        "POST",
-        "/v1/nodes/node-a",
-        "",
-    )
-    .await;
-    assert_eq!(code, StatusCode::NOT_FOUND);
-    assert_eq!(said["error"], "no_action");
-}
-
-/// A body of more than a drain's few bytes is refused before it is read.
-#[tokio::test]
-async fn a_large_body_is_refused() {
-    let body = "x".repeat(MAX_BODY + 1);
-    let (code, _) = ask(
-        open(),
-        Some(updater_of("node-a")),
-        "POST",
-        "/v1/nodes/node-a:drain",
-        &body,
-    )
-    .await;
-    assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
+    let who = Some(updater_of("node-a"));
+    let (code, said) = ask(open(), who, "GET", "/v1/nodes/node-a/storage-health", "").await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{said}");
 }
 
 /// The listener's deny list applies to the node of an updater as it does to a worker's calls:
@@ -376,7 +284,7 @@ async fn the_deny_list_applies_to_the_node() {
         peers.clone(),
         Some(updater_of("node-a")),
         "GET",
-        "/v1/nodes/node-a",
+        "/v1/nodes/node-a/storage-health",
         "",
     )
     .await;
@@ -391,7 +299,7 @@ async fn the_deny_list_applies_to_the_node() {
         peers.clone(),
         Some(updater_of("node-b")),
         "GET",
-        "/v1/nodes/node-b",
+        "/v1/nodes/node-b/storage-health",
         "",
     )
     .await;
@@ -402,7 +310,7 @@ async fn the_deny_list_applies_to_the_node() {
         peers,
         Some(updater_of("node-b")),
         "GET",
-        "/v1/nodes/node-b",
+        "/v1/nodes/node-b/storage-health",
         "",
     )
     .await;
@@ -415,7 +323,7 @@ async fn the_deny_list_applies_to_the_node() {
 async fn storage_health_without_members_is_a_404_beside_a_store() {
     let clock = Arc::new(ManualClock::default());
     let store: Arc<dyn Store> = Arc::new(Fake::with_flaw(clock, Flaw::None));
-    let mut router = routes(farm(), None, Some(store), open()).into_axum_router();
+    let mut router = routes(None, Some(store), open()).into_axum_router();
     let mut request = Request::builder()
         .uri("/v1/nodes/node-a/storage-health")
         .body(Body::empty())

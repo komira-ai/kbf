@@ -25,7 +25,7 @@ use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
 use kbf_server::worker_roles::{WORKER_LISTENER_ROLES, WorkerRolesLayer, admit, roles_for};
-use kbf_server::{DenyList, EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
+use kbf_server::{DenyList, Listeners, StateStore, WorkerTls, bind_server_with_state};
 use kbf_state::Store;
 use kbf_storage::service::{Admission, PeerRole, ROLE_URI_PREFIX};
 use kbf_tls::TlsSource;
@@ -298,10 +298,10 @@ async fn an_http_call_under_v1_is_refused_with_a_plain_status_and_never_reaches_
             ("GET", "/v1/nodes/node-a?x=1", 403),
             ("GET", "/v1/nodes/Node-A", 403),
             ("GET", "/v1/", 403),
-            ("GET", "/v1/nodes/node-a", 401),
+            ("GET", "/v1/nodes/node-a", 403),
             ("GET", "/v1/nodes/node-a/storage-health", 401),
-            ("POST", "/v1/nodes/node-a:drain", 401),
-            ("POST", "/v1/nodes/node-a:uncordon", 401),
+            ("POST", "/v1/nodes/node-a:drain", 403),
+            ("POST", "/v1/nodes/node-a:uncordon", 403),
         ] {
             let answer = through_http(layer, &inner, method, path).await;
             assert_eq!(
@@ -434,19 +434,8 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls,
-        tick: Duration::from_millis(50),
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
@@ -466,7 +455,6 @@ fn frontend_over(worker_tls: Option<WorkerTls>) -> (SocketAddr, Arc<Hooked>) {
     let store = Hooked::new();
     let state = StateStore {
         store: Arc::clone(&store) as Arc<dyn Store>,
-        epoch: EpochPolicy::Keep,
         members: MembershipConfig {
             ttl: Duration::from_secs(60),
             dwell: Duration::from_secs(60),

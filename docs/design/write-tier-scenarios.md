@@ -13,8 +13,8 @@ it waits for: **stage 3** (tier metadata: `PutStaged`, `SealStaged`, `ObjectFlus
 
 ## 1. Invariants
 
-Each scenario names the invariants it checks. The cell checks properties 1 to 7 of
-[simulation.md](simulation.md#8-the-cell-kbf-sim-cell) after every step as well.
+Each scenario names the invariants it checks. The cell checks properties 1 and 5 to 7 of
+[simulation.md](simulation.md#3-the-cell-kbf-sim-cell) after every step as well.
 
 | | Invariant | Checked by |
 |---|---|---|
@@ -52,7 +52,7 @@ The fault-injection points below exist in `kbf-sim-cell` today unless marked oth
 | 17 | A read of a staged blob while its flush is in progress | read during the PUT, the commit and the rename | A, B | served from the block; a reader that finds neither `.blk` nor `.seg` after `ObjectFlushed` reads the store; a staged object is never committed `ObjectUnreachable { Missing }` by a reader | stage 4 + stage 5; **stage 5: every tier run: each blob answered present is read 2 s later; `the_tier_stages_flushes_and_survives_a_rollback` wants reads that found their object's flush PUT outstanding (the cell commits `ObjectFlushed` and renames in one step, so no read lands between the commit and the rename)** |
 | 18 | Node loss before the flush | the tier directory is replaced by an empty disk (a disk-loss fault) | A (its disk-loss clause), E, G | acknowledged data on that one disk is lost: the exposure is the seal delay (30 s) plus one PUT, longer while the store is down. The unflushed-age alert has fired already if the store was down. The server refuses to start on the wrong `TIER`; `--hot-store-abandon` marks every object staged there `Missing`; its blobs answer `Unavailable` (never `NOT_FOUND`, never other bytes); `FindMissingBlobs` reports them missing and a re-upload heals | stage 5 |
 | 19 | Two servers: a Raft leader change with staged data on the old leader's disk | leadership moves; the old leader stays up, or goes down | A, B, F | `PutStaged` names the tier holding the block; reads of a blob staged elsewhere go to that server, or answer `Unavailable` while it is down; only the server holding a block flushes it. Until blocks are copied to two other tiers before the commit ([write-path.md](write-path.md#63-what-an-acknowledgement-means-now)), losing that server's disk is scenario 18 | after HA; not in stages 3 to 5 |
-| 20 | Clock jumps | the wall clock steps forward or back | A, F, G, property 6 | the seal delay and the unflushed age are measured on a monotonic clock, so a step neither seals early nor hides an old block; farm time in the log never goes back; object ids do not depend on time | stage 4 (unit tests on a paused clock); stage 5 once `kbf-sim` models clock skew ([simulation.md](simulation.md#8-the-cell-kbf-sim-cell) lists it as not modeled) |
+| 20 | Clock jumps | the wall clock steps forward or back | A, F, G, property 6 | the seal delay and the unflushed age are measured on a monotonic clock, so a step neither seals early nor hides an old block; farm time in the log never goes back; object ids do not depend on time | stage 4 (unit tests on a paused clock); stage 5 once `kbf-sim` models clock skew ([simulation.md](simulation.md#3-the-cell-kbf-sim-cell) lists it as not modeled) |
 | 21 | The orphan sweep after each crash | every crash point of 1 to 5, 11, 12 and 27, then a start (replaying the log, or from a snapshot as in 31) | E | `.blk` files of older epochs not staged are deleted and the directory synced: a block synced before its `PutStaged` committed, an upload open at the restart (its own block, never committed), and a flushed object's `.blk` left by a crash after `ObjectFlushed` and before the rename (the store holds the object). `.seg` files stay; no budget is held by a file nothing names | today: store orphans counted (`RunReport::orphans`) after every crash point; directory sweep stage 4; **stage 5: `every_tier_crash_point_keeps_every_property` (the `tier-after-sync` and `tier-before-rename` rows) and property 12 at every start** |
 | 22 | A wrong or missing `TIER` | the directory names another id, or none, while objects are staged | A | the server refuses to start; only `--hot-store-abandon=<id>` proceeds, as in 18 | stage 4 |
 | 23 | Two groups on one block commit out of order, then a crash | the later group's `PutStaged` applies first | B, C | the committed length is the larger `end`; both groups read back; `PutStaged` after `SealStaged` is refused | stage 3 (state machine) + stage 4 |
@@ -166,7 +166,7 @@ Each has a unit test fed a violation (`src/check/tier.rs`).
 
 | Test (`tests/write_tier.rs`) | Scenarios | Catches (planted, each red) |
 |---|---|---|
-| `the_tier_stages_flushes_and_survives_a_rollback` (16 `TierCalm` seeds): staged acks, flushes and reads in every seed, no read error (none is injected), reads during a flush PUT in at least 2 seeds; a version-1 binary opens the durable log, skips nothing (the server writes no raise), reads the same staged table, and this binary opens it again to the same staged table | 17, 30 | T3 the tier's `fdatasync` skipped (8); T4 its `sync_dir` skipped (8); a partial read of a staged block that answers an I/O error (8, a read error no fault caused) |
+| `the_tier_stages_flushes_and_survives_a_rollback` (64 `TierCalm` seeds): staged acks, flushes and reads in every seed, no read error (none is injected), reads during a flush PUT in at least 2 seeds; a version-1 binary opens the durable log, skips nothing (the server writes no raise), reads the same staged table, and this binary opens it again to the same staged table | 17, 30 | T3 the tier's `fdatasync` skipped (8); T4 its `sync_dir` skipped (8); a partial read of a staged block that answers an I/O error (8, a read error no fault caused) |
 | `every_tier_crash_point_keeps_every_property` (each of the 10 points, under a kill and power cuts keeping none and all; 4 seeds each): most runs crash, and each next start did what the point implies: after the sync the block is swept or cut back, before the rename it is swept, before the reply and after the ack it is kept whole, after the flush PUT the object is PUT again under its id and flushed | 1 to 5, 11, 12, 21 | T3, T4; T5 the orphan sweep skipped (12); T6 the rename to a flushed copy before `ObjectFlushed` commits (8) |
 | `tier_crash_seeds_keep_every_property` (32 `TierCrash` seeds) | 1 to 5, 11, 12, 21 | T5; T6; T7 bytes past the committed length kept at a start (12); T8 recovered unsealed blocks never named for their seal (13) |
 | `a_store_outage_fills_the_tier_then_pushes_back` (16 + 2 seeds): every ack inside the outage is a staged one, the budget pushed back in every seed, and acks resume after | 6, 7 | T9 the budget not enforced (11); T10 eviction that deletes a staged block (8, 13) |
@@ -180,7 +180,7 @@ log that was never raised, and that a raise an earlier build wrote is replayed.
 
 Not covered yet: the unflushed-age metric and alert (G), a disk loss and
 `--hot-store-abandon` (18, 22, 29), `FlushConflict` (28; the cell's store has no
-`conditional_put`), segment uploads and streamed own blocks (27), snapshots (31), a daemon input cache (32, 33), two
+`conditional_put`), segment uploads and streamed own blocks (27), snapshots (31), a daemon input cache (32, 33, which kbf no longer has a daemon for), two
 servers (19) and clock jumps (20).
 
 ## 5. The seams stages 3 to 5 plug into
@@ -203,9 +203,9 @@ servers (19) and clock jumps (20).
   disk loss, a full tier) and sweeps them as the store kinds are swept.
 - **What the cell does not model yet**: a metadata snapshot (scenario 31; the cell's
   server opens its log with `RaftMetaLog::open`, which writes no snapshot and refuses a
-  raft directory that holds one) and an input cache in the fake daemon (`src/daemon.rs` runs leases and fetches
-  nothing; scenarios 32 and 33). Each is a new step or a new part of an actor, not a
-  new fault on an existing one.
+  raft directory that holds one) and an input cache next to a daemon (scenarios 32 and 33: the cell has no daemon,
+  and kbf no longer has one). A snapshot is a new step of the server, not a new fault on
+  an existing one.
 
 ## 6. Questions this catalogue raises for write-path.md
 

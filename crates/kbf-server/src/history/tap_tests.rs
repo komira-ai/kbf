@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use kbf_history::records::{HitHow, MemoryKill, RunOutcome};
 use kbf_history::{Event, EventQueue, InvRef, Minter, QueueLimits};
+use kbf_invocation::RequeueReason;
 use kbf_invocation::{
     ActionRow, ActionShape, Attempt, AttemptEnd, Ended, EndedKind, How, Listing, NumaBytes,
     Outcome, Output, ReapiTimes, RecordKey, Run, RunUsage, Target, TargetKind, Text, WallTime,
 };
-use kbf_sched::RequeueReason;
 use kbf_types::{Digest, DigestFunction, Failure, LeaseId, LostWhy, WorkerId};
 
 use super::{HistoryTap, OPEN_CAP, RUN_INDEX_CAP, RunIndex};

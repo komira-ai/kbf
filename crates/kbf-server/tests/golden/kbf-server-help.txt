@@ -7,7 +7,7 @@ Options:
           The roles to run
 
           Possible values:
-          - all: Front, scheduler and metadata in one process
+          - all: Front, executor and metadata in one process
           
           [default: all]
 
@@ -30,7 +30,7 @@ Options:
           The directory of the metadata log (the CAS index and the action cache, a single-voter Raft log), on a local disk; created if missing. An empty directory gets a new log with a new id; every later start over it reads the id from the directory. Left out, it is `<hot store directory>/meta`; required when there is no `file://` hot store. Given, it wins over the hot store's directory
 
       --state-store <URI>
-          Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a local Unix socket, reached as this process's own user (peer authentication; a URL with a password is refused, as the command line is world-readable). The server must flush commits before it acknowledges them (`synchronous_commit` on) or the start is refused; the tables are created if missing. Or `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing: 0600, and 0700 for a directory it makes; a second frontend on it refuses to start); SQLite is removed in the next release, so a start on it logs a warning (see the upgrade notes). A start keeps the epoch the store holds, so workers that reconnect keep the runs of the leases they hold; an operator raises it with `kbf cluster epoch-bump`, after a restore from a backup. `kbf frontend` refuses to start without it; left out of `kbf-server`, the scheduler's state is in memory and a restart loses it
+          Where the storage members and the unfinished operations are kept, so that another frontend, or this one after a restart, answers and takes them up: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a local Unix socket, reached as this process's own user (peer authentication; a URL with a password is refused, as the command line is world-readable). The server must flush commits before it acknowledges them (`synchronous_commit` on) or the start is refused; the tables are created if missing. Or `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing: 0600, and 0700 for a directory it makes; a second frontend on it refuses to start); SQLite is removed in the next release, so a start on it logs a warning (see the upgrade notes). `kbf frontend` refuses to start without it; left out of `kbf-server`, the operations are in memory and a restart loses them
 
       --log-dir <DIR>
           The directory of the durable log file, `kbf-server.log` and its rotated `kbf-server.log.1`, `.2`, ... (created if missing): every event stderr gets, in the same format, kept across restarts. Left out, it is `<hot store directory>/log` when the hot store is a directory; with neither, there is no file and the server logs to stderr alone (the start logs which). A directory or file that cannot be written never stops the server ([`crate::log_file`])
@@ -69,7 +69,7 @@ Options:
           The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are open to whoever reaches it: bind it where only operators do
 
       --api-token-file <API_TOKEN_FILE>
-          A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the worker's, whose builds could read it. Without it, writes are refused
+          A file holding the token operator API writes (a frontend drain, a member's state) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the worker's, whose builds could read it. Without it, writes are refused
 
       --invocations-open
           Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy accepts, with no `invocations` or `blobs` key in the policy file (`docs/design/invocations.md` section 4.3): it fills in `allow` for whichever of the two keys the file leaves out. Without it, and without the keys, those routes answer 404. Pages and blobs hold build outputs and logs: give it only for a listener that only trusted people reach
@@ -104,99 +104,13 @@ Options:
           
           [default: 30]
 
-      --unservable-wait-secs <UNSERVABLE_WAIT_SECS>
-          How long, in seconds, queued work waits while no connected worker can run it (none satisfies its platform, or none that does is large enough) before it is refused FAILED_PRECONDITION. The wait restarts whenever one can
-          
-          [default: 300]
-
-      --default-platform <DEFAULT_PLATFORM>
-          The OS and architecture, as `<os>/<arch>` (`linux` or `macos`; `x86_64` or `arm64`), of an action whose platform names no OS, no architecture and no ISA level, so that it is not given to whichever node sorts first, a Mac among them. Not applied to an action that asks for `xcode` or an iOS device, which only a Mac reports. `none` applies no default: such an action runs on any node that fits. Placement only: the action's digest and cache key do not change
-          
-          [default: linux/x86_64]
-
-      --qos-allowed <QOS_ALLOWED>
-          The QoS levels a call may ask for with the `x-kbf-qos` request header, as a comma list of `ci`, `batch` and `interactive` (`ci` is always allowed: it is what a call with no header, or a header naming a level not on the list, gets, and that call is never refused). The level orders the queue, most urgent first: a `batch` action waits behind every queued `ci` action. It is not part of the action digest, so it does not split the cache. A client that sends no header stays at `ci`
-          
-          [default: ci,batch]
-
-      --memory-ladder-gib <MEMORY_LADDER_GIB>
-          The memory rungs of an action, in GiB, ascending and each at least 1. The first is what an action that names no size (`kbf-book-mem-gib`) books. An action that passes its own memory limit runs again on the next rung above what it booked, and after the last on a whole host: the memory of the largest node that could run it, so that no other lease fits there. A rung not below that node's memory is skipped for the whole host. An action that does finish keeps its rung: later runs of it start there
-          
-          [default: 4 16 32]
-
-      --exclusive-actions
-          Every `action` lease books the whole worker it lands on: all of its CPUs and all of its memory, whichever worker that is, so that exactly one action runs per worker and a second waits for it. The action digest is the client's and does not change (the per-action `kbf-book-cpus` and `kbf-book-mem-gib` properties would split the action cache); this is a setting of the server. `kbf-book-cpus` and `kbf-book-mem-gib` are still checked, but no longer change what is booked. `kbf-lease=whole_machine` and `vm` leases are as they were. An action killed for passing its own memory limit has no larger booking to climb to, so `--memory-ladder-gib` has no further rung to give it: it finishes out-of-memory, as an action that already books the largest node does, and its memory floor is not raised. A worker books by what it reported at registration. The setting is not kept in the state store, so a server restart ends it for the operations the store holds: one that was queued is read back as an ordinary action, and one that was running is recovered holding only the booking the front computed for it, not the worker, so ordinary actions can be placed beside it and, if it is lost or requeued, it runs again as an ordinary action. A run that needs one action per worker must not restart the server. Off by default
-
-      --no-memory-climb
-          Keeps an action's memory booking where it started. An action that passes its own memory limit is not run again on the next rung of `--memory-ladder-gib`: the kill finishes it, FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, as a kill at the largest node does, and its attempt is recorded with `memory_kill` `own_limit`. A booking is therefore the first rung, or the GiB the action names in `kbf-book-mem-gib`. No floor is raised, so with `--learned-sizes on` an own-limit kill leaves none either. A kill the node made under memory pressure is not the action's: it runs again with the same booking, as it does without this flag
-
-      --learned-sizes <LEARNED_SIZES>
-          What the farm does with `kbf-estimator`, which predicts an action's memory from what its earlier runs used. `off` calls it never. `shadow` shows it every attempt that finishes and logs, for every new operation, a `size estimate:` line with what it would book, and counts how the attempts fall against its estimates (`kbf_estimator_shadow_total`); it books exactly what `off` books. `on` is `shadow` plus one change to a booking: a kill at an action's own memory limit leaves a floor under the action's key (instance, platform class, instrument and shape), which every later digest of the key, queued or new, books at least, strictly below the memory of the largest node that could run it. The floor falls only by the estimator's decay: it halves once the key has run 256 times and 7 days have passed without an own-limit kill or a sample above half of it, and a floor that falls to the first rung or below is dropped; a kill raises it again. Only an action whose memory the client did not name, on a platform that pins the OS, is keyed. The size summaries and the keys are kept in the state store, in rows of their own that a release without this flag never reads; `off` neither reads nor deletes the summaries, and ignores the keys. The memory a floor raised a queued operation to is not stored: a restart, or a rollback to `off`, books such an operation at its submitted memory until it ends
-
-          Possible values:
-          - off:    The estimator is never called and nothing is read from or written to the store
-          - shadow: The estimator hears of every finished attempt and is asked for every new operation; the answers are logged and counted. Bookings are unchanged
-          - on:     `shadow`, and one change to a booking: a kill at an action's own memory limit leaves a floor under the action's key that its later digests book at least, until the estimator's decay lowers it
-          
-          [default: off]
-
-      --scheduler-core <SCHEDULER_CORE>
-          Which core drives the farm's scheduling. The one value is `legacy`, the default: the driver the server has always had. `js` names a core that was removed, because scheduling runs in the job service, and is refused at start (exit status 2). The core a server runs is logged at start and exported as `kbf_scheduler_core{core}`, the one series `kbf_scheduler_core{core="legacy"} 1`
-
-      --placement-load <PLACEMENT_LOAD>
-          Whether placement reads the load the nodes report. `off`, the default, books by the CPUs a lease asks for, as the server always has, and reads no load. `on` admits and ranks nodes by the load they report and the load a lease is predicted to add; a node that reports none is charged by prediction alone, and a node that has never sent a reading the server accepted is charged at least 1000 m for each lease (the node's whole CPU capacity, if that is less), so a prediction under one core changes nothing for such a node. `on` also keeps the flat memory charged to a node's leases within the node's memory; that guard counts only leases that carry a memory (a retry up the memory ladder, a VM) unless `--placement-predictions on` gives leases one
-
-          Possible values:
-          - off: Placement books by the CPUs a lease asks for, as it always has; the load is not read
-          - on:  Placement admits and ranks nodes by the load they report and the load a lease is predicted to add
-
-      --placement-predictions <PLACEMENT_PREDICTIONS>
-          Whether the farm gives its scheduler the estimator's prediction of what a new operation costs, from the rows `--learned-sizes` keeps, so that placement charges the learned cores and memory instead of the cores the request asked for and no memory. `off`, the default, computes none. `shadow` computes the prediction at submit, gives the scheduler nothing, and compares it with the run when it ends: the cores the run used on average, its peak memory and its life in whole minutes, each counted as under (the run used more than predicted), fit (at most the prediction and at least half of it) or over (less than half of it) in `kbf_prediction_vs_run_total`; the operations given a prediction are counted in `kbf_prediction_made_total` and those given none, by why, in `kbf_prediction_unset_total`. Placement is exactly what `off` does. `on` gives the scheduler the prediction as the cost of the operation's lease, at submit (and again for an operation read back from the state store at a start), which charges the learned memory as well as the cores: a lease is admitted to a node only while the memory charged to the node's leases stays within the node's memory. An operation the estimator has no usable row for, or is not asked about (not an action, one that asks for a GPU, no OS pinned, no subject), gets none and is charged as it is with `off`. `shadow` and `on` need `--learned-sizes shadow` or `on`; `on` needs `--placement-load on`; a prediction only changes what the lease is charged: the memory limit and the cores it is booked and run with stay the request's and the ladder's. A server given a combination that breaks one of these refuses to start
-
-          Possible values:
-          - off:    No prediction is computed, counted or given to the scheduler
-          - shadow: The prediction is computed and counted at submit and compared with the run when it ends; the scheduler is given nothing, so placement is what `off` does
-          - on:     The prediction is computed at submit (and again for an operation read back from the state store) and given to the scheduler as the cost of the operation's lease
-
-      --usage-profiles <USAGE_PROFILES>
-          Whether the farm learns what its leases use. Only `off`, the default, is accepted: it learns nothing and writes no row. `record` and `on` were run by the js scheduler core, which was removed because scheduling runs in the job service, and a start given one is refused (exit status 2). The mode a server runs is logged at start as `usage profiles: <mode>` and exported as the gauge `kbf_usage_profiles_mode{mode}`, 1 for the mode and 0 for the others
-
-          Possible values:
-          - off:    Nothing is learned or stored
-          - record: Refused at start: the core that ran it was removed
-          - on:     Refused at start: the core that ran it was removed
-
-      --whole-node-max <WORKERS>
-          Turns on the whole-node drain and caps for whole-machine requests (`kbf-lease` `whole_machine`), and names the most workers that may be whole at once: held by a whole-machine lease or reserved for a queued request (a request that fits nowhere reserves the worker that will empty soonest, and nothing newer is placed there). The ceiling is also at most the workers that serve whole-machine leases less `--whole-node-keep-for-ordinary`, and falls as workers leave. Left out, the scheduler books whole-machine requests as it always has, and the other `--whole-node-*` flags are refused. A request's reservation is never given up: it ends when its worker is empty and the request is granted, or when the request is cancelled or the worker can no longer hold it
-
-      --whole-node-max-draining <WORKERS>
-          The most workers reserved for a queued whole-machine request that still run other leases at once: the idle capacity a drain may cost. Default 1
-
-      --whole-node-keep-for-ordinary <WORKERS>
-          The fewest workers that carry neither a reservation nor a whole-machine lease, so ordinary work always has them. 0 lets whole-machine requests take every worker
-
-      --whole-node-allow-last-capable
-          Lets a reservation start on the last worker an older ordinary request that waits could run on. Off, the request waits for another worker, so a whole-machine request never takes the only worker such a request has
-
-      --whole-node-drain-after-secs <SECONDS>
-          How long, in seconds, a whole-machine request waits before it reserves a worker; until then it takes only a worker with no lease. 0, the default, reserves at once
-
-      --whole-node-drain-deadline-secs <SECONDS>
-          How long, in seconds, a reservation is expected to drain its worker: the deadline the queue document shows. Reaching it gives nothing up: the reservation stays until the request is granted or cancelled, or the worker can no longer hold it, and nothing running is stopped. Left out, the request's longest wall time, the `timeout` of its action; an action that names none has no wall time, and its deadline is the end of time
-
-      --whole-node-reserve-backoff-secs <SECONDS>
-          How long, in seconds, a worker stays barred to a request after a failed prepare there. kbf bars no worker this way and a reservation is never given up, so the setting changes nothing; it is still read, so a configuration that names it starts. Default 300
-
-      --whole-node-max-reserve-attempts <COUNT>
-          Deprecated: a reservation is never given up, so there is no attempt to count. Still read, and refused at 0, so a configuration that names it starts; it changes nothing. Default 2
-
       --finished-retention-secs <FINISHED_RETENTION_SECS>
-          How long, in seconds, a finished operation is kept after its callers are answered. Within it, WaitExecution on the operation's name streams its result (a client whose Execute stream broke gets a result the action cache does not keep, such as a failure); after it, the name is NOT_FOUND. Every operation finished within it is held in memory
+          How long, in seconds, a finished operation is kept after its callers are answered. Within it, WaitExecution on the operation's name streams its result (a client whose Execute stream broke gets a result the action cache does not keep, such as a failure); after it, the name is NOT_FOUND, unless the state store still holds the result (at least ten minutes). Every operation finished within it is held in memory
           
-          [default: 60]
+          [default: 600]
 
       --shutdown-timeout-secs <SHUTDOWN_TIMEOUT_SECS>
-          The operator's hard stop, in seconds, for a stop (SIGINT or SIGTERM). A stop refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done, however long that takes; the exception is a stream whose operation was never started and that no worker on this frontend can run (say every capable worker is cordoned) and no other frontend can take, which ends UNAVAILABLE as the drain begins (Buck2 retries only the opening of a call). The operation stays queued. The default, 0, is no deadline: the stop waits indefinitely, and a second signal is the other way to end it at once. Buck2 never recovers a stream that breaks mid-action, so set one only to force a stop: when it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off). `--drain-deadline` on a frontend over a state store only reports
+          The operator's hard stop, in seconds, for a stop (SIGINT or SIGTERM). A stop refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done, however long that takes. The default, 0, is no deadline: the stop waits indefinitely, and a second signal is the other way to end it at once. Buck2 never recovers a stream that breaks mid-action, so set one only to force a stop: when it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off). `--drain-deadline` on a frontend over a state store only reports
           
           [default: 0]
 

@@ -39,7 +39,7 @@ fn count(swept: &Sweep, met: impl Fn(&RunReport) -> bool) -> usize {
 /// least 2 seeds.
 #[test]
 fn the_tier_stages_flushes_and_survives_a_rollback() {
-    let swept = swept(Kind::TierCalm, 16);
+    let swept = swept(Kind::TierCalm, 64);
     for (seed, r) in &swept.reports {
         let at = format!("seed {seed}: {:?}", r.tier);
         assert!(r.tier.staged_acks > 0, "nothing staged: {at}");
@@ -56,7 +56,7 @@ fn the_tier_stages_flushes_and_survives_a_rollback() {
     let in_flush = count(&swept, |r| r.tier.reads_in_flush > 0);
     assert!(
         in_flush >= 2,
-        "{in_flush} of 16 seeds read during a flush PUT"
+        "{in_flush} of 64 seeds read during a flush PUT"
     );
 }
 

@@ -55,8 +55,7 @@ Everything the pages read is shown **unredacted** to whoever reaches the port:
 - the end of each failed action's stdout and stderr, each attempt's logs on the Log page
   (the last 1 MiB, or the first with `?from=start`, with a note when it is cut), and a link
   that downloads the whole log;
-- node names, software versions, capacity, leases and the queue, and storage members and
-  their health.
+- storage members and their health.
 
 This holds whatever the REAPI authentication policy says: the pages ask the policy-gated
 build, log and blob routes in process with every caller allowed. The same routes asked over
@@ -91,26 +90,21 @@ directly, bounds by the peer address: browsers behind one such address share one
 ## The pages
 
 Every path is under `/ui`. An opt-in `?refresh=N` (N is 5, 10, 30 or 60 seconds) reloads
-Overview, Nodes and Node; any other value or parameter is a `400`.
+Overview; any other value or parameter is a `400`.
 
 | Page | Path | Shows |
 |---|---|---|
-| Overview | `/ui` | Readiness and failing checks, nodes by state, queue depth, leases held, storage summary, the ten latest builds |
+| Overview | `/ui` | Readiness and failing checks, storage summary, the ten latest builds |
 | Builds | `/ui/builds` | Recent builds, filtered by state and instance, with a lookup of one build by id |
 | Build | `/ui/builds/{id}` | One build's summary, its failed actions first, then its actions |
 | Action | `/ui/builds/{id}/actions/{digest}` | One action; for a failed one, its failure class, command, exit code and log tails with links to the whole logs |
 | Targets | `/ui/targets` | The tests the farm has run, each with a strip of its last 16 builds' outcomes |
 | Target | `/ui/targets/{key}` | One test's recent builds as a pass/fail strip, each cell a link to its build |
-| Nodes | `/ui/nodes` | Every node: connection, placement, phase, software, update state, leases, booked resources |
-| Node | `/ui/nodes/{id}` | One node's capacity, booked and free resources, and leases |
-| Leases | `/ui/leases` | What the scheduler holds now: node, phase, age, operation, platform and QoS; filter `?node=` |
-| Queue | `/ui/queue` | Depth, oldest age, the queue per platform and QoS, and why operations wait or are kept off nodes |
 | Storage | `/ui/storage` | Under-replicated blobs, each member's state, repair debts and open writes, and its write-tier flush backlog |
 | Log | `/ui/runs/{run_id}/logs/{stream}` | One run's log (`stdout`, `stderr` or `result`) as escaped text, the last 1 MiB (`?from=start` for the first), with a note that names the end shown when it is cut, a link to the other end and a link that downloads the whole log; reached from the Action page |
 
-Nodes, leases and the queue live in the server's memory: after a restart of the frontend
-they are empty until the workers reconnect, and the pages say so, with the time the
-server started and how long it has run (`started_unix_ms` and `uptime_ms` of
+The pages say when the server started and how long it has run (`started_unix_ms` and `uptime_ms` of
 `GET /v1/health`; a page says the time is not known when the server does not send it).
+There are no pages for nodes, leases or a queue: kbf holds none (the job service has the jobs).
 A value the server
 does not know is shown as "unknown" or "not measured", never as zero.

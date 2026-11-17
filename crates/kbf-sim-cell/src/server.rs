@@ -5,13 +5,7 @@
 //!   is polled once, inside a Tokio runtime context for the tick task the open spawns,
 //!   which never runs. Farm time is the simulation's clock: the server commits
 //!   `Tick(now)` every [`TICK`] instead.
-//! - **The farm core** is a [`Scheduler`] of the log's term and a [`FarmMachine`],
-//!   fed as `crates/kbf-server/src/farm.rs` feeds them: each input and then a tick, a
-//!   committed record fed straight back, a `Start` recorded in the machine, a result
-//!   taken only from the holder of the operation's current lease and written to the
-//!   action cache before its callers are answered (and answered even if that write
-//!   fails), `Welcome` naming the log id as the lease epoch. Both live in memory, so a
-//!   restart loses them, as the server does today.
+//! - **Reads** of `FindMissingBlobs` are answered from the applied index.
 //! - **Writes** go to the object store first; the blob is committed to the log once
 //!   the store has it, and only then is the client told. A PUT the store answers as
 //!   failed, or not answered within [`PUT_TIMEOUT`], is answered `UNAVAILABLE`
@@ -33,32 +27,21 @@
 //!   the store. A crash or power cut takes both disks down together.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use crate::contact::FENCE_AFTER;
 use futures::FutureExt as _;
-use kbf_front::{Described, MetaLog};
+use kbf_front::MetaLog;
 use kbf_log::FarmLogId;
-use kbf_meta::{
-    ActionAnswer, ActionRecord, Applied, Closure, Command, Epoch, MetaState, ObjectId, Retention,
-    Role,
-};
-use kbf_sched::{DaemonInstance, Event as SchedEvent, Input, OpState, Request, Scheduler};
+use kbf_meta::{Applied, Command, Epoch, MetaState, ObjectId, Retention};
 use kbf_server::RaftMetaLog;
-use kbf_server::action_usage::Subject;
-use kbf_server::machine::{Booked, FarmMachine, Platform, Sent, Waiter};
-use kbf_server::stamp::Stamp;
 use kbf_sim::{Event, NodeId, NodeInput, Output};
 use kbf_store::{Fault, FaultFs};
-use kbf_types::{
-    ActionKey, Answer, Digest, Effect, FarmTime, LeaseId, LeaseKind, Outcome, Qos, Resources,
-    StartLease, StateMachine, WaiterId, WorkerId,
-};
+use kbf_types::{Digest, Effect, FarmTime, StateMachine};
 
 mod tier;
 mod write;
@@ -68,10 +51,8 @@ use crate::Msg;
 use crate::hook::{CrashPlan, Down, StorePoint, TierPoint};
 use crate::replica::{self, Broken, Replica};
 
-/// How often the server commits farm time and runs a placement round.
+/// How often the server commits farm time and runs a flush round.
 pub const TICK: Duration = Duration::from_secs(1);
-/// The heartbeat interval `Welcome` names.
-pub const HEARTBEAT: Duration = Duration::from_secs(5);
 const T_TICK: u64 = 0;
 const T_START: u64 = 1;
 const T_FAULT: u64 = 1 << 16;
@@ -132,13 +113,6 @@ pub struct ServerPlan {
 pub struct Seen {
     /// Each blob answered present, and when.
     pub present: Vec<(FarmTime, Digest)>,
-    /// Each lease given up, and whether its daemon was heard within T listing it.
-    pub requeues: Vec<(FarmTime, LeaseId, WorkerId, bool)>,
-    /// How many times each lease's result was accepted, for each lease a holder
-    /// reported (0: refused).
-    pub accepted: BTreeMap<LeaseId, u32>,
-    /// The actions with an accepted completed result.
-    pub won: BTreeSet<Digest>,
     /// How many times the server opened its log, and each refusal.
     pub starts: u64,
     pub refused: Vec<(FarmTime, String)>,
@@ -159,9 +133,6 @@ pub struct Seen {
     pub cuts: Vec<Cut>,
     /// What the local write tier did.
     pub tier: TierSeen,
-    /// Each action started, and the runs of the server's process ([`Seen::starts`])
-    /// that started it.
-    pub started: BTreeMap<Digest, BTreeSet<u64>>,
 }
 
 /// A `PutBlob` commit a crash cut part-way through ([`StorePoint::InCommit`]).
@@ -220,12 +191,6 @@ struct Up {
     writer: Epoch,
     /// The next object's sequence number in `writer`, shared with the tier's blocks.
     next_object: Arc<AtomicU64>,
-    lease_epoch: u64,
-    sched: Scheduler,
-    machine: FarmMachine,
-    streams: BTreeMap<WorkerId, u64>,
-    heard: BTreeMap<WorkerId, (FarmTime, Vec<LeaseId>)>,
-    callers: BTreeMap<WaiterId, NodeId>,
     uploads: BTreeMap<ObjectId, (NodeId, Digest)>,
     /// Each PUT waiting for the store, by its deadline timer's tag.
     deadlines: BTreeMap<u64, ObjectId>,
@@ -243,32 +208,6 @@ fn ready<F: Future>(future: F) -> F::Output {
 /// A new log's id draw that draws `id`.
 fn drawn(id: FarmLogId) -> impl FnOnce() -> std::io::Result<FarmLogId> {
     move || Ok(id)
-}
-
-fn wall(t: FarmTime) -> SystemTime {
-    UNIX_EPOCH + Duration::from_millis(t.as_millis())
-}
-
-/// The request every action makes: one core and 1 GiB, hermetic.
-fn request(action: Digest) -> Request {
-    Request {
-        key: key(action).into(),
-        qos: Qos::Ci,
-        kind: LeaseKind::Action,
-        resources: Resources::new(1_000, 1 << 30),
-        needs: kbf_caps::Request::default(),
-        hermetic: true,
-        whole_worker: false,
-        pin: None,
-        do_not_cache: false,
-    }
-}
-
-fn key(action: Digest) -> ActionKey {
-    ActionKey {
-        instance: "main".to_owned(),
-        action,
-    }
 }
 
 impl Server {
@@ -351,8 +290,7 @@ impl Server {
         self.out.push(Output::Timer { after, tag });
     }
 
-    /// Opens the log over what the disk holds and starts an empty farm core of its
-    /// term. A refused open is recorded and tried again after `down_for`.
+    /// Opens the log over what the disk holds. A refused open is recorded and tried again after `down_for`.
     fn start(&mut self, now: FarmTime, entropy: u64) {
         let log_id = FarmLogId::new(NonZeroU64::new(entropy).unwrap_or(NonZeroU64::MIN));
         let opened = {
@@ -373,25 +311,16 @@ impl Server {
                 return;
             }
         };
-        let leadership = log.leadership().expect("a raft log names its term");
         let Ok(Applied::Epoch(writer)) = ready(log.commit(Command::AllocEpoch)) else {
             self.down(Down::Kill);
             return;
         };
         let up = Up {
-            lease_epoch: leadership.log_id.get(),
-            sched: Scheduler::new(leadership.term)
-                .with_load_config(kbf_server::PlacementLoad::Off.config())
-                .recording_requeues(),
-            machine: FarmMachine::new(leadership.term),
             log,
             stopped: false,
             failed_at: None,
             writer,
             next_object: Arc::new(AtomicU64::new(0)),
-            streams: BTreeMap::new(),
-            heard: BTreeMap::new(),
-            callers: BTreeMap::new(),
             uploads: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             tier: None,
@@ -496,308 +425,22 @@ impl Up {
         ready(self.log.query(f)).expect("a query is never refused")
     }
 
-    /// Feeds `event` and then a tick, carrying out the effects in order, as the farm
-    /// core does; returns the answers.
-    fn feed(&mut self, now: FarmTime, event: SchedEvent, cx: &mut Cx<'_>) -> Vec<Answer> {
-        let mut effects: VecDeque<Effect> = self.sched.apply(Input::new(now, event)).into();
-        effects.extend(self.sched.apply(Input::new(now, SchedEvent::Tick)));
-        let mut answers = Vec::new();
-        while let Some(effect) = effects.pop_front() {
-            match effect {
-                Effect::Commit(record) => {
-                    let committed = SchedEvent::Committed(record);
-                    effects.extend(self.sched.apply(Input::new(now, committed)));
-                }
-                Effect::Start(start) => self.start_lease(now, &start, cx),
-                Effect::Answer(answer) => answers.push(answer),
-                // Every daemon serves every action, so nothing waits for a worker or is
-                // refused; a refusal would leave its callers unanswered (property 7).
-                Effect::Waiting(_) | Effect::Refuse(_) => {}
-            }
-        }
-        for requeue in self.sched.take_requeues() {
-            let listed = self
-                .heard
-                .get(&requeue.worker)
-                .is_some_and(|(at, running)| {
-                    now.saturating_duration_since(*at) < FENCE_AFTER
-                        && running.contains(&requeue.lease)
-                });
-            let seen = (now, requeue.lease, requeue.worker, listed);
-            cx.seen.requeues.push(seen);
-        }
-        self.forget_dropped();
-        answers
-    }
-
-    /// Forgets the callers of the finished operations the scheduler has dropped.
-    fn forget_dropped(&mut self) {
-        let sched = &self.sched;
-        self.machine.forget_dropped(|op| sched.state(op).is_some());
-        let machine = &self.machine;
-        self.callers.retain(|id, _| machine.waiter(*id).is_some());
-    }
-
-    fn start_lease(&mut self, now: FarmTime, start: &StartLease, cx: &mut Cx<'_>) {
-        let worker = &start.worker;
-        let process = cx.seen.starts;
-        let action = ActionKey::try_from(&start.key)
-            .expect("the cell submits the keys of actions")
-            .action;
-        let runs = cx.seen.started.entry(action).or_default();
-        runs.insert(process);
-        let stream = self.streams.get(worker).copied().unwrap_or_default();
-        cx.send(
-            NodeId::from(worker.as_str()),
-            Msg::Start {
-                stream,
-                lease: start.lease,
-                operation: start.operation,
-                action,
-            },
-        );
-        let queued = self
-            .sched
-            .waiters(start.operation)
-            .and_then(|w| w.first())
-            .and_then(|id| self.machine.waiter(*id))
-            .map_or(wall(now), |w| w.queued);
-        let sent = Sent {
-            operation: start.operation,
-            action,
-            stamp: Stamp {
-                queued,
-                started: wall(now),
-            },
-            booked: Some(Booked {
-                cpu_millis: start.resources.cpu_millis,
-                memory_bytes: start.resources.memory_bytes,
-            }),
-        };
-        self.machine.start(start.lease, sent);
-    }
-
-    fn answer_callers(&self, waiters: &[WaiterId], cached: bool, cx: &mut Cx<'_>) {
-        let callers = waiters
-            .iter()
-            .filter_map(|id| Some((self.callers.get(id)?, self.machine.waiter(*id)?)));
-        for (caller, waiter) in callers {
-            let action = waiter.key.action;
-            cx.send(caller.clone(), Msg::Answered { action, cached });
-        }
-    }
-
-    fn hello(
-        &mut self,
-        now: FarmTime,
-        from: &NodeId,
-        stream: u64,
-        instance: String,
-        capacity: Resources,
-        cx: &mut Cx<'_>,
-    ) {
-        let worker = WorkerId::new(from.as_str());
-        if self.streams.get(&worker).is_some_and(|s| *s >= stream) {
-            return;
-        }
-        self.streams.insert(worker.clone(), stream);
-        self.machine.register(&worker);
-        let welcome = Msg::Welcome {
-            stream,
-            epoch: self.lease_epoch,
-            interval_ms: u64::try_from(HEARTBEAT.as_millis()).expect("small"),
-        };
-        cx.send(from.clone(), welcome);
-        let caps = kbf_caps::NodeCaps::from_report([("arch", "x86_64")])
-            .expect("a valid report")
-            .with_drivers(["container"]);
-        let event = SchedEvent::WorkerUp {
-            worker,
-            instance: DaemonInstance::new(instance),
-            predecessor_stopped: false,
-            capacity,
-            caps,
-        };
-        self.feed(now, event, cx);
-    }
-
-    fn heartbeat(
-        &mut self,
-        now: FarmTime,
-        from: &NodeId,
-        stream: u64,
-        seq: u64,
-        running: Vec<LeaseId>,
-        cx: &mut Cx<'_>,
-    ) {
-        let worker = WorkerId::new(from.as_str());
-        if self.streams.get(&worker) != Some(&stream) {
-            cx.send(from.clone(), Msg::Reset { stream });
-            return;
-        }
-        cx.send(from.clone(), Msg::HeartbeatAck { stream, seq });
-        self.heard.insert(worker.clone(), (now, running.clone()));
-        let event = SchedEvent::Heartbeat {
-            worker: worker.clone(),
-            running: running.clone(),
-            load: None,
-        };
-        self.feed(now, event, cx);
-        let cancels: Vec<LeaseId> = self.sched.not_held(&worker, &running).collect();
-        for lease in cancels {
-            cx.send(from.clone(), Msg::Cancel { stream, lease });
-        }
-    }
-
-    /// The operation whose current lease is `lease`, if `worker` holds it and this
-    /// process sent its `Start`.
-    fn holder(&self, lease: LeaseId, worker: &WorkerId) -> Option<Sent> {
-        let sent = self.machine.sent(lease)?;
-        let (held, holder) = match self.sched.state(sent.operation)? {
-            OpState::Leased {
-                lease: held,
-                worker: holder,
-                committed: true,
-            }
-            | OpState::Running {
-                lease: held,
-                worker: holder,
-            } => (*held, holder),
-            _ => return None,
-        };
-        ((held, holder) == (lease, worker)).then_some(sent)
-    }
-
-    fn report(
-        &mut self,
-        now: FarmTime,
-        from: &NodeId,
-        lease: LeaseId,
-        action: Digest,
-        outcome: Outcome,
-        cx: &mut Cx<'_>,
-    ) {
-        let worker = WorkerId::new(from.as_str());
-        let holder = self
-            .holder(lease, &worker)
-            .filter(|sent| sent.action == action);
-        let Some(sent) = holder else {
-            cx.send(
-                from.clone(),
-                Msg::ResultAck {
-                    lease,
-                    accepted: false,
-                },
-            );
-            return;
-        };
-        let event = SchedEvent::Report {
-            operation: sent.operation,
-            lease,
-            outcome,
-        };
-        let answers = self.feed(now, event, cx);
-        let accepted = answers.iter().any(|a| a.lease == lease);
-        for answer in answers {
-            self.settle(&answer, cx);
-        }
-        *cx.seen.accepted.entry(lease).or_default() += u32::from(accepted);
-        cx.send(from.clone(), Msg::ResultAck { lease, accepted });
-    }
-
-    /// Writes a completed answer's action-cache entry, then answers its callers.
-    fn settle(&mut self, answer: &Answer, cx: &mut Cx<'_>) {
-        self.machine.forget_leases(answer.operation);
-        let action = answer
-            .waiters
-            .first()
-            .and_then(|id| self.machine.waiter(*id))
-            .map(|w| w.key.action);
-        if let (Outcome::Completed { action_result }, Some(action)) = (answer.outcome, action) {
-            cx.seen.won.insert(action);
-            let record = ActionRecord {
-                result: action_result.into(),
-                closure: Closure::new(),
-            };
-            let put = Command::PutAction {
-                role: Role::Daemon,
-                action,
-                record,
-            };
-            // A failed write is not retried; its callers are answered all the same.
-            self.commit(cx.out, put);
-        }
-        self.answer_callers(&answer.waiters, false, cx);
-        self.machine
-            .keep_finished(answer.operation, answer.waiters.clone());
-        self.forget_dropped();
-    }
-
-    fn execute(&mut self, now: FarmTime, from: &NodeId, action: Digest, cx: &mut Cx<'_>) {
-        if let ActionAnswer::Hit { .. } = self.query(|m| m.action(&action)) {
-            cx.send(
-                from.clone(),
-                Msg::Answered {
-                    action,
-                    cached: true,
-                },
-            );
-            return;
-        }
-        let waiter = self.machine.submit(Waiter {
-            key: key(action),
-            kind: LeaseKind::Action,
-            do_not_cache: false,
-            queued: wall(now),
-            // The simulation's actions have no `Command`: the `action usage:` line is not
-            // what it checks.
-            usage: Subject::of(Described::default()).0,
-            platform: Platform::of(&request(action).needs),
-        });
-        self.callers.insert(waiter, from.clone());
-        let event = SchedEvent::Submit {
-            waiter,
-            request: request(action),
-        };
-        self.feed(now, event, cx);
-    }
-
     fn receive(&mut self, now: FarmTime, from: &NodeId, msg: Msg, cx: &mut Cx<'_>) {
-        match msg {
-            Msg::FindMissing { digests } => {
-                let missing = self.query(|m| m.find_missing(&digests)).missing;
-                for digest in digests.iter().filter(|d| !missing.contains(d)) {
-                    cx.seen.present.push((now, *digest));
-                }
-                let reply = Msg::Missing {
-                    asked: digests,
-                    missing,
-                };
-                cx.send(from.clone(), reply);
+        if let Msg::FindMissing { digests } = msg {
+            let missing = self.query(|m| m.find_missing(&digests)).missing;
+            for digest in digests.iter().filter(|d| !missing.contains(d)) {
+                cx.seen.present.push((now, *digest));
             }
-            Msg::Execute { action } => self.execute(now, from, action, cx),
-            Msg::Hello {
-                stream,
-                instance,
-                capacity,
-            } => self.hello(now, from, stream, instance, capacity, cx),
-            Msg::Heartbeat {
-                stream,
-                seq,
-                running,
-            } => self.heartbeat(now, from, stream, seq, running, cx),
-            Msg::Report {
-                lease,
-                action,
-                outcome,
-                ..
-            } => self.report(now, from, lease, action, outcome, cx),
-            _ => {}
+            let reply = Msg::Missing {
+                asked: digests,
+                missing,
+            };
+            cx.send(from.clone(), reply);
         }
     }
 }
 
-/// What a handler writes to besides the farm core.
+/// What a handler writes to.
 struct Cx<'a> {
     out: &'a mut Vec<Output<Msg>>,
     seen: &'a mut Seen,
@@ -829,12 +472,11 @@ impl StateMachine for Server {
             Event::Timer { tag: T_TICK } => {
                 self.timer(TICK, T_TICK);
                 if let Some(up) = self.up.as_mut() {
-                    let mut cx = Cx {
+                    let cx = Cx {
                         out: &mut self.out,
                         seen: &mut self.seen,
                     };
                     up.commit(cx.out, Command::Tick(now));
-                    up.feed(now, SchedEvent::Tick, &mut cx);
                 }
                 self.flush_round(now);
             }
@@ -858,7 +500,7 @@ impl StateMachine for Server {
                 self.fault(fault);
             }
             Event::Message { from, msg } => {
-                // The write path and the tier, then reads and the farm core.
+                // The write path and the tier, then reads.
                 let asked = match &msg {
                     Msg::FindMissing { digests } => digests.clone(),
                     _ => Vec::new(),

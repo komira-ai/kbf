@@ -1,6 +1,6 @@
 //! The one-server cell over seed sweeps (crates/kbf-sim-cell; docs/design/ha.md
-//! section 15). Each run checks properties 1 to 7 after every step and panics with
-//! the kind, seed and property on a violation; `replay` reruns one seed.
+//! section 15). Each run checks properties 1 and 5 to 7 after every step and panics
+//! with the kind, seed and property on a violation; `replay` reruns one seed.
 
 use kbf_sim_cell::{Kind, Scenario, Sweep, run};
 
@@ -10,9 +10,9 @@ fn sweep(kind: Kind) -> Sweep {
     let swept = kbf_sim_cell::sweep(0..SEEDS, |seed| Scenario::new(kind, seed));
     swept.assert_clean();
     for (seed, report) in &swept.reports {
-        // Not vacuous: the server answered, and results were accepted.
+        // Not vacuous: the server answered, and uploads were acknowledged.
         assert!(report.present > 0, "{kind:?} seed {seed}: {report:?}");
-        assert!(report.accepted > 0, "{kind:?} seed {seed}: {report:?}");
+        assert!(!report.acked.is_empty(), "{kind:?} seed {seed}: {report:?}");
         if kind.restarts() {
             assert!(
                 report.starts > 1,
@@ -23,8 +23,7 @@ fn sweep(kind: Kind) -> Sweep {
     swept
 }
 
-/// Catches any defect that breaks a property with only the network's faults, all
-/// seven enforced.
+/// Catches any defect that breaks a property with only the network's faults.
 #[test]
 fn calm_seeds_keep_every_property() {
     sweep(Kind::Calm);
@@ -34,7 +33,7 @@ fn calm_seeds_keep_every_property() {
 /// its own log (7, the defect "a lost Bootstrap log id"), or answers a blob present
 /// that the store lacks (5).
 #[test]
-fn restart_seeds_keep_properties_1_2_5_6_7() {
+fn restart_seeds_keep_properties_1_5_6_7() {
     sweep(Kind::Restart);
 }
 
@@ -42,23 +41,15 @@ fn restart_seeds_keep_properties_1_2_5_6_7() {
 /// what is not (property 1: the defects "apply before commit" and "ack before
 /// fsync"), across power cuts now and part-way through a commit.
 #[test]
-fn crash_seeds_keep_properties_1_2_5_6_7() {
+fn crash_seeds_keep_properties_1_5_6_7() {
     sweep(Kind::Crash);
 }
 
 /// Catches an entry applied although its sync failed (property 1, read while the
 /// stopped log still serves reads).
 #[test]
-fn io_error_seeds_keep_properties_1_2_5_6_7() {
+fn io_error_seeds_keep_properties_1_5_6_7() {
     sweep(Kind::IoError);
-}
-
-/// Catches a daemon that does not fence once it has lost contact (property 2: its
-/// run goes on beside the run the scheduler grants again after G), and a lease given
-/// up while its daemon was still heard (3).
-#[test]
-fn partition_seeds_keep_properties_1_2_3_5_6_7() {
-    sweep(Kind::Partition);
 }
 
 /// Catches a cell that reads a clock, a random source or a hashed map's order: one

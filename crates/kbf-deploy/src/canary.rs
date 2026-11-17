@@ -10,9 +10,8 @@
 //! wall limit of [`WALL_SECS`], and the constraints of the executor's jobs (`linux`,
 //! `executor-arch`, containers).
 //!
-//! **It carries no `kbf-frontend` label.** The executor reads that label to find another
-//! frontend's jobs and stops when it finds one; a canary with it would stop the frontend it
-//! checks. It carries `kbf-canary=<frontend id>` instead, which the executor does not read.
+//! **It carries no `kbf-frontend` label**, which names the jobs of a farm's Executes: it carries
+//! `kbf-canary=<frontend id>` instead, so the canary is never counted as one of them.
 //!
 //! [`judge`] decides from what the service answers: a job that `SUCCEEDED` passes; one that
 //! ended any other way, or that the service does not know, fails, naming how; a live one is

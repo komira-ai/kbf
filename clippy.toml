@@ -1,4 +1,4 @@
-# Items the pure crates (kbf-types, kbf-caps, kbf-segments, kbf-meta, kbf-sched,
+# Items the pure crates (kbf-types, kbf-caps, kbf-segments, kbf-meta,
 # kbf-estimator, kbf-raft, kbf-invocation, kbf-map) must not use. Those crates deny
 # `clippy::disallowed_methods` and `clippy::disallowed_types` in their lib.rs; every other crate allows them through
 # `[workspace.lints.clippy]` in the root Cargo.toml. Time enters a pure core as an

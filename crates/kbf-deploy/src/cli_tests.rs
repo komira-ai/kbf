@@ -859,12 +859,6 @@ fn job_service_plan_and_apply_run_through_the_same_command_line() {
         "http://127.0.0.1:9443",
         "--token-file",
         "/etc/kbf/job-service.token",
-        "--hosts",
-        "2",
-        "--host-cpus",
-        "8",
-        "--host-memory-gib",
-        "32",
     ];
     let restart = [
         "--instance",

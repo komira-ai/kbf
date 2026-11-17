@@ -1,7 +1,6 @@
 //! The Overview page: is the farm healthy, on one screen.
 //!
-//! It reads `GET /v1/health` (readiness and the failing checks, nodes by state, the queue's
-//! depth, the leases held, the storage summary) and `GET /v1/invocations` (the latest
+//! It reads `GET /v1/health` (readiness and the failing checks, the storage summary) and `GET /v1/invocations` (the latest
 //! builds), and adds nothing of its own: every number is one the API sent. A value the API
 //! does not know is "unknown" or "not measured", never zero.
 
@@ -28,9 +27,6 @@ pub(crate) const OVERVIEW: Page = Page {
 struct Health {
     ready: bool,
     failing: Vec<Failing>,
-    nodes: NodeCounts,
-    queue: Queue,
-    leases: u64,
     storage: Option<Storage>,
     /// Why `storage` is `null`, when the membership could not be read.
     #[serde(default)]
@@ -47,25 +43,6 @@ struct Health {
 struct Failing {
     check: String,
     reason: String,
-}
-
-/// The nodes, each counted once in the first state that holds.
-#[derive(Debug, Deserialize)]
-struct NodeCounts {
-    total: u64,
-    serving: u64,
-    cordoned: u64,
-    draining: u64,
-    drained: u64,
-    quarantined: u64,
-    disconnected: u64,
-}
-
-/// The scheduler's queue.
-#[derive(Debug, Deserialize)]
-struct Queue {
-    depth: u64,
-    oldest_age_ms: Option<u64>,
 }
 
 /// The storage summary.
@@ -150,33 +127,12 @@ fn farm(h: &mut Html, health: &Health) {
     });
     failing(h, &health.failing);
 
-    h.el("h2", &[], |h| {
-        h.text("Nodes");
-    });
-    node_counts(h, &health.nodes);
-    let nodes = Href::root_relative("/ui/nodes").expect("the Nodes path is root-relative");
-    h.el("p", &[], |h| {
-        h.link(&nodes, "All nodes");
-    });
-    h.el("p", &[attr("class", "hint")], |h| {
-        h.text(
-            "Nodes, the queue and the leases are held in the server's memory: after a \
-             restart or a frontend swap they count only what has reconnected since.",
-        );
-    });
     started::note(h, &Started::of(health.started_unix_ms, health.uptime_ms));
 
     h.el("h2", &[], |h| {
-        h.text("Queue, leases and storage");
+        h.text("Storage");
     });
-    let oldest = health
-        .queue
-        .oldest_age_ms
-        .map_or_else(|| "not measured".to_owned(), |ms| format!("{ms} ms"));
-    let fields: [(&str, String); 5] = [
-        ("Queue depth", health.queue.depth.to_string()),
-        ("Oldest queued operation", oldest),
-        ("Leases held", health.leases.to_string()),
+    let fields: [(&str, String); 2] = [
         ("Storage members", members(health)),
         ("Under-replicated blobs", under_replicated(health)),
     ];
@@ -217,30 +173,6 @@ fn failing(h: &mut Html, failing: &[Failing]) {
                 });
             }
         });
-    });
-}
-
-fn node_counts(h: &mut Html, n: &NodeCounts) {
-    let cells: [(&str, u64); 7] = [
-        ("nodes", n.total),
-        ("serving", n.serving),
-        ("cordoned", n.cordoned),
-        ("draining", n.draining),
-        ("drained", n.drained),
-        ("quarantined", n.quarantined),
-        ("disconnected", n.disconnected),
-    ];
-    h.el("ul", &[attr("class", "counts")], |h| {
-        for (label, value) in cells {
-            h.el("li", &[], |h| {
-                h.el("span", &[attr("class", "n")], |h| {
-                    h.text(&value.to_string());
-                })
-                .el("span", &[attr("class", "label")], |h| {
-                    h.text(label);
-                });
-            });
-        }
     });
 }
 

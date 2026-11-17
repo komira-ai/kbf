@@ -1,4 +1,4 @@
-//! `kbf frontend` (`kbf_server::frontend`): its flags, Execute and the scheduler over a
+//! `kbf frontend` (`kbf_server::frontend`): its flags, Execute over a
 //! storage node (nothing in the frontend's process holds a blob), `/healthz` and
 //! `/readyz`, the state-store probe, and the mutual TLS toward a storage node: the
 //! frontend presents a certificate that names its role and verifies the node's against
@@ -52,7 +52,7 @@ use kbf_state::{
 };
 use kbf_storage::Storage;
 use serde_json::Value;
-use support::{Client, Job, PROMPT, done, ran, response};
+use support::{Client, Job, PROMPT, done, response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -131,7 +131,6 @@ struct Front {
     reapi: SocketAddr,
     worker: SocketAddr,
     api: SocketAddr,
-    farm: std::sync::Weak<kbf_server::farm::Farm>, // What a fake daemon registers with.
     _stop: oneshot::Sender<()>,
 }
 
@@ -149,19 +148,17 @@ impl Front {
             handle.worker.expect("a worker listener"),
             handle.api,
         );
-        let farm = handle.farm.clone();
         tokio::spawn(handle.serve());
         Self {
             reapi,
             worker,
             api: api.expect("the operator API"),
-            farm,
             _stop: stop,
         }
     }
 
     async fn client(&self) -> Client {
-        Client::connect_to(self.reapi, self.worker, self.farm.clone()).await
+        Client::connect(self.reapi, self.worker).await
     }
 }
 
@@ -330,20 +327,19 @@ fn the_storage_url_and_the_tls_flags_must_agree() {
 
 // ----------------------------------------------- Execute over a storage node
 
-/// Catches Execute and the scheduler still reading a cache of the frontend's own (which
-/// holds nothing here): a job whose Action, Command and inputs are on the storage node
-/// runs on a daemon, the accepted result's action-cache entry lands on the node (the
-/// frontend wrote it with both halves of the write), the same Execute is then answered
-/// from the node's action cache without a daemon, and a job whose input is not on the
-/// node is refused with the missing digest (the input check read the node's
-/// directories and asked it which files are missing).
+/// Catches Execute still reading a cache of the frontend's own (which holds nothing here): a
+/// job whose Action, Command and inputs are on the storage node and whose result the node's
+/// action cache holds is answered from that cache (the frontend read the node's action
+/// cache), a job the cache does not hold is refused FAILED_PRECONDITION by a frontend that
+/// runs no executor (nothing is queued or run), and a job whose input is not on the node is
+/// refused with the missing digest (the input check read the node's directories and asked it
+/// which files are missing).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn execute_reads_and_writes_the_storage_node() {
+async fn execute_reads_the_storage_node() {
     let node = Node::start().await;
     let url = format!("--storage=http://{}", node.addr);
     let front = Front::start(&flags(&[&url, "--heartbeat-interval-ms=100"]).expect("flags")).await;
     let client = front.client().await;
-    let mut daemon = client.daemon("node-a", 4, 8).await;
 
     let job = Job::new("build", &[]);
     client.upload(&job.blobs()).await;
@@ -355,28 +351,30 @@ async fn execute_reads_and_writes_the_storage_node() {
             .is_empty(),
         "the upload went to the node"
     );
-    let mut ops = client.execute(&job.action).await;
-    let start = daemon.start().await;
-    let result = support::output(&client, "built over storage", 0).await;
-    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    let last = done(&mut ops).await;
-    assert_eq!(response(&last).result, Some(result.clone()));
-    assert!(!response(&last).cached_result);
-    let (_, stored) = node
-        .storage
-        .action_result(&job.action.digest)
+    let miss = client
+        .execute_with(&job.action, false)
         .await
-        .expect("node")
-        .expect("the entry is on the node");
-    assert_eq!(support::unstamped(stored), result);
+        .map(|_| ())
+        .expect_err("no executor, and the node's action cache has no entry");
+    assert_eq!(miss.code(), tonic::Code::FailedPrecondition, "{miss:?}");
 
-    let mut again = client.execute(&job.action).await;
-    let answer = response(&done(&mut again).await);
+    let result = support::output(&client, "built over storage", 0).await;
+    let record = node
+        .storage
+        .prepare_action_result(&result)
+        .await
+        .expect("the output is on the node");
+    node.storage
+        .commit_action_record(kbf_meta::Role::Daemon, job.action.digest, record)
+        .await
+        .expect("the entry is written to the node");
+    let mut ops = client.execute(&job.action).await;
+    let answer = response(&done(&mut ops).await);
     assert!(
         answer.cached_result,
         "answered from the node's action cache"
     );
-    daemon.no_work().await;
+    assert_eq!(answer.result.map(support::unstamped), Some(result));
 
     let lonely = Job::new("lonely", &[]);
     client
@@ -802,7 +800,7 @@ fn scratch_dir(name: &str) -> kbf_testkit::dir::TestDir {
     )
 }
 
-/// Catches `--state-store` accepted and ignored by a frontend (the scheduler would run
+/// Catches `--state-store` accepted and ignored by a frontend (the executor's rows would be
 /// in memory while the operator believes its state is kept): a start over a SQLite path
 /// makes the file and serves, `/readyz` is ready with the store probed, a second start
 /// over the file the first holds is refused before anything is bound, and a path that
@@ -862,52 +860,6 @@ async fn a_postgres_store_not_up_is_refused_at_once_with_a_window_of_zero() {
         said.starts_with("the state store cannot be opened: "),
         "{said}"
     );
-}
-
-/// The `opkey/` rows of the SQLite state store at `path`, once the frontend that held it
-/// has stopped.
-async fn size_key_rows(path: &std::path::Path) -> Vec<String> {
-    use kbf_state::sqlite::{Options, SqliteStore};
-    for _ in 0..300 {
-        let opened = SqliteStore::open(
-            path,
-            Arc::new(kbf_state::SystemClock::default()),
-            Options::default(),
-        );
-        if let Ok(store) = opened {
-            let rows = store.scan_prefix("opkey/").expect("scan");
-            return rows.into_iter().map(|(key, _)| key).collect();
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("the state store is still held");
-}
-
-/// A frontend over external storage (it has no metadata log of its own, so no machine
-/// version to read) keys what it queues when `--learned-sizes=on` and writes the key in
-/// the `opkey/` row of its state store; with the default it writes none. The action
-/// names no memory and no platform, so the frontend's default platform pins the OS.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_over_external_storage_keeps_the_size_key_in_its_state_store() {
-    for (mode, rows) in [("on", 1), ("off", 0)] {
-        let node = Node::start().await;
-        let dir = scratch_dir(&format!("learned-{mode}"));
-        let state = dir.join("state").join("state.db");
-        let url = format!("--storage=http://{}", node.addr);
-        let store = format!("--state-store=sqlite://{}", state.display());
-        let sizes = format!("--learned-sizes={mode}");
-        let f = flags(&[&url, &store, &sizes, "--drain-lb-wait=0"]).expect("flags");
-        let front = Front::start(&f).await;
-        let client = front.client().await;
-        let job = Job::new("keyed", &[]);
-        client.upload(&job.blobs()).await;
-        // No daemon is connected: the operation is queued and stays so.
-        let ops = client.execute(&job.action).await;
-        drop((ops, client));
-        drop(front);
-        let found = size_key_rows(&state).await;
-        assert_eq!(found.len(), rows, "--learned-sizes={mode}: {found:?}");
-    }
 }
 
 /// Catches a plain-text listener off loopback starting without the warning the other
@@ -1417,72 +1369,6 @@ async fn the_reapi_listener_serves_tls_when_given_a_certificate() {
     assert!(!answered, "plain text was answered on a TLS listener");
 }
 
-/// Catches a frontend whose stop ends an open Execute (the copy of the shutdown path from
-/// before the drain: `closer.close()` at stop, UNAVAILABLE to the client, which Buck2 does
-/// not recover and so fails the action): with an action still running on a daemon, stop
-/// is signalled, a new Execute is refused, the open stream stays open, and
-/// when the daemon finishes the client gets the result and no error; the serving future
-/// ends once the client is gone. Catches: `kbf_server::serve::drain_and_stop` calling
-/// `closer.close()` before the sleep: the serving future ends at stop and the "holds the
-/// stop" assertion goes red.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_open_execute_survives_stop_until_its_action_is_done() {
-    let node = Node::start().await;
-    let url = format!("--storage=http://{}", node.addr);
-    let (stop, stopped) = oneshot::channel::<()>();
-    let handle = start_frontend(
-        &flags(&[&url, "--heartbeat-interval-ms=100"]).expect("flags"),
-        || {
-            Ok(async move {
-                let _ = stopped.await;
-            })
-        },
-    )
-    .expect("starts");
-    let (reapi, worker) = (handle.reapi, handle.worker.expect("a worker listener"));
-    let (farm, served) = (handle.farm.clone(), tokio::spawn(handle.serve()));
-    let client = Client::connect_to(reapi, worker, farm).await;
-    let mut daemon = client.daemon("node-a", 4, 8).await;
-
-    let job = Job::new("build", &[]);
-    client.upload(&job.blobs()).await;
-    let mut ops = client.execute(&job.action).await;
-    let start = daemon.start().await;
-
-    let late = Job::new("late", &[]);
-    client.upload(&late.blobs()).await;
-    // Uploaded now: the connection is going away once stop is signalled.
-    let result = support::output(&client, "built across the stop", 0).await;
-    stop.send(()).unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let refused = client
-        .execute_with(&late.action, false)
-        .await
-        .map(|_| ())
-        .expect_err("a stopping frontend takes no new Execute");
-    // UNAVAILABLE from the service, or CANCELLED when the listener's GOAWAY got there first.
-    assert!(
-        matches!(
-            refused.code(),
-            tonic::Code::Unavailable | tonic::Code::Cancelled
-        ),
-        "{refused:?}"
-    );
-    assert!(!served.is_finished(), "the open stream holds the stop");
-
-    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    let last = done(&mut ops).await;
-    assert_eq!(response(&last).result, Some(result));
-    drop(ops);
-    drop(client);
-    drop(daemon);
-    tokio::time::timeout(Duration::from_secs(30), served)
-        .await
-        .expect("the stop ends when the client is gone")
-        .unwrap()
-        .expect("served");
-}
-
 /// Catches a shutdown that waits for a client that never finishes: with a REAPI client
 /// stuck in an upload that never ends, the serving future ends when
 /// `--shutdown-timeout-secs` runs out, not when the client gives up.
@@ -1567,10 +1453,9 @@ async fn a_listen_address_that_is_taken_is_a_refused_start_naming_it() {
 /// Catches a `kbf frontend` that lacks what `kbf-server` has for its drain: the operator
 /// endpoint (`GET`/`POST /v1/frontend/drain`, one shared `Drain`), its counts of open
 /// streams and queued operations, and `Drain::close` (the second stop signal's action).
-/// An Execute runs on a node: the status reads one stream and no queued operation;
-/// a `POST` with the token drains (`/readyz` 503); a close ends the stream UNAVAILABLE
-/// and the serving future. Catches: the frontend's API router given a
-/// drain that is not the one its serving future drains.
+/// The status reads nothing open on an idle frontend; a `POST` without the token is refused
+/// and one with the token drains (`/readyz` 503); a close ends the serving future. Catches: the
+/// frontend's API router given a drain that is not the one its serving future drains.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1584,8 +1469,16 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
     let token_flag = format!("--api-token-file={}", path.display());
     let (_stop, stopped) = oneshot::channel::<()>();
     let heartbeat = "--heartbeat-interval-ms=100";
+    // The wait for the load balancer is a day, which the test ends by closing the drain; only a
+    // frontend over a state store has one, so it has a state store of its own.
+    let wait = "--drain-lb-wait=86400";
+    let state_dir = scratch_dir("front-drain-state");
+    let state = format!(
+        "--state-store=sqlite://{}",
+        state_dir.join("state.db").display()
+    );
     let handle = start_frontend(
-        &flags(&[&url, &token_flag, heartbeat]).expect("flags"),
+        &flags(&[&url, &token_flag, heartbeat, wait, &state]).expect("flags"),
         || {
             Ok(async move {
                 let _ = stopped.await;
@@ -1593,27 +1486,9 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         },
     )
     .expect("starts");
-    let (reapi, worker, api) = (
-        handle.reapi,
-        handle.worker.expect("a worker listener"),
-        handle.api.expect("an API"),
-    );
+    let api = handle.api.expect("an API");
     let drain = handle.drain();
-    let (farm, served) = (handle.farm.clone(), tokio::spawn(handle.serve()));
-    let client = Client::connect_to(reapi, worker, farm).await;
-    let job = Job::new("drained on a frontend", &[]);
-    client.upload(&job.blobs()).await;
-    let mut ops = client.execute(&job.action).await;
-    ops.message().await.expect("healthy").expect("QUEUED");
-    // A node takes the lease, so the stream has a running action: the drain keeps it.
-    let mut daemon = client.daemon("node-a", 4, 8).await;
-    daemon.start().await;
-    loop {
-        let op = ops.message().await.expect("healthy").expect("EXECUTING");
-        if support::stage(&op) == kbf_proto::reapi::execution_stage::Value::Executing as i32 {
-            break;
-        }
-    }
+    let served = tokio::spawn(handle.serve());
 
     let call = |token: Option<&'static str>, post: bool| async move {
         tokio::task::spawn_blocking(move || {
@@ -1633,7 +1508,7 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
     let want = serde_json::json!({
         "draining": false,
         "phase": "serving",
-        "open_executions": 1,
+        "open_executions": 0,
         "queued_operations": 0
     });
     assert_eq!(
@@ -1643,18 +1518,10 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
     assert_eq!(call(None, true).await.status, 401);
     let begun = call(Some(token), true).await;
     assert_eq!(begun.status, 200, "{begun:?}");
-    assert!(drain.is_draining());
+    assert_eq!(drain.phase(), kbf_server::drain::Phase::LbWait);
     assert_eq!(get(api, "/readyz").await.0, 503);
 
     drain.close();
-    let ended = tokio::time::timeout(PROMPT, ops.message())
-        .await
-        .expect("the stream ends after a close")
-        .expect_err("with an error");
-    assert_eq!(ended.code(), tonic::Code::Unavailable, "{ended:?}");
-    assert!(ended.message().contains("shutting down"), "{ended:?}");
-    drop((ops, daemon));
-    drop(client);
     tokio::time::timeout(Duration::from_secs(30), served)
         .await
         .expect("the frontend stops")

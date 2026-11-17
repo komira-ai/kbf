@@ -22,10 +22,10 @@
 
 mod support;
 
+use kbf_invocation::RequeueReason;
 use kbf_invocation::{
     CallKind, Event, ExecuteAnswer, Finished, LeaseEnd, Listing, Outcome, Output, Records,
 };
-use kbf_sched::RequeueReason;
 use kbf_types::{Digest, DigestFunction, LeaseId, OperationId, WorkerId};
 use prost::Message;
 use support::{call, ev, key, t};

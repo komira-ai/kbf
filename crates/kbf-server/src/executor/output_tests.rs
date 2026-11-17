@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use js_proto::v1::{GetLogsResponse, JobFile, JobResult, JobSpec, Refusal};
 use kbf_job_client::{Broken, Error, Stuck, Undecodable, Unsent};
 use kbf_proto::google::rpc::{self, ErrorInfo};
-use kbf_proto::worker;
 use prost::Message;
 use std::time::Duration;
 use tonic::Code;
@@ -236,14 +235,11 @@ fn a_result_without_output_has_no_tail_and_the_logs_answer_one() {
     );
 }
 
-fn failed() -> worker::Result {
-    worker::Result {
-        status: Some(rpc::Status {
-            code: Code::Unavailable as i32,
-            message: "why".to_owned(),
-            details: Vec::new(),
-        }),
-        ..worker::Result::default()
+fn failed() -> rpc::Status {
+    rpc::Status {
+        code: Code::Unavailable as i32,
+        message: "why".to_owned(),
+        details: Vec::new(),
     }
 }
 
@@ -255,8 +251,7 @@ fn fields(stdout: &str, stderr: &str, truncated: &str) -> BTreeMap<String, Strin
     ])
 }
 
-fn metadata(result: &worker::Result) -> BTreeMap<String, String> {
-    let status = result.status.as_ref().expect("a status");
+fn metadata(status: &rpc::Status) -> BTreeMap<String, String> {
     assert_eq!(status.details.len(), 1);
     let detail = &status.details[0];
     assert_eq!(detail.type_url, "type.googleapis.com/google.rpc.ErrorInfo");
@@ -278,16 +273,15 @@ fn the_output_is_a_detail_beside_the_reason() {
         note: None,
     };
     output.attach(&mut result);
-    let status = result.status.as_ref().expect("a status");
     assert_eq!(
-        (status.code, status.message.as_str()),
+        (result.code, result.message.as_str()),
         (Code::Unavailable as i32, "why")
     );
     assert_eq!(metadata(&result), fields("out", "err", "true"));
 }
 
-/// Catches an empty output adding a detail, and one attached to a result with no status
-/// making one up.
+/// Catches an empty output adding a detail, and a stream that is empty on one side hiding the
+/// other: only the stream that has something is shown, the other is the empty string.
 #[test]
 fn nothing_is_attached_when_there_is_nothing_to_say() {
     let mut result = failed();
@@ -300,13 +294,13 @@ fn nothing_is_attached_when_there_is_nothing_to_say() {
     }
     .attach(&mut only_stderr);
     assert_eq!(metadata(&only_stderr), fields("", "err", "false"));
-    let mut ok = worker::Result::default();
+    let mut only_stdout = failed();
     Output {
         stdout: "out".to_owned(),
         ..Output::default()
     }
-    .attach(&mut ok);
-    assert_eq!(ok, worker::Result::default());
+    .attach(&mut only_stdout);
+    assert_eq!(metadata(&only_stdout), fields("out", "", "false"));
 }
 
 /// Catches a failed read replacing the cause, and the service's own message (which this
@@ -352,10 +346,7 @@ fn a_failed_read_is_a_short_note_that_never_quotes_the_service() {
         let note = format!("the job's output could not be read: {said}");
         expected.insert("note".to_owned(), note);
         assert_eq!(metadata(&result), expected);
-        assert_eq!(
-            result.status.as_ref().map(|s| s.message.as_str()),
-            Some("why")
-        );
+        assert_eq!(result.message, "why");
     }
 }
 

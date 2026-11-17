@@ -3,8 +3,8 @@
 //!
 //! The cache half: `Capabilities`, `ContentAddressableStorage`, `ByteStream` and
 //! `ActionCache`, served by [`routes`] over one [`Cache`]. The execution half adds
-//! `Execution` over a [`Dispatch`], the scheduler's seam ([`routes_with_execution`]), and
-//! `Operations`, of which only GetOperation is served ([`OperationsService`]). The cache
+//! `Execution` over a [`Dispatch`], the job service's seam ([`routes_with_execution`]), and
+//! `Operations`, of which GetOperation and CancelOperation are served ([`OperationsService`]). The cache
 //! keeps its index and action cache in a [`MetaLog`] and its bytes in a
 //! [`kbf_objstore::ObjectStore`], packed into `kbf-segments` segments. Both are traits:
 //! [`Cache::memory`] runs them in this process ([`MemoryMetaLog`] and the fake store),
@@ -71,7 +71,6 @@ mod capabilities;
 mod cas;
 mod closure;
 mod cpu;
-mod default_platform;
 mod described;
 mod dir_cache;
 mod execution;
@@ -87,7 +86,6 @@ mod operations;
 mod output_index;
 pub mod prepare_run;
 mod proxy;
-mod qos_header;
 mod recorder;
 mod request_metadata;
 mod routed;
@@ -130,13 +128,11 @@ pub use crate::cache::{
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
-pub use crate::default_platform::{BadDefaultPlatform, DefaultPlatform};
 pub use crate::described::Described;
 pub use crate::execution::{
-    BOOK_CPUS_KEY, BOOK_MEM_GIB_KEY, Closer, Closing, DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN,
-    ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS, NO_WORKER_REASON,
-    OperationStream, Progress, ProgressTicker, Stage, Submission, Ticket, closing, missing_status,
-    progress,
+    Closer, Closing, Dispatch, ERROR_DOMAIN, ExecutionService, Finished, LEASE_KIND_KEY,
+    LEASE_KINDS, OperationStream, Progress, ProgressTicker, Stage, Submission, Ticket, closing,
+    missing_status, progress,
 };
 pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
@@ -151,7 +147,6 @@ pub use crate::proxy::{
     RejectReason, StoreError, Stored, UntrustedLimits, VerifyingKeys, ingest, ingest_put_dir,
     ingest_put_dir_with, ingest_set, large_key,
 };
-pub use crate::qos_header::{BadQosAllow, QOS_HEADER, QosAllow};
 pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
     Tap, listing, owner, wall_now,
@@ -271,35 +266,11 @@ where
         Progress::off(),
         authorizers,
         &Recorder::off(),
-        Defaults {
-            memory: DEFAULT_RESOURCES.memory_bytes,
-            platform: DefaultPlatform::NONE,
-            qos: QosAllow::DEFAULT,
-            exclusive_actions: false,
-        },
     )
 }
 
-/// What an `action` that names less than the farm needs is given.
-#[derive(Clone, Copy, Debug)]
-pub struct Defaults {
-    /// The memory an `action` that names no size books, in bytes
-    /// ([`ExecutionService::with_default_memory`]).
-    pub memory: u64,
-    /// The OS and architecture of an `action` that names neither
-    /// ([`ExecutionService::with_default_platform`]).
-    pub platform: DefaultPlatform,
-    /// The levels the `x-kbf-qos` header may name
-    /// ([`ExecutionService::with_qos_allow`]).
-    pub qos: QosAllow,
-    /// Whether every `action` lease owns the whole worker it lands on
-    /// ([`ExecutionService::with_exclusive_actions`]).
-    pub exclusive_actions: bool,
-}
-
 /// [`routes_with_authorizers`], each call that carries an invocation id sent to
-/// `recorder`, open streams re-sent at each tick of `progress`, and an `action` given
-/// `defaults` where it names no memory size, OS or architecture.
+/// `recorder`, and open streams re-sent at each tick of `progress`.
 pub fn routes_recorded<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
@@ -307,7 +278,6 @@ pub fn routes_recorded<M, O, D>(
     progress: Progress,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    defaults: Defaults,
 ) -> Routes
 where
     M: MetaLog,
@@ -323,11 +293,7 @@ where
             Arc::clone(&authorizers),
         )
         .recording(recorder.clone())
-        .with_progress(progress)
-        .with_default_memory(defaults.memory)
-        .with_default_platform(defaults.platform)
-        .with_qos_allow(defaults.qos)
-        .with_exclusive_actions(defaults.exclusive_actions),
+        .with_progress(progress),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -357,7 +323,6 @@ pub fn routes_proxied<D>(
     streams: OpenStreams,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    defaults: Defaults,
 ) -> Routes
 where
     D: Dispatch,
@@ -369,7 +334,6 @@ where
         streams,
         authorizers,
         recorder,
-        defaults,
     )
 }
 
@@ -384,7 +348,6 @@ pub fn routes_stored<D>(
     streams: OpenStreams,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    defaults: Defaults,
 ) -> Routes
 where
     D: Dispatch,
@@ -396,7 +359,6 @@ where
         streams,
         authorizers,
         recorder,
-        defaults,
     )
 }
 
@@ -408,7 +370,6 @@ fn execution_routes<D>(
     streams: OpenStreams,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    defaults: Defaults,
 ) -> Routes
 where
     D: Dispatch,
@@ -418,11 +379,7 @@ where
     let service =
         ExecutionService::with_authorizers(backend, dispatch, closing, Arc::clone(&authorizers))
             .recording(recorder.clone())
-            .with_progress(progress)
-            .with_default_memory(defaults.memory)
-            .with_default_platform(defaults.platform)
-            .with_qos_allow(defaults.qos)
-            .with_exclusive_actions(defaults.exclusive_actions);
+            .with_progress(progress);
     let execution = ExecutionServer::new(service)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);

@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use js_proto::v1::{ExecMode, Isolation, MountMode, MountPropagation, mount};
 use kbf_proto::reapi::{Digest, Platform, platform::Property};
-use kbf_types::LeaseId;
+use kbf_types::OperationId;
 
 use super::{
-    DEFAULT_MAC_OS_VERSION, MAC_ARCH, MAC_OS, MAC_OUT_TARGET, MacPool, MacPoolError, System,
+    DEFAULT_MAC_OS_VERSION, MAC_ARCH, MAC_OS, MAC_OUT_TARGET, MacPool, MacPoolError, RunId, System,
     TREE_TARGET, check_version, mac_argv, mac_constraints,
 };
 use crate::executor::PutDirRoots;
@@ -30,19 +30,19 @@ fn of(properties: &[(&str, &str)]) -> Result<System, String> {
 
 fn pool() -> MacPool {
     MacPool {
-        hosts: 2,
         bundle: format!("kbf-task@sha256:{}", "9a".repeat(32)),
         os_version: DEFAULT_MAC_OS_VERSION,
         roots: None,
     }
 }
 
-/// Asserts that an action asks for a Mac exactly when the farm would place it on one: every
-/// spelling of `OSFamily` the farm reads as macOS and `os=macos`, in any case of the name; and
+/// Asserts that an action asks for a Mac exactly when `kbf_caps` reads its platform as one:
+/// every spelling of `OSFamily` it reads as macOS and `os=macos`, in any case of the name; and
 /// that no platform, an empty one, a Linux one and one that names only an architecture are
-/// Linux. Catches a reader that knows fewer spellings than the farm, or takes any `os` for Linux.
+/// Linux. Catches a reader that knows fewer spellings than `kbf_caps`, or takes any `os` for
+/// Linux.
 #[test]
-fn an_action_asks_for_a_mac_as_the_farm_reads_its_platform() {
+fn an_action_asks_for_a_mac_as_kbf_caps_reads_its_platform() {
     let mac = System::Macos { os_version: None };
     for spelling in [
         &[("OSFamily", "macos")][..],
@@ -105,7 +105,7 @@ fn a_mac_actions_os_version_is_its_least_major_version() {
     }
 }
 
-/// Asserts that a platform the farm refuses is refused here with the farm's reason: an `os` no
+/// Asserts that a platform the reader refuses is refused here with the reader's reason: an `os` no
 /// worker runs, and `OSFamily` beside `os`.
 #[test]
 fn a_platform_the_farm_refuses_is_refused() {
@@ -113,21 +113,19 @@ fn a_platform_the_farm_refuses_is_refused() {
         &[("os", "windows")][..],
         &[("OSFamily", "macos"), ("os", "macos")],
     ] {
-        let farm = kbf_caps::Request::from_platform(bad.iter().copied())
-            .expect_err("the farm refuses it")
+        let reader = kbf_caps::Request::from_platform(bad.iter().copied())
+            .expect_err("the reader refuses it")
             .to_string();
-        assert_eq!(of(bad), Err(farm), "{bad:?}");
+        assert_eq!(of(bad), Err(reader), "{bad:?}");
     }
 }
 
-/// Asserts the pool's rules, each by its own error: a pool of no worker, a task bundle that is
+/// Asserts the pool's rules, each by its own error: a task bundle that is
 /// not pinned by a digest, and a least macOS of 0; and that a pool's roots are its
 /// own when it names them, else the Linux ones.
 #[test]
 fn a_pool_is_checked_and_its_roots_default_to_the_linux_ones() {
     assert_eq!(pool().validate(), Ok(()));
-    let none = MacPool { hosts: 0, ..pool() };
-    assert_eq!(none.validate(), Err(MacPoolError::NoHosts));
     let short = format!("kbf-task@sha256:{}", "9a".repeat(31));
     let upper = format!("kbf-task@sha256:{}", "9A".repeat(32));
     let nameless = format!("@sha256:{}", "9a".repeat(32));
@@ -147,10 +145,6 @@ fn a_pool_is_checked_and_its_roots_default_to_the_linux_ones() {
         ..pool()
     };
     assert_eq!(zero.validate(), Err(MacPoolError::OsVersion));
-    assert_eq!(
-        MacPoolError::NoHosts.to_string(),
-        "a pool of Macs needs at least one virtual worker"
-    );
     assert_eq!(
         MacPoolError::Bundle("kbf-task".to_owned()).to_string(),
         "the Macs' task bundle \"kbf-task\" is not pinned by an @sha256 digest (NAME@sha256:HEX)"
@@ -208,7 +202,11 @@ fn a_mac_task_is_told_the_tree_and_the_put_directory_in_exec() {
         hash: "cd".repeat(32),
         size_bytes: 3,
     };
-    let argv = mac_argv(&action, LeaseId::new(7, 8), Duration::from_secs(20));
+    let argv = mac_argv(
+        &action,
+        RunId::new(OperationId(7), 8),
+        Duration::from_secs(20),
+    );
     assert_eq!(
         argv,
         [

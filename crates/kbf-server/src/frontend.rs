@@ -162,7 +162,6 @@ use crate::drain::Drain;
 use crate::enroll::flags::EnrollFlags;
 use crate::enroll::start as enroll_start;
 use crate::executor::{Executor, Metrics as ExecutorMetrics, RunSource, Running};
-use crate::farm::Farm;
 use crate::front_maps::FrontMaps;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
@@ -175,10 +174,10 @@ use crate::retire::Retire;
 use crate::retired::RetiredHandoverFlags;
 use crate::sequence::{DrainTiming, Sequence, stopped};
 use crate::serve::{
-    AbortOnDrop, ServeError, cold_store, flow_control, keepalive, log_state, members_of,
-    membership, serve_api_goaway, stop_api, sweeping, worker_peers,
+    AbortOnDrop, ServeError, cold_store, flow_control, keepalive, members_of, membership,
+    serve_api_goaway, stop_api, sweeping, worker_peers,
 };
-use crate::stand::{QUIESCE_WAIT, Stand};
+use crate::stand::Stand;
 use crate::start::{Escalation, escalating, interruptions};
 use crate::state_store::Indexes;
 use crate::stop::Stop;
@@ -541,30 +540,17 @@ pub struct FrontendHandle {
     packs: Option<Packs>,
     /// The preparer of the runs `--task-secret-file` describes, if the flag was given.
     put_dir_prep: Option<Arc<PutDirPrep>>,
-    /// The count of intake polls the farm has run to the end ([`Farm::intake_polls`]).
-    intake_polls: tokio::sync::watch::Receiver<u64>,
-    /// The farm the serving future ticks, not owned here (it goes when serving ends): tests
-    /// register nodes with it in-process, as the executor's virtual workers do.
-    #[doc(hidden)]
-    pub farm: std::sync::Weak<Farm>,
     /// The count of sweeps the janitor of `cas/b/` has finished, if `--task-janitor-key-file`
     /// was given.
     janitor_sweeps: Option<tokio::sync::watch::Receiver<u64>>,
-    /// The executor `--executor js-agent` builds, stepped while the frontend serves.
+    /// The executor `--executor js-agent` builds: its task keeps its place in the state store
+    /// while the frontend serves.
     executor: Option<Executor>,
     /// The publishing of the kbf base tree, under `--executor js-agent`.
     base_tree: Option<base_tree::Start>,
 }
 
 impl FrontendHandle {
-    /// The count of intake polls this frontend's farm has run to the end
-    /// ([`Farm::intake_polls`]), told as each completes: a caller waits for polls by this
-    /// event and not by time.
-    #[must_use]
-    pub fn intake_polls(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.intake_polls.clone()
-    }
-
     /// The count of sweeps the janitor of `cas/b/` has finished (whole, stopped part way or by an
     /// error), told as each ends, or `None` without `--task-janitor-key-file`: a caller waits
     /// for sweeps by this event and not by time.
@@ -649,19 +635,11 @@ impl FrontendHandle {
         let _tasks: Vec<AbortOnDrop> = tasks
             .map(|task| AbortOnDrop(tokio::spawn(task).abort_handle()))
             .collect();
-        // Started with the listeners: a frontend that never serves submits no job. Stopped
-        // after the serving future (the listeners and their drain) is over, so the runs of
-        // builds still open are not cut before the drain ends; the background tasks above are
-        // not listeners and live to the end of this function.
-        let mut running = self.executor.map(Running::spawn);
-        let serving = escalating(self.serving, &self.drain, self.escalation);
-        let served = match running.as_mut() {
-            Some(running) => tokio::select! {
-                served = serving => served,
-                why = running.failed() => Err(ServeError::Executor(why)),
-            },
-            None => serving.await,
-        };
+        // Started with the listeners, and stopped after the serving future (the listeners and
+        // their drain) is over: until then this process's liveness row says its operations
+        // are being run, and no other frontend takes them up.
+        let running = self.executor.as_ref().map(Running::spawn);
+        let served = escalating(self.serving, &self.drain, self.escalation).await;
         if let Some(running) = running {
             running.stop().await;
         }
@@ -670,7 +648,7 @@ impl FrontendHandle {
 }
 
 /// What `/readyz` and the health service ask of a frontend, in the order they list the
-/// failures: the stop signal and the scheduler role ([`Readiness`]), the storage (the
+/// failures: the stop signal and the leader role ([`Readiness`]), the storage (the
 /// `--storage` node, or the owners the map names once `routed` routes by it), the state
 /// store if there is one, and the storage map.
 #[must_use]
@@ -827,10 +805,11 @@ impl<'a> Prepared<'a> {
     /// Reads the flags and binds the listeners.
     fn new(flags: &'a FrontendFlags) -> Result<Self, Box<dyn Error>> {
         let args = &flags.server;
-        args.check_scheduler_core()?;
         args.retired_release.warn();
         args.retired_worker.warn();
+        args.retired_scheduler.warn();
         flags.retired.warn();
+        flags.executor.warn_retired();
         let listeners = args.listeners()?;
         let proxy = args.proxy()?;
         let policy = args.reapi_auth_policy()?;
@@ -953,21 +932,19 @@ impl<'a> Prepared<'a> {
 
         let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
         let recording = crate::history::install(recording, history.as_ref());
-        let defaults = kbf_front::Defaults {
-            memory: listeners.memory_ladder.first(),
-            platform: listeners.default_platform,
-            qos: listeners.qos_allowed,
-            exclusive_actions: listeners.exclusive_actions,
-        };
-        let durable = state.is_some();
-        let farm = Farm::from_listeners(backend.clone(), &listeners).recording(recorder.clone());
-        crate::serve::log_core(&farm);
-        crate::serve::log_exclusive(listeners.exclusive_actions);
-        let farm = Arc::new(farm.with_state(state)?);
-        log_state(durable, farm.term(), farm.lease_epoch());
         let source = source.or_else(|| put_dir_prep.as_ref().map(RunSource::of_put_dir));
         let rows = state_store.clone();
-        let executor = executor_of(flags, &farm, &packs, &backend, source, timeout, rows)?;
+        let executor = executor_of(
+            flags,
+            &packs,
+            &backend,
+            source,
+            timeout,
+            rows,
+            recorder.clone(),
+        )?;
+        let dispatch =
+            crate::executor::Dispatcher::of(executor.as_ref().map(|built| built.executor.clone()));
         let checks = match &plane {
             stored::Plane::Node { storage, .. } => checks(
                 Arc::clone(&readiness),
@@ -1089,8 +1066,9 @@ impl<'a> Prepared<'a> {
         let delivery = object_stores.as_ref().map(|stores| stores.delivery.clone());
         // Set below, where the stand is built, if there is a state store to retire over.
         let retire = Arc::new(OnceLock::new());
+        let backend_for_stand = backend.clone();
         let api_routes = crate::api::router(
-            Arc::clone(&farm),
+            backend.clone(),
             token.clone(),
             Arc::clone(&drain),
             Arc::clone(&retire),
@@ -1103,7 +1081,11 @@ impl<'a> Prepared<'a> {
             token.clone(),
             object_stores.map(|stores| stores.api),
         ))
-        .merge(crate::health::routes(&checks, &farm, members.as_ref()))
+        .merge(crate::health::routes(
+            &checks,
+            executor.is_some(),
+            members.as_ref(),
+        ))
         .merge(metrics_route(
             backend.clone(),
             history.as_ref().map(crate::history::History::stats),
@@ -1115,7 +1097,6 @@ impl<'a> Prepared<'a> {
                 executor: executor.as_ref().map(|built| Arc::clone(&built.metrics)),
                 janitor: janitor_metrics,
             },
-            Arc::clone(&farm),
         ));
         // The storage health, if there are members.
         let api_routes = members.iter().fold(api_routes, |routes, members| {
@@ -1129,13 +1110,9 @@ impl<'a> Prepared<'a> {
         )
         .layer(ProxyAuthLayer::new(proxy_secret.clone()));
         let membership = membership(members.clone(), &peers, delivery.as_ref());
-        // The four calls a host's updater makes about its own node.
-        let node_calls = crate::node_self::routes(
-            Arc::clone(&farm),
-            members.clone(),
-            state_store.clone(),
-            peers.clone(),
-        );
+        // The call a host's updater makes about its own node.
+        let node_calls =
+            crate::node_self::routes(members.clone(), state_store.clone(), peers.clone());
         let cold_store = cold_store(members.clone(), &peers, delivery.as_ref());
         let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
         let authorizers = Arc::new(policy.authorizers);
@@ -1144,11 +1121,10 @@ impl<'a> Prepared<'a> {
             stored::Plane::Stored(stored) => kbf_front::routes_stored(
                 &stored,
                 backend,
-                Arc::clone(&farm),
+                Arc::clone(&dispatch),
                 streams,
                 authorizers,
                 &recorder,
-                defaults,
             ),
             stored::Plane::Node { channel, .. } => {
                 let bootstrap = Owner::new(&flags.storage_text(), channel);
@@ -1157,11 +1133,10 @@ impl<'a> Prepared<'a> {
                 kbf_front::routes_proxied(
                     &proxy,
                     backend,
-                    Arc::clone(&farm),
+                    Arc::clone(&dispatch),
                     streams,
                     authorizers,
                     &recorder,
-                    defaults,
                 )
             }
         };
@@ -1186,10 +1161,9 @@ impl<'a> Prepared<'a> {
         ];
         let stand = state_store.is_some().then(|| Stand {
             drain: Arc::clone(&drain),
-            farm: Arc::clone(&farm),
+            backend: backend_for_stand.clone(),
             worker: worker_stop.clone(),
             sweeper,
-            wait: QUIESCE_WAIT,
         });
         // Set once, here: nothing has called the retire or the drain route before the
         // listeners serve. A frontend over a state store drains by the sequence of
@@ -1202,8 +1176,6 @@ impl<'a> Prepared<'a> {
         background.extend(job_task);
         background.extend(janitor.map(|janitor| janitor.run().boxed()));
 
-        let intake_polls = farm.intake_polls();
-        let farm_handle = Arc::downgrade(&farm);
         let shutdown = shutdown()?;
         let stopper = Arc::clone(&drain);
         let serving = async move {
@@ -1251,16 +1223,6 @@ impl<'a> Prepared<'a> {
             )
             .fuse();
             tokio::pin!(api_serve);
-            let ticking = async {
-                let mut tick = tokio::time::interval(listeners.tick);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tick.tick().await;
-                    farm.tick().await;
-                }
-            };
-            // What the other frontends of a shared state store did (`Farm::intake`).
-            let intaking = farm.poll_intake();
             // The stop signal: the drain sequence of a frontend over a state store, else the
             // plain drain.
             let stopping = async {
@@ -1283,8 +1245,6 @@ impl<'a> Prepared<'a> {
                 Err(e) = worker_serve => Err(ServeError::from(e)),
                 Err(e) = &mut api_serve => Err(ServeError::Api(e)),
                 Err(e) = &mut enroll_serve => Err(ServeError::from(e)),
-                () = ticking => Ok(()),
-                () = intaking => Ok(()),
                 () = ticker.run() => Ok(()),
                 () = stopping => Ok(()),
                 () = drained => Ok(()),
@@ -1295,8 +1255,6 @@ impl<'a> Prepared<'a> {
                 api_stop.fire();
                 stop_api(api_stop_when_done, api_serve).await;
             }
-            // What the usage side learned and has not flushed yet.
-            farm.finish_usage().await;
             crate::history::finish(history).await;
             outcome
         };
@@ -1329,11 +1287,9 @@ impl<'a> Prepared<'a> {
             pack_index,
             packs,
             put_dir_prep,
-            intake_polls,
             janitor_sweeps,
             executor: executor.map(|built| built.executor),
             base_tree,
-            farm: farm_handle,
         })
     }
 }
@@ -1397,15 +1353,13 @@ struct Counters {
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
 /// counters when it keeps history, the storage health of `members` when there are any, the
 /// reloads of the listeners' `tls` files, the counters of the `packs` when there are any, those
-/// of the job-facing read when there is one, and the pack reads the workers of `farm` report
-/// and its failed actions by class.
+/// of the job-facing read when there is one, and the executor's when there is one.
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
     counters: Counters,
-    farm: Arc<Farm>,
 ) -> axum::Router {
     let Counters {
         packs,
@@ -1416,7 +1370,7 @@ fn metrics_route(
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
-        let (history, packs, farm) = (history.clone(), packs.clone(), Arc::clone(&farm));
+        let (history, packs) = (history.clone(), packs.clone());
         let executor = executor.clone();
         let job_read = job_read.clone();
         let janitor = janitor.clone();
@@ -1427,7 +1381,6 @@ fn metrics_route(
             }
             Packs::render_metrics_of(packs.as_ref(), &mut text);
             kbf_front::job_read::JobRead::render_metrics_of(job_read.as_deref(), &mut text);
-            crate::metrics::render_farm(&mut text, &farm);
             if let Some(executor) = executor {
                 executor.render(&mut text);
             }

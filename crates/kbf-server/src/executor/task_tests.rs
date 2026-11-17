@@ -1,14 +1,14 @@
 use std::time::Duration;
 
 use kbf_proto::reapi::Digest;
-use kbf_types::LeaseId;
+use kbf_types::OperationId;
 
-use super::{Delivery, PackKey, Secret, TaskArgs, build_id, put_dir_argv};
+use super::{Delivery, PackKey, RunId, Secret, TaskArgs, build_id, put_dir_argv};
 
 fn args<'a>(action: &'a Digest, grant: &'a Secret, url: &'a Secret, plain: bool) -> TaskArgs<'a> {
     TaskArgs {
         action,
-        lease: LeaseId::new(7, 3),
+        run: RunId::new(OperationId(7), 3),
         grant_url: "https://grant.test:9400",
         grant_token: grant,
         pack_url: url,
@@ -27,16 +27,19 @@ fn digest() -> Digest {
     }
 }
 
-/// Catches a build id the neighbours refuse: the farm prints a lease as `7.3`, and the pack
-/// key, the manifest and the ingest take a build of `0-9 a-z A-Z - _` only (a dot is refused,
-/// and every action would be rerun and answered INTERNAL). The id is `7-3`, and passes the
-/// pack crate's own check, for any lease.
+/// Catches a build id the neighbours refuse: the pack key, the manifest and the ingest take a
+/// build of `0-9 a-z A-Z - _` only (a dot is refused, and every action would be rerun and
+/// answered INTERNAL). The id of operation 7, attempt 3 is `7-3`, and passes the pack crate's
+/// own check, for any run.
 #[test]
-fn a_lease_is_a_build_id_the_pack_crate_accepts() {
-    assert_eq!(build_id(LeaseId::new(7, 3)), "7-3");
-    assert!(LeaseId::new(7, 3).to_string().contains('.'));
-    for lease in [LeaseId::new(0, 0), LeaseId::new(u64::MAX, u64::MAX)] {
-        assert_eq!(kbf_pack::check_build(&build_id(lease)), Ok(()), "{lease}");
+fn a_run_is_a_build_id_the_pack_crate_accepts() {
+    assert_eq!(build_id(RunId::new(OperationId(7), 3)), "7-3");
+    assert_eq!(RunId::new(OperationId(7), 3).to_string(), "7-3");
+    for run in [
+        RunId::new(OperationId(0), 0),
+        RunId::new(OperationId(u64::MAX), u32::MAX),
+    ] {
+        assert_eq!(kbf_pack::check_build(&build_id(run)), Ok(()), "{run}");
     }
 }
 
@@ -334,11 +337,15 @@ fn argv_delivery_is_unchanged() {
 }
 
 /// Asserts the task tool's command line for a run that commits into a put directory: the tree
-/// at `/`, the commit into `/out`, the action, the lease's build id, the deadline and the one-pass
+/// at `/`, the commit into `/out`, the action, the run's build id, the deadline and the one-pass
 /// object format, and nothing that names a url, a grant or a secret.
 #[test]
 fn a_put_dir_run_is_told_the_tree_and_out_and_no_secret() {
-    let argv = put_dir_argv(&digest(), LeaseId::new(7, 3), Duration::from_secs(90));
+    let argv = put_dir_argv(
+        &digest(),
+        RunId::new(OperationId(7), 3),
+        Duration::from_secs(90),
+    );
     let want = [
         "--tree",
         "--stage-and-commit",

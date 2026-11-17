@@ -1,31 +1,35 @@
 //! Where the time of one executor run goes, as the executor itself sees it.
 //!
-//! A run is stamped, on the executor's own clock, at the moments it passes: its `Start` first
-//! seen, its job prepared, its submit answered with the job, the job first read back as
-//! running, and read back as ended, and its ingest done. The time between two stamps is a phase, observed into
+//! A run is stamped, on the executor's own clock, at the moments it reaches: the Execute that
+//! made its operation (for a later attempt, the run before it ending), its job prepared, its
+//! submit answered with the job, the job first read back as running, and read back as ended,
+//! its ingest done, and its callers answered. The time between two stamps is a phase, observed into
 //! `kbf_executor_phase_seconds{phase=...}` the moment the second stamp is set. A phase whose
-//! first stamp was never set (the run was not seen running, the run never started) is not
+//! first stamp was never set (the run was not seen running, the run was never submitted) is not
 //! observed: it is absent, never zero.
 //!
 //! What the stamps can know is bounded by how the executor learns. The stamps are the
 //! executor's own clock, not the job's times, and the service learns a job's state from its
 //! host's agent, which trails the host by one or two beats; the executor reads each job once
-//! per pass. So `queue` and `task` are the executor's passes that first saw the job running and
-//! ended, not the instants the host started and finished it: each is good to a pass plus a
+//! per poll. So `queue` and `task` are the executor's polls that first saw the job running and
+//! ended, not the instants the host started and finished it: each is good to a poll plus a
 //! heartbeat or two, and a job that starts and ends between two reads is seen ended without
 //! having been seen running (it has a `run` phase and no `queue` or `task`).
 //!
 //! The phases:
 //!
-//! - `prepare`: the `Start` first seen to its job being ready (the CAS read, the key, the url
-//!   and the grant);
-//! - `start`: ready to the job service answering the submit with the job (every pass a submit
+//! - `prepare`: the Execute to its job being ready (the CAS read, the key, the url and the
+//!   grant);
+//! - `start`: ready to the job service answering the submit with the job (including each submit that
 //!   was not answered and was sent again);
 //! - `queue`: accepted to first read back as running (queued, placed and starting);
 //! - `task`: first read back as running to read back as ended;
 //! - `run`: accepted to read back as ended, seen or not seen running in between
 //!   (`queue` plus `task` when both are observed);
-//! - `ingest`: read back as ended to the frontend's read of the pack done.
+//! - `ingest`: read back as ended to the frontend's read of the pack done;
+//! - `submit`: the Execute to the job service answering the submit with the job (`prepare`
+//!   plus `start`);
+//! - `execute`: the Execute to its callers answered, for the run that answers them.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,17 +48,21 @@ pub(crate) enum Phase {
     Task,
     Run,
     Ingest,
+    Submit,
+    Execute,
 }
 
 impl Phase {
     /// Every phase, in the order the metric lists them.
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Prepare,
         Self::Start,
         Self::Queue,
         Self::Task,
         Self::Run,
         Self::Ingest,
+        Self::Submit,
+        Self::Execute,
     ];
 
     /// The `phase` label.
@@ -66,6 +74,8 @@ impl Phase {
             Self::Task => "task",
             Self::Run => "run",
             Self::Ingest => "ingest",
+            Self::Submit => "submit",
+            Self::Execute => "execute",
         }
     }
 
@@ -77,7 +87,7 @@ impl Phase {
 /// A moment of a run that is stamped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mark {
-    /// The `Start` first acted on.
+    /// The Execute that made the operation, or the end of the run before this attempt.
     Seen,
     /// The job is ready to submit.
     Prepared,
@@ -89,22 +99,26 @@ pub(crate) enum Mark {
     Ended,
     /// The frontend's read of the pack is done.
     Done,
+    /// The operation's callers are answered.
+    Answered,
 }
 
 /// Each phase, with the stamp that begins it and the stamp that ends it.
-const PHASES: [(Phase, Mark, Mark); 6] = [
+const PHASES: [(Phase, Mark, Mark); 8] = [
     (Phase::Prepare, Mark::Seen, Mark::Prepared),
     (Phase::Start, Mark::Prepared, Mark::Posted),
     (Phase::Queue, Mark::Posted, Mark::Running),
     (Phase::Task, Mark::Running, Mark::Ended),
     (Phase::Run, Mark::Posted, Mark::Ended),
     (Phase::Ingest, Mark::Ended, Mark::Done),
+    (Phase::Submit, Mark::Seen, Mark::Posted),
+    (Phase::Execute, Mark::Seen, Mark::Answered),
 ];
 
 /// The stamps of one run.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Timeline {
-    marks: [Option<Instant>; 6],
+    marks: [Option<Instant>; 7],
 }
 
 impl Timeline {
@@ -154,8 +168,8 @@ const BOUNDS: [(u64, &str); 12] = [
 #[derive(Debug, Default)]
 pub(crate) struct PhaseHistograms {
     /// Per phase, the observations that fell in each bucket (the last is over every bound).
-    buckets: [[AtomicU64; 13]; 6],
-    micros: [AtomicU64; 6],
+    buckets: [[AtomicU64; 13]; 8],
+    micros: [AtomicU64; 8],
 }
 
 impl PhaseHistograms {

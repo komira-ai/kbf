@@ -1,5 +1,8 @@
-//! The Execute join end to end, in one process: a REAPI client, the server, and a fake
-//! daemon on the worker stream. Each test drives the wire on both sides.
+//! The Execute join end to end, in one process: a REAPI client, the server, its executor and a
+//! fake job service. Each test drives the wire on one side and the job's life on the other.
+//! `execute_direct.rs` holds the first Execute tests of the executor (a miss runs as one job and
+//! is cached, a nonzero exit is not cached, a lost job runs again, a wall limit answers at
+//! once, no executor refuses).
 
 #[path = "execute/failure_log.rs"]
 mod failure_log;
@@ -7,660 +10,31 @@ mod failure_log;
 mod get_operation;
 #[path = "execute/invocations.rs"]
 mod invocations;
-#[path = "execute/lost.rs"]
-mod lost;
-#[path = "execute/memory.rs"]
-mod memory;
-#[path = "execute/missing.rs"]
-mod missing;
-#[path = "execute/run_data.rs"]
-mod run_data;
+#[path = "execute/log.rs"]
+mod log;
 #[path = "execute/slow_store.rs"]
 mod slow_store;
 mod support;
 
-use std::time::Duration;
-
+use kbf_proto::google::longrunning::Operation;
+use kbf_proto::google::rpc::ErrorInfo;
 use kbf_proto::reapi::execution_stage::Value as ExecStage;
-use kbf_proto::reapi::{ActionResult, WaitExecutionRequest};
-use kbf_proto::worker::daemon_message;
-use kbf_proto::worker::server_message::Message;
-use support::{
-    Blob, Cell, Job, done, done_within_quiet, failed, hello_on, output, ran, report_every_run,
-    response, stage,
-};
-use tonic::Code;
+use kbf_proto::reapi::{ExecuteResponse, WaitExecutionRequest};
+use prost::Message;
+use support::{Blob, Cell, Client, Job, Ran, done, done_within_quiet, response, stage};
+use tonic::{Code, Streaming};
 
-/// Runs `job` on `daemon` to completion and returns the result it reported.
-/// The daemon reports with no status at all, which counts as OK.
-async fn run_once(
-    cell: &support::Client,
-    daemon: &mut support::FakeDaemon,
-    job: &Job,
-) -> ActionResult {
-    let mut ops = cell.execute(&job.action).await;
-    let start = daemon.start().await;
-    let result = output(cell, "built once", 0).await;
-    let mut report = ran(start.lease_id, &result);
-    report.status = None;
-    assert!(daemon.report(report).await.accepted);
-    assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
-    result
-}
-
-/// Catches: a `Start` sent before (or without) the lease offer that the grant's commit
-/// follows; a `Start` naming another action or kind, or without the booking; an
-/// operation that never reaches EXECUTING or never completes; a completed operation
-/// that does not carry the daemon's `ActionResult`; an accepted result missing from the action cache, or a
-/// `ResultAck` that does not say it was accepted; and a second result accepted for a
-/// finished operation.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn execute_runs_on_a_daemon_and_caches_the_result() {
-    let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    let job = Job::new("build", &[]);
-    cell.upload(&job.blobs()).await;
-
-    let mut ops = cell.execute(&job.action).await;
-    let first_work = daemon
-        .expect("work", |m| match m {
-            Message::LeaseOffer(_) | Message::Start(_) => Some(m.clone()),
-            _ => None,
-        })
-        .await;
-    let Message::LeaseOffer(offer) = first_work else {
-        panic!("{first_work:?} came before the offer");
-    };
-    let start = daemon.start().await;
-    assert_eq!(
-        offer.lease_id, start.lease_id,
-        "the Start is the offered lease's"
-    );
-    assert_eq!(start.kind, "action");
-    assert_eq!(start.action_digest.as_ref(), Some(&job.action.proto));
-    assert_eq!(offer.action_digest, start.action_digest);
-    // The booking reaches the daemon, which sizes the lease's cgroup from it.
-    assert_eq!(
-        (start.millicpus, start.memory_bytes),
-        (
-            kbf_front::DEFAULT_RESOURCES.cpu_millis,
-            // The cell's first rung (`support::small_ladder`).
-            1 << 30
-        )
-    );
-
-    let first = ops.message().await.expect("a stream").expect("an update");
-    assert!(!first.done);
-    assert_eq!(stage(&first), ExecStage::Executing as i32, "placed at once");
-    assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
-
-    let result = output(&cell, "the build output", 0).await;
-    let ack = daemon.report(ran(start.lease_id, &result)).await;
-    assert!(ack.accepted, "{ack:?}");
-    let last = done(&mut ops).await;
-    assert_eq!(stage(&last), ExecStage::Completed as i32);
-    let answer = response(&last);
-    assert_eq!(answer.result, Some(result.clone()));
-    assert!(!answer.cached_result);
-    assert_eq!(answer.status.map(|s| s.code), Some(Code::Ok as i32));
-    assert_eq!(cell.cached(&job.action).await, Ok(result.clone()));
-
-    // A copy resent after a reconnect is acknowledged, not accepted a second time.
-    let other = output(&cell, "a second copy that differs", 0).await;
-    let ack = daemon.report(ran(start.lease_id, &other)).await;
-    assert!(!ack.accepted, "a second result accepted for one operation");
-    assert_eq!(cell.cached(&job.action).await, Ok(result));
-}
-
-/// Catches: a result written to the action cache when it arrives rather than when the
-/// scheduler accepts it, so a stale lease's result (its lease was given up and granted
-/// again) reaches the cache; and a result accepted from a node that does not hold the
-/// operation's current lease.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stale_lease_result_is_rejected_and_never_cached() {
-    let cell = Cell::start().await;
-    let mut first = cell.daemon("node-a", 4, 8).await;
-    // Registered with no CPU, so nothing is placed on it.
-    let mut other = cell.daemon("node-b", 0, 8).await;
-    let job = Job::new("flaky", &[]);
-    cell.upload(&job.blobs()).await;
-    let mut ops = cell.execute(&job.action).await;
-    let stale = first.start().await;
-
-    // node-a's daemon restarts and lists nothing: the old lease is given up at once
-    // and the operation granted again, on the new stream.
-    let mut again = cell.daemon("node-a", 4, 8).await;
-    assert!(again.heartbeat(&[]).await);
-    let current = again.start().await;
-    assert_ne!(current.lease_id, stale.lease_id);
-
-    let stale_result = output(&cell, "from the stale lease", 0).await;
-    let ack = again.report(ran(stale.lease_id, &stale_result)).await;
-    assert!(!ack.accepted, "a stale lease's result accepted");
-    assert_eq!(
-        cell.cached(&job.action).await,
-        Err(Code::NotFound),
-        "cached"
-    );
-    assert!(
-        !cell.holds(&Blob::of(&stale_result)).await,
-        "a stale lease's result was taken in (its ActionResult stored)"
-    );
-
-    let thief = output(&cell, "from a node without the lease", 0).await;
-    let ack = other.report(ran(current.lease_id, &thief)).await;
-    assert!(!ack.accepted, "another node's result accepted");
-    assert_eq!(
-        cell.cached(&job.action).await,
-        Err(Code::NotFound),
-        "cached"
-    );
-    assert!(
-        !done_within_quiet(&mut ops).await,
-        "answered by a refused result"
-    );
-
-    let result = output(&cell, "from the current lease", 0).await;
-    assert!(again.report(ran(current.lease_id, &result)).await.accepted);
-    assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
-    assert_eq!(cell.cached(&job.action).await, Ok(result));
-    // The old stream's daemon still holds nothing the server will take.
-    let late = output(&cell, "late, on the old stream", 0).await;
-    assert!(!first.report(ran(stale.lease_id, &late)).await.accepted);
-}
-
-/// Catches: a result written to the action cache before the scheduler accepts it. The
-/// result arrives while its lease is current, and the lease is given up while the
-/// server checks the result's outputs: the scheduler then refuses it, and the cache
-/// must never see it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_result_whose_lease_is_given_up_while_it_is_checked_is_never_cached() {
-    let cell = Cell::start().await;
-    let mut first = cell.daemon("node-a", 4, 8).await;
-    let job = Job::new("raced", &[]);
-    cell.upload(&job.blobs()).await;
-    let mut ops = cell.execute(&job.action).await;
-    let lost = first.start().await;
-    let raced = output(&cell, "from the lease given up", 0).await;
-
-    cell.cache.meta().query.close_next();
-    first.send(daemon_message::Message::Result(ran(lost.lease_id, &raced)));
-    cell.cache.meta().query.held().await;
-    let mut again = cell.daemon("node-a", 4, 8).await;
-    assert!(again.heartbeat(&[]).await);
-    let current = again.start().await;
-    cell.cache.meta().query.open();
-
-    let ack = first
-        .expect("ResultAck", |m| match m {
-            Message::ResultAck(a) => Some(*a),
-            _ => None,
-        })
-        .await;
-    assert!(!ack.accepted, "a result whose lease was given up accepted");
-    assert_eq!(
-        cell.cached(&job.action).await,
-        Err(Code::NotFound),
-        "cached"
-    );
-
-    let result = output(&cell, "from the current lease", 0).await;
-    assert!(again.report(ran(current.lease_id, &result)).await.accepted);
-    assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
-    assert_eq!(cell.cached(&job.action).await, Ok(result));
-}
-
-/// Catches: an Execute that dispatches an action whose result is cached (work run
-/// again), or answers it without `cached_result`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cached_action_is_answered_without_dispatch() {
-    let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    let job = Job::new("cached", &[]);
-    cell.upload(&job.blobs()).await;
-    let result = run_once(&cell, &mut daemon, &job).await;
-
-    let mut ops = cell.execute(&job.action).await;
-    let only = ops.message().await.expect("a stream").expect("an update");
-    let answer = response(&only);
-    assert!(answer.cached_result);
-    assert_eq!(answer.result, Some(result));
-    assert_eq!(
-        ops.message().await.expect("a stream"),
-        None,
-        "more after done"
-    );
-    daemon.no_work().await;
-
-    // `skip_cache_lookup` runs it again.
-    let mut ops = cell.execute_with(&job.action, true).await.expect("Execute");
-    let start = daemon.start().await;
-    let fresh = output(&cell, "built again", 0).await;
-    assert!(daemon.report(ran(start.lease_id, &fresh)).await.accepted);
-    assert!(!response(&done(&mut ops).await).cached_result);
-}
-
-/// Catches: in-flight dedup that does not join identical concurrent Executes (the
-/// action runs twice), and a joined caller that is not answered with the one result.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn identical_concurrent_executes_dispatch_once() {
-    let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 8, 16).await;
-    let job = Job::new("shared", &[]);
-    cell.upload(&job.blobs()).await;
-
-    let mut one = cell.execute(&job.action).await;
-    let start = daemon.start().await;
-    let mut two = cell.execute(&job.action).await;
-    let joined = two.message().await.expect("a stream").expect("an update");
-    assert_eq!(
-        stage(&joined),
-        ExecStage::Executing as i32,
-        "joiner sees it run"
-    );
-    daemon.no_work().await;
-
-    let result = output(&cell, "built for both", 0).await;
-    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    assert_eq!(response(&done(&mut one).await).result, Some(result.clone()));
-    assert_eq!(response(&done(&mut two).await).result, Some(result));
-}
-
-/// Catches: `do_not_cache` work that is joined to a twin, or written to the action
-/// cache.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn do_not_cache_is_neither_joined_nor_cached() {
-    let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 8, 16).await;
-    let mut job = Job::new("uncached", &[]);
-    let action = kbf_proto::reapi::Action {
-        command_digest: Some(job.command.proto.clone()),
-        input_root_digest: Some(job.root.proto.clone()),
-        do_not_cache: true,
-        ..Default::default()
-    };
-    job.action = Blob::of(&action);
-    cell.upload(&job.blobs()).await;
-
-    let mut one = cell.execute(&job.action).await;
-    let mut two = cell.execute(&job.action).await;
-    let a = daemon.start().await;
-    let b = daemon.start().await;
-    assert_ne!(a.lease_id, b.lease_id);
-    let result = output(&cell, "not for the cache", 0).await;
-    assert!(daemon.report(ran(a.lease_id, &result)).await.accepted);
-    assert!(daemon.report(ran(b.lease_id, &result)).await.accepted);
-    done(&mut one).await;
-    done(&mut two).await;
-    assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
-}
-
-/// Catches: a failing action (non-zero exit) written to the action cache, which would
-/// answer every later build with the failure (`docs/design/scheduler.md#outcomes`: a
-/// failure is not cached).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failing_action_is_answered_but_not_cached() {
-    let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    let job = Job::new("fails", &[]);
-    cell.upload(&job.blobs()).await;
-    let mut ops = cell.execute(&job.action).await;
-    let start = daemon.start().await;
-    let result = output(&cell, "a test failed", 1).await;
-    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    assert_eq!(response(&done(&mut ops).await).result, Some(result));
-    assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
-}
-
-/// Catches: an attempt's failure passed to the callers as the daemon's status rather
-/// than the status `docs/design/scheduler.md#outcomes` names (INTERNAL for the farm's
-/// failure, DEADLINE_EXCEEDED for a timeout); an INVALID_ARGUMENT (the action's own
-/// fault, such as an image named by tag) turned into INTERNAL, which a client retries,
-/// or answered without the daemon's reason; a failed attempt placed again instead of
-/// answered (each case's Start must name its own action); an OK result whose outputs
-/// were never uploaded, or that carries no result at all, accepted as a result (callers
-/// would get files nobody can fetch); a failed attempt that also carries a valid
-/// `ActionResult` taken as completed (the protocol sets `action_result` only with OK,
-/// or with DEADLINE_EXCEEDED for the logs alone, which a result without logs does not
-/// have); and a failure written to the action cache.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_attempts_answer_with_the_documented_codes() {
-    let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 8, 16).await;
-    let never_uploaded = ActionResult {
-        stdout_digest: Some(Blob::new("never uploaded").proto),
-        ..Default::default()
-    };
-    let stored = output(&cell, "stored, but the attempt failed", 0).await;
-    let stored_too = stored.clone();
-    let cases = [
-        (
-            "aborted with a result",
-            Some(Code::Aborted),
-            Some(stored.clone()),
-            Code::Internal,
-        ),
-        (
-            "timed out with a result",
-            Some(Code::DeadlineExceeded),
-            Some(stored),
-            Code::DeadlineExceeded,
-        ),
-        ("aborted", Some(Code::Aborted), None, Code::Internal),
-        (
-            "timed out",
-            Some(Code::DeadlineExceeded),
-            None,
-            Code::DeadlineExceeded,
-        ),
-        (
-            "outputs missing",
-            Some(Code::Ok),
-            Some(never_uploaded),
-            Code::Internal,
-        ),
-        ("OK without a result", Some(Code::Ok), None, Code::Internal),
-        (
-            "invalid",
-            Some(Code::InvalidArgument),
-            None,
-            Code::InvalidArgument,
-        ),
-        (
-            "invalid with a result",
-            Some(Code::InvalidArgument),
-            Some(stored_too),
-            Code::InvalidArgument,
-        ),
-    ];
-    for (name, code, result, want) in cases {
-        let job = Job::new(name, &[]);
-        cell.upload(&job.blobs()).await;
-        let mut ops = cell.execute(&job.action).await;
-        let start = daemon.start().await;
-        assert_eq!(
-            start.action_digest.as_ref(),
-            Some(&job.action.proto),
-            "{name}"
-        );
-        let code = code.expect("a code");
-        let make = |lease| {
-            let mut report = failed(lease, code);
-            report.action_result = result.clone();
-            report
-        };
-        if want == Code::Internal {
-            // The farm's failure is run again, so only its last run answers.
-            report_every_run(&mut daemon, start, make).await;
-        } else {
-            assert!(daemon.report(make(start.lease_id)).await.accepted, "{name}");
-        }
-        let answer = response(&done(&mut ops).await);
-        assert_eq!(answer.result, None, "{name}");
-        let status = answer.status.expect("a status");
-        assert_eq!(status.code, want as i32, "{name}");
-        if want == Code::InvalidArgument {
-            // The daemon's reason (`failed` sends "test") reaches the client.
-            assert_eq!(status.message, "test", "{name}");
-        }
-        assert_eq!(
-            cell.cached(&job.action).await,
-            Err(Code::NotFound),
-            "{name}"
-        );
-    }
-}
-
-/// Catches (issue #45): a timed-out action answered DEADLINE_EXCEEDED without the
-/// stdout and stderr it wrote before it was stopped, which REAPI lets the server
-/// return; a partial result that keeps the daemon's outputs or exit code (only the
-/// two logs are partial output, and an output of a stopped action may be half
-/// written); a log digest passed on although its blob is not in the CAS (the client
-/// could not fetch it), or one missing log taking the other with it; a partial result
-/// answered without the node it ran on; and a partial result written to the action
-/// cache (a timeout is never cached, and exit code 0 with an output would be).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_timed_out_action_answers_with_its_partial_stdout_and_stderr() {
-    let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    let (stdout, stderr) = (Blob::new("started\n"), Blob::new("warming up\n"));
-    cell.upload(&[&stdout, &stderr]).await;
-    let never_uploaded = Blob::new("never uploaded");
-    let stored = output(&cell, "half written", 0).await;
-    let logs = |out: &Blob, err: &Blob| ActionResult {
-        stdout_digest: Some(out.proto.clone()),
-        stderr_digest: Some(err.proto.clone()),
-        ..stored.clone()
-    };
-    let only = |out: Option<&Blob>, err: Option<&Blob>| ActionResult {
-        stdout_digest: out.map(|b| b.proto.clone()),
-        stderr_digest: err.map(|b| b.proto.clone()),
-        ..ActionResult::default()
-    };
-    let cases = [
-        (
-            "both logs",
-            logs(&stdout, &stderr),
-            Some(only(Some(&stdout), Some(&stderr))),
-        ),
-        (
-            "stderr not stored",
-            logs(&stdout, &never_uploaded),
-            Some(only(Some(&stdout), None)),
-        ),
-        (
-            "stdout not stored",
-            logs(&never_uploaded, &stderr),
-            Some(only(None, Some(&stderr))),
-        ),
-        (
-            "neither stored",
-            logs(&never_uploaded, &never_uploaded),
-            None,
-        ),
-    ];
-    for (name, reported, want) in cases {
-        let job = Job::new(name, &[]);
-        cell.upload(&job.blobs()).await;
-        let mut ops = cell.execute(&job.action).await;
-        let start = daemon.start().await;
-        let mut report = failed(start.lease_id, Code::DeadlineExceeded);
-        report.action_result = Some(reported);
-        assert!(daemon.report(report).await.accepted, "{name}");
-        let answer = support::stamped_response(&done(&mut ops).await);
-        let status = answer.status.expect("a status");
-        assert_eq!(status.code, Code::DeadlineExceeded as i32, "{name}");
-        assert_eq!(answer.result.map(support::unstamped), want, "{name}");
-        assert_eq!(
-            cell.cached(&job.action).await,
-            Err(Code::NotFound),
-            "{name}"
-        );
-    }
-}
-
-/// Catches: callers answered before the accepted result's action-cache entry is
-/// written, so a client that looks the action up as soon as its Execute finishes
-/// misses a result the farm has. The write is held at a gate: no answer may arrive
-/// while it is held, and once it is let through the answer and the entry are both
-/// there.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_cache_entry_is_written_before_the_callers_are_answered() {
-    let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    let job = Job::new("written first", &[]);
-    cell.upload(&job.blobs()).await;
-    let mut ops = cell.execute(&job.action).await;
-    let start = daemon.start().await;
-    let result = output(&cell, "in the cache first", 0).await;
-
-    let gate = &cell.cache.meta().action_write;
-    gate.close_next();
-    daemon.send(daemon_message::Message::Result(ran(
-        start.lease_id,
-        &result,
-    )));
-    gate.held().await;
-    assert!(
-        !done_within_quiet(&mut ops).await,
-        "answered before the action-cache write"
-    );
-    gate.open();
-    assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
-    assert_eq!(cell.cached(&job.action).await, Ok(result));
-    let ack = daemon
-        .expect("ResultAck", |m| match m {
-            Message::ResultAck(a) => Some(*a),
-            _ => None,
-        })
-        .await;
-    assert!(ack.accepted);
-}
-
-/// Catches: an accepted result whose action-cache write fails left unanswered (its
-/// callers would wait forever) or answered as a failure. The run succeeded; only the
-/// cache misses it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_cache_write_still_answers_the_callers() {
-    let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    let job = Job::new("unwritten", &[]);
-    cell.upload(&job.blobs()).await;
-    let mut ops = cell.execute(&job.action).await;
-    let start = daemon.start().await;
-    let result = output(&cell, "answered, not cached", 0).await;
-
-    cell.cache.meta().fail_next_action_write();
-    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    let answer = response(&done(&mut ops).await);
-    assert_eq!(answer.result, Some(result));
-    assert_eq!(answer.status.map(|s| s.code), Some(Code::Ok as i32));
-    assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
-}
-
-/// Catches: a WaitExecution that cannot find a running operation by the name Execute
-/// gave, or does not deliver its result; and one that answers for a name it never gave.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wait_execution_follows_a_running_operation() {
-    let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    let job = Job::new("waited", &[]);
-    cell.upload(&job.blobs()).await;
-    let mut ops = cell.execute(&job.action).await;
-    let name = ops
-        .message()
+/// The name of the first operation `ops` streams.
+async fn first_name(ops: &mut Streaming<Operation>) -> String {
+    ops.message()
         .await
         .expect("a stream")
         .expect("an update")
-        .name;
-    let mut waited = cell
-        .exec()
-        .wait_execution(WaitExecutionRequest { name: name.clone() })
-        .await
-        .expect("WaitExecution")
-        .into_inner();
-    let start = daemon.start().await;
-    let result = output(&cell, "for the waiter", 0).await;
-    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    let last = done(&mut waited).await;
-    assert_eq!(last.name, name);
-    assert_eq!(response(&last).result, Some(result));
-}
-
-/// Catches (issue #165): a finished operation forgotten as soon as it is answered,
-/// so a client whose Execute stream broke just before the answer cannot get it by
-/// WaitExecution, and runs again an action whose result the cache does not keep (a
-/// non-zero exit); and one kept past the retention (the farm's memory then grows with
-/// every operation). Within the retention WaitExecution streams the done operation
-/// with its result, once; after it the name is NOT_FOUND.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_finished_operation_is_waited_on_within_the_retention_then_not_found() {
-    let retention = Duration::from_secs(1);
-    let cell = Cell::start_with(kbf_sched::UNSERVABLE_WAIT, retention).await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    let job = Job::new("exits 1", &[]);
-    cell.upload(&job.blobs()).await;
-    let mut ops = cell.execute(&job.action).await;
-    let start = daemon.start().await;
-    let result = output(&cell, "not cached", 1).await;
-    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    let name = done(&mut ops).await.name;
-    assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
-
-    let mut waited = wait_stream(&cell, &name).await.expect("kept");
-    let first = waited
-        .message()
-        .await
-        .expect("a stream")
-        .expect("an update");
-    assert_eq!(first.name, name);
-    assert_eq!(response(&first).result, Some(result));
-    assert!(
-        waited.message().await.expect("a stream").is_none(),
-        "more after done"
-    );
-
-    tokio::time::sleep(retention + Duration::from_millis(500)).await;
-    assert_eq!(wait_name(&cell, &name).await, Err(Code::NotFound));
-}
-
-/// Catches: forgetting the channel of another caller than the one whose operation was
-/// dropped, such as the lowest-numbered (`pop_first`) or highest-numbered (`pop_last`)
-/// kept caller instead of the forgotten one. Three callers run at once; the middle
-/// one's operation finishes and, with a zero retention, is dropped at once. The
-/// callers numbered below and above it must still be found by WaitExecution, and both
-/// their Execute and WaitExecution streams get their results.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn forgetting_one_caller_keeps_the_channels_of_lower_and_higher_callers() {
-    let cell = Cell::start_with(kbf_sched::UNSERVABLE_WAIT, Duration::ZERO).await;
-    let mut daemon = cell.daemon("node-a", 8, 16).await;
-    let jobs = ["lower", "middle", "higher"].map(|argv| Job::new(argv, &[]));
-    let mut ops = Vec::new();
-    let mut names = Vec::new();
-    for job in &jobs {
-        cell.upload(&job.blobs()).await;
-        let mut stream = cell.execute(&job.action).await;
-        let first = stream
-            .message()
-            .await
-            .expect("a stream")
-            .expect("an update");
-        names.push(first.name);
-        ops.push(stream);
-    }
-    let mut leases = Vec::new();
-    for _ in &jobs {
-        let start = daemon.start().await;
-        let at = jobs
-            .iter()
-            .position(|job| start.action_digest.as_ref() == Some(&job.action.proto))
-            .expect("a Start for one of the jobs");
-        leases.push((at, start.lease_id));
-    }
-    leases.sort_by_key(|(at, _)| *at);
-
-    let middle = output(&cell, "middle", 0).await;
-    assert!(daemon.report(ran(leases[1].1, &middle)).await.accepted);
-    assert_eq!(response(&done(&mut ops[1]).await).result, Some(middle));
-    assert_eq!(wait_name(&cell, &names[1]).await, Err(Code::NotFound));
-
-    for kept in [0, 2] {
-        let mut waited = wait_stream(&cell, &names[kept]).await.expect("still kept");
-        let result = output(&cell, &format!("kept {kept}"), 0).await;
-        assert!(daemon.report(ran(leases[kept].1, &result)).await.accepted);
-        assert_eq!(
-            response(&done(&mut ops[kept]).await).result,
-            Some(result.clone())
-        );
-        assert_eq!(response(&done(&mut waited).await).result, Some(result));
-    }
+        .name
 }
 
 /// WaitExecution on `name`: its stream, or the code.
-async fn wait_stream(
-    cell: &support::Client,
-    name: &str,
-) -> Result<tonic::Streaming<kbf_proto::google::longrunning::Operation>, Code> {
+async fn wait_stream(cell: &Client, name: &str) -> Result<Streaming<Operation>, Code> {
     let ops = cell
         .exec()
         .wait_execution(WaitExecutionRequest {
@@ -672,7 +46,7 @@ async fn wait_stream(
 }
 
 /// WaitExecution on `name`: the name of the first operation it streams, or the code.
-async fn wait_name(cell: &support::Client, name: &str) -> Result<String, Code> {
+async fn wait_name(cell: &Client, name: &str) -> Result<String, Code> {
     let mut ops = wait_stream(cell, name).await?;
     Ok(ops
         .message()
@@ -682,92 +56,483 @@ async fn wait_name(cell: &support::Client, name: &str) -> Result<String, Code> {
         .name)
 }
 
-/// Catches (issue #154): a WaitExecution that still answers the old spelling
-/// `operations/{n}`, which a client of a server from before the term was in the name
-/// can hold across an upgrade restart. It would attach that client to whichever
-/// operation of the new process has number `n`. The operation running as number 0 is
-/// found by its own name only.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wait_execution_refuses_the_name_spelling_without_a_term() {
+/// Reads `ops` until an update at `want`, which it returns.
+async fn until_stage(ops: &mut Streaming<Operation>, want: ExecStage) -> Operation {
+    loop {
+        let op = tokio::time::timeout(support::PROMPT, ops.message())
+            .await
+            .expect("an update in time")
+            .expect("a healthy stream")
+            .expect("the stream ended before the stage");
+        if stage(&op) == want as i32 {
+            return op;
+        }
+        assert!(!op.done, "the operation finished before {want:?}");
+    }
+}
+
+/// Asserts the stages of an operation: queued until its job is running, executing once the
+/// executor reads the job running, then completed with the action's result, which is in the
+/// action cache only once the operation is done; and that the result is the pack's, not
+/// marked as cached.
+#[tokio::test]
+async fn an_operation_streams_queued_then_executing_then_completed() {
     let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    let job = Job::new("number 0", &[]);
+    let job = Job::new("build", &[]);
+    cell.upload(&job.blobs()).await;
+    cell.direct
+        .will_run(&job.action, Ran::writes("out", "the build output"));
+
+    let mut ops = cell.execute(&job.action).await;
+    let first = ops.message().await.expect("a stream").expect("an update");
+    assert!(!first.done);
+    assert_eq!(stage(&first), ExecStage::Queued as i32, "no job runs yet");
+    let id = cell.direct.run(&job.action).await;
+    until_stage(&mut ops, ExecStage::Executing).await;
+    assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
+
+    assert!(cell.direct.fake.finish(&id, 0));
+    let last = done(&mut ops).await;
+    assert_eq!(stage(&last), ExecStage::Completed as i32);
+    let answer = response(&last);
+    let result = answer.result.expect("a result");
+    assert_eq!(result.output_files[0].path, "out");
+    assert!(!answer.cached_result);
+    assert_eq!(answer.status.map(|s| s.code), Some(Code::Ok as i32));
+    assert_eq!(cell.cached(&job.action).await, Ok(result));
+}
+
+/// Asserts that a cached action is answered with no job (`cached_result` set, and the stream
+/// ends with that one update), and that `skip_cache_lookup` runs it again as a new operation
+/// whose answer is not marked as cached.
+#[tokio::test]
+async fn a_cached_action_is_answered_without_a_job_and_skip_cache_lookup_runs_it_again() {
+    let cell = Cell::start().await;
+    let job = Job::new("cached", &[]);
+    cell.upload(&job.blobs()).await;
+    cell.direct
+        .will_run(&job.action, Ran::writes("out", "built once"));
+    cell.direct
+        .will_run(&job.action, Ran::writes("out", "built again"));
+    let mut first = cell.execute(&job.action).await;
+    cell.direct.complete(&job.action).await;
+    let built = response(&done(&mut first).await).result.expect("a result");
+
+    let mut ops = cell.execute(&job.action).await;
+    let only = ops.message().await.expect("a stream").expect("an update");
+    let answer = response(&only);
+    assert!(answer.cached_result);
+    assert_eq!(answer.result.map(support::unstamped), Some(built));
+    assert_eq!(
+        ops.message().await.expect("a stream"),
+        None,
+        "more after done"
+    );
+    assert_eq!(cell.direct.submitted_jobs(), 1, "the hit ran nothing");
+
+    let first_job = cell.direct.jobs_of(&job.action)[0].id.clone();
+    let mut again = cell.execute_with(&job.action, true).await.expect("Execute");
+    let fresh = job_other_than(&cell, &job, &first_job).await;
+    cell.direct.run_job(&fresh);
+    assert!(cell.direct.fake.finish(&fresh, 0));
+    let answer = response(&done(&mut again).await);
+    assert!(!answer.cached_result);
+    assert_eq!(
+        answer.result.expect("a result").output_files[0].digest,
+        Some(Blob::new("built again").proto)
+    );
+}
+
+/// The id of a job of `job` other than `known`, once the executor has submitted it.
+async fn job_other_than(cell: &Cell, job: &Job, known: &str) -> String {
+    let found = async {
+        loop {
+            let jobs = cell.direct.jobs_of(&job.action);
+            if let Some(other) = jobs.iter().find(|j| j.id != known) {
+                return other.id.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(support::PROMPT, found)
+        .await
+        .expect("a second job is submitted")
+}
+
+/// Asserts that identical Executes that overlap run one job: the second joins the open
+/// operation (it is shown executing at once, under the same name) and both callers are answered
+/// with the one result.
+#[tokio::test]
+async fn identical_concurrent_executes_run_one_job() {
+    let cell = Cell::start().await;
+    let job = Job::new("shared", &[]);
+    cell.upload(&job.blobs()).await;
+    cell.direct
+        .will_run(&job.action, Ran::writes("out", "built for both"));
+
+    let mut one = cell.execute(&job.action).await;
+    let id = cell.direct.run(&job.action).await;
+    let mut two = cell.execute(&job.action).await;
+    assert_eq!(first_name(&mut one).await, first_name(&mut two).await);
+    assert!(cell.direct.fake.finish(&id, 0));
+
+    let (a, b) = (
+        response(&done(&mut one).await).result.expect("a result"),
+        response(&done(&mut two).await).result.expect("a result"),
+    );
+    assert_eq!(a, b);
+    assert_eq!(a.output_files[0].path, "out");
+    assert_eq!(cell.direct.jobs_of(&job.action).len(), 1, "one job");
+}
+
+/// Ends attempt `attempt` of `job` the way `ending` says, the job having been placed and run.
+async fn end_attempt(cell: &Cell, job: &Job, attempt: u32, ending: &str) {
+    let id = cell.direct.job(&job.action, attempt).await;
+    cell.direct.run_job(&id);
+    match ending {
+        "exit" => assert!(cell.direct.fake.finish(&id, 7)),
+        "lost" => assert!(cell.direct.fake.lose(&id)),
+        other => panic!("no ending named {other}"),
+    }
+}
+
+/// Asserts the answers of the endings of a job that is not a result, which the table in
+/// `executor/outcome.rs` names: the task tool exiting nonzero and a lost host are the farm's, so
+/// each is run again as the next attempt and, with all three attempts used, answered UNAVAILABLE;
+/// a host that refuses a file of the job is the action's own fault, so it is answered
+/// INVALID_ARGUMENT at once, with one job. None is cached, and none answers with a result.
+#[tokio::test]
+async fn job_endings_that_are_not_a_result_answer_with_the_documented_codes() {
+    let cell = Cell::start().await;
+    let cases = [
+        ("the task tool exits nonzero at every attempt", "exit", 3),
+        ("the host is lost at every attempt", "lost", 3),
+        ("the host refuses a file of the job", "refused", 1),
+    ];
+    for (name, ending, jobs) in cases {
+        let job = Job::new(name, &[]);
+        cell.upload(&job.blobs()).await;
+        let mut ops = cell.execute(&job.action).await;
+        if ending == "refused" {
+            let id = cell.direct.job(&job.action, 0).await;
+            assert!(cell.direct.fake.place(&id, support::HOST));
+            assert!(cell.direct.fake.refuse_start(&id, "invalid-file"));
+        } else {
+            for attempt in 0..jobs {
+                end_attempt(&cell, &job, attempt, ending).await;
+            }
+        }
+        let answer = response(&done(&mut ops).await);
+        let status = answer.status.expect("a status");
+        let want = if ending == "refused" {
+            Code::InvalidArgument
+        } else {
+            Code::Unavailable
+        };
+        assert_eq!(status.code, want as i32, "{name}: {status:?}");
+        assert_eq!(answer.result, None, "{name}");
+        assert_eq!(
+            cell.direct.jobs_of(&job.action).len(),
+            jobs as usize,
+            "{name}"
+        );
+        assert_eq!(
+            cell.cached(&job.action).await,
+            Err(Code::NotFound),
+            "{name}"
+        );
+    }
+}
+
+/// Asserts that the output of a job that ended badly reaches the caller with the status and
+/// not as a result: the end of its standard output and error ride in an `ErrorInfo` detail of
+/// the status (`JOB_OUTPUT_TAIL`), the status code is the ending's, nothing is cached, and
+/// there is no result.
+#[tokio::test]
+async fn a_job_that_ended_badly_answers_with_its_output_in_the_status() {
+    let cell = Cell::start().await;
+    let job = Job::new("writes then dies", &[]);
     cell.upload(&job.blobs()).await;
     let mut ops = cell.execute(&job.action).await;
-    let name = ops
-        .message()
-        .await
-        .expect("a stream")
-        .expect("an update")
-        .name;
-    daemon.start().await;
-    assert!(name.ends_with("-0"), "{name} is not number 0");
+    for attempt in 0..3 {
+        let id = cell.direct.job(&job.action, attempt).await;
+        cell.direct.run_job(&id);
+        assert!(
+            cell.direct
+                .fake
+                .write_logs(&id, b"started\n", b"warming up\n")
+        );
+        assert!(cell.direct.fake.finish(&id, 7));
+    }
 
-    assert_eq!(wait_name(&cell, "operations/0").await, Err(Code::NotFound));
+    let answer: ExecuteResponse = response(&done(&mut ops).await);
+    let status = answer.status.expect("a status");
+    assert_eq!(status.code, Code::Unavailable as i32);
+    assert_eq!(answer.result, None);
+    let info = status
+        .details
+        .iter()
+        .find(|any| any.type_url.ends_with("google.rpc.ErrorInfo"))
+        .map(|any| ErrorInfo::decode(any.value.as_slice()).expect("an ErrorInfo"))
+        .expect("the output rides in the status");
+    assert_eq!(info.reason, "JOB_OUTPUT_TAIL");
+    assert_eq!(info.metadata["stdout"], "started\n");
+    assert_eq!(info.metadata["stderr"], "warming up\n");
+    assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
+}
+
+/// Asserts that callers are answered only after the accepted result's action-cache entry is
+/// written, so a client that looks the action up as soon as its Execute finishes finds the
+/// result. The write is held at a gate: no answer arrives while it is held, and once it is let
+/// through the answer and the entry are both there.
+#[tokio::test]
+async fn the_cache_entry_is_written_before_the_callers_are_answered() {
+    let cell = Cell::start().await;
+    let job = Job::new("written first", &[]);
+    cell.upload(&job.blobs()).await;
+    cell.direct
+        .will_run(&job.action, Ran::writes("out", "in the cache first"));
+    let mut ops = cell.execute(&job.action).await;
+
+    let gate = &cell.cache.meta().action_write;
+    gate.close_next();
+    cell.direct.complete(&job.action).await;
+    gate.held().await;
+    assert!(
+        !done_within_quiet(&mut ops).await,
+        "answered before the action-cache write"
+    );
+    gate.open();
+    let result = response(&done(&mut ops).await).result.expect("a result");
+    assert_eq!(cell.cached(&job.action).await, Ok(result));
+}
+
+/// Asserts that a pack whose action-cache write the store refuses is not an answer: the pack
+/// could not be taken in, so the operation runs again as the next attempt, whose pack is taken
+/// in and answers the callers.
+#[tokio::test]
+async fn a_pack_the_store_could_not_take_in_runs_again_as_the_next_attempt() {
+    let cell = Cell::start().await;
+    let job = Job::new("unwritten", &[]);
+    cell.upload(&job.blobs()).await;
+    cell.direct
+        .will_run(&job.action, Ran::writes("out", "first pack"));
+    cell.direct
+        .will_run(&job.action, Ran::writes("out", "second pack"));
+    let mut ops = cell.execute(&job.action).await;
+
+    cell.cache.meta().fail_next_action_write();
+    cell.direct.complete(&job.action).await;
+    let second = cell.direct.job(&job.action, 1).await;
+    cell.direct.run_job(&second);
+    assert!(cell.direct.fake.finish(&second, 0));
+
+    let result = response(&done(&mut ops).await).result.expect("a result");
+    assert_eq!(
+        result.output_files[0].digest,
+        Some(Blob::new("second pack").proto)
+    );
+    assert_eq!(cell.direct.ingestions().len(), 2);
+    assert_eq!(cell.cached(&job.action).await, Ok(result));
+}
+
+/// Asserts that WaitExecution finds a running operation by the name Execute gave and delivers
+/// its result under the same name.
+#[tokio::test]
+async fn wait_execution_follows_a_running_operation() {
+    let cell = Cell::start().await;
+    let job = Job::new("waited", &[]);
+    cell.upload(&job.blobs()).await;
+    cell.direct
+        .will_run(&job.action, Ran::writes("out", "for the waiter"));
+    let mut ops = cell.execute(&job.action).await;
+    let name = first_name(&mut ops).await;
+    let mut waited = wait_stream(&cell, &name).await.expect("WaitExecution");
+
+    cell.direct.complete(&job.action).await;
+    let last = done(&mut waited).await;
+    assert_eq!(last.name, name);
+    let result = response(&last).result.expect("a result");
+    assert_eq!(result.output_files[0].path, "out");
+    assert_eq!(response(&done(&mut ops).await).result, Some(result));
+}
+
+/// Asserts that a finished operation is waited on within the retention (WaitExecution streams
+/// the done operation with its result, once, for an action whose result the cache does not keep)
+/// and not after: with no retention a finished operation is forgotten at once and its name is
+/// NOT_FOUND.
+#[tokio::test]
+async fn a_finished_operation_is_waited_on_within_the_retention_and_forgotten_with_none() {
+    for retention in [None, Some(std::time::Duration::ZERO)] {
+        let cell = match retention {
+            None => Cell::start().await,
+            Some(none) => Cell::start_with_retention(none).await,
+        };
+        let job = Job::new("exits 1", &[]);
+        cell.upload(&job.blobs()).await;
+        cell.direct.will_run(&job.action, Ran::exits(1));
+        let mut ops = cell.execute(&job.action).await;
+        cell.direct.complete(&job.action).await;
+        let finished = done(&mut ops).await;
+        let result = response(&finished).result.expect("a result");
+        assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
+
+        match retention {
+            None => {
+                let mut waited = wait_stream(&cell, &finished.name).await.expect("kept");
+                let first = waited
+                    .message()
+                    .await
+                    .expect("a stream")
+                    .expect("an update");
+                assert_eq!(first.name, finished.name);
+                assert_eq!(response(&first).result, Some(result));
+                assert!(
+                    waited.message().await.expect("a stream").is_none(),
+                    "more after done"
+                );
+            }
+            Some(_) => assert_eq!(
+                wait_name(&cell, &finished.name).await,
+                Err(Code::NotFound),
+                "forgotten at once"
+            ),
+        }
+    }
+}
+
+/// Asserts that forgetting one finished operation keeps the others: three operations run at
+/// once, the middle one finishes and, with no retention, is forgotten. The operations numbered
+/// below and above it are still found by WaitExecution, and both their Execute and WaitExecution
+/// streams get their results.
+#[tokio::test]
+async fn forgetting_one_operation_keeps_the_lower_and_higher_ones() {
+    let cell = Cell::start_with_retention(std::time::Duration::ZERO).await;
+    let jobs = ["lower", "middle", "higher"].map(|argv| Job::new(argv, &[]));
+    let mut ops = Vec::new();
+    let mut names = Vec::new();
+    for job in &jobs {
+        cell.upload(&job.blobs()).await;
+        cell.direct
+            .will_run(&job.action, Ran::writes(&job.input.proto.hash[..8], "out"));
+        let mut stream = cell.execute(&job.action).await;
+        names.push(first_name(&mut stream).await);
+        ops.push(stream);
+    }
+    let mut ids = Vec::new();
+    for job in &jobs {
+        ids.push(cell.direct.run(&job.action).await);
+    }
+
+    assert!(cell.direct.fake.finish(&ids[1], 0));
+    let middle = response(&done(&mut ops[1]).await).result.expect("a result");
+    assert_eq!(middle.output_files.len(), 1);
+    assert_eq!(wait_name(&cell, &names[1]).await, Err(Code::NotFound));
+
+    for kept in [0, 2] {
+        let mut waited = wait_stream(&cell, &names[kept]).await.expect("still kept");
+        assert!(cell.direct.fake.finish(&ids[kept], 0));
+        let through_execute = response(&done(&mut ops[kept]).await).result;
+        let through_wait = response(&done(&mut waited).await).result;
+        assert!(through_execute.is_some());
+        assert_eq!(through_execute, through_wait);
+    }
+}
+
+/// Asserts that WaitExecution answers the exact spelling Execute gave and no other: a name with
+/// a leading zero, a sign, a space or a cached result's spelling is NOT_FOUND, so a client's
+/// name from another spelling never attaches it to the operation that has the number.
+#[tokio::test]
+async fn wait_execution_refuses_a_name_spelled_other_than_the_one_execute_gave() {
+    let cell = Cell::start().await;
+    let job = Job::new("a name", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let name = first_name(&mut ops).await;
+    cell.direct.run(&job.action).await;
+    let number = name.strip_prefix("operations/").expect("a stored name");
+    assert!(number.bytes().all(|b| b.is_ascii_digit()), "{name}");
+
+    for other in [
+        format!("operations/0{number}"),
+        format!("operations/+{number}"),
+        format!("operations/{number} "),
+        "operations/".to_owned(),
+        format!("operations/cached/{number}"),
+        number.to_owned(),
+    ] {
+        assert_eq!(
+            wait_name(&cell, &other).await,
+            Err(Code::NotFound),
+            "{other:?}"
+        );
+    }
     assert_eq!(wait_name(&cell, &name).await, Ok(name));
 }
 
-/// Catches: a refused operation whose caller is never forgotten (WaitExecution on its
-/// name would replay the refusal forever, and the farm keep it), or forgotten at once
-/// (a caller that reconnects within the retention loses the reason). Within the
-/// retention WaitExecution streams the refusal; after it, NOT_FOUND, as for every
-/// other finished operation.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_operation_is_forgotten_after_the_retention() {
-    let retention = Duration::from_secs(1);
-    let cell = Cell::start_with(Duration::from_millis(300), retention).await;
-    let mut linux = cell.daemon("node-b", 4, 8).await;
-    let job = Job::new("mac only", &[("OSFamily", "macos")]);
-    cell.upload(&job.blobs()).await;
-    let mut ops = cell.execute(&job.action).await;
-    let name = ops
-        .message()
+/// Asserts that an Execute whose inputs are not in the CAS is refused FAILED_PRECONDITION
+/// naming each missing blob, and runs no job: the client uploads them and executes again.
+#[tokio::test]
+async fn an_execute_with_a_missing_input_is_refused_naming_the_blob_and_runs_no_job() {
+    let cell = Cell::start().await;
+    let job = Job::new("its input is not stored", &[]);
+    cell.upload(&[&job.action, &job.command]).await;
+
+    let refused = cell
+        .execute_with(&job.action, false)
         .await
-        .expect("a stream")
-        .expect("an update")
-        .name;
+        .expect_err("the Execute is refused");
+
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+    let status = kbf_proto::google::rpc::Status::decode(refused.details()).expect("rpc.Status");
+    let detail = status
+        .details
+        .iter()
+        .find(|any| any.type_url.ends_with("google.rpc.PreconditionFailure"))
+        .map(|any| {
+            kbf_proto::google::rpc::PreconditionFailure::decode(any.value.as_slice())
+                .expect("a PreconditionFailure")
+        })
+        .expect("the missing blobs are listed");
+    let subjects: Vec<_> = detail
+        .violations
+        .iter()
+        .map(|v| v.subject.clone())
+        .collect();
     assert_eq!(
-        wait_name(&cell, &name).await,
-        Ok(name.clone()),
-        "while queued"
+        subjects,
+        [format!(
+            "blobs/{}/{}",
+            job.root.digest.hash_hex(),
+            job.root.digest.size_bytes
+        )]
     );
-
-    let status = response(&done(&mut ops).await).status.expect("a status");
-    assert_eq!(status.code, Code::FailedPrecondition as i32, "{status:?}");
-    let mut waited = wait_stream(&cell, &name).await.expect("kept");
-    let first = waited
-        .message()
-        .await
-        .expect("a stream")
-        .expect("an update");
-    let again = response(&first).status.expect("a status");
-    assert_eq!(again, status, "the refusal is not the one answered");
-    linux.no_work().await;
-
-    tokio::time::sleep(retention + Duration::from_millis(500)).await;
-    assert_eq!(wait_name(&cell, &name).await, Err(Code::NotFound));
+    assert!(detail.violations.iter().all(|v| v.r#type == "MISSING"));
+    assert_eq!(cell.direct.submitted_jobs(), 0);
 }
 
-/// Catches: a `kbf-lease` kind dropped on the way to the `Start` (a whole-machine
-/// lease run as a shared one); a whole-machine lease offered to a daemon whose drivers
-/// serve only actions (`mac-0` sorts first, so placement that ignores the kind offers
-/// it there); and one that books less than the whole daemon.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_whole_machine_lease_starts_only_on_a_daemon_that_serves_it() {
+/// Asserts that the platform's `kbf-lease` reaches the job: an action that asks for a whole
+/// machine is submitted as a job that needs the whole host, and one that does not is not.
+#[tokio::test]
+async fn a_whole_machine_action_is_submitted_as_a_job_that_needs_the_whole_host() {
     let cell = Cell::start().await;
-    let mut shared = cell.daemon("mac-0", 4, 8).await;
-    let report = [("arch", "arm64"), ("drivers", "native-whole-machine")];
-    let mut whole = cell
-        .daemon_hello(hello_on("mac-1", 4, 8, &report))
-        .await
-        .expect("registered");
-    let job = Job::new("whole", &[("kbf-lease", "whole_machine")]);
-    cell.upload(&job.blobs()).await;
-    let _ops = cell.execute(&job.action).await;
-    let offer = whole.offer().await;
-    let start = whole.start().await;
-    assert_eq!(offer.kind, "whole_machine");
-    assert_eq!(start.kind, "whole_machine");
-    assert_eq!((start.millicpus, start.memory_bytes), (4_000, 8 << 30));
-    shared.no_work().await;
+    let whole = Job::new("whole", &[("kbf-lease", "whole_machine")]);
+    let shared = Job::new("shared", &[]);
+    cell.upload(&whole.blobs()).await;
+    cell.upload(&shared.blobs()).await;
+    let _whole_ops = cell.execute(&whole.action).await;
+    let _shared_ops = cell.execute(&shared.action).await;
+
+    let needs = |id: String| {
+        cell.direct
+            .fake
+            .submitted(&id)
+            .expect("a submitted job")
+            .needs
+            .map(|needs| needs.whole_host)
+    };
+    let whole_job = cell.direct.job(&whole.action, 0).await;
+    let shared_job = cell.direct.job(&shared.action, 0).await;
+    assert_eq!(needs(whole_job), Some(true));
+    assert!(!needs(shared_job).unwrap_or(false));
 }

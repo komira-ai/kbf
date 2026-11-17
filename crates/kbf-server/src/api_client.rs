@@ -11,7 +11,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::time::Duration;
 
-use crate::api::{JSON, node_path};
+use crate::api::JSON;
 
 /// How long a connect, a write or a read may take before the call fails. A drain
 /// answers at once (it does not wait for the streams), so a server that does not answer
@@ -132,14 +132,6 @@ impl OperatorClient {
         self.call("POST", path, Some(body))
     }
 
-    /// `POST /v1/nodes/{node}:{verb}` with `body`.
-    ///
-    /// # Errors
-    /// As [`OperatorClient::post`].
-    pub fn node_action(&self, node: &str, verb: &str, body: &str) -> Result<Reply, ClientError> {
-        self.post(&node_path(node, verb), body)
-    }
-
     fn call(&self, method: &str, path: &str, body: Option<&str>) -> Result<Reply, ClientError> {
         let io = |source| ClientError::Io {
             addr: self.addr,
@@ -256,7 +248,7 @@ mod tests {
 
         let again = answering(b"still not http");
         let err = OperatorClient::new(again, None)
-            .node_action("n", "drain", "")
+            .put("/v1/x", "{}")
             .expect_err("garbage");
         assert!(matches!(err, ClientError::Malformed { .. }), "{err:?}");
 

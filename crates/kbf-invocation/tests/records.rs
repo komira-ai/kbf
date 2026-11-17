@@ -4,12 +4,12 @@
 
 mod support;
 
+use kbf_invocation::RequeueReason;
 use kbf_invocation::{
     AttemptEnd, CallKind, Event, ExecuteAnswer, How, IDLE_AFTER, LeaseEnd, Listing, Metadata,
     OUTPUTS_PER_ROW, Outcome, Output, REASON_CAP, ROW_CAP, RecordKey, Records, State, TEXT_CAP,
     Text, WallTime,
 };
-use kbf_sched::RequeueReason;
 use kbf_types::{Failure, LostWhy, OperationId, WorkerId};
 use support::*;
 

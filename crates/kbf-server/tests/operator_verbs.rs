@@ -16,7 +16,7 @@ use kbf_objstore::MemoryStore;
 use kbf_server::members::{Members, MembershipConfig};
 use kbf_server::token::ApiToken;
 use kbf_server::verbs::routes;
-use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
+use kbf_server::{Api, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{Clock as _, Cond, ManualClock, Store, Txn};
 use kbf_types::operator_api::DeniedList;
@@ -57,19 +57,8 @@ fn listeners() -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        tick: Duration::from_millis(50),
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
@@ -97,7 +86,6 @@ fn start() -> Server {
     let clock = Arc::new(ManualClock::default());
     let state = StateStore {
         store: store_on(Arc::clone(&clock)),
-        epoch: EpochPolicy::Keep,
         members: config(),
         history: None,
     };

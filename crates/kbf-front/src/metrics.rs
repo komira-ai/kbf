@@ -20,12 +20,6 @@ use kbf_meta::Command;
 
 mod execute;
 pub use execute::{ErrorCause, ErrorCounts, ExecuteMetrics, OpenExecute};
-mod whole;
-pub use whole::WholeGauges;
-mod prediction;
-pub use prediction::{PREDICTION_AXES, PREDICTION_BUCKETS, PREDICTION_UNSET, PredictionTotals};
-mod shadow;
-pub use shadow::{SHADOW_SKIPS, ShadowBucket, ShadowLevel, ShadowTotals};
 mod tier;
 pub use tier::TierCounters;
 
@@ -414,8 +408,8 @@ pub struct CacheMetrics {
     /// Every metadata-log query the cache makes.
     pub query: Histogram,
     /// Execute calls between their start and their first stream item: the time before
-    /// the scheduler's first `QUEUED` operation can be sent (cache lookup, the action,
-    /// the input-tree walk, and the scheduler's submit). An Execute that fails is
+    /// the first `QUEUED` operation can be sent (cache lookup, the action,
+    /// the input-tree walk, and the dispatcher's submit). An Execute that fails is
     /// observed too.
     pub execute_presubmit: Histogram,
     /// Execute calls begun and not yet at their first stream item.
@@ -453,25 +447,8 @@ pub struct CacheMetrics {
     pub execute_dir_cache_evictions: Counter,
     pub execute_dir_cache_present_checked: Counter,
     pub execute_dir_cache_bytes: Level,
-    /// One call of the scheduler's submit from an Execute, the wait for its lock
-    /// included.
+    /// One call of the dispatcher's submit from an Execute.
     pub execute_submit: Histogram,
-    /// The wait for the scheduler's lock in one submit.
-    pub sched_lock_wait: Histogram,
-    /// Operations waiting for a lease, as of the last scheduler input.
-    pub sched_queued: Level,
-    /// Leases granted or running, as of the last scheduler input.
-    pub sched_leases: Level,
-    /// The whole-node caps' numbers and the requests waiting by reason; rendered only when
-    /// `--whole-node-max` is on.
-    pub sched_whole: WholeGauges,
-    /// Finished attempts the learned-sizes shadow compared with its estimate, by the
-    /// level the estimate came from and how the attempt fell (`kbf_estimator_shadow_total`).
-    pub estimator_shadow: ShadowTotals,
-    /// The placement predictions: the operations given one, why the others got none, how
-    /// finished runs fell against theirs, and the nodes with a CPU quota under
-    /// `--placement-load on` (`kbf_prediction_*`, `kbf_placement_cpu_limited_nodes`).
-    pub prediction: PredictionTotals,
     /// Write-tier calls queued on or running on the blocking pool.
     pub tier_in_flight: Gauge,
     /// The wait of one write-tier call for a blocking-pool thread.
@@ -537,12 +514,6 @@ impl Default for CacheMetrics {
             execute_dir_cache_present_checked: Counter::default(),
             execute_dir_cache_bytes: Level::default(),
             execute_submit: Histogram::new(Unit::Seconds),
-            sched_lock_wait: Histogram::new(Unit::Seconds),
-            sched_queued: Level::default(),
-            sched_leases: Level::default(),
-            sched_whole: WholeGauges::default(),
-            estimator_shadow: ShadowTotals::default(),
-            prediction: PredictionTotals::default(),
             tier_in_flight: Gauge::default(),
             tier_wait: Histogram::new(Unit::Seconds),
             tier_call: Histogram::new(Unit::Seconds),
@@ -645,7 +616,7 @@ impl CacheMetrics {
                 "kbf_execute_presubmit_seconds",
                 "Execute, from the handler's start to its first stream item: the action-cache \
                  lookup, the action and command reads, the input-tree walk and the \
-                 scheduler's submit (the first QUEUED operation cannot be sent sooner)",
+                 dispatcher's submit (the first QUEUED operation cannot be sent sooner)",
                 &self.execute_presubmit,
             ),
             (
@@ -675,13 +646,8 @@ impl CacheMetrics {
             ),
             (
                 "kbf_execute_submit_seconds",
-                "The scheduler's submit called from one Execute, the wait for its lock included",
+                "The dispatcher's submit called from one Execute",
                 &self.execute_submit,
-            ),
-            (
-                "kbf_sched_lock_wait_seconds",
-                "The wait for the scheduler's lock in one submit",
-                &self.sched_lock_wait,
             ),
             (
                 "kbf_tier_wait_seconds",
@@ -788,19 +754,6 @@ impl CacheMetrics {
              of the end of the last check",
             self.execute_dir_cache_bytes.get(),
         );
-        out.gauge(
-            "kbf_sched_queued",
-            "Operations waiting for a lease, as of the last scheduler input",
-            self.sched_queued.get(),
-        );
-        out.gauge(
-            "kbf_sched_leases",
-            "Leases granted or running, as of the last scheduler input",
-            self.sched_leases.get(),
-        );
-        self.sched_whole.render(&mut out);
-        self.estimator_shadow.render(&mut out);
-        self.prediction.render(&mut out);
         out.gauge(
             "kbf_tier_in_flight",
             "Write-tier calls queued on or running on the blocking pool",

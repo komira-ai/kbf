@@ -18,7 +18,7 @@ use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
 use kbf_server::proxy_auth::ProxySecret;
-use kbf_server::{Behind, EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_options};
+use kbf_server::{Behind, Listeners, StateStore, WorkerTls, bind_server_with_options};
 use kbf_state::Store;
 use kbf_storage::service::ROLE_URI_PREFIX;
 use kbf_tls::TlsSource;
@@ -151,19 +151,8 @@ fn listeners(worker_tls: WorkerTls) -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls: Some(worker_tls),
-        tick: Duration::from_millis(50),
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
@@ -184,7 +173,6 @@ fn frontend_behind(pki: &Pki, proxy: Option<Behind>) -> (SocketAddr, Arc<Hooked>
     let store = Hooked::new();
     let state = StateStore {
         store: Arc::clone(&store) as Arc<dyn Store>,
-        epoch: EpochPolicy::Keep,
         members: config(),
         history: None,
     };

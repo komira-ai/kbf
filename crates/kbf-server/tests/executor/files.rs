@@ -7,10 +7,8 @@ use js_proto::v1::StartFailureCode;
 use kbf_front::Finished;
 use kbf_server::executor::{Config, Delivery};
 
-use crate::recovery::until_jobs;
-use crate::rig::{Rig, submits};
+use crate::rig::{HOST, Rig, submits};
 
-const HOST: &str = "node1";
 const TOKEN: &str = "read-token-0001";
 const SIGNATURE: &str = "s3cr3t";
 
@@ -70,13 +68,11 @@ impl Log {
 /// Catches a secret that reaches the job any way but a file: the presigned url and the read
 /// token are in the two files the job carries and in no argument and no label; the task is told
 /// the paths; the job still ends end to end.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn the_job_holds_the_secrets_only_in_its_files() {
-    let mut rig = Rig::start(&[HOST], 1, files).await;
-    rig.pump().await;
-    let caller = rig.submit(3);
-    rig.pump().await;
-    let jobs = rig.jobs_of(3);
+    let rig = Rig::start(&[HOST], files).await;
+    let mut caller = rig.submit(3);
+    let jobs = rig.until_jobs(3, 1).await;
     assert_eq!(jobs.len(), 1, "{jobs:?}");
     let job = &jobs[0];
     assert_eq!(job.spec.files.len(), 2, "{:?}", job.spec.files);
@@ -102,30 +98,27 @@ async fn the_job_holds_the_secrets_only_in_its_files() {
         Some("/run/js-files/grant-token")
     );
     rig.host_finishes(job.id(), HOST, 0);
-    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
+    assert!(matches!(caller.done().await, Finished::Ran(_)));
 }
 
 /// Catches a fall back to arguments: a host that could not start a job whose secrets are files
 /// (the job ends failed to start, the agent refusing it) must not make the executor send the
-/// action's next job with the secrets as arguments. The action is the farm's to rerun as the
-/// infrastructure failure it is, and the rerun job carries its files and no secret in an
+/// action's next job with the secrets as arguments. The action is run again as the
+/// infrastructure failure it is, and the next job carries its files and no secret in an
 /// argument. (The fake's own start failure carries no agent detail; the class each detail,
 /// such as `files-unsupported`, comes to is held by the table in `outcome_tests`.)
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn files_delivery_never_falls_back_to_argv_after_a_host_could_not_start_the_job() {
-    let mut rig = Rig::start(&[HOST], 1, files).await;
-    rig.pump().await;
-    let caller = rig.submit(3);
-    rig.pump().await;
-    let first = rig.jobs_of(3).remove(0);
+    let rig = Rig::start(&[HOST], files).await;
+    let mut caller = rig.submit(3);
+    let first = rig.first_job(3).await;
     assert!(
         rig.fake
             .fail_to_start(first.id(), StartFailureCode::AgentRefused)
     );
-    rig.pump().await;
+    let jobs = rig.until_jobs(3, 2).await;
     assert!(caller.finished().is_none(), "{:?}", caller.finished());
     assert_eq!(rig.counter("kbf_executor_runs_total{outcome=\"infra\"}"), 1);
-    let jobs = until_jobs(&mut rig, 3, 2, 12).await;
     let rerun = &jobs[1];
     assert_ne!(rerun.id(), first.id());
     assert_eq!(rerun.spec.files.len(), 2, "{:?}", rerun.spec.files);
@@ -138,21 +131,20 @@ async fn files_delivery_never_falls_back_to_argv_after_a_host_could_not_start_th
         assert!(job.arg("--pack-url").is_none());
     }
     rig.host_finishes(rerun.id(), HOST, 0);
-    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
+    assert!(matches!(caller.done().await, Finished::Ran(_)));
 }
 
 /// Catches a secret that travels where it should not, in any of the places a job is shown: with
 /// files, the submit the job service decodes holds the url and the token in the job's files and
 /// in no argument; the spec printed with `{:?}` holds neither; and no line logged while the job
 /// is submitted, read, ingested and settled holds either value.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn the_files_carry_the_grant_and_the_put_url_and_nothing_else_does() {
     let log = Log::default();
     let _logged = log.capture();
-    let mut rig = Rig::start(&[HOST], 1, files).await;
-    rig.pump().await;
-    let caller = rig.submit(4);
-    rig.pump().await;
+    let rig = Rig::start(&[HOST], files).await;
+    let mut caller = rig.submit(4);
+    let job = rig.first_job(4).await;
     let sent = submits(&rig.fake.calls());
     assert_eq!(sent.len(), 1, "{sent:?}");
     let spec = &sent[0];
@@ -175,9 +167,8 @@ async fn the_files_carry_the_grant_and_the_put_url_and_nothing_else_does() {
     for secret in [TOKEN, SIGNATURE, url] {
         assert!(!printed.contains(secret), "{secret} is in {printed}");
     }
-    let job = rig.jobs_of(4).remove(0);
     rig.host_finishes(job.id(), HOST, 0);
-    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
+    assert!(matches!(caller.done().await, Finished::Ran(_)));
     let said = log.text();
     assert!(!said.is_empty(), "nothing was logged");
     for secret in [TOKEN, SIGNATURE, url] {
@@ -190,18 +181,17 @@ async fn the_files_carry_the_grant_and_the_put_url_and_nothing_else_does() {
 /// values of `--pack-url` and `--grant-token` after `--insecure-argv-secrets`, the job has no
 /// file, and still no line logged while the job is submitted, read, ingested and settled holds
 /// either value.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn insecure_argv_puts_the_secrets_in_the_arguments_and_in_no_file_or_log() {
     let log = Log::default();
     let _logged = log.capture();
-    let mut rig = Rig::start(&[HOST], 1, |cfg| {
+    let rig = Rig::start(&[HOST], |cfg| {
         cfg.delivery = Delivery::InsecureArgv;
         cfg.insecure_argv_secrets = true;
     })
     .await;
-    rig.pump().await;
-    let caller = rig.submit(4);
-    rig.pump().await;
+    let mut caller = rig.submit(4);
+    let job = rig.first_job(4).await;
     let sent = submits(&rig.fake.calls());
     assert_eq!(sent.len(), 1, "{sent:?}");
     let spec = &sent[0];
@@ -216,9 +206,8 @@ async fn insecure_argv_puts_the_secrets_in_the_arguments_and_in_no_file_or_log()
     assert!(url.starts_with("https://store.test/cas/b/"), "{url}");
     assert!(url.ends_with(&format!("?sig={SIGNATURE}")), "{url}");
     assert!(at("--pack-url-file").is_none() && at("--grant-token-file").is_none());
-    let job = rig.jobs_of(4).remove(0);
     rig.host_finishes(job.id(), HOST, 0);
-    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
+    assert!(matches!(caller.done().await, Finished::Ran(_)));
     let said = log.text();
     assert!(!said.is_empty(), "nothing was logged");
     for secret in [TOKEN, SIGNATURE, url.as_str()] {

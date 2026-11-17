@@ -26,9 +26,15 @@ struct Proc {
 impl Proc {
     /// `kbf <args>`, once it has printed its start line.
     fn start(args: &[&str]) -> Self {
+        Self::start_logged(args, Stdio::inherit())
+    }
+
+    /// As [`Proc::start`], with its standard error going to `stderr`.
+    fn start_logged(args: &[&str], stderr: Stdio) -> Self {
         let mut child = Command::new(BIN)
             .args(args)
             .stdout(Stdio::piped())
+            .stderr(stderr)
             .spawn()
             .expect("spawn kbf");
         // Read on a thread so that a child that never prints its start line fails the
@@ -256,65 +262,43 @@ fn a_refused_frontend_start_exits_2() {
     }
 }
 
-/// Catches `kbf --mode=frontend --scheduler-core=js` still starting (a farm that runs the
-/// legacy core while the flag says js), a refusal with a status other than 2, and one whose
-/// message does not name the flag and say the js core was removed: the start ends with status 2
-/// before a start line, its stderr names `--scheduler-core` and says `the js scheduler core was
-/// removed`, it logs no core, and its state store is left uncreated (the refusal comes before
-/// anything opens).
+/// Catches a retired scheduler flag that refuses the start (an operator's unit that still
+/// passes `--scheduler-core=js` or `--usage-profiles=on` would not come back), and one that
+/// is not warned about, or warned about more than once: the frontend prints its start line,
+/// and its stderr holds the whole warning of each flag, once.
 #[test]
-fn scheduler_core_js_is_refused_with_a_message() {
-    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-js-core-refused");
-    let state = dir.join("state.db");
-    let out = refused_core_start(&dir, &state, "--scheduler-core=js");
-    let said = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{said}");
-    assert!(out.stdout.is_empty(), "the frontend started");
-    assert!(said.contains("--scheduler-core"), "{said}");
-    assert!(said.contains("the js scheduler core was removed"), "{said}");
-    assert!(!said.contains("scheduler core:"), "a core ran: {said}");
-    assert!(!state.exists(), "{} was created", state.display());
-}
-
-/// Catches `--usage-profiles=record` or `--usage-profiles=on`, which needed the removed js
-/// core, starting a frontend, a refusal with a status other than 2, and a message that does
-/// not name the flag and its value: each ends the start with status 2 before a start line, its
-/// stderr holds the whole message for that value, and its state store is left uncreated.
-#[test]
-fn flags_that_needed_the_js_core_are_refused_with_a_message() {
-    let dir = TestDir::under(
-        env!("CARGO_TARGET_TMPDIR"),
-        "frontend-usage-profiles-refused",
+fn retired_scheduler_flags_are_accepted_and_warn_once_each() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-retired-flags");
+    let node = node(&dir.join("node"));
+    let state = format!(
+        "--state-store=sqlite://{}",
+        dir.join("state").join("state.db").display()
     );
-    for value in ["record", "on"] {
-        let state = dir.join(format!("state-{value}.db"));
-        let flag = format!("--usage-profiles={value}");
-        let out = refused_core_start(&dir, &state, &flag);
-        let said = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(2), "{flag}: {said}");
-        assert!(out.stdout.is_empty(), "{flag}: the frontend started");
-        let message = format!(
-            "--usage-profiles {value} needs the js scheduler core, which was removed: \
-             scheduling runs in the job service; leave the flag out or use --usage-profiles off"
-        );
-        assert!(said.contains(&message), "{flag}: {said}");
-        assert!(!state.exists(), "{flag}: {} was created", state.display());
+    let log = dir.join("stderr.log");
+    let stderr = std::fs::File::create(&log).expect("a log file");
+    let storage = format!("--storage=http://{}", node.field("storage="));
+    let mut front = Proc::start_logged(
+        &[
+            "frontend",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+            "--drain-lb-wait=0",
+            storage.as_str(),
+            &state,
+            "--scheduler-core=js",
+            "--usage-profiles=on",
+            "--whole-node-max=2",
+        ],
+        Stdio::from(stderr),
+    );
+    assert!(front.line.starts_with("kbf-frontend "), "{}", front.line);
+    assert!(front.stop().is_some_and(|status| status.success()));
+    let said = std::fs::read_to_string(&log).expect("the log");
+    for flag in ["--scheduler-core", "--usage-profiles", "--whole-node-max"] {
+        let message =
+            format!("{flag} is no longer read: every Execute is a job of the job service");
+        assert_eq!(said.matches(&message).count(), 1, "{flag}: {said}");
     }
-}
-
-/// `kbf --mode=frontend` with `flag` added, over a state store at `state`, run to its end.
-fn refused_core_start(dir: &Path, state: &Path, flag: &str) -> std::process::Output {
-    Command::new(BIN)
-        .args([
-            "--mode=frontend".to_owned(),
-            "--listen=127.0.0.1:0".to_owned(),
-            "--storage=http://127.0.0.1:1".to_owned(),
-            format!("--state-store=sqlite://{}", state.display()),
-            kbf_testkit::config::flag(dir),
-            flag.to_owned(),
-        ])
-        .output()
-        .expect("run kbf")
 }
 
 /// Asserts that a frontend given neither `--state-store` nor a settings file with the key

@@ -114,7 +114,7 @@ async fn the_tap_hears_each_settled_attempt_and_its_id_lands_in_the_record() {
     recorder.emit(Event::Requeued {
         operation: OperationId(7),
         lease: LeaseId::new(1, 1),
-        reason: kbf_sched::RequeueReason::Silent,
+        reason: kbf_invocation::RequeueReason::Silent,
         at: wall_now(),
     });
     recorder.emit(granted(7, 2));

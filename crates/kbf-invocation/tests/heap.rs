@@ -11,11 +11,11 @@ mod support;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+use kbf_invocation::RequeueReason;
 use kbf_invocation::{
     CallKind, Event, ExecuteAnswer, Finished, LeaseEnd, Metadata, Outcome, Output, ROW_CAP,
     Records, WallTime,
 };
-use kbf_sched::RequeueReason;
 use kbf_types::{Failure, OperationId};
 use support::*;
 

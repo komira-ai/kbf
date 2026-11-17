@@ -1,5 +1,7 @@
 # Scheduler
 
+> **Superseded by [direct-js.md](direct-js.md):** kbf no longer schedules. Every Execute that misses the action cache is one job of the job service, submitted at once; there are no leases, virtual workers, slots, Start window, fence, farm reruns, memory ladder, learned sizes, placement or queue in kbf. This page records the earlier design.
+
 > **kbf-daemon is deleted.** Where this page says a daemon holds a lease, it describes the deleted `kbf-daemon`. Placed actions run only as js-agent jobs of the job service; the frontend registers virtual workers with its farm for them (`crates/kbf-server/src/executor/host.rs`).
 
 The scheduler decides which worker runs which action, and makes sure that however
@@ -511,7 +513,7 @@ What the code does today:
 - Every action requests one core and 4 GiB, the first rung of the memory ladder
   (`kbf_front::DEFAULT_RESOURCES`; the server's `--memory-ladder-gib` sets the rung),
   or the whole cores and GiB its `kbf-book-cpus` and `kbf-book-mem-gib` properties name (see
-  [platform-properties.md](../platform-properties.md#kbf-book-cpus-and-kbf-book-mem-gib)),
+  [platform-properties.md](../platform-properties.md)),
   its `gpu` count, and what its platform asks of a worker (`Request::needs`). The
   scheduler raises the memory of a new submission to its action key's memory floor,
   if it has one (see "Memory kills" below).

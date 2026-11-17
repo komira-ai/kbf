@@ -9,15 +9,14 @@ use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{Cond, ManualClock, Store, Txn};
 use tonic::Code;
 
+use crate::StateStore;
 use crate::identity::{PeerCert, Peers};
 use crate::members::MembershipConfig;
 use crate::serve::members_of;
-use crate::{EpochPolicy, StateStore};
 
 fn state(fake: &Arc<Fake>) -> StateStore {
     StateStore {
         store: Arc::clone(fake) as Arc<dyn Store>,
-        epoch: EpochPolicy::Keep,
         members: MembershipConfig {
             ttl: Duration::from_secs(60),
             dwell: Duration::from_secs(60),
@@ -87,20 +86,4 @@ async fn a_failing_first_refresh_does_not_stop_the_start() {
         .await
         .expect_err("nobody is admitted yet");
     assert_eq!(refused.code(), Code::Unavailable);
-}
-
-/// A start with `--exclusive-actions` on says so, and a start with it off says nothing
-/// about it: an operator reading the start-up log can tell a farm that books a whole
-/// worker per action from one that does not. Catches a line that is missing when on or
-/// printed when off.
-#[test]
-fn a_start_logs_exclusive_actions_only_when_on() {
-    let off = crate::test_log::capture();
-    crate::serve::log_exclusive(false);
-    assert!(!off.text().contains("exclusive-actions"));
-    drop(off);
-    let on = crate::test_log::capture();
-    crate::serve::log_exclusive(true);
-    assert!(on.text().contains(crate::serve::EXCLUSIVE_LINE));
-    assert_eq!(crate::serve::EXCLUSIVE_LINE, "exclusive-actions: on");
 }

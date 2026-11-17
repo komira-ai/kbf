@@ -2,10 +2,6 @@
 //! the Fleet UI, scripts and clients (`docs/design/fleet-updates.md` section 11.4;
 //! `docs/api.md`).
 //!
-//! - `GET /v1/nodes`: every node registered since the server started, with the newest
-//!   software status each sent and where it is in
-//!   placement ([`crate::fleet`]), the protocol version each speaks, and the oldest of
-//!   those ([`ProtocolSummary`]).
 //! - `GET /v1/members`: the storage members of the current map, as the gRPC
 //!   `Membership` service keeps them ([`crate::members::Members`]), the protocol version
 //!   each registered naming, and the oldest of those, and what each said of the build it
@@ -13,12 +9,6 @@
 //! - `GET /v1/storage`: whether every blob is known to have its copies elsewhere, from the
 //!   storage members' heartbeats ([`crate::storage_health`]); on a frontend with a state
 //!   store.
-//! - `POST /v1/nodes/{node}:cordon`, `:drain` and `:uncordon`: take a node out of
-//!   placement, drain it, or return it ([`NodeAction`]). A drain's body may be
-//!   `{"deadline_secs": N}`; without one the drain has no deadline ([`NO_DRAIN_DEADLINE`]): it
-//!   waits for the leases however long they run. The answer
-//!   is the node as it is after the action.
-//!
 //! - `POST /v1/members/{id}` with `{"state": "active"|"draining"|"planned_down"}`: sets a
 //!   storage member's state ([`Members::set_state`]), the operator's promotion of a joiner;
 //!   `planned_down` ([`Members::plan_down`]) takes an `Active` member out of the write path
@@ -35,14 +25,13 @@
 //!   case); one that is an IP address or has a colon is `400`, since it would name nothing.
 //!
 //! - `GET /v1/frontend/drain`: whether the frontend is draining and in which phase, the
-//!   Execute and WaitExecution streams open and the operations queued ([`DrainStatus`]).
+//!   Execute and WaitExecution streams open ([`DrainStatus`]).
 //!   `POST /v1/frontend/drain` begins the drain and answers the same status. A frontend over
 //!   a state store runs the drain sequence ([`crate::sequence`]): `/readyz` goes false at
 //!   once while everything is still served, new Execute calls are refused after
 //!   `--drain-lb-wait`, every listener is sent GOAWAY, open executions run until they
-//!   are done, however long (`--drain-deadline`, if set, only reports when it passes; but the streams of operations that were never started
-//!   and that no worker on this frontend can run and no other frontend can take end
-//!   UNAVAILABLE when the drain begins), and the process exits 0. Any other server drains at
+//!   are done, however long (`--drain-deadline`, if set, only reports when it passes), and
+//!   the process exits 0. Any other server drains at
 //!   once ([`crate::drain`]): new Execute calls are refused, `/readyz` goes false, the REAPI
 //!   listener is sent GOAWAY, open streams run until their action is done, and the server
 //!   exits when they have. It is not undone: a drained frontend is restarted.
@@ -50,18 +39,12 @@
 //! - `GET /v1/frontend/retire` reads the retire mode of a frontend over a state store, and
 //!   `POST /v1/frontend/retire` begins it ([`crate::retire`]); any other server answers `409`.
 //!
-//! - `POST /v1/epoch/bump`: raises the epoch the state store holds by one ([`Farm::bump_epoch`])
-//!   and answers `{"previous", "epoch", "serving"}`. A frontend reads the stored epoch when
-//!   it starts and keeps it, so workers drop the leases of the older epoch when they reach a
-//!   frontend started after the bump; the one that answers goes on serving the epoch it
-//!   started under (`serving`). The operator's step after a restore from a backup.
-//!
 //! - `/v1/enroll/...`: the enrollment tokens and the node registry ([`crate::enroll::api`]).
 //!   Every one of these routes, a GET included, passes the gates below.
 //!
 //! Reads answer anyone who reaches the listener, except the enrollment routes. A write
-//! must pass every gate of [`write_request`], because a loopback peer is not an operator:
-//! every server host is also a worker whose build actions can reach loopback, a reverse proxy on the host
+//! must pass every gate of [`gate`], because a loopback peer is not an operator: a reverse
+//! proxy on the host
 //! makes remote callers loopback, and a browser on the host can POST to it from any
 //! page. The gates: a loopback peer, no `Origin` header (no browser page), the bearer
 //! token of `--api-token-file` ([`ApiToken`]; without one, writes are off), and a JSON
@@ -85,21 +68,18 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use kbf_front::Backend;
 use kbf_map::{DenyEntry, Map, MemberId, MemberState};
 use kbf_state::Store;
-use kbf_types::WorkerId;
 use serde::{Deserialize, Serialize};
 
 use crate::drain::{Drain, DrainStatus, Phase};
 use crate::enroll::api::EnrollApi;
-use crate::farm::{EpochBump, Farm, NodeAction, PlaceError, StateError};
-use crate::fleet::ProtocolSummary;
 use crate::members::{Members, MembershipError};
 use crate::proxy_auth::{Caller, Trust};
 use crate::retire::Retire;
 use crate::token::ApiToken;
 
-mod node_detail;
 mod retire;
 mod safe_to_stop;
 
@@ -108,37 +88,17 @@ pub use safe_to_stop::{Verdict, safe_to_stop_path};
 /// The media type of every body this API returns, and of every write it accepts.
 pub const JSON: &str = "application/json";
 
-/// What a drain waits for its leases when its request names no deadline: for ever. The
-/// scheduler adds it to the clock with saturation, so the drain's deadline is the largest
-/// farm time, which no clock reaches; the node is `drained` when its leases end and is never
-/// `drain_paused`. The views show no deadline for it ([`crate::fleet::shown_deadline`]).
-pub const NO_DRAIN_DEADLINE: Duration = Duration::MAX;
-
 /// The path of the frontend's drain: `GET` reads it, `POST` begins it.
 pub const FRONTEND_DRAIN: &str = "/v1/frontend/drain";
 
 /// The path of the frontend's retire: `GET` reads it, `POST` begins it.
 pub const FRONTEND_RETIRE: &str = "/v1/frontend/retire";
 
-/// The path of `POST /v1/epoch/bump`.
-pub const EPOCH_BUMP: &str = "/v1/epoch/bump";
-
-/// The path of `GET /v1/nodes`.
-pub const NODES: &str = "/v1/nodes";
-
 /// The path of `GET /v1/members`.
 pub const MEMBERS: &str = "/v1/members";
 
 /// The path of `POST /v1/denied` (add an entry) and `DELETE /v1/denied?entry=...`.
 pub const DENIED: &str = "/v1/denied";
-
-/// The path of `POST /v1/nodes/{node}:{verb}`, with `node` percent-encoded (every byte
-/// but an ASCII letter, digit, `-`, `.`, `_` or `~`), so a node id that holds a `/`, a
-/// `:` or a space still names one path segment.
-#[must_use]
-pub fn node_path(node: &str, verb: &str) -> String {
-    format!("{NODES}/{}:{verb}", encode_segment(node))
-}
 
 /// `text` percent-encoded to stand as one path segment: every byte but an ASCII letter,
 /// digit, `-`, `.`, `_` or `~` becomes `%XX`.
@@ -154,11 +114,42 @@ pub(crate) fn encode_segment(text: &str) -> String {
     out
 }
 
-/// What the handlers share: the farm, the token writes must present (`None`: writes
-/// are off), the frontend's drain and the storage members (`None`: this server keeps
-/// none, as without a state store).
+/// What the protocol versions of a list of storage members come to, as the envelope of
+/// `GET /v1/members` states it: the input of the check that a release may stop accepting the
+/// oldest version (`docs/design/frontend-proxy.md` section 9, rule R1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ProtocolSummary {
+    /// The least version among the members whose version is known; `None` when no member's
+    /// is. Read it with `protocol_unknown`.
+    pub oldest_protocol: Option<u32>,
+    /// How many members name no version. They are never counted in `oldest_protocol`.
+    pub protocol_unknown: u32,
+}
+
+impl ProtocolSummary {
+    /// The summary of members that speak `protocols` (`None`: names none).
+    #[must_use]
+    pub fn of(protocols: impl IntoIterator<Item = Option<u32>>) -> Self {
+        let (mut oldest, mut unknown) = (None::<u32>, 0_u32);
+        for protocol in protocols {
+            match protocol {
+                // Not `oldest.min(protocol)`: `None` is the least `Option`.
+                Some(version) => oldest = Some(oldest.map_or(version, |o| o.min(version))),
+                None => unknown = unknown.saturating_add(1),
+            }
+        }
+        Self {
+            oldest_protocol: oldest,
+            protocol_unknown: unknown,
+        }
+    }
+}
+
+/// What the handlers share: the REAPI front's store (its metrics count the open
+/// executions), the token writes must present (`None`: writes are off), the frontend's drain
+/// and the storage members (`None`: this server keeps none, as without a state store).
 struct ApiState {
-    farm: Arc<Farm>,
+    backend: Backend,
     token: Option<ApiToken>,
     drain: Arc<Drain>,
     /// What `POST /v1/frontend/retire` begins: set once by a frontend over a state store,
@@ -170,7 +161,7 @@ struct ApiState {
     store: Option<Arc<dyn Store>>,
 }
 
-/// The API's routes over `farm`; writes need `token`, and without one are refused.
+/// The API's routes over `backend`; writes need `token`, and without one are refused.
 /// `drain` is what `POST /v1/frontend/drain` begins; `members` is what
 /// `GET /v1/members` reads and `POST /v1/members/{id}` changes (the same value the
 /// `Membership` service registers into). `store` is the state store `safe_to_stop`
@@ -180,7 +171,7 @@ struct ApiState {
 /// Writes read the peer address from
 /// [`ConnectInfo`]: serve them with `into_make_service_with_connect_info`.
 pub fn router(
-    farm: Arc<Farm>,
+    backend: Backend,
     token: Option<ApiToken>,
     drain: Arc<Drain>,
     retire: Arc<OnceLock<Retire>>,
@@ -189,19 +180,15 @@ pub fn router(
     enroll: Option<Arc<EnrollApi>>,
 ) -> Router {
     let enrollment = crate::enroll::api::routes(token.clone(), enroll);
-    let scheduler = crate::http_sched::router(Arc::clone(&farm));
     Router::new()
-        .route(NODES, get(nodes))
         .route(MEMBERS, get(members_view))
-        .route("/v1/nodes/{target}", get(node_detail::one).post(act))
         .route("/v1/members/{id}", post(set_member_state))
         .route("/v1/members/{id}/safe-to-stop", get(safe_to_stop::check))
         .route(DENIED, post(deny_entry).delete(allow_entry))
         .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
         .route(FRONTEND_RETIRE, get(retire::status).post(retire::begin))
-        .route(EPOCH_BUMP, post(bump_epoch))
         .with_state(Arc::new(ApiState {
-            farm,
+            backend,
             token,
             drain,
             retire,
@@ -209,7 +196,6 @@ pub fn router(
             store,
         }))
         .merge(enrollment)
-        .merge(scheduler)
 }
 
 /// The drain as it is now.
@@ -218,8 +204,8 @@ fn status(api: &ApiState) -> DrainStatus {
     DrainStatus {
         draining: phase != Phase::Serving,
         phase,
-        open_executions: api.farm.open_executions(),
-        queued_operations: api.farm.queued_operations(),
+        open_executions: api.backend.metrics().execute.open_executions.get(),
+        queued_operations: 0,
         deadline_passed: api.drain.deadline_passed(),
     }
 }
@@ -257,68 +243,6 @@ async fn begin_drain(
         tracing::info!("frontend drain begun by the operator API");
     }
     json(StatusCode::OK, &status(&api))
-}
-
-async fn bump_epoch(
-    State(api): State<Arc<ApiState>>,
-    peer: Caller,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
-        return error(code, &why);
-    }
-    if !body.is_empty()
-        && let Err(e) = serde_json::from_slice::<NoBody>(&body)
-    {
-        let why = format!("an epoch bump takes no body, or {{}}: {e}");
-        return error(StatusCode::BAD_REQUEST, &why);
-    }
-    // The store's calls block (its trait says so).
-    let farm = Arc::clone(&api.farm);
-    let bumped = tokio::task::spawn_blocking(move || farm.bump_epoch()).await;
-    epoch_answer(api.farm.lease_epoch(), bumped)
-}
-
-/// The answer to an epoch bump, from what the blocking call returned: the epoch before it
-/// and the epoch stored now, and `serving`, the epoch this frontend started under and goes
-/// on serving. A server with no state store has no epoch to raise (404).
-fn epoch_answer(
-    serving: u64,
-    bumped: Result<Result<Option<EpochBump>, StateError>, tokio::task::JoinError>,
-) -> Response {
-    match bumped {
-        Ok(Ok(Some(EpochBump { previous, epoch }))) => {
-            tracing::info!(previous, epoch, "the stored epoch was raised");
-            json(
-                StatusCode::OK,
-                &serde_json::json!({ "previous": previous, "epoch": epoch, "serving": serving }),
-            )
-        }
-        Ok(Ok(None)) => error(
-            StatusCode::NOT_FOUND,
-            "this server keeps no state store: it has no epoch to raise",
-        ),
-        Ok(Err(e)) => error(epoch_failure(&e), &e.to_string()),
-        Err(e) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("epoch task: {e}"),
-        ),
-    }
-}
-
-/// The status a failed epoch bump answers with: a store that is down, or that other
-/// writers kept changing the epoch of, is to be tried again; a row that cannot be read is
-/// not.
-const fn epoch_failure(e: &StateError) -> StatusCode {
-    match e {
-        StateError::Store(_) | StateError::Conflict(_) => StatusCode::SERVICE_UNAVAILABLE,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
-async fn nodes(State(api): State<Arc<ApiState>>) -> Response {
-    json(StatusCode::OK, &api.farm.nodes())
 }
 
 /// One storage member of the map.
@@ -415,28 +339,6 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
         },
     );
     json(StatusCode::OK, &view)
-}
-
-async fn act(
-    State(api): State<Arc<ApiState>>,
-    peer: Caller,
-    Path(target): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let request = Write {
-        peer: &peer,
-        headers: &headers,
-        target: &target,
-        body: &body,
-    };
-    match write_request(api.token.as_ref(), &request) {
-        Ok((node, action)) => match api.farm.place(&node, action) {
-            Ok(view) => json(StatusCode::OK, &view),
-            Err(refused) => placed_error(&refused),
-        },
-        Err((code, why)) => error(code, &why),
-    }
 }
 
 /// The body of `POST /v1/members/{id}`: the state to put the member in. `Down` is the
@@ -752,26 +654,6 @@ pub(crate) fn no_members() -> Response {
     )
 }
 
-/// A write as it arrived.
-#[derive(Clone, Copy, Debug)]
-pub struct Write<'a> {
-    /// Who sent it, and how far the proxy vouches for it.
-    pub peer: &'a Caller,
-    /// Its headers.
-    pub headers: &'a HeaderMap,
-    /// The last path segment: `{node}:{verb}`.
-    pub target: &'a str,
-    /// Its body.
-    pub body: &'a [u8],
-}
-
-/// The body a drain may carry.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DrainBody {
-    deadline_secs: u64,
-}
-
 /// The gates every write passes, in order:
 ///
 /// 1. the peer is loopback, so the token never crosses a network in clear (a remote
@@ -784,7 +666,10 @@ struct DrainBody {
 /// 4. `Authorization: Bearer <token>`, compared in constant time: else 401;
 /// 5. `Content-Type: application/json` (parameters allowed), which a browser cannot
 ///    send cross-origin without a preflight the API never answers: else 415.
-pub(crate) fn gate(
+///
+/// # Errors
+/// The status and reason of the first gate that refuses.
+pub fn gate(
     token: Option<&ApiToken>,
     peer: &Caller,
     headers: &HeaderMap,
@@ -846,52 +731,6 @@ pub(crate) fn operator_gate(
     Ok(())
 }
 
-/// The node and action `write` names, if it passes every gate (see [`gate`]) and is
-/// well formed; else the status and reason to answer with.
-///
-/// # Errors
-/// The gates; then 404 for a target without a known verb, and 400 for a drain
-/// body that is not `{"deadline_secs": N}`.
-pub fn write_request(
-    token: Option<&ApiToken>,
-    write: &Write<'_>,
-) -> Result<(WorkerId, NodeAction), (StatusCode, String)> {
-    let Write {
-        peer,
-        headers,
-        target,
-        body,
-    } = *write;
-    gate(token, peer, headers)?;
-    let unknown = || (StatusCode::NOT_FOUND, format!("no action {target:?}"));
-    let (node, verb) = target.rsplit_once(':').ok_or_else(unknown)?;
-    let action = match verb {
-        "cordon" => NodeAction::Cordon,
-        "uncordon" => NodeAction::Uncordon,
-        "drain" => drain_action(body)?,
-        _ => return Err(unknown()),
-    };
-    Ok((WorkerId::new(node), action))
-}
-
-/// The drain a request body asks for: [`NO_DRAIN_DEADLINE`] for no body, else the
-/// `{"deadline_secs": N}` it holds (any `N`, 0 included: a drain with deadline 0 pauses at
-/// the next tick if a lease still runs).
-///
-/// # Errors
-/// 400 for a body that is not `{"deadline_secs": N}`.
-pub(crate) fn drain_action(body: &[u8]) -> Result<NodeAction, (StatusCode, String)> {
-    if body.is_empty() {
-        return Ok(NodeAction::Drain(NO_DRAIN_DEADLINE));
-    }
-    serde_json::from_slice::<DrainBody>(body)
-        .map(|drain| NodeAction::Drain(Duration::from_secs(drain.deadline_secs)))
-        .map_err(|e| {
-            let why = format!("a drain body is {{\"deadline_secs\": N}}: {e}");
-            (StatusCode::BAD_REQUEST, why)
-        })
-}
-
 /// Whether a `Content-Type` value is `application/json`, in any case, with or without
 /// parameters (`; charset=utf-8`).
 fn is_json(value: &[u8]) -> bool {
@@ -904,16 +743,6 @@ fn is_json(value: &[u8]) -> bool {
 pub(crate) fn json(code: StatusCode, value: &impl serde::Serialize) -> Response {
     let body = serde_json::to_vec(value).unwrap_or_default();
     (code, [(CONTENT_TYPE, JSON)], body).into_response()
-}
-
-/// The answer to a node action the farm did not apply: 404 for a node no frontend has held,
-/// 503 when the state store could not say who holds the node or did not take the action.
-pub(crate) fn placed_error(refused: &PlaceError) -> Response {
-    let code = match refused {
-        PlaceError::Unknown(_) => StatusCode::NOT_FOUND,
-        PlaceError::Unread(_) | PlaceError::Unwritten(_) => StatusCode::SERVICE_UNAVAILABLE,
-    };
-    error(code, &refused.to_string())
 }
 
 /// An error answer; a 401 names the scheme it wants (RFC 9110 section 11.6.1).
@@ -929,7 +758,7 @@ pub(crate) fn error(code: StatusCode, why: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use kbf_map::{Member, Rule};
-    use kbf_state::{Conflict, StoreError};
+    use kbf_state::StoreError;
 
     use super::*;
 
@@ -943,32 +772,6 @@ mod tests {
             boot: 0,
         };
         Map::new(9, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("a map")
-    }
-
-    /// Asserts that a refused node action is a 404 only for a node no frontend has held, and a
-    /// 503 naming the node when the store failed. Catches: an updater that takes a store
-    /// failure for "no worker here".
-    #[tokio::test]
-    async fn a_refused_node_action_is_a_404_only_for_an_unknown_node() {
-        let node = || "node-b".to_owned();
-        for (refused, want) in [
-            (
-                PlaceError::Unknown(crate::farm::UnknownNode(node())),
-                StatusCode::NOT_FOUND,
-            ),
-            (
-                PlaceError::Unread(crate::farm::NodeUnread(node())),
-                StatusCode::SERVICE_UNAVAILABLE,
-            ),
-            (
-                PlaceError::Unwritten(node()),
-                StatusCode::SERVICE_UNAVAILABLE,
-            ),
-        ] {
-            let (code, said) = body(placed_error(&refused)).await;
-            assert_eq!(code, want, "{refused}");
-            assert_eq!(said["error"], refused.to_string());
-        }
     }
 
     async fn body(answer: Response) -> (StatusCode, serde_json::Value) {
@@ -1127,55 +930,11 @@ mod tests {
         let (code, _) = body(allowed_answer(&entry, Err(panicked.expect_err("a panic")))).await;
         assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
     }
-
-    /// Asserts that an epoch bump answers the epochs before and after it and the epoch
-    /// this frontend serves, that a server with no state store says so (404), and that a
-    /// store that is down or kept changing under the bump is to be tried again (503), and
-    /// that a row that cannot be read and a panicked task are ours (500).
-    #[tokio::test]
-    async fn an_epoch_bump_answers_each_outcome_with_its_status() {
-        let bumped = EpochBump {
-            previous: 4,
-            epoch: 5,
-        };
-        let (code, ok) = body(epoch_answer(4, Ok(Ok(Some(bumped))))).await;
-        assert_eq!(code, StatusCode::OK);
-        let expected = serde_json::json!({"previous": 4, "epoch": 5, "serving": 4});
-        assert_eq!(ok, expected);
-        let (code, none) = body(epoch_answer(4, Ok(Ok(None)))).await;
-        assert_eq!(code, StatusCode::NOT_FOUND);
-        let said = none["error"].as_str().unwrap_or_default();
-        assert!(said.contains("no state store"), "{said}");
-        let lost = Conflict {
-            index: 0,
-            key: "meta/epoch".to_owned(),
-        };
-        let down = StoreError::Failed("down".to_owned());
-        let failures = [
-            (StateError::Store(down), StatusCode::SERVICE_UNAVAILABLE),
-            (StateError::Conflict(lost), StatusCode::SERVICE_UNAVAILABLE),
-            (
-                StateError::Missing("meta/epoch".to_owned()),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ),
-        ];
-        for (failure, want) in failures {
-            let text = failure.to_string();
-            let (code, answer) = body(epoch_answer(4, Ok(Err(failure)))).await;
-            assert_eq!(code, want, "{text}");
-            assert_eq!(answer["error"], text);
-        }
-        let panicked = tokio::task::spawn_blocking(|| -> Result<Option<EpochBump>, StateError> {
-            panic!("the epoch call panicked")
-        })
-        .await;
-        let (code, answer) = body(epoch_answer(4, Err(panicked.expect_err("a panic")))).await;
-        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
-        let said = answer["error"].as_str().unwrap_or_default();
-        assert!(said.contains("epoch task"), "{said}");
-    }
 }
 
 #[cfg(test)]
 #[path = "api_members_tests.rs"]
 mod members_tests;
+#[cfg(test)]
+#[path = "api_status_tests.rs"]
+mod status_tests;

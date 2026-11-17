@@ -2,8 +2,6 @@
 //! worker is a fake daemon on the frontend's worker listener; no test here depends on
 //! how long anything takes.
 
-use support::{FakeDaemon, hello};
-
 use super::*;
 
 /// A frontend over a storage node, with the node that keeps it ready.
@@ -17,36 +15,32 @@ async fn ready_front(more: &[&str]) -> (Node, Front) {
     (node, front)
 }
 
-/// `/readyz/reapi` until it answers `code`.
-async fn reapi_until(api: SocketAddr, code: u16) -> Value {
+/// `/readyz/reapi` until it names the failing check `check`.
+async fn reapi_until_failing(api: SocketAddr, check: &str) -> Value {
     for _ in 0..500 {
-        let (got, body) = get(api, "/readyz/reapi").await;
-        if got == code {
+        let (_, body) = get(api, "/readyz/reapi").await;
+        if failing(&body).contains(&check) {
             return body;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("/readyz/reapi never answered {code}");
+    panic!("/readyz/reapi never named {check}");
 }
 
-/// Catches the outage of a frontend that is ready and has no worker, which kept taking
-/// Execute calls it could not place: `/readyz/reapi` is 503 and names `no_worker` while no
-/// worker is connected (defect: the route does not exist, or answers `/readyz`'s 200), and
-/// `/readyz` stays 200 meanwhile (defect: the worker and enrollment clusters, which ask it,
-/// would never get a first worker through). Then 200, with `/readyz`'s body, once a worker
-/// connects (defect: a route that stays 503, or one that ignores the worker), and 503 again
-/// when its stream ends (defect: counting every node that ever registered, which
-/// `GET /v1/nodes` keeps listing as disconnected).
+/// Catches a frontend that is ready and runs no executor, which kept taking Execute calls it
+/// could answer only from the action cache: `/readyz/reapi` is 503 and names `no_executor`
+/// (defect: the route does not exist, or answers `/readyz`'s 200), and `/readyz` stays 200
+/// meanwhile (defect: the clusters that ask it would never get a first frontend through).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reapi_readiness_needs_a_connected_worker() {
+async fn reapi_readiness_needs_an_executor() {
     let (_node, front) = ready_front(&[]).await;
 
     let (code, body) = get(front.api, "/readyz/reapi").await;
     assert_eq!(code, 503, "{body}");
     assert_eq!(body["ready"], false, "{body}");
-    assert_eq!(failing(&body), ["no_worker"], "{body}");
+    assert_eq!(failing(&body), ["no_executor"], "{body}");
     assert_eq!(
-        body["failing"][0]["reason"], "no worker is connected to this server",
+        body["failing"][0]["reason"], "this server runs no executor (--executor js-agent)",
         "{body}"
     );
     let (code, plain) = get(front.api, "/readyz").await;
@@ -55,40 +49,26 @@ async fn reapi_readiness_needs_a_connected_worker() {
         (200, Some(true)),
         "{plain}"
     );
-
-    let daemon = FakeDaemon::connect(front.farm.clone(), hello("node-a", 4, 8))
-        .await
-        .expect("registered");
-    let (code, body) = get(front.api, "/readyz/reapi").await;
-    assert_eq!(code, 200, "{body}");
-    assert_eq!(body, get(front.api, "/readyz").await.1, "the same body");
-    assert_eq!(body["ready"], true, "{body}");
-
-    daemon.close();
-    let body = reapi_until(front.api, 503).await;
-    assert_eq!(failing(&body), ["no_worker"], "{body}");
-    let (_, nodes) = get(front.api, "/v1/nodes").await;
-    assert_eq!(nodes["nodes"][0]["connected"], false, "{nodes}");
 }
 
-/// Catches `/readyz/reapi` dropping `/readyz`'s own checks: with a worker connected, a
-/// frontend whose storage node is gone is still 503, naming `storage` and not `no_worker`.
+/// Catches `/readyz/reapi` dropping `/readyz`'s own checks: a frontend whose storage node is
+/// gone is 503 naming `storage` as well as `no_executor`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reapi_readiness_keeps_the_checks_of_readyz() {
     let (mut node, front) = ready_front(&["--readyz-store-timeout-ms=500"]).await;
-    let _daemon = FakeDaemon::connect(front.farm.clone(), hello("node-a", 4, 8))
-        .await
-        .expect("registered");
-    assert_eq!(get(front.api, "/readyz/reapi").await.0, 200);
+    assert_eq!(
+        failing(&get(front.api, "/readyz/reapi").await.1),
+        ["no_executor"]
+    );
 
     node.stop().await;
-    let body = reapi_until(front.api, 503).await;
-    assert_eq!(failing(&body), ["storage"], "{body}");
+    let body = reapi_until_failing(front.api, "storage").await;
+    assert_eq!(failing(&body), ["storage", "no_executor"], "{body}");
 }
 
 /// Catches a token gate on the route: a probe has no token, so a frontend that has one
-/// still answers `/readyz/reapi` to a request without it (`get` sends none), with both
-/// answers.
+/// still answers `/readyz/reapi` to a request without it (`get` sends none), with its
+/// readiness and not a refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reapi_readiness_is_open_like_readyz() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -99,9 +79,7 @@ async fn reapi_readiness_is_open_like_readyz() {
     std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     let flag = format!("--api-token-file={}", token_file.display());
     let (_node, front) = ready_front(&[&flag]).await;
-    assert_eq!(get(front.api, "/readyz/reapi").await.0, 503);
-    let _daemon = FakeDaemon::connect(front.farm.clone(), hello("node-a", 4, 8))
-        .await
-        .expect("registered");
-    assert_eq!(get(front.api, "/readyz/reapi").await.0, 200);
+    let (code, body) = get(front.api, "/readyz/reapi").await;
+    assert_eq!(code, 503, "{body}");
+    assert_eq!(failing(&body), ["no_executor"], "{body}");
 }

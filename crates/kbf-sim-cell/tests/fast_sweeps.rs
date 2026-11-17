@@ -28,7 +28,7 @@ fn calm_and_restart_seeds_answer_and_keep_every_property() {
         let swept = swept(kind, 0..3);
         for (seed, r) in &swept.reports {
             assert!(
-                r.present > 0 && r.accepted > 0,
+                r.present > 0 && !r.acked.is_empty(),
                 "{kind:?} seed {seed}: {r:?}"
             );
             if kind.restarts() {

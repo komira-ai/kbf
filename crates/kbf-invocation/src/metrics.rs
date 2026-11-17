@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use kbf_sched::RequeueReason;
+use crate::RequeueReason;
 use kbf_types::Failure;
 
 use crate::record::{AttemptEnd, How, Invocation};

@@ -8,16 +8,15 @@ mod cluster_support;
 
 use cluster_support::{cluster, kbf, token_file};
 
-/// Catches each verb sending the wrong call: the method, the path (the node id
-/// percent-encoded as one segment), the `Authorization` header of the token file on a
-/// write and none on a read, the JSON content type and length on a write, and the
-/// deadline in the body. The answer's body is printed as it came, exit 0.
+/// Catches each verb sending the wrong call: the method, the path, the `Authorization`
+/// header of the token file on a write and none on a read, and the JSON content type and
+/// length on a write. The answer's body is printed as it came, exit 0.
 #[test]
 fn each_verb_sends_its_call_and_prints_the_answer() {
     let token = token_file("each", "kbf-test-token-0123456789abcdef0123456789");
     let bearer = "authorization: bearer kbf-test-token-0123456789abcdef0123456789";
-    let cases: [(&[&str], &str, &str); 12] = [
-        (&["status"], "GET /v1/nodes HTTP/1.1", ""),
+    let cases: [(&[&str], &str, &str); 7] = [
+        (&["status"], "GET /v1/frontend/drain HTTP/1.1", ""),
         (
             &["status", "--frontend"],
             "GET /v1/frontend/drain HTTP/1.1",
@@ -26,42 +25,6 @@ fn each_verb_sends_its_call_and_prints_the_answer() {
         (
             &["drain", "--frontend", "--token-file", &token],
             "POST /v1/frontend/drain HTTP/1.1",
-            "",
-        ),
-        (
-            &[
-                "drain",
-                "rack 1/a",
-                "--deadline-secs",
-                "5",
-                "--token-file",
-                &token,
-            ],
-            "POST /v1/nodes/rack%201%2Fa:drain HTTP/1.1",
-            r#"{"deadline_secs":5}"#,
-        ),
-        // No `--deadline-secs`: an empty body, which the server reads as a drain with no
-        // deadline (it waits for the leases however long they run).
-        (
-            &["drain", "n1", "--token-file", &token],
-            "POST /v1/nodes/n1:drain HTTP/1.1",
-            "",
-        ),
-        (
-            &[
-                "drain",
-                "n1",
-                "--deadline-secs",
-                "0",
-                "--token-file",
-                &token,
-            ],
-            "POST /v1/nodes/n1:drain HTTP/1.1",
-            r#"{"deadline_secs":0}"#,
-        ),
-        (
-            &["undrain", "n1", "--token-file", &token],
-            "POST /v1/nodes/n1:uncordon HTTP/1.1",
             "",
         ),
         (
@@ -99,11 +62,6 @@ fn each_verb_sends_its_call_and_prints_the_answer() {
             ],
             "POST /v1/members/7 HTTP/1.1",
             r#"{"for_secs":600,"state":"planned_down"}"#,
-        ),
-        (
-            &["epoch-bump", "--token-file", &token],
-            "POST /v1/epoch/bump HTTP/1.1",
-            "",
         ),
     ];
     for (args, line, body) in cases {
@@ -225,16 +183,15 @@ fn a_refusal_or_no_answer_exits_1_and_says_why() {
 }
 
 /// Catches a command line that is accepted and means something else: `drain` with no
-/// target or with both, a deadline for the frontend (it has none), `undrain --frontend`
-/// (a frontend drain is not undone), a write with no token file, `safe-to-stop` with no id
-/// or no token file, `epoch-bump` with no token file, and an unknown verb, all exit 2 with
-/// clap's message.
+/// target, with a node (the frontend is all there is to drain), with a deadline (it has
+/// none), a verb that was removed with the farm scheduler (`undrain`, `epoch-bump`), a
+/// write with no token file, `safe-to-stop` with no id or no token file, and an unknown
+/// verb, all exit 2 with clap's message.
 #[test]
 fn a_command_line_that_names_no_single_call_exits_2() {
     let rows: [&[&str]; 10] = [
         &["cluster", "safe-to-stop", "--token-file", "t"],
         &["cluster", "safe-to-stop", "7"],
-        &["cluster", "epoch-bump"],
         &["cluster", "drain", "--token-file", "t"],
         &["cluster", "drain", "n1", "--frontend", "--token-file", "t"],
         &[
@@ -246,9 +203,10 @@ fn a_command_line_that_names_no_single_call_exits_2() {
             "--token-file",
             "t",
         ],
-        &["cluster", "undrain", "--frontend", "--token-file", "t"],
-        &["cluster", "drain", "n1"],
-        &["cluster", "undrain", "n1"],
+        &["cluster", "drain", "--frontend"],
+        &["cluster", "undrain", "n1", "--token-file", "t"],
+        &["cluster", "epoch-bump", "--token-file", "t"],
+        &["cluster", "drain", "n1", "--token-file", "t"],
         &["cluster", "restart"],
     ];
     for argv in rows {
@@ -264,8 +222,7 @@ fn a_command_line_that_names_no_single_call_exits_2() {
 fn help_names_cluster_after_the_modes() {
     let (code, out, err) = kbf(&["--help"]);
     assert_eq!(code, Some(0), "{err}");
-    let verbs =
-        "kbf cluster status|drain|undrain|member|safe-to-stop|denied|epoch-bump|object-store";
+    let verbs = "kbf cluster status|drain|member|safe-to-stop|denied|object-store";
     assert!(out.contains(verbs), "{out}");
 }
 
@@ -276,31 +233,25 @@ fn the_cluster_help_and_the_hint_name_every_verb_group() {
     let (code, out, err) = kbf(&["cluster", "--help"]);
     assert_eq!(code, Some(0), "{err}");
     let about = out.lines().next().unwrap_or_default();
-    for word in ["member", "be stopped", "denied", "epoch", "object store"] {
+    for word in ["member", "be stopped", "denied", "object store"] {
         assert!(
             about.contains(word),
             "{word} missing from the about line: {out}"
         );
     }
     let (_, top, _) = kbf(&["--help"]);
-    for word in [
-        "member",
-        "safe-to-stop",
-        "denied",
-        "epoch-bump",
-        "object-store",
-    ] {
+    for word in ["member", "safe-to-stop", "denied", "object-store"] {
         assert!(top.contains(word), "{word} missing from the hint: {top}");
     }
 }
 
-/// Catches `kbf cluster drain --help` still naming a default deadline: without
-/// `--deadline-secs` the drain has none.
+/// Catches `kbf cluster drain --help` naming a node or a deadline: the only thing it
+/// drains is the frontend.
 #[test]
-fn the_drain_help_says_no_deadline_is_the_default() {
+fn the_drain_help_names_only_the_frontend() {
     let (code, out, err) = kbf(&["cluster", "drain", "--help"]);
     assert_eq!(code, Some(0), "{err}");
-    let text = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(text.contains("Not given: no deadline"), "{out}");
-    assert!(!text.contains("30 minutes"), "{out}");
+    assert!(out.contains("--frontend"), "{out}");
+    assert!(!out.contains("--deadline-secs"), "{out}");
+    assert!(!out.contains("<NODE>"), "{out}");
 }

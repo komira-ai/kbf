@@ -19,8 +19,8 @@ use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
+use kbf_server::StateStore;
 use kbf_server::history::{Options, over};
-use kbf_server::{EpochPolicy, StateStore};
 use kbf_state::Store;
 use prost::Message as _;
 use tokio::sync::Notify;
@@ -217,7 +217,6 @@ impl World {
         );
         let state = StateStore {
             store,
-            epoch: EpochPolicy::Keep,
             members: Default::default(),
             history: Some(history),
         };

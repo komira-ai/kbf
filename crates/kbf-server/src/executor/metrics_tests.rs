@@ -1,30 +1,31 @@
-use kbf_proto::reapi::{ActionResult, Digest};
-use kbf_proto::worker::Lost;
-use kbf_types::LeaseId;
-
 use super::*;
-use crate::executor::outcome::{Settled, ran, result_of};
+use crate::executor::outcome::Settled;
 
-fn end_of(settled: &Settled) -> RunEnd {
-    let action = Digest::default();
-    RunEnd::of(&result_of(LeaseId::new(1, 1), &action, settled))
-}
-
-/// Catches a run counted under an ending the farm was not told: each way a result is formed
-/// has its own label.
+/// Catches a run counted under an ending it did not have: each way a run is settled has its
+/// own label, and the labels are the six of `RunEnd::ALL`, each once.
 #[test]
-fn each_result_is_counted_under_the_ending_the_farm_is_told() {
-    let action = Digest::default();
-    let lease = LeaseId::new(1, 1);
+fn each_settled_run_is_counted_under_its_own_ending() {
+    let ends = [
+        RunEnd::of(&Settled::Infra("x".to_owned())),
+        RunEnd::of(&Settled::Timeout),
+        RunEnd::of(&Settled::OutOfMemory),
+        RunEnd::of(&Settled::Lost("gone")),
+        RunEnd::of(&Settled::Invalid("x".to_owned())),
+    ];
     assert_eq!(
-        RunEnd::of(&ran(lease, &action, ActionResult::default())),
-        RunEnd::Ran
+        ends,
+        [
+            RunEnd::Infra,
+            RunEnd::Timeout,
+            RunEnd::OutOfMemory,
+            RunEnd::Lost,
+            RunEnd::Invalid
+        ]
     );
-    assert_eq!(end_of(&Settled::Infra("x".to_owned())), RunEnd::Infra);
-    assert_eq!(end_of(&Settled::Timeout), RunEnd::Timeout);
-    assert_eq!(end_of(&Settled::OutOfMemory), RunEnd::OutOfMemory);
-    assert_eq!(end_of(&Settled::Lost(Lost::Fenced)), RunEnd::Lost);
-    assert_eq!(end_of(&Settled::Invalid("x".to_owned())), RunEnd::Invalid);
+    let labels: std::collections::BTreeSet<&str> =
+        RunEnd::ALL.iter().map(|end| end.label()).collect();
+    assert_eq!(labels.len(), RunEnd::ALL.len());
+    assert!(labels.contains("ran"));
 }
 
 /// Catches a counter that lands in another's row: every ending and every ingest result has a
@@ -37,7 +38,7 @@ fn every_ending_and_every_ingest_result_has_a_row_of_its_own() {
             metrics.run_ended(*end);
         }
     }
-    let ingests: Vec<IngestEnd> = [IngestEnd::Ok, IngestEnd::Unavailable, IngestEnd::Stopped]
+    let ingests: Vec<IngestEnd> = [IngestEnd::Ok, IngestEnd::Unavailable]
         .into_iter()
         .chain(
             REASONS
@@ -80,15 +81,19 @@ type Counted<'a> = (&'a str, &'a dyn Fn(&Metrics), u32);
 fn each_plain_counter_renders_under_its_name_and_counts() {
     let metrics = Metrics::default();
     let calls: [Counted<'_>; 6] = [
-        ("kbf_executor_late_starts_total", &Metrics::late_start, 1),
         (
             "kbf_executor_jobs_submitted_total",
             &Metrics::job_submitted,
-            2,
+            1,
         ),
         (
             "kbf_executor_jobs_resubmitted_after_lost_answer_total",
             &Metrics::job_resubmitted,
+            2,
+        ),
+        (
+            "kbf_executor_attempts_resubmitted_total",
+            &Metrics::attempt_resubmitted,
             3,
         ),
         (
@@ -97,8 +102,8 @@ fn each_plain_counter_renders_under_its_name_and_counts() {
             4,
         ),
         (
-            "kbf_executor_jobs_adopted_cancelled_total",
-            &Metrics::job_adopted_cancelled,
+            "kbf_executor_operations_reattached_total",
+            &Metrics::reattached,
             5,
         ),
         (
@@ -126,12 +131,12 @@ fn each_plain_counter_renders_under_its_name_and_counts() {
     ] {
         assert!(text.contains(family), "{family}");
     }
-    assert!(
-        !text.contains("leases_held"),
-        "no gauge of held leases: {text}"
-    );
-    assert!(
-        !text.contains("stray_leases"),
-        "no stray lease counter: {text}"
-    );
+    for gone in [
+        "leases_held",
+        "stray_leases",
+        "late_starts",
+        "adopted_cancelled",
+    ] {
+        assert!(!text.contains(gone), "no {gone} family: {text}");
+    }
 }

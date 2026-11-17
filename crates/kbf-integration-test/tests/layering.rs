@@ -11,14 +11,11 @@
 //! - a pure crate that depends on a kbf crate outside the pure set;
 //! - a pure crate that reaches a crate taken from a git repository other than the ones
 //!   listed in `PURE_GIT_CRATES` (today `js-sizing`, `js-caps`, `js-types` and `js-sim`, which
-//!   `kbf-estimator`, `kbf-caps`, `kbf-types` and `kbf-sim` re-export; `js-sched`, which `kbf-sched` re-exports,
-//!   and `js-whole`, `js-agent-wire` and `js-elastic`, which `js-sched` depends on);
+//!   `kbf-estimator`, `kbf-caps`, `kbf-types` and `kbf-sim` re-export);
 //! - a pure crate whose `lib.rs` no longer denies the `clippy.toml` lists, which would
 //!   silently switch off the clock, sleep, network and `HashMap` checks for it;
 //! - a pure crate renamed or removed, which would otherwise make every check above
 //!   pass vacuously;
-//! - a pure module of an impure crate (`PURE_MODULES`) whose file no longer denies
-//!   the `clippy.toml` lists, or that was moved or removed;
 //! - the server (`kbf-server`) depending, directly or through another crate, on the blob
 //!   transfer engine (`SERVER_MUST_NOT_REACH`): the server stores and schedules, it never moves
 //!   blobs as a client;
@@ -70,12 +67,15 @@
 //! - the manifest holding a package of the job scheduler's server (`js-server-core`, `js-store`),
 //!   reached by any workspace crate through a normal, dev or build edge, or a package named
 //!   `kbf-lease-client` (in `scheduler_server_crates`).
+//! - a scheduler package (`kbf-sched`, `js-sched`, `js-whole`) in `Cargo.lock` (in
+//!   `no_scheduler_package`): kbf schedules nothing, the job service does.
 //! - the tierstore trees client (`kbf-trees-client`, in `trees_client_layer`) reaching a kbf
 //!   crate or a tierstore crate other than `tierstore-trees-api`, or being depended on by any
 //!   crate of this workspace (no user yet); and a crate of the tierstore repository at a second
 //!   revision, or `tierstore`, `objstore-s3` or `tierstore-trees-api` taken from elsewhere.
 
 mod job_client_layer;
+mod no_scheduler_package;
 mod scheduler_server_crates;
 mod step_runner_layer;
 mod trees_client_layer;
@@ -89,7 +89,6 @@ const PURE: &[&str] = &[
     "kbf-caps",
     "kbf-segments",
     "kbf-meta",
-    "kbf-sched",
     "kbf-estimator",
     "kbf-raft",
     "kbf-invocation",
@@ -119,35 +118,15 @@ const FORBIDDEN: &[&str] = &[
     "socket2",
 ];
 
-/// Modules of impure crates that hold state every server of a replicated farm must
-/// hold alike, so they are kept pure as the pure crates are. Paths are from the
-/// workspace's `crates` directory.
-const PURE_MODULES: &[&str] = &["kbf-server/src/machine.rs"];
-
 const DENY_ATTR: &str = "#![deny(clippy::disallowed_methods, clippy::disallowed_types)]";
 
 /// The crates of other repositories (taken by `git` dependency, `source` beginning
 /// `git+`) that a pure crate may reach, with the one repository each may come from.
 /// `kbf-estimator` re-exports `js-sizing`, `kbf-caps` re-exports `js-caps`, `kbf-types`
-/// re-exports `js-types` (its `sched` module), `kbf-sim` re-exports `js-sim` and `kbf-sched`
-/// re-exports `js-sched`; `js-sched` depends on `js-whole`, the pure whole-node rules, on
-/// `js-agent-wire`, the agent's wire types (the files a job carries, the heartbeat), and on
-/// `js-elastic`, which `js-agent-wire` depends on; they depend on one another and on
+/// re-exports `js-types` and `kbf-sim` re-exports `js-sim`; they depend on one another and on
 /// crates.io crates only, and each denies the `clippy.toml` lists in its own root. A
 /// further git crate in a pure crate's tree is a decision, so it is listed here by name.
 const PURE_GIT_CRATES: &[(&str, &str)] = &[
-    (
-        "js-sched",
-        "git+https://github.com/komira-ai/jobscheduler?rev=",
-    ),
-    (
-        "js-agent-wire",
-        "git+https://github.com/komira-ai/jobscheduler?rev=",
-    ),
-    (
-        "js-elastic",
-        "git+https://github.com/komira-ai/jobscheduler?rev=",
-    ),
     (
         "js-caps",
         "git+https://github.com/komira-ai/jobscheduler?rev=",
@@ -162,10 +141,6 @@ const PURE_GIT_CRATES: &[(&str, &str)] = &[
     ),
     (
         "js-types",
-        "git+https://github.com/komira-ai/jobscheduler?rev=",
-    ),
-    (
-        "js-whole",
         "git+https://github.com/komira-ai/jobscheduler?rev=",
     ),
 ];
@@ -384,20 +359,6 @@ fn pure_crates_deny_the_clippy_lists() {
     }
 }
 
-#[test]
-fn pure_modules_deny_the_clippy_lists() {
-    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    for &module in PURE_MODULES {
-        let path = crates.join(module);
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        assert!(
-            src.lines().any(|l| l.trim() == DENY_ATTR),
-            "{module} must carry `{DENY_ATTR}`"
-        );
-    }
-}
-
 /// What the server library's normal dependencies must not reach: the blob transfer engine.
 /// The server stores and schedules; it never moves blobs as a client.
 const SERVER_MUST_NOT_REACH: &[&str] = &["kbf-transfer"];
@@ -460,7 +421,7 @@ fn the_server_and_kbf_binaries_are_thin() {
 /// What the storage crate's normal dependencies must not reach: the frontend's scheduler
 /// and authorization (docs/design/architecture-v2.md, section 3). A storage process
 /// stores; it neither schedules nor decides who may call.
-const STORAGE_MUST_NOT_REACH: &[&str] = &["kbf-sched", "kbf-auth"];
+const STORAGE_MUST_NOT_REACH: &[&str] = &["kbf-auth"];
 
 #[test]
 fn storage_reaches_no_frontend_crate() {
@@ -555,13 +516,7 @@ fn the_updater_has_no_tie_to_the_proxy() {
 /// and authorization, the server, and the transfer engine.
 /// The frontend and the storage nodes both use it (docs/design/architecture-v2.md, section 7); a
 /// path to either side's code would make the other link it.
-const ROUTE_MUST_NOT_REACH: &[&str] = &[
-    "kbf-sched",
-    "kbf-auth",
-    "kbf-front",
-    "kbf-server",
-    "kbf-transfer",
-];
+const ROUTE_MUST_NOT_REACH: &[&str] = &["kbf-auth", "kbf-front", "kbf-server", "kbf-transfer"];
 
 #[test]
 fn route_reaches_neither_the_frontend_nor_the_transfer_engine() {
@@ -583,7 +538,6 @@ fn route_reaches_neither_the_frontend_nor_the_transfer_engine() {
 /// authorization, the server and the storage node, and the transfer engine. A frontend uses
 /// the packing client; a path to the server's or the engine's code would make it link them.
 const PACK_MUST_NOT_REACH: &[&str] = &[
-    "kbf-sched",
     "kbf-auth",
     "kbf-front",
     "kbf-server",

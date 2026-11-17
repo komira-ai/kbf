@@ -17,6 +17,12 @@
 //! And the flags of the worker session (`--heartbeat-interval-ms`, `--vm-host-floor-cpus`,
 //! `--vm-host-floor-mem-gib`, `--pack-commit-sample`): no worker opens a session or commits a
 //! pack to a server, so nothing reads them ([`RetiredWorkerFlags`]).
+//!
+//! And the flags of the farm's own scheduler (`--unservable-wait-secs`, the memory ladder,
+//! `--exclusive-actions`, the learned sizes, the placement flags, `--scheduler-core`,
+//! `--usage-profiles`, `--whole-node-*`, `--default-platform`, `--qos-allowed`): kbf schedules
+//! nothing, every Execute is a job of the job service, so nothing reads them
+//! ([`RetiredSchedulerFlags`]).
 
 use std::path::PathBuf;
 
@@ -216,6 +222,138 @@ impl RetiredWorkerFlags {
     }
 }
 
+/// The flags of the removed farm scheduler. Values are not checked: nothing reads them, and a
+/// value that was valid before must stay accepted.
+#[derive(Clone, Debug, Default, Args)]
+pub struct RetiredSchedulerFlags {
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "SECONDS")]
+    pub unservable_wait_secs: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "OS/ARCH")]
+    pub default_platform: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "LEVELS")]
+    pub qos_allowed: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "GIB")]
+    pub memory_ladder_gib: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "MODE")]
+    pub learned_sizes: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "CORE")]
+    pub scheduler_core: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "MODE")]
+    pub placement_load: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "MODE")]
+    pub placement_predictions: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "MODE")]
+    pub usage_profiles: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "WORKERS")]
+    pub whole_node_max: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "WORKERS")]
+    pub whole_node_max_draining: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "WORKERS")]
+    pub whole_node_keep_for_ordinary: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "SECONDS")]
+    pub whole_node_drain_after_secs: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "SECONDS")]
+    pub whole_node_drain_deadline_secs: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "SECONDS")]
+    pub whole_node_reserve_backoff_secs: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true, value_name = "COUNT")]
+    pub whole_node_max_reserve_attempts: Option<String>,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true)]
+    pub exclusive_actions: bool,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true)]
+    pub no_memory_climb: bool,
+    /// Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+    #[arg(long, hide = true)]
+    pub whole_node_allow_last_capable: bool,
+}
+
+impl RetiredSchedulerFlags {
+    /// One line for each retired flag that was given, naming it.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<String> {
+        let given = [
+            (
+                "--unservable-wait-secs",
+                self.unservable_wait_secs.is_some(),
+            ),
+            ("--default-platform", self.default_platform.is_some()),
+            ("--qos-allowed", self.qos_allowed.is_some()),
+            ("--memory-ladder-gib", self.memory_ladder_gib.is_some()),
+            ("--learned-sizes", self.learned_sizes.is_some()),
+            ("--scheduler-core", self.scheduler_core.is_some()),
+            ("--placement-load", self.placement_load.is_some()),
+            (
+                "--placement-predictions",
+                self.placement_predictions.is_some(),
+            ),
+            ("--usage-profiles", self.usage_profiles.is_some()),
+            ("--whole-node-max", self.whole_node_max.is_some()),
+            (
+                "--whole-node-max-draining",
+                self.whole_node_max_draining.is_some(),
+            ),
+            (
+                "--whole-node-keep-for-ordinary",
+                self.whole_node_keep_for_ordinary.is_some(),
+            ),
+            (
+                "--whole-node-drain-after-secs",
+                self.whole_node_drain_after_secs.is_some(),
+            ),
+            (
+                "--whole-node-drain-deadline-secs",
+                self.whole_node_drain_deadline_secs.is_some(),
+            ),
+            (
+                "--whole-node-reserve-backoff-secs",
+                self.whole_node_reserve_backoff_secs.is_some(),
+            ),
+            (
+                "--whole-node-max-reserve-attempts",
+                self.whole_node_max_reserve_attempts.is_some(),
+            ),
+            ("--exclusive-actions", self.exclusive_actions),
+            ("--no-memory-climb", self.no_memory_climb),
+            (
+                "--whole-node-allow-last-capable",
+                self.whole_node_allow_last_capable,
+            ),
+        ];
+        given
+            .into_iter()
+            .filter(|(_, given)| *given)
+            .map(|(flag, _)| {
+                format!("{flag} is no longer read: every Execute is a job of the job service")
+            })
+            .collect()
+    }
+
+    /// Logs [`warnings`](Self::warnings), once at start.
+    pub fn warn(&self) {
+        for line in self.warnings() {
+            tracing::warn!("{line}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::{Args as _, Command, FromArgMatches as _, Parser};
@@ -366,5 +504,55 @@ mod tests {
         .map(|flag| format!("{flag} is no longer read: the worker session was removed"))
         .into();
         assert_eq!(all, said);
+    }
+
+    /// Catches: a scheduler flag deleted outright (an old `kbf.toml` or unit would then fail
+    /// to start), one accepted in silence, a value that was valid before refused, and one shown
+    /// in `--help`. Each flag given is named by exactly one line; none given, no line.
+    #[test]
+    fn each_retired_scheduler_flag_given_warns_once_naming_it() {
+        let warnings = |argv: &[&str]| {
+            let mut all = vec!["kbf-server"];
+            all.extend_from_slice(argv);
+            Args::try_parse_from(all)
+                .expect("the retired flags still parse")
+                .retired_scheduler
+                .warnings()
+        };
+        assert!(warnings(&[]).is_empty());
+        let given = [
+            "--unservable-wait-secs=3",
+            "--default-platform=linux/x86_64",
+            "--qos-allowed=ci,batch",
+            "--memory-ladder-gib=4,8,16",
+            "--learned-sizes=shadow",
+            "--scheduler-core=legacy",
+            "--placement-load=on",
+            "--placement-predictions=off",
+            "--usage-profiles=off",
+            "--whole-node-max=3",
+            "--whole-node-max-draining=3",
+            "--whole-node-keep-for-ordinary=3",
+            "--whole-node-drain-after-secs=3",
+            "--whole-node-drain-deadline-secs=3",
+            "--whole-node-reserve-backoff-secs=3",
+            "--whole-node-max-reserve-attempts=3",
+            "--exclusive-actions",
+            "--no-memory-climb",
+            "--whole-node-allow-last-capable",
+        ];
+        let said: Vec<String> = given
+            .iter()
+            .map(|arg| arg.split_once('=').map_or(*arg, |(flag, _)| flag))
+            .map(|flag| {
+                format!("{flag} is no longer read: every Execute is a job of the job service")
+            })
+            .collect();
+        assert_eq!(warnings(&given), said);
+        let command = super::RetiredSchedulerFlags::augment_args(Command::new("frontend"));
+        for arg in command.get_arguments() {
+            assert!(arg.is_hide_set(), "{:?}", arg.get_long());
+        }
+        assert_eq!(command.get_arguments().count(), given.len());
     }
 }

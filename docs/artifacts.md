@@ -186,8 +186,7 @@ a shallow local build still says `seq: 0`.
 
 `kbf-server` and `kbf` embed the first 12 characters of the commit they
 were built from (`kbf` through the server library it links), and `--version` prints
-`<binary> <package version>+<commit>` (so do the server's start line and the `server`
-field of `GET /v1/nodes`, [api.md](api.md#get-v1nodes)). Before packaging, each Linux job
+`<binary> <package version>+<commit>` (so does the server's start line). Before packaging, each Linux job
 checks that `kbf-server`'s `--version` names `GITHUB_SHA` (`cargo xtask build-commit
 check`), and that `kbf`'s does too and that `kbf --version --json` (below) names the same
 commit and a release build (`build-commit check --json`); the macOS job makes the second check

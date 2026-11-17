@@ -10,7 +10,6 @@ use kbf_state::fake::{Fake, Flaw};
 
 use super::{HistoryError, HistoryFlags};
 use crate::StateStore;
-use crate::farm::EpochPolicy;
 use crate::stores::StoreUri;
 use crate::test_dir::scratch_dir;
 
@@ -22,7 +21,6 @@ fn state() -> StateStore {
             Arc::new(ManualClock::default()),
             Flaw::None,
         )),
-        epoch: EpochPolicy::Keep,
         members: Default::default(),
         history: None,
     }

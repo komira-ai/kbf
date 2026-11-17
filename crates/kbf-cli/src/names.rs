@@ -39,7 +39,7 @@ pub enum Entry {
     /// The storage node: `kbf_server::storage_node::run`, `kbf-server`'s store, write and
     /// log flags and its own listener flags.
     Storage,
-    /// The frontend: `kbf_server::frontend::run`, `kbf-server`'s listener, scheduler and
+    /// The frontend: `kbf_server::frontend::run`, `kbf-server`'s listener and
     /// log flags and its own storage flags.
     Frontend,
 }

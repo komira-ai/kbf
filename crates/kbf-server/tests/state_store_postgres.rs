@@ -9,8 +9,7 @@
 
 use std::sync::Arc;
 
-use kbf_front::Cache;
-use kbf_server::{EpochPolicy, Farm, OpenFailure, StateError, StateStore, StateStoreUri};
+use kbf_server::{OpenFailure, StateError, StateStoreUri};
 use kbf_state::postgres::{PostgresConfig, PostgresStore, TestDatabase, test_database};
 use kbf_state::{Cond, GENERATION, SHARED_WRITERS, Store, Txn};
 
@@ -38,16 +37,6 @@ fn write() -> Txn {
     Txn::new().put("k", "v", Cond::Any)
 }
 
-fn farm_over(state: StateStore) -> Farm {
-    Farm::new(
-        Arc::new(Cache::memory()),
-        kbf_sched::UNSERVABLE_WAIT,
-        kbf_sched::FINISHED_RETENTION,
-    )
-    .with_state(Some(state))
-    .expect("a farm over the store")
-}
-
 /// Catches a start that creates the tables itself (the installer owns the schema) and a
 /// refusal that is not one clear line: a start on a database nobody ran `setup` on fails
 /// as a `StateError::Open` that says what to run, without the URL, and leaves no schema.
@@ -72,17 +61,14 @@ fn a_start_on_a_database_without_the_installers_schema_is_refused() {
     assert!(made.is_empty(), "the refused start created the schema");
 }
 
-/// Asserts that a Postgres `--state-store` is parsed and then opened; that a fresh store is
-/// given an epoch of its own and the next start keeps it (every start keeps it, so a
-/// frontend started over the database leaves the daemons their runs); that no start takes a
+/// Asserts that a Postgres `--state-store` is parsed and then opened; that no start takes a
 /// generation, the generation row holding the marker of shared frontends after the first
-/// and after the second; and that the first frontend is not fenced by the second, in its
-/// store handle or in its farm.
+/// and after the second; that the server's connections are named in `pg_stat_activity`; and
+/// that the first frontend is not fenced by the second, in its store handle.
 #[test]
-fn a_flag_opened_postgres_store_is_shared_and_keeps_epochs() {
+fn a_flag_opened_postgres_store_is_shared_by_every_start() {
     let db = test_database();
     let uri = uri(&db.url());
-    assert_eq!(uri.epoch_policy(), EpochPolicy::Keep);
 
     let first = uri.open().expect("a first start on a fresh database");
     let named: i64 = postgres::Client::connect(&db.url(), postgres::NoTls)
@@ -97,16 +83,7 @@ fn a_flag_opened_postgres_store_is_shared_and_keeps_epochs() {
         named >= 1,
         "the server's connections are named kbf-server in pg_stat_activity"
     );
-    assert_eq!(first.epoch, EpochPolicy::Keep);
     assert_marked(first.store.as_ref());
-    let first_farm = farm_over(StateStore {
-        store: Arc::clone(&first.store),
-        epoch: first.epoch,
-        members: Default::default(),
-        history: None,
-    });
-    let epoch = first_farm.lease_epoch();
-    assert!(epoch > 0, "a fresh store is given an epoch: {epoch}");
 
     let second = uri.open().expect("a second start");
     assert_marked(second.store.as_ref());
@@ -117,12 +94,6 @@ fn a_flag_opened_postgres_store_is_shared_and_keeps_epochs() {
             .expect("no start fenced the handle")
             .expect("commits");
     }
-    let kept = farm_over(second).lease_epoch();
-    assert_eq!(kept, epoch, "a start moved the epoch");
-    first_farm
-        .bump_epoch()
-        .expect("the first frontend's farm writes")
-        .expect("a state store");
     assert_marked(first.store.as_ref());
 }
 
@@ -194,26 +165,6 @@ fn a_store_whose_generation_row_is_junk_is_refused_on_open() {
         "{refused:?}"
     );
     assert_eq!(junk.get(GENERATION).expect("read"), before);
-}
-
-/// Asserts that the operator's bump raises the epoch of a flag-opened Postgres store by
-/// one, once, through a frontend; that the frontend goes on serving the epoch it started
-/// under; and that the next start serves the raised epoch and raises nothing more.
-#[test]
-fn a_bump_raises_the_epoch_of_a_flag_opened_postgres_store_once() {
-    let db = test_database();
-    let uri = uri(&db.url());
-    let first = farm_over(uri.open().expect("a first start"));
-    let epoch = first.lease_epoch();
-
-    let bumped = first.bump_epoch().expect("a bump").expect("a state store");
-
-    assert_eq!((bumped.previous, bumped.epoch), (epoch, epoch + 1));
-    assert_eq!(first.lease_epoch(), epoch);
-    let second = farm_over(uri.open().expect("a second start"));
-    assert_eq!(second.lease_epoch(), epoch + 1);
-    let again = farm_over(uri.open().expect("a third start"));
-    assert_eq!(again.lease_epoch(), epoch + 1);
 }
 
 /// Catches: a Postgres server that acknowledges a commit before it is flushed

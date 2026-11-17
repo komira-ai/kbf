@@ -1,7 +1,8 @@
 //! What the executor counts, for `GET /metrics`: how the runs ended, what the ingest made of
-//! the packs, the `Start`s it dropped as late, and what it asked of the job service: the jobs
-//! submitted, those submitted again after an answer was lost, those cancelled, those of an
-//! earlier process cancelled at start, and the jobs seen on a host that missed its grace.
+//! the packs, and what it asked of the job service: the jobs submitted, those submitted again
+//! after an answer was lost, the operations run again as a new attempt, the jobs cancelled for
+//! their callers, the operations taken up from the state store, and the jobs seen on a host that
+//! missed its grace.
 //!
 //! The counters are shared by the executor and the page that renders them. A server that never
 //! builds an executor builds none of this and renders none of it.
@@ -9,18 +10,16 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kbf_proto::worker::{self, Lost, MemoryKill};
-use tonic::Code;
-
 use crate::executor::RejectReason;
+use crate::executor::outcome::Settled;
 use crate::executor::phases::{Phase, PhaseHistograms};
 
-/// How a run ended, as the farm was told.
+/// How a run ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RunEnd {
     /// The action ran and the frontend rebuilt its result.
     Ran,
-    /// An ending the farm runs again.
+    /// An ending for infrastructure reasons: the operation runs again while it has attempts left.
     Infra,
     /// The action's own timeout.
     Timeout,
@@ -53,21 +52,14 @@ impl RunEnd {
         }
     }
 
-    /// How a `Result` that is about to be sent ends its run.
-    pub(crate) fn of(result: &worker::Result) -> Self {
-        let code = result.status.as_ref().map(|status| status.code);
-        if result.action_result.is_some() {
-            Self::Ran
-        } else if result.lost != Lost::Unspecified as i32 {
-            Self::Lost
-        } else if result.memory_kill != MemoryKill::Unspecified as i32 {
-            Self::OutOfMemory
-        } else if code == Some(Code::DeadlineExceeded as i32) {
-            Self::Timeout
-        } else if code == Some(Code::InvalidArgument as i32) {
-            Self::Invalid
-        } else {
-            Self::Infra
+    /// How a run that produced no result ends.
+    pub(crate) const fn of(settled: &Settled) -> Self {
+        match settled {
+            Settled::Infra(_) => Self::Infra,
+            Settled::Timeout => Self::Timeout,
+            Settled::OutOfMemory => Self::OutOfMemory,
+            Settled::Lost(_) => Self::Lost,
+            Settled::Invalid(_) => Self::Invalid,
         }
     }
 }
@@ -81,13 +73,11 @@ pub(crate) enum IngestEnd {
     Rejected(RejectReason),
     /// The store could not be read.
     Unavailable,
-    /// The ingest panicked or was cancelled.
-    Stopped,
 }
 
 impl IngestEnd {
     fn labels() -> impl Iterator<Item = &'static str> {
-        ["ok", "unavailable", "stopped"]
+        ["ok", "unavailable"]
             .into_iter()
             .chain(REASONS.iter().map(|(_, label)| *label))
     }
@@ -96,9 +86,8 @@ impl IngestEnd {
         match self {
             Self::Ok => 0,
             Self::Unavailable => 1,
-            Self::Stopped => 2,
             Self::Rejected(reason) => {
-                3 + REASONS
+                2 + REASONS
                     .iter()
                     .position(|(r, _)| *r == reason)
                     .unwrap_or_default()
@@ -124,12 +113,12 @@ const REASONS: [(RejectReason, &str); 9] = [
 #[derive(Debug, Default)]
 pub struct Metrics {
     runs: [AtomicU64; 6],
-    ingests: [AtomicU64; 12],
-    late_starts: AtomicU64,
+    ingests: [AtomicU64; 11],
     jobs_submitted: AtomicU64,
     jobs_resubmitted: AtomicU64,
+    attempts: AtomicU64,
     jobs_cancelled: AtomicU64,
-    jobs_adopted_cancelled: AtomicU64,
+    reattached: AtomicU64,
     host_silence_seen: AtomicU64,
     phases: PhaseHistograms,
 }
@@ -147,10 +136,6 @@ impl Metrics {
         self.ingests[end.slot()].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn late_start(&self) {
-        self.late_starts.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// One `phase` of a run took `took`.
     pub(crate) fn phase_took(&self, phase: Phase, took: std::time::Duration) {
         self.phases.observe(phase, took);
@@ -166,14 +151,20 @@ impl Metrics {
         self.jobs_resubmitted.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The job service answered a cancel of a job of this process.
+    /// An operation is run again as its next attempt, after a run that ended for an
+    /// infrastructure reason of its own.
+    pub(crate) fn attempt_resubmitted(&self) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The job service answered a cancel of a job, asked for by its operation's callers.
     pub(crate) fn job_cancelled(&self) {
         self.jobs_cancelled.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The job service answered a cancel of a job an earlier process left.
-    pub(crate) fn job_adopted_cancelled(&self) {
-        self.jobs_adopted_cancelled.fetch_add(1, Ordering::Relaxed);
+    /// An unfinished operation another process left in the state store was taken up.
+    pub(crate) fn reattached(&self) {
+        self.reattached.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A job was seen on a host that has missed its grace.
@@ -185,7 +176,7 @@ impl Metrics {
     pub fn render(&self, out: &mut String) {
         let _ = writeln!(
             out,
-            "# HELP kbf_executor_runs_total Runs the executor ended, by how the farm was told\n\
+            "# HELP kbf_executor_runs_total Runs the executor ended, by how they ended\n\
              # TYPE kbf_executor_runs_total counter"
         );
         for (end, count) in RunEnd::ALL.iter().zip(&self.runs) {
@@ -210,11 +201,6 @@ impl Metrics {
         }
         let counters = [
             (
-                "kbf_executor_late_starts_total",
-                "Starts dropped because their window ended before their job was submitted",
-                &self.late_starts,
-            ),
-            (
                 "kbf_executor_jobs_submitted_total",
                 "Submits the job service answered with the job",
                 &self.jobs_submitted,
@@ -225,14 +211,19 @@ impl Metrics {
                 &self.jobs_resubmitted,
             ),
             (
+                "kbf_executor_attempts_resubmitted_total",
+                "Operations run again as a new attempt after a run that ended for an infrastructure reason",
+                &self.attempts,
+            ),
+            (
                 "kbf_executor_jobs_cancelled_total",
-                "Cancels of this process's jobs the job service answered",
+                "Cancels of jobs, asked for by their operation's callers, the job service answered",
                 &self.jobs_cancelled,
             ),
             (
-                "kbf_executor_jobs_adopted_cancelled_total",
-                "Live jobs of an earlier process under this frontend's id cancelled at start",
-                &self.jobs_adopted_cancelled,
+                "kbf_executor_operations_reattached_total",
+                "Unfinished operations another process left in the state store, taken up",
+                &self.reattached,
             ),
             (
                 "kbf_executor_host_silence_seen_total",

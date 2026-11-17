@@ -1,8 +1,9 @@
 //! Retire mode (`GET` and `POST /v1/frontend/retire`, `kbf_server::retire`): two frontends
 //! in this process over one real Postgres database (the server `KBF_TEST_POSTGRES_URL` names;
 //! those tests fail without it), each started as a start is, from `--state-store`, so each
-//! on a store handle of its own and with no generation taken, as the frontends of one farm
-//! hold the store. A fake daemon and a client play the farm's node and Buck2. The routes'
+//! on a store handle of its own, as the frontends of one cell hold the store. A client plays
+//! Buck2. A frontend started here has no executor (no `--executor`), so no execution is open
+//! on it; the open executions of a drain are in `frontend_drain.rs`. The routes'
 //! answers on a frontend with no state store need no Postgres.
 
 use kbf_server::api::FRONTEND_RETIRE;
@@ -10,7 +11,6 @@ use kbf_server::frontend::start_frontend;
 use kbf_server::{Drain, ServeError, StateStoreUri};
 use kbf_state::postgres::{PostgresConfig, PostgresStore, TestDatabase, test_database};
 use serde_json::json;
-use support::done_within_quiet;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tonic::Code;
@@ -107,10 +107,6 @@ impl Scratch {
 
 const TOKEN: &str = "a-token-that-is-long-enough-for-a-test";
 
-async fn refused(addr: SocketAddr) -> bool {
-    TcpStream::connect(addr).await.is_err()
-}
-
 /// The code an Execute is refused with, however it is surfaced.
 pub(super) async fn execute_refused(client: &Client, job: &Job) -> Option<Code> {
     execute_refusal(client, job)
@@ -127,29 +123,13 @@ pub(super) async fn execute_refusal(client: &Client, job: &Job) -> Option<tonic:
     }
 }
 
-/// Waits until `member` has run `more` intake polls to the end beyond the ones counted now:
-/// the last of them began after this call, so it saw what was written to the state store
-/// before it.
-pub(super) async fn polled(member: &Member, more: u64) {
-    let mut polls = member.polls.clone();
-    let target = polls.borrow_and_update().saturating_add(more);
-    let waiting = polls.wait_for(|seen| *seen >= target);
-    let reached = tokio::time::timeout(Duration::from_secs(30), waiting).await;
-    let seen = reached.expect("the polls run in time");
-    seen.expect("the frontend is alive");
-}
-
 /// A frontend serving in this test, until its stop signal is given.
 pub(super) struct Member {
     pub(super) reapi: SocketAddr,
     pub(super) worker: SocketAddr,
     pub(super) api: SocketAddr,
-    /// The frontend's farm, which a fake daemon registers with.
-    pub(super) farm: std::sync::Weak<kbf_server::farm::Farm>,
     /// The frontend's drain: the events of its phases, and the ends of its two waits.
     pub(super) drain: Arc<Drain>,
-    /// Counts the intake polls the frontend has run to the end.
-    pub(super) polls: watch::Receiver<u64>,
     stop: Option<oneshot::Sender<()>>,
     pub(super) served: JoinHandle<Result<(), ServeError>>,
     /// Becomes true when the serving future has returned.
@@ -171,8 +151,7 @@ impl Member {
             handle.worker.expect("a worker listener"),
             handle.api,
         );
-        let (drain, polls) = (handle.drain(), handle.intake_polls());
-        let farm = handle.farm.clone();
+        let drain = handle.drain();
         let (finish, ended) = watch::channel(false);
         let serving = async move {
             let served = handle.serve().await;
@@ -183,18 +162,16 @@ impl Member {
             reapi,
             worker,
             api: api.expect("the operator API"),
-            farm,
             drain,
-            polls,
             stop: Some(stop),
             served: tokio::spawn(serving),
             ended,
         }
     }
 
-    /// A client of the frontend, which opens fake daemons on its farm.
+    /// A client of the frontend.
     pub(super) async fn client(&self) -> Client {
-        Client::connect_to(self.reapi, self.worker, self.farm.clone()).await
+        Client::connect(self.reapi, self.worker).await
     }
 
     /// Gives the frontend its stop signal, as SIGTERM does, and goes on at once.
@@ -345,74 +322,8 @@ async fn retire(api: SocketAddr) -> (u16, Value) {
     call(api, "POST", &bearer(), "").await
 }
 
-/// The operations in the scheduler's queue of the frontend at `api`.
-pub(super) async fn queued(api: SocketAddr) -> u64 {
-    let (_, drain) = get(api, "/v1/frontend/drain").await;
-    drain["queued_operations"].as_u64().expect("a count")
-}
-
-/// Asserts that retiring a frontend hands its work to the other and keeps its caller. A
-/// daemon is connected to the first frontend (its status counts one session) with an
-/// Execute open on it and its action running. On `POST` the first frontend's worker
-/// listener closes, the daemon's stream ends `UNAVAILABLE` and the status says retired
-/// with the stream still open. The daemon dials the second frontend, which takes up the
-/// lease it lists and its result, and the caller on the first frontend gets that result
-/// from the state store. The action ran once: the daemon is given no second start and the
-/// store holds one result and no operation. A second `POST` answers the same status.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_retired_frontend_hands_its_daemon_to_the_other_and_still_answers_its_caller() {
-    let pair = Pair::start("retire-handover").await;
-    let (a, b) = (&pair.a, &pair.b);
-    let client = a.client().await;
-    let mut daemon = client.daemon("node-a", 4, 8).await;
-    let job = Job::new("a build across a retire", &[]);
-    client.upload(&job.blobs()).await;
-    let mut ops = client.execute(&job.action).await;
-    let lease = daemon.start().await.lease_id.expect("a lease id");
-    let before = status(a.api).await;
-    assert_eq!(before["retired"], false, "{before}");
-    assert_eq!(before["open_streams"], 1, "{before}");
-    assert_eq!(before["open_sessions"], 1, "{before}");
-
-    let (code, retired) = retire(a.api).await;
-    assert_eq!(code, 200, "{retired}");
-    assert_eq!(retired["retired"], true, "{retired}");
-    assert_eq!(retired["open_streams"], 1, "{retired}");
-    // The listener is closed before the retire answers.
-    assert!(refused(a.worker).await, "its worker listener is open");
-    let (code, again) = retire(a.api).await;
-    assert_eq!(code, 200, "{again}");
-    assert_eq!(again, retired, "a second retire changed the status");
-    assert_eq!(status(a.api).await, retired);
-
-    let ended = daemon.ended().await;
-    assert_eq!(ended.code(), Code::Unavailable, "{ended}");
-    let reached = b.client().await;
-    let mut daemon = reached.daemon("node-a", 4, 8).await;
-    assert_eq!(daemon.epoch, lease.term, "the epoch was kept");
-    assert!(
-        daemon.heartbeat(&[lease]).await,
-        "the other frontend did not keep the lease"
-    );
-    assert!(
-        !done_within_quiet(&mut ops).await,
-        "the caller was answered before the result"
-    );
-    let result = support::output(&reached, "built across a retire", 0).await;
-    let ack = daemon.report(ran(Some(lease), &result)).await;
-    assert!(ack.accepted, "the other frontend did not take the lease");
-    let last = done(&mut ops).await;
-    assert_eq!(response(&last).result, Some(result));
-
-    daemon.no_work().await;
-    assert_eq!(pair.count("done/"), 1);
-    assert_eq!((pair.count("op/"), pair.count("lease/")), (0, 0));
-    drop((ops, daemon, reached, client));
-    pair.stop().await;
-}
-
 /// Asserts that a retired frontend is not ready and refuses a new Execute `UNAVAILABLE`
-/// without queueing it (the store holds no queue row and no operation), while the other
+/// without opening it (the store holds no operation row), while the other
 /// frontend of the store stays ready.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_retired_frontend_is_not_ready_and_refuses_a_new_execute() {
@@ -432,57 +343,9 @@ async fn a_retired_frontend_is_not_ready_and_refuses_a_new_execute() {
     assert_eq!(readyz(b.api).await, 200, "the other frontend");
     let refused = execute_refused(&client, &job).await;
     assert_eq!(refused, Some(Code::Unavailable));
-    assert_eq!((pair.count("queue/"), pair.count("op/")), (0, 0));
+    assert_eq!(pair.count("exec/op/"), 0);
 
     drop(client);
-    pair.stop().await;
-}
-
-/// Asserts that a retired frontend takes no more work in: an operation another frontend
-/// queues before the retire is taken in by the first (its queue shows it), one queued
-/// after is not (its queue is as it was, the store holds the row), and both run on a
-/// daemon of the other frontend, once each.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_retired_frontend_takes_no_more_work_in_from_the_store() {
-    let pair = Pair::start("retire-intake").await;
-    let (a, b) = (&pair.a, &pair.b);
-    let client = b.client().await;
-    let first = Job::new("queued before the retire", &[]);
-    let second = Job::new("queued after the retire", &[]);
-    client.upload(&first.blobs()).await;
-    client.upload(&second.blobs()).await;
-    let mut early = client.execute(&first.action).await;
-    early.message().await.expect("healthy").expect("QUEUED");
-    polled(a, 2).await;
-    assert_eq!(queued(a.api).await, 1, "the first frontend took it in");
-
-    let (code, retired) = retire(a.api).await;
-    assert_eq!(code, 200, "{retired}");
-    let mut late = client.execute(&second.action).await;
-    late.message().await.expect("healthy").expect("QUEUED");
-    // The last of two intake polls of the retired frontend began after the operation was
-    // queued; a retired frontend's poll ends at once, having taken nothing in.
-    polled(a, 2).await;
-    assert_eq!(queued(a.api).await, 1, "the retired frontend took work in");
-    assert_eq!(queued(b.api).await, 2);
-
-    let mut daemon = client.daemon("node-a", 4, 8).await;
-    let result = support::output(&client, "run on the frontend that is left", 0).await;
-    for _ in 0..2 {
-        let start = daemon.start().await;
-        let ack = daemon.report(ran(start.lease_id, &result)).await;
-        assert!(ack.accepted, "{ack:?}");
-    }
-    assert_eq!(
-        response(&done(&mut early).await).result,
-        Some(result.clone())
-    );
-    assert_eq!(response(&done(&mut late).await).result, Some(result));
-    assert_eq!(pair.count("done/"), 2);
-    assert_eq!((pair.count("queue/"), pair.count("lease/")), (0, 0));
-    daemon.no_work().await;
-
-    drop((early, late, daemon, client));
     pair.stop().await;
 }
 

@@ -19,7 +19,7 @@ use axum::extract::ConnectInfo;
 use axum::routing::get;
 use clap::Parser as _;
 use kbf_peer::PeerRole;
-use kbf_server::api::{Write, write_request};
+use kbf_server::api::gate;
 use kbf_server::identity::{Presented, presented};
 use kbf_server::proxy_auth::{
     Caller, Identity, NODE_ID, NODE_IPS, PROXY_AUTH, ProxyAuthLayer, ProxySecret, ProxySecretError,
@@ -620,7 +620,7 @@ fn token() -> ApiToken {
     ApiToken::from_file(&file(format!("{TOKEN}\n").as_bytes(), 0o600)).expect("a token")
 }
 
-/// The status a cordon of `mac-1` gets from the gates alone.
+/// The status a write gets from the gates alone.
 fn gated(caller: &Caller, with_token: bool) -> Result<(), StatusCode> {
     let bearer = format!("Bearer {TOKEN}");
     let mut pairs = vec![("content-type", "application/json")];
@@ -628,15 +628,7 @@ fn gated(caller: &Caller, with_token: bool) -> Result<(), StatusCode> {
         pairs.push(("authorization", &bearer));
     }
     let h = headers(&pairs);
-    let write = Write {
-        peer: caller,
-        headers: &h,
-        target: "mac-1:cordon",
-        body: b"",
-    };
-    write_request(Some(&token()), &write)
-        .map(drop)
-        .map_err(|(code, _)| code)
+    gate(Some(&token()), caller, &h).map_err(|(code, _)| code)
 }
 
 /// Catches: the operator gate trusting the proxy's word instead of the token (a proxied

@@ -34,11 +34,9 @@ fn the_edit_changes_only_the_switchs_keys() {
             "[executor]\nexecutor = \"js-agent\"\n\
              executor-job-url = \"https://192.0.2.30:8443\"\n\
              executor-job-token-file = \"{token}\"\nexecutor-job-ca-file = \"{ca}\"\n\
-             executor-hosts = 4\nexecutor-host-cpus = 16\nexecutor-host-memory-gib = 64\n\
-             executor-host-slots = 8\n# where actions run\n"
+             # where actions run\n"
         ),
     );
-    let expected = expected.replace("executor-host-slots = 8\n\n[packs]", "\n[packs]");
     assert_eq!(new, expected);
 }
 
@@ -49,10 +47,10 @@ fn an_http_switch_removes_the_ca_and_a_table_is_added_when_there_is_none() {
     let dir = scratch("edit-http");
     let s = settings(dir.path(), "http://127.0.0.1:9443", false);
     let path = dir.path().join("kbf.toml");
-    let old = "[executor]\nexecutor-job-ca-file = \"/old/ca.pem\" # the old CA\n\n[other]\nexecutor-hosts = 1\n";
+    let old = "[executor]\nexecutor-job-ca-file = \"/old/ca.pem\" # the old CA\n\n[other]\nexecutor-job-url = 1\n";
     let new = rewritten(&path, old, &s).unwrap();
     assert!(!new.contains("/old/ca.pem"), "{new}");
-    assert!(new.contains("[other]\nexecutor-hosts = 1\n"), "{new}");
+    assert!(new.contains("[other]\nexecutor-job-url = 1\n"), "{new}");
     let new = rewritten(&path, "[scheduler]\nx = 1", &s).unwrap();
     assert!(
         new.starts_with("[scheduler]\nx = 1\n\n[executor]\nexecutor = \"js-agent\"\n"),
@@ -73,10 +71,13 @@ fn a_file_the_line_edit_cannot_rewrite_is_refused() {
     let s = settings(dir.path(), "http://127.0.0.1:9443", false);
     let path = dir.path().join("kbf.toml");
     for (old, why) in [
-        ("executor.executor-hosts = 2\n", "the result is not TOML"),
-        ("[executor]\n\"executor-hosts\" = 2\n", "the result is not"),
+        ("executor.executor-job-url = 2\n", "the result is not TOML"),
         (
-            "[executor]\nexecutor-hosts = [\n  2,\n]\n",
+            "[executor]\n\"executor-job-url\" = 2\n",
+            "the result is not",
+        ),
+        (
+            "[executor]\nexecutor-job-url = [\n  2,\n]\n",
             "the result is not TOML",
         ),
         (
@@ -84,7 +85,7 @@ fn a_file_the_line_edit_cannot_rewrite_is_refused() {
             "the result is not TOML",
         ),
         (
-            "[executor]\nexecutor-work-dir = \"\"\"\nexecutor-hosts = 3\n\"\"\"\n",
+            "[executor]\nexecutor-work-dir = \"\"\"\nexecutor-job-url = 3\n\"\"\"\n",
             "the result is not the file with only the switch's keys changed",
         ),
     ] {

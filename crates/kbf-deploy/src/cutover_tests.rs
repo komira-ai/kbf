@@ -22,7 +22,7 @@ pub(crate) fn ready_config() -> String {
          executor-base-image = \"registry.example/base@sha256:{d}\"\n\
          executor-kbf-image = \"docker://{KBF_IMAGE}\"\n\
          executor-base-tree = \"/opt/kbf/base-tree\"\n\
-         executor-secret-delivery = \"files\"\nexecutor-host-slots = 8\n\n[packs]\n\
+         executor-secret-delivery = \"files\"\n\n[packs]\n\
          pack-read = true\n",
         d = "ff".repeat(32)
     )
@@ -46,10 +46,6 @@ pub(crate) fn target(dir: &Path, config: &Path, url: &str, ca: bool) -> Target {
         url: url.to_owned(),
         token_file: write(dir, "job-service.token", SECRET),
         ca_file: ca.then(|| dir.join("ca.pem")),
-        hosts: 4,
-        host_cpus: 16,
-        host_memory_gib: 64,
-        host_slots: 8,
     }
 }
 
@@ -64,8 +60,7 @@ fn planned(t: &Target) -> (ExitCode, String, String) {
     )
 }
 
-/// Behaviour: the rendered flags are exactly the executor flags of the job service and the
-/// worker shape, and hold the token file's path and never its token.
+/// Behaviour: the rendered flags are exactly the executor flags of the job service, and hold the token file's path and never its token.
 #[test]
 fn the_flags_are_the_job_service_executor_flags_and_hold_no_token() {
     let dir = scratch("flags");
@@ -81,10 +76,6 @@ fn the_flags_are_the_job_service_executor_flags_and_hold_no_token() {
             "--executor-job-url=https://192.0.2.30:8443".to_owned(),
             format!("--executor-job-token-file={token}"),
             format!("--executor-job-ca-file={ca}"),
-            "--executor-hosts=4".to_owned(),
-            "--executor-host-cpus=16".to_owned(),
-            "--executor-host-memory-gib=64".to_owned(),
-            "--executor-host-slots=8".to_owned(),
         ]
     );
     assert!(flags.iter().all(|f| !f.contains(SECRET)));
@@ -111,18 +102,10 @@ fn the_plan_of_a_ready_file_prints_now_and_then() {
          \x20 executor-job-url: absent -> \"http://127.0.0.1:9443\"\n\
          \x20 executor-job-token-file: absent -> \"{token}\"\n\
          \x20 executor-job-ca-file: absent unchanged absent\n\
-         \x20 executor-hosts: absent -> 4\n\
-         \x20 executor-host-cpus: absent -> 16\n\
-         \x20 executor-host-memory-gib: absent -> 64\n\
-         \x20 executor-host-slots: 8 unchanged 8\n\
          the executor flags of the job-service mode:\n\
          \x20 --executor=js-agent\n\
          \x20 --executor-job-url=http://127.0.0.1:9443\n\
          \x20 --executor-job-token-file={token}\n\
-         \x20 --executor-hosts=4\n\
-         \x20 --executor-host-cpus=16\n\
-         \x20 --executor-host-memory-gib=64\n\
-         \x20 --executor-host-slots=8\n\
          kept from the file (the executor needs them):\n\
          \x20 executor-frontend-id = \"fe-a\"\n\
          \x20 executor-base-image = \"registry.example/base@sha256:{d}\"\n\
@@ -307,13 +290,6 @@ fn bad_flags_are_refused_naming_the_flag() {
                 ..base.clone()
             },
             "--ca-file: \"/etc/kbf/ca$1.pem\" is empty or holds",
-        ),
-        (
-            Target {
-                hosts: u64::MAX,
-                ..base.clone()
-            },
-            "--hosts: 18446744073709551615 is too large",
         ),
         (
             Target {

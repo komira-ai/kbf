@@ -6,11 +6,11 @@ mod support;
 
 use std::collections::BTreeSet;
 
+use kbf_invocation::RequeueReason;
 use kbf_invocation::proto::{self, attempt_end::End, outcome::Outcome as P};
 use kbf_invocation::{
     CallKind, Event, ExecuteAnswer, LeaseEnd, Metadata, Outcome, Records, Text, Usage,
 };
-use kbf_sched::RequeueReason;
 use kbf_types::{Failure, LostWhy, OperationId};
 use prost::Message;
 use support::*;

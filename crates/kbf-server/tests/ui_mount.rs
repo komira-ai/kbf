@@ -149,7 +149,7 @@ async fn ui_false_leaves_no_ui_and_every_other_route() {
         assert_eq!(answer.code, 404, "{path}: {}", answer.head);
         assert!(answer.header("content-security-policy").is_none(), "{path}");
     }
-    assert_eq!(server.get("/v1/nodes").await.code, 200);
+    assert_eq!(server.get("/v1/health").await.code, 200);
     assert_eq!(server.get("/readyz").await.code, 200);
     assert_eq!(server.get("/v1/invocations/none").await.code, 404);
     server.stop().await;

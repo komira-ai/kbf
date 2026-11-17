@@ -43,15 +43,11 @@ fn refused() -> io::Result<u16> {
 
 impl<'a> Script<'a> {
     /// Every tool succeeds (`kbf-host-install` answers `restarted`); the frontend is up, then
-    /// exits after one more ask; it is ready, and its first worker is there, at once.
+    /// exits after one more ask; it is ready after one more.
     fn healthy() -> Script<'a> {
         let mut statuses = BTreeMap::new();
         statuses.insert("/healthz".to_owned(), VecDeque::from([Ok(200), refused()]));
         statuses.insert("/readyz".to_owned(), VecDeque::from([Ok(503), Ok(200)]));
-        statuses.insert(
-            "/v1/nodes/js:fe-a-0".to_owned(),
-            VecDeque::from([Ok(404), Ok(200)]),
-        );
         Script {
             answer: Box::new(|cmd: &Cmd| {
                 Ok(if cmd.program.as_str() == "/usr/bin/ssh" {
@@ -171,10 +167,6 @@ fn args(dir: &Path, config: &Path, url: &str, apply: bool) -> ApplyArgs {
             url: url.to_owned(),
             token_file: token_file(dir, TOKEN),
             ca_file: None,
-            hosts: 4,
-            host_cpus: 16,
-            host_memory_gib: 64,
-            host_slots: 8,
         },
         restart: restart(),
         canary_deadline_secs: 30,
@@ -255,7 +247,6 @@ async fn a_dry_run_runs_asks_and_writes_nothing() {
             "DRY-RUN: wait until http://127.0.0.1:8982/healthz refuses the connection (the frontend has exited), however long".to_owned(),
             format!("DRY-RUN: /usr/bin/ssh {} (env PATH, HOME, LANG)", ssh_args().join(" ").replace("restart frontend=-", "\"restart frontend=-\"")),
             "DRY-RUN: wait for http://127.0.0.1:8982/readyz to answer 200 (the frontend is ready), at most 4 asks".to_owned(),
-            "DRY-RUN: wait for http://127.0.0.1:8982/v1/nodes/js:fe-a-0 to answer 200 (the executor of the job service registered its first worker), at most 4 asks".to_owned(),
             format!("DRY-RUN: canary: submit job {CANARY} ({KBF_IMAGE} --version, no network, label kbf-canary=fe-a) and ask after it at most 6 times"),
         ]
     );
@@ -272,8 +263,8 @@ async fn a_dry_run_runs_asks_and_writes_nothing() {
 }
 
 /// Behaviour: `--apply` checks the service, switches the file (the original kept), drains
-/// and waits for the exit, restarts through kbf-host-install, waits for readiness and the
-/// first worker, and passes the canary; the token is in no output.
+/// and waits for the exit, restarts through kbf-host-install, waits for readiness, and passes
+/// the canary; the token is in no output.
 #[tokio::test]
 async fn an_apply_switches_restarts_and_passes_the_canary() {
     let dir = scratch("apply");
@@ -325,20 +316,10 @@ async fn an_apply_switches_restarts_and_passes_the_canary() {
             ("/usr/bin/ssh".to_owned(), ssh_args()),
         ]
     );
-    assert_eq!(
-        host.asked,
-        [
-            "/healthz",
-            "/healthz",
-            "/readyz",
-            "/readyz",
-            "/v1/nodes/js:fe-a-0",
-            "/v1/nodes/js:fe-a-0"
-        ]
-    );
+    assert_eq!(host.asked, ["/healthz", "/healthz", "/readyz", "/readyz"]);
     // The drain's ask sees the frontend up, and the exit wait sees it gone at once; one pause
-    // in the readiness and the worker waits, and one before the canary's second ask.
-    assert_eq!(host.pauses, [5, 5, 5]);
+    // in the readiness wait, and one before the canary's second ask.
+    assert_eq!(host.pauses, [5, 5]);
     let spec = server.submitted(CANARY).unwrap();
     assert_eq!(spec.image, KBF_IMAGE);
     assert!(!spec.labels.contains_key("kbf-frontend"));

@@ -20,7 +20,6 @@ futures.workspace = true
 hmac.workspace = true
 http-body.workspace = true
 kbf-auth.workspace = true
-kbf-caps.workspace = true
 kbf-invocation.workspace = true
 kbf-map.workspace = true
 kbf-meta.workspace = true
@@ -30,7 +29,6 @@ kbf-objstore.workspace = true
 kbf-pack.workspace = true
 kbf-proto.workspace = true
 kbf-route.workspace = true
-kbf-sched.workspace = true
 kbf-segments.workspace = true
 # `PackIndex` and `BlobDigest`: where the packs' blobs are found (`proxy::packed`).
 kbf-pack-index.workspace = true

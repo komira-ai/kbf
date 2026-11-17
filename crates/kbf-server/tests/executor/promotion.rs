@@ -6,16 +6,11 @@
 //! answers to the executor's next read of the job and of its result are replaced by ones that
 //! say how it ended.
 
-use bytes::Bytes;
-use js_proto::v1::{GetJobResponse, GetResultResponse, Job, JobResult, JobState, ResultReason};
+use js_proto::v1::{JobState, ResultReason};
 use kbf_front::Finished;
-use kbf_job_client::fake::Fault;
-use prost::Message as _;
 use tonic::Code;
 
-use crate::rig::{Posted, Rig};
-
-const HOST: &str = "host-1";
+use crate::rig::{HOST, Posted, Rig};
 
 /// How the first job of the action ends, after it wrote its whole pack.
 #[derive(Debug)]
@@ -50,49 +45,13 @@ fn pack_key(job: &Posted) -> String {
     key.to_owned()
 }
 
-/// The keys the frontend was asked to read, in order.
-fn read_keys(rig: &Rig) -> Vec<String> {
-    let calls = rig.ingest.calls.lock().expect("calls");
-    calls.iter().map(|call| call.1.clone()).collect()
-}
-
-/// The next read of job `id` answers it in `job_state`, and the next read of its result
-/// answers `result_state`, `reason` and `exit_code`.
-fn script(
-    rig: &Rig,
-    id: &str,
-    (job_state, result_state, reason, exit_code): (JobState, JobState, ResultReason, Option<i32>),
-) {
-    let job = GetJobResponse {
-        job: Some(Job {
-            id: id.to_owned(),
-            state: job_state.into(),
-            ..Job::default()
-        }),
-    };
-    let result = GetResultResponse {
-        result: Some(JobResult {
-            state: result_state.into(),
-            exit_code,
-            reason: reason.into(),
-            ..JobResult::default()
-        }),
-    };
-    rig.fake
-        .inject_on("GetJob", Fault::Answer(Bytes::from(job.encode_to_vec())));
-    rig.fake.inject_on(
-        "GetResult",
-        Fault::Answer(Bytes::from(result.encode_to_vec())),
-    );
-}
-
 /// Catches a pack the job already wrote in full being read, and its outputs promoted, from a
 /// result that is not clean: a nonzero exit of the task tool, a cancel by someone else, the
 /// wall limit, the memory limit, and a job that says it succeeded with a result that has no
 /// exit code, a nonzero one, a reason other than its exit, or a state other than succeeded.
 /// For each, the first job's key is written and never read; the action runs again (or, for
 /// the wall limit, is answered `DEADLINE_EXCEEDED`), and only the rerun's clean end is read.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn outputs_are_promoted_only_from_a_clean_result() {
     use JobState::{Failed, Succeeded};
     use ResultReason::{Exit, Memory, Unspecified, WallLimit};
@@ -129,11 +88,9 @@ async fn outputs_are_promoted_only_from_a_clean_result() {
         ),
     ];
     for (ending, then) in endings {
-        let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
-        rig.pump().await;
-        let caller = rig.submit(1);
-        rig.pump().await;
-        let first = rig.jobs_of(1).remove(0);
+        let rig = Rig::start(&[HOST], |_| {}).await;
+        let mut caller = rig.submit(1);
+        let first = rig.first_job(1).await;
         let written = pack_key(&first);
         let url = format!("https://store.test/{written}");
         assert_eq!(
@@ -148,55 +105,50 @@ async fn outputs_are_promoted_only_from_a_clean_result() {
             }
             Ending::Scripted(job, result, reason, exit_code) => {
                 rig.host_runs(first.id(), HOST);
-                script(&rig, first.id(), (*job, *result, *reason, *exit_code));
+                rig.script_ending(first.id(), (*job, *result, *reason, *exit_code));
             }
         }
-        rig.pump().await;
-        assert_eq!(read_keys(&rig), Vec::<String>::new(), "{ending:?}");
         if then == Then::TimedOut {
-            match rig.until_done(&caller, 4).await {
+            match caller.done().await {
                 Finished::TimedOut { status, .. } | Finished::Failed(status) => {
                     assert_eq!(Code::from_i32(status.code), Code::DeadlineExceeded);
                 }
                 other => panic!("{ending:?}: not a timeout: {other:?}"),
             }
             assert_eq!(rig.jobs_of(1).len(), 1, "{ending:?} was run again");
-            assert_eq!(read_keys(&rig), Vec::<String>::new(), "{ending:?}");
+            assert_eq!(rig.ingest.keys_read(), Vec::<String>::new(), "{ending:?}");
             continue;
         }
+        let jobs = rig.until_jobs(1, 2).await;
         assert!(
             caller.finished().is_none(),
             "{ending:?} answered the caller"
         );
-        let jobs = rig.jobs_of(1);
-        assert_eq!(jobs.len(), 2, "{ending:?} was not run again: {jobs:?}");
+        assert_eq!(rig.ingest.keys_read(), Vec::<String>::new(), "{ending:?}");
         let rerun = pack_key(&jobs[1]);
         assert_ne!(rerun, written, "{ending:?}");
         rig.host_finishes(jobs[1].id(), HOST, 0);
-        match rig.until_done(&caller, 4).await {
+        match caller.done().await {
             Finished::Ran(result) => assert_eq!(result.exit_code, 0, "{ending:?}"),
             other => panic!("{ending:?}: did not run: {other:?}"),
         }
-        assert_eq!(read_keys(&rig), vec![rerun], "{ending:?}");
+        assert_eq!(rig.ingest.keys_read(), vec![rerun], "{ending:?}");
     }
 }
 
 /// Catches the clean result not being promoted: a job that wrote its pack and ended with the
 /// job and its result succeeded, for its exit, with exit code 0, has exactly that key read,
 /// once, and the caller is answered from it without a rerun.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn the_clean_result_promotes_the_pack_it_wrote() {
-    let mut rig = Rig::start(&[HOST], 1, |_| {}).await;
-    rig.pump().await;
-    let caller = rig.submit(1);
-    rig.pump().await;
-    let job = rig.jobs_of(1).remove(0);
+    let rig = Rig::start(&[HOST], |_| {}).await;
+    let mut caller = rig.submit(1);
+    let job = rig.first_job(1).await;
     let written = pack_key(&job);
     let url = format!("https://store.test/{written}");
     assert_eq!(rig.presign.put(&url), Ok(()));
     rig.host_runs(job.id(), HOST);
-    script(
-        &rig,
+    rig.script_ending(
         job.id(),
         (
             JobState::Succeeded,
@@ -205,10 +157,10 @@ async fn the_clean_result_promotes_the_pack_it_wrote() {
             Some(0),
         ),
     );
-    match rig.until_done(&caller, 4).await {
+    match caller.done().await {
         Finished::Ran(result) => assert_eq!(result.exit_code, 0),
         other => panic!("did not run: {other:?}"),
     }
-    assert_eq!(read_keys(&rig), vec![written]);
+    assert_eq!(rig.ingest.keys_read(), vec![written]);
     assert_eq!(rig.jobs_of(1).len(), 1);
 }

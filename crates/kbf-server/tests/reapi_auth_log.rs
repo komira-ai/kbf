@@ -3,6 +3,9 @@
 
 mod support;
 
+#[path = "frontend/idle_executor.rs"]
+mod idle_executor;
+
 use std::future::pending;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -72,7 +75,9 @@ async fn client(policy: &str) -> Client {
         "--worker-listen",
         "127.0.0.1:0",
     ]);
-    let listeners = args.listeners().expect("listeners");
+    let mut listeners = args.listeners().expect("listeners");
+    let (executor, fake) = idle_executor::idle_executor().await;
+    listeners.executor = Some(executor);
     let policy = Policy::from_json(policy).expect("a policy");
     let bound = bind_server_with_policy(
         Arc::new(Cache::memory()),
@@ -83,7 +88,10 @@ async fn client(policy: &str) -> Client {
     )
     .expect("bind");
     let (reapi, worker) = (bound.reapi, bound.worker);
-    tokio::spawn(async move { bound.serving.await.expect("serve") });
+    tokio::spawn(async move {
+        let _job_service = fake;
+        bound.serving.await.expect("serve")
+    });
     Client::connect(reapi, worker).await
 }
 

@@ -1,6 +1,59 @@
-//! An in-process single-node server on loopback ports, REAPI clients for it, and a scripted
-//! fake daemon: a node registered with the server's farm in-process, as the executor registers
-//! its workers.
+//! The integration-test harness: an in-process single-node `kbf-server` on loopback ports whose
+//! Execute runs on the real executor over a fake job service, and REAPI clients for it.
+//!
+//! # What a [`Cell`] is
+//!
+//! `Cell::start()` binds a server (`bind_server_with_state`) on its own runtime whose
+//! `Listeners::executor` is a [`kbf_server::executor::Executor`] over
+//! [`kbf_job_client::fake::FakeJobServer`] (one Linux x86-64 host, [`HOST`]), and fakes of the
+//! seams the executor reads the rest of the server through: the inputs (an image, the action's
+//! timeout, a read grant), the presigned `PUT`, and the ingest. The ingest stands for the task
+//! tool's pack: it answers with the [`Ran`] the test scripted for the action (nothing scripted:
+//! exit 0, no outputs), stores its blobs in the cell's CAS and, for an exit of 0, writes the
+//! result to the cell's action cache, as the frontend's ingest does. `cell.direct` holds the job
+//! service, the scripts and the drive helpers; it survives [`Cell::restart`] and
+//! [`Cell::cold_restart`], each of which builds a new executor over the same job service.
+//!
+//! Other starts: [`Cell::start_without_executor`] (an Execute the cache does not answer is
+//! refused FAILED_PRECONDITION), [`Cell::start_with_state`] over a [`FakeState`] (the executor
+//! keeps its operations' rows in it; its clock is the store's, moved with [`FakeState::advance`])
+//! or any `kbf_state::Store` in a [`StateHandle`], [`Cell::start_raft`], [`Cell::start_with_api`],
+//! [`Cell::start_with_retention`], [`Cell::start_with_streams`].
+//!
+//! # Driving a job
+//!
+//! An Execute submits one job; `direct.job(&action, attempt)` waits for it and names it,
+//! `direct.run(&action)` places it on the host and runs it, `direct.finish(&action, n)` ends it
+//! with the task tool's exit `n` (0: the pack is ingested; anything else is an infrastructure
+//! ending the executor runs again, as the next attempt), `direct.complete(&action)` is a clean
+//! end, `direct.lose(&action, attempt)` loses the host, `direct.time_out(&action)` ends the job
+//! at its wall limit. `direct.jobs_of(&action)` lists the attempts; `direct.fake` is the job
+//! service itself for anything finer (faults, its clock, its calls).
+//!
+//! Time here is real, bounded by [`PROMPT`] where a test waits for an event; the executor polls
+//! the job service every 20 ms. A test never asserts how long anything took.
+//!
+//! # Example
+//!
+//! ```ignore
+//! mod support;
+//! use support::{Cell, Job, Ran, done, response};
+//!
+//! #[tokio::test]
+//! async fn an_action_runs_as_one_job() {
+//!     let cell = Cell::start().await;
+//!     let job = Job::new("/bin/run", &[]);
+//!     cell.upload(&job.blobs()).await;
+//!     cell.direct.will_run(&job.action, Ran::writes("out", "hello").stdout("log"));
+//!
+//!     let mut ops = cell.execute(&job.action).await;
+//!     cell.direct.complete(&job.action).await;
+//!     let result = response(&done(&mut ops).await).result.expect("a result");
+//!
+//!     assert_eq!(result.exit_code, 0);
+//!     assert_eq!(cell.cached(&job.action).await.expect("cached"), result);
+//! }
+//! ```
 
 #![allow(dead_code)]
 
@@ -14,7 +67,6 @@ use kbf_front::{Cache, Leadership, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, Me
 use kbf_meta::{Applied, Command as MetaCommand, MetaState, Retention};
 use kbf_objstore::KeyPrefix;
 use kbf_proto::google::longrunning::{Operation, operation};
-use kbf_proto::google::rpc;
 use kbf_proto::reapi::action_cache_client::ActionCacheClient;
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::execution_client::ExecutionClient;
@@ -23,11 +75,9 @@ use kbf_proto::reapi::{
     ExecuteResponse, FileNode, FindMissingBlobsRequest, GetActionResultRequest, OutputFile,
     Platform, batch_update_blobs_request, platform,
 };
-use kbf_proto::worker::{Capability, Hello, LeaseId, Start};
 use kbf_server::token::ApiToken;
 use kbf_server::{
-    Api, Bound, Listeners, MemoryLadder, RaftMetaLog, ServeError, StreamLimits,
-    bind_server_with_state,
+    Api, Bound, Listeners, RaftMetaLog, ServeError, StreamLimits, bind_server_with_state,
 };
 use kbf_store::FaultFs;
 use prost::Message;
@@ -36,9 +86,11 @@ use tokio::time::timeout;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Streaming};
 
-mod daemon;
+mod direct;
 mod store;
-pub use daemon::FakeDaemon;
+// Each test binary takes what it uses of the harness.
+#[allow(unused_imports)]
+pub use direct::{Direct, HOST, Ingestion, Ran, machine};
 pub use store::SharedStore;
 
 /// How long a test waits for something that should happen promptly.
@@ -161,15 +213,82 @@ impl MetaLog for GateLog {
     }
 }
 
+/// What a server is started with: the knobs the `Cell::start_*` constructors turn.
+#[derive(Clone)]
+struct Setup {
+    api: Option<Api>,
+    raft_dir: Option<FaultFs>,
+    retention: Duration,
+    streams: StreamLimits,
+    /// The state store, which the executor keeps its operations' rows in too.
+    state: Option<Arc<StateHandle>>,
+    /// Whether the server has an executor (`Listeners::executor`).
+    executor: bool,
+}
+
+/// A state store a cell is started over, which every restart of the cell opens again.
+pub struct StateHandle {
+    pub store: Arc<dyn kbf_state::Store>,
+}
+
+impl StateHandle {
+    fn open(&self) -> kbf_server::StateStore {
+        kbf_server::StateStore {
+            store: Arc::clone(&self.store),
+            members: Default::default(),
+            history: None,
+        }
+    }
+}
+
+/// An in-memory state store, and the clock its rows expire on, which a test moves by hand.
+pub struct FakeState {
+    pub clock: Arc<kbf_state::ManualClock>,
+    pub store: Arc<kbf_state::fake::Fake>,
+}
+
+impl FakeState {
+    pub fn new() -> Self {
+        let clock = Arc::new(kbf_state::ManualClock::default());
+        let store = Arc::new(kbf_state::fake::Fake::with_flaw(
+            Arc::clone(&clock),
+            kbf_state::fake::Flaw::None,
+        ));
+        Self { clock, store }
+    }
+
+    /// The store as a cell takes it.
+    pub fn handle(&self) -> Arc<StateHandle> {
+        Arc::new(StateHandle {
+            store: Arc::clone(&self.store) as Arc<dyn kbf_state::Store>,
+        })
+    }
+
+    /// Time passes on the store's clock.
+    pub fn advance(&self, by: Duration) {
+        self.clock.advance(by);
+    }
+
+    /// Every key under `prefix`.
+    pub fn keys(&self, prefix: &str) -> Vec<String> {
+        use kbf_state::Store as _;
+        let rows = self.store.scan_prefix(prefix).expect("a scan");
+        rows.into_iter().map(|(key, _)| key).collect()
+    }
+}
+
 /// A running server in this process, and a [`Client`] of it.
 pub struct Cell {
     pub cache: Arc<Cache<GateLog, SharedStore>>,
     /// The bucket, shared with every restart of this cell.
     pub store: SharedStore,
+    /// The job service the server's executor submits to, the scripts of its actions, and the
+    /// helpers that drive a job. Shared with every restart of this cell.
+    pub direct: Direct,
     /// The operator API's address, for a cell started with one.
     pub api: Option<SocketAddr>,
-    /// The operator API's configuration, kept for a restart.
-    api_config: Option<Api>,
+    /// What the cell was started with, kept for a restart.
+    setup: Setup,
     /// The raft directory of a cell started with [`Cell::start_raft`], as the old
     /// process left it.
     raft_dir: Option<FaultFs>,
@@ -181,31 +300,7 @@ pub struct Cell {
     pub recorder: kbf_front::Recorder,
     /// The server's frontend drain.
     pub drain: Arc<kbf_server::Drain>,
-    /// The server's farm, whose tick and write-behind a test can run by hand.
-    farm: std::sync::Weak<kbf_server::farm::Farm>,
     client: Client,
-}
-
-impl Cell {
-    fn farm(&self) -> Arc<kbf_server::farm::Farm> {
-        self.farm.upgrade().expect("the farm is serving")
-    }
-
-    /// One tick of the farm now: what the timer does every `tick`, so that the gauges and
-    /// counters `/metrics` serves are published when this returns.
-    pub async fn tick(&self) {
-        self.farm().tick().await;
-    }
-
-    /// The farm's write-behind of its size summaries to the state store, now.
-    pub fn write_behind(&self) {
-        self.farm().write_behind_now();
-    }
-
-    /// What the farm's scheduler has counted about node-load readings, among other things.
-    pub fn load_counters(&self) -> kbf_sched::LoadCounters {
-        self.farm().load_counters()
-    }
 }
 
 impl Drop for Cell {
@@ -229,217 +324,84 @@ pub struct Client {
     pub reapi_addr: SocketAddr,
     pub worker_addr: SocketAddr,
     channel: Channel,
-    /// The farm the server serves, which a [`FakeDaemon`] registers with. Empty for a client
-    /// of a server in another process.
-    farm: std::sync::Weak<kbf_server::farm::Farm>,
-}
-
-/// The memory ladder of every cell but [`Cell::start_with_ladder`]'s: 1, 2 and 4 GiB,
-/// so an action that names no size books 1 GiB and a test node of 1 to 4 GiB runs it.
-/// (The server's default is 4, 16 and 32 GiB.)
-pub fn small_ladder() -> MemoryLadder {
-    MemoryLadder::from_gib(&[1, 2, 4]).expect("a ladder")
 }
 
 /// The bearer token of a cell's operator API ([`Cell::start_with_api`]).
 pub const API_TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 
+impl Setup {
+    fn new() -> Self {
+        Self {
+            api: None,
+            raft_dir: None,
+            retention: kbf_server::executor::FINISHED_RETENTION,
+            streams: StreamLimits::DEFAULT,
+            state: None,
+            executor: true,
+        }
+    }
+}
+
 impl Cell {
+    /// A server with an executor over a fresh fake job service.
     pub async fn start() -> Self {
-        Self::start_with(kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION).await
+        Self::fresh(Setup::new()).await
     }
 
-    /// A cell whose scheduler refuses queued work no live worker can run after `wait`.
-    pub async fn start_with_unservable_wait(wait: Duration) -> Self {
-        Self::start_with(wait, kbf_sched::FINISHED_RETENTION).await
-    }
-
-    /// A cell that gives an action naming no OS or architecture `default_platform`, as
-    /// `--default-platform` sets it. (The other cells give it none, so that a test of
-    /// the platform match sees the match.)
-    pub async fn start_with_default_platform(default_platform: kbf_front::DefaultPlatform) -> Self {
-        let store = SharedStore::new();
-        let cache = Self::cold_cache(&store, None).await;
-        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve_with_state(
-            cache,
-            store,
-            None,
-            None,
-            wait,
-            retention,
-            small_ladder(),
-            StreamLimits::DEFAULT,
-            None,
-            default_platform,
-            kbf_server::LearnedSizes::Off,
-            true,
-        )
-        .await
-    }
-
-    /// A cell that books and climbs `ladder`, as `--memory-ladder-gib` sets it. The
-    /// other cells book 1 GiB first ([`small_ladder`]), so the small nodes of these
-    /// tests can run an action that names no size.
-    pub async fn start_with_ladder(ladder: MemoryLadder) -> Self {
-        let store = SharedStore::new();
-        let cache = Self::cold_cache(&store, None).await;
-        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(
-            cache,
-            store,
-            None,
-            None,
-            wait,
-            retention,
-            ladder,
-            StreamLimits::DEFAULT,
-        )
-        .await
-    }
-
-    /// A cell that books `ladder`'s first rung and never climbs it (`--no-memory-climb`), with
-    /// learned sizes `mode`, keeping its scheduler's state in `state` if given.
-    pub async fn start_no_climb(
-        mode: kbf_server::LearnedSizes,
-        ladder: MemoryLadder,
-        state: Option<kbf_server::StateStore>,
-    ) -> Self {
-        let store = SharedStore::new();
-        let cache = Self::cold_cache(&store, None).await;
-        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve_with_state(
-            cache,
-            store,
-            None,
-            None,
-            wait,
-            retention,
-            ladder,
-            StreamLimits::DEFAULT,
-            state,
-            kbf_front::DefaultPlatform::NONE,
-            mode,
-            false,
-        )
-        .await
-    }
-
-    /// A cell that books and climbs `ladder` with learned sizes `mode` (`--learned-sizes`),
-    /// keeping its scheduler's state in `state` if given.
-    pub async fn start_learned(
-        mode: kbf_server::LearnedSizes,
-        ladder: MemoryLadder,
-        state: Option<kbf_server::StateStore>,
-    ) -> Self {
-        let store = SharedStore::new();
-        let cache = Self::cold_cache(&store, None).await;
-        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve_with_state(
-            cache,
-            store,
-            None,
-            None,
-            wait,
-            retention,
-            ladder,
-            StreamLimits::DEFAULT,
-            state,
-            kbf_front::DefaultPlatform::NONE,
-            mode,
-            true,
-        )
+    /// A server with no executor: an Execute the action cache does not answer is refused
+    /// FAILED_PRECONDITION.
+    pub async fn start_without_executor() -> Self {
+        Self::fresh(Setup {
+            executor: false,
+            ..Setup::new()
+        })
         .await
     }
 
     /// A cell whose listeners allow `streams` HTTP/2 streams per connection
     /// (`--reapi-max-streams`, `--worker-max-streams`).
     pub async fn start_with_streams(streams: StreamLimits) -> Self {
-        let store = SharedStore::new();
-        let cache = Self::cold_cache(&store, None).await;
-        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(
-            cache,
-            store,
-            None,
-            None,
-            wait,
-            retention,
-            small_ladder(),
+        Self::fresh(Setup {
             streams,
-        )
+            ..Setup::new()
+        })
         .await
     }
 
-    /// A cell whose scheduler keeps its state in `state` (and writes the build history it
-    /// names, if any), and that serves the operator API without a token: its `/metrics`
-    /// is at [`Cell::api`].
-    pub async fn start_with_state(state: kbf_server::StateStore) -> Self {
-        let store = SharedStore::new();
-        let cache = Self::cold_cache(&store, None).await;
-        let api = Api {
-            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
-            token: None,
-        };
-        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve_with_state(
-            cache,
-            store,
-            Some(api),
-            None,
-            wait,
-            retention,
-            small_ladder(),
-            StreamLimits::DEFAULT,
-            Some(state),
-            kbf_front::DefaultPlatform::NONE,
-            kbf_server::LearnedSizes::Off,
-            true,
-        )
+    /// A cell whose executor keeps its operations' rows in `state` ([`FakeState::handle`], or a
+    /// SQLite store of the test's own in a [`StateHandle`]), and that serves the operator API
+    /// without a token: its `/metrics` is at [`Cell::api`].
+    pub async fn start_with_state(state: Arc<StateHandle>) -> Self {
+        Self::fresh(Setup {
+            api: Some(Api {
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+                token: None,
+            }),
+            state: Some(state),
+            ..Setup::new()
+        })
         .await
     }
 
     /// [`Cell::start_with_state`], whose operator API takes writes with [`API_TOKEN`].
-    pub async fn start_with_api_and_state(state: kbf_server::StateStore) -> Self {
-        let store = SharedStore::new();
-        let cache = Self::cold_cache(&store, None).await;
-        let api = Api {
-            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
-            token: Some(api_token()),
-        };
-        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve_with_state(
-            cache,
-            store,
-            Some(api),
-            None,
-            wait,
-            retention,
-            small_ladder(),
-            StreamLimits::DEFAULT,
-            Some(state),
-            kbf_front::DefaultPlatform::NONE,
-            kbf_server::LearnedSizes::Off,
-            true,
-        )
+    pub async fn start_with_api_and_state(state: Arc<StateHandle>) -> Self {
+        Self::fresh(Setup {
+            api: Some(Api {
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+                token: Some(api_token()),
+            }),
+            state: Some(state),
+            ..Setup::new()
+        })
         .await
     }
 
-    /// A cell whose scheduler refuses queued work no live worker can run after `wait`,
-    /// and keeps a finished operation for `retention`.
-    pub async fn start_with(wait: Duration, retention: Duration) -> Self {
-        let store = SharedStore::new();
-        let cache = Self::cold_cache(&store, None).await;
-        Self::serve(
-            cache,
-            store,
-            None,
-            None,
-            wait,
+    /// A cell that keeps a finished operation for `retention`.
+    pub async fn start_with_retention(retention: Duration) -> Self {
+        Self::fresh(Setup {
             retention,
-            small_ladder(),
-            StreamLimits::DEFAULT,
-        )
+            ..Setup::new()
+        })
         .await
     }
 
@@ -447,20 +409,11 @@ impl Cell {
     /// an in-memory raft directory, which [`Cell::cold_restart`] carries over as a
     /// process restart leaves it. Objects go under `kbf/<log id>/`.
     pub async fn start_raft() -> Self {
-        let store = SharedStore::new();
         let dir = FaultFs::new();
-        let cache = Self::cold_cache(&store, Some(&dir)).await;
-        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(
-            cache,
-            store,
-            None,
-            Some(dir),
-            wait,
-            retention,
-            small_ladder(),
-            StreamLimits::DEFAULT,
-        )
+        Self::fresh(Setup {
+            raft_dir: Some(dir),
+            ..Setup::new()
+        })
         .await
     }
 
@@ -471,59 +424,46 @@ impl Cell {
 
     /// A cell that also serves the operator API, whose writes need [`API_TOKEN`].
     pub async fn start_with_api() -> Self {
-        let store = SharedStore::new();
-        let api = Api {
-            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
-            token: Some(api_token()),
-        };
-        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        let cache = Self::cold_cache(&store, None).await;
-        Self::serve(
-            cache,
-            store,
-            Some(api),
-            None,
-            wait,
-            retention,
-            small_ladder(),
-            StreamLimits::DEFAULT,
-        )
+        Self::fresh(Setup {
+            api: Some(Api {
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+                token: Some(api_token()),
+            }),
+            ..Setup::new()
+        })
         .await
     }
 
-    /// A new server over this cell's store and its in-memory action cache and CAS
-    /// index, with a fresh scheduler, no daemon registered and nothing queued. This one
-    /// is left running; its daemons simply never reach the new one's state.
-    ///
-    /// Sharing the cache models a durable cache, which `kbf-server` does not have
-    /// today: its metadata is in memory. [`Cell::cold_restart`] is a restart as the
-    /// binary has it. On a cell started with [`Cell::start_raft`] both servers share
-    /// one open Raft log, and so its term: use [`Cell::cold_restart`] there.
+    async fn fresh(setup: Setup) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, setup.raft_dir.as_ref()).await;
+        let direct = Direct::start().await;
+        Self::serve(cache, store, direct, setup).await
+    }
+
+    /// A new server over this cell's store, its in-memory action cache and CAS index, and its
+    /// job service, with a new executor: no operation of the old one is known to it (with a
+    /// state store, it takes up the old one's unfinished operations once the old one's
+    /// liveness row expires). This one is left running. [`Cell::cold_restart`] is a restart as
+    /// the binary has it. On a cell started with [`Cell::start_raft`] both servers share one
+    /// open Raft log, and so its term: use [`Cell::cold_restart`] there.
     pub async fn restart(&self) -> Self {
-        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let (cache, store) = (Arc::clone(&self.cache), self.store.clone());
-        let dir = self.raft_dir.clone();
-        Self::serve(
-            cache,
-            store,
-            self.api_config.clone(),
-            dir,
-            wait,
-            retention,
-            small_ladder(),
-            StreamLimits::DEFAULT,
-        )
-        .await
+        let setup = Setup {
+            raft_dir: self.raft_dir.clone(),
+            ..self.setup.clone()
+        };
+        Self::serve(cache, store, self.direct.clone(), setup).await
     }
 
     /// Stops this server, waits until its runtime and every task on it are gone (each
     /// connection and stream of it ends, as when the process exits), and starts a new
-    /// one over the same bucket, as a restart of the `kbf-server` binary does: a new
-    /// `Cache` with a new, empty metadata log (so an empty CAS index and action
-    /// cache), a fresh scheduler (no daemon, no cordon, no drain, nothing queued), and
-    /// its objects written under a key prefix no earlier start used, as an S3 cold store
-    /// does. The objects earlier starts wrote stay in the bucket. The operator API, if
-    /// this cell has one, listens again on a new port.
+    /// one over the same bucket and the same job service, as a restart of the `kbf-server`
+    /// binary does: a new `Cache` with a new, empty metadata log (so an empty CAS index and
+    /// action cache), a new executor, and its objects written under a key prefix no earlier
+    /// start used, as an S3 cold store does. The objects earlier starts wrote stay in the
+    /// bucket, and the jobs the job service holds go on. The operator API, if this cell has
+    /// one, listens again on a new port.
     ///
     /// A cell started with [`Cell::start_raft`] reopens its Raft log from the raft
     /// directory as the old process left it (the Raft metadata log), so the CAS index and
@@ -531,8 +471,9 @@ impl Cell {
     pub async fn cold_restart(mut self) -> Self {
         let stop = self.stop.take().expect("the server is running");
         let stopped = self.stopped.take().expect("the server is running");
-        let (store, api_config) = (self.store.clone(), self.api_config.clone());
+        let (store, direct) = (self.store.clone(), self.direct.clone());
         let dir = self.raft_dir.take();
+        let setup = self.setup.clone();
         drop(self);
         stop.send(()).expect("the server is running");
         timeout(PROMPT * 4, stopped)
@@ -541,18 +482,11 @@ impl Cell {
             .expect("the old server stops cleanly");
         let dir = dir.map(|d| d.restart());
         let cache = Self::cold_cache(&store, dir.as_ref()).await;
-        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(
-            cache,
-            store,
-            api_config,
-            dir,
-            wait,
-            retention,
-            small_ladder(),
-            StreamLimits::DEFAULT,
-        )
-        .await
+        let setup = Setup {
+            raft_dir: dir,
+            ..setup
+        };
+        Self::serve(cache, store, direct, setup).await
     }
 
     /// A new cache over `store` and a writer epoch it allocates. Without `raft_dir`:
@@ -589,81 +523,20 @@ impl Cell {
         Arc::new(cache.expect("open the cache"))
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn serve(
         cache: Arc<Cache<GateLog, SharedStore>>,
         store: SharedStore,
-        api_config: Option<Api>,
-        raft_dir: Option<FaultFs>,
-        wait: Duration,
-        retention: Duration,
-        ladder: MemoryLadder,
-        streams: StreamLimits,
+        direct: Direct,
+        setup: Setup,
     ) -> Self {
-        Self::serve_with_state(
-            cache,
-            store,
-            api_config,
-            raft_dir,
-            wait,
-            retention,
-            ladder,
-            streams,
-            None,
-            kbf_front::DefaultPlatform::NONE,
-            kbf_server::LearnedSizes::Off,
-            true,
-        )
-        .await
-    }
-
-    /// [`Cell::serve`], over the scheduler's `state` if given.
-    #[allow(clippy::too_many_arguments)]
-    async fn serve_with_state(
-        cache: Arc<Cache<GateLog, SharedStore>>,
-        store: SharedStore,
-        api_config: Option<Api>,
-        raft_dir: Option<FaultFs>,
-        wait: Duration,
-        retention: Duration,
-        ladder: MemoryLadder,
-        streams: StreamLimits,
-        state: Option<kbf_server::StateStore>,
-        default_platform: kbf_front::DefaultPlatform,
-        learned: kbf_server::LearnedSizes,
-        climb: bool,
-    ) -> Self {
-        let listeners = Listeners {
-            reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
-            worker: SocketAddr::from(([127, 0, 0, 1], 0)),
-            reapi_tls: None,
-            worker_tls: None,
-            tick: Duration::from_millis(50),
-            unservable_wait: wait,
-            default_platform,
-            qos_allowed: kbf_front::QosAllow::DEFAULT,
-            memory_ladder: ladder,
-            memory_climb: climb,
-            learned_sizes: learned,
-            exclusive_actions: false,
-            placement_load: kbf_server::PlacementLoad::Off,
-            placement_predictions: kbf_server::PlacementPredictions::Off,
-            usage_profiles: kbf_server::UsageProfiles::Off,
-            whole_node: None,
-            finished_retention: retention,
-            shutdown_timeout: Duration::from_secs(10),
-            streams: kbf_server::StreamTiming::default(),
-            store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
-            invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
-            stream_limits: streams,
-        };
         let (stop, stop_rx) = oneshot::channel::<()>();
         let (stopped_tx, stopped) = oneshot::channel::<()>();
         let (bound_tx, bound_rx) = oneshot::channel();
-        let (server_cache, server_api) = (Arc::clone(&cache), api_config.clone());
+        let (server_cache, server_api) = (Arc::clone(&cache), setup.api.clone());
+        let (server_direct, server_setup) = (direct.clone(), setup.clone());
         // The server runs on a runtime of its own, as a process apart: once it stops,
-        // the runtime is dropped and every task of it (each connection, each stream)
-        // goes with it, as when the process exits.
+        // the runtime is dropped and every task of it (each connection, each stream, each
+        // operation of the executor) goes with it, as when the process exits.
         std::thread::Builder::new()
             .name("kbf-server-cell".to_owned())
             .spawn(move || {
@@ -674,6 +547,28 @@ impl Cell {
                 runtime.block_on(async move {
                     let shutdown = async move {
                         let _ = stop_rx.await;
+                    };
+                    let state = server_setup.state.as_ref().map(|s| s.open());
+                    let executor = server_setup.executor.then(|| {
+                        let rows = state.as_ref().map(|s| Arc::clone(&s.store));
+                        server_direct.executor(
+                            Arc::clone(&server_cache),
+                            rows,
+                            server_setup.retention,
+                        )
+                    });
+                    let listeners = Listeners {
+                        reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
+                        worker: SocketAddr::from(([127, 0, 0, 1], 0)),
+                        reapi_tls: None,
+                        worker_tls: None,
+                        executor,
+                        finished_retention: server_setup.retention,
+                        shutdown_timeout: Duration::from_secs(10),
+                        streams: kbf_server::StreamTiming::default(),
+                        store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
+                        invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
+                        stream_limits: server_setup.streams,
                     };
                     let bound = bind_server_with_state(
                         server_cache,
@@ -689,19 +584,19 @@ impl Cell {
                 let _ = stopped_tx.send(());
             })
             .expect("a server thread");
-        let (reapi, worker, api, recorder, drain, farm) = bound_rx.await.expect("the server binds");
+        let (reapi, worker, api, recorder, drain) = bound_rx.await.expect("the server binds");
         Self {
             cache,
             store,
+            direct,
             api,
-            api_config,
-            raft_dir,
+            raft_dir: setup.raft_dir.clone(),
+            setup,
             stop: Some(stop),
             stopped: Some(stopped),
             recorder,
             drain,
-            client: Client::connect_to(reapi, worker, farm.clone()).await,
-            farm,
+            client: Client::connect(reapi, worker).await,
         }
     }
 }
@@ -714,7 +609,6 @@ type Started = (
     Option<SocketAddr>,
     kbf_front::Recorder,
     Arc<kbf_server::Drain>,
-    std::sync::Weak<kbf_server::farm::Farm>,
 );
 
 /// Says where `bound` listens on `addresses`, then serves it until it stops.
@@ -729,7 +623,6 @@ async fn run(
         bound.api,
         recorder,
         Arc::clone(&bound.drain),
-        bound.farm.clone(),
     ));
     bound.serving.await.expect("serve");
 }
@@ -748,15 +641,6 @@ fn api_token() -> ApiToken {
 impl Client {
     /// A client of the server listening at `reapi` and `worker`.
     pub async fn connect(reapi: SocketAddr, worker: SocketAddr) -> Self {
-        Self::connect_to(reapi, worker, std::sync::Weak::new()).await
-    }
-
-    /// [`Client::connect`], with the `farm` of the server, for a client that opens daemons.
-    pub async fn connect_to(
-        reapi: SocketAddr,
-        worker: SocketAddr,
-        farm: std::sync::Weak<kbf_server::farm::Farm>,
-    ) -> Self {
         let channel = Endpoint::from_shared(format!("http://{reapi}"))
             .expect("endpoint")
             .connect()
@@ -766,7 +650,6 @@ impl Client {
             reapi_addr: reapi,
             worker_addr: worker,
             channel,
-            farm,
         }
     }
 
@@ -846,7 +729,7 @@ impl Client {
             .map(tonic::Response::into_inner)
     }
 
-    /// GetActionResult: the result as the daemon reported it ([`unstamped`]), or the
+    /// GetActionResult: the result as the fake ingest gave it ([`unstamped`]), or the
     /// error code.
     pub async fn cached(&self, action: &Blob) -> Result<ActionResult, Code> {
         self.cached_stamped(action).await.map(unstamped)
@@ -862,142 +745,6 @@ impl Client {
             .await
             .map(tonic::Response::into_inner)
             .map_err(|s| s.code())
-    }
-
-    /// A daemon for `node` with `cpus` CPUs and `mem_gib` GiB, registered. Every daemon
-    /// a test opens for one node this way is the same daemon process (a new stream of
-    /// it); see [`Client::daemon_process`].
-    pub async fn daemon(&self, node: &str, cpus: u32, mem_gib: u32) -> FakeDaemon {
-        FakeDaemon::connect(self.farm.clone(), hello(node, cpus, mem_gib))
-            .await
-            .expect("registered")
-    }
-
-    /// A daemon registered with `hello`, or the refusal.
-    pub async fn daemon_hello(&self, hello: Hello) -> Result<FakeDaemon, tonic::Status> {
-        FakeDaemon::connect(self.farm.clone(), hello).await
-    }
-
-    /// [`Client::daemon_hello`] for a node that sends no `NodeStatus`.
-    pub async fn daemon_hello_without_status(
-        &self,
-        hello: Hello,
-    ) -> Result<FakeDaemon, tonic::Status> {
-        FakeDaemon::connect_without_status(self.farm.clone(), hello).await
-    }
-
-    /// A daemon for `node`, registered by the daemon process `instance` (its
-    /// `Hello.instance_id`).
-    pub async fn daemon_process(
-        &self,
-        node: &str,
-        instance: &str,
-        cpus: u32,
-        mem_gib: u32,
-    ) -> FakeDaemon {
-        let hello = Hello {
-            instance_id: instance.to_owned(),
-            ..hello(node, cpus, mem_gib)
-        };
-        FakeDaemon::connect(self.farm.clone(), hello)
-            .await
-            .expect("registered")
-    }
-}
-
-/// A Hello for a Linux x86-64 `node` reporting `cpus` and `mem_gib`.
-pub fn hello(node: &str, cpus: u32, mem_gib: u32) -> Hello {
-    hello_on(node, cpus, mem_gib, &[("arch", "x86_64"), ("os", "linux")])
-}
-
-/// A Hello for `node` reporting `cpus`, `mem_gib` and the `platform` entries, and
-/// `drivers=fake` (which serves `action` leases) unless `platform` names its drivers.
-pub fn hello_on(node: &str, cpus: u32, mem_gib: u32, platform: &[(&str, &str)]) -> Hello {
-    let drivers: &[(&str, &str)] = if platform.iter().any(|(key, _)| *key == "drivers") {
-        &[]
-    } else {
-        &[("drivers", "fake")]
-    };
-    let platform = platform
-        .iter()
-        .chain(drivers)
-        .map(|(key, value)| Capability {
-            key: (*key).to_owned(),
-            value: (*value).to_owned(),
-        });
-    Hello {
-        protocol_version: 1,
-        node_id: node.to_owned(),
-        daemon_version: "test".to_owned(),
-        capabilities: vec![
-            Capability {
-                key: "cpus".to_owned(),
-                value: cpus.to_string(),
-            },
-            Capability {
-                key: "mem_gib".to_owned(),
-                value: mem_gib.to_string(),
-            },
-        ]
-        .into_iter()
-        .chain(platform)
-        .collect(),
-        report_hash: Vec::new(),
-        // One daemon process per node unless a test says otherwise.
-        instance_id: format!("{node}-daemon"),
-        phase: None,
-        predecessor_instance_id: String::new(),
-    }
-}
-
-/// An OK Result for `lease` carrying `result`.
-pub fn ran(lease: Option<LeaseId>, result: &ActionResult) -> kbf_proto::worker::Result {
-    kbf_proto::worker::Result {
-        lease_id: lease,
-        status: Some(rpc::Status::default()),
-        action_result: Some(result.clone()),
-        // As a daemon that predates the field sends it: the server checks no action.
-        action_digest: None,
-        memory_kill: 0,
-        lost: 0,
-        job_outcome: None,
-    }
-}
-
-/// Reports `result(lease)` for `first` and for each rerun the farm's budget allows
-/// (`1 + FARM_RERUNS` runs in all, each `Start` taken from `daemon`): a run the farm
-/// could not do is run again, so only the last report finishes the operation.
-pub async fn report_every_run(
-    daemon: &mut FakeDaemon,
-    first: Start,
-    result: impl Fn(Option<LeaseId>) -> kbf_proto::worker::Result,
-) {
-    let mut start = first;
-    for run in 0..=kbf_sched::FARM_RERUNS {
-        assert!(
-            daemon.report(result(start.lease_id)).await.accepted,
-            "run {run}"
-        );
-        if run < kbf_sched::FARM_RERUNS {
-            start = daemon.start().await;
-        }
-    }
-}
-
-/// A failed Result for `lease`.
-pub fn failed(lease: Option<LeaseId>, code: Code) -> kbf_proto::worker::Result {
-    kbf_proto::worker::Result {
-        lease_id: lease,
-        status: Some(rpc::Status {
-            code: code as i32,
-            message: "test".to_owned(),
-            details: Vec::new(),
-        }),
-        action_result: None,
-        action_digest: None,
-        memory_kill: 0,
-        lost: 0,
-        job_outcome: None,
     }
 }
 
@@ -1092,7 +839,7 @@ pub async fn output(cell: &Client, text: &str, exit_code: i32) -> ActionResult {
     }
 }
 
-/// The ExecuteResponse of a done operation, its result as the daemon reported it
+/// The ExecuteResponse of a done operation, its result as the fake ingest gave it
 /// ([`unstamped`]).
 pub fn response(op: &Operation) -> ExecuteResponse {
     let mut response = stamped_response(op);
@@ -1100,20 +847,10 @@ pub fn response(op: &Operation) -> ExecuteResponse {
     response
 }
 
-/// `result` without the metadata the server adds to every accepted result (issue
-/// #166), which must be there: the node id in `worker` and a `queued_timestamp`. The
-/// fake daemons here report results without metadata, so what is left is what they
-/// reported. `tests/execute.rs` checks the metadata's values.
+/// `result` without its execution metadata, whatever put it there (the task tool's own, or
+/// the front's): what is left is what the fake ingest ([`Ran`]) gave back.
 pub fn unstamped(mut result: ActionResult) -> ActionResult {
-    let metadata = result
-        .execution_metadata
-        .take()
-        .unwrap_or_else(|| panic!("a result without the server's metadata: {result:?}"));
-    assert!(!metadata.worker.is_empty(), "no worker: {metadata:?}");
-    assert!(
-        metadata.queued_timestamp.is_some(),
-        "no queued_timestamp: {metadata:?}"
-    );
+    result.execution_metadata = None;
     result
 }
 

@@ -7,22 +7,17 @@ use super::*;
 type Refused = (&'static str, Vec<(&'static str, &'static str)>, Code);
 
 /// Platforms kbf refuses.
-fn bad_platforms() -> [Refused; 3] {
+fn bad_platforms() -> [Refused; 2] {
     [
         (
             "one requirement twice",
-            vec![("OSFamily", "linux"), ("os", "linux")],
+            vec![("kbf-lease", "action"), ("KBF-LEASE", "action")],
             Code::InvalidArgument,
         ),
         (
             "an unknown lease kind",
             vec![("kbf-lease", "vm")],
             Code::InvalidArgument,
-        ),
-        (
-            "an OS no daemon runs",
-            vec![("OSFamily", "Windows")],
-            Code::FailedPrecondition,
         ),
     ]
 }

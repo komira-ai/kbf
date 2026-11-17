@@ -13,12 +13,11 @@
 //! `{id}` is a storage member's number (`2` for member `m2`) or a node's id. A node is judged
 //! as the member that is its storage half, joined by the address it enrolled with as the
 //! controller joins a host to its member ([`storage_half`]), so asking by either name gives
-//! the same answer. A node that has no storage half (a Mac, a worker-only host, any host of a
-//! server without a state store) is a worker, which drains in its own stop and needs no
-//! permit: it answers safe, with a line that says what was judged. A node that cannot be told
-//! from one that has a member (the enrollment registry does not know it or cannot be read, or
-//! its address is no member's or two members') is `409`, never safe. An id that is neither a
-//! member nor a node is `404`.
+//! the same answer. An enrolled node that has no storage half runs no storage member and needs
+//! no permit: it answers safe, with a line that says what was judged. A node that cannot be told
+//! from one that has a member (the enrollment registry cannot be read, or its address is no
+//! member's or two members') is `409`, never safe. An id that is neither a member nor a node
+//! the enrollment registry knows is `404`, as is every node of a server without a state store.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,19 +32,17 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinError;
 
 use super::{ApiState, encode_segment, error, gate, json, member_failure};
-use crate::farm::Farm;
 use crate::members::{MemberLook, Members, MembersLook, MembershipError};
 use crate::proxy_auth::Caller;
-use crate::storage_gate::{member_facts, storage_gate, storage_half};
+use crate::storage_gate::{Link, advertised, link, member_facts, storage_gate};
 
 /// The instant a look is judged at. The gate reads only how long ago each member was heard,
 /// and a look carries those ages, so any instant later than the oldest age serves; this one
 /// is about thirty-five years after the epoch.
 const LOOK_AT: FarmTime = FarmTime::from_millis(1 << 40);
 
-/// What a worker-only answer says: only the worker is judged.
-const DAEMON: &str = "judged as a worker only: the host runs no storage member, and a \
-                      worker drains in its own stop";
+/// What the answer for a node with no storage member says.
+const DAEMON: &str = "the host runs no storage member: nothing of the storage is judged";
 
 /// The answer of the query.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,12 +95,12 @@ fn member_verdict(id: &str, look: &MembersLook, ttl: Duration) -> Option<Verdict
     Some(verdict(look, own, ttl))
 }
 
-/// What the farm and the enrollment registry say of an id that names no member.
+/// What the enrollment registry says of an id that names no member.
 #[derive(Debug)]
 enum Node {
     /// No node of that name has registered (or the id named a member, and none was asked).
     Unknown,
-    /// A node with no storage half: a worker.
+    /// An enrolled node with no storage half.
     Daemon,
     /// A node whose storage half is this member.
     Member(MemberLook),
@@ -123,36 +120,37 @@ struct Seen {
 /// What the blocking read returned.
 type Looked = Result<Result<Seen, MembershipError>, JoinError>;
 
-/// The node `id` as the farm and the enrollment registry (in `store`, the state store;
-/// `None` on a server without one, which keeps no members) have it, given the members `look`.
-fn node_of(farm: &Farm, store: Option<&dyn Store>, id: &str, look: &MembersLook) -> Node {
-    let worker = WorkerId::new(id);
-    let Some(seen) = farm.update_look().into_iter().find(|n| n.id == worker) else {
+/// The node `id` as the enrollment registry (in `store`, the state store; `None` on a server
+/// without one, which keeps no members) has it, given the members `look`.
+fn node_of(store: Option<&dyn Store>, id: &str, look: &MembersLook) -> Node {
+    let Some(store) = store else {
         return Node::Unknown;
     };
-    // Only a Linux host has a storage half, as the node step reads the farm.
-    let Some(store) = store.filter(|_| seen.os == "linux") else {
-        return Node::Daemon;
+    let adverts = match advertised(store) {
+        Ok(adverts) => adverts,
+        Err(why) => return Node::Unsure(why),
     };
-    match storage_half(store, &worker, look) {
-        Ok(None) => Node::Daemon,
-        Ok(Some(member)) => Node::Member(member),
-        Err(why) => Node::Unsure(why),
+    if !adverts.contains_key(id) {
+        return Node::Unknown;
+    }
+    match link(&WorkerId::new(id), &adverts, look) {
+        Link::NoStorage => Node::Daemon,
+        Link::Member(member) => Node::Member(member.clone()),
+        Link::Unlinked(why) => Node::Unsure(why),
     }
 }
 
 /// The blocking half of the query: the members and, if `id` names none of them, the node of
-/// that name. The store's calls block (its trait says so), and so does the farm's lock.
+/// that name. The store's calls block (its trait says so).
 fn read(
     id: &str,
-    farm: &Farm,
     members: Option<&Members>,
     store: Option<&dyn Store>,
 ) -> Result<Seen, MembershipError> {
     let ttl = members.map_or(Duration::ZERO, |m| m.config().ttl);
     let look = members.map_or_else(|| Ok(MembersLook::default()), Members::look)?;
     let node = if member_verdict(id, &look, ttl).is_none() {
-        node_of(farm, store, id, &look)
+        node_of(store, id, &look)
     } else {
         Node::Unknown
     };
@@ -201,8 +199,8 @@ pub(super) async fn check(
     // A server without a state store keeps no members: every host it knows is a worker.
     let members = api.members.clone();
     let store = api.store.clone();
-    let (farm, name) = (Arc::clone(&api.farm), id.clone());
-    let job = move || read(&name, &farm, members.as_deref(), store.as_deref());
+    let name = id.clone();
+    let job = move || read(&name, members.as_deref(), store.as_deref());
     let looked = tokio::task::spawn_blocking(job).await;
     respond(&id, looked)
 }
@@ -502,6 +500,28 @@ mod tests {
         assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
         let message = said["error"].as_str().unwrap_or_default();
         assert!(message.contains("membership task"));
+    }
+
+    /// Catches: a node answered for by a server that has no state store: with no store and no
+    /// members, the blocking read finds neither a member nor a node, so a node id (and a
+    /// number that no member has) is a 404 naming the id, never a safe answer. The server holds
+    /// no worker of its own to judge in place of the store.
+    #[tokio::test]
+    async fn a_node_of_a_server_with_no_store_is_a_404() {
+        for id in ["linux-1", "7"] {
+            let looked = tokio::task::spawn_blocking({
+                let id = id.to_owned();
+                move || read(&id, None, None)
+            })
+            .await;
+            let (code, said) = body(respond(id, looked)).await;
+            assert_eq!(code, StatusCode::NOT_FOUND, "{id}");
+            let text = said["error"].as_str().unwrap_or_default();
+            assert!(
+                text.contains(&format!("no member or node {id:?}")),
+                "{text}"
+            );
+        }
     }
 
     /// Catches: an id sent unencoded, which a `/` or a space in a node id would split into

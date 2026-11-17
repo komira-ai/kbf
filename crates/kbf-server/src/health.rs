@@ -6,27 +6,20 @@
 //! - `/readyz`: the server is ready to serve. 200 only when every check passes; else
 //!   503 with the failing checks and why. The checks:
 //!   - `stopping`: no stop signal has been received ([`Readiness::stop`]);
-//!   - `leader`: this server holds the scheduler role ([`Readiness::set_leader`]);
+//!   - `leader`: this server holds its roles ([`Readiness::set_leader`]);
 //!   - `store`: the object store answers a read of one fixed key within the probe
 //!     timeout. The probe only reads (`get_range` of one byte), so a poll never writes
 //!     to the bucket; an absent key is an answer, and so passes.
 //!
 //! - `/readyz/reapi`: what the REAPI cluster of a load balancer asks. `/readyz`'s checks, and
-//!   one more, `no_worker`: at least one worker has an open stream to this server. The worker
-//!   and enrollment clusters keep asking `/readyz`, since a frontend with no worker gets its
-//!   first one through the worker listener, which the same balancer routes by that answer.
-//!   An Execute that none of this server's workers can run still runs: it is queued in the
-//!   state store, every frontend's intake takes queued rows it did not queue, and one whose
-//!   worker can run it places it there while this server follows the store for its callers.
-//!   It waits only while no frontend has a worker that can run it. The check keeps such calls
-//!   off a server with no worker at all, so they go straight to one that has a worker instead
-//!   of through the store.
+//!   one more, `no_executor`, on a server that runs no executor: it answers an Execute only
+//!   from the action cache, so the check keeps REAPI calls off it. Whether the job service
+//!   answers is a probe of `/readyz` itself on a frontend that has one.
 //!
 //! Once the server has given its roles away ([`Readiness::set_handed_over`], which a retire
 //! does: `POST /v1/frontend/retire`, `docs/api.md`) the probes are not asked and the check
-//! passes on `stopping` and `leader` alone: its farm is fenced and the others hold the store's
-//! work, so a probe could fail or wait out its timeout while the server is still the one to
-//! answer the calls it kept open.
+//! passes on `stopping` and `leader` alone: a probe could fail or wait out its timeout while
+//! the server is still the one to answer the calls it kept open.
 //!
 //! The routes are served by the same future as the REAPI and worker listeners, which
 //! are bound before it runs and stop when it returns, so an answer from either route
@@ -45,7 +38,7 @@
 //! ([`Checks::begin`]): each probe is asked again on its own interval
 //! (`--readyz-probe-interval-ms`), within its own timeout (`--readyz-store-timeout-ms`), and
 //! `/readyz` reads what the last ask found, so no request waits for a probe. A probe that has
-//! not answered within its timeout counts as failed. The stop signal, the scheduler role and
+//! not answered within its timeout counts as failed. The stop signal, the leader role and
 //! the hand-over are flags read at each request, not probes, so a drain turns `/readyz` to 503
 //! at once. A server that has not called [`Checks::begin`] (`kbf-server` itself) asks its
 //! probes on every request.
@@ -68,7 +61,6 @@ use kbf_types::{Digest, DigestFunction};
 use serde::Serialize;
 
 use crate::api::JSON;
-use crate::farm::Farm;
 use crate::members::Members;
 use crate::{BUILD_COMMIT, SERVER_VERSION};
 
@@ -85,7 +77,7 @@ pub const STORE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What `/readyz` reads besides the store: whether a stop signal has come, and
-/// whether this server holds the scheduler role. Shared by the serving future, which
+/// whether this server holds its roles. Shared by the serving future, which
 /// sets it, and the route and the gRPC health service, which read it. Every change is
 /// announced to [`Readiness::subscribe`]rs, so a health `Watch` answers it at once.
 pub struct Readiness {
@@ -96,8 +88,7 @@ pub struct Readiness {
 }
 
 impl Default for Readiness {
-    /// Not stopping, and the leader: a single server runs every role, and its control
-    /// log commits in this process, so it holds the scheduler role from its start.
+    /// Not stopping, and the leader: a single server runs every role from its start.
     fn default() -> Self {
         Self {
             stopping: AtomicBool::new(false),
@@ -142,14 +133,14 @@ impl Readiness {
         self.stopping.load(Ordering::SeqCst)
     }
 
-    /// Whether this server holds the scheduler role. Nothing in the server clears it
+    /// Whether this server holds its roles. Nothing in the server clears it
     /// yet; it is the hook for a replicated control log, whose followers are not ready.
     pub fn set_leader(&self, leader: bool) {
         self.leader.store(leader, Ordering::SeqCst);
         self.changed.send_replace(());
     }
 
-    /// Whether this server holds the scheduler role.
+    /// Whether this server holds its roles.
     #[must_use]
     pub fn is_leader(&self) -> bool {
         self.leader.load(Ordering::SeqCst)
@@ -166,7 +157,7 @@ impl Readiness {
 /// One failing check of `/readyz`.
 #[derive(Serialize)]
 pub struct Failing {
-    /// `stopping`, `leader`, `no_worker` (`/readyz/reapi` only), or the name of a probe (`store`; a frontend's `storage`,
+    /// `stopping`, `leader`, `no_executor` (`/readyz/reapi` only), or the name of a probe (`store`; a frontend's `storage`,
     /// `state_store` and `map`; `deny_rows` where the worker listener checks the deny rows).
     pub check: &'static str,
     /// Why it fails.
@@ -229,7 +220,7 @@ async fn keep(entry: Arc<Entry>, interval: Duration, timeout: Duration) {
     }
 }
 
-/// The checks of `/readyz`: the stop signal, the scheduler role and the [`Probe`]s, in
+/// The checks of `/readyz`: the stop signal, the leader role and the [`Probe`]s, in
 /// that order. One evaluation for the HTTP route and the `grpc.health.v1` service.
 pub struct Checks {
     readiness: Arc<Readiness>,
@@ -499,17 +490,17 @@ where
     Arc::new(Checks::of_cache(cache, readiness, timeout))
 }
 
-/// The health routes over `checks`: `/healthz`, `/readyz` and `GET /v1/health`, which
-/// composes `checks`, `farm`'s nodes and queue, and the storage health of `members` (none:
-/// this server keeps no storage members) ([`crate::health_summary`]).
-pub fn routes(checks: &Arc<Checks>, farm: &Arc<Farm>, members: Option<&Arc<Members>>) -> Router {
-    let summary =
-        crate::health_summary::route(Arc::clone(checks), Arc::clone(farm), members.cloned());
+/// The health routes over `checks`: `/healthz`, `/readyz`, `/readyz/reapi` (which also fails
+/// while `executes` is false: this server runs no executor) and `GET /v1/health`, which
+/// composes `checks` and the storage health of `members` (none: this server keeps no storage
+/// members) ([`crate::health_summary`]).
+pub fn routes(checks: &Arc<Checks>, executes: bool, members: Option<&Arc<Members>>) -> Router {
+    let summary = crate::health_summary::route(Arc::clone(checks), members.cloned());
     let reapi = Router::new()
         .route(READYZ_REAPI, get(readyz_reapi))
         .with_state(Arc::new(ReapiReady {
             checks: Arc::clone(checks),
-            farm: Arc::clone(farm),
+            executes,
         }));
     router_of(Arc::clone(checks)).merge(summary).merge(reapi)
 }
@@ -520,11 +511,12 @@ pub const READYZ_REAPI: &str = "/readyz/reapi";
 /// What `GET /readyz/reapi` reads.
 struct ReapiReady {
     checks: Arc<Checks>,
-    farm: Arc<Farm>,
+    /// Whether this server runs an executor.
+    executes: bool,
 }
 
 /// The check `/readyz/reapi` adds to `/readyz`'s.
-const NO_WORKER: &str = "no_worker";
+const NO_EXECUTOR: &str = "no_executor";
 
 /// The `/healthz` and `/readyz` routes over `checks`.
 pub fn router_of(checks: Arc<Checks>) -> Router {
@@ -547,15 +539,15 @@ async fn readyz(State(checks): State<Arc<Checks>>) -> Response {
     ready_answer(checks.failing().await)
 }
 
-/// `/readyz`'s answer, and `no_worker` while no worker has a connected stream here. A
-/// worker of any platform counts, whatever its placement: the rule is that this server has
-/// someone to hand an operation to at all, not that it can run every operation.
+/// `/readyz`'s answer, and `no_executor` on a server that runs no executor: it answers no
+/// Execute but from the action cache. Whether the job service answers is a check of
+/// `/readyz` itself, where the server has one.
 async fn readyz_reapi(State(state): State<Arc<ReapiReady>>) -> Response {
     let mut failing = state.checks.failing().await;
-    if !state.farm.nodes().nodes.iter().any(|node| node.connected) {
+    if !state.executes {
         failing.push(Failing {
-            check: NO_WORKER,
-            reason: "no worker is connected to this server".to_owned(),
+            check: NO_EXECUTOR,
+            reason: "this server runs no executor (--executor js-agent)".to_owned(),
         });
     }
     ready_answer(failing)

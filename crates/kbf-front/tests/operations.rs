@@ -1,10 +1,10 @@
-//! `Operations` over gRPC, against a scripted dispatch that stands in for the scheduler:
-//! GetOperation reads the stage of an operation by the name Execute returned, and the other
-//! calls of the service are not served.
+//! `Operations` over gRPC, against a scripted dispatch that stands in for the job service:
+//! GetOperation reads the stage of an operation by the name Execute returned, CancelOperation
+//! reaches the dispatch's cancel, and the other calls of the service are not served.
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use common::Farm;
 use kbf_front::{Dispatch, Finished, Stage, Submission, Ticket};
@@ -24,13 +24,31 @@ use tonic::{Code, Status};
 /// The one operation the dispatch knows, `operations/7`, under the instance `main`.
 struct Known {
     stage: watch::Sender<Stage>,
+    /// Every name `cancel` was asked about, in order.
+    cancelled: Mutex<Vec<String>>,
+    /// What `cancel` answers: whether the operation was still unfinished.
+    unfinished: bool,
 }
 
 impl Known {
     fn new(stage: Stage) -> Arc<Self> {
+        Self::cancelling(stage, true)
+    }
+
+    /// As [`Known::new`], where `cancel` answers `unfinished`.
+    fn cancelling(stage: Stage, unfinished: bool) -> Arc<Self> {
         Arc::new(Self {
             stage: watch::channel(stage).0,
+            cancelled: Mutex::new(Vec::new()),
+            unfinished,
         })
+    }
+
+    fn cancelled(&self) -> Vec<String> {
+        self.cancelled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -51,6 +69,14 @@ impl Dispatch for Known {
             action: action(),
             stage: self.stage.subscribe(),
         })
+    }
+
+    fn cancel(&self, name: &str) -> bool {
+        self.cancelled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(name.to_owned());
+        self.unfinished
     }
 }
 
@@ -110,6 +136,45 @@ async fn get_operation_on_an_unknown_name_is_not_found() {
     assert_eq!(error.code(), Code::NotFound, "{error:?}");
 }
 
+/// Asserts that CancelOperation on a name the dispatch does not know is NOT_FOUND, and asks
+/// the dispatch to cancel nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_operation_on_an_unknown_name_is_not_found() {
+    let known = Known::new(Stage::Queued);
+    let farm = Farm::with_execution(Arc::clone(&known)).await;
+    let mut client = OperationsClient::new(farm.channel());
+
+    let error = client
+        .cancel_operation(CancelOperationRequest {
+            name: "operations/8".to_owned(),
+        })
+        .await
+        .expect_err("unknown");
+
+    assert_eq!(error.code(), Code::NotFound, "{error:?}");
+    assert!(known.cancelled().is_empty());
+}
+
+/// Asserts that CancelOperation on a known name reaches `Dispatch::cancel` with that name and
+/// succeeds, also when the dispatch says the operation had already finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_operation_reaches_the_dispatch_with_the_name() {
+    for unfinished in [true, false] {
+        let known = Known::cancelling(Stage::Executing, unfinished);
+        let farm = Farm::with_execution(Arc::clone(&known)).await;
+        let mut client = OperationsClient::new(farm.channel());
+
+        client
+            .cancel_operation(CancelOperationRequest {
+                name: "operations/7".to_owned(),
+            })
+            .await
+            .expect("cancelled, or already finished");
+
+        assert_eq!(known.cancelled(), ["operations/7"], "{unfinished}");
+    }
+}
+
 /// Asserts that the other calls of the service are not served: each is UNIMPLEMENTED, and
 /// says so naming the call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -121,15 +186,12 @@ async fn the_other_calls_of_the_service_are_not_served() {
     let list = client.list_operations(list).await.map(drop);
     let delete = DeleteOperationRequest::default();
     let delete = client.delete_operation(delete).await.map(drop);
-    let cancel = CancelOperationRequest::default();
-    let cancel = client.cancel_operation(cancel).await.map(drop);
     let wait = WaitOperationRequest::default();
     let wait = client.wait_operation(wait).await.map(drop);
 
     let refused = [
         ("ListOperations", list),
         ("DeleteOperation", delete),
-        ("CancelOperation", cancel),
         ("WaitOperation", wait),
     ];
     for (call, answer) in refused {

@@ -4,6 +4,9 @@
 
 mod support;
 
+#[path = "frontend/idle_executor.rs"]
+mod idle_executor;
+
 use std::future::pending;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -65,10 +68,12 @@ fn args(extra: &[&str]) -> Args {
     Args::parse_from(argv)
 }
 
-/// Serves `policy` with the listeners of `args`; returns the REAPI and worker
-/// addresses.
-fn serve(args: &Args, policy: Policy) -> (std::net::SocketAddr, std::net::SocketAddr) {
-    let listeners = args.listeners().expect("listeners");
+/// Serves `policy` with the listeners of `args`, whose executor is over a fake job service
+/// that runs nothing; returns the REAPI and worker addresses.
+async fn serve(args: &Args, policy: Policy) -> (std::net::SocketAddr, std::net::SocketAddr) {
+    let mut listeners = args.listeners().expect("listeners");
+    let (executor, fake) = idle_executor::idle_executor().await;
+    listeners.executor = Some(executor);
     let Bound {
         reapi,
         worker,
@@ -82,7 +87,10 @@ fn serve(args: &Args, policy: Policy) -> (std::net::SocketAddr, std::net::Socket
         pending(),
     )
     .expect("bind");
-    tokio::spawn(async move { serving.await.expect("serve") });
+    tokio::spawn(async move {
+        let _job_service = fake;
+        serving.await.expect("serve")
+    });
     (reapi, worker)
 }
 
@@ -106,7 +114,7 @@ async fn the_policy_file_runs_on_the_reapi_listener_alone() {
     );
     let args = args(&["--reapi-auth-policy", path.to_str().expect("UTF-8 path")]);
     let policy = args.reapi_auth_policy().expect("a policy");
-    let (reapi, worker) = serve(&args, policy);
+    let (reapi, worker) = serve(&args, policy).await;
 
     let e = capabilities(reapi).await.expect_err("refused");
     assert_eq!(
@@ -139,7 +147,7 @@ async fn health_checks_are_answered_whatever_the_policy() {
         r#"{"authenticationPolicy": {"deny": "no REAPI callers today"}}"#,
     );
     let args = args(&["--reapi-auth-policy", path.to_str().expect("UTF-8 path")]);
-    let (reapi, _) = serve(&args, args.reapi_auth_policy().expect("a policy"));
+    let (reapi, _) = serve(&args, args.reapi_auth_policy().expect("a policy")).await;
 
     let e = capabilities(reapi).await.expect_err("refused");
     assert_eq!(e.code(), Code::Unauthenticated);
@@ -176,7 +184,7 @@ async fn health_checks_are_answered_whatever_the_policy() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_the_flag_every_call_is_accepted() {
     let args = args(&[]);
-    let (reapi, _) = serve(&args, args.reapi_auth_policy().expect("allow all"));
+    let (reapi, _) = serve(&args, args.reapi_auth_policy().expect("allow all")).await;
     capabilities(reapi).await.expect("GetCapabilities");
 }
 
@@ -245,7 +253,7 @@ async fn wait_execution_is_authorized_against_the_operations_instance() {
         ..Policy::allow_all()
     };
     let args = args(&[]);
-    let (reapi, worker) = serve(&args, policy);
+    let (reapi, worker) = serve(&args, policy).await;
     let client = Client::connect(reapi, worker).await;
     let job = Job::new("wait for me", &[]);
     client.upload(&job.blobs()).await;

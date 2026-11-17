@@ -26,10 +26,6 @@ The switch sets exactly these keys and leaves every other line of the file as it
 | `executor-job-url` | the job service, `https://host:port` (or `http://` to loopback) |
 | `executor-job-token-file` | the path of kbf's client token on the frontend's host |
 | `executor-job-ca-file` | the CA of the service's certificate, for an `https` URL; removed for an `http` one |
-| `executor-hosts` | how many virtual workers the frontend registers, `js:<frontend id>-<n>` |
-| `executor-host-cpus` | the cores of each virtual worker |
-| `executor-host-memory-gib` | the memory of each virtual worker, in GiB |
-| `executor-host-slots` | the actions each virtual worker runs at once (default 8) |
 
 The rest of what `js-agent` needs must be in the file already, and the switch does not write
 it: `executor-frontend-id`, `executor-base-image`, `executor-kbf-image`, `executor-base-tree`
@@ -290,15 +286,12 @@ failure, and never holds the token itself.
 
 ```text
 kbf-deploy job-service plan --config FILE --url URL --token-file FILE [--ca-file FILE]
-                            --hosts N --host-cpus N --host-memory-gib N [--host-slots N]
 ```
 
 | Flag | Meaning |
 |---|---|
 | `--config <FILE>` | the frontend's `kbf.toml` |
 | `--url`, `--token-file`, `--ca-file` | the job service, as for the check; the token file is named by its path, and `plan` never opens it |
-| `--hosts`, `--host-cpus`, `--host-memory-gib` | the virtual workers' number and shape (each at least 1) |
-| `--host-slots` | the actions each virtual worker runs at once, 1 to 256, default 8 |
 
 It reads the file and prints, for each key the switch sets, what the file holds now and what the
 switch sets; the executor flags of the job-service mode; and what the switch keeps from the file.
@@ -312,19 +305,11 @@ config: [executor] in /etc/kbf/kbf.toml
   executor-job-url: absent -> "https://192.0.2.30:8443"
   executor-job-token-file: absent -> "/etc/kbf/job-service.token"
   executor-job-ca-file: absent -> "/etc/kbf/job-service-ca.pem"
-  executor-hosts: absent -> 4
-  executor-host-cpus: absent -> 16
-  executor-host-memory-gib: absent -> 64
-  executor-host-slots: absent -> 8
 the executor flags of the job-service mode:
   --executor=js-agent
   --executor-job-url=https://192.0.2.30:8443
   --executor-job-token-file=/etc/kbf/job-service.token
   --executor-job-ca-file=/etc/kbf/job-service-ca.pem
-  --executor-hosts=4
-  --executor-host-cpus=16
-  --executor-host-memory-gib=64
-  --executor-host-slots=8
 kept from the file (the executor needs them):
   executor-frontend-id = "fe-a"
   executor-base-image = "registry.example/kbf-base@sha256:bbbb...bbbb"
@@ -364,7 +349,7 @@ The restart flags:
 | `--kbf <FILE>`, `--ssh <FILE>` | the `kbf` and `ssh` binaries; default `/usr/bin/kbf` and `/usr/bin/ssh` |
 | `--poll-secs <SECS>` | the time between two asks of a wait; default 5 |
 | `--drain-deadline-secs <SECS>` | how long to wait for the drained frontend to exit. Not given (the default): however long its open executions run, and none is cut |
-| `--ready-deadline-secs <SECS>` | how long to wait for the restarted frontend to be ready, and for its first worker; default 300 |
+| `--ready-deadline-secs <SECS>` | how long to wait for the restarted frontend to be ready; default 300 |
 | `--canary-deadline-secs <SECS>` | (`apply` only) how long the canary job may take to end; default 600 |
 
 Run it on the frontend's host, as root or as the user that can read the token files and the
@@ -393,9 +378,7 @@ and stops at the first that fails:
    operator API refuses the connection before the drain is not running: it is not drained
    (`the frontend is not running: nothing to drain`), and the restart starts it. Then a wait
    until `GET /readyz` answers 200.
-5. **The first worker**: a wait until `GET /v1/nodes/js:<frontend id>-0` answers 200, which
-   it does once the executor of the job service runs and has registered its virtual workers.
-6. **The canary** (below).
+5. **The canary** (below).
 
 ```text
 kbf-deploy job-service apply (apply)
@@ -412,7 +395,6 @@ pass: the job service answered ListJobs (no job of this client yet)
 + wait until http://127.0.0.1:8982/healthz refuses the connection (the frontend has exited), however long
 + /usr/bin/ssh -F /dev/null -i /var/lib/kbf-updater/id_ed25519 ... -T -- kbf-updater@192.0.2.20 "restart frontend=-" (env PATH, HOME, LANG)
 + wait for http://127.0.0.1:8982/readyz to answer 200 (the frontend is ready), at most 60 asks
-+ wait for http://127.0.0.1:8982/v1/nodes/js:fe-a-0 to answer 200 (the executor of the job service registered its first worker), at most 60 asks
 + canary: submit job kbf-canary-1794048581 (registry.example/kbf@sha256:aaaa...aaaa --version, no network, label kbf-canary=fe-a) and ask after it at most 120 times
 pass: the canary job kbf-canary-1794048581 succeeded on host farm-7
 done: the frontend runs executor = "js-agent"
@@ -447,9 +429,8 @@ after it once per `--poll-secs` until it ends:
 - **Its shape**: 1 core, 1 GiB of memory and no disk (the executor's jobs book none), no network
   (`NETWORK_LEVEL_NONE`), a wall limit of 300 seconds. Its id is `kbf-canary-<seconds since
   the epoch>`, so every run makes a new job.
-- **Its label**: `kbf-canary=<frontend id>`, and no `kbf-frontend` label. The executor reads
-  `kbf-frontend` to find the jobs of other frontends and stops when it finds one, so a canary
-  carrying it would stop the frontend it checks.
+- **Its label**: `kbf-canary=<frontend id>`, and no `kbf-frontend` label. The `kbf-frontend` label names the jobs of the frontend's operations, and the canary is not
+  one of them.
 
 A job that `SUCCEEDED` passes (`pass: the canary job <id> succeeded on host <host>`). One that
 ended any other way (`failed`, `failed to start`, with the agent's words when it gave some,

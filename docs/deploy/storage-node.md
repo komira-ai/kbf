@@ -331,14 +331,13 @@ file can be longer.
   stops the server and never costs the stderr copy. The failure is reported once on
   stderr; the file then drops events until 64 KiB more of them have
   passed, and tries again.
-- **What is in it at INFO and WARN, one line each.** An operation placed on a worker
-  (`lease granted`, with operation, lease and node); how a lease ended (`lease finished
-  ok`, or `lease finished failed` with the failure kind); a requeue and why (`lease given
-  up; requeued`, with the reason, which for a memory kill names the old and the new
-  booking, and `farm_runs` of `farm_budget` farm-fault reruns spent); an operation that
-  fails for good (`operation finished failed`, with the failure kind and the budget and
-  ladder its runs used); an operation no worker can run; and a write-tier flush that
-  failed, or found a corrupt or conflicting object. Blob requests are not logged.
+- **What is in it at INFO and WARN, one line each.** The executor's: an operation whose run
+  ended for a reason of the farm's and runs again (`the run ended for a reason of the farm's: the
+  operation runs again`), one that finished failed (`the operation finished failed`, with the
+  status code and message), one taken up from a gone frontend (`taken up from the state store`),
+  and a job whose host missed its grace, whose job the service no longer knows, or whose read
+  failed; and a write-tier flush that failed, or found a corrupt or conflicting object. Blob
+  requests are not logged.
 
 To read it from the host:
 
@@ -354,13 +353,13 @@ or holds no `kbf-server.log`. It cannot find a server's flags, so it is told the
 `pilot server-install` does not yet pass `--log-dir`, so a pilot server logs to journald
 only unless its unit is given the flag.
 
-## Planned: the scheduler's state in the log
+## Planned: the runtime directory
 
 `kbf-server` keeps its metadata in the Raft log on local disk (`--meta-dir`, or
 `<hot store>/meta`; [deployment-topology.md](../design/deployment-topology.md#built-and-planned)).
-Until the scheduler's state is in the log too, a restart keeps the epoch but not
-the server's leases, so the old runs go on as orphans whose results are refused. The
-unit gains this flag once the scheduler's state is built:
+kbf holds no scheduler state: a frontend's open operations are rows of its state store
+([direct-js.md](../design/direct-js.md) section 3), not records of this log. The
+unit gains this flag when it is built:
 
 ```text planned-flags kbf-server
 --runtime-dir=/run/kbf

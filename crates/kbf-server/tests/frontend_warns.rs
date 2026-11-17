@@ -68,7 +68,7 @@ fn flags(more: &[&str]) -> frontend::FrontendFlags {
 }
 
 /// Catches a frontend with a state store and no TLS flags that goes on storing to its one
-/// `--storage` node in silence, when the members its daemons place blobs on are others
+/// `--storage` node in silence, when the members its blobs are placed on are others
 /// (the failure is an OK result whose outputs are not stored): the start logs a warning
 /// saying so; without a state store there are no members and it does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,16 +1,16 @@
-//! What a failed run's tails cost the farm (`docs/design/ui-data.md` 5.3 and Q21, phase U3):
-//! nothing a `Result`, the recorder or another run waits for. Over the in-process farm with a
-//! fake daemon, and a blob source whose reads can be made never to answer. Each test names
-//! the defect it catches.
+//! What a failed run's tails cost the server (`docs/design/ui-data.md` 5.3 and Q21, phase U3):
+//! nothing the recorder or another run waits for. Over a server whose records are fed the events
+//! the executor tells the recorder, and a blob source whose reads can be made never to answer.
+//! Each test names the defect it catches.
 
-mod support;
+mod pages;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use kbf_front::REQUEST_METADATA_HEADER;
 use kbf_history::records::TailOmitted;
 use kbf_history::{HistoryIndex, HistoryRoot, IndexRoot, Inline, Limits, Reader, RunId, RunView};
 use kbf_invocation::{InvocationId, RecordKey};
@@ -18,20 +18,15 @@ use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
-use kbf_proto::google::longrunning::Operation;
-use kbf_proto::reapi::execution_client::ExecutionClient;
-use kbf_proto::reapi::{ActionResult, ExecuteRequest, RequestMetadata, ToolDetails};
+use kbf_proto::reapi::ActionResult;
+use kbf_server::StateStore;
 use kbf_server::history::{BlobReadError, BlobReads, Options, TailOptions, over};
 use kbf_server::http_blobs::ReadBudget;
-use kbf_server::{EpochPolicy, StateStore};
 use kbf_state::ManualClock;
 use kbf_state::Store;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_types::Digest;
-use prost::Message as _;
-use support::{Blob, Cell, FakeDaemon, Job, done, ran};
-use tonic::Streaming;
-use tonic::metadata::MetadataValue;
+use pages::Server;
 
 const BUILD: &str = "0b8c2f0e-6d1a-4c55-9a7e-2f43d1c0a9b4";
 
@@ -106,74 +101,56 @@ impl BlobReads for Slow {
     }
 }
 
-fn tagged<T>(id: &str, message: T) -> tonic::Request<T> {
-    let metadata = RequestMetadata {
-        tool_details: Some(ToolDetails {
-            tool_name: "buck2".to_owned(),
-            tool_version: "0.1.0".to_owned(),
-        }),
-        tool_invocation_id: id.to_owned(),
-        ..Default::default()
-    };
-    let mut request = tonic::Request::new(message);
-    request.metadata_mut().insert_bin(
-        REQUEST_METADATA_HEADER,
-        MetadataValue::from_bytes(&metadata.encode_to_vec()),
-    );
-    request
+/// A server over `state`, whose records the tests feed.
+fn server_over(state: StateStore) -> Server {
+    let policy = kbf_auth::Policy::from_json(pages::OPEN).expect("a policy");
+    Server::start_over(policy, kbf_front::DEFAULT_INVOCATION_MEMORY, Some(state))
 }
 
-async fn execute(cell: &Cell, id: &str, job: &Job) -> Streaming<Operation> {
-    let request = ExecuteRequest {
-        instance_name: "main".to_owned(),
-        action_digest: Some(job.action.proto.clone()),
-        ..Default::default()
-    };
-    ExecutionClient::new(cell.channel())
-        .execute(tagged(id, request))
-        .await
-        .expect("Execute")
-        .into_inner()
-}
-
-/// Runs a new job `text` as invocation `id`, answered by `daemon` with a result that exits
-/// `exit_code` and names `stdout` for its log; the job and its run id.
-async fn run(
-    cell: &Cell,
-    daemon: &mut FakeDaemon,
-    text: &str,
-    stdout: &Blob,
-    exit_code: i32,
-) -> (Job, [u8; 12]) {
-    let job = Job::new(text, &[]);
-    cell.upload(&job.blobs()).await;
-    cell.upload(&[stdout]).await;
-    let mut ops = execute(cell, BUILD, &job).await;
-    let start = daemon.start().await;
+/// Runs a new job `text` as invocation `BUILD`, whose result exits `exit_code` and names
+/// `stdout` for its log, as the executor tells the recorder of it; the action and its run id.
+async fn run(server: &Server, text: &str, stdout: &[u8], exit_code: i32) -> (Digest, [u8; 12]) {
+    static NEXT_OP: AtomicU64 = AtomicU64::new(1);
+    let op = NEXT_OP.fetch_add(1, Ordering::Relaxed);
+    let action = pages::digest(5_000 + op);
+    let log = server.store(stdout).await;
     let result = ActionResult {
         exit_code,
-        stdout_digest: Some(stdout.proto.clone()),
+        stdout_digest: Some(kbf_front::digest_to_proto(&log)),
         ..Default::default()
     };
-    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    done(&mut ops).await;
+    let at = |ms: u64| pages::later(ms * 1_000);
+    server
+        .feed([
+            pages::queued(BUILD, "main", at(1), action, op),
+            pages::granted(op, 0, &format!("job-{op}-0-{text}"), at(2)),
+            pages::started(op, 0, at(3)),
+            pages::finished(
+                op,
+                0,
+                kbf_invocation::Outcome::Ok { exit_code },
+                Some(kbf_front::listing(None, &result)),
+                at(4),
+            ),
+        ])
+        .await;
     // A recorder stuck behind the tap would never catch up.
-    tokio::time::timeout(support::PROMPT, cell.recorder.caught_up())
+    tokio::time::timeout(Duration::from_secs(10), server.recorder.caught_up())
         .await
         .expect("the recorder keeps up");
-    let record = cell
+    let record = server
         .recorder
         .get(&RecordKey::owner(InvocationId::new(BUILD)))
         .expect("a record");
     let row = record
         .rows()
         .iter()
-        .find(|r| r.action == job.action.digest)
+        .find(|r| r.action == action)
         .expect("a row");
     let id = row.attempts[0]
         .run_id
         .expect("an id minted for the attempt");
-    (job, id)
+    (action, id)
 }
 
 /// The run `id` as history holds it, once the writer has put its chunk there.
@@ -230,25 +207,22 @@ async fn a_stalled_blob_read_never_delays_a_result_and_the_run_arrives_with_busy
     .with_blobs(Arc::new(StallsOnHundred), ReadBudget::new(100));
     let index = HistoryIndex::new(Arc::clone(&store), IndexRoot::default(), Arc::new(Inline));
     let reader = Reader::new(objects, root(), index);
-    let cell = Cell::start_with_state(StateStore {
+    let server = server_over(StateStore {
         store,
-        epoch: EpochPolicy::Keep,
         members: Default::default(),
         history: Some(history),
-    })
-    .await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    });
     // The first run's log is 100 bytes: its read never ends, and holds all 100 of the budget.
-    let (_, one) = run(&cell, &mut daemon, "stalls", &Blob::new(vec![b'x'; 100]), 2).await;
+    let (_, one) = run(&server, "stalls", &[b'x'; 100], 2).await;
     // The second's is 10 bytes, and the budget is not free.
-    let (_, two) = run(&cell, &mut daemon, "waits", &Blob::new(vec![b'y'; 10]), 2).await;
+    let (_, two) = run(&server, "waits", &[b'y'; 10], 2).await;
     let view = resolved(&reader, two).await;
     let failed = view.failed.expect("a failed-run section");
     let tail = failed.stdout.expect("a stdout tail record");
     assert_eq!(tail.omitted(), TailOmitted::Busy);
     assert_eq!((tail.bytes.len(), tail.total_bytes), (0, 10));
     // The recorder is not stuck: a run after both, that passes, is recorded and arrives.
-    let (_, three) = run(&cell, &mut daemon, "after", &Blob::new(vec![b'z'; 5]), 0).await;
+    let (_, three) = run(&server, "after", &[b'z'; 5], 0).await;
     assert!(resolved(&reader, three).await.failed.is_none());
     let first = reader
         .run(RunId::from_bytes(one), &|_| true)
@@ -298,23 +272,13 @@ async fn a_stop_waits_for_the_failed_runs_in_the_pool() {
     );
     let index = HistoryIndex::new(Arc::clone(&store), IndexRoot::default(), Arc::new(Inline));
     let reader = Reader::new(objects, root(), index);
-    let cell = Cell::start_with_state(StateStore {
+    let server = server_over(StateStore {
         store,
-        epoch: EpochPolicy::Keep,
         members: Default::default(),
         history: Some(history),
-    })
-    .await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    let (_, id) = run(
-        &cell,
-        &mut daemon,
-        "slow",
-        &Blob::new(b"a slow log".to_vec()),
-        2,
-    )
-    .await;
-    let _restarted = cell.cold_restart().await;
+    });
+    let (_, id) = run(&server, "slow", b"a slow log", 2).await;
+    server.stop().await;
     let view = resolved(&reader, id).await;
     let tail = view
         .failed

@@ -4,8 +4,7 @@
 //! The settings are keys of the `[executor]` table of the frontend's `kbf.toml`, one key per
 //! flag of the same name. [`Settings`] is what the switch sets: `executor = "js-agent"`, the job
 //! service (`executor-job-url`, `executor-job-token-file`, and `executor-job-ca-file` for an
-//! `https` URL, removed for an `http` one) and the shape of the virtual workers
-//! (`executor-hosts`, `executor-host-cpus`, `executor-host-memory-gib`, `executor-host-slots`).
+//! `https` URL, removed for an `http` one).
 //! Every other key of the file is kept as it is, and the executor's other needs
 //! (`executor-frontend-id`, the two images, the secret delivery) must already be there:
 //! [`Readiness`] names the ones that are not.
@@ -38,15 +37,11 @@ pub(crate) const NO_EXECUTOR: &str = "no executor";
 pub(crate) const JOB_SERVICE_EXECUTOR: &str = "js-agent";
 
 /// The keys the switch sets, in the order they are printed and written.
-pub(crate) const KEYS: [&str; 8] = [
+pub(crate) const KEYS: [&str; 4] = [
     "executor",
     "executor-job-url",
     "executor-job-token-file",
     "executor-job-ca-file",
-    "executor-hosts",
-    "executor-host-cpus",
-    "executor-host-memory-gib",
-    "executor-host-slots",
 ];
 
 /// The keys of `--executor js-agent` the switch does not set and the file must already hold.
@@ -57,7 +52,7 @@ const KEPT: [&str; 4] = [
     "executor-base-tree",
 ];
 
-/// The job service and the virtual workers: the flags `plan` and `apply` share.
+/// The job service: the flags `plan` and `apply` share.
 #[derive(Args, Clone, Debug)]
 pub struct Target {
     /// The frontend's `kbf.toml`, whose `[executor]` table the switch changes.
@@ -75,19 +70,6 @@ pub struct Target {
     /// `https` URL, refused for `http`.
     #[arg(long, value_name = "FILE")]
     pub(crate) ca_file: Option<PathBuf>,
-    /// How many virtual workers the frontend registers (`executor-hosts`).
-    #[arg(long, value_name = "WORKERS", value_parser = clap::value_parser!(u64).range(1..))]
-    pub(crate) hosts: u64,
-    /// The cores of each virtual worker (`executor-host-cpus`).
-    #[arg(long, value_name = "CORES", value_parser = clap::value_parser!(u64).range(1..))]
-    pub(crate) host_cpus: u64,
-    /// The memory of each virtual worker, in GiB (`executor-host-memory-gib`).
-    #[arg(long, value_name = "GIB", value_parser = clap::value_parser!(u64).range(1..))]
-    pub(crate) host_memory_gib: u64,
-    /// The actions each virtual worker runs at once (`executor-host-slots`).
-    #[arg(long, value_name = "SLOTS", default_value_t = 8,
-          value_parser = clap::value_parser!(u64).range(1..=256))]
-    pub(crate) host_slots: u64,
 }
 
 /// Why a verb of the cutover stopped.
@@ -204,13 +186,6 @@ fn absolute(flag: &str, path: &Path) -> Result<String, CutoverError> {
     plain(flag, text)
 }
 
-/// A whole number of a flag as a TOML integer.
-fn number(flag: &str, n: u64) -> Result<Value, CutoverError> {
-    i64::try_from(n)
-        .map(Value::Number)
-        .map_err(|_| CutoverError::Refused(format!("{flag}: {n} is too large")))
-}
-
 impl Settings {
     /// The settings of `t`. The URL is checked as the executor's client checks it (`https`,
     /// or `http` to loopback); the CA file is needed for `https` and refused for `http`.
@@ -241,13 +216,6 @@ impl Settings {
                 Value::Text(absolute("--token-file", &t.token_file)?),
             ),
             ("executor-job-ca-file", ca),
-            ("executor-hosts", number("--hosts", t.hosts)?),
-            ("executor-host-cpus", number("--host-cpus", t.host_cpus)?),
-            (
-                "executor-host-memory-gib",
-                number("--host-memory-gib", t.host_memory_gib)?,
-            ),
-            ("executor-host-slots", number("--host-slots", t.host_slots)?),
         ]))
     }
 

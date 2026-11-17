@@ -248,44 +248,27 @@ async fn a_frontend_with_no_worker_listener_still_serves_its_reapi_listener() {
     serving.abort();
 }
 
-/// Asserts that a frontend writes `kbf_execute_failed_actions_total` on `GET /metrics` with a
-/// series of each of the four classes at 0 before any Execute, the page the beta gate reads.
+/// Asserts that a frontend with no executor writes the front's own metrics on `GET /metrics`
+/// (the open-executions gauge the drain waits on is one) and none of the series of the removed
+/// farm scheduler: no `kbf_sched_*`, no `kbf_scheduler_core`, no
+/// `kbf_execute_failed_actions_total`, and no `kbf_executor_*` series without an executor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_exports_its_failed_actions_by_class() {
+async fn a_frontend_exports_the_fronts_metrics_and_none_of_the_removed_scheduler() {
     let flags = flags_of(&[]);
     let handle = started(&flags, Some(index())).expect("starts");
     let api = handle.api.expect("the operator API");
     let served = tokio::spawn(handle.serve());
     let text = scrape(api).await;
-    assert!(
-        text.contains("# TYPE kbf_execute_failed_actions_total counter\n"),
-        "{text}"
-    );
-    for class in ["farm", "request", "action", "ambiguous"] {
-        let sample = format!("kbf_execute_failed_actions_total{{class=\"{class}\"}} 0\n");
-        assert!(text.contains(&sample), "{sample}{text}");
+    assert!(text.contains("kbf_front_open_executions"), "{text}");
+    for gone in [
+        "kbf_sched",
+        "kbf_scheduler_core",
+        "kbf_execute_failed_actions_total",
+        "kbf_executor_",
+    ] {
+        assert!(!text.contains(gone), "{gone} in {text}");
     }
     served.abort();
-}
-
-/// Asserts that a frontend writes `kbf_scheduler_core` on `GET /metrics`: the one series,
-/// `legacy` at 1, whether `--scheduler-core legacy` is given or left out, and no series for
-/// the js core.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_exports_the_scheduler_core_it_runs() {
-    for given in [None, Some("--scheduler-core=legacy")] {
-        let more: Vec<String> = given.into_iter().map(str::to_owned).collect();
-        let flags = flags_of(&more);
-        let handle = started(&flags, Some(index())).expect("starts");
-        let api = handle.api.expect("the operator API");
-        let served = tokio::spawn(handle.serve());
-        let text = scrape(api).await;
-        assert!(text.contains("# TYPE kbf_scheduler_core gauge\n"), "{text}");
-        let on = "kbf_scheduler_core{core=\"legacy\"} 1\n";
-        assert!(text.contains(on), "{given:?}: {on}{text}");
-        assert!(!text.contains("core=\"js\""), "{given:?}: {text}");
-        served.abort();
-    }
 }
 
 /// Asserts that a frontend whose pack store cannot be written to does not serve: the start check

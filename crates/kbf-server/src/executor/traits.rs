@@ -3,15 +3,15 @@
 //! Each trait has a real implementation, [`Front`](crate::executor::Front), which is built from
 //! what the frontend owns: the packs, a CAS backend over the same packs, the key mint and the
 //! preparation of a run. It maps this module's types to the frontend's one for one: the build id
-//! of a farm lease ([`build_id`](crate::executor::build_id)) for the lease, a key the mint
+//! of a run ([`build_id`](crate::executor::build_id)) for the run, a key the mint
 //! issued for [`PackKey`], [`UntrustedLimits`] filled out with the frontend's own bounds for the
 //! fields it does not have, and the frontend's reasons for [`RejectReason`]. The tests have fakes.
 
 use std::fmt;
 use std::time::Duration;
 
+use crate::executor::task::RunId;
 use kbf_proto::reapi::{ActionResult, Digest};
-use kbf_types::LeaseId;
 
 use crate::executor::config::InputTree;
 use crate::executor::mac::System;
@@ -33,7 +33,7 @@ pub struct UntrustedLimits {
     pub object_bytes_per_entry: u64,
 }
 
-/// Why a pack was refused. Every reason is the farm's to run again with a new key.
+/// Why a pack was refused. Every reason ends the run so that the operation runs again with a new key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectReason {
     /// No object under the key.
@@ -99,19 +99,19 @@ pub enum MintError {
     /// not one, a configuration that does not sign): the caller's to fix, and settled as such.
     #[error("{0}")]
     Refused(String),
-    /// The store could not answer: the farm runs the action again.
+    /// The store could not answer: the operation runs again as its next attempt.
     #[error("{0}")]
     Unavailable(String),
 }
 
 /// Issues, reads, verifies and commits the pack a task wrote. Called after a run ended with
-/// the task tool's exit 0, and never with a lock of the farm held.
+/// the task tool's exit 0, and never with a lock held.
 #[tonic::async_trait]
 pub trait Ingest: Send + Sync {
-    /// The key `lease` may write the pack of `action` under, good for a run of `wall`. Issued
+    /// The key `run` may write the pack of `action` under, good for a run of `wall`. Issued
     /// by the same secret that [`ingest`](Self::ingest) verifies it with: a key the ingest did
-    /// not issue for this lease and this action is refused there. Called once for a farm
-    /// lease, before the url and the grant of the same run are asked for. A run that commits
+    /// not issue for this run and this action is refused there. Called once for a run,
+    /// before the url and the grant of the same run are asked for. A run that commits
     /// into a put directory has its input tree written here too, as `tree` says, for
     /// [`Inputs::tree`]; a presigned run has none, and `tree` is not read.
     ///
@@ -119,16 +119,16 @@ pub trait Ingest: Send + Sync {
     /// [`MintError`].
     async fn mint(
         &self,
-        lease: LeaseId,
+        run: RunId,
         action: &Digest,
         wall: Duration,
         tree: InputTree,
     ) -> Result<PackKey, MintError>;
 
-    /// What `key` holds, for `action`, run under `lease`. Never trusts the pack.
+    /// What `key` holds, for `action`, run under `run`. Never trusts the pack.
     async fn ingest(
         &self,
-        lease: LeaseId,
+        run: RunId,
         key: &PackKey,
         action: &Digest,
         limits: &UntrustedLimits,
@@ -203,27 +203,27 @@ pub trait Inputs: Send + Sync {
     /// [`InputsError`].
     async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError>;
 
-    /// A grant that reads the closure of `action` for `lease` for `expires`.
+    /// A grant that reads the closure of `action` for `run` for `expires`.
     ///
     /// # Errors
     /// [`InputsError`].
     async fn read_grant(
         &self,
-        lease: LeaseId,
+        run: RunId,
         action: &Digest,
         expires: Duration,
     ) -> Result<ReadGrant, InputsError>;
 
-    /// The action tree [`Ingest::mint`] wrote for the run of `lease` that commits into a put
+    /// The action tree [`Ingest::mint`] wrote for the run of `run` that commits into a put
     /// directory, as it was asked to write it: with [`InputTree::Manifests`], its root
     /// manifest's digest, 64 lowercase hex digits; with [`InputTree::Provider`], the key of its
     /// tree list. Handed out once.
     ///
     /// # Errors
     /// [`InputsError`]; by default [`InputsError::Unavailable`], for inputs that write no tree.
-    async fn tree(&self, lease: LeaseId) -> Result<String, InputsError> {
+    async fn tree(&self, run: RunId) -> Result<String, InputsError> {
         Err(InputsError::Unavailable(format!(
-            "no input tree was written for {lease}"
+            "no input tree was written for {run}"
         )))
     }
 }

@@ -5,215 +5,91 @@ A build tool describes where an action may run with REAPI platform properties
 or from the `Command`'s when the `Action` carries none. A property may appear once;
 a repeated property is refused with `INVALID_ARGUMENT`.
 
-These properties change how kbf schedules an action today:
+kbf no longer schedules ([direct-js.md](design/direct-js.md)): every Execute that misses the
+action cache is one job of the job service, which decides where and when it runs. These properties
+are the ones kbf reads when it makes that job:
 
 | Property | Values | Default | Effect |
 |---|---|---|---|
-| `kbf-lease` | `action`, `whole_machine` | `action` | The kind of lease the action runs under (see [`kbf-lease`](#kbf-lease)). |
-| `gpu` | a whole number | `0` | Whole GPUs the action needs. |
-| `kbf-book-cpus` | a whole number, at least 1, plain digits | `1` | Whole cores the lease books. |
-| `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `4` (the first rung of `--memory-ladder-gib`) | GiB of memory the lease asks for: the limit it runs under, checked against the node's memory but not reserved (see [below](#kbf-book-cpus-and-kbf-book-mem-gib)). |
+| `kbf-lease` | `action`, `whole_machine` | `action` | `whole_machine` makes the job ask for a whole host, with nothing beside it (see [`kbf-lease`](#kbf-lease)). |
+| `OSFamily`, `os` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | `linux` | A macOS value makes the job a Mac job (see [macOS](#macos)). |
+| `os_version` | a version such as `26` or `26.1` | any | The least macOS a Mac action takes; read only for a Mac action. |
+| `container-image` | the executor's base image, by digest | the base image | The base environment the Command sees. |
 | `kbf-network` | `allow` | absent: no network | Lets the action's Command use the network (see [`kbf-network`](#kbf-network)). |
-| `OSFamily` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | any | The operating system of the worker. |
-| `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; `arm-a64`, `arm64`, `aarch64`; an ISA level such as `x86-64-v3` (any case) | any | The CPU architecture, and level, of the worker. |
 
-Any other value of `kbf-lease`, `gpu`, `kbf-book-cpus` or `kbf-book-mem-gib` is refused
-with `INVALID_ARGUMENT`. kbf's own
-capability keys (`os`, `arch`, `isa_level`, `cpu.feature`, ...; see
-[capabilities.md](design/capabilities.md#matching)) are matched too. Other properties
-(`container-image`, `Pool`, ...) are accepted and not acted on by the scheduler.
+Any other value of `kbf-lease` is refused with `INVALID_ARGUMENT`. Every other property
+(`gpu`, `ISA`, `Arch`, `Pool`, ...) is accepted and does nothing: kbf does not match an action
+to a worker, books no cores, GPUs or memory for it, and reads neither `kbf-book-cpus` nor
+`kbf-book-mem-gib` (the job asks for no CPU and no memory; the job service sizes it from the
+history of the action's build target, which kbf gives it as the job's `size-class` label). Like
+every platform property they are part of the action digest, so changing one reruns the action
+once.
 
 ### Property names are read in any case
 
 kbf reads every property name it knows without regard to ASCII case, so a property
 meant for kbf is never ignored because of how it is spelled: `osfamily=darwin`,
-`OSFAMILY=Darwin` and `OSFamily=darwin` all ask for a Mac. This holds for the REAPI
-names (`OSFamily`, `ISA`, `Arch`) and for every kbf key: the capability keys above
-(`OS` is `os`, `ISA_Level` is `isa_level`), `gpu` (`GPU=1` books a GPU), and the
-reserved `kbf-lease`, `kbf-cpu`, `kbf-mac-admin`, `kbf-book-cpus` and
-`kbf-book-mem-gib`. A `label.<k>` is not one of them in any case: node labels were
-removed, so it is a name kbf does not read and is ignored like `Pool`.
-`arch` spelled exactly so is kbf's own `arch` key (values `x86_64`, `arm64`); in any
-other spelling (`Arch`, `ARCH`) it is REAPI's `Arch` and takes the values in the
-table. Values are compared as described for each key: `OSFamily`, `ISA` and `Arch`
-values in any case, kbf's own keys' values exactly.
+`OSFAMILY=Darwin` and `OSFamily=darwin` all ask for a Mac. This holds for `OSFamily` and
+for the kbf keys (`OS` is `os`, and the reserved `kbf-lease`). Values are compared as described
+for each key: `OSFamily` values in any case, kbf's own keys' values exactly.
 
 One property sent under two spellings of its name (`gpu` and `GPU`, `OSFamily` and
 `osfamily`) is refused with `INVALID_ARGUMENT`, as is one requirement named twice
 through two names (`OSFamily` and `os`, `ISA` and `arch`). A name kbf does not know,
 in any case, is not acted on.
 
-`container-image` is the one exception: it is read by the executor (`--executor js-agent`),
-not by the scheduler, and only in exactly that spelling. It names the base environment the
-Command sees; an action that names an image other than the executor's base image is refused as
-invalid, and one that names none gets the base ([kbf-modes.md](deploy/kbf-modes.md)).
-`Container-Image` is a name kbf does not know, so the action is scheduled as if it named no
-image.
+`container-image` is read by the executor (`--executor js-agent`), and only in exactly that
+spelling. It names the base environment the Command sees; an action that names an image other
+than the executor's base image is refused as invalid, and one that names none gets the base
+([kbf-modes.md](deploy/kbf-modes.md)). `Container-Image` is a name kbf does not know, so the
+action runs as if it named no image.
 
 ## Where an action runs
 
-An action runs only on a worker whose node report satisfies its platform: a Linux
-action is never handed to a Mac, nor an arm64 action to an x86-64 machine. Buck2 and
-Bazel name the platform with `OSFamily` (and `ISA` where the architecture matters):
+kbf does not place an action. The job it makes asks for a Linux host of the executor's
+architecture (`--executor-arch`) in a container, or, for an action that names a Mac, a Mac of the
+job service's. Buck2 and Bazel name the platform with `OSFamily`:
 
 ```starlark
 # Buck2: an execution platform's executor config
-remote_execution_properties = {"OSFamily": "linux", "ISA": "x86-64"}
+remote_execution_properties = {"OSFamily": "linux"}
 ```
 
 ```starlark
 # Bazel: a platform for actions that must run on the Macs
 platform(
     name = "macos_arm64",
-    exec_properties = {"OSFamily": "Darwin", "ISA": "arm-a64"},
+    exec_properties = {"OSFamily": "Darwin"},
 )
 ```
 
-An action no worker can ever run (an `OSFamily` other than Linux or macOS, an `ISA`
-of another architecture) is refused at once with `FAILED_PRECONDITION`. An action that
-no connected worker satisfies now waits: its operation stays `QUEUED`, and its metadata
-carries a `google.rpc.ErrorInfo` (reason `NO_WORKER_CAN_RUN`, domain `kbf`) whose `why`
-names the closest worker and what it lacks. The server logs it too. If no live worker
-satisfies it for `--unservable-wait-secs` (300 by default; the wait restarts whenever
-one does), it fails with `FAILED_PRECONDITION` and that reason. Work larger than every
-worker that satisfies its platform (`gpu=2` where nodes have one) is treated the same.
-
-An action that names no OS, no architecture and no ISA level (an empty platform, or one
-with only properties kbf does not read, such as `pool`) is placed by
-`--default-platform` (`linux/x86_64` by default), so it is never handed to a Mac that
-merely sorts first. The default is not applied to an action that names `OSFamily` or
-`ISA` alone, or asks for `xcode`, an iOS device or a VM image.
-`--default-platform none` applies none. It changes placement only: the action digest and
-the cache key are the client's. Each application is logged with the action digest, at
-most once in ten seconds.
-
-## `gpu`
-
-`gpu=N` places the action only on a worker with `N` free GPUs, and books those GPUs
-for the action's lease alone: no other lease is given them until that lease ends
-(its result is accepted, or the lease is given up and the action requeued). A worker
-with one GPU runs one `gpu=1` action at a time; work that asks for no GPU still
-shares the worker's CPUs and memory beside it.
-
-A worker reports how many GPUs it has in the `gpu` entry of its node report; a report
-without one has none. The virtual workers of the executor report none (a job books no GPU),
-so a `gpu=N` action waits and then fails as described under
-[Where an action runs](#where-an-action-runs). A macOS action runs as a js-agent job
-([actions-as-jobs.md](design/actions-as-jobs.md) section 14) and books no GPU slot.
-
-In Bazel:
-
-```starlark
-cc_test(
-    name = "kernel_test",
-    exec_properties = {"gpu": "1"},
-    ...
-)
-```
+An action that asks for something the executor cannot run (a Mac when no Macs are configured, a
+whole machine on a Mac, a `container-image` other than the base) is refused at once as the
+caller's, `INVALID_ARGUMENT`. kbf never waits for a worker that satisfies a platform: an action
+the job service cannot place is the job service's to hold, and kbf reads its job back until it
+ends.
 
 ## `kbf-lease`
 
-An `action` lease (the default) books cores and GPUs of a worker and asks for memory: one core and 4 GiB (the first rung of
-the memory ladder), or what
-`kbf-book-cpus` and `kbf-book-mem-gib` name, plus its `gpu` GPUs. A `whole_machine`
-lease books every core, byte of memory and GPU of its worker, and runs there alone.
+`kbf-lease=action` (the default) is an ordinary job. `kbf-lease=whole_machine` makes the job
+need a whole host of the executor's architecture and nothing beside it, for the action's timeout
+and the run margin. It cannot be a put-directory job (`--task-out-mode put-dir`), and a Mac
+action cannot ask for it: both are refused as the caller's. This is the only property kbf still
+reads to size the job; the others about a lease, a booking or a GPU (`gpu`, `kbf-book-cpus`,
+`kbf-book-mem-gib`) are not read.
 
-A lease goes only to a worker whose node report lists a driver for its kind: `container` for
-`action`, `native-whole-machine` for `whole_machine` (see
-[capabilities.md](design/capabilities.md#driver-entries)). The virtual workers of a Linux
-executor list both; on a farm without such a worker an action waits with the reason and then
-fails, as described under [Where an action runs](#where-an-action-runs). A macOS action runs
-as a js-agent job ([actions-as-jobs.md](design/actions-as-jobs.md) section 14).
+A job that ends because it passed its memory limit is submitted again as the next attempt, at
+most twice, and then answered `FAILED_PRECONDITION` (out of memory, reason `ACTION_OUT_OF_MEMORY`);
+there is no ladder of sizes and kbf remembers no size for the action.
 
-A `whole_machine` lease waits for a worker that holds no lease. While it waits it holds
-one worker that could run it, and work queued after it at the same or a lower QoS is
-not placed there, so that worker empties as its leases end. More urgent work is still
-placed there. Running leases are never stopped for it.
+## macOS
 
-## `kbf-book-cpus` and `kbf-book-mem-gib`
-
-Every action asks for one core and 4 GiB of memory on the worker it runs on (the first
-rung of the server's memory ladder, `--memory-ladder-gib`), unless it
-names a size: `kbf-book-cpus=N` books `N` whole cores, and `kbf-book-mem-gib=N` books
-`N` GiB. `N` is written in plain digits with no leading zero: `+4` and `04` are
-refused, since each would book the same as `4` under a different action digest, and so
-miss the cache entries `4` made. Either may be given alone; the other stays at its
-default. Cores (and `gpu` GPUs) are booked: the scheduler places the action only on a
-worker with that many free, and holds them for the lease until the lease ends. Memory is
-not booked the same way: the worker's memory capacity must be at least the action's
-memory, but what other leases on the worker hold of its memory never keeps the action
-out. The worker bounds how many actions run at once by their cores, and its
-memory-pressure backstop pauses new starts. An action that asks for the whole host's
-memory (the last rung of the ladder) runs alone on its worker. The memory is the limit the
-action runs under, below.
-
-With the server's `--exclusive-actions` on, every `action` lease books the whole worker
-it lands on instead: all of the worker's cores and all of its memory, as the worker reported
-them when it registered, whichever worker that is. Exactly one action then runs per
-worker, and a second waits for it, even on a worker of many cores. The setting is the
-server's, not the action's, so it does not touch the action digest and the action cache is
-shared with a server that has it off. `kbf-book-cpus` and `kbf-book-mem-gib` are still
-checked (a malformed value is still refused) and still recorded as the client's hints, but
-they no longer change what is booked, and `kbf-lease=whole_machine` and `vm` leases are as
-they were. The lease's memory limit and CPU weight come from the booking, so the action may
-use the worker's whole memory. An action killed for passing its own memory limit has no
-larger booking to climb to: it finishes `FAILED_PRECONDITION` (out of memory) at once, as
-one that already books the largest node does, and its key's memory floor is not raised.
-The setting is not kept in the state store, so a server restart ends it for the operations
-the store holds. An operation that was queued is read back as an ordinary `action`. One that
-was running is recovered holding only the booking the front computed for it (by default one
-core and the first memory rung), not the worker, so the scheduler may place ordinary
-actions beside it; and if that lease is later lost or requeued, the operation runs again as
-an ordinary `action`, climbing the memory ladder, with no claim on a worker. A run that
-needs exactly one action per worker (a benchmark) must not restart the server, and
-a restart during one invalidates it. The setting works on both scheduler cores.
-
-The booking also sets the memory the action may use. The executor submits the job with the
-memory the farm booked as a hard cap of 1.5 times the booking plus 512 MiB (6.5 GiB for the
-default booking, 12.5 GiB for `kbf-book-mem-gib=8`), so a large `swiftc` or `ld` step that
-dies at 2 GiB needs a larger booking.
-
-The booking is where an action starts, not always where it runs. When a job ends because the
-action passed its own memory limit, the server runs it again one rung up a
-fixed ladder, 4, then 16, then 32 GiB, then a whole host (the largest node that could
-run it, so that no other lease shares it; the rungs are the server's
-`--memory-ladder-gib`). A size named here climbs from where it is: a killed 6 GiB ask
-runs again with 16 GiB. The server remembers the raised booking for the action (its instance name and action digest), so
-the next run of the same action starts there; only a kill at the largest node reaches
-the client, as `FAILED_PRECONDITION` saying the action needs more memory than any node
-offers. A job the host kills under the host's own memory pressure is rerun with the
-same booking. See [scheduler.md](design/scheduler.md#memory-kills).
-
-```starlark
-# Bazel: a link step that needs 4 cores and 12 GiB
-cc_binary(
-    name = "server",
-    exec_properties = {"kbf-book-cpus": "4", "kbf-book-mem-gib": "12"},
-    ...
-)
-```
-
-A value that is not a whole number of at least 1 is refused with `INVALID_ARGUMENT`,
-as is either key on a `kbf-lease=whole_machine` lease, which books the whole
-worker. A booking larger than any worker that satisfies the platform waits and
-then fails, as described under [Where an action runs](#where-an-action-runs).
-
-Like every platform property, the two keys are part of the action digest: the same
-action with another booking is a different action cache entry, so changing a booking
-reruns the action once. They are not the capability keys `cpus` and `mem_gib`, which
-ask for a worker whose whole machine has at least that much and book nothing.
-
-## macOS, Xcode, simulators, VMs and iOS devices
-
-A macOS action runs as a js-agent job
-([actions-as-jobs.md](design/actions-as-jobs.md) section 14). No worker reports the `xcode`,
-`vm.image`, `vm.slots`, `ios.device` or `gpu` entries of a node report, and there is no
-`simulator` property. The server still reads those report keys (the wire fields stay), so an
-action that names `xcode`, `vm.image` or `ios.device` matches no worker: it waits and then fails
-as described under [Where an action runs](#where-an-action-runs). A `vm.image` value without a
-digest, a `vm.slots`, `vm.max_cpus` or `vm.max_mem_gib` key, a value of `ios.device` other than
-`1`, an `ios.device.<attribute>` without `ios.device=1`, and `kbf-lease=vm` are refused with
-`INVALID_ARGUMENT`.
+An action whose platform names `OSFamily` (or `os`) `macos`, `darwin`, `macosx` or `osx` runs as a
+js-agent job on a Mac of the job service ([actions-as-jobs.md](design/actions-as-jobs.md)
+section 14), when the executor is given the release's macOS `kbf-task` bundle
+(`--executor-mac-task-bundle`); without it the action is refused. `os_version=26` means macOS 26
+or newer, held against `--executor-mac-os-version`. kbf reads no `xcode`, `vm.image`, `ios.device`
+or simulator property: they are accepted and do nothing.
 
 ## `kbf-network`
 

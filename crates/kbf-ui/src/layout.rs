@@ -6,14 +6,11 @@ use crate::read::Asked;
 use crate::{PREFIX, STYLESHEET};
 
 /// The navigation: each section's label and page. More sections come with their
-/// routes (nodes, queue, tests).
+/// routes.
 const NAV: &[(&str, &str)] = &[
     ("Overview", PREFIX),
     ("Builds", "/ui/builds"),
     ("Targets", "/ui/targets"),
-    ("Nodes", "/ui/nodes"),
-    ("Leases", "/ui/leases"),
-    ("Queue", "/ui/queue"),
     ("Storage", "/ui/storage"),
 ];
 

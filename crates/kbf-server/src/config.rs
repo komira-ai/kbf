@@ -35,14 +35,10 @@ pub const DEFAULT_WORKER_LISTEN: SocketAddr =
 /// The default of `--tls-reload-interval-secs`.
 const DEFAULT_TLS_RELOAD_SECS: u64 = 30;
 
-/// The longest heartbeat interval `--heartbeat-interval-ms` accepts: half of
-/// [`kbf_sched::fence::START_VALIDITY`].
-pub const MAX_HEARTBEAT_INTERVAL_MS: u64 = kbf_sched::fence::START_VALIDITY.as_millis() as u64 / 2;
-
 /// The roles a server can run. A single node runs them all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Role {
-    /// Front, scheduler and metadata in one process.
+    /// Front, executor and metadata in one process.
     All,
 }
 
@@ -213,7 +209,7 @@ pub struct Args {
     /// open to whoever reaches it: bind it where only operators do.
     #[arg(long)]
     pub api_listen: Option<SocketAddr>,
-    /// A file holding the token operator API writes (cordon, drain, uncordon) must
+    /// A file holding the token operator API writes (a frontend drain, a member's state) must
     /// present as `Authorization: Bearer <token>`. It must be owned by the server's
     /// user with mode 0600 or 0400, or the server refuses to start; run the server as
     /// a user other than the worker's, whose builds could read it. Without it, writes
@@ -299,181 +295,18 @@ pub struct Args {
         value_parser = clap::value_parser!(u64).range(1..=3600)
     )]
     pub tls_reload_interval_secs: u64,
-    /// How long, in seconds, queued work waits while no connected worker can run it
-    /// (none satisfies its platform, or none that does is large enough) before it is
-    /// refused FAILED_PRECONDITION. The wait restarts whenever one can.
-    #[arg(long, default_value_t = kbf_sched::UNSERVABLE_WAIT.as_secs())]
-    pub unservable_wait_secs: u64,
-    /// The OS and architecture, as `<os>/<arch>` (`linux` or `macos`; `x86_64` or
-    /// `arm64`), of an action whose platform names no OS, no architecture and no ISA
-    /// level, so that it is not given to whichever node sorts first, a Mac among them.
-    /// Not applied to an action that asks for `xcode` or an iOS device, which only a
-    /// Mac reports. `none` applies no default: such an action runs on any node that
-    /// fits. Placement only: the action's digest and cache key do not change.
-    #[arg(long, default_value_t = kbf_front::DefaultPlatform::LINUX_X86_64)]
-    pub default_platform: kbf_front::DefaultPlatform,
-    /// The QoS levels a call may ask for with the `x-kbf-qos` request header, as a comma
-    /// list of `ci`, `batch` and `interactive` (`ci` is always allowed: it is what a call
-    /// with no header, or a header naming a level not on the list, gets, and that call is
-    /// never refused). The level orders the queue, most urgent first: a `batch` action
-    /// waits behind every queued `ci` action. It is not part of the action digest, so it
-    /// does not split the cache. A client that sends no header stays at `ci`
-    #[arg(long, default_value_t = kbf_front::QosAllow::DEFAULT)]
-    pub qos_allowed: kbf_front::QosAllow,
-    /// The memory rungs of an action, in GiB, ascending and each at least 1. The first
-    /// is what an action that names no size (`kbf-book-mem-gib`) books. An action that
-    /// passes its own memory limit runs again on the next rung above what it booked,
-    /// and after the last on a whole host: the memory of the largest node that could
-    /// run it, so that no other lease fits there. A rung not below that node's memory
-    /// is skipped for the whole host. An action that does finish keeps its rung: later
-    /// runs of it start there.
-    #[arg(
-        long,
-        value_delimiter = ',',
-        default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
-    )]
-    pub memory_ladder_gib: Vec<u64>,
-    /// Every `action` lease books the whole worker it lands on: all of its CPUs and all of
-    /// its memory, whichever worker that is, so that exactly one action runs per worker
-    /// and a second waits for it. The action digest is the client's and does not change
-    /// (the per-action `kbf-book-cpus` and `kbf-book-mem-gib` properties would split the
-    /// action cache); this is a setting of the server. `kbf-book-cpus` and `kbf-book-mem-gib`
-    /// are still checked, but no longer change what is booked. `kbf-lease=whole_machine` and
-    /// `vm` leases are as they were. An action killed for passing its own memory limit has
-    /// no larger booking to climb to, so `--memory-ladder-gib` has no further rung to give
-    /// it: it finishes out-of-memory, as an action that already books the largest node does,
-    /// and its memory floor is not raised. A worker books by what it reported at
-    /// registration. The setting is not kept in the state store, so a server restart
-    /// ends it for the operations the store holds: one that was queued is read back as
-    /// an ordinary action, and one that was running is recovered holding only the booking
-    /// the front computed for it, not the worker, so ordinary actions can be placed
-    /// beside it and, if it is lost or requeued, it runs again as an ordinary action. A
-    /// run that needs one action per worker must not restart the server. Off by default
-    #[arg(long, default_value_t = false)]
-    pub exclusive_actions: bool,
-    /// Keeps an action's memory booking where it started. An action that passes its own
-    /// memory limit is not run again on the next rung of `--memory-ladder-gib`: the kill
-    /// finishes it, FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, as a kill at the
-    /// largest node does, and its attempt is recorded with `memory_kill` `own_limit`. A
-    /// booking is therefore the first rung, or the GiB the action names in
-    /// `kbf-book-mem-gib`. No floor is raised, so with `--learned-sizes on` an own-limit
-    /// kill leaves none either. A kill the node made under memory pressure is not the
-    /// action's: it runs again with the same booking, as it does without this flag
-    #[arg(long)]
-    pub no_memory_climb: bool,
-    /// What the farm does with `kbf-estimator`, which predicts an action's memory from
-    /// what its earlier runs used. `off` calls it never. `shadow` shows it every attempt
-    /// that finishes and logs, for every new operation, a `size estimate:` line with what
-    /// it would book, and counts how the attempts fall against its estimates
-    /// (`kbf_estimator_shadow_total`); it books exactly what `off` books. `on` is `shadow`
-    /// plus one change to a booking: a kill at an action's own memory limit leaves a floor
-    /// under the action's key (instance, platform class, instrument and shape), which every
-    /// later digest of the key, queued or new, books at least, strictly below the memory of
-    /// the largest node that could run it. The floor falls only by the estimator's decay:
-    /// it halves once the key has run 256 times and 7 days have passed without an
-    /// own-limit kill or a sample above half of it, and a floor that falls to the first
-    /// rung or below is dropped; a kill raises it again. Only an action whose memory the
-    /// client did not name, on a platform that pins the OS, is keyed. The size summaries
-    /// and the keys are kept in the state store, in rows of their own that a release
-    /// without this flag never reads; `off` neither reads nor deletes the summaries, and
-    /// ignores the keys. The memory a floor raised a queued operation to is not stored: a
-    /// restart, or a rollback to `off`, books such an operation at its submitted memory
-    /// until it ends.
-    #[arg(long, value_enum, default_value_t = crate::LearnedSizes::Off)]
-    pub learned_sizes: crate::LearnedSizes,
-    /// Which core drives the farm's scheduling. The one value is `legacy`, the default: the
-    /// driver the server has always had. `js` names a core that was removed, because
-    /// scheduling runs in the job service, and is refused at start (exit status 2). The core a
-    /// server runs is logged at start and exported as `kbf_scheduler_core{core}`, the one
-    /// series `kbf_scheduler_core{core="legacy"} 1`
-    // The text above states the default; the help golden cannot hold the whitespace-only
-    // line clap prints before a `[default: ...]` line.
-    #[arg(
-        long,
-        value_parser = crate::scheduler_core::parse,
-        default_value = "legacy",
-        hide_default_value = true
-    )]
-    pub scheduler_core: crate::SchedulerCore,
-    /// Whether placement reads the load the nodes report. `off`, the default, books by
-    /// the CPUs a lease asks for, as the server always has, and reads no load. `on` admits
-    /// and ranks nodes by the load they report and the load a lease is predicted to add;
-    /// a node that reports none is charged by prediction alone, and a node that has never sent
-    /// a reading the server accepted is charged at least 1000 m for each lease (the node's
-    /// whole CPU capacity, if that is less), so a prediction under one core changes nothing for
-    /// such a node. `on` also keeps the flat memory charged to a node's leases within the
-    /// node's memory; that guard counts only leases that carry a memory (a retry up the
-    /// memory ladder, a VM) unless `--placement-predictions on` gives leases one
-    // The text above states the default; the help golden cannot hold the whitespace-only
-    // line clap prints before a `[default: ...]` line.
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = crate::PlacementLoad::Off,
-        hide_default_value = true
-    )]
-    pub placement_load: crate::PlacementLoad,
-    /// Whether the farm gives its scheduler the estimator's prediction of what a new
-    /// operation costs, from the rows `--learned-sizes` keeps, so that placement charges the
-    /// learned cores and memory instead of the cores the request asked for and no memory.
-    /// `off`, the default, computes none. `shadow` computes the prediction at submit, gives
-    /// the scheduler nothing, and compares it with the run when it ends: the cores the run
-    /// used on average, its peak memory and its life in whole minutes, each counted as under
-    /// (the run used more than predicted), fit (at most the prediction and at least half of
-    /// it) or over (less than half of it) in `kbf_prediction_vs_run_total`; the operations
-    /// given a prediction are counted in `kbf_prediction_made_total` and those given none,
-    /// by why, in `kbf_prediction_unset_total`. Placement is exactly what `off` does. `on`
-    /// gives the scheduler the prediction as the cost of the operation's lease, at submit (and
-    /// again for an operation read back from the state store at a start), which charges the
-    /// learned memory as well as the cores: a lease is admitted to a node only while the
-    /// memory charged to the node's leases stays within the node's memory. An operation the
-    /// estimator has no usable row for, or is not asked about (not an action, one that asks
-    /// for a GPU, no OS pinned, no subject), gets none and is charged as it is with `off`. `shadow` and `on` need `--learned-sizes shadow` or `on`;
-    /// `on` needs `--placement-load on`; a prediction only changes what the lease is charged:
-    /// the memory limit and the cores it is booked and run with stay the request's and the
-    /// ladder's. A server given a combination that breaks one of these refuses to start
-    // The text above states the default; the help golden cannot hold the whitespace-only
-    // line clap prints before a `[default: ...]` line.
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = crate::PlacementPredictions::Off,
-        hide_default_value = true
-    )]
-    pub placement_predictions: crate::PlacementPredictions,
-    /// Whether the farm learns what its leases use. Only `off`, the default, is accepted: it
-    /// learns nothing and writes no row. `record` and `on` were run by the js scheduler core,
-    /// which was removed because scheduling runs in the job service, and a start given one is
-    /// refused (exit status 2). The mode a server runs is logged at start as
-    /// `usage profiles: <mode>` and exported as the gauge `kbf_usage_profiles_mode{mode}`, 1
-    /// for the mode and 0 for the others
-    // The text above states the default; the help golden cannot hold the whitespace-only
-    // line clap prints before a `[default: ...]` line.
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = crate::UsageProfiles::Off,
-        hide_default_value = true
-    )]
-    pub usage_profiles: crate::UsageProfiles,
-    /// Whether whole-machine requests are run with the scheduler's whole-node drain and
-    /// caps (`--whole-node-max`), and with which settings: off unless it is given.
-    #[command(flatten)]
-    pub whole_node: crate::WholeNodeFlags,
     /// How long, in seconds, a finished operation is kept after its callers are
     /// answered. Within it, WaitExecution on the operation's name streams its result
     /// (a client whose Execute stream broke gets a result the action cache does not
-    /// keep, such as a failure); after it, the name is NOT_FOUND. Every operation
-    /// finished within it is held in memory.
-    #[arg(long, default_value_t = kbf_sched::FINISHED_RETENTION.as_secs())]
+    /// keep, such as a failure); after it, the name is NOT_FOUND, unless the state store
+    /// still holds the result (at least ten minutes). Every operation finished within it is
+    /// held in memory.
+    #[arg(long, default_value_t = crate::executor::FINISHED_RETENTION.as_secs())]
     pub finished_retention_secs: u64,
     /// The operator's hard stop, in seconds, for a stop (SIGINT or SIGTERM). A stop refuses
     /// new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open
     /// Execute and WaitExecution stream stays open until its action is done, however long
-    /// that takes; the exception is a stream whose operation was never started and that no
-    /// worker on this frontend can run (say every capable worker is cordoned) and no other
-    /// frontend can take, which ends UNAVAILABLE as the drain begins (Buck2 retries only the
-    /// opening of a call). The operation stays queued. The default, 0, is no deadline: the
+    /// that takes. The default, 0, is no deadline: the
     /// stop waits indefinitely, and a second signal is the other way to end it at once.
     /// Buck2 never recovers a stream that breaks mid-action, so set one only to force a stop:
     /// when it runs out, the open streams end UNAVAILABLE (a client still uploading is cut
@@ -676,8 +509,8 @@ pub struct Args {
     /// all Executes.
     #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.reads_in_flight)]
     pub input_tree_reads_in_flight: NonZeroUsize,
-    /// Where the scheduler keeps its state, written before each change is acknowledged and
-    /// replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a
+    /// Where the storage members and the unfinished operations are kept, so that another
+    /// frontend, or this one after a restart, answers and takes them up: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a
     /// local Unix socket, reached as this process's own user (peer authentication; a URL
     /// with a password is refused, as the command line is world-readable). The server must
     /// flush commits before it acknowledges them (`synchronous_commit` on) or the start is
@@ -685,10 +518,8 @@ pub struct Args {
     /// a local disk that this process owns (created, with its directory, if missing: 0600,
     /// and 0700 for a directory it makes; a second frontend on it refuses to start); SQLite
     /// is removed in the next release, so a start on it logs a warning (see the upgrade
-    /// notes). A start keeps the epoch the store holds, so workers that reconnect keep the
-    /// runs of the leases they hold; an operator raises it with `kbf cluster epoch-bump`,
-    /// after a restore from a backup. `kbf frontend` refuses to start without it; left out
-    /// of `kbf-server`, the scheduler's state is in memory and a restart loses it
+    /// notes). `kbf frontend` refuses to start without it; left out of `kbf-server`, the
+    /// operations are in memory and a restart loses them
     // Listed beside `--meta-dir`, whose place in the help it takes without moving the
     // flags declared after it.
     #[arg(
@@ -721,6 +552,9 @@ pub struct Args {
     /// The retired worker session's flags: accepted, hidden, ignored.
     #[command(flatten)]
     pub retired_worker: crate::retired::RetiredWorkerFlags,
+    /// The farm scheduler's flags, accepted and ignored for one release.
+    #[command(flatten)]
+    pub retired_scheduler: crate::retired::RetiredSchedulerFlags,
     /// Serves the web UI on the operator API (`--api-listen`): read-only pages under `/ui`
     /// (`docs/design/kbf-ui-v1.md`). On by default; `--ui=false` turns it off, and `/ui` is
     /// then a `404`. The UI is open: it asks for no login or certificate, and it shows
@@ -850,9 +684,6 @@ pub enum ConfigError {
          loopback address"
     )]
     PlaintextStorageOffLoopback { addr: SocketAddr },
-    /// `--memory-ladder-gib` is empty, holds a 0, does not ascend, or overflows.
-    #[error("--memory-ladder-gib: {0}")]
-    MemoryLadder(#[from] kbf_sched::LadderError),
     /// The REAPI policy file is not a policy.
     #[error("--reapi-auth-policy: {path}: {source}")]
     Policy {
@@ -860,34 +691,9 @@ pub enum ConfigError {
         #[source]
         source: PolicyError,
     },
-    /// `--placement-predictions shadow` or `on` with `--learned-sizes off`.
-    #[error(
-        "--placement-predictions {0} needs --learned-sizes shadow or on: with the estimator off \
-         there are no learned rows to predict from"
-    )]
-    PredictionsNeedLearnedSizes(&'static str),
-    /// `--placement-predictions on` with `--placement-load off`.
-    #[error(
-        "--placement-predictions on needs --placement-load on: with it off the scheduler books \
-         by cores and ignores a prediction"
-    )]
-    PredictionsNeedPlacementLoad,
-    /// `--usage-profiles` was given a value other than `off`.
-    #[error(transparent)]
-    UsageProfiles(#[from] crate::usage_profiles::UsageProfilesError),
 }
 
 impl Args {
-    /// Refuses a flag value the server cannot run: a `--usage-profiles` other than `off`.
-    ///
-    /// # Errors
-    /// [`ConfigError::UsageProfiles`]: `--usage-profiles` is `record` or `on` (see
-    /// [`crate::usage_profiles::UsageProfilesError`]).
-    pub fn check_scheduler_core(&self) -> Result<(), ConfigError> {
-        self.usage_profiles_fit()?;
-        Ok(())
-    }
-
     /// The directory of the durable log file: `--log-dir`, else `log` in the hot
     /// store's directory (beside `meta`), else none.
     #[must_use]
@@ -955,11 +761,10 @@ impl Args {
     /// # Errors
     /// A TLS file cannot be read; `--segment-upload-max-bytes` is over
     /// `--write-bytes-in-flight`; `--durable-wait` is not under half the chain's commit
-    /// bound; `--memory-ladder-gib` is not a ladder.
+    /// bound.
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
         self.durable_wait_fits_commit_bound()?;
-        self.placement_predictions_fit()?;
         let reload = Duration::from_secs(self.tls_reload_interval_secs);
         let deny_list = self
             .worker_deny_list
@@ -1008,18 +813,7 @@ impl Args {
             reapi_tls,
             worker: self.worker_listen.unwrap_or(DEFAULT_WORKER_LISTEN),
             worker_tls,
-            tick: Duration::from_secs(1),
-            unservable_wait: Duration::from_secs(self.unservable_wait_secs),
-            default_platform: self.default_platform,
-            qos_allowed: self.qos_allowed,
-            memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
-            memory_climb: !self.no_memory_climb,
-            learned_sizes: self.learned_sizes,
-            exclusive_actions: self.exclusive_actions,
-            placement_load: self.placement_load,
-            placement_predictions: self.placement_predictions,
-            usage_profiles: self.usage_profiles,
-            whole_node: self.whole_node.config(),
+            executor: None,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
                 0 => Duration::MAX,

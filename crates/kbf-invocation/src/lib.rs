@@ -30,6 +30,7 @@ mod event;
 mod metrics;
 mod record;
 mod records;
+mod requeue;
 mod run;
 
 /// The generated `kbf.invocation.v1` messages.
@@ -48,6 +49,7 @@ pub use record::{
     REASON_CAP, ROW_CAP, RecordKey, Restored, State, TEXT_CAP, Text,
 };
 pub use records::{Ended, EndedKind, Records};
+pub use requeue::RequeueReason;
 pub use run::{
     ActionShape, BookSource, Durations, Evidence, FootprintUsage, MemoryKillKind, NumaBytes, Phase,
     PhaseTimes, ReapiTimes, Run, RunUsage, Target, TargetKind, UsageBasis,

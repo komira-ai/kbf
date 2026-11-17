@@ -109,7 +109,7 @@ impl Dispatch for Queue {
             .unwrap_or_else(PoisonError::into_inner);
         let name = format!("operations/{}", held.len());
         held.push(tx);
-        let key = kbf_types::ActionKey::try_from(&submission.request.key).expect("an action's key");
+        let key = submission.key.clone();
         Ok(Ticket {
             name,
             instance: key.instance,
@@ -120,6 +120,10 @@ impl Dispatch for Queue {
 
     fn wait(&self, _name: &str) -> Option<Ticket> {
         None
+    }
+
+    fn cancel(&self, _name: &str) -> bool {
+        false
     }
 }
 

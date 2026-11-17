@@ -29,8 +29,8 @@ breaking changes.
 ## Design
 
 [ARCHITECTURE.md](ARCHITECTURE.md) describes how kbf is put together, and links the
-design documents in [docs/design](docs/design): the scheduler, storage, the worker
-protocol, execution, and capabilities.
+design documents in [docs/design](docs/design): direct job submission, storage, the
+execution path, and capabilities.
 
 [docs/artifacts.md](docs/artifacts.md) says which binaries CI builds and attests, and
 how a node verifies one before it runs it.

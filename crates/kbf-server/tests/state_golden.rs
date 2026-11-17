@@ -2,21 +2,20 @@
 //! release stays readable by this one, row for row.
 //!
 //! `tests/golden/state/` holds, per released schema version `N`, a real state store file
-//! (`vN.db`, written by the code of the release through a real farm) and the rows it
-//! held (`vN.rows`, a text rendering). This test opens a copy of every such file with the
-//! code under test and requires:
+//! (`vN.db`, written by the code of the release) and the rows it held (`vN.rows`, a text
+//! rendering). This test opens a copy of every such file with the code under test and
+//! requires:
 //!
 //! - the file opens (so a bumped `SCHEMA_VERSION` with no way to read the old file is red,
 //!   and so is a renamed or retyped column);
 //! - every row reads back unchanged: keys, values, versions, expiry times, the change
 //!   feed, the head revision and a counter;
-//! - a farm started over the file takes up what the scheduler wrote, each through the
-//!   reader that uses it: the `op/` rows (the queued operation and the one holding a
-//!   lease are known to the farm), the `queue/` row (the queued operation is granted and
-//!   leaves the queue by the key the code forms today), `fate/` (the memory run and the
-//!   raised booking), `cordon/` (the node stays out of placement until uncordoned),
-//!   `loss/` (the next loss is counted from the stored count), the `done/` row (found by
-//!   today's key) and the `lease/` row (a result for it is accepted);
+//! - the executor's rows over the file take up what an earlier release wrote, each through
+//!   the reader that uses it: a `done/` row with no `doneof/` row beside it (as an earlier
+//!   release wrote it) is not an error, `meta/next_op` is continued (no id an earlier release gave is given
+//!   again), and the rows of families this release no longer reads (`op/`, `queue/`,
+//!   `lease/`, `loss/`, `fate/`, `cordon/`, `session/`) are left as they are and take up
+//!   nothing;
 //! - there is a golden for the current `SCHEMA_VERSION`, so a bump cannot ship without a
 //!   new golden (and, until a migration exists, without the old ones being refused here).
 //!
@@ -30,23 +29,13 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kbf_caps::NodeCaps;
-use kbf_front::{Cache, Described, Finished, Submission};
+use kbf_front::Finished;
 use kbf_proto::google::rpc;
-use kbf_proto::worker::{self, MemoryKill, ServerMessage};
-use kbf_sched::{DaemonInstance, Request};
-use kbf_server::farm::{NodeAction, Reported};
-use kbf_server::fleet::PlacementView;
-use kbf_server::{EpochPolicy, Farm, StateStore};
+use kbf_server::executor::rows::Rows;
 use kbf_state::sqlite::{Options, SCHEMA_VERSION, SqliteStore};
 use kbf_state::{ManualClock, Revision, Store, Txn};
-use kbf_types::{
-    ActionKey, Digest, DigestFunction, LeaseId, LeaseKind, OperationId, Qos, Resources, WorkerId,
-};
-use tokio::sync::mpsc;
+use kbf_types::{ActionKey, Digest, DigestFunction, OperationId};
 use tonic::Code;
-
-const GIB: u64 = 1 << 30;
 
 /// The counter the writer advances twice, so a golden holds a counter row.
 const COUNTER: &str = "golden/counter";
@@ -101,128 +90,34 @@ fn render(store: &dyn Store) -> String {
     out
 }
 
-fn request(tag: u8, resources: Resources) -> Request {
-    Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        }
-        .into(),
-        qos: Qos::Ci,
-        kind: LeaseKind::Action,
-        resources,
-        hermetic: true,
-        do_not_cache: false,
-        whole_worker: false,
-        pin: None,
-        needs: kbf_caps::Request::default(),
+/// The action of the tag `tag`.
+fn action(tag: u8) -> ActionKey {
+    ActionKey {
+        instance: "main".to_owned(),
+        action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
     }
 }
 
-fn submit(farm: &Farm, request: Request) {
-    kbf_front::Dispatch::submit(
-        farm,
-        Submission {
-            request,
-            call: None,
-            described: Described::default(),
-            evidence: Default::default(),
-            max_wall: None,
-        },
-    )
-    .expect("submitted");
-}
-
-type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, tonic::Status>>;
-
-fn register(farm: &Farm, name: &str, room: Resources) -> (kbf_server::farm::StreamId, Inbox) {
-    let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
-        .expect("caps")
-        .with_drivers(["container"]);
-    let (outbound, inbox) = mpsc::unbounded_channel();
-    let stream = farm.register(
-        &WorkerId::new(name),
-        DaemonInstance::new("daemon"),
-        DaemonInstance::new(""),
-        Reported::serving(room, caps),
-        outbound,
-        ServerMessage::default(),
-    );
-    (stream, inbox)
-}
-
-/// The leases of the `Start`s waiting in `inbox`, each with the memory it books.
-fn booked(inbox: &mut Inbox) -> Vec<(LeaseId, u64)> {
-    let mut leases = Vec::new();
-    while let Ok(message) = inbox.try_recv() {
-        if let Some(worker::server_message::Message::Start(start)) =
-            message.expect("no error").message
-        {
-            let lease = start.lease_id.expect("a lease id");
-            leases.push((LeaseId::new(lease.term, lease.seq), start.memory_bytes));
-        }
-    }
-    leases
-}
-
-fn starts(inbox: &mut Inbox) -> Vec<LeaseId> {
-    booked(inbox).into_iter().map(|(lease, _)| lease).collect()
-}
-
-fn result(lease: LeaseId, memory_kill: MemoryKill) -> worker::Result {
-    let code = match memory_kill {
-        MemoryKill::OwnLimit => Code::ResourceExhausted,
-        _ => Code::InvalidArgument,
-    };
-    worker::Result {
-        lease_id: Some(worker::LeaseId {
-            term: lease.term,
-            seq: lease.seq,
-        }),
-        status: Some(rpc::Status {
-            code: code as i32,
-            message: "golden".to_owned(),
-            details: Vec::new(),
-        }),
-        action_result: None,
-        action_digest: None,
-        memory_kill: memory_kill as i32,
-        lost: 0,
-        job_outcome: None,
+/// The executor's op row of the action `tag`.
+fn op_row(tag: u8) -> kbf_server::executor::rows::OpRow {
+    let key = action(tag);
+    kbf_server::executor::rows::OpRow {
+        owner: String::new(),
+        instance: key.instance,
+        hash: key.action.hash_hex(),
+        size: key.action.size_bytes,
+        attempt: 0,
+        job: format!("k0000000{tag}-op-0"),
+        key: None,
+        whole_machine: false,
     }
 }
 
-async fn accepted(farm: &Farm, worker: &str, lease: LeaseId) -> bool {
-    let ack = farm
-        .report(
-            &WorkerId::new(worker),
-            result(lease, MemoryKill::Unspecified),
-        )
-        .await;
-    ack.expect("an acknowledgement").accepted
-}
-
-fn farm_over(store: Arc<dyn Store>) -> Farm {
-    Farm::new(
-        Arc::new(Cache::memory()),
-        kbf_sched::UNSERVABLE_WAIT,
-        kbf_sched::FINISHED_RETENTION,
-    )
-    .with_state(Some(StateStore {
-        store,
-        epoch: EpochPolicy::Keep,
-        members: Default::default(),
-        history: None,
-    }))
-    .expect("a farm over the store")
-}
-
-/// Writes `vN.db` and `vN.rows` into `dir` by driving a real farm over a new store:
+/// Writes `vN.db` and `vN.rows` into `dir` by driving the executor's rows over a new store:
 ///
-/// - `op-0` is killed for memory on a cordoned node, so the store holds its `op/`,
-///   `queue/` (at the raised booking), `fate/` and the node's `cordon/` rows;
-/// - `op-1` finishes on a second node, so the store holds a `done/` row;
-/// - `op-2` loses its lease once, so the store holds a `loss/` row and a live `lease/`.
+/// - operation 0 is unfinished: the store holds its `exec/op/` row and its process's
+///   `exec/live/` row;
+/// - operation 1 finishes, so the store holds its `done/` and `doneof/` rows.
 async fn write_into(dir: &Path) {
     let db = dir.join(format!("v{SCHEMA_VERSION}.db"));
     let rows = dir.join(format!("v{SCHEMA_VERSION}.rows"));
@@ -233,58 +128,36 @@ async fn write_into(dir: &Path) {
     );
     let scratch = tempdir();
     let store = Arc::new(open(&scratch.join("state.db")));
-    let farm = farm_over(store.clone());
-
-    let (_, mut big) = register(&farm, "node-a", Resources::new(4_000, 64 * GIB));
-    submit(&farm, request(1, Resources::new(1_000, 4 * GIB)));
-    let [lease] = starts(&mut big)[..] else {
-        panic!("one lease expected");
-    };
-    farm.place(&WorkerId::new("node-a"), NodeAction::Cordon)
-        .expect("cordoned");
-    let ack = farm
-        .report(
-            &WorkerId::new("node-a"),
-            result(lease, MemoryKill::OwnLimit),
-        )
-        .await;
-    assert!(ack.expect("an acknowledgement").accepted);
-
-    let (_, mut small) = register(&farm, "node-b", Resources::new(4_000, 2 * GIB));
-    submit(&farm, request(2, Resources::new(1_000, GIB)));
-    let [done] = starts(&mut small)[..] else {
-        panic!("one lease expected");
-    };
-    assert!(accepted(&farm, "node-b", done).await);
-    submit(&farm, request(3, Resources::new(1_000, GIB)));
-    assert_eq!(starts(&mut small).len(), 1);
-    let (stream, mut small) = register(&farm, "node-b", Resources::new(4_000, 2 * GIB));
-    assert!(
-        farm.heartbeat(&WorkerId::new("node-b"), stream, 1, Vec::new())
-            .await
+    let mine = Rows::new(store.clone(), "golden");
+    mine.beat(std::time::Duration::from_secs(60))
+        .expect("a liveness row");
+    let (unfinished, finished) = (
+        mine.next_id().expect("an id"),
+        mine.next_id().expect("an id"),
     );
-    assert_eq!(starts(&mut small).len(), 1, "granted again after the loss");
+    mine.put_op(unfinished, &op_row(1)).expect("an op row");
+    mine.put_op(finished, &op_row(2)).expect("an op row");
+    let answer = Finished::Failed(rpc::Status {
+        code: Code::InvalidArgument as i32,
+        message: "golden".to_owned(),
+        details: Vec::new(),
+    });
+    mine.finish(
+        finished,
+        &action(2),
+        &answer,
+        std::time::Duration::from_secs(600),
+    )
+    .expect("an answer");
+    drop(mine);
 
-    drop(farm);
     for _ in 0..COUNTER_AT_WRITE {
         store
             .apply_batch(vec![Txn::new().next(COUNTER)])
             .expect("a counter");
     }
     let text = render(&*store);
-    for prefix in [
-        "op/",
-        "queue/",
-        "lease/",
-        "loss/",
-        "fate/",
-        "done/",
-        "cordon/",
-        "session/",
-        "meta/epoch",
-        "meta/next_op",
-        "meta/next_seq",
-    ] {
+    for prefix in ["exec/live/", "exec/op/", "done/", "doneof/", "meta/next_op"] {
         assert!(
             text.lines().any(|l| l.starts_with(&format!("kv {prefix}"))),
             "the golden holds no {prefix} row"
@@ -341,6 +214,20 @@ async fn every_golden_state_store_reads_back_unchanged() {
     }
 }
 
+/// The keys under each of the families this release no longer reads.
+const RETIRED: [&str; 7] = [
+    "op/", "queue/", "lease/", "loss/", "fate/", "cordon/", "session/",
+];
+
+fn keys_of(store: &SqliteStore, prefix: &str) -> Vec<String> {
+    store
+        .scan_prefix(prefix)
+        .expect("a scan")
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect()
+}
+
 async fn read_back(golden: &Path) {
     let name = golden
         .file_name()
@@ -368,174 +255,42 @@ async fn read_back(golden: &Path) {
         .counters;
     assert_eq!(next, vec![COUNTER_AT_WRITE + 1], "{name}: the counter row");
 
-    let keys = |prefix: &str| -> Vec<String> {
-        store
-            .scan_prefix(prefix)
-            .expect("a scan")
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect()
-    };
-    let hexes = |key: &str, skip: &str| -> u64 {
-        u64::from_str_radix(key.strip_prefix(skip).expect("a prefix"), 16).expect("hex")
-    };
-    let [done_key] = &keys("done/")[..] else {
+    let [done_key] = &keys_of(&store, "done/")[..] else {
         panic!("{name}: expected one done/ row");
     };
-    let done = OperationId(hexes(done_key, "done/"));
-    let leases = keys("lease/");
-    let held: Vec<LeaseId> = leases
-        .iter()
-        .map(|key| {
-            let (term, seq) = key
-                .strip_prefix("lease/")
-                .and_then(|rest| rest.split_once('.'))
-                .expect("a lease key");
-            LeaseId::new(
-                u64::from_str_radix(term, 16).expect("hex"),
-                u64::from_str_radix(seq, 16).expect("hex"),
-            )
-        })
-        .collect();
-    assert!(!held.is_empty(), "{name}: no lease row to recover");
-
-    let farm = farm_over(store.clone());
-    let ended = farm.ended(done).expect("the done/ row decodes");
-    assert!(
-        matches!(&ended, Some(Finished::Failed(s)) if s.code == Code::InvalidArgument as i32),
-        "{name}: the done/ row is not found by today's key: {ended:?}"
+    let done = OperationId(
+        u64::from_str_radix(done_key.strip_prefix("done/").expect("a prefix"), 16).expect("hex"),
     );
-    let (stream, _inbox) = register(&farm, "node-b", Resources::new(4_000, 2 * GIB));
-    assert!(
-        farm.heartbeat(&WorkerId::new("node-b"), stream, 1, held.clone())
-            .await
-    );
-    assert!(
-        accepted(&farm, "node-b", held[0]).await,
-        "{name}: the recovered lease is not taken up"
-    );
-    drop(farm);
-    drop(store);
+    let stored_next = store
+        .get("meta/next_op")
+        .expect("a read")
+        .expect("a next_op row")
+        .value;
+    let stored_next = u64::from_be_bytes(stored_next.as_slice().try_into().expect("eight bytes"));
+    let before: Vec<Vec<String>> = RETIRED.iter().map(|p| keys_of(&store, p)).collect();
 
-    queue_fate_and_cordon_recovered(golden, &name).await;
-    loss_recovered(golden, &name).await;
-}
-
-/// A new store over a copy of `golden`, and the scratch directory holding it.
-fn copy_of(golden: &Path) -> (Arc<SqliteStore>, kbf_testkit::dir::TestDir) {
-    let scratch = tempdir();
-    let copy = scratch.join("state.db");
-    std::fs::copy(golden, &copy).expect("a copy");
-    (Arc::new(open(&copy)), scratch)
-}
-
-fn keys_of(store: &SqliteStore, prefix: &str) -> Vec<String> {
-    store
-        .scan_prefix(prefix)
-        .expect("a scan")
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect()
-}
-
-/// The queued operation (`op-0`: `op/`, `queue/`, `fate/` rows, on the cordoned `node-a`):
-/// the farm holds it queued with its memory run, keeps `node-a` cordoned, and once the
-/// node is uncordoned grants it at the raised booking, which takes it out of the queue
-/// by the `queue/` key and writes its lease.
-async fn queue_fate_and_cordon_recovered(golden: &Path, name: &str) {
-    let (store, _scratch) = copy_of(golden);
+    let rows = Rows::new(store.clone(), "today");
+    // An earlier release wrote a `done/` row with no `doneof/` row beside it; the executor names
+    // an answer's action from `doneof/`, so it does not serve that answer by name (the row is
+    // not corrupt: reading it is not an error).
     assert_eq!(
-        keys_of(&store, "queue/"),
-        ["queue/0000000000000000"],
-        "{name}: the golden's queue"
+        rows.done(done).expect("the done/ row is not an error"),
+        None,
+        "{name}: a done/ row with no doneof/ row"
     );
-    let farm = farm_over(store.clone());
-    // `op/`: the farm holds the queued operation (and `op-2`, which holds a lease).
-    assert_eq!(farm.queued_operations(), 1, "{name}: the queued operation");
-    // `fate/`: the one memory run of the killed operation.
-    let runs = farm.memory_runs();
-    let [(operation, kills)] = runs.iter().collect::<Vec<_>>()[..] else {
-        panic!("{name}: one operation with a kill expected: {runs:?}");
-    };
-    assert_eq!(*operation, OperationId(0), "{name}: the killed operation");
-    let [kill] = &kills[..] else {
-        panic!("{name}: one memory run expected: {kills:?}");
-    };
-    assert_eq!(kill.worker, WorkerId::new("node-a"), "{name}: its node");
-    assert_eq!(kill.booked, 4 * GIB, "{name}: its booking");
+    let first = rows.next_id().expect("an id");
     assert!(
-        matches!(kill.kill, kbf_types::MemoryKill::OwnLimit { .. }),
-        "{name}: its kill: {kill:?}"
+        first.0 >= stored_next && first > done,
+        "{name}: id {first:?} may be one an earlier release gave (next_op was {stored_next})"
     );
-
-    // `cordon/`: no lease while the node is cordoned.
-    let (_, mut inbox) = register(&farm, "node-a", Resources::new(4_000, 64 * GIB));
-    let view = farm.node_view(&WorkerId::new("node-a")).expect("the node");
     assert_eq!(
-        view.placement,
-        PlacementView::Cordoned,
-        "{name}: the cordon"
+        rows.orphans().expect("a scan"),
+        [],
+        "{name}: the rows of a release before the executor were taken for operations to run"
     );
-    assert!(
-        booked(&mut inbox).is_empty(),
-        "{name}: a cordoned node was granted"
-    );
-    farm.place(&WorkerId::new("node-a"), NodeAction::Uncordon)
-        .expect("uncordoned");
-    // `fate/` and `queue/`: granted at the raised booking, and out of the queue.
-    let [(lease, memory)] = booked(&mut inbox)[..] else {
-        panic!("{name}: one grant expected after the uncordon");
-    };
-    assert_eq!(memory, 16 * GIB, "{name}: the raised booking");
-    assert_eq!(farm.queued_operations(), 0, "{name}: still queued");
-    assert!(
-        keys_of(&store, "queue/").is_empty(),
-        "{name}: the queue row stayed after the grant"
-    );
-    assert!(
-        keys_of(&store, "lease/")
-            .contains(&format!("lease/{:016x}.{:016x}", lease.term, lease.seq)),
-        "{name}: the grant wrote no lease row"
-    );
-    drop(farm);
-    drop(store);
-}
-
-/// `op-2` lost its lease once (`loss/` row of 1) and holds a new one on `node-b`. A
-/// registration of `node-b` that holds no lease loses it again: the farm counts from the
-/// stored count and writes 2.
-async fn loss_recovered(golden: &Path, name: &str) {
-    let (store, _scratch) = copy_of(golden);
-    let [loss_key] = &keys_of(&store, "loss/")[..] else {
-        panic!("{name}: expected one loss/ row");
-    };
-    let loss_key = loss_key.clone();
-    let count = |store: &SqliteStore| -> Vec<u8> {
-        store
-            .get(&loss_key)
-            .expect("a read")
-            .expect("a loss row")
-            .value
-    };
-    assert_eq!(
-        count(&store),
-        1u64.to_be_bytes(),
-        "{name}: the golden's count"
-    );
-    let farm = farm_over(store.clone());
-    let (stream, mut inbox) = register(&farm, "node-b", Resources::new(4_000, 2 * GIB));
-    assert!(
-        farm.heartbeat(&WorkerId::new("node-b"), stream, 1, Vec::new())
-            .await
-    );
-    assert_eq!(starts(&mut inbox).len(), 1, "{name}: granted again");
-    assert_eq!(
-        count(&store),
-        2u64.to_be_bytes(),
-        "{name}: the second loss is not counted from the stored one"
-    );
-    drop(farm);
-    drop(store);
+    assert_eq!(rows.unknown_rows(), 0, "{name}");
+    let after: Vec<Vec<String>> = RETIRED.iter().map(|p| keys_of(&store, p)).collect();
+    assert_eq!(after, before, "{name}: rows of retired families changed");
 }
 
 /// Catches: a writer that replaces a released golden (the file the next release must still
@@ -547,4 +302,50 @@ async fn the_writer_refuses_to_replace_a_golden() {
     std::fs::write(dir.join(format!("v{SCHEMA_VERSION}.db")), b"kept").expect("a file");
     let wrote = tokio::spawn(async move { write_into(&dir).await }).await;
     assert!(wrote.is_err(), "the writer replaced an existing golden");
+}
+
+/// Catches: a golden writer whose files the reader refuses or reads back changed: what the
+/// writer puts in an empty directory (the executor's operation, liveness and answer rows, the
+/// counter) reads back row for row from the copied file, and the answer it wrote is the one the
+/// executor's rows return by name with its action.
+#[tokio::test(start_paused = true)]
+async fn what_the_writer_writes_the_reader_reads_back() {
+    let scratch = tempdir();
+    let dir = scratch.to_path_buf();
+    write_into(&dir).await;
+    let db = dir.join(format!("v{SCHEMA_VERSION}.db"));
+    let rows = std::fs::read_to_string(db.with_extension("rows")).expect("the rows file");
+
+    let store = Arc::new(open(&db));
+    assert_eq!(render(&*store), rows, "the file reads back changed");
+    let [done_key] = &keys_of(&store, "done/")[..] else {
+        panic!("one operation finished");
+    };
+    let finished = OperationId(
+        u64::from_str_radix(done_key.strip_prefix("done/").expect("a prefix"), 16).expect("hex"),
+    );
+    let [op_key] = &keys_of(&store, "exec/op/")[..] else {
+        panic!("one operation is unfinished");
+    };
+    let unfinished = OperationId(
+        u64::from_str_radix(op_key.strip_prefix("exec/op/").expect("a prefix"), 16).expect("hex"),
+    );
+    let reader = Rows::new(store, "reader");
+    let (key, answer) = reader
+        .done(finished)
+        .expect("the answer decodes")
+        .expect("the finished operation has its answer");
+    assert_eq!(key, action(2));
+    assert!(
+        matches!(&answer, Finished::Failed(s) if s.code == Code::InvalidArgument as i32),
+        "{answer:?}"
+    );
+    assert_eq!(
+        reader.op(unfinished).expect("a read"),
+        Some(kbf_server::executor::rows::OpRow {
+            owner: "golden".to_owned(),
+            ..op_row(1)
+        }),
+        "the unfinished operation keeps its row"
+    );
 }

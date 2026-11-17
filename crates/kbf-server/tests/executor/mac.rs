@@ -1,31 +1,27 @@
-//! An action that asks for a Mac, through the farm, the executor and the job service: which
-//! worker the farm places it on, and what the service is asked to run.
+//! An action that asks for a Mac, through the executor and the job service: what the service is
+//! asked to run, and what an executor with no Macs answers.
 
 use js_proto::v1::{ExecMode, MountMode, mount};
-use kbf_server::executor::{
-    DEFAULT_MAC_OS_VERSION, MAC_OUT_TARGET, MacPool, PutDirRoots, System, TREE_TARGET, TaskOut,
-};
-use kbf_types::LeaseKind;
-
+use kbf_front::Finished;
 use kbf_job_client::fake::Machine;
+use kbf_server::executor::{
+    ActionFacts, DEFAULT_MAC_OS_VERSION, MAC_OUT_TARGET, MacPool, PutDirRoots, System, TREE_TARGET,
+    TaskOut,
+};
+use tonic::Code;
 
-use crate::rig::{Rig, TREE, machine};
+use crate::rig::{HOST, IMAGE, Rig, TREE, built_class, machine};
 
 const BUNDLE: &str =
     "kbf-task@sha256:9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a";
 
-fn mac_needs() -> kbf_caps::Request {
-    kbf_caps::Request::from_platform([("OSFamily", "macos")]).expect("a Mac's platform")
-}
-
-/// A rig of one Linux worker, `macs` Mac workers and the put root `/mnt/ts/put`, whose
-/// actions' platform asks for a Mac.
-async fn rig(macs: usize) -> Rig {
+/// A rig of one Linux host, a Mac host and the put root `/mnt/ts/put`, whose actions' platform
+/// asks for a Mac; with `macs`, its executor takes Mac actions.
+async fn rig(macs: bool) -> Rig {
     let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
-    let rig = Rig::start(&["host-1"], 1, |cfg| {
+    let rig = Rig::start(&[HOST], |cfg| {
         cfg.task_out = TaskOut::PutDir(roots);
-        cfg.mac = (macs > 0).then(|| MacPool {
-            hosts: macs,
+        cfg.mac = macs.then(|| MacPool {
             bundle: BUNDLE.to_owned(),
             os_version: DEFAULT_MAC_OS_VERSION,
             roots: None,
@@ -41,49 +37,24 @@ async fn rig(macs: usize) -> Rig {
             ..machine(64, "arm64")
         },
     );
-    *rig.inputs.facts.lock().expect("facts") = Ok(kbf_server::executor::ActionFacts {
-        image: crate::rig::IMAGE.to_owned(),
+    *rig.inputs.facts.lock().expect("facts") = Ok(ActionFacts {
+        image: IMAGE.to_owned(),
         timeout: Some(std::time::Duration::from_secs(60)),
         system: System::Macos { os_version: None },
-        size_class: crate::rig::built_class(),
+        size_class: built_class(),
     });
     rig
 }
 
-/// Asserts that a pool of Macs registers its workers beside the Linux ones, each a node of
-/// `os=macos` and `arch=arm64`; and that a Mac action is placed on a Mac worker and submitted
-/// as a Mac job: the release's task bundle as its image, no command or layer, the tree and the put directory under
-/// `/work`, `os=macos`, `arch=arm64`, in the native runtime. Catches a Mac action that becomes
-/// a Linux container job, or a Mac worker the farm takes for a Linux one.
-#[tokio::test(start_paused = true)]
-async fn a_mac_action_is_placed_on_a_mac_worker_and_submitted_as_a_native_mac_job() {
-    let mut rig = rig(1).await;
-    rig.pump().await;
-    let workers: Vec<String> = rig
-        .exec
-        .workers()
-        .iter()
-        .map(|w| w.worker.to_string())
-        .collect();
-    assert_eq!(workers, ["js:front-1-0", "js-mac:front-1-0"]);
-    let mut nodes: Vec<(String, String)> = rig
-        .farm
-        .update_look()
-        .iter()
-        .map(|node| (node.os.clone(), node.arch.to_string()))
-        .collect();
-    nodes.sort();
-    assert_eq!(
-        nodes,
-        [
-            ("linux".to_owned(), "x86_64".to_owned()),
-            ("macos".to_owned(), "arm64".to_owned())
-        ]
-    );
-
-    let caller = rig.submit_needing(5, LeaseKind::Action, mac_needs());
-    rig.pump().await;
-    let jobs = rig.jobs_of(5);
+/// Asserts that a Mac action is submitted as a Mac job: the release's task bundle as its
+/// image, no command or layer, the tree and the put directory under `/work`, `os=macos`,
+/// `arch=arm64`, in the native runtime. Catches a Mac action that becomes a Linux container
+/// job.
+#[tokio::test]
+async fn a_mac_action_is_submitted_as_a_native_mac_job() {
+    let rig = rig(true).await;
+    let mut caller = rig.submit(5);
+    let jobs = rig.until_jobs(5, 1).await;
     assert_eq!(jobs.len(), 1, "{jobs:?}");
     let spec = &jobs[0].spec;
     assert_eq!(spec.image, BUNDLE);
@@ -124,29 +95,25 @@ async fn a_mac_action_is_placed_on_a_mac_worker_and_submitted_as_a_native_mac_jo
 
     // The Mac runs it, and the caller gets its result as from any job.
     rig.host_finishes(jobs[0].id(), "mac-1", 0);
-    match rig.until_done(&caller, 4).await {
-        kbf_front::Finished::Ran(result) => assert_eq!(result.exit_code, 0),
+    match caller.done().await {
+        Finished::Ran(result) => assert_eq!(result.exit_code, 0),
         other => panic!("did not run: {other:?}"),
     }
 }
 
-/// Asserts that an executor with no Macs, the default, registers no Mac worker and takes no
-/// Mac action: the farm keeps it queued, as it did before there were Mac workers, and the job
-/// service is asked to run nothing for it.
-#[tokio::test(start_paused = true)]
-async fn with_no_macs_a_mac_action_is_not_placed_on_the_executor() {
-    let mut rig = rig(0).await;
-    rig.pump().await;
-    let workers: Vec<String> = rig
-        .exec
-        .workers()
-        .iter()
-        .map(|w| w.worker.to_string())
-        .collect();
-    assert_eq!(workers, ["js:front-1-0"]);
-    let caller = rig.submit_needing(6, LeaseKind::Action, mac_needs());
-    rig.pump().await;
-    assert!(rig.jobs_of(6).is_empty());
+/// Asserts that an executor with no Macs, the default, takes no Mac action: the caller is
+/// answered INVALID_ARGUMENT at once, which no retry would change, and the job service is asked
+/// to run nothing for it.
+#[tokio::test]
+async fn with_no_macs_a_mac_action_is_refused_and_nothing_is_submitted() {
+    let rig = rig(false).await;
+    let mut caller = rig.submit(6);
+    match caller.done().await {
+        Finished::Failed(status) => {
+            assert_eq!(Code::from_i32(status.code), Code::InvalidArgument);
+            assert!(status.message.contains("has none"), "{}", status.message);
+        }
+        other => panic!("not refused: {other:?}"),
+    }
     assert!(rig.jobs().is_empty());
-    drop(caller);
 }

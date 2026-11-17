@@ -31,7 +31,6 @@
 //! kbf-deploy job-service check --url URL --token-file FILE [--ca-file FILE]
 //! kbf-deploy job-service agent-egress --config FILE
 //! kbf-deploy job-service plan --config FILE --url URL --token-file FILE [--ca-file FILE]
-//!                             --hosts N --host-cpus N --host-memory-gib N [--host-slots N]
 //! kbf-deploy job-service apply <the flags of plan> <the restart flags>
 //!                              [--canary-deadline-secs SECS] [--apply]
 //!   restart flags: --instance NAME --api-token-file FILE --ssh-host ADDRESS --ssh-user USER

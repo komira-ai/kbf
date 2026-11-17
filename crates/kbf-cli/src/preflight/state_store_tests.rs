@@ -62,7 +62,7 @@ fn a_frontend_with_a_state_store_passes() {
     }
 }
 
-/// Asserts that a storage node, which holds no scheduler state, is not asked for a state store.
+/// Asserts that a storage node, which holds no state store, is not asked for a state store.
 #[test]
 fn the_storage_mode_is_not_asked_for_a_state_store() {
     let args = [

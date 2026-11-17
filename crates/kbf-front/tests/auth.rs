@@ -234,6 +234,19 @@ fn get_operation<'a>(farm: &'a Farm, instance: &'a str) -> BoxFuture<'a, Result<
     })
 }
 
+/// CancelOperation of the operation `ops/<instance>` the stub knows, which Execute authorizes
+/// like WaitExecution.
+fn cancel_operation<'a>(farm: &'a Farm, instance: &'a str) -> BoxFuture<'a, Result<(), Status>> {
+    Box::pin(async move {
+        let name = format!("ops/{instance}");
+        let mut client = OperationsClient::new(farm.channel());
+        let answer = client
+            .cancel_operation(CancelOperationRequest { name })
+            .await;
+        answer.map(drop)
+    })
+}
+
 /// The other calls of the `Operations` service, which no authorizer is asked for: they are
 /// not served.
 fn list_operations<'a>(farm: &'a Farm, _: &'a str) -> BoxFuture<'a, Result<(), Status>> {
@@ -249,14 +262,6 @@ fn delete_operation<'a>(farm: &'a Farm, _: &'a str) -> BoxFuture<'a, Result<(), 
         let mut client = OperationsClient::new(farm.channel());
         let request = DeleteOperationRequest::default();
         client.delete_operation(request).await.map(drop)
-    })
-}
-
-fn cancel_operation<'a>(farm: &'a Farm, _: &'a str) -> BoxFuture<'a, Result<(), Status>> {
-    Box::pin(async move {
-        let mut client = OperationsClient::new(farm.channel());
-        let request = CancelOperationRequest::default();
-        client.cancel_operation(request).await.map(drop)
     })
 }
 
@@ -369,7 +374,7 @@ const METHODS: &[(&str, Option<Slot>, Call)] = &[
     ),
     (
         "/google.longrunning.Operations/CancelOperation",
-        None,
+        Some(Slot::Execute),
         cancel_operation,
     ),
     (
@@ -439,6 +444,10 @@ impl Dispatch for Stub {
             action: kbf_segments::sha256(b"stub"),
             stage: rx,
         })
+    }
+
+    fn cancel(&self, _name: &str) -> bool {
+        true
     }
 }
 

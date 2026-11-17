@@ -29,19 +29,8 @@ fn start() -> (SocketAddr, SocketAddr) {
         worker: loopback(),
         reapi_tls: None,
         worker_tls: None,
-        tick: Duration::from_millis(50),
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
@@ -118,15 +107,8 @@ async fn metrics_count_what_the_reapi_listener_serves() {
         "{body}"
     );
     assert_eq!(sample(&body, "kbf_bytestream_write_requests_total"), 0);
-    // The scheduler core the farm runs: the one series, legacy, at 1; no series for a core
-    // that does not exist.
-    assert!(body.contains("# TYPE kbf_scheduler_core gauge"), "{body}");
-    assert_eq!(
-        sample(&body, "kbf_scheduler_core{core=\"legacy\"}"),
-        1,
-        "{body}"
-    );
-    assert!(!body.contains("core=\"js\""), "{body}");
+    // The scheduler core gauge went with the farm: no series names a core.
+    assert!(!body.contains("kbf_scheduler_core"), "{body}");
     // The loss-mark families, read from the metadata state at the scrape.
     assert!(body.contains("# TYPE kbf_cache_lost_blobs gauge"), "{body}");
     assert!(

@@ -17,7 +17,7 @@ use kbf_map::{DenyEntry, Map};
 use kbf_objstore::MemoryStore;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
 use kbf_server::token::ApiToken;
-use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
+use kbf_server::{Api, Listeners, StateStore, bind_server_with_state};
 use kbf_state::Store;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -51,19 +51,8 @@ fn listeners() -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        tick: Duration::from_millis(50),
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
@@ -116,7 +105,6 @@ fn served() -> (Server, Members) {
     let store = Hooked::new();
     let state = StateStore {
         store: Arc::clone(&store) as Arc<dyn Store>,
-        epoch: EpochPolicy::Keep,
         members: config(),
         history: None,
     };

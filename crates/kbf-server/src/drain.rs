@@ -3,11 +3,8 @@
 //!
 //! A drain refuses every new Execute UNAVAILABLE and lets the open streams run until
 //! their action is done (Buck2 retries only the opening of a call and does not recover a
-//! stream that breaks, so ending one fails its action: kbf#791). The one early end is the
-//! stream of an operation that was never started and that no worker can run, on this
-//! frontend or another (`kbf_front::Stage::Waiting`): it would fail at the deadline
-//! anyway, so it ends when the drain begins and the stop is not held; the operation stays
-//! queued. The drain takes the server out of
+//! stream that breaks, so ending one fails its action: komira-ai/kbf#791). The drain takes the
+//! server out of
 //! `/readyz` and the health service, and sends GOAWAY to the REAPI listener's connections,
 //! which then stop accepting. The serving future returns once the REAPI connections have closed.
 //!
@@ -64,9 +61,7 @@ pub enum Phase {
 
 /// What `GET /v1/frontend/drain` answers, and what a drain reports after it begins.
 ///
-/// `open_executions` and `queued_operations` together tell an orchestrator which kind of
-/// quiet it is looking at: both 0 is idle; a stream open with a queued operation and no
-/// worker to run it is waiting, not running.
+/// `open_executions` 0 is idle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct DrainStatus {
     /// A drain has begun (by a signal or the endpoint) and will not be undone: the phase
@@ -76,7 +71,8 @@ pub struct DrainStatus {
     pub phase: Phase,
     /// Execute and WaitExecution operation streams open (`kbf_front_open_executions`).
     pub open_executions: u64,
-    /// Operations in the scheduler's queue, not yet leased to a worker.
+    /// Always 0: kbf queues no operation, every one is a job of the job service at once.
+    /// Kept so a reader of an earlier release's document finds the field.
     pub queued_operations: u64,
     /// The configured `--drain-deadline` has passed with executions open: the drain has
     /// stopped waiting on a clock and reported, and goes on serving them until they end.

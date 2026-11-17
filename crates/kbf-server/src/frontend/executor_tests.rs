@@ -1,14 +1,13 @@
 //! A frontend started with the executor flags, over a job service in this process: with no
-//! executor it never contacts the job service; with `js-agent` it registers its workers while
-//! it serves, takes up the jobs an earlier process left and cancels its own when it stops, and
-//! stops by itself when another frontend has jobs.
+//! executor it never contacts the job service; with `js-agent` it serves without submitting a
+//! job until an action is executed, and leaves none on the job service when it stops.
 
 use std::error::Error;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
 
-use js_proto::v1::{ExecMode, JobSpec, JobState, ListJobsRequest, Shape};
+use js_proto::v1::{ExecMode, Shape};
 use kbf_front::PackKeyMint;
 use kbf_job_client::fake::{Call, FakeJobServer, Machine, TOKEN};
 use kbf_objstore::s3::fake::{Failure, FakeS3};
@@ -22,7 +21,6 @@ use super::base_tree::tests::bundle_dir;
 use super::pack_tests::{flags_over, index, pack_flags, scrape};
 use super::{FrontendFlags, FrontendHandle, Prepared, boxed};
 use crate::executor::{PrepareError, PreparedRun, RunPrepare, RunSource};
-use crate::serve::ServeError;
 use crate::test_dir::scratch_dir;
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
@@ -154,11 +152,8 @@ pub(super) fn flag_list(
         format!("--executor-job-url={}", fake.origin()),
         format!("--executor-job-token-file={}", token.display()),
         "--executor-frontend-id=front-1".to_owned(),
-        "--executor-hosts=1".to_owned(),
         // A change in the job service shows in `/readyz` within a tick of the test's.
         "--readyz-probe-interval-ms=20".to_owned(),
-        "--executor-host-cpus=2".to_owned(),
-        "--executor-host-memory-gib=16".to_owned(),
         "--executor-base-image=registry.test/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
         "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_owned(),
     ]);
@@ -198,7 +193,6 @@ pub(super) fn state_store() -> (Arc<Fake>, crate::StateStore) {
     ));
     let state = crate::StateStore {
         store: fake.clone(),
-        epoch: crate::farm::EpochPolicy::Keep,
         members: crate::members::MembershipConfig::default(),
         history: None,
     };
@@ -224,16 +218,14 @@ pub(super) async fn try_get(api: std::net::SocketAddr, path: &str) -> Option<Str
     Some(text)
 }
 
-/// Waits until the farm lists the worker `worker`, as a registered node. A connection the
-/// listener drops (a frontend that is stopping closes it) is not an answer, and is asked
-/// again: whether the frontend stops is for its `serve` to say, not for this poll.
-pub(super) async fn registered(api: std::net::SocketAddr, worker: &str) -> String {
-    loop {
-        if let Some(nodes) = try_get(api, "/v1/nodes").await
-            && nodes.contains(worker)
-        {
-            return nodes;
-        }
+/// Waits until the frontend has recorded the base tree `root` in `store`, which it does before
+/// its executor runs.
+async fn tree_recorded(store: &Fake, root: &str) {
+    while store
+        .get(&format!("job-tree/{root}"))
+        .expect("a read")
+        .is_none()
+    {
         tokio::task::yield_now().await;
     }
 }
@@ -276,11 +268,11 @@ async fn a_frontend_with_no_executor_never_contacts_the_job_service() {
 }
 
 /// Catches an executor that does not live with the frontend: it asks nothing of the job service
-/// until the frontend serves, then lists the jobs an earlier process left under its id and
-/// registers its worker with the farm (which lists it as a node), says so on `GET /metrics`,
-/// and has nothing of its own left on the job service once the frontend has stopped.
+/// before the frontend serves, counts into `GET /metrics` once it does, submits no job while no
+/// action is executed, and has nothing of its own left on the job service once the frontend has
+/// stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_with_js_agent_registers_its_workers_while_it_serves_and_leaves_no_job() {
+async fn a_frontend_with_js_agent_serves_submits_no_job_unasked_and_leaves_none() {
     let s3 = FakeS3::start().await;
     let dir = scratch_dir("executor-js");
     let fake = job_server(&["host-1"]).await;
@@ -298,29 +290,13 @@ async fn a_frontend_with_js_agent_registers_its_workers_while_it_serves_and_leav
     );
     let served = tokio::spawn(handle.serve());
 
-    let nodes = registered(api, "js:front-1-0").await;
-    assert!(nodes.contains("js:front-1-0"), "{nodes}");
     let text = scrape(api).await;
     for family in [
         "kbf_executor_runs_total{outcome=\"ran\"} 0\n",
-        "kbf_executor_ingests_total{result=\"ok\"} 0\n",
-        "kbf_executor_late_starts_total 0\n",
         "kbf_executor_jobs_submitted_total 0\n",
-        "kbf_executor_jobs_adopted_cancelled_total 0\n",
     ] {
         assert!(text.contains(family), "{family} in {text}");
     }
-    // The jobs of the frontend's id were listed for adoption (the rival check's listing, of
-    // every live job, has no label), and no action was placed.
-    let listed = fake.calls().into_iter().find_map(|call| match call {
-        Call::ListJobs(request) if !request.labels.is_empty() => Some(request),
-        _ => None,
-    });
-    let listed: ListJobsRequest = listed.expect("the earlier jobs were listed");
-    assert_eq!(
-        listed.labels.get("kbf-frontend").map(String::as_str),
-        Some("front-1")
-    );
     assert!(
         !methods(&fake).contains(&"SubmitJob"),
         "{:?}",
@@ -332,57 +308,6 @@ async fn a_frontend_with_js_agent_registers_its_workers_while_it_serves_and_leav
     assert!(fake.jobs().is_empty(), "{:?}", fake.jobs());
     assert!(
         !methods(&fake).contains(&"CancelJob"),
-        "{:?}",
-        methods(&fake)
-    );
-}
-
-/// Catches two frontends that both run workers: a live job of another frontend on the job
-/// service stops this frontend with an error naming it, before it has registered a worker or
-/// submitted a job of its own, and the other frontend's job is left alone.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_stops_when_another_frontend_has_jobs() {
-    let s3 = FakeS3::start().await;
-    let dir = scratch_dir("executor-rival");
-    let fake = job_server(&["host-1", "host-2"]).await;
-    let theirs = JobSpec {
-        job_id: "kother-1-1-1".to_owned(),
-        image: "registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-            .to_owned(),
-        wall_limit_seconds: Some(3_600),
-        labels: [
-            ("kbf-frontend".to_owned(), "front-2".to_owned()),
-            ("kbf-instance".to_owned(), "other-process".to_owned()),
-        ]
-        .into(),
-        ..JobSpec::default()
-    };
-    fake.record(theirs).expect("recorded");
-    let flags = flags(
-        dir.path(),
-        &s3,
-        &fake,
-        &["--executor=js-agent", "--executor-insecure-argv-secrets"],
-    );
-    let (handle, _stop) = started(&flags, Some(source())).expect("starts");
-    let api = handle.api.expect("the operator API");
-    // A frontend that does not stop would register a worker of its own: the test fails then,
-    // with the nodes, instead of waiting for a stop that does not come.
-    let served = tokio::select! {
-        served = handle.serve() => served,
-        nodes = registered(api, "js:front-1-0") => panic!("it registered a worker: {nodes}"),
-    };
-    let Err(ServeError::Executor(why)) = served else {
-        panic!("not refused: {served:?}");
-    };
-    assert!(why.contains("front-2"), "{why}");
-    let jobs = fake.jobs();
-    assert_eq!(jobs.len(), 1, "no job of its own: {jobs:?}");
-    assert_eq!(jobs[0].id, "kother-1-1-1");
-    assert_eq!(jobs[0].state(), JobState::Queued, "left alone");
-    assert!(!jobs[0].cancel_requested);
-    assert!(
-        !methods(&fake).contains(&"SubmitJob"),
         "{:?}",
         methods(&fake)
     );
@@ -464,7 +389,7 @@ async fn a_frontend_that_cannot_build_its_executor_does_not_start() {
 /// Asserts that a `js-agent` frontend writes the release's base tree to the pack store and the
 /// `job-tree/<root>` row to its state store while it starts to serve, before its executor runs:
 /// nothing is written when the frontend is started, every object of the bundle is under `cas/l/`
-/// by the time the executor has registered its worker, and the row names this build's commit and a
+/// by the time the row is recorded, and the row names this build's commit and a
 /// publish time. Catches: a tree published after the executor took jobs, or never, and a record
 /// that is missing or names another release.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -485,7 +410,7 @@ async fn a_js_agent_frontend_publishes_the_base_tree_and_records_it_before_it_se
     );
     let (store, state) = state_store();
     let (handle, stop) = started_over(&flags, Some(source()), Some(state)).expect("starts");
-    let api = handle.api.expect("the operator API");
+    assert!(handle.api.is_some(), "the operator API");
     assert!(
         large_keys(&s3).is_empty(),
         "nothing is written by the start"
@@ -493,7 +418,7 @@ async fn a_js_agent_frontend_publishes_the_base_tree_and_records_it_before_it_se
     assert!(store.scan_prefix("job-tree/").expect("a scan").is_empty());
     let served = tokio::spawn(handle.serve());
 
-    registered(api, "js:front-1-0").await;
+    tree_recorded(&store, &bundled.root).await;
 
     let held = large_keys(&s3);
     for object in &bundled.objects {

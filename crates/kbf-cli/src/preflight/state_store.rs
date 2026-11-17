@@ -1,13 +1,13 @@
-//! The scheduler's state store: a frontend keeps its state in a state store, Postgres from
+//! The frontend's state store: a frontend keeps its state in a state store, Postgres from
 //! the next release, so a `kbf frontend` given no `--state-store` (and no `state-store` key
 //! in `kbf.toml`) is refused here, before anything is bound or opened. The storage mode holds
-//! no scheduler state.
+//! no state store.
 
 use super::Report;
 use crate::Invocation;
 
 const WHAT: &str = "--state-store is not set";
-const WHY: &str = "a frontend keeps its scheduler state in a state store, Postgres from the \
+const WHY: &str = "a frontend keeps its state in a state store, Postgres from the \
                    next release";
 const FIX: &str = "give '--state-store=postgres:///kbf?host=/run/postgresql&user=kbf-server', or \
                    the state-store key of kbf.toml (kbf-installer setup writes it)";

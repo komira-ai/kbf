@@ -2,11 +2,11 @@
 
 #![allow(dead_code, reason = "each test binary uses some of the builders")]
 
+use kbf_invocation::RequeueReason;
 use kbf_invocation::{
     Call, CallKind, Event, ExecuteAnswer, Finished, InvocationId, LeaseEnd, Listing, Metadata,
     Outcome, Output, Owner, RecordKey, WallTime,
 };
-use kbf_sched::RequeueReason;
 use kbf_types::{Digest, DigestFunction, LeaseId, OperationId, WorkerId};
 
 /// A digest whose hash is `n` repeated and whose size is `n`.

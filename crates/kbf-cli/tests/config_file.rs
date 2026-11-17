@@ -87,11 +87,11 @@ fn a_mode_takes_every_setting_from_the_file_alone() {
     );
 }
 
-/// Catches `no-memory-climb` missing from the file's keys (the file cannot turn the
-/// climb off), or read the wrong way round: absent or `false` leaves the climb on, `true`
-/// turns it off, for the frontend, the mode a server runs as.
+/// Catches `no-memory-climb` missing from the file's keys (a file that still names it would
+/// no longer start the frontend), or read the wrong way round: absent or `false` leaves the
+/// retired flag unset, `true` sets it, for the frontend, the mode a server runs as.
 #[test]
-fn the_file_turns_the_memory_climb_off() {
+fn the_file_still_names_the_retired_memory_climb_flag() {
     let dir = scratch("no_memory_climb");
     for (line, off) in [
         ("", false),
@@ -103,7 +103,10 @@ fn the_file_turns_the_memory_climb_off() {
         let parsed =
             kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None).expect("parses");
         assert_eq!(
-            frontend(&parsed.invocation).server.no_memory_climb,
+            frontend(&parsed.invocation)
+                .server
+                .retired_scheduler
+                .no_memory_climb,
             off,
             "{line:?}"
         );

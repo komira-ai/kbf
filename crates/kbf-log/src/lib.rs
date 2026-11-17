@@ -1,9 +1,9 @@
 //! The encoding of the replicated log's command entries (docs/design/ha.md, section
 //! 4.6): conversions between the domain values and the `kbf.log.v1` messages of
-//! `kbf-proto`, so the domain crates (`kbf-meta`, `kbf-sched`) stay free of codec
-//! dependencies. The metadata commands are `kbf_meta`'s; the control commands and the
-//! values they carry are in this crate ([`FarmBatch`], [`Report`], [`Takeover`],
-//! [`Checkpoint`], [`MachineVersion`]).
+//! `kbf-proto`, so the domain crates (`kbf-meta`) stay free of codec dependencies. The
+//! metadata commands are `kbf_meta`'s; the machine version is [`MachineVersion`], in this
+//! crate. The farm commands (`Farm`, `Report`, `Takeover`, `Checkpoint`) that earlier
+//! builds wrote are no longer read: they decode as [`LogCommand::Unknown`].
 //!
 //! [`encode`] and [`decode`] take the log's committed [`Format`]: [`Format::V1`];
 //! [`Format::V2`], which added the write tier's metadata commands
@@ -26,16 +26,11 @@
 //! - a field no message of this binary names: prost drops it, and the part this binary
 //!   knows decodes as it would without the field;
 //! - a `oneof` that is unset, because its arm is one this binary does not name (a
-//!   command, a farm input, a record, an outcome, a QoS kind): the entry decodes as
-//!   [`LogCommand::Unknown`];
+//!   command): the entry decodes as [`LogCommand::Unknown`];
+//! - a farm command (`Farm`, `Report`, `Takeover`, `Checkpoint`): the entry decodes as
+//!   [`LogCommand::Unknown`] without its content being read;
 //! - an enum value that is unspecified (zero) or unnamed, in a command this binary
 //!   knows: the entry decodes as [`LogCommand::Unknown`] as well;
-//! - a consumable amount whose consumable is unspecified or unnamed: that amount is left
-//!   out of the node's capabilities and the rest of the command decodes as it would
-//!   without it;
-//! - a field absent that a later build added, which reads as its zero: a `Resources` without
-//!   `disk_bytes` (field 6, added after format 1; zero is not written) is a vector that books
-//!   no disk, and the bytes of a vector with none are the bytes it always had;
 //! - the bytes [`encode`] would not have written (an explicit zero, a varint that is not
 //!   minimal, a field repeated or out of order): the value they stand for is decoded.
 //!
@@ -48,9 +43,7 @@
 //! - a required message field that is absent, a log id, term or machine version that is
 //!   zero, or a hash that is not 32 bytes;
 //! - a set (a closure, a touch) that is not in strictly increasing order;
-//! - an object id that names no one writer, a store id or an urgency past 16 bits;
-//! - a value its own type refuses (a custom QoS level, a capability request), as the
-//!   type's own constructor says.
+//! - an object id that names no one writer, or a store id past 16 bits.
 //!
 //! An error is fail-stop for the replica that meets it.
 
@@ -60,9 +53,7 @@ mod meta;
 use std::fmt;
 use std::num::NonZeroU64;
 
-pub use control::{
-    ActionEntry, Checkpoint, FarmBatch, FarmInput, MachineVersion, Report, Takeover,
-};
+pub use control::MachineVersion;
 use kbf_meta::Command;
 use kbf_proto::kbf::log::v1 as proto;
 use prost::Message;
@@ -163,19 +154,12 @@ pub enum LogCommand {
     Meta(Command),
     /// The log's first command.
     Bootstrap(Bootstrap),
-    /// Scheduler and farm inputs, batched.
-    Farm(FarmBatch),
-    /// A worker's result and the action-cache entry it writes.
-    Report(Report),
-    /// A new leader's first command.
-    Takeover(Takeover),
-    /// A determinism check.
-    Checkpoint(Checkpoint),
     /// Raises the machine version. A log written by an earlier build holds these; this
     /// build writes none outside its tests.
     MachineVersion(MachineVersion),
     /// A command this binary does not know: a `oneof` arm that no message of this binary
-    /// names, or an enum value it does not know inside a command it does. The entry's
+    /// names, a farm command of an earlier build, or an enum value it does not know
+    /// inside a command it does. The entry's
     /// bytes are not kept, so it cannot be encoded.
     Unknown,
 }
@@ -189,17 +173,6 @@ pub enum EncodeError {
     /// A digest names a hash function the format has no value for.
     #[error("a digest names a hash function log format 1 cannot encode")]
     DigestFunction,
-    /// A request's work key is not an action's (its dedup text is not an action digest),
-    /// which is all the format has a message for.
-    #[error("a request's work key is not an action digest, which log format 1 requires")]
-    WorkKey,
-    /// A control record is of a kind the format has no message for.
-    #[error("a control record is of a kind log format 1 cannot encode")]
-    Record,
-    /// A batch's wall-clock time is before the Unix epoch, or more than `u64::MAX`
-    /// nanoseconds after it.
-    #[error("a batch's wall-clock time is not a u64 count of nanoseconds since the Unix epoch")]
-    WallTime,
     /// A [`LogCommand::Unknown`] has no encoding.
     #[error("a command this binary does not know has no encoding")]
     Unknown,
@@ -245,15 +218,6 @@ pub enum DecodeError {
     /// A store id does not fit in 16 bits.
     #[error("Location.store {0} does not fit in 16 bits")]
     Store(u32),
-    /// A custom QoS level's urgency does not fit in 16 bits.
-    #[error("CustomQos.urgency {0} does not fit in 16 bits")]
-    Urgency(u32),
-    /// A custom QoS level that `Qos::custom` refuses.
-    #[error("invalid QoS level: {0}")]
-    Qos(#[from] kbf_types::QosError),
-    /// A capability request that `kbf_caps::Request::parse` refuses.
-    #[error("invalid capability request: {0}")]
-    Request(#[from] kbf_caps::RequestError),
     /// A set is out of order or repeats an element.
     #[error("{0} is not in strictly increasing order")]
     SetOrder(&'static str),
@@ -272,10 +236,6 @@ pub fn encode(format: Format, command: &LogCommand) -> Result<Vec<u8>, EncodeErr
             log_id: b.log_id.get(),
             store_prefix: b.store_prefix.clone(),
         }),
-        LogCommand::Farm(b) => P::Farm(control::batch_to_proto(b)?),
-        LogCommand::Report(r) => P::Report(control::report_to_proto(r)?),
-        LogCommand::Takeover(t) => P::Takeover(control::takeover_to_proto(t)),
-        LogCommand::Checkpoint(c) => P::Checkpoint(control::checkpoint_to_proto(c)),
         LogCommand::MachineVersion(v) => {
             P::MachineVersion(proto::MachineVersion { version: v.get() })
         }
@@ -314,12 +274,11 @@ fn command(bytes: &[u8]) -> Result<LogCommand, DecodeError> {
                 .ok_or(DecodeError::Missing("Bootstrap.log_id"))?,
             store_prefix: b.store_prefix,
         }),
-        Some(P::Farm(b)) => LogCommand::Farm(control::batch_from_proto(b)?),
-        Some(P::Report(r)) => LogCommand::Report(control::report_from_proto(r)?),
-        Some(P::Takeover(t)) => LogCommand::Takeover(control::takeover_from_proto(t)?),
-        Some(P::Checkpoint(c)) => LogCommand::Checkpoint(control::checkpoint_from_proto(c)?),
         Some(P::MachineVersion(v)) => {
             LogCommand::MachineVersion(control::machine_version_from_proto(v)?)
+        }
+        Some(P::Farm(_) | P::Report(_) | P::Takeover(_) | P::Checkpoint(_)) => {
+            return Err(DecodeError::UnknownCommand("LogCommand"));
         }
         None => return Err(DecodeError::UnknownCommand("LogCommand")),
     })

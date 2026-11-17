@@ -9,14 +9,15 @@ The design documents under [docs/design](docs/design) go deeper:
 
 | Document | Covers |
 |---|---|
-| [scheduler.md](docs/design/scheduler.md) | operations, leases, fencing, QoS, placement, accounting |
-| [simulation.md](docs/design/simulation.md) | the scheduler's simulations: what exists, the invariants every step checks, the scenario families to build and the defects each must catch |
+| [direct-js.md](docs/design/direct-js.md) | what an Execute does now: one job of the job service, submitted at once and read back by polling; endings, resubmits and cancel; the state-store rows that let any frontend answer by name and take up a gone process's operations |
+| [scheduler.md](docs/design/scheduler.md) | (**superseded** by direct-js.md) the earlier farm scheduler: operations, leases, fencing, QoS, placement, accounting |
+| [simulation.md](docs/design/simulation.md) | what is simulated (the Raft log, the object store writes, the write tier), the conventions every simulation keeps, and the one-server cell |
 | [storage.md](docs/design/storage.md) | the CAS and action cache, segments, metadata, retention, the object store interface |
 | [write-path.md](docs/design/write-path.md) | uploads grouped into shared segments (one PUT and one metadata commit per segment), segment upload (a client's outputs as whole segments, one metadata commit) and segment-range fills, a local NVMe/SSD write tier flushed to the object store, what an acknowledgement promises at each step, crash and lost-disk recovery, rollout and tests (grouping built; the rest **planned**) |
 | [write-tier-scenarios.md](docs/design/write-tier-scenarios.md) | every failure the local write tier must survive (crash points, store outages of minutes and hours, slow and failing stores, lost commits, disk full, bad sectors, torn tails, eviction and read races, node loss, leader change, clock jumps, the orphan sweep), the invariant each checks and the outcome expected, which run today against the direct path and which wait for the tier, and the simulation seams the tier plugs into (**planned**; the direct-path runs exist) |
 | [metadata-snapshots.md](docs/design/metadata-snapshots.md) | the snapshot encoding of the metadata state, compaction of the single-voter log, starting from a snapshot, version refusal, size and pause at today's scale and 10x, and how the HA design inherits it (**planned**) |
-| [worker-protocol.md](docs/design/worker-protocol.md) | `kbf.worker.v1`: messages and the rules both sides keep |
-| [capabilities.md](docs/design/capabilities.md) | node reports, ISA levels, matching an action to a node |
+| [worker-protocol.md](docs/design/worker-protocol.md) | (**superseded** by direct-js.md) `kbf.worker.v1`: messages and the rules both sides keep |
+| [capabilities.md](docs/design/capabilities.md) | (**superseded in part**) node reports, ISA levels, matching an action to a node |
 | [fleet-updates.md](docs/design/fleet-updates.md), [fleet-updates-security.md](docs/design/fleet-updates-security.md) | keeping node software current: rolling updates, MDM on Macs, Linux host updates, bare-metal GPU and app-install isolation, the Fleet UI; its security model: threat model, root helpers, signing keys, the MDM gate, enrollment (**planned**) |
 | [updates.md](docs/design/updates.md) | updates by a coordinator and an updater on every host: the heartbeat and its reply, the desired state CI sets with an OIDC token, the per-role limits and the order the coordinator decides by, one host's A/B, the trust (enrollment, mTLS, OIDC, attestation), the failures, and the three PRs (the coordinator is built; the host agent and the deletion of the ssh path are **planned**) |
 | [frontend-proxy.md](docs/design/frontend-proxy.md), [kbf-proxy-api.md](docs/design/kbf-proxy-api.md) | the front door of a frontend host: `kbf-proxy` terminating TLS and balancing each stream over a pool of frontends that share one Postgres state store, the identity headers it sends, a roll that drains, retires and restarts one frontend at a time, release compatibility, and the crate's API, limits and admin API |
@@ -48,9 +49,9 @@ on its own.
 **`kbf`** takes its mode from `--mode` (or `mode = "..."` in `kbf.toml`; the mode is a
 flag, never a word after `kbf`):
 
-- `frontend`: the REAPI front end. It takes the listener, scheduler, state-store and log
+- `frontend`: the REAPI front end. It takes the listener, executor, state-store and log
   flags of `kbf-server`, requires `--storage`, and holds no blob stores. With `--executor
-  js-agent` it places each action as a job of the jobscheduler's job service (crate
+  js-agent` it submits each action as a job of the jobscheduler's job service (crate
   `kbf-server`, module `executor`; [kbf-modes.md](docs/deploy/kbf-modes.md));
 - `storage`: the storage node. It takes the store, write and log flags of `kbf-server`
   and no state-store flag: a storage node reaches the state store only through a
@@ -63,7 +64,7 @@ it is a client of the frontend's operator API. Source: `crates/kbf-cli/src/lib.r
 
 **`kbf-server`** (crate `kbf-server`) is the whole server in one process: it serves REAPI to build clients and
 `kbf.worker.v1` to storage nodes, on two separate listeners. It holds the cache, the
-scheduler and the record of which workers are connected. Today one process runs every
+executor and the record of which storage nodes are connected. Today one process runs every
 role (`--role=all`). The flags are:
 
 - `--listen` (REAPI, default `127.0.0.1:8980`) and `--worker-listen` (storage nodes, default
@@ -90,36 +91,39 @@ role (`--role=all`). The flags are:
 - `--heartbeat-interval-ms`, `--vm-host-floor-cpus`, `--vm-host-floor-mem-gib` and
   `--pack-commit-sample`, retired flags of the worker session: accepted, ignored and warned
   about at start;
-- `--finished-retention-secs` (default 60), how long a finished operation is kept
+- `--finished-retention-secs` (default 600), how long a finished operation is kept
   for WaitExecution before its name is `NOT_FOUND`;
 - `--shutdown-timeout-secs` (default 0, no deadline), how long a stop (SIGINT or SIGTERM) waits
   for REAPI clients to disconnect after their open Execute and WaitExecution streams
   that are not done are ended `UNAVAILABLE` (a finished operation a stream is waiting
   on is still sent first);
-- `--state-store`, where the scheduler keeps its state: `postgres:///kbf?host=/run/postgresql`
+- `--state-store`, where the executor keeps the rows of its open operations (`exec/op/`,
+  `exec/live/`) and the answers of finished ones (`done/`, `doneof/`):
+  `postgres:///kbf?host=/run/postgresql`
   (a database on a local Unix socket, reached as the process's own user; a URL with a
-  password is refused) or `sqlite:///absolute/path`. Changes are written before they are
-  acknowledged and replayed at start, and every start is a new epoch, so workers kill the
-  runs of the leases they held before. Left out, the scheduler's state is in memory and a
-  restart loses it ([architecture-v2.md](docs/design/architecture-v2.md) section 4.3);
+  password is refused) or `sqlite:///absolute/path`. A restarted process, or another
+  frontend of the store, takes up the operations a gone process left
+  ([direct-js.md](docs/design/direct-js.md) section 3). Left out, the operations are in
+  memory and a restart loses them ([architecture-v2.md](docs/design/architecture-v2.md) section 4.3);
 - `--invocation-memory` (bytes, default 268435456, 256 MiB), the memory the invocation
   records take together ([invocations.md](docs/design/invocations.md) section 3.5):
-  each build's calls, leases and outcomes, kept in memory only and lost on restart;
+  each build's calls, jobs and outcomes, kept in memory only and lost on restart;
 - `--api-listen`, off unless given: the operator API, HTTP/JSON under `/v1`
   ([docs/api.md](docs/api.md)). Reads are open, so bind it where only operators
   reach it; writes need the token in `--api-token-file` (owner-only file), come from
   loopback, and carry no `Origin` header. Run `kbf-server` as a user other than the
   one the job service's agents and jobs run as, or a job on the same host can read the token.
 
-**Where an action runs.** A placed action runs only as a job of the jobscheduler's job
-service, submitted by the frontend's executor (`--executor js-agent`, the only value). The
-executor registers virtual workers with the frontend's farm (`js:<frontend id>-<n>` on
-Linux, `js-mac:<frontend id>-<n>` for Macs), so the scheduler books and places leases on
-them as on any worker, and turns each lease into one job. The job is the
+**Where an action runs.** Every Execute that the action cache does not answer runs as one job of
+the jobscheduler's job service, submitted at once by the frontend's executor (`--executor
+js-agent`, the only value) with no CPU or memory and the build target as its size-class label.
+kbf does not schedule: how many jobs run, where and when is the job service's. The executor
+reads each job back every `--executor-poll-ms` (250 ms) until it ends
+([direct-js.md](docs/design/direct-js.md)). The job is the
 `kbf-task` tool (crate `kbf-task`), which runs the action's Command and commits its outputs
 into a put directory that the frontend then reads once, hashes and records. With no
-`--executor` the frontend builds no executor: it serves the cache and the CAS and places
-nothing.
+`--executor` the frontend builds no executor: it serves the cache and the CAS and answers
+Execute `FAILED_PRECONDITION`.
 
 ## Crates
 
@@ -129,17 +133,15 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 
 | Crate | Pure | What it holds |
 |---|---|---|
-| `kbf-types` | yes | digests, images by manifest digest (`ImageRef`), platforms, QoS levels, lease ids, farm time, the `StateMachine` trait and `Effect` enum, `HostRole` (what a host runs, for the update coordinator) |
-| `kbf-sched` | yes | the scheduler state machine and the fence constants (a re-export of `js-sched`, in the jobscheduler repository) |
+| `kbf-types` | yes | digests, images by manifest digest (`ImageRef`), platforms, farm time, the `StateMachine` trait and `Effect` enum, `HostRole` (what a host runs, for the update coordinator) |
 | `kbf-meta` | yes | the metadata state machine: CAS index, action cache, closure check, retention |
 | `kbf-segments` | yes | the segment format and FastCDC chunking |
 | `kbf-caps` | yes | CPU capability parsing, ISA levels, request matching |
 | `kbf-raft` | yes | a sans-IO Raft core ([ADR 0001](docs/adr/0001-consensus.md)) and its host loop over `Storage`, `Transport` and `Machine` traits, with an in-memory storage |
-| `kbf-invocation` | yes | the invocation record ([invocations.md](docs/design/invocations.md) section 3): each build's header, counters and action rows, built only from events (calls, lease grants, starts, requeues, finishes), its `kbf.invocation.v1` encoding, and the memory bound of section 3.5 (minted, then idle records evicted; then the largest open one closed to new rows, and whatever else does not fit left out) |
+| `kbf-invocation` | yes | the invocation record ([invocations.md](docs/design/invocations.md) section 3): each build's header, counters and action rows, built only from events (calls, job submits, resubmits, finishes), its `kbf.invocation.v1` encoding, and the memory bound of section 3.5 (minted, then idle records evicted; then the largest open one closed to new rows, and whatever else does not fit left out) |
 | `kbf-map` | yes | the storage map (generation, members with address, zone, weight and state, rule, replication factor, minimum protocol, deny entries) and weighted rendezvous hashing over it: write owners, read order, and read order across two generations ([architecture-v2](docs/design/architecture-v2.md) sections 6 and 8); depends on `kbf-types` and a fixed-key SipHash only, so the frontend, storage, the daemon and the transfer engine can all use it |
 | `kbf-mapsync` | no | the storage map in motion: the `MapSource` seam a frontend implements (the map it holds and a generation that ticks when it changes), and the `MapHolder` a storage node keeps the newest pushed map in, never going back ([architecture-v2](docs/design/architecture-v2.md) section 6); depends on `kbf-map` and tokio's watch channel only |
-| `kbf-estimator` | yes | per-key memory and CPU size summaries and estimates learned from earlier runs, with an OOM floor and raise-only state (only the offline replay calls it yet) |
-| `kbf-estimator-replay` | no | the read-only exporter of the farm's run history (`kbf-estimator-replay export`: GET routes only, one JSON line per attempt, one file per UTC day); and a memory-only replay of the export through the real scheduler and `kbf-estimator` (`kbf-estimator-replay replay`); and `kbf-estimator-replay slowdown`, each successful run's wall time against the p10 of its estimator key's quiet runs |
+| `kbf-estimator` | yes | per-key memory and CPU size summaries and estimates learned from earlier runs, with an OOM floor and raise-only state (the scheduler no longer uses it; `kbf-front`'s metrics read its key and summary types) |
 | `kbf-objstore` | no | the `ObjectStore` trait and the S3 store, re-exported from `objstore-s3` (komira-ai/tierstore), an in-memory store, a local-directory store (`FsStore`, `kbf-server --cold-store=file://...`), the conformance suite, the segment-footer reader |
 | `objstore-s3` | no | not a member of this workspace: the `ObjectStore` trait, its key, range and page types and the S3 store, taken from [komira-ai/tierstore](https://github.com/komira-ai/tierstore) at the revision pinned in the root `Cargo.toml`; `kbf-objstore` re-exports it |
 | `update-hook` | no | the contract between a host updater and the update hook a service ships (the five steps and their arguments, exit codes 0/1/75/76, the JSON last line, the `--params` table, the next-step table as a pure function) and the conformance harness a service uses as a dev-dependency to prove its hook keeps it; the hook is any executable, `update-hook` is our convention; depends on no other workspace crate and is named without `kbf` (`kbf-integration-test` keeps both true) ([README](crates/update-hook/README.md)) |
@@ -147,19 +149,19 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `update-register` | no | the client of the host updater's registration socket: a service sends its name, version and an optional loopback health address and holds the connection open for as long as it runs (dropping it is `stopped`); each refusal the updater sends is a typed error; depends on no other workspace crate and is named without `kbf` (`kbf-integration-test` keeps both true) ([README](crates/update-register/README.md)) |
 | `kbf-step-runner` | no | the step runner of the generic host updater: one update from `prepare` to its verdict through a `StepLauncher`, the persisted step record and its resume, the dead-man thread, the staged-artifact digest checked before every step, the registration socket (`SO_PEERCRED`, liveness and version) and the updater's own update with its fallback; names no service and reads no declaration ([README](crates/kbf-step-runner/README.md)) |
 | `kbf-tier` | no | the local write tier's disk layer ([write-path.md](docs/design/write-path.md) section 6): block files in the hot store directory (`kbf-server --hot-store`) written in reserved ranges and synced (file and name) before a range may be committed, seals at the segment limit or after the seal-after interval, the hot store's budget, and the restart: the `TIER` check, staged blocks cut to their committed length, and the orphan sweep, against the committed state through `StagedIndex`; once flushed, blocks become `.seg` copies evicted least recently read first, only in what the budget leaves over. `kbf-front` (`Cache::attach_tier`, `Cache::flush_tier`) stages writes on it, reads staged blobs from it, and runs the flusher; `kbf-server` attaches it with `--hot-store` over either metadata log (nothing raises the log: the tier's commands commit to the Raft metadata log as it is) |
-| `kbf-state` | no | a re-export of the `js-state` crate of the jobscheduler repository, at the revision the workspace pins (`pub use js_state::*`; the `postgres`, `test-support` and `test-database` features forward to the same ones of `js-state`), so the code and its tests (the state store trait the scheduler writes every change through ([architecture-v2](docs/design/architecture-v2.md) section 4.1), the in-memory fake, the SQLite and Postgres backends, the conformance suite C1 to C8, `share`, and `postgres::schema::extend` and `ExtensionPool`, with which a crate that keeps tables of its own in the schema (`kbf-pack-index`) ships its migration) live and run in that repository's CI; the `state-postgres` CI job and the pull-request gate run kbf's consumers over the Postgres backend |
-| `kbf-job-client` | no | a typed gRPC client of the job service (`jobscheduler.v1.JobService` of `js-proto`, at the revision the workspace pins), which no farm code calls yet: submit (idempotent on the caller's job id), get, list (one page, or every page up to 10000 jobs), cancel, result and logs, taking and returning `js-proto`'s own messages; the job id checked before anything is sent; the bearer token from a 0600 file sent in the metadata of every call to the configured origin only, TLS pinned to one CA, plain http for loopback only; errors typed by what the caller does next (`Unreachable` nothing sent, `Transport` and `Decode` the server may have acted, `Refused` a refused submit with its refusal code, `Status` any other definite answer), each of the 17 gRPC codes classed in one table; with the `fake` feature, `FakeJobServer`, an in-process job service with the service's rules (idempotent submit and `job-id-conflict`, admission and its refusals, states moved by the test, cancel, results kept for the retention window on its own clock, host silence, file contents never returned) and faults of the connection; golden bytes in `tests/golden` copied from `js-proto`, held to the released service by `tests/js_real_service.rs` of kbf-integration-test (field set by field set, against the release `kbf-js-version.toml` pins); reaches no scheduler crate but `js-proto`, and no farm crate depends on it yet (the deploy tool `kbf-deploy` does, for `job-service check` and the canary job of `job-service apply`, and kbf-integration-test as a dev-dependency, for those tests) |
+| `kbf-state` | no | a re-export of the `js-state` crate of the jobscheduler repository, at the revision the workspace pins (`pub use js_state::*`; the `postgres`, `test-support` and `test-database` features forward to the same ones of `js-state`), so the code and its tests (the state store trait the executor writes its operation rows through ([architecture-v2](docs/design/architecture-v2.md) section 4.1), the in-memory fake, the SQLite and Postgres backends, the conformance suite C1 to C8, `share`, and `postgres::schema::extend` and `ExtensionPool`, with which a crate that keeps tables of its own in the schema (`kbf-pack-index`) ships its migration) live and run in that repository's CI; the `state-postgres` CI job and the pull-request gate run kbf's consumers over the Postgres backend |
+| `kbf-job-client` | no | a typed gRPC client of the job service (`jobscheduler.v1.JobService` of `js-proto`, at the revision the workspace pins), which the executor of `kbf-server` calls: submit (idempotent on the caller's job id), get, list (one page, or every page up to 10000 jobs), cancel, result and logs, taking and returning `js-proto`'s own messages; the job id checked before anything is sent; the bearer token from a 0600 file sent in the metadata of every call to the configured origin only, TLS pinned to one CA, plain http for loopback only; errors typed by what the caller does next (`Unreachable` nothing sent, `Transport` and `Decode` the server may have acted, `Refused` a refused submit with its refusal code, `Status` any other definite answer), each of the 17 gRPC codes classed in one table; with the `fake` feature, `FakeJobServer`, an in-process job service with the service's rules (idempotent submit and `job-id-conflict`, admission and its refusals, states moved by the test, cancel, results kept for the retention window on its own clock, host silence, file contents never returned) and faults of the connection; golden bytes in `tests/golden` copied from `js-proto`, held to the released service by `tests/js_real_service.rs` of kbf-integration-test (field set by field set, against the release `kbf-js-version.toml` pins); reaches no scheduler crate but `js-proto`, and no farm crate depends on it yet (the deploy tool `kbf-deploy` does, for `job-service check` and the canary job of `job-service apply`, and kbf-integration-test as a dev-dependency, for those tests) |
 | `kbf-trees-client` | no | a typed gRPC client of a build node's tierstore trees interface (`tierstore.trees.v1.TreesService` of `tierstore-trees-api`, at the one tierstore revision the workspace pins), which no farm code calls yet (the executor's input-tree stage of [trees-for-action-inputs.md](docs/design/trees-for-action-inputs.md) will): `CreateTree`, `GetPlacement` and `DeleteTree`, taking and returning the generated messages; the node's tree digest and the placement id checked and kept as `TreeDigest` and `PlacementId`, no digest of kbf's own computed; one node per client (`host:port`, as a host's address label carries it); each call signed with SigV4 over the gRPC path and the SHA-256 of its whole body, as tierstore checks it, the secret never sent; TLS pinned to one CA, plain for loopback and, off loopback, only with an explicit opt-in; errors typed by what the caller does next (`Unreachable` nothing sent, `Transport` and `Decode` the node may have acted, `Refused` a refusal of the node by its tierstore name with what it is about, `Status` any other definite answer); with the `fake` feature, `FakeTreesServer`, an in-process trees interface that checks each signature and keeps the node's rules (idempotent create by tree and locations, location taken, unknown child tree, marked sources missing, short or lying, a pin limit under `wait`, a salted digest of its own, unknown placement, directory listings) and faults of the connection; reaches no kbf crate and no tierstore crate but `tierstore-trees-api` (`trees_client_layer` of `tests/layering.rs`, which also holds every tierstore crate to one revision) |
-| `kbf-usage` | no | what kbf learns from the measured use of its leases, for the job scheduler's admission, as a library that no farm code calls now (its caller, the js scheduler core's usage side, was removed with that core; the crate stays with the other crates the legacy core uses until the legacy core is removed after the cutover to the job service): the name of a profile from an estimator key (`profile_name`, the SHA-256 of the key's five parts, so a profile is that of an action shape and not of one digest), the bounded index from an action to its profile name that the scheduler's curve source reads (`ShapeIndex`), a worker's id as the recorder's host id (`HostNames`: the id when it fits, else a hashed `w-` name, counted), the sink that owns the `js-usage` recorder and profile store over the farm's state store (`ProfileSink`: lease minutes in, runs ended, a flush for a tick that also drops the node series nobody stores, the curves), the seam a `js-usage` `UsageHub` is made over (`KbfUsageSink`, a `UsageSink` over `ProfileSink` with no node series, and `RunKeys`, a `KeySource` from a bound run to its action's profile name through `ShapeIndex`) and the `--usage-profiles` mode (`UsageMode`: `off`, `record`, `on`); depends on `kbf-types`, `kbf-estimator`, `kbf-state` and `js-usage` of the jobscheduler repository at the pinned revision |
+| `kbf-usage` | no | the profile names, shape index and sink the usage recorder was built on; no part of `kbf-server` reads it now |
 | `kbf-history` | no | build history in the object store ([ui-data.md](docs/design/ui-data.md) section 5), as a library not yet wired into the server: the one container format (a versioned header, zstd blocks of length-prefixed protobuf records, a footer with the block index and the family summary, a trailer with the footer's CRC-32C), object keys led by retention class (`r7`, `r30`, `r45`, `r400`) and the `ui/` index row keys; the run, hit and outcome records, tails, command renderings and failed-run sections, each with its `instance`; time-ordered run ids minted from memory (stream blocks from the `ui/streams` counter, a fallback range that never waits); the writer core (chunks cut by size, age, day, stream and close; object written first and index rows second through `kbf-state`; bounded queues and a bounded set of open invocations that drop and count; rows dropped past the bound restored from the object's footer with no LIST); the reader (a run id to its record, an invocation to its header and newest chunk summary, its records a bounded page of chunks at a time, all-must-allow across instances); the index seam (`HistoryIndex`: rows under an `IndexRoot`, every blocking state-store call through an `Offload` the server supplies); and `Scoped`, an object store that refuses every key outside `history/` |
 | `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch`, and the invocation `Recorder` the services and the farm send events to (a channel bounded in events and bytes that drops, never waits) |
 | `kbf-gate` | no | the fail-closed gate library every CI/CD stage shares ([kbf-cicd](docs/design/kbf-cicd.md) sections 5.2, 7 and 10): the result document (one shape, written RUNNING first and FINISHED on every exit a drop guard or `fail_and_exit` can see), a Prometheus text reader whose absent series is red, the gate verdicts, and the one definition of a release set's hash; its only I/O is the document's atomic write, and the layering test keeps it off the async stack and off other kbf crates |
-| `kbf-storage` | no | the storage boundary ([architecture-v2.md](docs/design/architecture-v2.md) sections 3 and 13): the `Storage` trait (FindMissing, whole-blob read and write, a streamed write, the `Segments` service, the action cache) and its `StorageError`. `kbf-front`'s `CacheStorage` puts the cache behind it and `kbf-server`'s `LocalStore` calls through it; the cache's code is to move here. Depends on no frontend crate: not `kbf-sched`, not `kbf-auth` (`crates/kbf-integration-test/tests/layering.rs`) |
+| `kbf-storage` | no | the storage boundary ([architecture-v2.md](docs/design/architecture-v2.md) sections 3 and 13): the `Storage` trait (FindMissing, whole-blob read and write, a streamed write, the `Segments` service, the action cache) and its `StorageError`. `kbf-front`'s `CacheStorage` puts the cache behind it and `kbf-server`'s `LocalStore` calls through it; the cache's code is to move here. Depends on no frontend crate: not `kbf-auth` (`crates/kbf-integration-test/tests/layering.rs`) |
 | `kbf-peer` | no | the role a peer's certificate names ([architecture-v2.md](docs/design/architecture-v2.md) section 9): the one reader of its `urn:kbf:role:<name>` URI subjectAltName (`role_of`), which the storage service's per-endpoint table and the worker listener's per-method table (`kbf-server`'s `worker_roles`) ask; no gRPC, so a tool that checks a certificate can use it too; `uri_values_of`, the URI values of one prefix (the update coordinator reads an updater's host role with it) A fourth role, `updater`, is a host's updater (`urn:kbf:role:updater`, with the host role in `urn:kbf:host-role:<name>` read by `uri_values_of`); the worker listener's role table serves it four HTTP calls about its own node (`kbf-server`'s `node_self`) and no gRPC method. |
 | `kbf-enroll` | no | the node's side of enrollment (`docs/design/install-and-enrollment.md`, sections 4 and 5, on its own branch until it merges): `kbf.toml` with every field validated, the enroll token file, first contact checked against the CA fingerprint in the token (`pin`), `Enroll` and `Renew` over `kbf.enroll.v1` with one key per role made on the node, the answer's checks, the key and certificate files written atomically (`store`), the schedule of renewal, and the cold-store keys a storage node holds in memory only; a library, called by the start of a node mode in `kbf-cli` (`kbf --mode=storage`) `Config::updater` and `Store::unopened` serve a host's updater, whose role `updater` has its own `updater.key` and `updater.pem` (`kbf-updater enroll`, `docs/deploy/kbf-updater.md`). |
-| `kbf-server` | no | the server: wires front, scheduler and storage together (`start` returns a `ServerHandle`; the `kbf-server` binary is a thin main over it, so `kbf` can run the server in its own process; the stores its flags name, `--cold-store`, `--hot-store` and `--meta-dir`, are parsed and resolved in `stores`); the executor (`executor`, built by `--executor js-agent`), which runs a placed action as a job of the jobscheduler's job service, as a virtual worker of the farm, with no change to the scheduler core |
+| `kbf-server` | no | the server: wires front, executor and storage together (`start` returns a `ServerHandle`; the `kbf-server` binary is a thin main over it, so `kbf` can run the server in its own process; the stores its flags name, `--cold-store`, `--hot-store` and `--meta-dir`, are parsed and resolved in `stores`); the executor (`executor`, built by `--executor js-agent`), which runs each action that misses the cache as one job of the jobscheduler's job service, polls it to its end and answers the operation ([direct-js.md](docs/design/direct-js.md)) |
 | `kbf-proto` | no | generated code for REAPI, `kbf.worker.v1`, `kbf.storage.v1`, `kbf.log.v1`, `kbf.map.v1` (the storage map's messages, with their conversions to and from `kbf-map` types) and `kbf.update.v1` (self-update: offer, order, status, release fetch) |
-| `kbf-log` | no | the replicated log's entry encoding: `kbf-meta` commands and the control commands (batched farm inputs (a lease grant with the cost admission charged it, left out when it is the default), a result with its action-cache entry, takeover, checkpoint, machine version) to and from `kbf.log.v1`, under the log's format version |
+| `kbf-log` | no | the replicated log's entry encoding: `kbf-meta` commands and the control commands (batched farm inputs, a result with its action-cache entry, takeover, checkpoint, machine version) to and from `kbf.log.v1`, under the log's format version |
 | `kbf-transfer` | no | the shared blob transfer engine: the `Cas` trait, and `Transfers`: one HTTP/2 connection to the worker listener with explicit windows, one in-flight limit and byte budget for every caller, one fetch per digest however many callers ask, FindMissing before every upload, resumed reads after a broken connection, and each caller's `TransferStats` |
 | `kbf-image` | no | the node's image source: a digest-verified registry client (hyper over rustls) and the layer unpacker (whiteouts, ownership, in-root path resolution) |
 | `kbf-cas-conformance` | no | the checks every implementation of the data plane (`kbf_transfer::Cas`) must pass, generic over the implementation (`tests!`); run against the gRPC implementation `kbf_transfer::Transfers` |
@@ -180,7 +182,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-state-copy` | no | the cutover tool that moves a frontend's SQLite state file into an empty Postgres store, a binary of its own and never part of `kbf` (`kbf-state-copy <state.db> <postgres-url>` is a dry run, `--apply` copies; [state-store-cutover.md](docs/deploy/state-store-cutover.md)): it reads the file through rusqlite alone, read-only and immutable, and refuses a frontend that holds the lock beside it, a write-ahead log that holds writes the file does not, a store that is not empty or whose schema is not the version it was built for, and clocks more than 2 seconds apart; it then copies every row and counter in one transaction with its version kept and its expiry converted from nanoseconds to microseconds, sets the head revision and revision sequence past the highest version, compares row counts and a SHA-256 digest per key family inside the transaction before it commits (a mismatch rolls back) and again on a new connection after; its `cutover` command (an operator-only step) runs that copy and then points the frontend's one state-store setting, the `[scheduler] state-store` key of `kbf.toml` or a `--state-store=` flag of a unit file, at Postgres, keeping the original file byte for byte as `<file>.pre-postgres` and renaming the new text over it, and its `rollback` command renames the backup back (both are dry runs without `--apply`, and neither changes the SQLite file); exit status 0 done, 2 refused, 1 failed |
 | `kbf-alert` | no | alerts with their exact fix; the alert book (raise and resolve with hysteresis) and the outbox, both pure modules; the webhook notifier, which keeps the outbox in a file. Nothing raises alerts yet |
 | `kbf-store` | no | a Raft server's durable state on the local disk, as a `kbf_raft::Storage`: a segmented append-only log of CRC-32C records, the hard state (term, vote) and the newest snapshot, whose segments it covers are removed only once it is durable; a torn tail cut at open, any other damage refused; the first write or fsync error stops the store; all I/O through an `Fs` trait, with a fault-injecting in-memory `FaultFs` for crash tests |
-| `kbf-sim-cell` | no | the whole-cell simulation: one server assembled from `RaftMetaLog`, the scheduler and the `FarmMachine` on a fault-injecting disk, with fake workers, clients and an object store, checked against properties 1 to 7 of the high-availability design and the write path's properties 8 and 9 after every step, with object-store faults (hang, slow, failures, lost answers), crashes at named points of the write path, the local write tier (`kbf-tier` on a second fault-injecting disk, staged writes, the flusher, reads, crashes at named tier points, a full disk, a bad sector, eviction) checked against the tier's invariants (properties 10 to 13), and a seed sweep that reports every failing seed ([simulation.md](docs/design/simulation.md#8-the-cell-kbf-sim-cell), [write-tier-scenarios.md](docs/design/write-tier-scenarios.md)) |
+| `kbf-sim-cell` | no | the whole-cell simulation: one server assembled from `RaftMetaLog` on a fault-injecting disk, with fake clients (`FindMissingBlobs`, upload, check again) and an object store, checked against properties 1 and 5 to 7 of the high-availability design and the write path's properties 8 and 9 after every step, with object-store faults (hang, slow, failures, lost answers), crashes at named points of the write path, the local write tier (`kbf-tier` on a second fault-injecting disk, staged writes, the flusher, reads, crashes at named tier points, a full disk, a bad sector, eviction) checked against the tier's invariants (properties 10 to 13), and a seed sweep that reports every failing seed ([simulation.md](docs/design/simulation.md#3-the-cell-kbf-sim-cell), [write-tier-scenarios.md](docs/design/write-tier-scenarios.md)) |
 | `kbf-ui` | no | the server-rendered pages ([ui-data.md](docs/design/ui-data.md) 6.1 and 8): pages made only from the read API's JSON documents through a `Source` the server gives them, each declaring the routes it reads (its reader refuses any other) and listing the URLs it read; HTML escaped by construction (`html::Html`, no public raw write); every answer with the `Content-Security-Policy` of section 8 and `nosniff`; one embedded token-based stylesheet, no script. Builds (an id lookup), Build and Action; not mounted on the server yet |
 | `kbf-unitfile` | yes | the systemd unit-file reader the deploy docs check, `kbf-deploy`, `kbf-harness` and the packaged-unit tests share: `UnitFile::parse` (sections, `Key=value`, `\` continuations joined with a space, comments skipped, systemd's `WHITESPACE` trimmed), last-assignment-wins reads (`get`, `get_in`, `exec_start`, `flag`), `extend` for a drop-in, and `comments_in_continuations`; no kbf dependency |
 | `tierstore` | no | not a member of this workspace: the generic hot/cold object store, its S3 front and the `tierstore` binary, taken from [komira-ai/tierstore](https://github.com/komira-ai/tierstore) at the revision pinned in the root `Cargo.toml` (`kbf-front` and `kbf-task` use it; the `tierstore` release asset is built and released there) |
@@ -229,15 +231,14 @@ client                      kbf frontend                             job service
   |--------------------------->| 1. AC lookup (closure check): hit -> done
   |                            | 2. Action, Command, input tree in CAS?  |
   |                            |    no -> FAILED_PRECONDITION (MISSING)  |
-  |                            | 3. submit: join a running twin, or queue|
-  |<-- QUEUED -----------------| 4. place on a virtual worker, propose   |
-  |                            |    the lease                            |
-  |                            | 5. lease committed                      |
-  |<-- EXECUTING --------------|--- submit job -------------------------->| kbf-task runs the action,
-  |                            |                                         | writes outputs to its put dir
+  |                            | 3. submit: join an open operation of    |
+  |                            |    the same action, or open a new one   |
+  |<-- QUEUED -----------------| 4. write exec/op/<id>, submit the job --->| kbf-task runs the action,
+  |                            |    (no CPU, no memory, size class)      | writes outputs to its put dir
+  |                            |<-- GetJob every --executor-poll-ms -----|
   |                            |<-- job ended ---------------------------|
-  |                            | 6. read the pack, hash, outputs stored? |
-  |                            | 7. accept, write the AC entry           |
+  |                            | 5. read the pack, hash, outputs stored? |
+  |                            | 6. accept, write the AC entry           |
   |<-- done (ExecuteResponse) -|                                         |
 ```
 
@@ -246,23 +247,27 @@ client                      kbf frontend                             job service
 2. **Inputs.** The `Action`, its `Command` and every blob of its input tree must be in
    the CAS; each one that is not becomes a `MISSING` violation in a single
    `FAILED_PRECONDITION`, as REAPI asks.
-3. **Submit.** The front hands the request to the scheduler through the `Dispatch`
+3. **Submit.** The front hands the request to the executor through the `Dispatch`
    trait. If an identical action (same instance name and action digest) is already
-   in flight and both may be joined, the caller is attached to it (in-flight dedup).
-4. **Place.** The scheduler grants a lease on a worker with room (one of the executor's
-   virtual workers) and asks for the grant to be committed. The executor is told with a
-   `LeaseOffer`, on which it runs nothing.
-5. **Start.** Only once the grant is committed does the executor get `Start` and submit the
-   job.
-6. **Result.** The server accepts a result only for the operation's current lease, and
-   only if every output it names is already stored: the frontend reads the pack the job
-   committed once, hashes it and stores the blobs before it records the result.
-7. **Answer.** An accepted successful result (exit code 0, not `do_not_cache`) is
+   open on this frontend, the caller is attached to its operation (in-flight dedup).
+4. **Job.** The executor submits the job at once, under an id made of the frontend, the
+   operation and the attempt, so a submit whose answer was lost makes no second job. It
+   keeps no queue: the job service decides when and where the job runs. A job that ends
+   as the farm's fault (host lost, job unknown, refused at its start, killed at its memory
+   limit) is submitted again as the next attempt, at most 2 times; an action's own timeout
+   or an action that cannot run is answered at once.
+5. **Result.** The frontend accepts a clean result only if every output it names is
+   already stored: it reads the pack the job committed once, hashes it and stores the
+   blobs before it records the result.
+6. **Answer.** An accepted successful result (exit code 0, not `do_not_cache`) is
    written to the action cache *before* the callers are answered.
+
+`CancelOperation` cancels the job and answers the callers `CANCELLED`. A stream that ends does
+not cancel it, and nothing is cancelled when a frontend stops.
 
 `WaitExecution` streams the same stages for an operation name that Execute returned, and
 `GetOperation` reads the stage the name's operation is at, once. A finished operation is
-kept for `--finished-retention-secs` (60 by default), in which WaitExecution streams its
+kept for `--finished-retention-secs` (600 by default), in which WaitExecution streams its
 done operation, so a client whose Execute stream broke still gets a result the action
 cache does not keep; then it is forgotten, and the next Execute for it is answered from
 the action cache.
@@ -270,18 +275,17 @@ the action cache.
 Over a state store, an operation name is `operations/<id>`:
 the operation's id, which the store numbers (each server reserves blocks of ids, so an id
 names one operation on every server of the store and across restarts). Any server answers
-the name: from its scheduler if it holds the operation, otherwise from the store's rows,
+the name: from its memory if it runs the operation, otherwise from the store's `done/` row (an operation another frontend runs is followed until that row appears),
 and a result stays in the store for at least ten minutes (`DONE_FLOOR`, or the finished
 retention if that is longer), so a client that reconnects to another server after the finish still
 gets it. After that, or for a name nobody gave, the answer is `NOT_FOUND`. A server with no
 state store (tests only) names an operation `operations/{term}-{n}`: its process's term
-(the one its leases carry) and a count that starts at 0 in each process, and answers no
+and a count that starts at 0 in each process, and answers no
 other name, so a client still holding a name from an earlier process is never attached to
 another action's operation. A name of that form is answered over a store only by the
 process that issued it, while it holds the caller.
 
-See [scheduler.md](docs/design/scheduler.md) and
-[worker-protocol.md](docs/design/worker-protocol.md).
+See [direct-js.md](docs/design/direct-js.md).
 
 ## Where state lives
 
@@ -289,10 +293,8 @@ See [scheduler.md](docs/design/scheduler.md) and
 |---|---|---|
 | CAS index, action cache, farm time | `MetaState` behind `RaftMetaLog`, applied from a single-voter Raft log on local disk (`--meta-dir`, or `<hot store>/meta`); behind `MemoryMetaLog`, in the process's memory, only in tests | the Raft log with three voters |
 | Blob bytes | segments in an object store (in memory, or an S3 bucket) | the same, with garbage collection and multiple stores |
-| Leases, operations, workers | `Scheduler` in the server's memory; with `--state-store` (Postgres or SQLite, through `kbf-state`; a frontend always has one) each change is written to the store before it is acknowledged and replayed at start; without it a control record "commits" when appended and a restart loses them | the same state machine fed from a replicated control log, kept on the servers' local disks |
-| Memory kills | the scheduler's `MemoryState`, in the server's memory: each action key's memory floor and the order the floors were raised in, each held operation's memory-killed runs and busy-node reruns, each node's busy-node kill count; it compares with `Eq` | the same, inside the machine fed from the replicated control log |
-| Callers, started leases, node registry | `FarmMachine` (`kbf-server`'s `machine` module) in the server's memory: each caller's record, the finished operations whose callers are kept for the finished retention, the leases whose `Start` was sent, and each node that has registered with whether its newest stream is open and its newest `NodeStatus`; each caller's channel and each node's stream stay beside it in the farm core, which tells the machine when a stream has closed | the same machine fed from the replicated control log |
-| Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | report changes noticed by hash; the node registry kept durable through the replicated control log, with alerts on absent nodes |
+| Open operations, finished answers | the executor's memory, and with `--state-store` (Postgres or SQLite, through `kbf-state`; a frontend always has one) the rows `exec/op/<id>` (owner, action, attempt, job id), `exec/live/<instance>` (a process is alive) and `done/<id>`, `doneof/<id>`, written before the job is submitted and deleted when the operation finishes; without a store a restart loses them | the same rows, kept as they are |
+| Jobs | the job service's, not kbf's: kbf holds only each operation's job id | the same |
 
 Under `MemoryMetaLog` (tests only; the binary has no flag for it) the index is in memory,
 so a restarted server forgets every blob, and an S3 store gets a fresh key prefix at
@@ -308,15 +310,9 @@ replicated log changes the implementation behind the seam, not its callers:
   state. `MemoryMetaLog` is the single-process implementation; `RaftMetaLog` (in
   `kbf-server`) implements the same two calls over a single-voter Raft log.
 - `ObjectStore` (in `kbf-objstore`): five calls any S3-compatible store can serve, and `may_hold`, which a local store answers from its files and any other with yes.
-- `Dispatch` (in `kbf-front`): how the REAPI front reaches the scheduler.
-- `FarmMachine` (in `kbf-server`): a pure struct that compares with `Eq`; it reads
-  no clock and holds no hashed map, which clippy checks for the module.
-  `MemoryState` (in `kbf-sched`, read through `Scheduler::memory_state`) is the
-  scheduler's first part that compares with `Eq`.
-- `StateMachine` (in `kbf-types`): inputs in, effects out. The server carries out the
-  scheduler's `Commit`, `Start` and `Answer` effects. The one place a control record
-  is appended and fed straight back as committed is the step a replicated log
-  replaces.
+- `Dispatch` (in `kbf-front`): how the REAPI front reaches what runs its Executes (the
+  executor of `kbf-server`, one job of the job service for each).
+- `StateMachine` (in `kbf-types`): inputs in, effects out; the metadata state is one.
 
 ## One endpoint, a leader and its followers
 
@@ -347,29 +343,11 @@ with what exists today and the probes still to run. In short:
   metadata commit. So the byte traffic is shared across the three hosts. A follower
   may answer a false "missing", which only makes the client upload again, but never a
   false "present". The leader of the control log keeps every metadata write,
-  `Execute` and `WaitExecution`, and every worker stream, so one place sees all free
-  room on all workers and places every action. A follower takes over when it is
+  `Execute` and `WaitExecution`. A follower takes over when it is
   elected. The first deployment is a single server.
-- **Workers dial the servers directly (planned).** A worker's stream does not go through
-  the front: it is given the servers as one DNS name with a record per server, or a
-  list, dials them over mutual TLS and holds one stream, to the leader. A follower
-  ends a worker's session with a status naming the leader, or answers `UNAVAILABLE`
-  when it knows none, and the worker tries the next server. A failover keeps running
-  leases: the lease epoch names the replicated log, and the worker resends its results
-  to the new leader. Today the workers of a frontend are its executor's virtual workers,
-  in its own process, and storage nodes dial the worker listener.
-- **Locality comes from placement.** The front sees a request's method but not what
-  it is about, so kbf gets locality inside: workers report which inputs they hold,
-  and placement prefers a worker that already has an action's inputs.
-
-What already holds for this shape in the single-server code: the seams above, lease
-ids that carry the granting process's term (the Raft term of the metadata log), a
-scheduler that refuses results from leases it does not hold, a lease epoch in
-`Welcome` that makes a worker drop leases a restarted server never granted (with
-the Raft log the epoch is the log id, the same at every start, so the worker keeps
-its runs, and until the scheduler's state is in the log a restart leaves them running
-as orphans whose results are refused), and a worker protocol in which only the newest
-stream of a worker counts. See [scheduler.md](docs/design/scheduler.md#more-than-one-server).
+- **Executes need no leader.** Each frontend submits its own jobs to the job service; over a
+  state store any frontend answers an operation by name and takes up a gone frontend's
+  operations ([direct-js.md](docs/design/direct-js.md) section 3).
 
 ## Security model
 
@@ -482,15 +460,13 @@ The project's testing rules are T1 to T19 of [AGENTS.md](AGENTS.md): tests asser
 behaviour, a bug fix ships a test that failed before the fix, and the coverage gate checks every crate for 99% of lines and branches, or its floor in
 [coverage-floors](coverage-floors), which may only rise. How the code is tested:
 
-- **Pure cores, unit-tested.** The scheduler, metadata, segment, capability and Raft
+- **Pure cores, unit-tested.** The metadata, segment, capability and Raft
   crates are plain state machines with plain tests; each test says which defect it
   catches.
 - **Deterministic simulation.** `kbf-sim` runs state machines on a virtual clock with
   a seeded random stream and a message bus that delays, drops, duplicates, reorders
   and partitions. The same seed gives the same trace hash on any machine, so a failing
-  seed is a complete bug report. The scheduler runs there with a control log and
-  workers that disconnect, reboot and restart (checks: every `Start` names a committed
-  lease, every operation is answered once, no self-fenced operation runs twice). The
+  seed is a complete bug report. The
   Raft core runs there with crashes part-way through its effects (checks: election
   safety, log matching, leader completeness, state machine safety).
 - **Contract suites.** Every object store backend must pass the conformance suite in

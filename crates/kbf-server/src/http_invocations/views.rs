@@ -5,11 +5,11 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use kbf_invocation::RequeueReason;
 use kbf_invocation::{
     ActionRow, ActionShape, Attempt, AttemptEnd, Counts, Durations, Histogram, How, Invocation,
     Outcome, Phase, Run, RunUsage, State, Text, Usage, WallTime, failure_name, requeue_name,
 };
-use kbf_sched::RequeueReason;
 use kbf_types::Digest;
 use serde_json::{Map, Value, json};
 

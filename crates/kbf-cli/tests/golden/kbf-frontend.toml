@@ -39,7 +39,7 @@ enroll-rate-per-minute = 60
 # frontend-name = []
 
 [executor]
-# Where the farm runs the actions it places: `js-agent`, the only value, runs each as a job of the job scheduler's job service, in the kbf image (`--executor-kbf-image`, built from `--executor-base-image`), whose task tool runs the action inside it; it needs the job service's flags (`--executor-job-url`, `--executor-job-token-file`, and `--executor-job-ca-file` for https), `--executor-frontend-id`, the release's base tree bundles (`--executor-base-tree`), the packs (`--pack-store-endpoint`) and the secret delivery (`--executor-secret-delivery`, with `--executor-insecure-argv-secrets` for its default `argv`); the virtual workers' shape (`--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`) has defaults. The executor runs on exactly one frontend: a second frontend that has jobs on the same job service stops. A restart of the frontend fails the builds in flight. A frontend stopped cancels its jobs; a killed frontend's jobs run to their wall limit, unless a later `js-agent` start cancels them. Left out, no executor is built and no job service is contacted, whatever the other `--executor-*` flags say; `--executor-insecure-argv-secrets` is then ignored
+# Where the frontend runs the actions it is asked to execute: `js-agent`, the only value, runs each Execute as a job of the job scheduler's job service, in the kbf image (`--executor-kbf-image`, built from `--executor-base-image`), whose task tool runs the action inside it; it needs the job service's flags (`--executor-job-url`, `--executor-job-token-file`, and `--executor-job-ca-file` for https), `--executor-frontend-id`, the release's base tree bundles (`--executor-base-tree`), the packs (`--pack-store-endpoint`) and the secret delivery (`--executor-secret-delivery`, with `--executor-insecure-argv-secrets` for its default `argv`). Left out, no executor is built and no job service is contacted, whatever the other `--executor-*` flags say; `--executor-insecure-argv-secrets` is then ignored
 # executor = "KIND"
 # Says jobs may be given an open network: what `--executor-network open` needs, and refused with any other `--executor-network`. Off by default. Used only with `--executor js-agent`
 executor-allow-open-network = false
@@ -47,7 +47,7 @@ executor-allow-open-network = false
 executor-allow-plain-http-grant = false
 # Lets the task write its pack to an `http://` url, until the store serves TLS. The reads stay https unless `--executor-allow-plain-http-grant` says otherwise. Used only with `--executor js-agent`
 executor-allow-plain-http-put = false
-# The CPU architecture of the Linux hosts. Every job of a Linux action asks for a host of `os=linux`, this `arch` and containers, and the virtual workers report them to the farm (the Macs' are `arm64`, `--executor-mac-hosts`). Used only with `--executor js-agent`
+# The CPU architecture of the Linux hosts. Every job of a Linux action asks for a host of `os=linux`, this `arch` and containers (the Macs' are `arm64`). Used only with `--executor js-agent`
 executor-arch = "x86_64"
 # The base environment the Command of an action sees, pinned by digest as `<repository>@sha256:<64 hex digits>` (a leading `docker://` is optional). It is the one image an action's `container-image` platform property may name: an action that names another is refused as invalid, one that names none gets this. A tag is refused. Needed with `--executor js-agent`
 # executor-base-image = "IMAGE"
@@ -59,22 +59,26 @@ executor-base-tree-keep = 1
 executor-base-tree-timeout-secs = 60
 # Where the release's base tree files are looked up when `--executor-base-tree` lacks them: a list of releases in the shape of GitHub's `GET /repos/<owner>/<repo>/releases` (an array, each release with `assets` of `name` and `browser_download_url`), read a page at a time (`?per_page=100&page=N`) until a release lists the bundle and the `SHA256SUMS`. https, or http on loopback. Empty fetches nothing: the files must then be in `--executor-base-tree` already. Used only with `--executor js-agent`
 executor-base-tree-url = "https://api.github.com/repos/komira-ai/kbf/releases"
-# How long one call to the job service may take before it counts as unanswered, in seconds. Under the fence time. Used only with `--executor js-agent`
+# How long one call to the job service may take before it counts as unanswered, in seconds. Used only with `--executor js-agent`
 executor-call-timeout-secs = 5
 # The timeout, in seconds, of an action that names none: at most `--executor-max-run-secs`. Used only with `--executor js-agent`
 executor-default-timeout-secs = 3000
 # The most bytes of a failed job's standard error the frontend writes to its log, at WARN, with the job's secrets redacted: the end of the stream. 0 writes none. The whole output (up to 8 KiB with standard output) goes with the result either way. Used only with `--executor js-agent`
 executor-failed-stderr-log-bytes = 512
-# The name of this frontend on the job service: the value of the `kbf-frontend` label on its jobs, by which a restarted frontend finds and cancels the ones an earlier process left, hashed into every job id, and the name of its virtual workers (`js:<ID>-<n>`, and `js-mac:<ID>-<n>` for the Macs; with `--executor-ownership shared`, `<ID>.<the first 8 characters of the process's instance>` in place of `<ID>`). 1 to 63 of letters, digits, `-`, `_` and `.`. It must be different for each frontend (not copied with the config), except that the frontends of one `--executor-ownership shared` group give the same one. Used only with `--executor js-agent`
+# The name every frontend of the farm gives: the value of the `kbf-frontend` label of every job, hashed into the job ids. 1 to 63 of letters, digits, `-`, `_` and `.`. It is the same for every frontend of one farm, not unique to each. Used only with `--executor js-agent`
 # executor-frontend-id = "ID"
-# The CPU cores of a virtual worker: the most the farm books on it at once. At least 1. A ceiling, as for `--executor-hosts`. Used only with `--executor js-agent`
-executor-host-cpus = 32
-# The memory, in GiB, of a virtual worker. The farm counts each run as 1.5 times its booking plus 512 MiB (what a Mac job needs; a Linux job names no memory and the job service sizes it from its class's history), and the bookings of a worker add up to what is left after that. A ceiling, as for `--executor-hosts`. Used only with `--executor js-agent`
-executor-host-memory-gib = 128
-# The most actions a virtual worker has in flight at once, reported to the farm as its action slots. Used only with `--executor js-agent`
-executor-host-slots = 8
-# How many virtual workers the farm places actions on, each of the shape below: how many actions of which size the farm may have in flight as jobs. A ceiling on what this frontend admits, not the hardware: the job service decides which host runs each job and holds the real capacity, so set it lower only to cap this frontend. Used only with `--executor js-agent`
-executor-hosts = 4
+# Retired: no longer read, every Execute is a job of the job service
+# (not in --help)
+# executor-host-cpus = "CORES"
+# Retired: no longer read, every Execute is a job of the job service
+# (not in --help)
+# executor-host-memory-gib = "GIB"
+# Retired: no longer read, every Execute is a job of the job service
+# (not in --help)
+# executor-host-slots = "RUNS"
+# Retired: no longer read, every Execute is a job of the job service
+# (not in --help)
+# executor-hosts = "WORKERS"
 # What a Linux put-directory job's root is read from. `manifests`, the default: the action tree's manifests, the job's layer `<mp>/trees/<digest>`. `provider`: one tree list of the tree, the job's layer tierstore's mount provider, which fetches the tree's files while the job's sandbox is made. `provider` needs `--task-out-mode put-dir`. A Mac job's root is always `manifests`. Used only with `--executor js-agent`
 executor-input-tree = "manifests"
 # Says the secrets of a task (the presigned write url, the read token) may travel as arguments of the job, where the action can read them from `/proc` and the engine's inspect shows them. It is what the default `--executor-secret-delivery argv` needs, and `--executor-secret-delivery files` refuses it. Off by default
@@ -87,33 +91,36 @@ executor-insecure-argv-secrets = false
 # executor-job-url = "URL"
 # The kbf image, pinned by digest like `--executor-base-image` and built from it, that every job is launched from. It keeps the task tool as its `ENTRYPOINT`, so the job's arguments are the tool's flags and the action runs inside this image. Must be another image than the base. Needed with `--executor js-agent`
 # executor-kbf-image = "IMAGE"
-# How long the liveness row of a frontend lives after its last renewal, on the state store's clock, with `--executor-ownership shared`: at least the fence time (40 s) and 5 s. Used only with `--executor js-agent`
-executor-live-secs = 45
+# How long the liveness row of this process lives in the state store after its last renewal, on the store's clock, in seconds. Once it has expired, another frontend of the store takes up this process's unfinished operations. Read only with `--state-store`. Used only with `--executor js-agent`
+executor-live-secs = 20
 # Has the task tool ask the read listener where each input is kept (`GET /locate`). The answer names no store and no grant (tierstore v0.3.29 removed the store read grants), so the task still reads every input through the listener, as without the flag; every byte is checked against its digest. Off by default. Used only with `--executor js-agent`, and refused without it
 executor-locate = false
-# How many virtual workers stand for the job service's Macs, each of the shape of `--executor-host-*`, reporting `os=macos` and `arch=arm64`: the farm places an action whose platform asks for macOS on them, and each becomes a job of a Mac's native runtime that runs `--executor-mac-task-bundle`. 0, the default, registers none, and the farm places no macOS action on this executor. Needs `--executor-mac-task-bundle`. Used only with `--executor js-agent`
-executor-mac-hosts = 0
-# The least major macOS every Mac of the job service runs. An action's `os_version` is the least it takes (`26` means 26 or newer), and one that asks for a newer macOS than this is refused, naming both: the job service cannot be asked for a version. Used only with `--executor-mac-hosts`
+# Retired: no longer read, every Execute is a job of the job service
+# (not in --help)
+# executor-mac-hosts = "WORKERS"
+# The least major macOS every Mac of the job service runs. An action's `os_version` is the least it takes (`26` means 26 or newer), and one that asks for a newer macOS than this is refused, naming both: the job service cannot be asked for a version. Used only with `--executor-mac-task-bundle`
 executor-mac-os-version = 26
-# The release's macOS `kbf-task` bundle, by its manifest digest (the one entry of the `index.json` of `kbf-task-bundle-<commit>-darwin-arm64.tar.gz`): the image of a Mac job, whose entrypoint `kbf-task` runs. Needed with `--executor-mac-hosts`, refused without it
+# The release's macOS `kbf-task` bundle, by its manifest digest (the one entry of the `index.json` of `kbf-task-bundle-<commit>-darwin-arm64.tar.gz`): the image of a Mac job, whose entrypoint `kbf-task` runs. It enables the Macs: without it no action whose platform asks for macOS is run, and `--executor-mac-os-version` and `--executor-mac-task-out-root` are refused. Used only with `--executor js-agent`
 # executor-mac-task-bundle = "NAME@sha256:HEX"
-# The tier store's put directory on the Macs, if it is not `--task-out-root`: a Mac job mounts its put directory under it and its action tree from the `trees` directory beside it. Used only with `--executor-mac-hosts`, refused without it
+# The tier store's put directory on the Macs, if it is not `--task-out-root`: a Mac job mounts its put directory under it and its action tree from the `trees` directory beside it. Used only with `--executor-mac-task-bundle`, refused without it
 # executor-mac-task-out-root = "PATH"
 # The longest action timeout the executor runs, in seconds; an action that asks for more is refused. Used only with `--executor js-agent`
 executor-max-run-secs = 3000
-# The network every job is given on its host. `allow-list`, the default, is the endpoints the host's agent is set up to allow and nothing else: the task reaches the read listener and the pack store only once each agent allows them, and a host whose agent cannot check those limits refuses the job (`egress-unchecked`), which the farm runs again. `none` is no route out: every action fails, as the task can reach neither. `open` is any address but those the agent always denies, and needs `--executor-allow-open-network`. Used only with `--executor js-agent`
+# The network every job is given on its host. `allow-list`, the default, is the endpoints the host's agent is set up to allow and nothing else: the task reaches the read listener and the pack store only once each agent allows them, and a host whose agent cannot check those limits refuses the job (`egress-unchecked`). `none` is no route out: every action fails, as the task can reach neither. `open` is any address but those the agent always denies, and needs `--executor-allow-open-network`. Used only with `--executor js-agent`
 executor-network = "allow-list"
-# Who owns the jobs. `single`, the default, runs the executor on exactly one frontend per `--executor-frontend-id`: it stops if another frontend has jobs, cancels at start the jobs an earlier process left, and cancels its jobs when it ends. `shared` lets any number of frontends of one `--executor-frontend-id` serve beside each other over one `--state-store`: each keeps the rows of its jobs there, and cancels a job only when the farm withdraws it (a lease or the worker's whole stream), never at start or at its end. `shared` needs `--state-store`. Used only with `--executor js-agent`
-executor-ownership = "single"
-# How often the executor polls the job service for its jobs, in milliseconds: 100 to 10000. Together with the fence time it must stay under the scheduler's re-dispatch grace, which is checked at start. Used only with `--executor js-agent`
-executor-poll-ms = 1000
-# How many runs of one virtual worker prepare their inputs at once. The farm gives a worker a full set of `Start`s at one instant, and preparing them all together slows each until none is ready inside its window; the ones past this wait their turn. Used only with `--executor js-agent`
-executor-prepare-concurrency = 4
-# How long the inputs of one run (its action, its input tree published into the store, its keys) may take to prepare, in seconds. The `Start`'s own window ends only the submit, not the preparation, which goes on until this limit so the tree it publishes is there for the run the farm starts next. Used only with `--executor js-agent`
+# Retired: no longer read, every Execute is a job of the job service
+# (not in --help)
+# executor-ownership = "MODE"
+# How often each operation's job is read back from the job service, and a submit whose answer was lost is sent again, in milliseconds: 100 to 10000. Used only with `--executor js-agent`
+executor-poll-ms = 250
+# Retired: no longer read, every Execute is a job of the job service
+# (not in --help)
+# executor-prepare-concurrency = "COUNT"
+# How long the inputs of one run (its action, its input tree published into the store, its keys) may take to prepare, in seconds; a run whose preparation takes longer ends as an infrastructure failure. Used only with `--executor js-agent`
 executor-prepare-limit-secs = 300
 # What a job's wall limit adds to the action's timeout, in seconds: the fetch of the inputs and the upload of the pack. An action that fetches or uploads for longer than this ends at the wall limit and is answered to the caller as a timeout. Used only with `--executor js-agent`
 executor-run-margin-secs = 300
-# How the secrets of a task (the presigned write url, the read token) reach it. `argv`, the default, passes them as arguments of the job and needs `--executor-insecure-argv-secrets`. `files` passes each as a file of the job, which its host writes read-only at `/run/js-files`: no argument holds a secret, and `--executor-insecure-argv-secrets` is refused with it; a host whose agent cannot write files refuses to start the job, and the farm runs the action again. `files` is refused without `--executor js-agent`, which builds the command line
+# How the secrets of a task (the presigned write url, the read token) reach it. `argv`, the default, passes them as arguments of the job and needs `--executor-insecure-argv-secrets`. `files` passes each as a file of the job, which its host writes read-only at `/run/js-files`: no argument holds a secret, and `--executor-insecure-argv-secrets` is refused with it; a host whose agent cannot write files refuses to start the job. `files` is refused without `--executor js-agent`, which builds the command line
 executor-secret-delivery = "argv"
 # Where the task tool works in the container, if not in its own default: the kbf image must have a writable directory there. Used only with `--executor js-agent`
 # executor-work-dir = "DIR"
@@ -195,7 +202,7 @@ job-reads-in-flight = 32
 [listener]
 # The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are open to whoever reaches it: bind it where only operators do
 # api-listen = "API_LISTEN"
-# When set, how long, in seconds, after a drain (a stop signal or `POST /v1/frontend/drain`) has refused new executions it reports the ones still open: a WARN with their count, and `deadline_passed` in `GET /v1/frontend/drain`. It never ends a stream or stops the drain: absent, the default, and set alike, the drain waits for the open executions for as long as they run, and the process stays up serving them. Only a second stop signal, or `--shutdown-timeout-secs` on a stop signal (default none), forces a stop and ends the streams that are left UNAVAILABLE. The one stream that does not wait is that of an operation that was never started, that no worker on this frontend can run and that no other frontend can take: it ends UNAVAILABLE as the drain begins (Buck2 retries only the opening of a call), and the operation stays queued for the other frontends. No upper bound; at least 1.
+# When set, how long, in seconds, after a drain (a stop signal or `POST /v1/frontend/drain`) has refused new executions it reports the ones still open: a WARN with their count, and `deadline_passed` in `GET /v1/frontend/drain`. It never ends a stream or stops the drain: absent, the default, and set alike, the drain waits for the open executions for as long as they run, and the process stays up serving them. Only a second stop signal, or `--shutdown-timeout-secs` on a stop signal (default none), forces a stop and ends the streams that are left UNAVAILABLE. No upper bound; at least 1.
 # drain-deadline = "SECONDS"
 # How long, in seconds, a drain (a stop signal or `POST /v1/frontend/drain`) keeps serving everything after `/readyz` has begun to answer 503, so that the load balancer's health check sees it before any call is refused: at least its check interval times its unhealthy threshold, and the time its routes take to change. Then new Execute calls are refused UNAVAILABLE and every listener is sent GOAWAY. 0 goes on at once. The container's stop timeout must exceed this and the longest action to be waited for.
 drain-lb-wait = 10
@@ -215,7 +222,7 @@ reapi-max-streams = 10000
 # release-poll-repo = "OWNER/NAME"
 # Retired: no longer read, the release store was removed; a directory left there is not touched. Accepted and ignored for one release
 # releases-dir = "DIR"
-# The operator's hard stop, in seconds, for a stop (SIGINT or SIGTERM). A stop refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done, however long that takes; the exception is a stream whose operation was never started and that no worker on this frontend can run (say every capable worker is cordoned) and no other frontend can take, which ends UNAVAILABLE as the drain begins (Buck2 retries only the opening of a call). The operation stays queued. The default, 0, is no deadline: the stop waits indefinitely, and a second signal is the other way to end it at once. Buck2 never recovers a stream that breaks mid-action, so set one only to force a stop: when it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off). `--drain-deadline` on a frontend over a state store only reports
+# The operator's hard stop, in seconds, for a stop (SIGINT or SIGTERM). A stop refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done, however long that takes. The default, 0, is no deadline: the stop waits indefinitely, and a second signal is the other way to end it at once. Buck2 never recovers a stream that breaks mid-action, so set one only to force a stop: when it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off). `--drain-deadline` on a frontend over a state store only reports
 shutdown-timeout-secs = 0
 # How often, in seconds, a TLS listener looks at its certificate, key and client CA files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is applied to the next TLS handshake, with no restart and without ending a connection already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable, not PEM, a key that is not the certificate's, an expired certificate, a renewal caught between its two writes) are logged and counted in `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving; the next look finds them whole and applies them. The files must be good at start
 tls-reload-interval-secs = 30
@@ -233,11 +240,11 @@ log-files = 8
 log-max-bytes = 67108864
 
 [memory]
-# What the farm does with `kbf-estimator`, which predicts an action's memory from what its earlier runs used. `off` calls it never. `shadow` shows it every attempt that finishes and logs, for every new operation, a `size estimate:` line with what it would book, and counts how the attempts fall against its estimates (`kbf_estimator_shadow_total`); it books exactly what `off` books. `on` is `shadow` plus one change to a booking: a kill at an action's own memory limit leaves a floor under the action's key (instance, platform class, instrument and shape), which every later digest of the key, queued or new, books at least, strictly below the memory of the largest node that could run it. The floor falls only by the estimator's decay: it halves once the key has run 256 times and 7 days have passed without an own-limit kill or a sample above half of it, and a floor that falls to the first rung or below is dropped; a kill raises it again. Only an action whose memory the client did not name, on a platform that pins the OS, is keyed. The size summaries and the keys are kept in the state store, in rows of their own that a release without this flag never reads; `off` neither reads nor deletes the summaries, and ignores the keys. The memory a floor raised a queued operation to is not stored: a restart, or a rollback to `off`, books such an operation at its submitted memory until it ends
-learned-sizes = "off"
-# The memory rungs of an action, in GiB, ascending and each at least 1. The first is what an action that names no size (`kbf-book-mem-gib`) books. An action that passes its own memory limit runs again on the next rung above what it booked, and after the last on a whole host: the memory of the largest node that could run it, so that no other lease fits there. A rung not below that node's memory is skipped for the whole host. An action that does finish keeps its rung: later runs of it start there
-memory-ladder-gib = [4, 16, 32]
-# Keeps an action's memory booking where it started. An action that passes its own memory limit is not run again on the next rung of `--memory-ladder-gib`: the kill finishes it, FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, as a kill at the largest node does, and its attempt is recorded with `memory_kill` `own_limit`. A booking is therefore the first rung, or the GiB the action names in `kbf-book-mem-gib`. No floor is raised, so with `--learned-sizes on` an own-limit kill leaves none either. A kill the node made under memory pressure is not the action's: it runs again with the same booking, as it does without this flag
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# learned-sizes = "MODE"
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# memory-ladder-gib = "GIB"
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
 no-memory-climb = false
 
 [packs]
@@ -265,58 +272,58 @@ pack-upload-idle-timeout = 30
 pack-writer = "frontend"
 
 [scheduler]
-# The OS and architecture, as `<os>/<arch>` (`linux` or `macos`; `x86_64` or `arm64`), of an action whose platform names no OS, no architecture and no ISA level, so that it is not given to whichever node sorts first, a Mac among them. Not applied to an action that asks for `xcode` or an iOS device, which only a Mac reports. `none` applies no default: such an action runs on any node that fits. Placement only: the action's digest and cache key do not change
-default-platform = "linux/x86_64"
-# Every `action` lease books the whole worker it lands on: all of its CPUs and all of its memory, whichever worker that is, so that exactly one action runs per worker and a second waits for it. The action digest is the client's and does not change (the per-action `kbf-book-cpus` and `kbf-book-mem-gib` properties would split the action cache); this is a setting of the server. `kbf-book-cpus` and `kbf-book-mem-gib` are still checked, but no longer change what is booked. `kbf-lease=whole_machine` and `vm` leases are as they were. An action killed for passing its own memory limit has no larger booking to climb to, so `--memory-ladder-gib` has no further rung to give it: it finishes out-of-memory, as an action that already books the largest node does, and its memory floor is not raised. A worker books by what it reported at registration. The setting is not kept in the state store, so a server restart ends it for the operations the store holds: one that was queued is read back as an ordinary action, and one that was running is recovered holding only the booking the front computed for it, not the worker, so ordinary actions can be placed beside it and, if it is lost or requeued, it runs again as an ordinary action. A run that needs one action per worker must not restart the server. Off by default
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# default-platform = "OS/ARCH"
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
 exclusive-actions = false
-# How long, in seconds, a finished operation is kept after its callers are answered. Within it, WaitExecution on the operation's name streams its result (a client whose Execute stream broke gets a result the action cache does not keep, such as a failure); after it, the name is NOT_FOUND. Every operation finished within it is held in memory
-finished-retention-secs = 60
+# How long, in seconds, a finished operation is kept after its callers are answered. Within it, WaitExecution on the operation's name streams its result (a client whose Execute stream broke gets a result the action cache does not keep, such as a failure); after it, the name is NOT_FOUND, unless the state store still holds the result (at least ten minutes). Every operation finished within it is held in memory
+finished-retention-secs = 600
 # Retired: no longer read, the worker session was removed. Accepted and ignored for one release
 # heartbeat-interval-ms = "MILLISECONDS"
 # Opens the pack index at start: the tables in the Postgres state store that say which pack holds each blob and where. A frontend given `--pack-store-endpoint` reads and writes them; without it nothing does, and the flag only checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack table is touched
 pack-index = false
-# Whether placement reads the load the nodes report. `off`, the default, books by the CPUs a lease asks for, as the server always has, and reads no load. `on` admits and ranks nodes by the load they report and the load a lease is predicted to add; a node that reports none is charged by prediction alone, and a node that has never sent a reading the server accepted is charged at least 1000 m for each lease (the node's whole CPU capacity, if that is less), so a prediction under one core changes nothing for such a node. `on` also keeps the flat memory charged to a node's leases within the node's memory; that guard counts only leases that carry a memory (a retry up the memory ladder, a VM) unless `--placement-predictions on` gives leases one
-placement-load = "off"
-# Whether the farm gives its scheduler the estimator's prediction of what a new operation costs, from the rows `--learned-sizes` keeps, so that placement charges the learned cores and memory instead of the cores the request asked for and no memory. `off`, the default, computes none. `shadow` computes the prediction at submit, gives the scheduler nothing, and compares it with the run when it ends: the cores the run used on average, its peak memory and its life in whole minutes, each counted as under (the run used more than predicted), fit (at most the prediction and at least half of it) or over (less than half of it) in `kbf_prediction_vs_run_total`; the operations given a prediction are counted in `kbf_prediction_made_total` and those given none, by why, in `kbf_prediction_unset_total`. Placement is exactly what `off` does. `on` gives the scheduler the prediction as the cost of the operation's lease, at submit (and again for an operation read back from the state store at a start), which charges the learned memory as well as the cores: a lease is admitted to a node only while the memory charged to the node's leases stays within the node's memory. An operation the estimator has no usable row for, or is not asked about (not an action, one that asks for a GPU, no OS pinned, no subject), gets none and is charged as it is with `off`. `shadow` and `on` need `--learned-sizes shadow` or `on`; `on` needs `--placement-load on`; a prediction only changes what the lease is charged: the memory limit and the cores it is booked and run with stay the request's and the ladder's. A server given a combination that breaks one of these refuses to start
-placement-predictions = "off"
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# placement-load = "MODE"
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# placement-predictions = "MODE"
 # How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
 progress-interval-secs = 30
-# The QoS levels a call may ask for with the `x-kbf-qos` request header, as a comma list of `ci`, `batch` and `interactive` (`ci` is always allowed: it is what a call with no header, or a header naming a level not on the list, gets, and that call is never refused). The level orders the queue, most urgent first: a `batch` action waits behind every queued `ci` action. It is not part of the action digest, so it does not split the cache. A client that sends no header stays at `ci`
-qos-allowed = "ci,batch"
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# qos-allowed = "LEVELS"
 # How often, in milliseconds, a frontend asks each of the dependencies behind `GET /readyz` (the storage node, the state store, the storage map) again, in the background. `GET /readyz` and the REAPI listener's `grpc.health.v1` service answer from the last answers at once and wait for no probe; a probe that has not answered within `--readyz-store-timeout-ms` counts as failed
 readyz-probe-interval-ms = 1000
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready
 readyz-store-timeout-ms = 2000
-# Which core drives the farm's scheduling. The one value is `legacy`, the default: the driver the server has always had. `js` names a core that was removed, because scheduling runs in the job service, and is refused at start (exit status 2). The core a server runs is logged at start and exported as `kbf_scheduler_core{core}`, the one series `kbf_scheduler_core{core="legacy"} 1`
-scheduler-core = "legacy"
-# Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a local Unix socket, reached as this process's own user (peer authentication; a URL with a password is refused, as the command line is world-readable). The server must flush commits before it acknowledges them (`synchronous_commit` on) or the start is refused; the tables are created if missing. Or `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing: 0600, and 0700 for a directory it makes; a second frontend on it refuses to start); SQLite is removed in the next release, so a start on it logs a warning (see the upgrade notes). A start keeps the epoch the store holds, so workers that reconnect keep the runs of the leases they hold; an operator raises it with `kbf cluster epoch-bump`, after a restore from a backup. `kbf frontend` refuses to start without it; left out of `kbf-server`, the scheduler's state is in memory and a restart loses it
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# scheduler-core = "CORE"
+# Where the storage members and the unfinished operations are kept, so that another frontend, or this one after a restart, answers and takes them up: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a local Unix socket, reached as this process's own user (peer authentication; a URL with a password is refused, as the command line is world-readable). The server must flush commits before it acknowledges them (`synchronous_commit` on) or the start is refused; the tables are created if missing. Or `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing: 0600, and 0700 for a directory it makes; a second frontend on it refuses to start); SQLite is removed in the next release, so a start on it logs a warning (see the upgrade notes). `kbf frontend` refuses to start without it; left out of `kbf-server`, the operations are in memory and a restart loses them
 # state-store = "URI"
 # How long, in seconds, the start waits for a Postgres `--state-store` that is not up yet (connection refused or reset, a Unix socket that does not exist yet, a connect that times out, or the server answering that it is starting up), trying again after 250 ms and then after twice as long each time, up to 10 s. The window is the time spent waiting between attempts; the time inside an attempt (a connect that times out) is not counted, so the whole wait can be longer. A store that refuses (a URL that does not parse, a login, a missing database, a schema this build does not accept) is not waited for: the frontend exits 2 at once. If the window is used up with the store still not up, the frontend exits 1, not 2, so that a unit which restarts on failure and prevents a restart on exit 2 starts it again. 0 does not wait, and exits 2 as it did before this flag. At most 3600.
 state-store-wait-secs = 300
-# How long, in seconds, queued work waits while no connected worker can run it (none satisfies its platform, or none that does is large enough) before it is refused FAILED_PRECONDITION. The wait restarts whenever one can
-unservable-wait-secs = 300
-# Whether the farm learns what its leases use. Only `off`, the default, is accepted: it learns nothing and writes no row. `record` and `on` were run by the js scheduler core, which was removed because scheduling runs in the job service, and a start given one is refused (exit status 2). The mode a server runs is logged at start as `usage profiles: <mode>` and exported as the gauge `kbf_usage_profiles_mode{mode}`, 1 for the mode and 0 for the others
-usage-profiles = "off"
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# unservable-wait-secs = "SECONDS"
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# usage-profiles = "MODE"
 # Retired: no longer read, the worker session was removed. Accepted and ignored for one release
 # vm-host-floor-cpus = "CPUS"
 # Retired: no longer read, the worker session was removed. Accepted and ignored for one release
 # vm-host-floor-mem-gib = "GIB"
-# Lets a reservation start on the last worker an older ordinary request that waits could run on. Off, the request waits for another worker, so a whole-machine request never takes the only worker such a request has
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
 whole-node-allow-last-capable = false
-# How long, in seconds, a whole-machine request waits before it reserves a worker; until then it takes only a worker with no lease. 0, the default, reserves at once
-whole-node-drain-after-secs = 0
-# How long, in seconds, a reservation is expected to drain its worker: the deadline the queue document shows. Reaching it gives nothing up: the reservation stays until the request is granted or cancelled, or the worker can no longer hold it, and nothing running is stopped. Left out, the request's longest wall time, the `timeout` of its action; an action that names none has no wall time, and its deadline is the end of time
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# whole-node-drain-after-secs = "SECONDS"
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
 # whole-node-drain-deadline-secs = "SECONDS"
-# The fewest workers that carry neither a reservation nor a whole-machine lease, so ordinary work always has them. 0 lets whole-machine requests take every worker
-whole-node-keep-for-ordinary = 1
-# Turns on the whole-node drain and caps for whole-machine requests (`kbf-lease` `whole_machine`), and names the most workers that may be whole at once: held by a whole-machine lease or reserved for a queued request (a request that fits nowhere reserves the worker that will empty soonest, and nothing newer is placed there). The ceiling is also at most the workers that serve whole-machine leases less `--whole-node-keep-for-ordinary`, and falls as workers leave. Left out, the scheduler books whole-machine requests as it always has, and the other `--whole-node-*` flags are refused. A request's reservation is never given up: it ends when its worker is empty and the request is granted, or when the request is cancelled or the worker can no longer hold it
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# whole-node-keep-for-ordinary = "WORKERS"
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
 # whole-node-max = "WORKERS"
-# The most workers reserved for a queued whole-machine request that still run other leases at once: the idle capacity a drain may cost. Default 1
-whole-node-max-draining = 1
-# Deprecated: a reservation is never given up, so there is no attempt to count. Still read, and refused at 0, so a configuration that names it starts; it changes nothing. Default 2
-whole-node-max-reserve-attempts = 2
-# How long, in seconds, a worker stays barred to a request after a failed prepare there. kbf bars no worker this way and a reservation is never given up, so the setting changes nothing; it is still read, so a configuration that names it starts. Default 300
-whole-node-reserve-backoff-secs = 300
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# whole-node-max-draining = "WORKERS"
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# whole-node-max-reserve-attempts = "COUNT"
+# Retired: no longer read, kbf schedules nothing. Accepted and ignored for one release
+# whole-node-reserve-backoff-secs = "SECONDS"
 
 [storage-client]
 # The storage node the frontend proxies blobs to, as `http://host:port` or `https://host:port` with the three flags below. Left out, the frontend has no storage node: it needs `--executor js-agent`, `--pack-index` and `--pack-store-endpoint` (and its companions); client uploads are kept in packs (and, over the pack bound, as `cas/l/` objects) in that object store, the action cache is the `action_result` table of the Postgres state store, and `/readyz` asks the state store and the job service and nothing else. Needs the installer's action-cache migration
@@ -411,7 +418,7 @@ task-put-retry-secs = 60
 task-url-slack-secs = 600
 
 [tls]
-# A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the worker's, whose builds could read it. Without it, writes are refused
+# A file holding the token operator API writes (a frontend drain, a member's state) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the worker's, whose builds could read it. Without it, writes are refused
 # api-token-file = "API_TOKEN_FILE"
 # A file holding the per-boot secret of the TLS-terminating proxy in front of this server (`docs/design/frontend-proxy.md`, section 3): exactly 32 bytes, owned by the server's user with mode 0600 or 0400, read at start. The proxy presents them as 64 lower-case hex digits in `x-kbf-proxy-auth`. With it, the REAPI, worker and operator listeners take calls from loopback only, and believe `x-kbf-node-id` and `x-kbf-role` only from a call that presents the secret; every other `x-kbf-*` header is dropped. The worker listener then takes the proxy's identity in place of a client certificate (it needs no TLS flags), and the operator API's writes must come through the proxy as well as carry the token (a local `curl` write is refused). The storage listener is not covered: it keeps its own mutual TLS. Without it, behavior is as before
 # proxy-auth-file = "PATH"

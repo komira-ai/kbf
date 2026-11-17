@@ -220,15 +220,6 @@ const STEPS: &[(&str, IsStep)] = &[
         )
     }),
     ("safe-to-stop", |v| matches!(v, Verb::SafeToStop { .. })),
-    ("drain", |v| {
-        matches!(
-            v,
-            Verb::Drain {
-                frontend: false,
-                ..
-            }
-        )
-    }),
     ("planned-down", |v| {
         matches!(
             v,
@@ -238,7 +229,6 @@ const STEPS: &[(&str, IsStep)] = &[
             }
         )
     }),
-    ("undrain", |v| matches!(v, Verb::Undrain { .. })),
 ];
 
 /// The steps of [`STEPS`] that no command of `page` in a block with info string `info`
@@ -297,8 +287,8 @@ fn every_kbf_cluster_command_in_the_deploy_docs_parses_with_kbfs_parser() {
 
 #[test]
 fn the_switch_page_has_every_step_in_its_walk_and_in_its_held_script() {
-    // Catches: a step of the switch (the repoint, the status read, safe-to-stop, drain,
-    // planned-down, undrain) dropped from the page's walk (its `text` blocks) or from
+    // Catches: a step of the switch (the repoint, the status read, safe-to-stop,
+    // planned-down) dropped from the page's walk (its `text` blocks) or from
     // the held script (its `shell` block).
     let page = switch_page();
     assert_eq!(missing_steps(&page, "text"), Vec::<&str>::new(), "the walk");
@@ -318,9 +308,7 @@ fn a_step_only_printed_or_with_another_state_is_missing() {
 echo \"+ kbf cluster object-store repoint --connection cold --endpoint http://x --expect-generation 7 --token-file f\"
 kbf cluster object-store status --token-file f
 kbf cluster safe-to-stop 1 --token-file f
-kbf cluster drain n --token-file f
 kbf cluster member 1 --state draining --for-secs 9 --token-file f
-kbf cluster undrain n --token-file f
 ```
 ";
     assert_eq!(missing_steps(script, "shell"), ["repoint", "planned-down"]);

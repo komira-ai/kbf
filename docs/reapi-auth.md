@@ -212,6 +212,6 @@ a listener that only trusted people reach.
   `jmespathExpression` and `remote` authorizers, as above.
 - Reading the policy file again when it changes.
 - Tracing attributes from the metadata.
-- Using the metadata to choose a QoS or for fair sharing between callers (in the
-  manner of Buildbarn's invocation keys taken from authentication metadata). Every
-  Execute is still QoS `ci`.
+- Using the metadata for fair sharing between callers (in the manner of Buildbarn's
+  invocation keys taken from authentication metadata). kbf does not schedule: every
+  Execute is one job of the job service, submitted at once.

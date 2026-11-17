@@ -1,30 +1,49 @@
-//! The harness: a farm, a job service, an executor, and fakes for what the executor reads
-//! from the rest of the server.
+//! The harness: an executor over a fake job service, and fakes for what the executor reads from
+//! the rest of the server.
+//!
+//! Time here is real, bounded by [`PROMPT`] wherever a test waits for an event; the executor
+//! reads its jobs every few milliseconds ([`POLL`]). A test never asserts how long anything took.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use js_proto::v1::{ExecMode, Job, JobSpec, JobState, Shape};
-use kbf_front::{Backend, Cache, Described, Dispatch, Finished, Stage, Submission};
+use bytes::Bytes;
+use js_proto::v1::{
+    ExecMode, GetJobResponse, GetResultResponse, Job, JobResult, JobSpec, JobState, ResultReason,
+    Shape,
+};
+use kbf_auth::AuthenticationMetadata;
+use kbf_front::{
+    CallMetadata, Described, Dispatch, ExecuteCall, Finished, InvocationId, Recorder, Stage,
+    Submission,
+};
 use kbf_job_client::Client;
-use kbf_job_client::fake::{Call, FakeJobServer, Machine};
+use kbf_job_client::fake::{Call, FakeJobServer, Fault, Machine};
 use kbf_proto::reapi::{ActionResult, Digest};
-use kbf_sched::Request;
-use kbf_server::Farm;
-use kbf_server::executor::rows::ExecRows;
+use kbf_server::executor::rows::Rows;
 use kbf_server::executor::{
     ActionFacts, Config, Deps, Executor, Ingest, Ingested, InputTree, Inputs, InputsError, Metrics,
-    MintError, Ownership, PackKey, Presign, PresignError, PutDirRoots, ReadGrant, Secret,
-    SizeClass, TaskOut, UntrustedLimits, build_id,
+    MintError, PackKey, Presign, PresignError, ReadGrant, RunId, Secret, SizeClass, System,
+    UntrustedLimits, build_id,
 };
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
-use kbf_types::{ActionKey, LeaseKind, Qos, Resources};
+use kbf_types::{ActionKey, DigestFunction};
+use prost::Message as _;
 use tokio::sync::watch;
+use tokio::time::{sleep, timeout};
 
-pub const GIB: u64 = 1 << 30;
+/// How long a test waits for something that should happen promptly.
+pub const PROMPT: Duration = Duration::from_secs(10);
+
+/// How often the rig's executor reads its jobs back.
+pub const POLL: Duration = Duration::from_millis(5);
+
+/// The one Linux host of a rig that has any.
+pub const HOST: &str = "host-1";
+
 /// The class of a build of `root//pkg:t`, which every action of the fake inputs is:
 /// `root.pkg.t.build`.
 pub fn built_class() -> SizeClass {
@@ -46,9 +65,6 @@ pub struct FakeInputs {
     /// The action tree of a put-directory run.
     pub tree: Mutex<Result<String, InputsError>>,
     pub looked_up: Mutex<Vec<String>>,
-    /// While set, the read of an action waits for `release` (a slow CAS).
-    pub hold: std::sync::atomic::AtomicBool,
-    pub release: tokio::sync::Notify,
 }
 
 impl FakeInputs {
@@ -57,7 +73,7 @@ impl FakeInputs {
             facts: Mutex::new(Ok(ActionFacts {
                 image: IMAGE.to_owned(),
                 timeout: Some(Duration::from_secs(60)),
-                system: kbf_server::executor::System::Linux,
+                system: System::Linux,
                 size_class: built_class(),
             })),
             grant: Mutex::new(Ok(ReadGrant {
@@ -66,8 +82,6 @@ impl FakeInputs {
             })),
             tree: Mutex::new(Ok(TREE.to_owned())),
             looked_up: Mutex::new(Vec::new()),
-            hold: std::sync::atomic::AtomicBool::new(false),
-            release: tokio::sync::Notify::new(),
         }
     }
 }
@@ -76,22 +90,19 @@ impl FakeInputs {
 impl Inputs for FakeInputs {
     async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
         locked(&self.looked_up).push(action.hash.clone());
-        if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
-            self.release.notified().await;
-        }
         locked(&self.facts).clone()
     }
 
     async fn read_grant(
         &self,
-        _lease: kbf_types::LeaseId,
+        _run: RunId,
         _action: &Digest,
         _expires: Duration,
     ) -> Result<ReadGrant, InputsError> {
         locked(&self.grant).clone()
     }
 
-    async fn tree(&self, _lease: kbf_types::LeaseId) -> Result<String, InputsError> {
+    async fn tree(&self, _run: RunId) -> Result<String, InputsError> {
         locked(&self.tree).clone()
     }
 }
@@ -175,14 +186,13 @@ impl Presign for FakePresign {
 /// What the frontend makes of a pack: scripted, then the default.
 pub struct FakeIngest {
     /// While set, a read waits for `release` (a slow store).
-    pub hold: std::sync::atomic::AtomicBool,
+    pub hold: AtomicBool,
     pub release: tokio::sync::Notify,
-    /// How many of the next reads panic, as a bug of the real ingest would.
-    pub panics: std::sync::atomic::AtomicUsize,
     pub script: Mutex<VecDeque<Ingested>>,
     /// The reason the next mint fails for, if any.
-    pub mint_fails: Mutex<Option<MintError>>,
-    pub calls: Mutex<Vec<(kbf_types::LeaseId, String, UntrustedLimits)>>,
+    pub mint_fails: Mutex<VecDeque<MintError>>,
+    /// Each read: the run, the key and the limits.
+    pub calls: Mutex<Vec<(RunId, String, UntrustedLimits)>>,
     /// How many keys were minted: each key is new.
     pub minted: AtomicU64,
     /// The form of input tree each mint was asked to write, in order.
@@ -192,11 +202,10 @@ pub struct FakeIngest {
 impl FakeIngest {
     fn new() -> Self {
         Self {
-            hold: std::sync::atomic::AtomicBool::new(false),
+            hold: AtomicBool::new(false),
             release: tokio::sync::Notify::new(),
-            panics: std::sync::atomic::AtomicUsize::new(0),
             script: Mutex::new(VecDeque::new()),
-            mint_fails: Mutex::new(None),
+            mint_fails: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
             minted: AtomicU64::new(0),
             forms: Mutex::new(Vec::new()),
@@ -212,23 +221,28 @@ impl FakeIngest {
             cached: true,
         }
     }
+
+    /// The keys read, in order.
+    pub fn keys_read(&self) -> Vec<String> {
+        locked(&self.calls).iter().map(|c| c.1.clone()).collect()
+    }
 }
 
 #[tonic::async_trait]
 impl Ingest for FakeIngest {
     async fn mint(
         &self,
-        lease: kbf_types::LeaseId,
+        run: RunId,
         _action: &Digest,
         _wall: Duration,
         tree: InputTree,
     ) -> Result<PackKey, MintError> {
         locked(&self.forms).push(tree);
-        match locked(&self.mint_fails).take() {
+        match locked(&self.mint_fails).pop_front() {
             Some(why) => Err(why),
             None => Ok(PackKey::new(format!(
                 "cas/b/{}/{:032x}-0",
-                build_id(lease),
+                build_id(run),
                 self.minted.fetch_add(1, Ordering::SeqCst)
             ))),
         }
@@ -236,106 +250,68 @@ impl Ingest for FakeIngest {
 
     async fn ingest(
         &self,
-        lease: kbf_types::LeaseId,
+        run: RunId,
         key: &PackKey,
         _action: &Digest,
         limits: &UntrustedLimits,
     ) -> Ingested {
-        locked(&self.calls).push((lease, key.to_string(), *limits));
-        if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+        locked(&self.calls).push((run, key.to_string(), *limits));
+        if self.hold.load(Ordering::SeqCst) {
             self.release.notified().await;
         }
-        let panics = self.panics.fetch_update(
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-            |n| Some(n.saturating_sub(1)),
-        );
-        assert!(panics == Ok(0), "the ingest broke");
         locked(&self.script)
             .pop_front()
             .unwrap_or_else(|| Self::ran(0))
     }
 }
 
-/// Holds tokio's paused clock where it is. The paused clock jumps to its next timer whenever
-/// the runtime waits, which a client's timeout, a retry delay of the farm and a socket being
-/// served all do; a blocking task in flight stops the jump. The tests move the clock by hand,
-/// and so assert on what happened, never on how long it took.
-pub struct ClockHold {
-    release: Option<std::sync::mpsc::Sender<()>>,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl ClockHold {
-    pub fn new() -> Self {
-        let (release, hold) = std::sync::mpsc::channel::<()>();
-        let task = tokio::task::spawn_blocking(move || {
-            let _ = hold.recv();
-        });
-        Self {
-            release: Some(release),
-            task: Some(task),
-        }
-    }
-}
-
-impl Drop for ClockHold {
-    fn drop(&mut self) {
-        self.release.take().iter().for_each(|release| {
-            let _ = release.send(());
-        });
-        self.task.take();
-    }
-}
-
-/// The state store the executors of one group share (`--executor-ownership shared`): the
-/// in-memory store and the clock its rows expire on, which a test moves by hand.
+/// The state store the executors of one group share: the in-memory store.
 pub struct Shared {
-    pub clock: Arc<ManualClock>,
     pub store: Arc<Fake>,
 }
 
 impl Shared {
     pub fn new() -> Self {
         let clock = Arc::new(ManualClock::default());
-        let store = Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None));
-        Self { clock, store }
+        let store = Arc::new(Fake::with_flaw(clock, Flaw::None));
+        Self { store }
     }
 
-    /// The `exec/` rows as the store holds them.
-    pub fn rows(&self) -> ExecRows {
-        ExecRows::new(Arc::clone(&self.store) as Arc<dyn Store>)
+    /// The store as an executor takes it.
+    pub fn handle(&self) -> Arc<dyn Store> {
+        Arc::clone(&self.store) as Arc<dyn Store>
     }
 
-    /// Every key under `exec/`.
-    pub fn keys(&self) -> Vec<String> {
-        let rows = self.store.scan_prefix("exec/").expect("a scan");
+    /// The rows of the process `instance`.
+    pub fn rows(&self, instance: &str) -> Rows {
+        Rows::new(self.handle(), instance)
+    }
+
+    /// Every key under `prefix`.
+    pub fn keys(&self, prefix: &str) -> Vec<String> {
+        let rows = self.store.scan_prefix(prefix).expect("a scan");
         rows.into_iter().map(|(key, _)| key).collect()
-    }
-
-    /// Time passes on the store's clock.
-    pub fn advance(&self, by: Duration) {
-        self.clock.advance(by);
     }
 }
 
-/// A farm, a job service with `hosts`, and an executor that submits to it.
+/// A job service with hosts, and an executor that submits to it.
 pub struct Rig {
-    pub fake: FakeJobServer,
+    pub fake: Arc<FakeJobServer>,
     pub api: Client,
-    pub farm: Arc<Farm>,
     pub exec: Executor,
     pub cfg: Config,
     pub inputs: Arc<FakeInputs>,
     pub presign: Arc<FakePresign>,
     pub ingest: Arc<FakeIngest>,
     pub metrics: Arc<Metrics>,
-    _hold: ClockHold,
+    /// The invocation recorder the executor tells.
+    pub recorder: Recorder,
 }
 
-/// The farm leases an action makes, by what the test calls it.
+/// An Execute the rig made: its operation, and where it is.
 pub struct Caller {
     pub tag: u8,
+    pub name: String,
     pub stage: watch::Receiver<Stage>,
 }
 
@@ -346,10 +322,45 @@ impl Caller {
             _ => None,
         }
     }
+
+    /// Waits until the operation's job has started.
+    ///
+    /// # Panics
+    /// It has not within [`PROMPT`].
+    pub async fn executing(&mut self) {
+        let waited = timeout(
+            PROMPT,
+            self.stage
+                .wait_for(|stage| matches!(stage, Stage::Executing | Stage::Done(_))),
+        )
+        .await;
+        waited
+            .unwrap_or_else(|_| panic!("action {} is not executing", self.tag))
+            .expect("the operation is open");
+    }
+
+    /// Waits until the operation is answered.
+    ///
+    /// # Panics
+    /// It is not answered within [`PROMPT`].
+    pub async fn done(&mut self) -> Finished {
+        let waited = timeout(
+            PROMPT,
+            self.stage.wait_for(|stage| matches!(stage, Stage::Done(_))),
+        )
+        .await;
+        let stage = waited
+            .unwrap_or_else(|_| panic!("action {} is not answered", self.tag))
+            .expect("the operation is open");
+        match &*stage {
+            Stage::Done(finished) => finished.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
 }
 
 pub fn digest_of(tag: u8) -> kbf_types::Digest {
-    kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [tag; 32], u64::from(tag))
+    kbf_types::Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag))
 }
 
 /// A Linux host of 16 cores, `gib` GiB of memory and 1 TiB of disk that runs containers on
@@ -358,7 +369,7 @@ pub fn machine(gib: u64, arch: &str) -> Machine {
     Machine {
         shape: Shape {
             cpu_millis: 16_000,
-            memory_bytes: gib * GIB,
+            memory_bytes: gib << 30,
             gpus: 0,
             gpu_class: String::new(),
             disk_bytes: Some(1 << 40),
@@ -369,251 +380,148 @@ pub fn machine(gib: u64, arch: &str) -> Machine {
     }
 }
 
-/// An instance id no other process of the rig has.
-pub fn fresh_instance() -> String {
-    Config::new("x", 1, 1_000, GIB).instance
-}
-
 impl Rig {
-    /// A rig over a job service of `hosts` (each [`machine`] of 64 GiB on `x86_64`), and an
-    /// executor of `workers` virtual workers of 2 cores and 16 GiB with `adjust` applied to its
-    /// config.
-    pub async fn start(hosts: &[&str], workers: usize, adjust: impl FnOnce(&mut Config)) -> Self {
-        Self::shaped(hosts, workers, 16, adjust).await
+    /// A rig over a job service of `hosts` (each a [`machine`] of 64 GiB on `x86_64`), and an
+    /// executor with `adjust` applied to its config.
+    pub async fn start(hosts: &[&str], adjust: impl FnOnce(&mut Config)) -> Self {
+        Self::over(hosts, None, adjust).await
     }
 
-    /// As [`Rig::start`], with virtual workers of `gib` GiB of memory.
-    pub async fn shaped(
-        hosts: &[&str],
-        workers: usize,
-        gib: u64,
-        adjust: impl FnOnce(&mut Config),
-    ) -> Self {
-        Self::over(
-            hosts,
-            workers,
-            gib,
-            Arc::new(Cache::memory()).into(),
-            adjust,
-        )
-        .await
-    }
-
-    /// A frontend with no storage node: its cache is the packs and the state store alone.
-    pub fn no_storage_node() -> Arc<kbf_front::Stored> {
-        use kbf_objstore::{Capabilities, MemoryStore};
-        use kbf_pack::{PackKeys, WriterKind};
-        use kbf_pack_index::action::ActionStore;
-        use kbf_pack_index::memory::MemoryPackIndex;
-        let create_only = Capabilities {
-            conditional_put: true,
-            object_lock: false,
-        };
-        let store = Arc::new(MemoryStore::new(create_only));
-        let actions: Arc<dyn ActionStore> = Arc::new(MemoryPackIndex::new(Arc::new(
-            kbf_state::ManualClock::default(),
-        )));
-        let keys = PackKeys::new(WriterKind::Frontend, "fe1", "boot1").expect("keys");
-        let stored =
-            kbf_front::Stored::new(store, actions, keys, kbf_front::PackSettings::default());
-        Arc::new(stored.expect("stored"))
-    }
-
-    /// As [`Rig::shaped`], over the cache `cache`.
+    /// As [`Rig::start`], keeping the executor's rows in `store`.
     pub async fn over(
         hosts: &[&str],
-        workers: usize,
-        gib: u64,
-        cache: Backend,
+        store: Option<Arc<dyn Store>>,
         adjust: impl FnOnce(&mut Config),
     ) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_max_level(tracing::Level::INFO)
             .try_init();
-        let hold = ClockHold::new();
         let fake = FakeJobServer::start().await.expect("a loopback port");
         for host in hosts {
             fake.add_host(host, machine(64, "x86_64"));
         }
         let api = fake.client().expect("a client");
-        let mut cfg = Config::new("front-1", workers, 2_000, gib * GIB);
-        cfg.slots = 2;
+        let mut cfg = Config::new("front-1");
         cfg.insecure_argv_secrets = true;
+        cfg.poll = POLL;
         adjust(&mut cfg);
-        let farm = Arc::new(Farm::new(
-            cache.clone(),
-            kbf_sched::UNSERVABLE_WAIT,
-            kbf_sched::FINISHED_RETENTION,
-        ));
+        let (recorder, recording) = Recorder::new(1 << 20, 256);
+        tokio::spawn(recording.run());
+        let fake = Arc::new(fake);
         let (inputs, presign, ingest) = (
             Arc::new(FakeInputs::new()),
             Arc::new(FakePresign::new()),
             Arc::new(FakeIngest::new()),
         );
         let metrics = Arc::new(Metrics::default());
-        let exec = Self::executor(&fake, &farm, &cfg, &inputs, &presign, &ingest, &metrics);
+        let deps = Deps {
+            client: fake.client().expect("a client"),
+            ingest: ingest.clone(),
+            presign: presign.clone(),
+            inputs: inputs.clone(),
+            metrics: Arc::clone(&metrics),
+            store,
+            recorder: recorder.clone(),
+        };
+        let exec = Executor::new(cfg.clone(), deps).expect("a valid config");
         Self {
             fake,
             api,
-            farm,
             exec,
             cfg,
             inputs,
             presign,
             ingest,
             metrics,
-            _hold: hold,
+            recorder,
         }
     }
 
-    fn executor(
-        fake: &FakeJobServer,
-        farm: &Arc<Farm>,
-        cfg: &Config,
-        inputs: &Arc<FakeInputs>,
-        presign: &Arc<FakePresign>,
-        ingest: &Arc<FakeIngest>,
-        metrics: &Arc<Metrics>,
-    ) -> Executor {
+    /// An executor of `cfg` over this rig's job service and fakes.
+    pub fn executor_of(&self, cfg: Config, store: Option<Arc<dyn Store>>) -> Executor {
         let deps = Deps {
-            farm: Arc::clone(farm),
-            client: fake.client().expect("a client"),
-            ingest: ingest.clone(),
-            presign: presign.clone(),
-            inputs: inputs.clone(),
-            metrics: Arc::clone(metrics),
-            store: None,
-        };
-        Executor::new(cfg.clone(), deps).expect("a valid config")
-    }
-
-    /// A new executor over the same farm and job service, as a restarted frontend has: the
-    /// same frontend id, and a process of its own.
-    pub fn restarted_executor(&self) -> Executor {
-        self.other_executor(&self.cfg.frontend)
-    }
-
-    /// A new executor of this rig's frontend id, in shared ownership over the store of `shared`,
-    /// with a process of its own: any number of them serve beside each other.
-    pub fn shared_executor(&self, shared: &Shared) -> Executor {
-        let mut cfg = self.shared_config();
-        cfg.instance = fresh_instance();
-        let deps = Deps {
-            farm: Arc::clone(&self.farm),
             client: self.fake.client().expect("a client"),
             ingest: self.ingest.clone(),
             presign: self.presign.clone(),
             inputs: self.inputs.clone(),
             metrics: Arc::clone(&self.metrics),
-            store: Some(Arc::clone(&shared.store) as Arc<dyn Store>),
+            store,
+            recorder: self.recorder.clone(),
         };
-        Executor::new(cfg, deps).expect("a valid shared config")
+        Executor::new(cfg, deps).expect("a valid config")
     }
 
-    /// The config of this rig as a shared executor has it: its tasks write into a put
-    /// directory, as a presigned write is refused with shared ownership.
-    pub fn shared_config(&self) -> Config {
+    /// A new executor over the same job service, of the frontend `frontend` and a process of
+    /// its own.
+    pub fn other_executor(&self, frontend: &str, store: Option<Arc<dyn Store>>) -> Executor {
         let mut cfg = self.cfg.clone();
-        cfg.ownership = Ownership::Shared;
-        cfg.task_out = TaskOut::PutDir(PutDirRoots::new("/mnt/ts/put").expect("roots"));
-        cfg
+        let fresh = Config::new(frontend);
+        cfg.frontend = fresh.frontend;
+        cfg.instance = fresh.instance;
+        self.executor_of(cfg, store)
     }
 
-    /// A new executor over the same farm and job service, of the frontend `frontend` and a
-    /// process of its own.
-    pub fn other_executor(&self, frontend: &str) -> Executor {
-        let mut cfg = self.cfg.clone();
-        cfg.frontend = frontend.to_owned();
-        cfg.instance = fresh_instance();
-        Self::executor(
-            &self.fake,
-            &self.farm,
-            &cfg,
-            &self.inputs,
-            &self.presign,
-            &self.ingest,
-            &self.metrics,
-        )
-    }
-
-    /// Lets pass the time an executor watches the jobs of an earlier process for a new one.
-    /// Nothing is stepped: the process that made them is gone, and makes nothing.
-    pub async fn watch_over(&self) {
-        self.advance(self.cfg.adopt_watch() + Duration::from_secs(1))
-            .await;
-    }
-
-    /// One step of the executor and of the farm, with the tasks they spawn run to rest.
-    pub async fn pump(&mut self) {
-        for _ in 0..4 {
-            self.exec.step().await;
-            settle().await;
-            self.farm.tick().await;
-            settle().await;
-        }
-    }
-
-    /// Time passes: tokio's clock, the job service's, and the farm's with the first.
-    pub async fn advance(&self, by: Duration) {
-        tokio::time::advance(by).await;
-        self.fake.advance(by);
-    }
-
-    /// `seconds` pass in steps of 5 s, the executor and the farm stepping after each.
-    pub async fn elapse(&mut self, seconds: u64) {
-        for _ in 0..seconds.div_ceil(5) {
-            self.advance(Duration::from_secs(5)).await;
-            self.pump().await;
-        }
-    }
-
-    /// Submits the action of `tag`, booking one core and one GiB.
-    pub fn submit(&self, tag: u8) -> Caller {
-        self.submit_kind(tag, LeaseKind::Action)
-    }
-
-    /// Submits the action of `tag` as a lease of `kind`.
-    pub fn submit_kind(&self, tag: u8, kind: LeaseKind) -> Caller {
-        self.submit_needing(tag, kind, kbf_caps::Request::default())
-    }
-
-    /// Submits the action of `tag` as a lease of `kind` that the farm places only on a worker
-    /// that meets `needs`.
-    pub fn submit_needing(&self, tag: u8, kind: LeaseKind, needs: kbf_caps::Request) -> Caller {
-        let request = Request {
-            key: ActionKey {
-                instance: "main".to_owned(),
-                action: digest_of(tag),
-            }
-            .into(),
-            qos: Qos::Ci,
-            kind,
-            resources: Resources::new(1_000, GIB),
-            hermetic: true,
-            do_not_cache: false,
-            whole_worker: false,
-            pin: None,
-            needs,
+    /// Submits the action of `tag` to `exec`; `whole` asks for the whole machine, and `call`
+    /// is the call the invocation recorder is told of.
+    pub fn submit_to(
+        &self,
+        exec: &Executor,
+        tag: u8,
+        whole: bool,
+        call: Option<ExecuteCall>,
+    ) -> Caller {
+        let key = ActionKey {
+            instance: "main".to_owned(),
+            action: digest_of(tag),
         };
-        let ticket = self
-            .farm
+        let ticket = exec
             .submit(Submission {
-                request,
-                call: None,
+                key,
+                whole_machine: whole,
+                call,
                 described: Described {
                     arguments: vec!["/bin/run".to_owned()],
                     outputs: Vec::new(),
                     label: Default::default(),
                 },
                 evidence: Default::default(),
-                max_wall: None,
             })
-            .expect("the farm takes the action");
+            .expect("the executor takes the action");
         Caller {
             tag,
+            name: ticket.name,
             stage: ticket.stage,
         }
+    }
+
+    /// Submits the action of `tag`.
+    pub fn submit(&self, tag: u8) -> Caller {
+        self.submit_to(&self.exec, tag, false, None)
+    }
+
+    /// Submits the action of `tag`, which asks for the whole machine.
+    pub fn submit_whole(&self, tag: u8) -> Caller {
+        self.submit_to(&self.exec, tag, true, None)
+    }
+
+    /// Submits the action of `tag` as a call of the invocation `invocation`, which the recorder
+    /// is told of.
+    pub fn submit_called(&self, tag: u8, invocation: &str) -> Caller {
+        let metadata = CallMetadata {
+            invocation_id: InvocationId::parse(invocation),
+            ..CallMetadata::default()
+        };
+        let call = ExecuteCall::new(
+            &self.recorder,
+            &metadata,
+            &AuthenticationMetadata::default(),
+            "main",
+            digest_of(tag),
+            digest_of(tag.wrapping_add(100)),
+        );
+        assert!(call.is_some(), "a call with an invocation id is recorded");
+        self.submit_to(&self.exec, tag, false, call)
     }
 
     /// Every job the job service holds, with what it was submitted as (file contents
@@ -629,13 +537,42 @@ impl Rig {
             .collect()
     }
 
-    /// The jobs of the action of `tag`.
+    /// The jobs of the action of `tag`, in the order they were submitted.
     pub fn jobs_of(&self, tag: u8) -> Vec<Posted> {
         let want = format!("{}/{}", hex(tag), tag);
         self.jobs()
             .into_iter()
             .filter(|p| p.arg("--action") == Some(want.as_str()))
             .collect()
+    }
+
+    /// Waits until the job service holds `n` jobs of the action of `tag`.
+    ///
+    /// # Panics
+    /// They are not there within [`PROMPT`].
+    pub async fn until_jobs(&self, tag: u8, n: usize) -> Vec<Posted> {
+        let found = async {
+            loop {
+                let jobs = self.jobs_of(tag);
+                if jobs.len() >= n {
+                    return jobs;
+                }
+                sleep(POLL).await;
+            }
+        };
+        match timeout(PROMPT, found).await {
+            Ok(jobs) => jobs,
+            Err(_) => panic!(
+                "{n} jobs of action {tag} not made: {:?}\ncalls {:?}",
+                self.jobs_of(tag),
+                self.methods()
+            ),
+        }
+    }
+
+    /// The first job of the action of `tag`, once the executor has submitted it.
+    pub async fn first_job(&self, tag: u8) -> Posted {
+        self.until_jobs(tag, 1).await.remove(0)
     }
 
     /// The host `host` takes the queued job `id` and runs it.
@@ -651,62 +588,14 @@ impl Rig {
         assert!(self.fake.finish(id, exit_code), "{id} finishes");
     }
 
+    /// The running job `id` ends with exit code 0.
+    pub fn host_finishes_running(&self, id: &str) {
+        assert!(self.fake.finish(id, 0), "{id} finishes");
+    }
+
     /// Every call the job service read, by method name, in order.
     pub fn methods(&self) -> Vec<&'static str> {
         self.fake.calls().iter().map(method).collect()
-    }
-
-    /// Runs the executor until `caller` is done, or panics after `steps` of 5 s.
-    pub async fn until_done(&mut self, caller: &Caller, steps: usize) -> Finished {
-        for _ in 0..steps {
-            if let Some(finished) = caller.finished() {
-                return finished;
-            }
-            self.advance(Duration::from_secs(5)).await;
-            self.pump().await;
-        }
-        panic!(
-            "action {} not done: {:?}\nworkers {:?}\ncalls {:#?}",
-            caller.tag,
-            caller.stage.borrow(),
-            self.exec.workers(),
-            self.methods()
-        );
-    }
-
-    /// One step of the executor while `by` passes on every clock after it has begun and
-    /// waited as long as it will. True if the step had ended by then; a step that had not is
-    /// given 31 s more (more than a call's bound) so that it ends, and the answer is false.
-    pub async fn step_through(&mut self, by: Duration) -> bool {
-        let done = AtomicBool::new(false);
-        let (exec, fake, inputs) = (&mut self.exec, &self.fake, &self.inputs);
-        let stepping = async {
-            exec.step().await;
-            done.store(true, Ordering::SeqCst);
-        };
-        let passing = async {
-            settle().await;
-            tokio::time::advance(by).await;
-            fake.advance(by);
-            // The calls the step makes after the clock has moved are answered over loopback
-            // in a few rounds of the runtime; the clock moves only 3 ms a round meanwhile.
-            for _ in 0..20 {
-                settle().await;
-                if done.load(Ordering::SeqCst) {
-                    break;
-                }
-            }
-            let in_time = done.load(Ordering::SeqCst);
-            if !in_time {
-                // Whatever the step waits on is let go, so that a failure fails and does not hang.
-                inputs.hold.store(false, Ordering::SeqCst);
-                inputs.release.notify_one();
-                tokio::time::advance(Duration::from_secs(31)).await;
-                fake.advance(Duration::from_secs(31));
-            }
-            in_time
-        };
-        tokio::join!(stepping, passing).1
     }
 
     /// What the executor counts, as `GET /metrics` shows it.
@@ -724,12 +613,71 @@ impl Rig {
             .unwrap_or_else(|| panic!("no counter {name} in\n{text}"))
     }
 
+    /// Waits until the counter `name` is at least `at_least`.
+    ///
+    /// # Panics
+    /// It is not within [`PROMPT`].
+    pub async fn counter_reaches(&self, name: &str, at_least: u64) {
+        let reached = async {
+            while self.counter(name) < at_least {
+                sleep(POLL).await;
+            }
+        };
+        if timeout(PROMPT, reached).await.is_err() {
+            panic!("{name} is below {at_least} in\n{}", self.counted());
+        }
+    }
+
     /// Every action the rig is asked about runs for `timeout`.
     pub fn set_timeout(&self, timeout: Duration) {
         locked(&self.inputs.facts)
             .as_mut()
             .expect("ok facts")
             .timeout = Some(timeout);
+    }
+
+    /// The next read of the job `id` and of its result are answered as a job that ended in
+    /// `job_state` and a result of `result_state`, for `reason`, with `exit_code`, whatever the
+    /// job service holds.
+    pub fn script_ending(
+        &self,
+        id: &str,
+        (job_state, result_state, reason, exit_code): (
+            JobState,
+            JobState,
+            ResultReason,
+            Option<i32>,
+        ),
+    ) {
+        let job = GetJobResponse {
+            job: Some(Job {
+                id: id.to_owned(),
+                state: job_state.into(),
+                ..Job::default()
+            }),
+        };
+        let result = GetResultResponse {
+            result: Some(JobResult {
+                state: result_state.into(),
+                exit_code,
+                reason: reason.into(),
+                ..JobResult::default()
+            }),
+        };
+        self.fake
+            .inject_on("GetJob", Fault::Answer(Bytes::from(job.encode_to_vec())));
+        self.fake.inject_on(
+            "GetResult",
+            Fault::Answer(Bytes::from(result.encode_to_vec())),
+        );
+    }
+
+    /// As [`Rig::script_ending`] for a job that failed for `reason` with `exit_code`.
+    pub fn script_failed(&self, id: &str, reason: ResultReason, exit_code: i32) {
+        self.script_ending(
+            id,
+            (JobState::Failed, JobState::Failed, reason, Some(exit_code)),
+        );
     }
 }
 
@@ -771,26 +719,6 @@ pub fn hex(tag: u8) -> String {
     format!("{tag:02x}").repeat(32)
 }
 
-/// Lets the tasks the executor and the farm spawned run to rest. The farm's cache lingers
-/// 2 ms before it writes a batch, and the clock is held, so the clock moves 3 ms a round: the
-/// tests' own clock is `Rig::advance` and `Rig::elapse`.
-///
-/// Each round also waits on blocking tasks that do nothing, which lets the runtime park on its
-/// I/O driver as one with nothing to run does, so a call a spawned task has in flight to the
-/// job service on loopback moves on between the clock's steps. No time is waited for, real or
-/// virtual.
-pub async fn settle() {
-    for _ in 0..3 {
-        for _ in 0..16 {
-            let _ = tokio::task::spawn_blocking(|| ()).await;
-            for _ in 0..4 {
-                tokio::task::yield_now().await;
-            }
-        }
-        tokio::time::advance(Duration::from_millis(3)).await;
-    }
-}
-
 /// A job as the job service holds it, and the spec it was submitted with (file contents
 /// included).
 #[derive(Clone, Debug)]
@@ -803,11 +731,6 @@ impl Posted {
     /// The job's id.
     pub fn id(&self) -> &str {
         &self.job.id
-    }
-
-    /// The job's state.
-    pub fn state(&self) -> JobState {
-        self.job.state()
     }
 
     /// The value after `flag` in the task tool's arguments.

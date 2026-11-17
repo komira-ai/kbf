@@ -1028,33 +1028,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "js-agent-wire"
-version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
-dependencies = [
- "js-elastic",
- "js-types",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
 name = "js-caps"
 version = "0.1.0"
 source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 dependencies = [
  "js-types",
- "thiserror",
-]
-
-[[package]]
-name = "js-elastic"
-version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
-dependencies = [
- "js-types",
- "sha2",
  "thiserror",
 ]
 
@@ -1071,20 +1049,6 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
-]
-
-[[package]]
-name = "js-sched"
-version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
-dependencies = [
- "js-agent-wire",
- "js-caps",
- "js-elastic",
- "js-sizing",
- "js-types",
- "js-whole",
- "thiserror",
 ]
 
 [[package]]
@@ -1160,11 +1124,6 @@ dependencies = [
  "js-types",
  "thiserror",
 ]
-
-[[package]]
-name = "js-whole"
-version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=03e0582c3e25c02575831270e3478624f31ba918#03e0582c3e25c02575831270e3478624f31ba918"
 
 [[package]]
 name = "kbf-alert"
@@ -1445,25 +1404,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-estimator-replay"
-version = "0.1.0"
-dependencies = [
- "clap",
- "kbf-caps",
- "kbf-estimator",
- "kbf-history",
- "kbf-invocation",
- "kbf-sched",
- "kbf-server",
- "kbf-testkit",
- "kbf-types",
- "serde",
- "serde_json",
- "thiserror",
- "time",
-]
-
-[[package]]
 name = "kbf-front"
 version = "0.1.0"
 dependencies = [
@@ -1473,7 +1413,6 @@ dependencies = [
  "hmac",
  "http-body",
  "kbf-auth",
- "kbf-caps",
  "kbf-front",
  "kbf-invocation",
  "kbf-map",
@@ -1484,7 +1423,6 @@ dependencies = [
  "kbf-pack-index",
  "kbf-proto",
  "kbf-route",
- "kbf-sched",
  "kbf-segments",
  "kbf-state",
  "kbf-storage",
@@ -1680,7 +1618,6 @@ dependencies = [
  "kbf-objstore",
  "kbf-proto",
  "kbf-proxy",
- "kbf-sched",
  "kbf-server",
  "kbf-state",
  "kbf-storage",
@@ -1715,7 +1652,6 @@ dependencies = [
 name = "kbf-invocation"
 version = "0.1.0"
 dependencies = [
- "kbf-sched",
  "kbf-types",
  "prost",
  "prost-build",
@@ -1753,10 +1689,8 @@ name = "kbf-log"
 version = "0.1.0"
 dependencies = [
  "hex",
- "kbf-caps",
  "kbf-meta",
  "kbf-proto",
- "kbf-sched",
  "kbf-types",
  "prost",
  "thiserror",
@@ -2007,14 +1941,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-sched"
-version = "0.1.0"
-dependencies = [
- "js-sched",
- "js-whole",
-]
-
-[[package]]
 name = "kbf-seatbelt"
 version = "0.1.0"
 
@@ -2065,7 +1991,6 @@ dependencies = [
  "kbf-proto",
  "kbf-raft",
  "kbf-route",
- "kbf-sched",
  "kbf-segments",
  "kbf-server",
  "kbf-signer",
@@ -2165,7 +2090,6 @@ dependencies = [
  "kbf-log",
  "kbf-meta",
  "kbf-raft",
- "kbf-sched",
  "kbf-segments",
  "kbf-server",
  "kbf-sim",

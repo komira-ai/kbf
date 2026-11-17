@@ -47,12 +47,8 @@ pub(super) fn args() -> [Arg; 2] {
                  the default, and set alike, the drain waits for the open executions for \
                  as long as they run, and the process stays up serving them. Only a second \
                  stop signal, or `--shutdown-timeout-secs` on a stop signal (default none), \
-                 forces a stop and ends the streams that are left UNAVAILABLE. The one \
-                 stream that does not wait is that of an operation that was never started, \
-                 that no worker on this frontend can run and that no other frontend can \
-                 take: it ends UNAVAILABLE as the drain begins (Buck2 retries only the \
-                 opening of a call), and the operation stays queued for the other \
-                 frontends. No upper bound; at least 1.",
+                 forces a stop and ends the streams that are left UNAVAILABLE. No upper \
+                 bound; at least 1.",
             ),
     ]
 }

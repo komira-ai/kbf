@@ -163,8 +163,7 @@ marker is left as it is. Do it in this order:
    is the way back.
 3. **Start the first frontend of this release.** Its open replaces the generation row (an
    8-byte number, or no row on a new database; a database copied by `kbf-state-copy` carries
-   the SQLite file's number) with the marker. The epoch is not touched, so the workers that
-   reconnect keep the leases they hold.
+   the SQLite file's number) with the marker.
 4. **Start the others.** They find the marker and write nothing to the row.
 
 **If a frontend of an earlier release is started after the marker is written**, it does not
@@ -275,8 +274,8 @@ kbf-state-copy (dry run)
 state file: /var/lib/kbf/state.db
 key/value rows: 14; counters: 1; highest version: 36; head revision: 36
 key families (rows, digest):
-  lease/        1  <64 hex digits>
-  op/           2  <64 hex digits>
+  exec/         1  <64 hex digits>
+  done/         2  <64 hex digits>
   ...
 counter families (rows, digest):
   seq/          1  <64 hex digits>
@@ -284,7 +283,7 @@ the target is empty, its schema is current and the clocks agree
 dry run: nothing was written; run again with --apply to copy
 ```
 
-A key family is the first path segment of a key, with its slash (`op/`, `lease/`); a key with
+A key family is the first path segment of a key, with its slash (`exec/`, `done/`); a key with
 no slash is a family of its own. The digest is the SHA-256 of the family's rows in key order:
 for each row, its key, value, version and expiry (in microseconds), each in a fixed encoding
 that `crates/kbf-state-copy/src/digest.rs` states. Two stores that hold the same rows give

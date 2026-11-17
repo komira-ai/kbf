@@ -2,7 +2,7 @@
 //! hands out an [`Ended`] for each attempt that settled and each cache hit that gained
 //! its row, and [`Records::idle_since`] each record that has gone quiet, once.
 
-use kbf_sched::RequeueReason;
+use crate::RequeueReason;
 use kbf_types::{LeaseId, OperationId};
 
 use super::Records;
@@ -46,14 +46,15 @@ pub struct Ended {
     pub correlated_invocations_id: Option<String>,
 }
 
-/// Whether a lease given up for `reason` is followed by the worker's report of its run.
+/// Whether a lease given up for `reason` is followed by the worker's report of its run. An
+/// attempt the executor ran again for an infrastructure ending (`Infra`) has no report after
+/// it: it is settled when it is given up.
 pub(super) const fn reports(reason: RequeueReason) -> bool {
     matches!(
         reason,
         RequeueReason::OutOfMemory { .. }
             | RequeueReason::NodeMemoryPressure
             | RequeueReason::Lost(_)
-            | RequeueReason::Infra
     )
 }
 

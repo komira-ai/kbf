@@ -1,5 +1,7 @@
 # kbf architecture v2: frontend, state store, storage, daemon
 
+> **Superseded in part by [direct-js.md](direct-js.md):** kbf no longer schedules; the scheduler, leases, virtual workers and the epoch described here are gone. An Execute is one job of the job service, and the state store holds `exec/op/`, `exec/live/` and `done/` rows. This page records the earlier design.
+
 > **Status: kbf-daemon is deleted.** Where this page describes the daemon, the `daemon`, `storage-and-daemon` or `all-in-one` modes or a Mac daemon, it records the design as it was written. Placed actions now run only as js-agent jobs of the job service, storage nodes run `kbf --mode=storage`, and Macs run js-agent only ([kbf-modes.md](../deploy/kbf-modes.md#the-removed-modes)).
 
 Status: design, partly built; passages marked as built describe the code. It supersedes the leader-elected server cluster in `cluster.md`. Labels: **[F]** fact checked in the code at `200d7289` or on `main`, **[D]** owner decision, **[I]** inference, **[V]** verify before building on it. Numbers are arithmetic from stated hardware, not measurements; section 13 names the benchmarks to run first.

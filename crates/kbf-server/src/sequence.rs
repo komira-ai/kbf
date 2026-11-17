@@ -10,35 +10,17 @@
 //! 2. The frontend waits [`DrainTiming::lb_wait`] (`--drain-lb-wait`, 10 s by default, 0
 //!    allowed) so that the load balancer's health check sees the 503. Unary calls have no
 //!    client retry, so they must still be served in this wait.
-//! 3. It refuses new Execute calls UNAVAILABLE ([`Drain::begin`]), closes its intake
-//!    ([`crate::farm::Farm::close_intake`]: no queued work taken from the shared store, none
-//!    placed on its nodes, so the other frontends take what it holds queued), and sends GOAWAY on
-//!    every listener: REAPI, worker and operator API. The REAPI and worker listeners stop
+//! 3. It refuses new Execute calls UNAVAILABLE ([`Drain::begin`]) and sends GOAWAY on every
+//!    listener: REAPI, worker and operator API. The REAPI and worker listeners stop
 //!    accepting; the operator API goes on answering so that the drain can be read.
-//! 4. It waits until no execution is open, however long that takes. A
-//!    [`DrainTiming::deadline`] (`--drain-deadline`, none by default) that passes with
-//!    executions open does not end the wait or any stream: it logs a WARN with the count and
-//!    sets `deadline_passed` in the drain status, and the wait goes on. The streams of
-//!    operations that were never started and that no worker on this frontend can run (every
-//!    capable worker is cordoned by an operator, or there is none), with no other frontend
-//!    of the store to take them (no worker of another frontend could run them: the
-//!    `session/` rows, read at each intake poll), end UNAVAILABLE as step 3 begins, at the
-//!    end of the load balancer wait, and do not wait: nothing here could ever run them. Every other stream waits, as Buck2
-//!    does not recover one that ends, including the stream of an operation that waits only
-//!    for the nodes this drain cordoned itself (step 3): the other frontends take it. The
-//!    operations stay queued for the other frontends. Under `--executor js-agent` a job that is
-//!    still queued on the job service when the intake closes (no host took it) is cancelled and
-//!    its lease given up, since nothing has run and a queue that no host serves would hold the
-//!    drain for ever: its operation is queued again and its stream ends as that of any
-//!    operation that never started, or is kept and followed in the state store when a worker
-//!    session of another frontend could run it ([`crate::executor::Executor`]). An execution that runs on a node of
-//!    this frontend finishes here: its result is taken, and its caller is answered. An execution
-//!    whose operation another frontend took is followed in the state store.
-//! 5. It stands down as a retire does ([`Stand::release`]: the farm is fenced, the worker
-//!    streams that are left end UNAVAILABLE and their workers dial another frontend, whose
-//!    owner rows keep their leases), closes the client streams that are left
-//!    ([`Drain::close`]) and, after a short grace for the clients to take their status when
-//!    there was a stream to close, ends the drain ([`Drain::sequence_ended`]); the serving
+//! 4. It waits until no execution is open, however long that takes: every operation this
+//!    frontend runs goes on until its job ends and its callers are answered
+//!    ([`crate::executor`]). A [`DrainTiming::deadline`] (`--drain-deadline`, none by default)
+//!    that passes with executions open does not end the wait or any stream: it logs a WARN
+//!    with the count and sets `deadline_passed` in the drain status, and the wait goes on.
+//! 5. It stands down as a retire does ([`Stand::release`]), closes the client streams that are
+//!    left ([`Drain::close`]) and, after a short grace for the clients to take their status
+//!    when there was a stream to close, ends the drain ([`Drain::sequence_ended`]); the serving
 //!    future returns and the process exits 0.
 //!
 //! A second stop signal ([`Drain::close`]) skips the waits of steps 2 and 4, as does
@@ -52,10 +34,10 @@
 //! A frontend without a state store has no other frontend to hand its work to and keeps the
 //! plain drain of [`crate::drain`]: [`stopped`] and the endpoint begin it at once.
 //!
-//! Retire (`POST /v1/frontend/retire`, [`crate::retire`]) is the same fence without the
+//! Retire (`POST /v1/frontend/retire`, [`crate::retire`]) is the same stand-down without the
 //! waits and without the exit: it stays a mode of its own, since an updater uses it to stand
 //! a frontend down and keep it answering the callers it holds, which a drain that ends the
-//! process cannot do. Both end in [`Stand::release`], so the fence is one piece of code.
+//! process cannot do. Both end in [`Stand::release`].
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -80,7 +62,7 @@ pub struct DrainTiming {
     /// When set, how long after the drain refuses new executions it reports the ones still
     /// open (a WARN, and `deadline_passed` in the drain status). It only stops the waiting
     /// there: nothing is ended, and the drain goes on until they are done. `None`, the
-    /// default, reports nothing. Streams of operations that can never start do not wait.
+    /// default, reports nothing.
     pub deadline: Option<Duration>,
 }
 
@@ -147,8 +129,7 @@ impl Sequence {
             () = drain.lb_wait_ended() => {}
         }
 
-        tracing::info!("draining: refusing new executions, taking no more work, sending GOAWAY");
-        self.stand.farm.close_intake();
+        tracing::info!("draining: refusing new executions, sending GOAWAY");
         drain.begin();
         self.stand.worker.fire();
         self.api.fire();
@@ -179,7 +160,7 @@ impl Sequence {
                 // The deadline only stops the waiting and says so: nothing is closed or
                 // released over the open executions, which finish or are ended by a second
                 // signal or `--shutdown-timeout-secs`.
-                let open = self.stand.farm.open_executions();
+                let open = self.stand.open_executions();
                 if open > 0 {
                     drain.mark_deadline_passed();
                     tracing::warn!(
@@ -194,9 +175,7 @@ impl Sequence {
         }
 
         tracing::info!("draining: standing down, closing the streams that are left");
-        let farm = &self.stand.farm;
-        let sessions = u64::try_from(farm.open_sessions()).unwrap_or(u64::MAX);
-        let streams = farm.open_executions().saturating_add(sessions);
+        let streams = self.stand.open_executions();
         self.stand.release().await;
         drain.close();
         // The clients that were ended get a moment to take their status before the process
@@ -208,7 +187,7 @@ impl Sequence {
 
     /// Completes once no execution is open.
     async fn until_idle(&self) {
-        while self.stand.farm.open_executions() > 0 {
+        while self.stand.open_executions() > 0 {
             tokio::time::sleep(OPEN_LOOK).await;
         }
     }

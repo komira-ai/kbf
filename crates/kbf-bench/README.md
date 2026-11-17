@@ -224,13 +224,13 @@ names it), so two runs of `kbf-bench` share no action.
 | `execute_to_done_ms` | from sending the Execute to receiving the done operation; `null` when none came |
 | `ok`, `error` | `true` for a done operation, status OK, an `ActionResult` not from the cache and exit 0; otherwise `false` and why |
 | `exit_code`, `worker` | from the result, when there is one |
-| `queued_ms`, `worker_ms` | the result's `queued_timestamp` to `worker_start_timestamp`, and `worker_start_timestamp` to `worker_completed_timestamp`: the frontend's own times for the lease |
+| `queued_ms`, `worker_ms` | the result's `queued_timestamp` to `worker_start_timestamp`, and `worker_start_timestamp` to `worker_completed_timestamp`: the frontend's own times for the run |
 | `input_fetch_ms`, `execution_ms`, `output_upload_ms` | the result's three phases: a worker's own stamps, or under the executor the task's claim |
 | `claimed` | the three phases are a task's claim, not a worker's measurement (`kbf_proto::task_claim`) |
 
 A phase is `null` when either of its stamps is missing or they are out of order. The
-executor's own phases (`kbf_executor_phase_seconds`: prepare, start, queue, task, ingest)
-are a histogram on the frontend, not per lease, and are not in the result; join them by
+executor's own phases (`kbf_executor_phase_seconds`: prepare, start, queue, task, run, ingest, submit, execute)
+are a histogram on the frontend, not per run, and are not in the result; join them by
 the time of the run, or the frontend's logs by `operation`.
 
 The table on stdout has, per arm and phase, the runs, how many failed and the

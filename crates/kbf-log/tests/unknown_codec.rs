@@ -3,7 +3,7 @@
 
 use std::num::NonZeroU64;
 
-use kbf_log::{DecodeError, EncodeError, Format, LogCommand, Takeover, decode, encode};
+use kbf_log::{DecodeError, EncodeError, Format, LogCommand, decode, encode};
 use kbf_meta::{Command, Epoch, Generation, NodeWriter, ObjectId, ServerId, StagedPut, TierId};
 use kbf_proto::kbf::log::v1 as proto;
 use kbf_types::FarmTime;
@@ -92,11 +92,8 @@ fn an_unknown_field_in_a_known_command_is_ignored_and_the_known_part_decodes() {
     assert_eq!(decode(Format::V3, &nested), Ok(reachable));
     // Takeover { term 5, farm time 7, field 15 = 1 }
     let control = bytes("2a06080510077801");
-    let takeover = LogCommand::Takeover(Takeover {
-        term: NonZeroU64::new(5).expect("non-zero"),
-        now: FarmTime::from_millis(7),
-    });
-    assert_eq!(decode(Format::V1, &control), Ok(takeover));
+    // A farm command is skipped as a whole, its unknown field with it.
+    assert_eq!(decode(Format::V1, &control), UNKNOWN);
 }
 
 /// Asserts that a `oneof` with no arm this binary names decodes as an unknown command,
@@ -142,8 +139,7 @@ fn an_unknown_enum_value_decodes_as_unknown() {
     assert!(matches!(marked, Ok(LogCommand::Meta(_))), "{marked:?}");
     let hashed = decode(Format::V1, &meta_entry(touch(digest(1, vec![7; 32]))));
     assert!(matches!(hashed, Ok(LogCommand::Meta(_))), "{hashed:?}");
-    let report = decode(Format::V1, &failed_report(1));
-    assert!(matches!(report, Ok(LogCommand::Report(_))), "{report:?}");
+    assert_eq!(decode(Format::V1, &failed_report(1)), UNKNOWN, "a report");
 }
 
 /// Writes `command` under the format it joined and asserts that it decodes to itself

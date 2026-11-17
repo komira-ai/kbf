@@ -3,14 +3,14 @@
 //!
 //! - **Ingest** is [`kbf_front::ingest`] over the frontend's [`Packs`], a [`Backend`] built over
 //!   the same packs (the Action it reads to decide on caching may be a blob the frontend keeps
-//!   in a pack), and the [`PackKeyMint`] that issued the key. The lease it is given is the farm
-//!   lease's build id ([`build_id`]), the same string the task tool is told with `--lease`.
+//!   in a pack), and the [`PackKeyMint`] that issued the key. The run it is given is the executor
+//!   run's build id ([`build_id`]), the same string the task tool is told with `--run`.
 //! - **The key, the write and the grant** come from one call of the frontend's run preparation
 //!   ([`RunPrepare`], which the frontend implements over `prepare_run_for` of
 //!   `kbf_front::prepare_run`): the pack key, one presigned `PUT` of exactly that key, and the
 //!   read grant. The executor asks for them in three steps ([`Ingest::mint`], then
 //!   [`Presign::put_url`], then [`Inputs::read_grant`]), so what the one call returned is parked
-//!   under the farm lease and handed out once. The write host and the size cap are the
+//!   under the run and handed out once. The write host and the size cap are the
 //!   preparation's: it signs for one store endpoint and the signer limits the object. A run
 //!   that cannot be prepared is the caller's ([`MintError::Refused`]) unless the store could
 //!   not be read ([`MintError::Unavailable`]): see [`PrepareFault`].
@@ -25,7 +25,7 @@
 //!   the timeout. The image a run is launched from is the kbf image, built from that base and
 //!   set by the operator: it keeps its `ENTRYPOINT` (the task tool), so no action's image is
 //!   launched and no entrypoint is looked for. The platform's system is read too (`OSFamily`
-//!   or `os`, and a Mac's `os_version`), as the farm reads it: a Mac action becomes a Mac job
+//!   or `os`, and a Mac's `os_version`), as `kbf-front` reads it: a Mac action becomes a Mac job
 //!   ([`crate::executor::mac`]).
 
 use std::collections::BTreeMap;
@@ -38,14 +38,14 @@ use kbf_front::prepare_run::{
 };
 use kbf_front::{Backend, Described, IssuedPackKey, IssuedPutDir, PackKeyMint, Packs};
 use kbf_proto::reapi::{self, Action, Command, Digest};
-use kbf_types::{DigestFunction, ImageRef, LeaseId};
+use kbf_types::{DigestFunction, ImageRef};
 use std::sync::Arc;
 
 use crate::action_usage::Shape;
 use crate::executor::config::InputTree;
 use crate::executor::mac::System;
 use crate::executor::size_class::SizeClass;
-use crate::executor::task::{PackKey, Secret, build_id};
+use crate::executor::task::{PackKey, RunId, Secret, build_id};
 use crate::executor::traits::{
     ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
     ReadGrant, RejectReason, UntrustedLimits,
@@ -81,20 +81,20 @@ pub enum PrepareError {
 /// The frontend's preparation of a run: the key, the write and the grant.
 #[tonic::async_trait]
 pub trait RunPrepare: Send + Sync {
-    /// The inputs of the run of `action` on `lease` (a build id), started at `now`, which may
+    /// The inputs of the run of `action` on `run` (a build id), started at `now`, which may
     /// take `wall`: the write and the grant are good for it.
     ///
     /// # Errors
     /// [`PrepareError`].
     async fn prepare_run(
         &self,
-        lease: &str,
+        run: &str,
         action: &kbf_types::Digest,
         now: SystemTime,
         wall: Duration,
     ) -> Result<PreparedRun, PrepareError>;
 
-    /// The run of `action` on `lease`, started at `now`, which may take `wall`, that commits
+    /// The run of `action` on `run`, started at `now`, which may take `wall`, that commits
     /// into a put directory: the directory and the closure its action tree is written from.
     ///
     /// # Errors
@@ -102,12 +102,12 @@ pub trait RunPrepare: Send + Sync {
     /// put directory.
     async fn prepare_put_dir(
         &self,
-        lease: &str,
+        run: &str,
         action: &kbf_types::Digest,
         now: SystemTime,
         wall: Duration,
     ) -> Result<PreparedPutDir, PrepareError> {
-        let _ = (lease, action, now, wall);
+        let _ = (run, action, now, wall);
         Err(PrepareError::Refused(
             "this preparation makes no put directory".to_owned(),
         ))
@@ -155,12 +155,12 @@ impl RunPrepare for PutDirPrep {
 
     async fn prepare_put_dir(
         &self,
-        lease: &str,
+        run: &str,
         action: &kbf_types::Digest,
         now: SystemTime,
         wall: Duration,
     ) -> Result<PreparedPutDir, PrepareError> {
-        PutDirPrep::prepare_put_dir(self, lease, action, now, wall)
+        PutDirPrep::prepare_put_dir(self, run, action, now, wall)
             .await
             .map(prepared_put_dir)
             .map_err(prepare_error)
@@ -277,7 +277,7 @@ impl Parked {
 pub struct Front {
     parts: FrontParts,
     now: fn() -> SystemTime,
-    parked: Mutex<BTreeMap<LeaseId, Parked>>,
+    parked: Mutex<BTreeMap<RunId, Parked>>,
 }
 
 impl Front {
@@ -302,7 +302,7 @@ impl Front {
         }
     }
 
-    fn parked(&self) -> MutexGuard<'_, BTreeMap<LeaseId, Parked>> {
+    fn parked(&self) -> MutexGuard<'_, BTreeMap<RunId, Parked>> {
         self.parked.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -338,7 +338,7 @@ fn seconds(time: SystemTime) -> u64 {
 impl Ingest for Front {
     async fn mint(
         &self,
-        lease: LeaseId,
+        run: RunId,
         action: &Digest,
         wall: Duration,
         tree: InputTree,
@@ -346,12 +346,12 @@ impl Ingest for Front {
         let action = cas_digest(action).map_err(MintError::Refused)?;
         let now = (self.now)();
         if let Some(put_dir) = &self.parts.put_dir {
-            return (self.mint_put_dir(put_dir, lease, &action, (now, wall), tree)).await;
+            return (self.mint_put_dir(put_dir, run, &action, (now, wall), tree)).await;
         }
         let prepared = self
             .parts
             .prepare
-            .prepare_run(&build_id(lease), &action, now, wall)
+            .prepare_run(&build_id(run), &action, now, wall)
             .await
             .map_err(MintError::from)?;
         let needed = seconds(now).saturating_add(wall.as_secs());
@@ -365,7 +365,7 @@ impl Ingest for Front {
         // What a start that ran out of its window left behind.
         parked.retain(|_, run| run.not_after >= seconds(now));
         parked.insert(
-            lease,
+            run,
             Parked {
                 key: prepared.key,
                 put_url: Some(prepared.put_url),
@@ -382,7 +382,7 @@ impl Ingest for Front {
 
     async fn ingest(
         &self,
-        lease: LeaseId,
+        run: RunId,
         key: &PackKey,
         action: &Digest,
         limits: &UntrustedLimits,
@@ -409,7 +409,7 @@ impl Ingest for Front {
             ..kbf_front::UntrustedLimits::default()
         };
         let (packs, backend, mint) = (&self.parts.packs, &self.parts.backend, &self.parts.mint);
-        let build = build_id(lease);
+        let build = build_id(run);
         let done = match key {
             Issued::PutDir(dir) => {
                 let writer = self.parts.put_dir.as_ref().map(|parts| &parts.writer);
@@ -453,7 +453,7 @@ impl Front {
     async fn mint_put_dir(
         &self,
         put_dir: &PutDirParts,
-        lease: LeaseId,
+        run: RunId,
         action: &kbf_types::Digest,
         (now, wall): (SystemTime, Duration),
         form: InputTree,
@@ -467,7 +467,7 @@ impl Front {
         let prepared = self
             .parts
             .prepare
-            .prepare_put_dir(&build_id(lease), action, now, wall)
+            .prepare_put_dir(&build_id(run), action, now, wall)
             .await
             .map_err(MintError::from)?;
         let needed = seconds(now).saturating_add(wall.as_secs());
@@ -494,7 +494,7 @@ impl Front {
         let mut parked = self.parked();
         parked.retain(|_, run| run.not_after >= seconds(now));
         parked.insert(
-            lease,
+            run,
             Parked {
                 key: prepared.dir.clone(),
                 put_url: None,
@@ -571,21 +571,21 @@ impl Inputs for Front {
 
     async fn read_grant(
         &self,
-        lease: LeaseId,
+        run: RunId,
         _action: &Digest,
         _expires: Duration,
     ) -> Result<ReadGrant, InputsError> {
         let mut parked = self.parked();
-        let grant = parked.get_mut(&lease).and_then(|run| run.grant.take());
+        let grant = parked.get_mut(&run).and_then(|run| run.grant.take());
         parked.retain(|_, run| run.holds_any());
-        grant.ok_or_else(|| InputsError::Unavailable(format!("no grant was prepared for {lease}")))
+        grant.ok_or_else(|| InputsError::Unavailable(format!("no grant was prepared for {run}")))
     }
 
-    async fn tree(&self, lease: LeaseId) -> Result<String, InputsError> {
+    async fn tree(&self, run: RunId) -> Result<String, InputsError> {
         let mut parked = self.parked();
-        let tree = parked.get_mut(&lease).and_then(|run| run.tree.take());
+        let tree = parked.get_mut(&run).and_then(|run| run.tree.take());
         parked.retain(|_, run| run.holds_any());
-        tree.ok_or_else(|| InputsError::Unavailable(format!("no tree was written for {lease}")))
+        tree.ok_or_else(|| InputsError::Unavailable(format!("no tree was written for {run}")))
     }
 }
 
@@ -615,9 +615,9 @@ fn check_base(
     }
 }
 
-/// The platform of `action` if it names any property, or else of its `command`: as the farm
+/// The platform of `action` if it names any property, or else of its `command`: as `kbf-front`
 /// reads it (`kbf-front`'s `execution.rs`), so the system the executor runs an action on is the
-/// one the farm placed it for.
+/// one `kbf-front` read for it.
 // The Command's platform is deprecated in REAPI 2.2 in favour of the Action's, and clients that
 // predate it still send only the Command's: both are read, the Action's first.
 #[allow(deprecated)]

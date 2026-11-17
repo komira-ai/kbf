@@ -1,5 +1,5 @@
-//! What a host's updater may ask of its frontend, on the worker listener: four calls about its
-//! own node, and no others (`docs/design/updates.md`).
+//! What a host's updater may ask of its frontend, on the worker listener: one call about its
+//! own node, and no other (`docs/design/updates.md`).
 //!
 //! The worker listener is where the frontend already authenticates node certificates (mutual
 //! TLS against `--worker-client-ca`), and every host that runs a worker or a storage node
@@ -8,10 +8,11 @@
 //!
 //! | call | what it does |
 //! |---|---|
-//! | `POST /v1/nodes/{id}:drain` | cordons the node and waits for its leases (body `{"deadline_secs": N}`, optional) |
-//! | `POST /v1/nodes/{id}:uncordon` | returns it to placement |
-//! | `GET /v1/nodes/{id}` | the node as `GET /v1/nodes/{id}` of the operator API has it |
 //! | `GET /v1/nodes/{id}/storage-health` | the node's own storage member and two storage-wide numbers ([`storage`]) |
+//!
+//! kbf places no work on a node, so an updater has nothing to drain, cordon or read of its
+//! node's work: `POST /v1/nodes/{id}:drain`, `:uncordon` and `GET /v1/nodes/{id}` are routes of
+//! no shape here, and are refused as any other call of an updater certificate.
 //!
 //! **Who may.** [`admit`] decides, in [`crate::worker_roles::WorkerRoles`] before anything is
 //! routed: the certificate TLS verified must name the role `updater` and exactly one node, and
@@ -19,15 +20,15 @@
 //! certificate, a call with no certificate, and an updater of another node are refused (401
 //! without a certificate, 403 otherwise). The worker listener's deny list then applies to the
 //! node, as it does to a storage node's calls ([`crate::identity::Peers::admit`]). Every other call
-//! of an updater certificate is refused: the shapes of [`node_call`] are exact, and the
-//! router below serves nothing else, so no operator route is reachable from here whatever the
+//! of an updater certificate is refused: the shape of [`node_call`] is exact, and the router
+//! below serves nothing else, so no operator route is reachable from here whatever the
 //! certificate.
 //!
 //! **Which shapes.** `{id}` is a node id as the farm spells it (1 to 63 of `a-z`, `0-9` and
 //! `-`, not starting or ending with `-`), so a `.`, a `/`, a `%` or any other byte makes the
-//! call none of the four: nothing is percent-decoded or normalized, and what is compared with
-//! the certificate is what the handler reads. A query string makes it none of them, as does
-//! any other verb (`:cordon` included) or method.
+//! call not the one: nothing is percent-decoded or normalized, and what is compared with the
+//! certificate is what the handler reads. A query string makes it not the one, as does any
+//! other method.
 //!
 //! A request over HTTP/1.1 reaches these routes through the same listener as the gRPC calls
 //! (`--worker-tls-*` offers `h2` and `http/1.1`).
@@ -35,7 +36,6 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Extension, Path, State};
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::Response;
@@ -46,65 +46,33 @@ use kbf_types::WorkerId;
 use tonic::Code;
 use tonic::service::Routes;
 
-use crate::api::{drain_action, error, json, placed_error};
-use crate::farm::{Farm, NodeAction};
+use crate::api::error;
 use crate::identity::{PeerCert, Peers, Presented};
 use crate::members::Members;
 
 pub(crate) mod storage;
 
-/// The most bytes a call of an updater may carry: a drain's body is a few.
+/// The most bytes a call of an updater may carry: the one call has no body.
 const MAX_BODY: usize = 1024;
 
-/// The four calls, by what they do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    /// `POST /v1/nodes/{id}:drain`.
-    Drain,
-    /// `POST /v1/nodes/{id}:uncordon`.
-    Uncordon,
-    /// `GET /v1/nodes/{id}`.
-    Status,
-    /// `GET /v1/nodes/{id}/storage-health`.
-    StorageHealth,
-}
-
-/// A call that has the shape of one of the four, about `node`.
+/// A call that has the shape of the one, `GET /v1/nodes/{id}/storage-health`, about `node`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeCall<'a> {
     /// The node the path names.
     pub node: &'a str,
-    /// Which of the four.
-    pub kind: Kind,
 }
 
-/// The call `method` and `uri` make, if it has the shape of one of the four (see the module
-/// docs for how exact the shapes are).
+/// The call `method` and `uri` make, if it has the shape of the one (see the module docs for
+/// how exact the shape is).
 #[must_use]
 pub fn node_call<'a>(method: &Method, uri: &'a Uri) -> Option<NodeCall<'a>> {
-    if uri.query().is_some() {
+    if uri.query().is_some() || method != Method::GET {
         return None;
     }
     let rest = uri.path().strip_prefix("/v1/nodes/")?;
-    let call = |node: &'a str, kind| is_node_label(node).then_some(NodeCall { node, kind });
-    if let Some((node, verb)) = rest.split_once(':') {
-        let kind = match verb {
-            "drain" => Kind::Drain,
-            "uncordon" => Kind::Uncordon,
-            _ => return None,
-        };
-        if method != Method::POST {
-            return None;
-        }
-        return call(node, kind);
-    }
-    if method != Method::GET {
-        return None;
-    }
     match rest.split_once('/') {
-        None => call(rest, Kind::Status),
-        Some((node, "storage-health")) => call(node, Kind::StorageHealth),
-        Some(_) => None,
+        Some((node, "storage-health")) if is_node_label(node) => Some(NodeCall { node }),
+        _ => None,
     }
 }
 
@@ -166,30 +134,26 @@ pub fn admit(
 
 /// What the handlers share.
 struct Calls {
-    farm: Arc<Farm>,
     members: Option<Arc<Members>>,
     store: Option<Arc<dyn Store>>,
     peers: Peers,
 }
 
-/// The routes of the four calls, to be served on the worker listener behind
+/// The route of the one call, to be served on the worker listener behind
 /// [`crate::worker_roles::WorkerRolesLayer`], which lets only [`admit`]ted calls reach them.
 /// `members` and `store` are the storage members and the state store the storage health reads
 /// (`None`: this server keeps none, and that call answers 404); `peers` applies the listener's
 /// deny list to the node.
 #[must_use]
 pub fn routes(
-    farm: Arc<Farm>,
     members: Option<Arc<Members>>,
     store: Option<Arc<dyn Store>>,
     peers: Peers,
 ) -> Routes {
     let router = Router::new()
-        .route("/v1/nodes/{target}", get(status).post(act))
         .route("/v1/nodes/{id}/storage-health", get(storage_health))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(Arc::new(Calls {
-            farm,
             members,
             store,
             peers,
@@ -222,49 +186,6 @@ async fn own(
             };
             Err(error(code, refused.message()))
         }
-    }
-}
-
-async fn status(
-    State(calls): State<Arc<Calls>>,
-    who: Option<Extension<UpdaterCall>>,
-    Path(node): Path<String>,
-) -> Response {
-    let node = match own(&calls, who, &node).await {
-        Ok(node) => node,
-        Err(refused) => return refused,
-    };
-    match calls.farm.node_detail(&node) {
-        Ok(Some(detail)) => json(StatusCode::OK, &detail),
-        Ok(None) => error(StatusCode::NOT_FOUND, "no_node"),
-        Err(unread) => error(StatusCode::SERVICE_UNAVAILABLE, &unread.to_string()),
-    }
-}
-
-async fn act(
-    State(calls): State<Arc<Calls>>,
-    who: Option<Extension<UpdaterCall>>,
-    Path(target): Path<String>,
-    body: Bytes,
-) -> Response {
-    let (node, verb) = target.rsplit_once(':').unwrap_or((&target, ""));
-    let action = match verb {
-        "uncordon" => Some(Ok(NodeAction::Uncordon)),
-        "drain" => Some(drain_action(&body)),
-        _ => None,
-    };
-    let node = match own(&calls, who, node).await {
-        Ok(node) => node,
-        Err(refused) => return refused,
-    };
-    let action = match action {
-        Some(Ok(action)) => action,
-        Some(Err((code, why))) => return error(code, &why),
-        None => return error(StatusCode::NOT_FOUND, "no_action"),
-    };
-    match calls.farm.place(&node, action) {
-        Ok(view) => json(StatusCode::OK, &view),
-        Err(refused) => placed_error(&refused),
     }
 }
 

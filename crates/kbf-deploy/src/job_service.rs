@@ -46,7 +46,7 @@ pub enum JobService {
     Plan(crate::cutover::Target),
     /// Switch the frontend's executor onto the job service: check the service, rewrite the
     /// `[executor]` table (the original kept beside it), drain and restart the frontend
-    /// through kbf-host-install, wait for its first virtual worker, and run one canary job.
+    /// through kbf-host-install, wait for it to be ready, and run one canary job.
     /// A dry run without --apply.
     Apply(Box<crate::cutover_apply::ApplyArgs>),
 }

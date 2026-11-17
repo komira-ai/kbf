@@ -1,14 +1,11 @@
 //! A host's updater against the frontend's real worker listener, over mutual TLS and with no
-//! token: the four calls about its own node (`kbf_server::node_self`), and everything else
+//! token: the one call about its own node (`kbf_server::node_self`), and everything else
 //! refused. The updater side is the real code of `kbf-updater` (its client and its storage
-//! health check); the frontend is the one `bind_server_with_state` starts, with a fake daemon
-//! registered with its farm for the node being drained, storage members and the enrollment
-//! registry in the state store.
+//! health check); the frontend is the one `bind_server_with_state` starts, with storage members
+//! and the enrollment registry in the state store.
 //!
 //! The refusals are tried twice: with the updater's own client over HTTP/1.1 (what the agent
 //! speaks), and with raw HTTP/2 requests under a certificate of each other role.
-
-mod support;
 
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
@@ -20,12 +17,11 @@ use bytes::Bytes;
 use http_body_util::Full;
 use kbf_enroll_registry::{EnrollRequest, IssuedRole, TokenSpec, create_token, enroll_txn};
 use kbf_front::Cache;
-use kbf_server::farm::Farm;
 use kbf_server::members::{
     Fill, Members, MembershipConfig, NodeFacts, PROTOCOL, Progress, Registrant,
 };
 use kbf_server::storage_health::{Debts, Reported};
-use kbf_server::{DenyList, EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
+use kbf_server::{DenyList, Listeners, StateStore, WorkerTls, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
 use kbf_testkit::dir::TestDir;
@@ -44,8 +40,6 @@ use rcgen::{
 };
 use tonic::codegen::{Service, http};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint as GrpcEndpoint, Identity};
-
-use support::{FakeDaemon, hello};
 
 const DAY: u64 = 24 * 3600;
 const PROMPT: Duration = Duration::from_secs(10);
@@ -186,19 +180,8 @@ fn listeners(worker_tls: WorkerTls) -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls: Some(worker_tls),
-        tick: Duration::from_secs(3600),
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
@@ -207,16 +190,10 @@ fn listeners(worker_tls: WorkerTls) -> Listeners {
     }
 }
 
-/// A frontend with a state store, serving; returns its worker listener's address.
+/// [`frontend`]: a frontend with a state store, serving; its worker listener's address.
 fn frontend(worker_tls: WorkerTls, fake: &Arc<Fake>) -> SocketAddr {
-    frontend_over(worker_tls, fake).0
-}
-
-/// [`frontend`], and its farm, which a fake daemon registers with.
-fn frontend_over(worker_tls: WorkerTls, fake: &Arc<Fake>) -> (SocketAddr, std::sync::Weak<Farm>) {
     let state = StateStore {
         store: Arc::clone(fake) as Arc<dyn Store>,
-        epoch: EpochPolicy::Keep,
         members: config(),
         history: None,
     };
@@ -230,20 +207,13 @@ fn frontend_over(worker_tls: WorkerTls, fake: &Arc<Fake>) -> (SocketAddr, std::s
     )
     .expect("binds");
     tokio::spawn(bound.serving);
-    (bound.worker, bound.farm.clone())
+    bound.worker
 }
 
 fn store() -> Arc<Fake> {
     let clock = Arc::new(ManualClock::default());
     clock.advance(Duration::from_secs(10 * DAY));
     Arc::new(Fake::with_flaw(clock, Flaw::None))
-}
-
-/// A fake daemon for `node`, registered with `farm`: the node exists for the operator API.
-async fn daemon(farm: &std::sync::Weak<Farm>, node: &str) -> FakeDaemon {
-    FakeDaemon::connect(farm.clone(), hello(node, 1, 1))
-        .await
-        .expect("registered")
 }
 
 /// A raw HTTP/2 call on `channel`: the status the listener answered with.
@@ -304,25 +274,14 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.expect("the task")
 }
 
-fn state_of(node: &serde_json::Value) -> String {
-    node["placement"]["state"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned()
-}
-
-/// What an updater certificate is refused: another node's drain, uncordon and status, a cordon
-/// of its own node, every operator route and a path that is none. Each is a 403, and the node
-/// it could have touched is where it was.
+/// What an updater certificate is refused: another node's storage health, every route of the
+/// removed node calls (drain, uncordon and status, of its own node as well as another), every
+/// operator route and a path that is none. Each is a 403.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_updater_is_refused_another_node_an_operator_route_and_every_other_verb() {
     let dir = scratch("refused");
     let pki = Pki::new();
-    let (addr, farm) = frontend_over(pki.worker_tls(None), &store());
-    let mut sessions = Vec::new();
-    for node in ["node-a", "node-b"] {
-        sessions.push(daemon(&farm, node).await);
-    }
+    let addr = frontend(pki.worker_tls(None), &store());
 
     let (files, who) = pki.files(&sub(&dir, "a"), &pki.updater("node-a", "daemon"));
     let client = api(addr, files, who);
@@ -330,14 +289,18 @@ async fn an_updater_is_refused_another_node_an_operator_route_and_every_other_ve
     let answers = blocking(move || {
         let mut out = Vec::new();
         for (method, path, body) in [
+            ("GET", "/v1/nodes/node-b/storage-health", ""),
             ("POST", "/v1/nodes/node-b:drain", r#"{"deadline_secs": 5}"#),
             ("POST", "/v1/nodes/node-b:uncordon", ""),
             ("GET", "/v1/nodes/node-b", ""),
-            ("GET", "/v1/nodes/node-b/storage-health", ""),
+            ("POST", "/v1/nodes/node-a:drain", r#"{"deadline_secs": 5}"#),
+            ("POST", "/v1/nodes/node-a:uncordon", ""),
             ("POST", "/v1/nodes/node-a:cordon", ""),
+            ("GET", "/v1/nodes/node-a", ""),
             ("POST", "/v1/nodes/node-a", ""),
+            ("POST", "/v1/nodes/node-a/storage-health", ""),
             ("GET", "/v1/nodes/node-a:drain", ""),
-            ("GET", "/v1/nodes/node-a?x=1", ""),
+            ("GET", "/v1/nodes/node-a/storage-health?x=1", ""),
             ("GET", "/v1/nodes", ""),
             ("GET", "/v1/members", ""),
             ("GET", "/v1/members/node-a/safe-to-stop", ""),
@@ -362,36 +325,21 @@ async fn an_updater_is_refused_another_node_an_operator_route_and_every_other_ve
     for (method, path, status) in answers {
         assert_eq!(status, 403, "{method} {path}");
     }
-
-    for node in ["node-a", "node-b"] {
-        let c = client.clone();
-        let path = format!("/v1/nodes/{node}");
-        let reply = blocking(move || c.get(&path).expect("status")).await;
-        if node == "node-a" {
-            assert_eq!(reply.status, 200);
-            let body: serde_json::Value = serde_json::from_slice(&reply.body).expect("JSON");
-            assert_eq!(state_of(&body), "serving", "nothing was done to the node");
-        } else {
-            assert_eq!(reply.status, 403);
-        }
-    }
-    drop(sessions);
 }
 
 /// A certificate of any role but the updater's, even one for the very node of the call, is
-/// refused every one of the four calls, and so is an updater's certificate for another node:
-/// 403 each, whatever the method and path, over HTTP/2.
+/// refused the storage-health call, and so is an updater's certificate for another node: 403
+/// each, over HTTP/2. The removed node routes are refused node-a's own updater as well.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_other_role_gets_the_node_calls() {
     let pki = Pki::new();
-    let (addr, farm) = frontend_over(pki.worker_tls(None), &store());
-    let _node = daemon(&farm, "node-a").await;
+    let addr = frontend(pki.worker_tls(None), &store());
 
     let calls = [
+        ("GET", "/v1/nodes/node-a/storage-health", ""),
         ("POST", "/v1/nodes/node-a:drain", r#"{"deadline_secs": 5}"#),
         ("POST", "/v1/nodes/node-a:uncordon", ""),
         ("GET", "/v1/nodes/node-a", ""),
-        ("GET", "/v1/nodes/node-a/storage-health", ""),
         ("GET", "/v1/nodes", ""),
         ("GET", "/v1/members", ""),
     ];
@@ -413,58 +361,22 @@ async fn no_other_role_gets_the_node_calls() {
         }
     }
 
-    // The same certificate that was refused is not what protects the node: node-a's own
-    // updater, over HTTP/2 as well, is served.
     let own = pki.channel(addr, &pki.updater("node-a", "daemon")).await;
-    assert_eq!(status_of(&own, "GET", "/v1/nodes/node-a", "").await, 200);
-    assert_eq!(
-        status_of(
-            &own,
-            "POST",
-            "/v1/nodes/node-a:drain",
-            r#"{"deadline_secs": 5}"#
-        )
-        .await,
-        200
-    );
-    assert_eq!(
-        status_of(&own, "POST", "/v1/nodes/node-a:uncordon", "").await,
-        200
-    );
-    assert_eq!(status_of(&own, "GET", "/v1/nodes", "").await, 403);
+    for (method, path, body) in &calls[1..] {
+        assert_eq!(
+            status_of(&own, method, path, body).await,
+            403,
+            "{method} {path}"
+        );
+    }
     assert_eq!(
         status_of(&own, "POST", "/v1/nodes/node-a:cordon", "").await,
         403
     );
 }
 
-/// A node the frontend has never seen is 404 for its own updater, which is how a storage host
-/// without a worker is told so.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_node_the_frontend_does_not_know_is_a_404() {
-    let dir = scratch("unknown");
-    let pki = Pki::new();
-    let addr = frontend(pki.worker_tls(None), &store());
-    let (files, who) = pki.files(&sub(&dir, "z"), &pki.updater("node-z", "storage"));
-    let client = api(addr, files, who);
-    let c = client.clone();
-    let (status, drain, undrain) = blocking(move || {
-        (
-            c.get("/v1/nodes/node-z").expect("an answer").status,
-            c.post("/v1/nodes/node-z:drain", "")
-                .expect("an answer")
-                .status,
-            c.post("/v1/nodes/node-z:uncordon", "")
-                .expect("an answer")
-                .status,
-        )
-    })
-    .await;
-    assert_eq!((status, drain, undrain), (404, 404, 404));
-}
-
 /// The worker listener's deny list applies to an updater's node: a listed node is refused its
-/// own calls (403), another is served.
+/// own storage-health call (403), another is served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_deny_list_refuses_a_listed_nodes_updater() {
     let dir = scratch("denied");
@@ -472,16 +384,30 @@ async fn the_deny_list_refuses_a_listed_nodes_updater() {
     let list = dir.join("denied");
     std::fs::write(&list, "node node-a\n").expect("write");
     let deny = DenyList::open(&list).expect("a list");
-    let (addr, farm) = frontend_over(pki.worker_tls(Some(deny)), &store());
-    let _node = daemon(&farm, "node-b").await;
+    let fake = store();
+    let addr = frontend(pki.worker_tls(Some(deny)), &fake);
+    enroll(&*fake, 1, "node-a", &[Role::Storage], "192.0.2.1:8982");
+    enroll(&*fake, 2, "node-b", &[Role::Storage], "192.0.2.2:8982");
 
-    let (files, who) = pki.files(&sub(&dir, "a"), &pki.updater("node-a", "daemon"));
+    let (files, who) = pki.files(&sub(&dir, "a"), &pki.updater("node-a", "storage"));
     let denied = api(addr, files, who);
-    let listed = blocking(move || denied.get("/v1/nodes/node-a").expect("an answer").status).await;
+    let listed = blocking(move || {
+        denied
+            .get("/v1/nodes/node-a/storage-health")
+            .expect("an answer")
+            .status
+    })
+    .await;
     assert_eq!(listed, 403);
-    let (files, who) = pki.files(&sub(&dir, "b"), &pki.updater("node-b", "daemon"));
+    let (files, who) = pki.files(&sub(&dir, "b"), &pki.updater("node-b", "storage"));
     let served = api(addr, files, who);
-    let ok = blocking(move || served.get("/v1/nodes/node-b").expect("an answer").status).await;
+    let ok = blocking(move || {
+        served
+            .get("/v1/nodes/node-b/storage-health")
+            .expect("an answer")
+            .status
+    })
+    .await;
     assert_eq!(ok, 200);
 }
 

@@ -24,11 +24,11 @@ use kbf_history::records::{
     BookSource, HitHow, HitRecord, MemoryKill, PhaseTimes, RunOutcome, RunRecord, UsageBasis,
     WireDigest,
 };
+use kbf_invocation::RequeueReason;
 use kbf_invocation::{
     ActionRow, ActionShape, Attempt, AttemptEnd, Evidence, How, Listing, NumaBytes, Outcome,
     Output, ReapiTimes, Run, RunUsage, Target, TargetKind, Text, WallTime,
 };
-use kbf_sched::RequeueReason;
 use kbf_types::{Digest, DigestFunction, Failure, LeaseId, LostWhy, OperationId, WorkerId};
 
 /// gRPC `INVALID_ARGUMENT`: what a run the farm could not run as written was answered.

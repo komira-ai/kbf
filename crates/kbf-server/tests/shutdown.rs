@@ -1,15 +1,16 @@
-//! Stopping the `kbf-server` binary with open REAPI streams (issue #168, and kbf#791): SIGTERM
-//! ends the stream of an operation that has never started at once, and a connection that never
-//! closes is cut off at `--shutdown-timeout-secs`, after which the server exits 0. The same file
-//! holds the stream-liveness flags: an idle Execute stream is sent progress operations, and the
-//! listeners send HTTP/2 PINGs. A stream that a worker runs is drained in process, where a test
-//! registers the worker with the farm (`frontend_drain.rs`, `frontend/drain.rs`), and in the
-//! `kbf frontend` process, where the worker is a job of the job service
+//! Stopping the `kbf-server` binary with open REAPI streams (issue #168, and kbf#791): a connection
+//! that never closes is cut off at `--shutdown-timeout-secs`, after which the server exits 0. The
+//! same file holds the stream-liveness flags: an idle Execute stream is sent progress operations,
+//! and the listeners send HTTP/2 PINGs. A stream whose job is open is drained in process
+//! (`frontend_drain.rs`, `frontend/drain.rs`), and in the `kbf frontend` process
 //! (`kbf-cli`'s `tests/frontend_shutdown.rs`).
 
 #![cfg(unix)]
 
 mod support;
+
+#[path = "frontend/idle_executor.rs"]
+mod idle_executor;
 
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
@@ -19,11 +20,7 @@ use std::time::{Duration, Instant};
 use futures::channel::mpsc;
 use kbf_proto::google::bytestream::WriteRequest;
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
-use kbf_proto::google::longrunning::Operation;
-use kbf_proto::reapi::ExecuteOperationMetadata;
-use prost::Message;
 use support::{Blob, Client, Job, PROMPT};
-use tonic::Code;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-server");
 
@@ -138,50 +135,41 @@ impl Drop for Running {
     }
 }
 
-/// Catches a stop that holds for an operation that has never started and that no worker
-/// can run: with no deadline (the default) and no worker connected, SIGTERM ends the
-/// stream UNAVAILABLE at once (naming why) and the server exits 0 with no second signal.
-/// The client's connection stays open throughout.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sigterm_ends_a_queued_stream_at_once_and_the_server_exits() {
-    let (mut server, reapi, worker) = Running::start(&[]);
-    let client = Client::connect(reapi, worker).await;
-    let job = Job::new("queued across a SIGTERM", &[]);
-    client.upload(&job.blobs()).await;
-    let mut executed = client.execute(&job.action).await;
-    loop {
-        let op = tokio::time::timeout(PROMPT, executed.message())
-            .await
-            .expect("an update in time")
-            .expect("healthy")
-            .expect("an update");
-        if waits_for_a_worker(&op) {
-            break;
-        }
-    }
-
-    server.terminate();
-    let ended = tokio::time::timeout(PROMPT, executed.message())
-        .await
-        .expect("the queued stream ends after SIGTERM")
-        .expect_err("it ends with an error");
-    assert_eq!(ended.code(), Code::Unavailable, "{ended:?}");
-    assert!(ended.message().contains("never started"), "{ended:?}");
-    let status = server.exited(PROMPT).await;
-    assert!(status.success(), "kbf-server exited with {status}");
-    drop(client);
-}
-
 /// Catches (kbf#791): a server that sends nothing on an idle Execute
 /// stream, so a load balancer's idle timeout cuts it. With `--progress-interval-secs 1`
-/// an operation waiting for a worker is sent again, same name, not done. The
-/// defect it catches is a server that never runs the progress ticker (the read times out).
+/// an operation waiting for its job (nobody runs it) is sent again, same name, not done. The
+/// defect it catches is a server that never runs the progress ticker (the read times out). The
+/// server runs in this process, over an executor with a fake job service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_idle_execute_stream_is_sent_progress() {
-    let (_server, reapi, worker) = Running::start(&["--progress-interval-secs", "1"]);
-    let client = Client::connect(reapi, worker).await;
+    use clap::Parser as _;
+    let args = kbf_server::Args::parse_from([
+        "kbf-server",
+        "--listen",
+        "127.0.0.1:0",
+        "--worker-listen",
+        "127.0.0.1:0",
+        "--progress-interval-secs",
+        "1",
+    ]);
+    let mut listeners = args.listeners().expect("listeners");
+    let (executor, fake) = idle_executor::idle_executor().await;
+    listeners.executor = Some(executor);
     let job = Job::new("idle with progress", &[]);
-    client.upload(&job.blobs()).await;
+    let cache = std::sync::Arc::new(kbf_front::Cache::memory());
+    let blobs = [&job.action, &job.command, &job.root, &job.input];
+    let stored = blobs
+        .iter()
+        .map(|b| kbf_front::VerifiedBlob::new(b.digest, b.data.clone().into()).expect("a digest"));
+    cache.store_blobs(stored.collect()).await.expect("store");
+    let bound = kbf_server::bind_server_with_api(cache, listeners, None, std::future::pending())
+        .expect("bind");
+    let (reapi, worker) = (bound.reapi, bound.worker);
+    tokio::spawn(async move {
+        let _job_service = fake;
+        bound.serving.await.expect("serve")
+    });
+    let client = Client::connect(reapi, worker).await;
     let mut executed = client.execute(&job.action).await;
     let mut seen = Vec::new();
     while seen.len() < 3 {
@@ -244,8 +232,8 @@ async fn the_reapi_listener_pings_an_idle_connection() {
     server.stop().await;
 }
 
-/// The same for the worker listener, which a daemon's stream (a lease's whole life)
-/// crosses a proxy on. The defect it catches is `keepalive` not applied to the worker
+/// The same for the worker listener, which a storage node's calls
+/// cross a proxy on. The defect it catches is `keepalive` not applied to the worker
 /// builder: the REAPI test above stays green, this one gets no PING.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_worker_listener_pings_an_idle_connection() {
@@ -257,14 +245,6 @@ async fn the_worker_listener_pings_an_idle_connection() {
     ]);
     expects_a_ping_from(worker, "the worker listener").await;
     server.stop().await;
-}
-
-/// Whether `op` is queued with the reason no live worker can run it.
-fn waits_for_a_worker(op: &Operation) -> bool {
-    let any = op.metadata.as_ref().expect("metadata");
-    let meta = ExecuteOperationMetadata::decode(any.value.as_slice()).expect("metadata");
-    meta.partial_execution_metadata
-        .is_some_and(|partial| !partial.auxiliary_metadata.is_empty())
 }
 
 /// Catches: a stop that waits on a REAPI connection that never closes (here a

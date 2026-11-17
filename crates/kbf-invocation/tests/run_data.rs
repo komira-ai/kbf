@@ -5,11 +5,11 @@
 
 mod support;
 
+use kbf_invocation::RequeueReason;
 use kbf_invocation::{
     ActionShape, Event, LeaseEnd, MemoryKillKind, Outcome, Phase, ReapiTimes, Records, Run,
     RunUsage, Target, TargetKind, Text,
 };
-use kbf_sched::RequeueReason;
 use kbf_types::{Failure, OperationId};
 use support::*;
 

@@ -1,5 +1,5 @@
 //! `Execution` over gRPC, against the in-process cache and a scripted dispatch that
-//! stands in for the scheduler: what Execute checks, what it submits, and how it streams
+//! stands in for the dispatcher: what Execute checks, what it submits, and how it streams
 //! an operation's stages.
 
 mod common;
@@ -7,21 +7,14 @@ mod common;
 mod error_causes_tests;
 #[path = "execution/platform.rs"]
 mod platform_tests;
-#[path = "execution/qos.rs"]
-mod qos_tests;
 #[path = "execution/refuse_platform.rs"]
 mod refuse_platform_tests;
-#[path = "execution/wall.rs"]
-mod wall_tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use common::{Blob, Farm};
-use kbf_front::{
-    DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN, Finished, NO_WORKER_REASON, Stage, Submission,
-    Ticket,
-};
+use kbf_front::{Dispatch, Finished, Stage, Submission, Ticket};
 use kbf_meta::Role;
 use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::google::rpc::{self, PreconditionFailure};
@@ -31,7 +24,7 @@ use kbf_proto::reapi::{
     ExecuteRequest, ExecuteResponse, FileNode, GetCapabilitiesRequest, Platform,
     WaitExecutionRequest, platform,
 };
-use kbf_types::{ActionKey, LeaseKind, Qos};
+use kbf_types::ActionKey;
 use prost::Message;
 use tokio::sync::watch;
 use tonic::{Code, Status, Streaming};
@@ -85,8 +78,7 @@ impl Dispatch for Script {
         };
         let (tx, rx) = watch::channel(first);
         stages.push((name.clone(), tx));
-        let ActionKey { instance, action } =
-            ActionKey::try_from(&submission.request.key).expect("an action's key");
+        let ActionKey { instance, action } = submission.key.clone();
         self.submitted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -97,6 +89,10 @@ impl Dispatch for Script {
             action,
             stage: rx,
         })
+    }
+
+    fn cancel(&self, _name: &str) -> bool {
+        false
     }
 
     fn wait(&self, name: &str) -> Option<Ticket> {
@@ -125,16 +121,6 @@ fn property(name: &str, value: &str) -> platform::Property {
 }
 
 fn job(argv: &str, action_platform: &[(&str, &str)], do_not_cache: bool) -> Job {
-    job_with_timeout(argv, action_platform, do_not_cache, None)
-}
-
-/// As [`job`], with the action's `timeout` field set to `timeout`.
-fn job_with_timeout(
-    argv: &str,
-    action_platform: &[(&str, &str)],
-    do_not_cache: bool,
-    timeout: Option<prost_types::Duration>,
-) -> Job {
     let input = Blob::new(format!("input of {argv}"));
     let root = Blob::of(&Directory {
         files: vec![FileNode {
@@ -152,7 +138,6 @@ fn job_with_timeout(
         command_digest: Some(command.proto.clone()),
         input_root_digest: Some(root.proto.clone()),
         do_not_cache,
-        timeout,
         platform: Some(Platform {
             properties: action_platform
                 .iter()
@@ -242,8 +227,7 @@ fn subject(blob: &Blob) -> String {
     )
 }
 
-/// Catches: a request sent to the scheduler with the wrong key, QoS, size, fence or
-/// cache flag; an operation stream that skips a stage, reports the wrong stage, does
+/// Catches: a request sent to the dispatcher with the wrong key, lease; an operation stream that skips a stage, reports the wrong stage, does
 /// not end after the done operation, or answers without the result or with
 /// `cached_result` set for work that ran.
 #[tokio::test]
@@ -260,17 +244,13 @@ async fn execute_submits_and_streams_each_stage() {
     assert_eq!(queued.name, "operations/0");
     let [submission] = script.submitted().try_into().expect("one submission");
     assert_eq!(
-        submission.request.key,
+        submission.key,
         ActionKey {
             instance: "main".to_owned(),
             action: job.action.digest
         }
-        .into()
     );
-    assert_eq!(submission.request.qos, Qos::Ci);
-    assert_eq!(submission.request.resources, DEFAULT_RESOURCES);
-    assert!(submission.request.hermetic && !submission.request.do_not_cache);
-    assert_eq!(submission.request.kind, LeaseKind::Action);
+    assert!(!submission.whole_machine);
 
     script.set(0, Stage::Executing);
     let executing = next(&mut ops).await.expect("healthy").expect("an update");
@@ -477,93 +457,6 @@ async fn a_drain_keeps_open_streams_and_refuses_new_executes() {
     }
 }
 
-/// Catches a drain that ends a stream it must keep, and one that keeps a stream that can
-/// never finish. Buck2 does not recover a stream that breaks after the call opened, so
-/// only an operation that has never been started and that no worker can run
-/// (`Stage::Waiting`) is ended early. Operation 0 is plainly queued (a worker may take
-/// it), 1 is waiting with no worker and never started, 2 is running, 3 waits for a worker
-/// but had a lease once (`WaitingKept`). After `drain`, only stream 1 (and a second
-/// stream on it, and a WaitExecution opened later on it, after its first operation) ends
-/// UNAVAILABLE, naming its operation; streams 0, 2 and 3 stay silent, and each ends
-/// with its done operation when the operation is done.
-#[tokio::test]
-async fn a_drain_ends_only_the_streams_of_operations_that_can_never_start() {
-    let script = Arc::new(Script::default());
-    let (closer, closing) = kbf_front::closing();
-    let farm = Farm::with_execution_until(Arc::clone(&script), closing).await;
-    let jobs = [
-        job("queued", &[], false),
-        job("waiting", &[], false),
-        job("running", &[], false),
-        job("requeued", &[], false),
-    ];
-    for job in &jobs {
-        farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
-    }
-    let mut streams = Vec::new();
-    for job in &jobs {
-        let mut ops = start(&farm, &job.action).await.expect("Execute");
-        next(&mut ops).await.expect("healthy").expect("queued");
-        streams.push(ops);
-    }
-    let farm_ref = &farm;
-    let wait = |n: usize| async move {
-        farm_ref
-            .exec()
-            .wait_execution(WaitExecutionRequest {
-                name: format!("operations/{n}"),
-            })
-            .await
-    };
-    let mut waited = wait(1).await.expect("WaitExecution").into_inner();
-    next(&mut waited).await.expect("healthy").expect("queued");
-    for (n, to) in [
-        (1, Stage::Waiting("no worker".to_owned())),
-        (2, Stage::Executing),
-        (3, Stage::WaitingKept("no worker".to_owned())),
-    ] {
-        script.set(n, to);
-        next(&mut streams[n])
-            .await
-            .expect("healthy")
-            .expect("update");
-    }
-
-    closer.drain();
-    let gone = next(&mut streams[1]).await.expect_err("waiting");
-    assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
-    assert!(gone.message().contains("operations/1"), "{gone:?}");
-    // The update that stage change sent it first, then the end.
-    next(&mut waited).await.expect("healthy").expect("waiting");
-    let gone = next(&mut waited).await.expect_err("second stream on it");
-    assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
-
-    let mut late = wait(1)
-        .await
-        .expect("WaitExecution during the drain")
-        .into_inner();
-    next(&mut late)
-        .await
-        .expect("healthy")
-        .expect("first operation");
-    let gone = next(&mut late).await.expect_err("opened during the drain");
-    assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
-
-    // The drain has ended every stream it ends (the waiting operation's three, above and
-    // just now), so a stream of an operation that can still start is untouched by now.
-    for n in [0, 2, 3] {
-        let quiet = futures::FutureExt::now_or_never(streams[n].message());
-        assert!(quiet.is_none(), "stream {n} spoke or ended: {quiet:?}");
-    }
-
-    for n in [0, 2, 3] {
-        script.set(n, Stage::Done(Finished::Ran(Box::default())));
-        let done = next(&mut streams[n]).await.expect("kept").expect("done");
-        assert!(done.done, "stream {n}: {done:?}");
-        assert_eq!(next(&mut streams[n]).await.expect("ends"), None);
-    }
-}
-
 /// A dispatch whose first `submit` stops inside the call until the test lets it go,
 /// over a [`Script`]: the window between an Execute's drain check and its stream.
 struct Gated {
@@ -596,6 +489,10 @@ impl Dispatch for Gated {
 
     fn wait(&self, name: &str) -> Option<Ticket> {
         self.script.wait(name)
+    }
+
+    fn cancel(&self, name: &str) -> bool {
+        self.script.cancel(name)
     }
 }
 
@@ -1220,49 +1117,8 @@ async fn malformed_requests_are_invalid() {
     assert!(script.submitted().is_empty());
 }
 
-/// Catches: an operation no worker can run streamed as plainly QUEUED, so a build
-/// hangs with no word of why, and a reason left in the metadata once it is gone.
-#[tokio::test]
-async fn a_waiting_operation_says_why_in_its_metadata() {
-    let script = Arc::new(Script::default());
-    let farm = Farm::with_execution(Arc::clone(&script)).await;
-    let job = job("wait", &[("OSFamily", "darwin")], false);
-    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
-    let mut ops = start(&farm, &job.action).await.expect("Execute");
-
-    let partial = |op: &Operation| {
-        let meta = op.metadata.as_ref().expect("metadata");
-        ExecuteOperationMetadata::decode(meta.value.as_slice())
-            .expect("metadata decodes")
-            .partial_execution_metadata
-    };
-    let queued = next(&mut ops).await.expect("healthy").expect("an update");
-    assert_eq!(partial(&queued), None);
-
-    let why = "none of the 1 live worker(s) satisfies the action's platform";
-    script.set(0, Stage::Waiting(why.to_owned()));
-    let waiting = next(&mut ops).await.expect("healthy").expect("an update");
-    assert_eq!(stage(&waiting), ExecStage::Queued as i32);
-    assert!(!waiting.done);
-    let [info] = partial(&waiting)
-        .expect("partial metadata")
-        .auxiliary_metadata
-        .try_into()
-        .expect("one entry");
-    assert_eq!(info.type_url, "type.googleapis.com/google.rpc.ErrorInfo");
-    let info = rpc::ErrorInfo::decode(info.value.as_slice()).expect("an ErrorInfo");
-    assert_eq!(info.reason, NO_WORKER_REASON);
-    assert_eq!(info.domain, ERROR_DOMAIN);
-    assert_eq!(info.metadata.get("why").map(String::as_str), Some(why));
-
-    script.set(0, Stage::Queued);
-    let again = next(&mut ops).await.expect("healthy").expect("an update");
-    assert_eq!(stage(&again), ExecStage::Queued as i32);
-    assert_eq!(partial(&again), None);
-}
-
 /// Catches: a WaitExecution that does not follow the named operation, or that answers
-/// for a name it does not know instead of NOT_FOUND; and a refusal from the scheduler
+/// for a name it does not know instead of NOT_FOUND; and a refusal from the dispatcher
 /// that is swallowed.
 #[tokio::test]
 async fn wait_execution_and_refusals() {

@@ -46,14 +46,11 @@ const BASE: &str =
 const KBF: &str =
     "registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
-const JS: [&str; 12] = [
+const JS: [&str; 9] = [
     "--executor=js-agent",
     "--executor-job-url=http://127.0.0.1:7",
     "--executor-job-token-file=/etc/token",
     "--executor-frontend-id=front-1",
-    "--executor-hosts=2",
-    "--executor-host-cpus=8",
-    "--executor-host-memory-gib=32",
     "--executor-base-image=registry.test/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "--executor-kbf-image=registry.test/kbf@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
     "--executor-base-tree=/opt/kbf/base-tree",
@@ -145,22 +142,10 @@ fn js_agent_names_each_flag_it_needs() {
     ] {
         assert!(why.contains(flag), "{flag} in {why}");
     }
-    for flag in [
-        "--executor-hosts",
-        "--executor-host-cpus",
-        "--executor-host-memory-gib",
-    ] {
+    for flag in RETIRED.map(|(_, long, _)| long) {
         assert!(!why.contains(flag), "{flag} is not needed: {why}");
     }
-    let shape = [
-        "--executor-hosts",
-        "--executor-host-cpus",
-        "--executor-host-memory-gib",
-    ];
-    for (at, flag) in JS.iter().enumerate().skip(1).take(9) {
-        if shape.contains(&name(flag)) {
-            continue;
-        }
+    for (at, flag) in JS.iter().enumerate().skip(1).take(6) {
         let name = name(flag);
         let mut all = JS.to_vec();
         all.remove(at);
@@ -188,39 +173,12 @@ fn js_agent_needs_the_secrets_opt_in_and_the_packs() {
     assert!(why.contains("--pack-store-endpoint"), "{why}");
 }
 
-/// Catches the virtual workers' shape being required: left out, the executor gets the
-/// ceilings the flags default to (the constants), and giving them lowers each ceiling.
-#[test]
-fn the_workers_shape_defaults_to_generous_ceilings() {
-    let mut all = JS.to_vec();
-    all.retain(|flag| {
-        ![
-            "--executor-hosts",
-            "--executor-host-cpus",
-            "--executor-host-memory-gib",
-        ]
-        .contains(&name(flag))
-    });
-    let flags = parsed(argv(&all)).expect("flags");
-    let config = flags.executor.js.expect("js-agent").config;
-    assert_eq!(config.hosts, DEFAULT_HOSTS);
-    assert_eq!(config.cpu_millis, DEFAULT_HOST_CPUS * 1_000);
-    assert_eq!(config.memory_bytes, DEFAULT_HOST_MEMORY_GIB << 30);
-    let flags = js_with(&[]).expect("flags");
-    let config = flags.executor.js.expect("js-agent").config;
-    assert_eq!(
-        (config.hosts, config.cpu_millis, config.memory_bytes),
-        (2, 8_000, 32 << 30),
-        "a given shape lowers the ceilings"
-    );
-}
-
-/// Catches settings that do not become the executor's: the shape is in cores and GiB, the two
-/// images are the ones given by digest, and everything else is what was given.
+/// Catches settings that do not become the executor's: the two images are the ones given by
+/// digest, and everything else is what was given, the poll, call, preparation and liveness
+/// times among it.
 #[test]
 fn js_agent_settings_become_the_executors_config() {
     let flags = js_with(&[
-        "--executor-host-slots=4",
         "--executor-arch=arm64",
         "--executor-work-dir=/scratch",
         "--executor-allow-plain-http-put",
@@ -231,7 +189,7 @@ fn js_agent_settings_become_the_executors_config() {
         "--executor-call-timeout-secs=3",
         "--executor-poll-ms=250",
         "--executor-prepare-limit-secs=45",
-        "--executor-prepare-concurrency=3",
+        "--executor-live-secs=90",
         "--executor-failed-stderr-log-bytes=2048",
     ])
     .expect("flags");
@@ -243,10 +201,6 @@ fn js_agent_settings_become_the_executors_config() {
     assert_eq!(js.base_image.to_string(), BASE);
     assert_eq!(js.kbf_image.to_string(), KBF);
     assert_eq!(config.frontend, "front-1");
-    assert_eq!(config.hosts, 2);
-    assert_eq!(config.cpu_millis, 8_000);
-    assert_eq!(config.memory_bytes, 32 << 30);
-    assert_eq!(config.slots, 4);
     assert_eq!(config.arch, "arm64");
     assert_eq!(config.work_dir.as_deref(), Some("/scratch"));
     assert!(config.allow_plain_http_put);
@@ -258,7 +212,7 @@ fn js_agent_settings_become_the_executors_config() {
     assert_eq!(config.call_timeout, Duration::from_secs(3));
     assert_eq!(config.poll, Duration::from_millis(250));
     assert_eq!(config.prepare_limit, Duration::from_secs(45));
-    assert_eq!(config.prepare_concurrency, 3);
+    assert_eq!(config.live, Duration::from_secs(90));
     assert_eq!(config.failed_stderr_log_bytes, 2048);
 }
 
@@ -294,8 +248,10 @@ fn the_defaults_are_the_executors_own() {
         .collect();
     let flags = parsed(argv(&all)).expect("flags");
     let config = flags.executor.js.expect("js-agent").config;
-    let own = Config::new("front-1", 2, 8_000, 32 << 30);
-    assert_eq!(config.slots, own.slots);
+    let own = Config::new("front-1");
+    assert_eq!(config.poll, own.poll);
+    assert_eq!(config.live, own.live);
+    assert_eq!(config.live, crate::executor::LIVE);
     assert_eq!(config.arch, own.arch);
     assert_eq!(config.work_dir, own.work_dir);
     assert_eq!(config.allow_plain_http_put, own.allow_plain_http_put);
@@ -306,7 +262,6 @@ fn the_defaults_are_the_executors_own() {
     assert_eq!(config.default_timeout, own.default_timeout);
     assert_eq!(config.call_timeout, own.call_timeout);
     assert_eq!(config.prepare_limit, own.prepare_limit);
-    assert_eq!(config.prepare_concurrency, own.prepare_concurrency);
     assert_eq!(config.failed_stderr_log_bytes, own.failed_stderr_log_bytes);
     assert_eq!(own.delivery, config.delivery);
     assert_eq!(config.network, own.network);
@@ -411,7 +366,6 @@ fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
 fn settings_that_break_a_rule_of_the_executor_are_refused() {
     for more in [
         &["--executor-default-timeout-secs=4000"][..],
-        &["--executor-call-timeout-secs=60"],
         &["--executor-max-run-secs=20000"],
     ] {
         let why = refused(more);
@@ -441,13 +395,14 @@ fn the_base_tree_flag_is_the_directory_of_the_bundles_and_unread_with_no_executo
 
     let mut all = JS.to_vec();
     all.remove(0);
-    all[8] = "--executor-base-tree=/does/not/exist";
+    all.retain(|flag| name(flag) != "--executor-base-tree");
+    all.push("--executor-base-tree=/does/not/exist");
     let flags = parsed(argv(&all)).expect("flags");
     assert!(flags.executor.js.is_none());
 }
 
 fn flags_of(url: &str, token: &Path, ca: Option<&Path>) -> JsAgentFlags {
-    let config = Config::new("front-1", 1, 2_000, 16 << 30);
+    let config = Config::new("front-1");
     JsAgentFlags {
         config,
         job_url: url.to_owned(),
@@ -753,16 +708,18 @@ fn the_stderr_log_bytes_take_zero_to_the_output_cap() {
     assert!(why.contains("--executor-failed-stderr-log-bytes"), "{why}");
 }
 
-/// Asserts that a js-agent executor given no `--executor-poll-ms` polls every 1000 ms.
+/// Asserts that a js-agent executor given no `--executor-poll-ms` polls every 250 ms, the
+/// executor's own default.
 #[test]
-fn the_poll_interval_defaults_to_one_second() {
+fn the_poll_interval_defaults_to_the_executors_own() {
     let config = js_with(&[])
         .expect("flags")
         .executor
         .js
         .expect("js-agent")
         .config;
-    assert_eq!(config.poll, Duration::from_millis(1000));
+    assert_eq!(config.poll, Duration::from_millis(250));
+    assert_eq!(config.poll, Config::new("front-1").poll);
 }
 
 /// Asserts that `--executor-poll-ms` outside 100 to 10000 is refused, and the ends are taken.
@@ -783,93 +740,48 @@ fn the_poll_interval_outside_its_range_is_refused() {
     );
 }
 
-/// The flags that make a frontend's task output a put directory, which shared ownership needs.
+/// The flags that make a frontend's task output a put directory.
 const PUT_DIR: [&str; 2] = ["--task-out-mode=put-dir", "--task-out-root=/mnt/ts/put"];
 
-/// [`js_with`] and the put-directory flags, with `more`.
-fn shared_with(more: &[&str]) -> Result<FrontendFlags, String> {
-    let mut all = PUT_DIR.to_vec();
-    all.push("--executor-ownership=shared");
-    all.extend(more);
-    js_with(&all)
-}
-
-/// Catches defaults that turn shared ownership on or change the liveness time: given no
-/// ownership flag a frontend is single and its liveness time is 45 s, and the same flags with
-/// a put directory change nothing of that.
+/// Asserts the liveness time: with no flag it is `crate::executor::LIVE` (20 s), the flag's literal default and
+/// the executor's own, and a given time is read in seconds into the config. A time that is no
+/// number, or zero, is refused naming the flag.
 #[test]
-fn ownership_defaults_to_single_and_live_secs_to_45() {
-    for flags in [js_with(&[]), js_with(&PUT_DIR)] {
-        let config = flags.expect("flags").executor.js.expect("js-agent").config;
-        assert_eq!(config.ownership, Ownership::Single);
-        assert!(!config.shared());
-        assert_eq!(config.live, Duration::from_secs(45));
+fn live_secs_defaults_to_the_executors_own_and_becomes_the_config() {
+    let live = |more: &[&str]| {
+        let flags = js_with(more).expect("flags");
+        flags.executor.js.expect("js-agent").config.live
+    };
+    assert_eq!(live(&[]), crate::executor::LIVE);
+    assert_eq!(live(&[]), Duration::from_secs(20));
+    assert_eq!(live(&["--executor-live-secs=90"]), Duration::from_secs(90));
+    for bad in ["--executor-live-secs=soon", "--executor-live-secs=0"] {
+        let why = refused(&[bad]);
+        assert!(why.contains("--executor-live-secs"), "{bad}: {why}");
     }
 }
 
-/// Catches `--executor-ownership shared` and `--executor-live-secs` that do not reach the
-/// executor's config, or a live time that is not read in seconds: shared with a put
-/// directory parses to `Ownership::Shared`, a given live time is the config's, and `single`
-/// named outright is the default.
+/// Asserts that the frontend's `--finished-retention-secs` is not an executor flag: the
+/// executor's flags carry the executor's own default until `build` is given the retention.
 #[test]
-fn ownership_shared_and_live_secs_become_the_config() {
-    let config = |more: &[&str]| {
-        let flags = shared_with(more).expect("flags");
-        flags.executor.js.expect("js-agent").config
-    };
-    let default = config(&[]);
-    assert_eq!(default.ownership, Ownership::Shared);
-    assert!(default.shared());
-    assert_eq!(default.live, Duration::from_secs(45));
-    assert_eq!(
-        config(&["--executor-live-secs=90"]).live,
-        Duration::from_secs(90)
-    );
-    let single = js_with(&["--executor-ownership=single", "--executor-live-secs=7"])
+fn the_executor_flags_hold_the_default_finished_retention_until_built() {
+    let config = js_with(&[])
         .expect("flags")
         .executor
         .js
         .expect("js-agent")
         .config;
-    assert_eq!(single.ownership, Ownership::Single);
-    assert_eq!(single.live, Duration::from_secs(7));
-}
-
-/// Catches a mode that clap lets through: a value other than `single` or `shared` is refused
-/// at parse, the message names the flag and the values it takes, and a live time that is not a
-/// number is refused.
-#[test]
-fn an_unknown_ownership_mode_or_a_live_time_that_is_no_number_is_refused() {
-    for mode in ["--executor-ownership=both", "--executor-ownership="] {
-        let why = refused(&[mode]);
-        assert!(why.contains("--executor-ownership"), "{mode}: {why}");
-        assert!(why.contains("single") && why.contains("shared"), "{why}");
-    }
-    let why = refused(&["--executor-live-secs=soon"]);
-    assert!(why.contains("--executor-live-secs"), "{why}");
-}
-
-/// Catches a liveness time under the fence time parsed with shared ownership, and the same
-/// time refused where it is not used: 44 s is refused naming the flag (the fence time is 40 s
-/// and the margin 5 s), 45 s parses, and under single ownership any time parses.
-#[test]
-fn a_live_time_under_the_fence_time_is_refused_with_shared_ownership_only() {
-    let why = shared_with(&["--executor-live-secs=44"]).expect_err("refused");
-    assert!(
-        why.contains(
-            "--executor-live-secs must be at least the fence time plus 5 s with \
-             --executor-ownership shared"
-        ),
-        "{why}"
+    assert_eq!(
+        config.finished_retention,
+        crate::executor::FINISHED_RETENTION
     );
-    assert!(shared_with(&["--executor-live-secs=45"]).is_ok());
-    assert!(js_with(&["--executor-live-secs=1"]).is_ok());
 }
-/// Asserts the Macs' flags: none by default; `--executor-mac-hosts` with
-/// `--executor-mac-task-bundle` becomes the pool, the least macOS 26 unless `--executor-mac-os-version` says otherwise and
-/// the roots `--task-out-root`'s unless `--executor-mac-task-out-root` names others; and each
-/// refusal names its flag: hosts with no bundle, a bundle or Mac root with no hosts, a bundle
-/// not pinned by digest, a root that is not one, and a least macOS of 0.
+
+/// Asserts the Macs' flags: none by default; `--executor-mac-task-bundle` alone becomes the
+/// pool, the least macOS 26 unless `--executor-mac-os-version` says otherwise and the roots
+/// `--task-out-root`'s unless `--executor-mac-task-out-root` names others; and each refusal
+/// names its flag: a least macOS or a Mac root with no bundle (naming the bundle flag), a
+/// bundle not pinned by digest, a root that is not one, and a least macOS of 0.
 #[test]
 fn the_mac_flags_become_the_pool_of_macs() {
     let mac = |more: &[&str]| {
@@ -880,16 +792,14 @@ fn the_mac_flags_become_the_pool_of_macs() {
     let task = format!("--executor-mac-task-bundle={BUNDLE}");
     let task = task.as_str();
     assert_eq!(
-        mac(&["--executor-mac-hosts=2", task]),
+        mac(&[task]),
         Some(MacPool {
-            hosts: 2,
             bundle: BUNDLE.to_owned(),
             os_version: DEFAULT_MAC_OS_VERSION,
             roots: None,
         })
     );
     let own = mac(&[
-        "--executor-mac-hosts=1",
         task,
         "--executor-mac-os-version=27",
         "--executor-mac-task-out-root=/Volumes/ts/put",
@@ -901,42 +811,140 @@ fn the_mac_flags_become_the_pool_of_macs() {
         Some(PutDirRoots::new("/Volumes/ts/put").expect("roots"))
     );
     let first = |why: String| why.lines().next().unwrap_or_default().to_owned();
-    assert_eq!(
-        first(refused(&["--executor-mac-hosts=1"])),
-        "error: --executor-mac-hosts needs --executor-mac-task-bundle, the release's kbf-task \
-         bundle for the Macs"
-    );
-    for stray in [task, "--executor-mac-task-out-root=/Volumes/ts/put"] {
+    for stray in [
+        "--executor-mac-os-version=27",
+        "--executor-mac-task-out-root=/Volumes/ts/put",
+    ] {
         assert_eq!(
             first(refused(&[stray])),
-            "error: --executor-mac-task-bundle and --executor-mac-task-out-root are for \
-             --executor-mac-hosts: with no Mac worker they would do nothing",
+            "error: --executor-mac-os-version and --executor-mac-task-out-root are for \
+             --executor-mac-task-bundle: without the bundle no Mac is used and they would do \
+             nothing",
             "{stray}"
         );
     }
     assert_eq!(
-        first(refused(&[
-            "--executor-mac-hosts=1",
-            "--executor-mac-task-bundle=kbf-task"
-        ])),
+        first(refused(&["--executor-mac-task-bundle=kbf-task"])),
         "error: --executor js-agent: the Macs' task bundle \"kbf-task\" is not pinned by an \
          @sha256 digest (NAME@sha256:HEX)"
     );
-    let root = refused(&[
-        "--executor-mac-hosts=1",
-        task,
-        "--executor-mac-task-out-root=put",
-    ]);
+    let root = refused(&[task, "--executor-mac-task-out-root=put"]);
     assert!(
         first(root.clone()).starts_with("error: --executor-mac-task-out-root: "),
         "{root}"
     );
-    let zero = refused(&[
-        "--executor-mac-hosts=1",
-        task,
-        "--executor-mac-os-version=0",
-    ]);
+    let zero = refused(&[task, "--executor-mac-os-version=0"]);
     assert!(zero.contains("--executor-mac-os-version"), "{zero}");
+}
+
+/// Asserts that each flag of the virtual workers and their ownership still parses with a value
+/// the way a unit written before the removal gave it (also one the flag took no longer, as
+/// the values are not read), with and without an executor, and reaches nothing of the
+/// config: the executor's settings are those of a frontend given none of them.
+#[test]
+fn each_retired_flag_still_parses_with_a_value_and_changes_no_setting() {
+    // The process's own name is made up for each config.
+    let shown = |mut config: Config| {
+        config.instance.clear();
+        format!("{config:?}")
+    };
+    let plain = shown(
+        js_with(&[])
+            .expect("flags")
+            .executor
+            .js
+            .expect("js-agent")
+            .config,
+    );
+    for (_, long, _) in RETIRED {
+        for value in ["3", "shared", "not-checked"] {
+            let given = format!("{long}={value}");
+            let flags = js_with(&[given.as_str()]).expect("parses");
+            let config = flags.executor.js.expect("js-agent").config;
+            assert_eq!(shown(config), plain, "{given}");
+            parsed(argv(&[given.as_str()])).expect("parses with no executor");
+        }
+        js_with(&[long, "2"]).expect("a value as the next argument");
+    }
+}
+
+/// Asserts that no retired flag is shown by `--help` and that each is a flag of the frontend's
+/// command that takes a value: the list names exactly the seven that were removed.
+#[test]
+fn the_retired_flags_are_hidden_from_help() {
+    let command = crate::frontend::command();
+    let help = clap::Command::new("executor")
+        .args(args())
+        .render_long_help()
+        .to_string();
+    let named: Vec<&str> = RETIRED.iter().map(|(_, long, _)| *long).collect();
+    assert_eq!(
+        named,
+        [
+            "--executor-hosts",
+            "--executor-host-cpus",
+            "--executor-host-memory-gib",
+            "--executor-host-slots",
+            "--executor-prepare-concurrency",
+            "--executor-ownership",
+            "--executor-mac-hosts",
+        ]
+    );
+    for long in named {
+        assert!(!help.contains(long), "{long} in help");
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some(&long[2..]))
+            .expect("a flag of the command");
+        assert!(arg.is_hide_set(), "{long}");
+        assert!(arg.get_value_names().is_some(), "{long}");
+    }
+    for kept in ["--executor-poll-ms", "--executor-live-secs"] {
+        assert!(help.contains(kept), "{kept} in help");
+    }
+    for gone in [
+        "fence",
+        "virtual worker",
+        "slot",
+        "ownership",
+        "farm places",
+    ] {
+        assert!(!help.contains(gone), "{gone} in help");
+    }
+}
+
+/// Asserts that each retired flag given logs one warning line naming itself, and a flag not
+/// given logs none: given all seven, the lines are those of the seven in the order of the list,
+/// given one, that one's alone, given none, nothing; and with no executor the same lines are
+/// kept for the frontend's start to log.
+#[test]
+fn each_retired_flag_given_warns_once_naming_itself() {
+    let none = js_with(&[]).expect("flags");
+    assert!(none.executor.retired.is_empty());
+    let one = js_with(&["--executor-ownership=shared"]).expect("flags");
+    assert_eq!(
+        one.executor.retired,
+        ["--executor-ownership is no longer read: every Execute is a job of the job service"]
+    );
+    let given: Vec<String> = RETIRED
+        .iter()
+        .map(|(_, long, _)| format!("{long}=1"))
+        .collect();
+    let given: Vec<&str> = given.iter().map(String::as_str).collect();
+    let all = js_with(&given).expect("flags");
+    let want: Vec<String> = RETIRED
+        .iter()
+        .map(|(_, long, _)| {
+            format!("{long} is no longer read: every Execute is a job of the job service")
+        })
+        .collect();
+    assert_eq!(all.executor.retired, want);
+    let bare = parsed(argv(&["--executor-hosts=4"])).expect("flags");
+    assert!(bare.executor.js.is_none());
+    assert_eq!(
+        bare.executor.retired,
+        ["--executor-hosts is no longer read: every Execute is a job of the job service"]
+    );
 }
 
 /// The macOS `kbf-task` bundle of a release, by its manifest digest.

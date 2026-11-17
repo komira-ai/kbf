@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
 
-use kbf_sched::RequeueReason;
+use crate::RequeueReason;
 use kbf_types::{Digest, Failure, LeaseId, OperationId, WorkerId};
 
 use crate::event::{Call, InvocationId, Listing, Metadata, Outcome, Output, Owner, WallTime};

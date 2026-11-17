@@ -7,10 +7,9 @@
 mod pages;
 
 use kbf_invocation::{
-    ActionShape, Event, LeaseEnd, NumaBytes, Outcome, PhaseTimes, ReapiTimes, Run, RunUsage,
-    Target, TargetKind, Text,
+    ActionShape, Event, LeaseEnd, NumaBytes, Outcome, PhaseTimes, ReapiTimes, RequeueReason, Run,
+    RunUsage, Target, TargetKind, Text,
 };
-use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure, OperationId};
 use pages::{
     OPEN, Server, at, digest, ended, finished, granted, hit, lease, listing, queued, requeued,

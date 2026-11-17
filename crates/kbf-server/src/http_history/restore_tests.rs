@@ -4,8 +4,8 @@ use kbf_history::records::{
     Cgroup, HitHow, HitRecord, MemoryKill, Output as WireOutput, PhaseTimes, RunOutcome, RunRecord,
     Timestamps, WireDigest,
 };
+use kbf_invocation::RequeueReason;
 use kbf_invocation::{AttemptEnd, How, Outcome, RunUsage, TargetKind, WallTime};
-use kbf_sched::RequeueReason;
 use kbf_types::{Digest, DigestFunction, Failure};
 
 use super::rows as to_rows;

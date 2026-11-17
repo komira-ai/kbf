@@ -1,53 +1,39 @@
-//! A slow object store, end to end in one process: settling a daemon's `Result`
-//! writes its action-cache record to the store, and on a store whose writes take many
-//! seconds that must not hold up the daemon's heartbeats. A heartbeat the server
-//! leaves unacknowledged for the fence time makes the daemon fence its leases.
+//! A slow object store, end to end in one process: reading a job's pack writes its blobs to the
+//! store, and on a store whose writes take many seconds that must hold up only the operation
+//! whose pack is being taken in. Another operation's job goes on to its answer.
 //!
-//! A module of the `execute` test binary, not a binary of its own: `Farm` is generic,
-//! and coverage counts each generic function by its best-covered instantiation.
+//! A module of the `execute` test binary, not a binary of its own.
 
-use kbf_proto::worker::daemon_message;
-use kbf_proto::worker::server_message::Message;
+use crate::support::{Cell, Job, Ran, done, response};
 
-use crate::support::{Cell, Job, done, output, ran, response};
-
-/// Catches: the server settling a `Result` on the task that reads the worker
-/// stream, so that every heartbeat behind it waits for the store's write. With the
-/// write held, ten heartbeats in a row must each be acknowledged within the quiet
-/// time, the lease they list must stay held (no `Cancel`), and once the write goes
-/// through the `Result` is accepted and the caller answered.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn heartbeats_are_acknowledged_while_a_result_waits_on_the_store() {
+/// Asserts that an operation whose pack waits on the store does not hold up another: with the
+/// store's next write held, the first operation's job ends and its pack is read (the write
+/// blocks); a second operation then runs to its answer; and once the write goes through the
+/// first is answered too.
+#[tokio::test]
+async fn an_operation_waiting_on_a_slow_store_does_not_hold_up_another() {
     let cell = Cell::start().await;
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    let job = Job::new("behind a slow store", &[]);
-    cell.upload(&job.blobs()).await;
-    let mut ops = cell.execute(&job.action).await;
-    let start = daemon.start().await;
-    let lease = start.lease_id.expect("a lease");
-    let result = output(&cell, "written slowly", 0).await;
+    let slow = Job::new("behind a slow store", &[]);
+    let quick = Job::new("beside it", &[]);
+    cell.upload(&slow.blobs()).await;
+    cell.upload(&quick.blobs()).await;
+    cell.direct
+        .will_run(&slow.action, Ran::writes("out", "written slowly"));
+    cell.direct.will_run(&quick.action, Ran::exits(0));
+    let mut slow_ops = cell.execute(&slow.action).await;
+    let mut quick_ops = cell.execute(&quick.action).await;
 
     let put = &cell.store.put;
     put.close_next();
-    daemon.send(daemon_message::Message::Result(ran(
-        start.lease_id,
-        &result,
-    )));
+    cell.direct.complete(&slow.action).await;
     put.held().await;
-    for n in 0..10 {
-        assert!(
-            daemon.heartbeat(&[lease]).await,
-            "heartbeat {n} waited for the store's write"
-        );
-    }
-    assert_eq!(daemon.cancelled().await, None, "the lease was given up");
+    cell.direct.complete(&quick.action).await;
+    let quick_answer = response(&done(&mut quick_ops).await);
+    assert_eq!(quick_answer.status.map(|s| s.code), Some(0));
+
     put.open();
-    let ack = daemon
-        .expect("ResultAck", |m| match m {
-            Message::ResultAck(a) => Some(*a),
-            _ => None,
-        })
-        .await;
-    assert!(ack.accepted);
-    assert_eq!(response(&done(&mut ops).await).result, Some(result));
+    let result = response(&done(&mut slow_ops).await)
+        .result
+        .expect("a result");
+    assert_eq!(result.output_files[0].path, "out");
 }

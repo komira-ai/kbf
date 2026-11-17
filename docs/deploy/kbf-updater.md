@@ -475,21 +475,18 @@ The CA's key is the frontend's alone; the coordinator holds none. The units in
 ### The boundary
 
 The design says the full operator token must not be on hosts, and the agent does not need it. The
-frontend itself serves a host's updater four calls about its own node on the worker listener, the
+frontend itself serves a host's updater one call about its own node on the worker listener, the
 listener it already authenticates node certificates on (mutual TLS against `--worker-client-ca`,
 reached by every storage node):
 
 | call | |
 |---|---|
-| `POST /v1/nodes/{id}:drain` | cordon the node and wait for its leases (body `{"deadline_secs": N}`, optional) |
-| `POST /v1/nodes/{id}:uncordon` | return it to placement |
-| `GET /v1/nodes/{id}` | the node, as the operator API has it |
 | `GET /v1/nodes/{id}/storage-health` | the node's own storage member and two storage-wide numbers |
 
-The agent drains no node.
+kbf places no work on a node, so the agent drains, cordons and reads nothing of a node's work: `POST /v1/nodes/{id}:drain`, `:uncordon` and `GET /v1/nodes/{id}` are refused like any other path.
 
 **The frontend serves these for a certificate with the role `updater` whose one DNS name is `{id}`,
-and nothing else**: another node's id, the cordon, a listing, the members and enrollment routes,
+and nothing else**: another node's id, a listing, the members and enrollment routes,
 the update API and every other path are `403`, and so is every call of a storage, frontend
 or coordinator certificate on these paths. No operator token is involved on the host or the
 frontend, and the worker listener's deny list applies to the node. The shipped units give the agent

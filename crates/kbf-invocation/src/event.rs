@@ -2,7 +2,7 @@
 //! the farm does for the operations those calls queued or joined. Each carries the
 //! server's wall time as a value; nothing here reads a clock.
 
-use kbf_sched::RequeueReason;
+use crate::RequeueReason;
 use kbf_types::{Digest, Failure, LeaseId, OperationId, WorkerId};
 
 use crate::record::{Text, outcome_bytes, output_bytes, run_bytes, shape_bytes};

@@ -7,7 +7,7 @@
 //! equal the replica's, and its log id the replica's `Bootstrap`'s: every entry the
 //! server has applied, and so answered from, was durable, and a restart or a follower
 //! would apply it alike. An entry the machine skips (a command this binary does not know,
-//! a control command, a raise past the machine versions this binary knows) is skipped by
+//! a raise past the machine versions this binary knows) is skipped by
 //! the replica too, so equality holds; an entry that does not decode breaks it.
 
 use kbf_log::{FarmLogId, Format, LogCommand, MachineVersion};
@@ -117,7 +117,8 @@ impl Replica {
                     self.version = self.version.max(v);
                 }
                 // What the server's metadata machine skips: a command this binary does not
-                // know, a control command, a raise past the versions it knows.
+                // know (a farm command of an earlier build among them), a raise past the versions it
+                // knows.
                 Ok(_) => {}
                 Err(e) => return Err(equality(format!("entry {last} does not decode: {e}"))),
             }
@@ -153,7 +154,7 @@ pub(crate) fn same_as_live(
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
-    use kbf_log::{Bootstrap, MachineVersion, Takeover};
+    use kbf_log::{Bootstrap, MachineVersion};
     use kbf_meta::Command;
     use kbf_raft::{LogId, LogIndex, Term};
     use kbf_store::Fault;
@@ -285,19 +286,14 @@ mod tests {
         );
     }
 
-    /// Asserts that the replica skips a command this binary does not know, a control
-    /// command and a raise to a machine version this binary does not know, as the server's
+    /// Asserts that the replica skips a command this binary does not know and a raise to
+    /// a machine version this binary does not know, as the server's
     /// metadata machine does, and applies the tick that follows each.
     #[test]
     fn the_replica_skips_what_the_machine_skips_and_applies_the_entries_after() {
         let version = MachineVersion::new(NonZeroU32::new(6).expect("non-zero"));
-        let takeover = LogCommand::Takeover(Takeover {
-            term: NonZeroU64::MIN,
-            now: FarmTime::from_millis(1),
-        });
         let skipped = [
             raw(4, vec![0x0a, 0x03, 0xaa, 0x01, 0x00]),
-            entry(4, &takeover),
             entry(4, &LogCommand::MachineVersion(version)),
         ];
         let tick = LogCommand::Meta(Command::Tick(FarmTime::from_millis(9)));

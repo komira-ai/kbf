@@ -21,9 +21,7 @@ use kbf_server::join::{Identity as NodeIdentity, Joiner};
 use kbf_server::members::{Members, MembershipConfig};
 use kbf_server::storage_health::Reported;
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
-use kbf_server::{
-    EpochPolicy, Listeners, StateStore, TlsSource, WorkerTls, bind_server_with_state,
-};
+use kbf_server::{Listeners, StateStore, TlsSource, WorkerTls, bind_server_with_state};
 use kbf_state::{Store, Versioned};
 use kbf_storage::Storage as _;
 use kbf_storage::repair::{NoLedger, Options, RepairRecord, Repairs};
@@ -91,19 +89,8 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls,
-        tick: Duration::from_millis(50),
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
@@ -118,7 +105,6 @@ fn frontend(worker_tls: Option<WorkerTls>) -> Frontend {
     let store = Hooked::new();
     let state = StateStore {
         store: Arc::clone(&store) as Arc<dyn Store>,
-        epoch: EpochPolicy::Keep,
         members: config(),
         history: None,
     };

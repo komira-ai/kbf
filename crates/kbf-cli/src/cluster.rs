@@ -1,18 +1,13 @@
-//! `kbf cluster status|drain|undrain|member|safe-to-stop|denied|epoch-bump|object-store`: a thin client of the operator API
+//! `kbf cluster status|drain|member|safe-to-stop|denied|object-store`: a thin client of the operator API
 //! (`docs/api.md`) on the frontend's host. It holds no cluster logic: each verb is one
 //! call, and the answer is the API's JSON, printed as it came.
 //!
-//! - `kbf cluster status`: `GET /v1/nodes`, every node and where it is in placement.
-//!   `--frontend`: `GET /v1/frontend/drain` instead, `{draining, phase, open_executions,
-//!   queued_operations}`.
-//! - `kbf cluster drain <node> [--deadline-secs N]`: `POST /v1/nodes/<node>:drain`, the
-//!   node takes no new lease and its leases run on; without `--deadline-secs` (an empty
-//!   body) the drain has no deadline and waits for them however long they take. `kbf cluster drain --frontend`:
-//!   `POST /v1/frontend/drain`, the frontend goes out of `/readyz` at once, refuses new
-//!   Execute calls after `--drain-lb-wait`, and exits once its open executions are done
-//!   (at most `--drain-deadline`).
-//! - `kbf cluster undrain <node>`: `POST /v1/nodes/<node>:uncordon`. A frontend drain
-//!   is not undone (the process exits): start a new one.
+//! - `kbf cluster status`: `GET /v1/frontend/drain`, `{draining, phase, open_executions,
+//!   queued_operations}`. `--frontend` is accepted and means the same.
+//! - `kbf cluster drain --frontend`: `POST /v1/frontend/drain`, the frontend goes out of
+//!   `/readyz` at once, refuses new Execute calls after `--drain-lb-wait`, and exits once
+//!   its open executions are done (at most `--drain-deadline`). A frontend drain is not
+//!   undone (the process exits): start a new one.
 //! - `kbf cluster member <id> --state active|draining`: `POST /v1/members/<id>`, sets a
 //!   storage member's state; this is how a `joining` member is promoted.
 //! - `kbf cluster safe-to-stop <id>`: `GET /v1/members/<id>/safe-to-stop`, whether the host of
@@ -20,11 +15,6 @@
 //!   needs `--token-file`. Exit 0 if it may, 3 if not (the reasons on stdout), 1 if the call
 //!   failed.
 //! - `kbf cluster denied`: `GET /v1/denied`, the storage deny list with its reasons.
-//! - `kbf cluster epoch-bump`: `POST /v1/epoch/bump`, raises the epoch the state store
-//!   holds by one, for a store restored from a backup (the frontends that start after it
-//!   serve the new epoch, so the workers drop the leases the lost history granted; a
-//!   frontend that runs keeps the one it started under). The answer names the epoch
-//!   before, the epoch stored now and the epoch the frontend serves.
 //! - `kbf cluster object-store ...`: the object-store registration routes
 //!   ([`object_store`]). `denied` and `object-store` pass the whole write gate with a
 //!   `GET`, so they need `--token-file` too.
@@ -44,7 +34,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand, ValueEnum};
-use kbf_server::api::{DENIED, EPOCH_BUMP, FRONTEND_DRAIN, NODES, safe_to_stop_path};
+use kbf_server::api::{DENIED, FRONTEND_DRAIN, safe_to_stop_path};
 use kbf_server::api_client::{ClientError, OperatorClient, Reply};
 use serde::Serialize;
 use zeroize::Zeroizing;
@@ -53,9 +43,9 @@ use zeroize::Zeroizing;
 /// `--api-listen`.
 pub const DEFAULT_API: &str = "127.0.0.1:8982";
 
-/// Show, drain and undrain the cluster, set a member's state, ask whether a member's host may
-/// be stopped, list the denied hosts, raise the state store's epoch and manage the object
-/// store, through the frontend's operator API.
+/// Show and drain the frontend, set a member's state, ask whether a member's host may be
+/// stopped, list the denied hosts and manage the object store, through the frontend's
+/// operator API.
 #[derive(Args, Clone, Debug, PartialEq, Eq)]
 pub struct Cluster {
     /// The operator API (the server's `--api-listen`).
@@ -80,35 +70,20 @@ pub enum MemberState {
 /// What `kbf cluster` does.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum Verb {
-    /// Show every node's placement (or, with --frontend, the frontend's drain).
+    /// Show the frontend's drain: whether it is draining, and the streams and queued
+    /// operations left.
     Status {
-        /// The frontend's drain: whether it is draining, and the streams and queued
-        /// operations left.
+        /// Accepted for the command lines that name it: the frontend's drain is the only
+        /// status.
         #[arg(long)]
         frontend: bool,
     },
-    /// Drain a node, or with --frontend the frontend.
-    #[command(group(clap::ArgGroup::new("what").required(true).args(["node", "frontend"])))]
+    /// Drain the frontend: no new Execute, out of /readyz, exits when its streams are
+    /// done. Not undone.
     Drain {
-        /// The node to drain: no new lease; its leases run on.
-        node: Option<String>,
-        /// Drain the frontend: no new Execute, out of /readyz, exits when its streams
-        /// are done. Not undone.
-        #[arg(long, conflicts_with = "deadline_secs")]
+        /// The frontend: the only thing to drain.
+        #[arg(long, required = true)]
         frontend: bool,
-        /// How long the node's drain waits for its leases, in seconds, with no upper bound.
-        /// Not given: no deadline, the drain waits however long the leases run. When the
-        /// deadline passes the drain pauses; no lease is cut.
-        #[arg(long, value_name = "SECS")]
-        deadline_secs: Option<u64>,
-        /// The file holding the server's operator API token.
-        #[arg(long, value_name = "FILE")]
-        token_file: PathBuf,
-    },
-    /// Return a drained node to placement.
-    Undrain {
-        /// The node.
-        node: String,
         /// The file holding the server's operator API token.
         #[arg(long, value_name = "FILE")]
         token_file: PathBuf,
@@ -142,15 +117,6 @@ pub enum Verb {
     Denied {
         #[command(flatten)]
         token: object_store::Token,
-    },
-    /// Raise the epoch the state store holds by one, after a restore from a backup: the
-    /// frontends that start after it serve the new epoch, so the workers drop the leases the
-    /// lost history granted. The frontend that answers goes on serving its own until it is
-    /// restarted.
-    EpochBump {
-        /// The file holding the server's operator API token.
-        #[arg(long, value_name = "FILE")]
-        token_file: PathBuf,
     },
     /// Register the farm's object store: connections, the `cold` binding, probes, status
     /// and audit.
@@ -240,25 +206,8 @@ impl Verb {
     /// The secret key of `connection put` cannot be read from its source.
     pub fn call(&self, stdin: &mut dyn std::io::Read) -> Result<Call, CallError> {
         Ok(match self {
-            Self::Status { frontend: true } => Call::Get(FRONTEND_DRAIN.to_owned()),
-            Self::Status { frontend: false } => Call::Get(NODES.to_owned()),
-            Self::Drain { frontend: true, .. } => {
-                Call::Post(FRONTEND_DRAIN.to_owned(), Body::empty())
-            }
-            Self::Drain {
-                node,
-                deadline_secs,
-                ..
-            } => {
-                let body = deadline_secs.map_or_else(Body::empty, |secs| {
-                    Body::json(&serde_json::json!({ "deadline_secs": secs }))
-                });
-                let node = node.as_deref().unwrap_or_default();
-                Call::Post(kbf_server::api::node_path(node, "drain"), body)
-            }
-            Self::Undrain { node, .. } => {
-                Call::Post(kbf_server::api::node_path(node, "uncordon"), Body::empty())
-            }
+            Self::Status { .. } => Call::Get(FRONTEND_DRAIN.to_owned()),
+            Self::Drain { .. } => Call::Post(FRONTEND_DRAIN.to_owned(), Body::empty()),
             Self::Member {
                 id,
                 state,
@@ -278,7 +227,6 @@ impl Verb {
             }
             Self::SafeToStop { id, .. } => Call::GetGated(safe_to_stop_path(id)),
             Self::Denied { .. } => Call::GetGated(DENIED.to_owned()),
-            Self::EpochBump { .. } => Call::Post(EPOCH_BUMP.to_owned(), Body::empty()),
             Self::ObjectStore { verb } => verb.call(stdin)?,
         })
     }
@@ -289,10 +237,8 @@ impl Verb {
         match self {
             Self::Status { .. } => None,
             Self::Drain { token_file, .. }
-            | Self::Undrain { token_file, .. }
             | Self::Member { token_file, .. }
-            | Self::SafeToStop { token_file, .. }
-            | Self::EpochBump { token_file } => Some(token_file),
+            | Self::SafeToStop { token_file, .. } => Some(token_file),
             Self::Denied { token } => Some(&token.token_file),
             Self::ObjectStore { verb } => Some(verb.token_file()),
         }

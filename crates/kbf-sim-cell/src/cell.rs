@@ -5,16 +5,16 @@ use std::time::Duration;
 
 use kbf_meta::ObjectId;
 
-use kbf_sim::{Chance, Faults, Node, NodeId, NodeInput, Output, Partition, Sim, SimRng, TraceHash};
+use kbf_sim::{Chance, Faults, Node, NodeId, NodeInput, Output, Sim, SimRng, TraceHash};
 use kbf_store::Fault;
-use kbf_types::{Digest, Effect, FarmTime, Resources, StateMachine};
+use kbf_types::{Digest, Effect, FarmTime, StateMachine};
 
 use crate::check::Checker;
 use crate::client::RETRY;
 use crate::server::Rollback;
 use crate::{
-    Cut, Down, FakeClient, FakeDaemon, Met, Msg, ObjectStore, Server, ServerFault, ServerPlan,
-    StoreFault, StorePlan, StorePoint, StoreStats, TierPlan, TierPoint, TierSeen, action,
+    Cut, Down, FakeClient, Met, Msg, ObjectStore, Server, ServerFault, ServerPlan, StoreFault,
+    StorePlan, StorePoint, StoreStats, TierPlan, TierPoint, TierSeen, action,
 };
 
 /// What the server meets in a run.
@@ -28,8 +28,6 @@ pub enum Kind {
     Crash,
     /// An I/O error that stops the log, then a restart.
     IoError,
-    /// One daemon cut off from the cell for longer than the scheduler's grace G.
-    Partition,
     /// The object store down for minutes: hanging (PUTs held) on even seeds, refusing
     /// every PUT on odd ones.
     StoreOutage,
@@ -66,12 +64,11 @@ pub enum Kind {
 
 impl Kind {
     /// Every kind, in the order the sweeps run them.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 17] = [
         Self::Calm,
         Self::Restart,
         Self::Crash,
         Self::IoError,
-        Self::Partition,
         Self::StoreOutage,
         Self::StoreOutageHours,
         Self::StoreSlow,
@@ -129,9 +126,6 @@ pub struct Scenario {
     pub faults: Faults,
     pub server: ServerPlan,
     pub store: StorePlan,
-    pub daemons: usize,
-    /// A daemon cut off from every other node from a time, for [`CUT_FOR`].
-    pub partition: Option<(usize, FarmTime)>,
     /// Each client's actions, and when it starts on each.
     pub clients: Vec<Vec<(u64, FarmTime)>>,
     /// The run stops here. Every fault has ended long enough before it for every
@@ -154,9 +148,6 @@ const TIER_ACTIONS_PER_CLIENT: usize = 8;
 /// The size at which the tier's open block seals in the cell.
 const TIER_SEGMENT: u64 = 48;
 const LAST_FAULT_MS: u64 = 60_000;
-const DAEMONS: usize = 3;
-/// How long a [`Kind::Partition`] daemon is cut off: past the grace G (60 s).
-pub const CUT_FOR: Duration = Duration::from_secs(70);
 
 impl Scenario {
     /// The scenario `kind` draws from `seed`.
@@ -190,7 +181,6 @@ impl Scenario {
                 let after = rng.between(0, 30);
                 faults.push((at(&mut rng), ServerFault::IoErrorAt { after }));
             }
-            Kind::Partition => {}
             Kind::StoreOutage
             | Kind::StoreOutageHours
             | Kind::TierStoreOutage
@@ -299,10 +289,6 @@ impl Scenario {
                 faults.push((when, ServerFault::TierFlip));
             }
         }
-        let partition = (kind == Kind::Partition).then(|| {
-            let daemon = usize::try_from(rng.between(0, DAEMONS as u64 - 1)).expect("small");
-            (daemon, at(&mut rng))
-        });
         faults.sort_by_key(|(t, _)| *t);
         store.sort_by_key(|(t, _)| *t);
         // The store is quiet once its last window has ended and its last slowed answer
@@ -335,7 +321,10 @@ impl Scenario {
                 min_delay: Duration::from_millis(1),
                 max_delay: Duration::from_millis(50),
                 drop: Chance::percent(1),
-                duplicate: Chance::percent(3),
+                // A network duplicate of a PUT the store refused can arrive after the refusal
+                // has passed and be kept, an orphan the refusal did not make: the store's own
+                // errors are judged with no duplicates (the other kinds keep them).
+                duplicate: Chance::percent(if kind == Kind::StoreErrors { 0 } else { 3 }),
                 reorder: Chance::percent(3),
             },
             server: ServerPlan {
@@ -344,8 +333,6 @@ impl Scenario {
                 tier: kind.tier(),
             },
             store: StorePlan { faults: store },
-            daemons: DAEMONS,
-            partition,
             clients,
             end: quiet.saturating_add(Duration::from_secs(150)),
             pinned: None,
@@ -428,7 +415,6 @@ impl Scenario {
 /// The node kinds of the cell.
 pub enum CellNode {
     Server(Box<Server>),
-    Daemon(Box<FakeDaemon>),
     Client(Box<FakeClient>),
     Store(Box<ObjectStore>),
 }
@@ -439,16 +425,6 @@ impl CellNode {
     pub fn server(&self) -> Option<&Server> {
         if let Self::Server(s) = self {
             Some(s)
-        } else {
-            None
-        }
-    }
-
-    /// The node as a daemon, if it is one.
-    #[must_use]
-    pub fn daemon(&self) -> Option<&FakeDaemon> {
-        if let Self::Daemon(d) = self {
-            Some(d)
         } else {
             None
         }
@@ -481,7 +457,6 @@ impl StateMachine for CellNode {
     fn apply(&mut self, input: NodeInput<Msg>) -> Vec<Effect> {
         match self {
             Self::Server(s) => s.apply(input),
-            Self::Daemon(d) => d.apply(input),
             Self::Client(c) => c.apply(input),
             Self::Store(s) => s.apply(input),
         }
@@ -498,7 +473,6 @@ impl Node for CellNode {
     fn take_outputs(&mut self) -> Vec<Output<Msg>> {
         match self {
             Self::Server(s) => s.take_outputs(),
-            Self::Daemon(d) => d.take_outputs(),
             Self::Client(c) => c.take_outputs(),
             Self::Store(s) => s.take_outputs(),
         }
@@ -519,8 +493,6 @@ pub struct RunReport {
     pub trace: TraceHash,
     /// How many times the server opened its log.
     pub starts: u64,
-    /// How many results were accepted.
-    pub accepted: usize,
     /// How many blobs were answered present.
     pub present: usize,
     /// Each upload acknowledged: when, the blob, and the object its PUT wrote.
@@ -549,8 +521,6 @@ pub struct RunReport {
     /// A binary that runs only machine version 1 opening the durable log at the end
     /// (scenario 30); `None` without a tier, or with the server down.
     pub rollback: Option<Rollback>,
-    /// How many actions were started by more than one run of the server's process.
-    pub rerun: usize,
 }
 
 /// Runs `scenario` to its end, checking every property after every step.
@@ -566,14 +536,6 @@ pub fn run(scenario: &Scenario) -> RunReport {
     sim.add_node(store_id(), CellNode::Store(Box::new(store)));
     let server = Server::new(scenario.server.clone(), store_id());
     sim.add_node(server_id(), CellNode::Server(Box::new(server)));
-    for n in 0..scenario.daemons {
-        let capacity = Resources::new(2_000, 4 << 30);
-        let daemon = FakeDaemon::new(server_id(), format!("daemon-{n}-1"), capacity);
-        sim.add_node(
-            NodeId::new(format!("daemon-{n}")),
-            CellNode::Daemon(Box::new(daemon)),
-        );
-    }
     for (n, jobs) in scenario.clients.iter().enumerate() {
         let jobs = jobs.iter().map(|(a, at)| (action(*a), *at));
         let client = FakeClient::new(server_id(), jobs);
@@ -581,11 +543,6 @@ pub fn run(scenario: &Scenario) -> RunReport {
             NodeId::new(format!("client-{n}")),
             CellNode::Client(Box::new(client)),
         );
-    }
-    if let Some((n, at)) = scenario.partition {
-        let cut = vec![NodeId::new(format!("daemon-{n}"))];
-        sim.partition_at(at, Partition::new([cut]));
-        sim.partition_at(at.saturating_add(CUT_FOR), Partition::none());
     }
     let mut checker = Checker::new(scenario);
     while sim.now() <= scenario.end {
@@ -608,7 +565,6 @@ pub fn run(scenario: &Scenario) -> RunReport {
     RunReport {
         trace: sim.trace_hash(),
         starts: seen.starts,
-        accepted: seen.accepted.values().filter(|n| **n > 0).count(),
         present: seen.present.len(),
         acked: seen.acked.clone(),
         crashes: seen.crashed_at.len(),
@@ -622,6 +578,5 @@ pub fn run(scenario: &Scenario) -> RunReport {
         tier: seen.tier.clone(),
         flush_met: store.flush_met().to_vec(),
         rollback,
-        rerun: seen.started.values().filter(|runs| runs.len() > 1).count(),
     }
 }

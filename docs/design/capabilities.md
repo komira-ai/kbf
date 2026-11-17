@@ -1,5 +1,7 @@
 # Capabilities
 
+> **Superseded in part by [direct-js.md](direct-js.md):** kbf no longer schedules, so it matches no action to a node and holds no node reports, booking or drivers for actions; an Execute is one job of the job service. `kbf-caps` still reads the platform an action names (a macOS action becomes a Mac job). This page records the earlier design.
+
 > **kbf-daemon is deleted.** The `kbf-daemon` and its `report` module, which this page names as the source of the node report, are gone; `kbf-caps` stays. Placed actions run only as js-agent jobs (the frontend's `--executor js-agent`), on the executor's virtual workers (`crates/kbf-server/src/executor`), and the Macs run js-agent only. Where this page says a daemon detects, reports or runs a driver, it describes the deleted daemon; the report keys, `Role::Daemon` and the wire fields stay readable.
 
 A farm is only useful if each action lands on a machine that can run it. kbf's rule is
@@ -219,7 +221,7 @@ skipped by the matcher (`kbf_caps::RESERVED_KEYS`; names read in any case):
 | `kbf-lease` | the lease kind: `action` (the default, a share of a machine) or `whole_machine` |
 | `kbf-cpu` | the name is reserved; its meaning is **planned**: `dedicated` for whole physical cores, for quiet performance runs |
 | `kbf-mac-admin` | the name is reserved and has no meaning |
-| `kbf-book-cpus`, `kbf-book-mem-gib` | the whole cores and GiB an `action` lease books in place of one core and 4 GiB (the first rung of the memory ladder) (see [platform-properties.md](../platform-properties.md#kbf-book-cpus-and-kbf-book-mem-gib)); the front refuses either on a `whole_machine` lease. **Planned**: they also size a `vm` lease's guest |
+| `kbf-book-cpus`, `kbf-book-mem-gib` | the whole cores and GiB an `action` lease books in place of one core and 4 GiB (the first rung of the memory ladder) (see [platform-properties.md](../platform-properties.md)); the front refuses either on a `whole_machine` lease. **Planned**: they also size a `vm` lease's guest |
 | `kbf-node` | **planned**, not yet reserved: pins a lease to one node for qualification. The front will refuse it from every client; only the rollout driver's internal submitter sets it ([fleet-updates.md](fleet-updates.md#31-observed)) |
 
 `kbf-book-cpus` and `kbf-book-mem-gib` are not `cpus` and `mem_gib`: those ask for a node
@@ -250,7 +252,7 @@ Buck2 and Bazel send whatever their remote platform sets (`remote_execution_prop
 | `ISA`, `Arch` | an ISA level (`x86-64-v3`, `armv8.2-a`) | its `arch` and `isa_level` |
 
 Every key in the matching table above passes through unchanged, except `gpu`, which is
-booked (see [platform-properties.md](../platform-properties.md#gpu)). Every other
+booked (see [platform-properties.md](../platform-properties.md)). Every other
 property is not a capability and is left to whoever reads it (`kbf-lease`,
 `container-image`, ...). One requirement named twice (`OSFamily` and `os`) is refused.
 

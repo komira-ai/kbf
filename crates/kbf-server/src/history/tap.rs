@@ -13,11 +13,11 @@ use kbf_history::records::{
     RunRecord, Timestamps, UsageBasis, WireDigest,
 };
 use kbf_history::{Event, EventQueue, InvRef, Minter};
+use kbf_invocation::RequeueReason;
 use kbf_invocation::{
     ActionRow, Attempt, AttemptEnd, Ended, EndedKind, How, MemoryKillKind, NumaBytes, Outcome,
     RecordKey, TargetKind, UsageBasis as InvBasis, WallTime,
 };
-use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure};
 
 use super::tails::{Job, Tails};

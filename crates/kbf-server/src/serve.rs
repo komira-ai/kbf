@@ -13,7 +13,6 @@ use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{Backend, Cache, MetaLog, RECORDER_CHANNEL, Recorder, RequestMetadataLayer};
 use kbf_objstore::ObjectStore;
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
-use kbf_sched::MemoryLadder;
 use kbf_storage::service::Admission;
 use kbf_tls::{Incoming, TlsSource};
 use tonic::service::Routes;
@@ -22,7 +21,6 @@ use tonic::transport::server::TcpIncoming;
 use tower_layer::{Identity, Stack};
 
 use crate::drain::Drain;
-use crate::farm::{Farm, StateError};
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::{Checks, Readiness};
 use crate::http_blobs::ReadBudget;
@@ -42,7 +40,7 @@ use crate::worker_roles::WorkerRolesLayer;
 use kbf_proto::kbf::enroll::v1::cold_store_server::ColdStoreServer;
 use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 
-/// How the server listens and paces its workers.
+/// How the server listens, and what runs its Executes.
 #[derive(Clone, Debug)]
 pub struct Listeners {
     /// The REAPI listener (clients: buck2, Bazel).
@@ -59,38 +57,9 @@ pub struct Listeners {
     /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
     /// node is bound to a certificate.
     pub worker_tls: Option<WorkerTls>,
-    /// How often the scheduler expires silent workers' leases and places queued work
-    /// when no input arrives.
-    pub tick: Duration,
-    /// How long queued work waits while no live worker can run it (none satisfies its
-    /// platform, or none that does is large enough) before it is refused
-    /// FAILED_PRECONDITION.
-    pub unservable_wait: Duration,
-    /// The OS and architecture of an action that names neither (`--default-platform`).
-    pub default_platform: kbf_front::DefaultPlatform,
-    /// The levels the `x-kbf-qos` header may name (`--qos-allowed`).
-    pub qos_allowed: kbf_front::QosAllow,
-    /// The memory rungs of an action: the first is what an action that names no size
-    /// books, the others are what it climbs through when it passes its own memory
-    /// limit, before a whole host (`--memory-ladder-gib`).
-    pub memory_ladder: MemoryLadder,
-    /// Whether an action that passes its own memory limit runs again on the next rung
-    /// (`false` is `--no-memory-climb`: the kill finishes it).
-    pub memory_climb: bool,
-    /// Whether the farm shows `kbf-estimator` what finished (`--learned-sizes`).
-    pub learned_sizes: crate::LearnedSizes,
-    /// Whether every `action` lease books the whole worker it lands on, so that one action
-    /// runs per worker (`--exclusive-actions`).
-    pub exclusive_actions: bool,
-    /// Whether placement reads the load the nodes report (`--placement-load`).
-    pub placement_load: crate::PlacementLoad,
-    /// Whether the scheduler is given the estimator's prediction of a new operation's cost
-    /// (`--placement-predictions`).
-    pub placement_predictions: crate::PlacementPredictions,
-    /// Whether the farm learns what its leases use (`--usage-profiles`).
-    pub usage_profiles: crate::UsageProfiles,
-    /// The whole-node settings of the scheduler, if on (`--whole-node-max`).
-    pub whole_node: Option<kbf_sched::WholeNodeConfig>,
+    /// What runs the Execute calls the action cache does not answer: the executor over the
+    /// job service. `None` answers each of them FAILED_PRECONDITION.
+    pub executor: Option<crate::executor::Executor>,
     /// How long a finished operation is kept after its callers are answered, in which
     /// WaitExecution on it still streams its result; then it is NOT_FOUND.
     pub finished_retention: Duration,
@@ -178,6 +147,9 @@ pub struct Api {
 /// Why the server could not start or stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
+    /// The state store could not be opened or read.
+    #[error("--state-store: {0}")]
+    State(#[from] crate::state_store::StateError),
     /// A listener could not be bound.
     #[error("bind {addr}: {source}")]
     Bind {
@@ -191,9 +163,6 @@ pub enum ServeError {
     /// The operator API listener failed.
     #[error("operator API: {0}")]
     Api(#[source] std::io::Error),
-    /// The scheduler's state store could not be taken up.
-    #[error("--state-store: {0}")]
-    State(#[from] StateError),
     /// The pack store does not refuse to replace an object, or cannot be written to.
     #[error("--pack-store-endpoint: {0}")]
     Packs(String),
@@ -221,16 +190,12 @@ pub struct Bound<F> {
     /// `POST /v1/frontend/drain`, and escalated by [`Drain::close`], which a second
     /// stop signal calls (`ServerHandle::serve_escalating`).
     pub drain: Arc<Drain>,
-    /// Serves every listener and the tick, and runs the invocation recorder's task,
+    /// Serves every listener, and runs the invocation recorder's task,
     /// until the shutdown future completes.
     pub serving: F,
     /// The invocation records the serving future builds, which the build pages read
     /// ([`crate::http_invocations`]); tests feed it events.
     pub recorder: Recorder,
-    /// The farm the serving future ticks, not owned here (it goes when serving ends);
-    /// tests drive its tick and write-behind by hand instead of waiting for the timer.
-    #[doc(hidden)]
-    pub farm: std::sync::Weak<Farm>,
 }
 
 /// Aborts its task when dropped.
@@ -415,10 +380,6 @@ pub(crate) fn keepalive(server: Server, timing: StreamTiming) -> Server {
         .http2_keepalive_timeout(on.then_some(timing.keepalive_timeout))
 }
 
-/// The warning every start logs ([`bind_server_with_api`]).
-const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
-    operation of an earlier server process is restored, and the server keeps no rollout record";
-
 /// The members a frontend with a state store keeps, promoting joiners by their own beats
 /// when `handoff` is given (`--auto-promote`). Not generic, for the same reason as
 /// [`sweeping`].
@@ -432,8 +393,7 @@ pub(crate) fn members_of(
         Some(handoff) => members.with_handoff(handoff),
         None => members,
     });
-    // One refresh at once, so the map and the deny rows are read before the farm's state is
-    // restored. The rows are read again just before the listeners serve (`deny_rows::denying`).
+    // One refresh at once, so the map and the deny rows are read before anything is served. The rows are read again just before the listeners serve (`deny_rows::denying`).
     // A failure is loud and the start goes on: the sweeper tries again every beat.
     if let Err(error) = members.refresh() {
         tracing::error!(
@@ -506,37 +466,6 @@ pub(crate) fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Outp
     }
 }
 
-/// Logs the core a server runs, the usage profiles mode of `farm`, and whether an
-/// own-limit kill climbs the ladder (`--no-memory-climb`), in the words every server uses.
-pub(crate) fn log_core(farm: &Farm) {
-    tracing::info!("{}", crate::SchedulerCore::Legacy.start_line());
-    tracing::info!("{}", farm.usage_profiles().start_line());
-    tracing::info!(
-        "memory climb: {}",
-        if farm.memory_climb() { "on" } else { "off" }
-    );
-}
-
-/// The line a start logs when `--exclusive-actions` is on, and none when it is off.
-pub(crate) const EXCLUSIVE_LINE: &str = "exclusive-actions: on";
-
-/// Logs [`EXCLUSIVE_LINE`] at a start with `--exclusive-actions` on.
-pub(crate) fn log_exclusive(on: bool) {
-    if on {
-        tracing::info!("{EXCLUSIVE_LINE}");
-    }
-}
-
-/// Logs where the scheduler's state is, at every start. Not generic, unlike the binding
-/// that calls it, so every test binary's runs count toward the same function's coverage.
-pub(crate) fn log_state(durable: bool, term: u64, epoch: u64) {
-    if durable {
-        tracing::info!(term, epoch, "the scheduler's state is in the state store");
-    } else {
-        tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
-    }
-}
-
 /// Stops the operator API once the REAPI listener is done: `api_serve` (see
 /// [`serve_api`]) answers the requests in flight, the one that began a drain on an idle
 /// frontend among them (its response would otherwise race the process's exit), and
@@ -592,9 +521,6 @@ where
 ///
 /// The REAPI listener accepts and allows every call; [`bind_server_with_policy`] runs a
 /// policy instead.
-///
-/// It logs a warning that the scheduler's state (cordons, drains, leases, operations)
-/// starts empty, as it does at every start: nothing of an earlier process is restored.
 ///
 /// The REAPI listener also serves `grpc.health.v1.Health` ([`crate::grpc_health`]),
 /// with `/readyz`'s answer.
@@ -658,8 +584,8 @@ where
     bind_server_with_options(cache, listeners, api, policy, None, None, None, shutdown)
 }
 
-/// [`bind_server_with_policy`], with the scheduler's state kept in `state` if given
-/// (`--state-store`): see [`Farm::with_state`].
+/// [`bind_server_with_policy`], over the state store `state` if given (`--state-store`): the
+/// storage members, and the operations' rows of the executor.
 ///
 /// # Errors
 /// As [`bind_server_with_policy`], and the state store cannot be read.
@@ -731,22 +657,13 @@ where
         history.with_blobs(blobs, budget.clone())
     });
     let recording = crate::history::install(recording, history.as_ref());
-    let defaults = kbf_front::Defaults {
-        memory: listeners.memory_ladder.first(),
-        platform: listeners.default_platform,
-        qos: listeners.qos_allowed,
-        exclusive_actions: listeners.exclusive_actions,
-    };
-    let farm = Farm::from_listeners(Arc::clone(&cache), &listeners).recording(recorder.clone());
-    log_core(&farm);
-    log_exclusive(listeners.exclusive_actions);
-    let durable = state.is_some();
+    let dispatch = crate::executor::Dispatcher::of(listeners.executor.clone());
+    let executes = listeners.executor.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref(), None);
     // The API reads the same store, whose handle is shared.
     let api_store = state.as_ref().map(|s| Arc::clone(&s.store));
     let node_store = api_store.clone();
-    let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi, &binder)?;
     let (worker_incoming, worker) = bind(listeners.worker, &binder)?;
     let (mut worker_server, peers, worker_tls) = worker_peers(
@@ -786,7 +703,7 @@ where
         budget,
     };
     let api_routes = crate::api::router(
-        Arc::clone(&farm),
+        Backend::from(Arc::clone(&cache)),
         token.clone(),
         Arc::clone(&drain),
         // A server with no frontend role has nothing to retire: its retire routes answer 409.
@@ -797,13 +714,12 @@ where
         None,
     )
     .merge(crate::verbs::routes(token.clone(), members.clone()))
-    .merge(crate::health::routes(&checks, &farm, members.as_ref()))
+    .merge(crate::health::routes(&checks, executes, members.as_ref()))
     .merge(crate::metrics::router(
         Arc::clone(&cache),
         history.as_ref().map(crate::history::History::stats),
         members.clone(),
         tls_sources,
-        Some(Arc::clone(&farm)),
     ));
     // The storage health, if there are members: no branch in this generic function.
     let api_routes = members.iter().fold(api_routes, |routes, members| {
@@ -811,9 +727,6 @@ where
     });
     // The gated reads (blobs, builds, runs, host updates) under the policy, and `/ui`.
     let api_routes = crate::ui_mount::mount(api_routes, &reads, &policy, ui);
-    // Logged at every start, the first one too (issue #156).
-    let (term, epoch) = (farm.term(), farm.lease_epoch());
-    log_state(durable, term, epoch);
 
     let proxy_secret = proxy.as_ref().map(|behind| Arc::clone(&behind.secret));
     let mut reapi_server = keepalive(
@@ -822,13 +735,8 @@ where
     )
     .layer(ProxyAuthLayer::new(proxy_secret.clone()));
     let membership = membership(members.clone(), &peers, None);
-    // The four calls a host's updater makes about its own node.
-    let node_calls = crate::node_self::routes(
-        Arc::clone(&farm),
-        members.clone(),
-        node_store,
-        peers.clone(),
-    );
+    // The call a host's updater makes about its own node.
+    let node_calls = crate::node_self::routes(members.clone(), node_store, peers.clone());
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
@@ -836,20 +744,18 @@ where
         Some(node) => kbf_front::routes_proxied(
             &kbf_front::Proxy::to_endpoint(&node, Arc::clone(&authorizers)),
             cache,
-            Arc::clone(&farm),
+            Arc::clone(&dispatch),
             kbf_front::OpenStreams { closing, progress },
             authorizers,
             &recorder,
-            defaults,
         ),
         None => kbf_front::routes_recorded(
             cache,
-            Arc::clone(&farm),
+            Arc::clone(&dispatch),
             closing,
             progress,
             authorizers,
             &recorder,
-            defaults,
         ),
     };
     let authenticate = AuthenticateLayer::new(policy.authenticator);
@@ -871,9 +777,12 @@ where
     .add_service(health);
 
     let stopper = Arc::clone(&drain);
-    let farm_handle = Arc::downgrade(&farm);
+    let running = listeners
+        .executor
+        .as_ref()
+        .map(crate::executor::Running::spawn);
     let serving = async move {
-        // A task of its own: applying events never delays the tick or an accept loop,
+        // A task of its own: applying events never delays an accept loop,
         // and they never delay it. It stops when the serving future does.
         let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
@@ -903,16 +812,6 @@ where
         );
         tokio::pin!(api_serve);
         let sweeping = sweeping(members);
-        let ticking = async {
-            let mut tick = tokio::time::interval(listeners.tick);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                farm.tick().await;
-            }
-        };
-        // What the other frontends of a shared state store did (`Farm::intake`).
-        let intaking = farm.poll_intake();
         // Completes when the drain has run out of time or was forced: the REAPI
         // listener, drained in time, completes first.
         let stopping = async {
@@ -931,8 +830,6 @@ where
             // Finished on its own: there is nothing left to answer, so it is not waited
             // for again below (`reapi_done` stays false).
             served = &mut api_serve => served.map_err(ServeError::Api),
-            () = ticking => Ok(()),
-            () = intaking => Ok(()),
             () = sweeping => Ok(()),
             // One timer for every open stream's progress operation.
             () = ticker.run() => Ok(()),
@@ -941,8 +838,9 @@ where
         if reapi_done {
             stop_api(api_stop, api_serve).await;
         }
-        // What the usage side learned and has not flushed yet.
-        farm.finish_usage().await;
+        if let Some(running) = running {
+            running.stop().await;
+        }
         crate::history::finish(history).await;
         outcome
     };
@@ -954,7 +852,6 @@ where
         drain,
         serving,
         recorder,
-        farm: farm_handle,
     })
 }
 

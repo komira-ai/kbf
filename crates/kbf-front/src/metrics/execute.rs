@@ -3,10 +3,10 @@
 //! families ([`super::CacheMetrics::render`]).
 //!
 //! The front can see four moments of an Execute: its arrival, the call to the
-//! scheduler ([`crate::Dispatch::submit`]), the scheduler's acceptance, and the first
+//! dispatcher ([`crate::Dispatch::submit`]), the dispatcher's acceptance, and the first
 //! update that is not `QUEUED` (`EXECUTING`, or the done operation when the stream
 //! missed the `EXECUTING` one because the stage changed twice between two polls). It
-//! cannot see inside the scheduler or the worker, so everything after that first
+//! cannot see inside the dispatcher or the worker, so everything after that first
 //! update is one number, [`ExecuteMetrics::total`].
 //!
 //! Recording takes no lock and allocates nothing: a stream holds one `Arc` of these
@@ -25,7 +25,7 @@ use super::{Counter, Families, Gauge, Histogram, Unit};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCause {
     /// The call ended with a gRPC error status: refused, not authorized, a bad request,
-    /// inputs missing, the scheduler's refusal, or a stream the server ended.
+    /// inputs missing, the dispatcher's refusal, or a stream the server ended.
     Status,
     /// The client reset the stream and its connection stayed: it gave the call up.
     ClientAbort,
@@ -110,21 +110,21 @@ pub struct ExecuteMetrics {
     /// A rollout that sees it flat while `open_executions` is 0 sees a frontend no
     /// client is using.
     pub started: Counter,
-    /// Execute streams the scheduler accepted whose operation has not left `QUEUED`
-    /// yet. A stream that joined a running twin counts only until its first update.
+    /// Execute streams the dispatcher accepted whose operation has not been read back
+    /// running yet (its job is submitted). A stream that joined a running twin counts only until its first update.
     pub queued: Gauge,
     /// From the arrival of an Execute to the call of [`crate::Dispatch::submit`]:
     /// authorization, the action cache lookup, the reads of the action, its command and
     /// its input tree, the check that every input is held, and the booking. Observed
-    /// only for an Execute that reaches the scheduler.
+    /// only for an Execute that reaches the dispatcher.
     pub prepare: Histogram,
     /// The call of [`crate::Dispatch::submit`] itself, from the call to its return
-    /// (the scheduler joining or queueing the request).
+    /// (the dispatcher joining the request or submitting its job).
     pub dispatch: Histogram,
-    /// From the scheduler's acceptance to this stream's first update that is not
-    /// `QUEUED`. It is read by the stream as it polls its operation, so it can run a
-    /// little over the scheduler's own time; a call that joined an operation already
-    /// executing observes near zero.
+    /// From the dispatcher's acceptance to this stream's first update that is not
+    /// `QUEUED` (submitted, not yet read back running). It is read by the stream as it
+    /// polls its operation, so it can run a little over the dispatcher's own time; a call
+    /// that joined an operation already executing observes near zero.
     pub queued_seconds: Histogram,
     /// An Execute from its arrival to its last response (or its error, or its caller
     /// leaving). Cache hits are in it.
@@ -212,23 +212,23 @@ impl ExecuteMetrics {
         );
         out.gauge(
             "kbf_execute_queued",
-            "Execute streams accepted by the scheduler whose operation has not left QUEUED",
+            "Execute streams accepted by the dispatcher whose operation has not left QUEUED",
             self.queued.get(),
         );
         let histograms = [
             (
                 "kbf_execute_prepare_seconds",
-                "An Execute from its arrival to the call of the scheduler: authorization, action cache lookup, reading the action and its inputs, the held-inputs check and the booking",
+                "An Execute from its arrival to the call of the dispatcher: authorization, action cache lookup, reading the action and its inputs and the held-inputs check",
                 &self.prepare,
             ),
             (
                 "kbf_execute_dispatch_seconds",
-                "The scheduler's submit call, from the call to its return",
+                "The dispatcher's submit call, from the call to its return",
                 &self.dispatch,
             ),
             (
                 "kbf_execute_queued_seconds",
-                "From the scheduler's acceptance to the stream's first update that is not QUEUED",
+                "From the dispatcher's acceptance to the stream's first update that is not QUEUED",
                 &self.queued_seconds,
             ),
             (
@@ -267,7 +267,7 @@ pub struct OpenExecute {
 }
 
 impl OpenExecute {
-    /// The call reaches the scheduler: observes the prepare phase.
+    /// The call reaches the dispatcher: observes the prepare phase.
     pub fn dispatching(&mut self) {
         let now = Instant::now();
         self.metrics
@@ -276,9 +276,9 @@ impl OpenExecute {
         self.phase = now;
     }
 
-    /// The scheduler returned: observes its call, and counts the stream as queued
-    /// until [`Self::update`] sees it leave `QUEUED`. Called with the scheduler's
-    /// answer either way; only an accepted call is queued.
+    /// The dispatcher returned: observes its call, and counts the stream as submitted
+    /// until [`Self::update`] reads the operation back running. Called with the
+    /// dispatcher's answer either way; only an accepted call is counted.
     pub fn dispatched(&mut self, accepted: bool) {
         let now = Instant::now();
         self.metrics

@@ -124,10 +124,9 @@ fn fixture(text: &str) -> Value {
     serde_json::from_str(text).expect("the fixture is JSON")
 }
 
-// The wrapper crates `kbf-sched`, `kbf-caps`, `kbf-estimator`, `kbf-sim`, `kbf-state` and
-// `kbf-usage`, keep their `js-*` dependencies:
-// the legacy farm core uses them until it is removed, after the cutover to the job service. So
-// they are not checked here: only the scheduler's server crates and the lease client are.
+// The wrapper crates `kbf-caps`, `kbf-estimator`, `kbf-sim`, `kbf-state` and `kbf-usage` keep
+// their `js-*` dependencies, so they are not checked here: only the scheduler's server crates and
+// the lease client are. That no scheduler package is in the lock file at all is `no_scheduler_package`.
 /// Asserts that no workspace member reaches `js-server-core` or `js-store` through a normal, dev
 /// or build edge, and that no package is named `kbf-lease-client`. The walk is shown to see the
 /// job service client's own dependency, `js-proto`, so the check does not pass on an empty walk.

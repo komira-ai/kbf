@@ -386,7 +386,7 @@ async fn a_release_that_cannot_be_fetched_fails_the_start_naming_the_flag() {
 /// Catches: two frontends of one host that download one commit into one directory.
 #[test]
 fn a_start_downloads_under_the_executors_instance_id() {
-    let mut config = crate::executor::Config::new("front-1", 1, 2_000, 16 << 30);
+    let mut config = crate::executor::Config::new("front-1");
     config.instance = "fe-a".to_owned();
 
     let start = Start::new(&js_flags(config), packs().0, None);
@@ -400,7 +400,7 @@ fn a_start_downloads_under_the_executors_instance_id() {
 /// provider frontend whose base is never listed, so every run is unavailable.
 #[test]
 fn a_start_lists_the_base_only_for_tree_lists() {
-    let manifests = crate::executor::Config::new("front-1", 1, 2_000, 16 << 30);
+    let manifests = crate::executor::Config::new("front-1");
     let mut provider = manifests.clone();
     provider.input_tree = crate::executor::InputTree::Provider;
 

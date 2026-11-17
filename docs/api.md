@@ -19,12 +19,11 @@ operators, a short-lived `rollout` for CI) are **planned**; the token is the one
 operator credential until they land.
 
 Every body is `application/json`, except a blob's bytes and `/metrics`. What the server keeps here is
-**in memory**, like the scheduler's state: a restart forgets it, and a node
-reports again with its next report.
+**in memory**: a restart forgets it.
 
 ## Who may write
 
-A write (cordon, drain, uncordon, a member's state, a deny list entry) can take every node in the fleet out of service, so
+A write (a member's state, a deny list entry, a frontend's drain) can take the fleet out of service, so
 it must come from an operator. Where a request comes from does not show that:
 
 - **A server host may run other services.** A process on it can reach loopback.
@@ -128,136 +127,26 @@ What the flag does not do, and what the proxy must do:
 Without the flag, nothing changes: the headers do nothing (they are removed all the same),
 and the gates are the ones in the table.
 
-## `GET /v1/nodes`
+## Own-node call of a host's updater
 
-The server that answers, then every node registered since it started, in node-id
-order, with the protocol version it speaks, its software and where it is in
-placement, and, after the list, the oldest protocol version among them:
-
-```json
-{ "server": { "version": "0.1.0+0123456789ab", "commit": "0123456789ab" },
-  "nodes": [
-  { "node_id": "mac-1", "connected": true, "protocol": 1, "software": {
-      "os_name": "macOS", "os_version": "15.1", "os_build": "24B83", "kernel": "",
-      "daemon_version": "0.1.0", "xcode_builds": ["15F31d", "16C5032a"],
-      "xcodes": [
-        { "app": "/Applications/Xcode_15.4.app", "build": "15F31d", "state": "ready",
-          "reason": "", "fix": "" },
-        { "app": "/Applications/Xcode_16.1.app", "build": "16B40",
-          "state": "license_not_accepted",
-          "reason": "/usr/bin/xcodebuild -license check exited with exit status: 69: You have not agreed to the Xcode license agreements.",
-          "fix": "sudo /Applications/Xcode_16.1.app/Contents/Developer/usr/bin/xcodebuild -license accept" },
-        { "app": "/Applications/Xcode_16.2.app", "build": "16C5032a", "state": "ready",
-          "reason": "", "fix": "" } ],
-      "container_images": [],
-      "received_at_unix_ms": 1791370000000 },
-    "needs_attention": [
-      "Xcode 16B40 (/Applications/Xcode_16.1.app) installed but not ready: /usr/bin/xcodebuild -license check exited with exit status: 69: You have not agreed to the Xcode license agreements.; fix: sudo /Applications/Xcode_16.1.app/Contents/Developer/usr/bin/xcodebuild -license accept" ],
-    "placement": { "state": "draining", "deadline_unix_ms": 1791371800000,
-                   "leases": ["117399224320012061.42"] } },
-  { "node_id": "old-1", "connected": false, "protocol": null, "software": null,
-    "needs_attention": [], "placement": { "state": "serving" } }
-],
-  "oldest_protocol": 1, "protocol_unknown": 1 }
-```
-
-| Field | Meaning |
-|---|---|
-| `server.version` | the `kbf-server` build that answers, as `--version` and the start line print it: the package version, `+`, and the commit |
-| `server.commit` | the commit it was built from, 12 hex digits (`git rev-parse --short=12`), or `unknown` for a build without a git checkout |
-| `node_id` | the id its worker registered with (`js:<frontend id>-<n>` for the executor's virtual workers) |
-| `connected` | whether its newest stream is still open |
-| `protocol` | the `kbf.worker.v1` version the `Welcome` that answered the `Hello` opening its newest stream named: the lesser of the `Hello`'s version and the newest the server speaks, so a worker whose `Hello` names 5 against a server speaking 3 shows 3 ([worker-protocol.md](design/worker-protocol.md)); `null` if no version is known (a `Hello` naming 0, which is not a version, from a server that accepts it). A `Hello` resent on the stream does not change it, and a node that returns on another version shows the new one. It stays after the stream closes: it is the version the node last spoke |
-| `blocked_on` | only on a `joining` member, only when the frontend runs with `--auto-promote`: a list of sentences saying what holds its automatic promotion back (a member that has not flushed, a tail epoch not acknowledged, a member down, the settle time). Absent otherwise; an empty answer for a joiner means only its next beat or the next sweep is owed |
-| `oldest_protocol` | the least `protocol` among the listed nodes whose `protocol` is not `null`, connected or not (a node whose stream closed may return on the version it last spoke); `null` if no listed node names one. Nodes that name none are not in it |
-| `protocol_unknown` | how many listed nodes have a `null` `protocol`. They are never counted in `oldest_protocol`, so `oldest_protocol` says "every node but these speaks at least this": a reader that needs every node reads it with `protocol_unknown` equal to 0 |
-| `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a worker that predates it or sends none. An empty string or list is a value the node could not read |
-| `software.received_at_unix_ms` | when the server received it, by the server's clock |
-| `software.xcode_builds` | the Xcode builds actions can use on it: only these route work |
-| `software.xcodes` | every installed Xcode, ready or not: `app`, `build` (empty if not known), `state` (`ready`, `license_not_accepted`, `first_launch_not_run`, `metal_toolchain_missing`, `failed`, `not_surveyed` from the worker's start until its first survey of its Xcodes ends (never advertised; the worker sends its status again when the survey ends), or `unknown` for a state this server does not know), `reason` (the check that failed and its answer, from the worker's last survey that changed this Xcode's `DEVELOPER_DIR`, build or state; a survey that differs only in its reason is not sent, so when another check later fails with the same build and state, this is still the earlier check's text) and `fix` (the command an administrator runs on the node, when one is known). Empty from a worker that predates it |
-| `software.container_images` | the container images the node was pinned to, as `docker://<repo>@sha256:<digest>`, sorted. Status only: no work is placed by image. Empty when none is pinned and from a worker that sends none |
-| `needs_attention` | what an operator must do on the node, one line per item: today each installed Xcode that is not ready, as `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`. An Xcode `not_surveyed` keeps the item the same app had in the node's previous status (as when a restarted worker sends its first status), until a survey reports it; one with no previous item has none. The server also logs each item once at `WARN` (target `kbf_server::attention`) when it appears, and at `INFO` when a status reports it gone (its Xcode ready, changed or removed); a status that repeats an item, or lists its Xcode `not_surveyed`, logs nothing. An item is the same while its Xcode's app, build, state and fix are, so a reason that changes alone is shown here but not logged again. The previous status is kept in the server's memory: after a server restart, each item is logged again when its node reports it; kbf has no alert delivery yet (issue #189) |
-| `lease_count` | how many leases it holds now (granted or running), the number of entries of `GET /v1/nodes/{id}`'s `leases`. In memory like the rest: after a server restart it is 0 until the worker's leases are granted again |
-| `booked` | what those leases book of its capacity: `{"cpu_millis", "memory_bytes", "gpus", "vms"}`, CPU in thousandths of a core, memory in bytes. A record of the leases' limits, not a measurement of use |
-| `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`, which is left out for a drain with no deadline); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
-| `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
-
-The `software` fields (`xcodes`, `xcode_builds`, `container_images`, `daemon_version`) and `needs_attention` are shipped fields of the node status; the programs of this release send no node status, so they are `null` or empty on every node today.
-
-The list is the nodes this server process has seen, so it says nothing of a worker that has
-not connected to it yet: a server that has just started, or one of several frontends that
-share a state store ([design/frontend-proxy.md](design/frontend-proxy.md)), lists only
-those that have registered with it. `oldest_protocol` and `protocol_unknown` describe that list and
-no more. The check that a release may stop accepting the oldest version
-([design/frontend-proxy.md](design/frontend-proxy.md) section 9, rule R1) reads them; it is
-not made by this server.
-
-## `GET /v1/nodes/{id}`
-
-One node: every field of its entry in `GET /v1/nodes`, and four more (`capacity`, `free`, `leases`
-and `owner`), a read open like the list. The fields `load` and `input_cache` of earlier releases
-are never written now: nothing reports the readings they showed, and a reader that finds
-neither must read that as no reading:
-
-```json
-{ "node_id": "linux-1", "connected": true, "protocol": 1, "software": null,
-  "needs_attention": [], "placement": { "state": "serving" }, "phase": { "state": "serving" },
-  "lease_count": 1,
-  "booked": { "cpu_millis": 1000, "memory_bytes": 1073741824, "gpus": 0, "vms": 0 },
-  "capacity": { "cpu_millis": 8000, "memory_bytes": 17179869184, "gpus": 0, "vms": 0 },
-  "free": { "cpu_millis": 7000, "memory_bytes": 16106127360, "gpus": 0, "vms": 0 },
-  "leases": ["117399224320012061.42"] }
-```
-
-| Field | Meaning |
-|---|---|
-| `capacity` | what the node's newest `Hello` said it can run at once |
-| `free` | `capacity` less `booked` on each axis, never below zero |
-| `leases` | the leases it holds, as `term.seq`, in lease order |
-| `owner` | who placed the node out of placement: `operator` or `updater:<unit>`. Present while the node is cordoned, draining or drained, left out while it serves. A cordon with no recorded owner is `operator`, and so is one whose recorded owner cannot be read. No writer records an owner yet, so every cordon reads `operator` |
-
-`{id}` is the node id as `POST /v1/nodes/{node}:cordon` takes it, percent-encoded as one
-path segment. `404` with `{"error": "no_node"}` for a node that has not registered since
-this server started and that no frontend of its state store holds, and for an id that ends in
-`:cordon`, `:drain` or `:uncordon`: that
-is a write's path, and a read of it is never a node (an id that holds another colon,
-`host:8080`, is read as it is). A path below the node (`/v1/nodes/{id}/...`) is `404`.
-The node's recent failed runs are not here: they are `GET /v1/runs?node=` with
-`--history-objects`.
-
-With a state store, a cordon or drain written through another frontend is read at once,
-wherever the read lands: the server takes up the store's `cordon/` rows before it answers.
-A node connected to another frontend of the store is answered from the store: `placement` is
-its `cordon/` row (a drain with no lease left reads as `drained`; the store does not say
-whether a drain paused), `leases` and `lease_count` are the leases the store records on it,
-`connected` is `false`, and `protocol`, `software`, `booked`, `capacity` and `free` are empty
-(they are the other frontend's to say). `503` when that store cannot be read, and when the
-store cannot say who holds a node that is not connected to the frontend answering: never "no
-such node", and never the node with no lease. A node connected to the frontend answering is
-answered from that frontend while its store cannot be read.
-
-## Own-node calls of a host's updater
-
-A host's updater ([deploy/kbf-updater.md](deploy/kbf-updater.md#the-boundary)) drains and reads its
-own node without a token. The calls are served by the frontend on its **worker listener**
+A host's updater ([deploy/kbf-updater.md](deploy/kbf-updater.md#the-boundary)) reads its own
+storage health without a token. The call is served by the frontend on its **worker listener**
 (`--worker-listen`, mutual TLS against `--worker-client-ca`, the listener storage nodes dial), not on the
 operator API, and only to a certificate with the role `updater` whose one DNS name is the `{id}` of
 the call:
 
 | Call | Answer |
 |---|---|
-| `POST /v1/nodes/{id}:drain` | as the operator API's drain: cordons the node and waits for its leases; the body is `{"deadline_secs": N}` or none (no deadline: the drain waits for the leases however long they run) |
-| `POST /v1/nodes/{id}:uncordon` | as the operator API's uncordon |
-| `GET /v1/nodes/{id}` | as `GET /v1/nodes/{id}` above |
 | `GET /v1/nodes/{id}/storage-health` | below |
 
-Everything else is `403`: another node's id, `:cordon`, any other path (the whole operator API
+kbf places no work on a node, so an updater has nothing to drain, cordon or read of its node's work
+(the routes `POST /v1/nodes/{id}:drain`, `:uncordon` and `GET /v1/nodes/{id}` of earlier releases are
+gone). Everything else is `403`: another node's id, any other path (the whole operator API
 included), and every call of a certificate that is not an updater's (a storage node's, a
 frontend's), whatever the path; a call with no client certificate does not get past the handshake.
 The id is compared as written: it is 1 to 63 of `a-z`, `0-9` and `-` (not first or last), nothing
-is decoded, and a query string makes the call none of the four. A node on the listener's deny list
-(`--worker-deny-list`, or the `deny/` rows) is refused. `404` for a node the frontend has not seen since it started
-(a storage host has none unless a worker registered under that id). The listener offers `h2` and `http/1.1`; the
+is decoded, and a query string makes the call none. A node on the listener's deny list
+(`--worker-deny-list`, or the `deny/` rows) is refused. The listener offers `h2` and `http/1.1`; the
 updater's client speaks HTTP/1.1 with one request per connection.
 
 **`GET /v1/nodes/{id}/storage-health`** is a storage host's own storage health and nothing else of
@@ -284,9 +173,8 @@ answers `404`.
 
 The storage members of the current map, as the `Membership` service keeps them
 (`kbf.map.v1.Membership`; [architecture-v2.md](design/architecture-v2.md) section 6),
-in the map's order. A read, open like `GET /v1/nodes`; it takes no write. Storage
-members are not the nodes of `/v1/nodes`: a storage node registers with a
-frontend, a worker opens a worker stream.
+in the map's order. A read, open like `GET /v1/storage`; it takes no write. A storage node
+registers with a frontend as a member.
 
 ```json
 { "generation": 7,
@@ -313,7 +201,7 @@ frontend, a worker opens a worker stream.
 | `log_version` | the machine version the node's metadata log was at in its newest heartbeat (a registration says it too). Informational: no build raises a log any more, so it is the version an earlier build left, and 1 for a new log |
 | `build_commit` | the commit the node's binary was built from, as its registration said (a heartbeat never replaces it; it fills it only when the row holds none): 40 hex digits, or the 12-digit commit when the build did not know the full one, or the text `unknown` when the build had no git checkout; at most 64 bytes are kept |
 | `oldest_protocol` | the least `protocol` among the members whose `protocol` is not `null`; `null` if none is |
-| `protocol_unknown` | how many members have a `null` `protocol`. Never counted in `oldest_protocol`: read the two together, as for [`GET /v1/nodes`](#get-v1nodes) |
+| `protocol_unknown` | how many members have a `null` `protocol`. Never counted in `oldest_protocol`: read the two together |
 
 The registration is judged against the map's floor once, when it is made
 ([design/frontend-proxy.md](design/frontend-proxy.md) section 9); `protocol` is what it
@@ -335,48 +223,6 @@ store that cannot be read answers `503`. The view reads the map and then the mem
 (for `protocol`), so a stored map or a stored member row that does not decode answers
 `500` for the whole view, not a list without that member's version: the store is up and
 its content is wrong, as it is for the other readers of those rows.
-
-## `POST /v1/nodes/{node}:cordon`, `:drain`, `:uncordon`
-
-An operator takes a node out of placement, drains it, or returns it
-([fleet-updates.md](design/fleet-updates.md) sections 3.3 and 4.2):
-
-- `:cordon` (`POST /v1/nodes/{node}:cordon`): the scheduler offers the node no new lease; its leases run on. A drain
-  already under way is kept.
-- `:drain` (`POST /v1/nodes/{node}:drain`): cordons the node and waits for its leases to end. The body may be
-  `{"deadline_secs": N}` (seconds, any value, 0 included); without a body there is **no
-  deadline**: the node stays `draining` until its leases end, then is `drained`, and is never
-  `drain_paused`. With no lease left the node is `drained`. If a deadline that was given comes
-  first, the drain **pauses**: the
-  leases run on, nothing is killed or given up, and the node stays `drain_paused`
-  even after they end, until an operator drains it again (a new deadline) or
-  uncordons it.
-- `:uncordon` (`POST /v1/nodes/{node}:uncordon`): returns the node to placement and ends any drain.
-
-The answer is the node, as `GET /v1/nodes` lists it, after the action. `404` for a
-node that no frontend of the state store has held or an unknown verb, `400` for a drain body of
-another shape, and `401`, `403` or `415` from the gates of [Who may write](#who-may-write).
-
-With a state store, a node connected to another frontend is placed through the row the
-action writes under `cordon/`, which the node's own frontend applies. `503` when the store
-cannot say whether another frontend holds a node that is not connected to the frontend
-answering (never `404`), and when the store does not take the row. In both the action is not
-applied: the row is written first, and the frontend's own scheduler follows it, so a node
-connected to the answering frontend keeps the placement it had. A `503` that follows a write
-the store did take despite the error can leave the row; read the node to see where it stands.
-The same holds for the updater's own-node `:drain` and `:uncordon` below, which a host's
-updater takes as a failed call, not as "no such node".
-
-A cordon names the node, not its stream: a node that reconnects (say, after a reboot)
-is still cordoned. Work that only cordoned nodes could run waits, and its callers are
-told so (`every live worker that can run it is cordoned: <nodes>`). It is **not**
-refused for it, however long the cordon lasts: a cordon is temporary by intent, and
-refusing would fail builds. An uncordon places it at once. The scheduler's unservable
-wait (`--unservable-wait-secs`) still refuses work that no connected node, cordoned
-or not, could run, and the time spent waiting for a cordon does not count toward it.
-A server restart forgets every cordon, as it forgets the rest of the scheduler's
-state, and every start logs a warning that says so. The protocol has no drain
-message yet: the worker is not told, and the server simply sends it no new `Start`.
 
 ## `POST /v1/members/{id}`
 
@@ -518,8 +364,7 @@ line that says only the node was judged. A Linux node that cannot be told from o
 member answers `409` with `{"error": ...}` saying why, never safe: the enrollment registry
 does not know it or cannot be read, or its address is no member's or two members'. A
 number is a member's number first, then a node id. `404` with `{"error": ...}` for an
-`{id}` that is neither a member nor a node that has registered with this server
-(`GET /v1/nodes`). `503` when the state store cannot be read, `500` when a stored row does
+`{id}` that is neither a member nor a node of the enrollment registry. `503` when the state store cannot be read, `500` when a stored row does
 not decode; `401`, `403` or `415` from the gates.
 
 The answer is about the members as the server sees them now: a heartbeat is up to a time
@@ -608,25 +453,19 @@ are the frontend's, so a denied storage node can still register and beat through
 that predates them. A frontend that predates the list copies it forward in the map
 unchanged.
 
-## `GET /v1/leases` and `GET /v1/queue`
-
-The leases the scheduler holds and the operations waiting for one: open reads, in memory,
-unredacted. Written up in [api-scheduler.md](api-scheduler.md).
-
 ## `GET /v1/frontend/drain` and `POST /v1/frontend/drain`
 
-Draining the frontend itself, for a rollout that restarts it (the nodes are drained
-with `:drain` above). Buck2 does not recover an Execute stream that breaks after it
+Draining the frontend itself, for a rollout that restarts it. Buck2 does not recover an Execute stream that breaks after it
 started, so a restart that cuts a stream fails its action: the frontend is drained, and
 restarted when it has no stream left. The drain works behind any load balancer (Envoy,
 HAProxy, a Kubernetes Service) with nothing of kbf in front: it is a sequence that the
 load balancer's own health check follows, and `POST` and SIGTERM (a container's stop, a
 pod's deletion) begin the same one.
 
-**`GET /v1/frontend/drain`**: a read, open like `GET /v1/nodes`:
+**`GET /v1/frontend/drain`**: a read, open like `GET /v1/health`:
 
 ```json
-{ "draining": false, "phase": "serving", "open_executions": 3, "queued_operations": 1 }
+{ "draining": false, "phase": "serving", "open_executions": 3, "queued_operations": 0 }
 ```
 
 Once a configured `--drain-deadline` has passed with executions open, the answer also holds
@@ -642,13 +481,11 @@ Once a configured `--drain-deadline` has passed with executions open, the answer
 - `open_executions`: Execute and WaitExecution operation streams open now
   (`kbf_front_open_executions`: a stream counts from the moment it is made, before its
   first operation is read, until it ends or its client leaves).
-- `queued_operations`: operations in the scheduler's queue, with no lease yet. With
-  `open_executions` it tells idle (both 0) from busy, and a stream that waits for a
-  worker (`open_executions` above 0, `queued_operations` above 0, no lease running)
-  from one that runs. Once a drain has begun, the streams of operations that were never
-  started and that no worker can run are ended `UNAVAILABLE`, so `queued_operations` can
-  stay above 0 with fewer streams open. `kbf_front_executes_started_total` (see the metrics below) tells a
-  client that has just come from one that is still there.
+- `queued_operations`: always 0. The frontend queues no operation of its own: an Execute is a
+  job of the job service from its first moment, and a job that waits for a host waits there.
+  The field stays so that a reader of an earlier release's document finds it.
+  `kbf_front_executes_started_total` (see the metrics below) tells a client that has just come
+  from one that is still there.
 
 **`POST /v1/frontend/drain`**: begins the drain, a write that passes every gate of
 [Who may write](#who-may-write) and takes no body (or `{}`), and answers the same status
@@ -666,11 +503,8 @@ over a state store (`kbf frontend` requires one):
    take to change (for a Kubernetes pod, the readiness probe's period times its failure
    threshold, plus the endpoints' propagation). Unary calls carry no client retry, which is
    why they are served here.
-3. **Refuse, stop taking work, GOAWAY.** New Execute calls are refused `UNAVAILABLE`, which
-   Buck2 retries when it opens a call. The frontend stops taking queued work from the
-   state store and stops placing work on its nodes (they read `cordoned` in `GET /v1/nodes`
-   of this frontend; nothing is written to the store), so the other frontends take what it
-   holds queued; what a node of this frontend is running goes on. The REAPI listener, the
+3. **Refuse, GOAWAY.** New Execute calls are refused `UNAVAILABLE`, which
+   Buck2 retries when it opens a call. The REAPI listener, the
    worker listener and the operator API are sent HTTP/2 GOAWAY, so a load balancer
    drains their connections: calls in flight on a connection finish and new ones open
    elsewhere. The REAPI and worker listeners stop accepting; this API goes on answering, so
@@ -680,29 +514,14 @@ over a state store (`kbf frontend` requires one):
    time has passed. `--drain-deadline` (seconds, at least 1, no upper bound, absent by
    default) only reports: when it passes with executions open, the frontend logs a WARN
    with the count, sets `deadline_passed` in `GET /v1/frontend/drain`, and goes on waiting,
-   serving the open streams, with the farm not stood down and the process up, whether a
+   serving the open streams, with the process up, whether a
    signal or the endpoint began the drain. Buck2 retries only the opening of an Execute
    call, not a stream that breaks after it, so an ended stream fails that Buck2 action:
-   the frontend ends none except one whose operation can never start. That is an operation that has never been started
-   and that no live worker can run: no worker on this frontend, and no other frontend to
-   take it (`WAITING`: there is no worker that could run it, or at least one that could is
-   cordoned by an operator, or not serving, and no worker connected to another frontend
-   of the state store could run it; the stream says so in its metadata). Its stream ends
-   `UNAVAILABLE` at the end of the load balancer wait, when step 3 begins, naming why. The
-   action could never run, so this costs nothing and frees the stop. An
-   operation that is only queued (a worker can take it), and one that waits only for the
-   nodes this drain cordoned in step 3, and one that a worker of another frontend could
-   run (the other frontends take it), keep their streams,
-   as does any operation that ever had a lease, even one queued again after a lost lease:
-   they stay until the operation is done. Ending a stream does not cancel
-   the operation: it stays queued for the other frontends. An execution running on a node
-   of this frontend finishes here: the node's result is taken and the caller is answered.
-   An execution another frontend took is answered from the result it records in the state
-   store.
-5. **Close and exit.** The frontend stands down as a retire does (below): the farm is
-   fenced, and the worker streams that are left end `UNAVAILABLE`, so each storage node dials
-   another frontend through the load balancer, which keeps its leases (the state store's
-   owner rows are authoritative). No Execute or WaitExecution stream is open by now unless a
+   the frontend ends none, whether its job has started or waits for a host in the job service
+   (the stream of a queued execution stays open until its job has run). An execution another
+   frontend took up is answered from the result it records in the state store.
+5. **Close and exit.** The frontend stands down as a retire does (below): the worker listener
+   stops, so each storage node dials another frontend through the load balancer. No Execute or WaitExecution stream is open by now unless a
    second signal or `--shutdown-timeout-secs` forced the stop; the ones that are end
    `UNAVAILABLE` (an action that was still running fails, as Buck2 does not recover a
    stream). Phase `closing`, a few seconds long, and the process exits 0. For a worker
@@ -716,9 +535,7 @@ SIGTERM or SIGINT skips the waits of steps 2 and 4 and goes on to step 5, and
 same when it runs out. These two are the operator's hard stops and the only ways a drain
 ends open streams. A drain the endpoint began is bounded the same way once a stop signal
 arrives. A server with no state store (`kbf-server`; a frontend started by a test) drains at once instead: `/readyz` `503`, new Execute calls refused, the REAPI
-listener sent GOAWAY, the open streams kept until their action is done except the
-streams of operations that can never start (there is no other frontend), which end
-`UNAVAILABLE` when the drain begins (as in step 4),
+listener sent GOAWAY, the open streams kept until their action is done,
 and the server exits when the REAPI connections have closed, bounded by
 `--shutdown-timeout-secs` (it has no `--drain-deadline`).
 
@@ -730,34 +547,31 @@ a container, `stop_grace_period` (Docker) or `terminationGracePeriodSeconds`
 sleep, since the wait is the frontend's own. See
 [kbf-units.md](deploy/kbf-units.md#draining-a-frontend-behind-a-load-balancer).
 
-`kbf cluster` (on the frontend's host) calls this API: `kbf cluster status [--frontend]`,
-`kbf cluster drain <node> [--deadline-secs N] --token-file F`, `kbf cluster drain
---frontend --token-file F` and `kbf cluster undrain <node> --token-file F` (the API's
-`:uncordon`). It prints the answer's JSON, exits 0 on a 2xx and 1 otherwise, and takes
-`--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
-restart it. `kbf cluster member <id> --state active|draining|planned-down [--for-secs N] --token-file F` calls
+`kbf cluster` (on the frontend's host) calls this API: `kbf cluster status` (`--frontend`
+is accepted and means the same) and `kbf cluster drain --frontend --token-file F`. It prints
+the answer's JSON, exits 0 on a 2xx and 1 otherwise, and takes `--api` for the listener
+(default `127.0.0.1:8982`). A frontend drain has no undrain: restart it. `kbf cluster member <id> --state active|draining|planned-down [--for-secs N] --token-file F` calls
 `POST /v1/members/{id}`, and `kbf cluster denied --token-file F` calls `GET /v1/denied`.
 `kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
-`kbf cluster epoch-bump --token-file F` calls `POST /v1/epoch/bump`.
 
 ## `GET /v1/frontend/retire` and `POST /v1/frontend/retire`
 
 Taking one frontend out of service while other frontends share its state store, for a
 rollout that restarts it. A drain (above) serves on while the load balancer sees it go,
-waits for the open executions and then exits, the worker streams and the queue moving to the
-others at its end (its last step is a retire's); a retire moves them at once and keeps the
-process answering the callers it holds, which is what an updater uses.
+waits for the open executions and then exits (its last step is a retire's); a retire stops
+the frontend taking work at once and keeps the process answering the callers it holds, which is
+what an updater uses.
 
 **`GET /v1/frontend/retire`**: a read, open like `GET /v1/frontend/drain`:
 
 ```json
-{ "retired": false, "open_streams": 3, "open_sessions": 2 }
+{ "retired": false, "open_streams": 3, "open_sessions": 0 }
 ```
 
 - `retired`: the retire has completed. It is not undone.
 - `open_streams`: Execute and WaitExecution operation streams open now, the callers this
   frontend still answers (`kbf_front_open_executions`).
-- `open_sessions`: the worker sessions the frontend holds.
+- `open_sessions`: always 0: kbf holds no worker sessions. The field stays so that a reader of an earlier release's document finds it.
 
 **`POST /v1/frontend/retire`**: begins the retire, a write that passes every gate of
 [Who may write](#who-may-write) and takes no body (or `{}`). It answers the same status
@@ -765,44 +579,15 @@ once the retire has completed, with `retired` true. Calling it again changes not
 answers the same status. The retire:
 
 - refuses every new Execute `UNAVAILABLE`, which Buck2 retries when it opens a call;
-- waits, for at most ten seconds, for the calls between their request and their queueing,
-  then stops taking work: the frontend reads no more of the state store's queue, grants nothing,
-  claims nothing and writes the requeues the store had refused (for at most the same
-  time again);
-- stops the worker listener and ends every worker stream `UNAVAILABLE`, so each storage node
-  dials another frontend;
+- stops the worker listener, so each storage node dials another frontend;
 - turns `/readyz` to `503` (`stopping`) and the health service to `NOT_SERVING`;
-- keeps every open Execute and WaitExecution stream, and answers it from the result another
-  frontend records in the state store, for as long as the process lives.
+- keeps every open Execute and WaitExecution stream, for as long as the process lives: its
+  operations go on until they are answered, and one still open when the process ends is taken up
+  by another frontend of the state store, which reads its job back from the job service.
 
 The REAPI listener is not sent GOAWAY and the process does not exit: the operator restarts
 the unit once `open_streams` is 0. A server that is not a frontend over a state store
 answers both routes `409` (`this server is not a frontend over a state store`).
-
-## `POST /v1/epoch/bump`
-
-Raises the epoch the state store holds by one, for the day the store was restored from a
-backup and the workers must drop the leases the lost history granted (the steps are in
-[kbf-units.md](deploy/kbf-units.md#the-state-store-postgres-for-the-frontend)). A write that
-passes every gate of [Who may write](#who-may-write) and takes no body (or `{}`). The epoch
-is the one `Welcome` names: a worker that sees an epoch other than the one it knew kills the
-runs of its leases and lists none. A frontend that starts keeps the stored epoch, so a start
-no longer changes it; this call is the one way it changes.
-
-```json
-{ "previous": 41, "epoch": 42, "serving": 41 }
-```
-
-- `previous`: the epoch the store held before the call.
-- `epoch`: the epoch it holds now. The next frontend that starts serves it.
-- `serving`: the epoch the frontend that answered serves, the one it started under. The
-  call does not change it: restart the frontend for the new epoch to apply.
-
-`404` from a server with no `--state-store`, which keeps no epoch; `503` when the store
-cannot be reached or other writers kept changing the epoch for the whole of the call's tries
-(it changed nothing; call again); `409` when the store refuses the write as fenced
-(`Fenced`; no current store returns it, so a live store does not answer it; it changed
-nothing).
 
 ## `/v1/enroll/tokens` and `/v1/enroll/nodes`
 
@@ -814,7 +599,7 @@ answers every one of these routes with `404` once the call passes the gates.
 **Every route here, a GET included, passes every gate of [Who may write](#who-may-write):**
 a loopback peer (one that presents the proxy's secret, with `--proxy-auth-file`), no `Origin` header, the bearer token, and `Content-Type: application/json`
 (send it on a GET and a DELETE too, with no body). The list of tokens and nodes is the farm's
-door, so unlike `GET /v1/nodes` it is not open to whoever reaches the address. A refused
+door, so unlike `GET /v1/storage` it is not open to whoever reaches the address. A refused
 call changes nothing. Every answer carries `Cache-Control: no-store`.
 
 | Route | Does | Answer |
@@ -1103,7 +888,7 @@ nothing: a unit that still passes it starts as before.
 ## `GET /v1/storage`
 
 Whether every blob is known to have its copies elsewhere: the number a rollout asks
-before it takes a storage node down. A read, open like `GET /v1/nodes`, served by a
+before it takes a storage node down. A read, open like `GET /v1/health`, served by a
 frontend with a state store (without one there are no storage members, and the route is
 `404`). The definition, which is also the help text of the metric below:
 
@@ -1384,7 +1169,7 @@ The key is never logged, never in a state row and never in an answer.
 ## `GET /healthz` and `GET /readyz`
 
 For the health check of a front or proxy (a TLS-terminating ingress, Envoy) in front
-of the REAPI listener. Both are reads, open like `GET /v1/nodes`, and are served only
+of the REAPI listener. Both are reads, open like `GET /v1/health`, and are served only
 when `--api-listen` is given. The routes are served by the same task as the REAPI
 and worker listeners, which are bound before it starts and stop when it ends, so any
 answer means both are bound.
@@ -1407,12 +1192,12 @@ otherwise; the body lists each failing check and why:
 
 | Check | Fails when |
 |---|---|
-| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them (`--drain-deadline`, on a frontend over a state store, only reports); the one exception is a stream whose operation was never started, that no worker on this frontend can run and that no other frontend can take, which ends `UNAVAILABLE` when the drain begins |
-| `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
+| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them (`--drain-deadline`, on a frontend over a state store, only reports); no stream is ended because its job has not started |
+| `leader` | the server does not hold its roles. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
 | `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. A frontend has no such check: its probes are `storage`, `state_store` and `map` (above). The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
 | `deny_rows` | only where the worker listener checks callers against the state store's deny rows (worker mTLS or `--proxy-auth-file`, with `--state-store`): the listener's copy of the rows cannot be used, because no read has found them since the start or the newest is older than three sweeps (`DENY_SNAPSHOT_SWEEPS` beats), so the listener refuses every call `UNAVAILABLE` ("When the rows cannot be read", in the enrollment section above). It reads no store |
 
-`version` and `commit` are those of `GET /v1/nodes`' `server` field.
+`version` and `commit` are the server's build, as `GET /healthz` says.
 
 A frontend answers `/readyz` from the last answers of its probes (`storage`, `state_store`,
 `map`, `executor`, `deny_rows`), without waiting for any of them. Each probe is asked again in
@@ -1428,40 +1213,30 @@ not probes: they are read at each request and change the answer at once. `kbf-se
 
 **`GET /readyz/reapi`**: the readiness a load balancer asks for the REAPI cluster. It is
 `/readyz` with one more check, and has the same body, status codes and (no) token. A
-frontend that answers `/readyz` with `200` but has no worker connected answers `503`:
+server that runs no executor (no `--executor js-agent`) answers an Execute only from the
+action cache, and answers `503`:
 
 ```json
 { "ready": false, "version": "0.1.0+0123456789ab", "commit": "0123456789ab",
-  "failing": [ { "check": "no_worker", "reason": "no worker is connected to this server" } ] }
+  "failing": [ { "check": "no_executor", "reason": "this server runs no executor (--executor js-agent)" } ] }
 ```
 
 | Check | Fails when |
 |---|---|
-| `no_worker` | no worker has an open stream to this server, as `connected` in `GET /v1/nodes` (a node of any platform and any placement counts; a node whose stream has closed does not). Listed after the checks of `/readyz`, which this route also runs |
+| `no_executor` | the server runs no executor, so an Execute the action cache does not answer is refused `FAILED_PRECONDITION`. Listed after the checks of `/readyz`, which this route also runs |
 
-Why it is a route of its own: an operation that none of a frontend's own workers can run
-waits on that frontend, and another frontend takes it only once this one stands down. After
-a frontend restarts, its workers may all be on the other frontend, and it would take Execute
-calls it cannot place for as long as it is up. `/readyz` itself cannot fail for this, because
-workers reach a frontend through the worker listener, which a load balancer routes by
-`/readyz` too: a frontend with no worker would never get its first. So the REAPI cluster asks
-`/readyz/reapi`, and the worker and enrollment clusters ask `/readyz`. The route does not
-look at platforms: a frontend whose workers are all Linux is in the REAPI rotation, and an
-action that needs another platform still waits there.
+Whether the job service answers is a probe of `/readyz` itself (`executor`, above) on a
+frontend that has one, so `/readyz/reapi` adds nothing for it.
 
 ## `GET /v1/health`
 
-The one-screen answer to "is the farm healthy": the values other routes report, composed
-so a reader does not add them up. A read, open like `GET /v1/nodes`; it names no secret.
+The one-screen answer to "is the server healthy": the values other routes report, composed
+so a reader does not add them up. A read, open like `GET /v1/storage`; it names no secret.
 It answers `200` whether or not the server is ready (`/readyz` stays the probe), and
 says which in `ready`.
 
 ```json
 { "ready": true, "failing": [],
-  "nodes": { "total": 5, "serving": 2, "cordoned": 1, "draining": 1, "drained": 0,
-             "quarantined": 0, "disconnected": 1 },
-  "queue": { "depth": 3, "oldest_age_ms": 41200 },
-  "leases": 7,
   "storage": { "members_active": 3, "members_total": 3, "under_replicated_blobs": 0 },
   "started_unix_ms": 1792584000000, "uptime_ms": 86400000 }
 ```
@@ -1469,15 +1244,12 @@ says which in `ready`.
 | Field | Same value as |
 |---|---|
 | `ready`, `failing` | `GET /readyz`: the same evaluation, `failing` as `[{"check", "reason"}]` |
-| `nodes` | the list of `GET /v1/nodes`, each node counted once, in the first of these that holds: `disconnected` (`connected` is false), `quarantined` (`phase.state`), then `placement.state`: `cordoned`, `draining` (a drain running, or paused at its deadline), `drained`, or `serving`. `total` is the number of nodes listed and the sum of the six |
-| `queue.depth`, `queue.oldest_age_ms` | `depth` and `oldest_age_ms` of `GET /v1/queue`, both read from one scheduler snapshot (`depth` is also `queued_operations` of `GET /v1/frontend/drain`). `oldest_age_ms` is how long the longest-waiting operation has waited, in milliseconds, and `null` only when nothing waits |
-| `leases` | the sum of `lease_count` of `GET /v1/nodes` |
 | `storage` | `members_active`, `members_total` and `under_replicated_blobs` of `GET /v1/storage` (`null` while unknown, never zero); `storage` is `null` when this server keeps no storage members, and when the membership cannot be read, with `storage_unavailable` saying why |
-| `started_unix_ms`, `uptime_ms` | when the server started, as milliseconds since the Unix epoch on its wall clock, and the milliseconds since then by its monotonic clock (so a clock step does not change `uptime_ms`). A retire and restart of the frontend starts a new process, and with it a new `started_unix_ms`: it is when the in-memory state below began to fill |
+| `started_unix_ms`, `uptime_ms` | when the server started, as milliseconds since the Unix epoch on its wall clock, and the milliseconds since then by its monotonic clock (so a clock step does not change `uptime_ms`). A retire and restart of the frontend starts a new process, and with it a new `started_unix_ms` |
 
-In memory like `GET /v1/nodes`: after a restart or a retire and restart of the frontend `nodes`, `queue` and
-`leases` count only what has reconnected since. The update state and the history store's
-counters are not in this answer.
+The fields `nodes`, `queue` and `leases` of earlier releases are gone with the farm scheduler: the
+jobs, their queue and their hosts are the job service's. The update state and the history
+store's counters are not in this answer.
 
 ## `grpc.health.v1` on the REAPI listener
 
@@ -1500,7 +1272,7 @@ whole), `build.bazel.remote.execution.v2.Capabilities`,
 |---|---|
 | `Check` | the status, from the same answers as `/readyz` (a frontend: the last answers of its probes; `kbf-server`: after one store probe). Another service name is `NOT_FOUND` |
 | `List` | every name above with the status, as `Check` |
-| `Watch` | the status at once, then each time it changes. It evaluates again as soon as a stop signal arrives or the scheduler role changes, and evaluates the checks every 5 s (a frontend reads the last answers of its probes; `kbf-server` probes the store). Once the server is stopping it sends `NOT_SERVING` (if that was not its last message) and ends the stream `UNAVAILABLE`, so an open Watch does not hold up the drain. Another service name is sent `SERVICE_UNKNOWN`, and the stream stays open until the server stops |
+| `Watch` | the status at once, then each time it changes. It evaluates again as soon as a stop signal arrives or the server's roles change (the `leader` flag), and evaluates the checks every 5 s (a frontend reads the last answers of its probes; `kbf-server` probes the store). Once the server is stopping it sends `NOT_SERVING` (if that was not its last message) and ends the stream `UNAVAILABLE`, so an open Watch does not hold up the drain. Another service name is sent `SERVICE_UNKNOWN`, and the stream stays open until the server stops |
 
 On SIGTERM or SIGINT the status turns `NOT_SERVING` before the REAPI streams are
 ended and the listener stops accepting. After that the listener takes no new calls,
@@ -1520,7 +1292,7 @@ to serve reads and leader; which service name reports which is not chosen
 
 The cache's upload path in the Prometheus text exposition format (version 0.0.4,
 `Content-Type: text/plain; version=0.0.4; charset=utf-8`): what the CAS services did,
-and how long each stage of a store took. A read, open like `GET /v1/nodes`; it names
+and how long each stage of a store took. A read, open like `GET /v1/health`; it names
 no blob, build or node. Every listener that serves the cache counts into the same
 families: the REAPI listener (clients) and the worker listener (storage nodes' calls). The counts are in memory and start at 0 with the
 process.
@@ -1545,9 +1317,7 @@ caller goes away before the answer counts as an error.
 | `kbf_find_missing_requests_total`, `_errors_total`, `_in_flight`, `_seconds` | as above | FindMissingBlobs calls; `kbf_find_missing_digests_total` the digests asked about, `kbf_find_missing_missing_total` those answered missing |
 | `kbf_execute_requests_total` | counter | Execute calls ended |
 | `kbf_execute_errors_total{cause}` | counter | Execute calls that ended in an error status or were dropped before the done operation (an operation that finished with a failed `ExecuteResponse` is not one), by `cause`: `status` (a gRPC error status), `client_abort` (the client reset the stream and its connection stayed), `dropped` (the stream was dropped and the client did not say so: a lost connection, or no connection to ask). All three are always exposed; the harness gate `execute_errors` reads their sum |
-| `kbf_execute_failed_actions_total{class}` | counter | operations this frontend finished as failed, by the failure class of `docs/design/failure-classes.md` (section 1), counted once when the farm settles the operation (not per caller, not per rerun), by what its callers are told: `action` (the action exited non-zero, timed out, or was killed at the largest node's memory), `request` (the action cannot run as written: INVALID_ARGUMENT), `farm` (the farm could not run it: a farm fault past its reruns, an input blob lost since the front checked it, an operation no live worker could run), `ambiguous` (never a final answer, so it stays 0 until a path ends an operation with it). All four series are written from the start of a farm, so an absent series means the metric is gone. Only a frontend with a farm writes it |
-| `kbf_farm_lost_races_total` | counter | writes to the state store refused as stale because another frontend took the same operation first. This is how a race between two frontends ends by design: the store keeps the winner's write, the operation runs once under it, and this frontend undoes its placement and follows the store (one WARN line names the operation). Not a loss of data and not counted in `kbf_farm_dropped_writes_total`. Written from the start of a farm, at 0. Only a frontend with a farm writes it |
-| `kbf_farm_dropped_writes_total` | counter | writes to the state store the frontend gave up on for good, each logged at ERROR: held effects dropped because a newer writer fenced the store, writes for a node another frontend owns now, writes that cannot be encoded, and records over the held cap. Any other store failure (unavailable, timeout) is retried and is not counted here. Written from the start of a farm. Alert on any rise. Only a frontend with a farm writes it |
+| `kbf_execute_failed_actions_total{class}` | counter | operations this frontend finished as failed, by the failure class of `docs/design/failure-classes.md` (section 1), counted once when the executor settles the operation (not per caller, not per attempt), by what its callers are told: `action` (the action exited non-zero, timed out, or was killed at the largest node's memory), `request` (the action cannot run as written: INVALID_ARGUMENT), `farm` (the executor could not run it: an infrastructure ending past its attempts, an input blob lost since the front checked it), `ambiguous` (never a final answer, so it stays 0 until a path ends an operation with it). All four series are written from the start of an executor, so an absent series means the metric is gone. Only a frontend with an executor writes it |
 | `kbf_execute_in_flight` | gauge | Execute and WaitExecution streams open |
 | `kbf_under_replicated_blobs` | gauge | the sum over all registered storage members of the blobs each owes a second copy, exported **only while it is known** (every registered member `ACTIVE` and reporting within the window); absent otherwise, never 0. Frontends with a state store. [`GET /v1/storage`](#get-v1storage) says why it is unknown |
 | `kbf_member_repair_debts{member}`, `kbf_member_open_writes{member}` | gauge | per storage member, the copies it owes and the writes it has open now, one sample per member, **only for a value that is known** (fresh report, and the node says it counts); a member with no sample is unknown, never 0. Frontends with a state store. [`GET /v1/storage`](#get-v1storage) lists the same per node |
@@ -1557,10 +1327,10 @@ caller goes away before the answer counts as an error.
 | `kbf_member_boot{member}` | gauge | per storage member, the boot counter of its current registration: larger at every restart, unchanged by heartbeats. The restart gate reads its growth over the scrapes. Frontends with a state store |
 | `kbf_front_open_executions` | gauge | Execute and WaitExecution operation streams alive: raised when the stream is made (before its first item is read), lowered when it ends or its caller drops it. A call still being authorized or prepared, and one answered from the action cache, is not in it. `GET /v1/frontend/drain` reports it |
 | `kbf_front_executes_started_total` | counter | Execute calls the front took (not refused because it is draining), cache hits included |
-| `kbf_execute_queued` | gauge | Execute streams the scheduler accepted whose operation has not left `QUEUED` |
-| `kbf_execute_prepare_seconds` | histogram | an Execute from its arrival to the call of the scheduler: authorization, action cache lookup, reading the action and its inputs, the held-inputs check, the booking; observed only for an Execute that reaches the scheduler |
-| `kbf_execute_dispatch_seconds` | histogram | the scheduler's submit call, from the call to its return |
-| `kbf_execute_queued_seconds` | histogram | from the scheduler's acceptance to the stream's first update that is not `QUEUED` |
+| `kbf_execute_queued` | gauge | Execute streams the executor accepted whose job is submitted and not yet read back running (`QUEUED`) |
+| `kbf_execute_prepare_seconds` | histogram | an Execute from its arrival to the call of the executor: authorization, action cache lookup, reading the action and its inputs, the held-inputs check; observed only for an Execute that reaches the executor |
+| `kbf_execute_dispatch_seconds` | histogram | the executor's submit call, from the call to its return |
+| `kbf_execute_queued_seconds` | histogram | from the executor's acceptance to the stream's first update that is not `QUEUED` |
 | `kbf_execute_total_seconds` | histogram | an Execute from its arrival to its last response, its error or the departure of its caller; cache hits included |
 | `kbf_store_blobs_seconds` | histogram | one store of verified blobs (a Write's, or a batch's): the query for blobs already held, their touch, and the wait until every segment holding its blobs is written: the linger, the wait for a PUT slot, each PUT attempt with the backoff between attempts, the footer read, and the commit with any wait behind commits queued ahead of it |
 | `kbf_segment_put_seconds` | histogram | one PUT attempt of a segment's object; a PUT tried again is observed once per attempt |
@@ -1577,19 +1347,14 @@ caller goes away before the answer counts as an error.
 | `kbf_pack_store_requests_total{op}`, `kbf_pack_store_errors_total{op}`, `kbf_pack_store_bytes_total{dir}`, `kbf_pack_store_request_seconds{op}` | counter, counter, counter, histogram | the same four families for the object store the frontend's packs are written to and read from; present on a frontend that has packs |
 | `kbf_meta_commit_seconds{command}` | histogram | every metadata-log commit the cache makes, by command (`put_blobs`, `touch`, `put_action`, `object_unreachable`, `tick`, `collect`, ...): with the Raft metadata log, the Raft log's commit latency |
 | `kbf_meta_query_seconds` | histogram | every metadata-log query the cache makes |
-| `kbf_execute_presubmit_seconds` | histogram | an Execute from the handler's start to its first stream item (the first `QUEUED` operation cannot be sent sooner): authorization, the action-cache lookup, the action and command reads, the input-tree walk and the scheduler's submit. Failed and abandoned calls are observed too |
-| `kbf_execute_presubmit_in_flight` | gauge | Executes inside that window now: during a stall with idle slots, this is the number of requests the scheduler has not seen |
+| `kbf_execute_presubmit_seconds` | histogram | an Execute from the handler's start to its first stream item (the first `QUEUED` operation cannot be sent sooner): authorization, the action-cache lookup, the action and command reads, the input-tree walk and the executor's submit. Failed and abandoned calls are observed too |
+| `kbf_execute_presubmit_in_flight` | gauge | Executes inside that window now: during a stall, this is the number of requests the executor has not seen |
 | `kbf_execute_walk_seconds`, `kbf_execute_dir_reads_total` | histogram, counter | the input-tree check of one Execute, whole (directories read concurrently or taken from memory, subtrees skipped, presence checks, any wait for a check another request is running), and the Directory blobs read from the store, counted as each read starts |
 | `kbf_execute_walk_dir_read_seconds` | histogram | one Directory read from the store by an Execute's input-tree check over a store (the farm's frontends): the store's latency per read, failed reads included; Directories taken from the content cache and reads shared with another check are not observed. |
 | `kbf_execute_dir_cache_hits_total`, `kbf_execute_dir_cache_misses_total`, `kbf_execute_dir_cache_merged_total` | counters | the content cache of decoded Directories behind those checks (128 MiB, least recently used out first, shared by every Execute; content is addressed by digest so it never goes stale). Hits: Directories a check took without reading, from the cache or from a read another check had open. Misses: reads a check led. Merged: of the hits, those another check's read supplied. A cached Directory is never taken for held: its digest goes to FindMissing with the check's files (`kbf_execute_dir_cache_present_checked_total` counts them), and one the store reports missing is an absent input, as for a Directory that cannot be read |
 | `kbf_execute_dir_cache_present_checked_total` | counter | cached Directories whose digests a check put to FindMissing to confirm the store still holds them (each costs a digest in a call the files already make, not a read) |
 | `kbf_execute_dir_cache_evictions_total`, `kbf_execute_dir_cache_bytes` | counter, gauge | decoded Directories pushed out of the content cache to stay within its byte bound, and the bytes it held at the end of the last check (about 1 MB for a 1000-Directory, 15k-file tree). Evictions climbing with the same trees walked again means the bound is too small for the working set |
-| `kbf_scheduler_core{core}` | gauge | the scheduler core the server runs (`--scheduler-core`): one series, `kbf_scheduler_core{core="legacy"} 1`. `legacy` is the only core; `--scheduler-core js` is refused at start (exit status 2) |
-| `kbf_usage_profiles_mode{mode}` | gauge | the `--usage-profiles` mode the server runs: one series per mode (`off`, `record`, `on`), 1 for the one running and 0 for the others. Only `off` can run: `record` and `on` are refused at start (exit status 2), because the js scheduler core that ran them was removed. `off` is the default and learns nothing |
-| `kbf_execute_submit_seconds`, `kbf_sched_lock_wait_seconds` | histogram | the scheduler's submit called from an Execute, and the part of it spent waiting for the scheduler's lock |
-| `kbf_sched_queued`, `kbf_sched_leases` | gauge | operations waiting for a lease, and leases granted or running on all nodes, as of the last submit or scheduler tick (at most a tick old) |
-| `kbf_sched_whole_held`, `kbf_sched_whole_marks`, `kbf_sched_whole_draining`, `kbf_sched_whole_ceiling` | gauge | workers held by a whole-machine lease, held by a queued whole-machine request while they drain, marked workers that still have leases, and the most workers that may be whole now. Printed only with `--whole-node-max`, as of the last submit or scheduler tick |
-| `kbf_sched_whole_waiting{reason}` | gauge | queued whole-machine requests by why each waits (`early`, `holding`, `barred`, `cap_ceiling`, `cap_keep_for_ordinary`, `cap_max_draining`, `cap_per_consumer`, `last_capable`, `queued`, `unservable`), every reason always printed, 0 when none. Printed only with `--whole-node-max` |
+| `kbf_execute_submit_seconds` | histogram | the dispatcher's submit called from an Execute |
 | `kbf_prediction_made_total` | counter | new operations the estimator gave a prediction (`--placement-predictions shadow` or `on`): the learned cores, memory and life of the operation's key |
 | `kbf_prediction_unset_total{reason}` | counter | new operations that got none, by why: the estimator's fallbacks (`missing`, `stale`, `cold`, `corrupt`, `over_cap`) and what the farm does not ask it about (`kind`, `no_os`, `no_subject`); such an operation is charged as it is with `--placement-predictions off` |
 | `kbf_prediction_vs_run_total{axis,bucket}` | counter | with `shadow`: finished runs compared with the prediction made for their operation, once per operation, for a run that succeeded and ran a second or more. `axis` is `cpu` (the cores the run used on average), `mem` (its peak memory) or `life` (its life in whole minutes); `bucket` is `under` (the run used more than predicted), `fit` (at most the prediction and at least half of it) or `over` (less than half of it) |
@@ -1663,19 +1428,19 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_ingest_put_dirs_total` | counter | of `kbf_pack_ingests_total`, the runs a task committed into a put directory, ingested from pack 0's footer and manifest and the other packs' footers |
 | `kbf_pack_put_dir_records_total` | counter | packs of a put directory recorded in the pack index from their footer, no record read; the first location recorded for a digest is kept |
 | `kbf_pack_ingest_rejects_total` | counter | packs `ingest` refused, labelled `reason`: `missing` (no object under the key of pack 0), `wrong_key` (a key was not minted for this lease and action or is not in the place its slot names, the manifest is for another lease or action, or a key was recorded with another pack), `too_large` (the pack, its record count, a record or the manifest record is over its cap), `malformed` (a damaged footer or trailer, records out of order, overlapping, with a gap, one of no bytes, or a digest in two places), `hash_mismatch` (a record is not its digest, or a large object is not the blob its digest names: another length, or bytes that do not hash to it), `bad_manifest` (the record at offset 0 is not a valid manifest, it names more packs or other large slots than the keys issued, or an output tree is not a `Tree`) or `incomplete` (a pack beyond the first or a large object is not in the store, or a digest the manifest or a tree names is in no pack and no large object) |
-| `kbf_pack_ingest_unavailable_total` | counter | ingests the object store, the pack index or the action cache could not answer; the pack is not judged and the lease is run again |
+| `kbf_pack_ingest_unavailable_total` | counter | ingests the object store, the pack index or the action cache could not answer; the pack is not judged and the action is run again |
 | `kbf_pack_ingest_packs_total` | counter | packs of the runs `ingest` turned into an action result (a run of one pack counts 1): divided by `kbf_pack_ingests_total`, the packs per run |
 | `kbf_pack_ingest_large_bytes_total` | counter | bytes of large objects (raw objects over the record cap that a task wrote under `L<i>` keys) that `ingest` streamed into the CAS, for the runs it turned into an action result |
 | `kbf_pack_ingest_large_writethrough_total` | counter | large objects that `ingest` also put to `cas/l/<sha256 hex>` in the pack object store, labelled `result`: `ok`; `exists` (the key was already held at the digest's length, so nothing was uploaded, or the store refused a second write of it: the key names the bytes); `failed` (the store failed the write, or holds an object of another length under the key, which is not trusted or replaced); `aborted` (the ingest gave the write up before its end: the CAS write stopped, the bytes were not the blob, a retry started the pass over, or the store did not take a window in 30 s; nothing is kept under the key). Best effort: no result fails the ingest |
-| `kbf_executor_runs_total` | counter | runs the executor ended, labelled `outcome` by what the farm was told: `ran` (the frontend rebuilt the action's result), `infra` (an ending the farm runs again), `timeout` (the action's own), `out_of_memory`, `lost` (the host or the job service) or `invalid` (an action that cannot run here) (only with `--executor js-agent`; the `kbf_executor_*` families are absent otherwise) |
+| `kbf_executor_runs_total` | counter | runs the executor ended, labelled `outcome`: `ran` (the frontend rebuilt the action's result), `infra` (an ending the executor runs again as the next attempt), `timeout` (the action's own), `out_of_memory`, `lost` (the host or the job service) or `invalid` (an action that cannot run here) (only with `--executor js-agent`; the `kbf_executor_*` families are absent otherwise) |
 | `kbf_executor_ingests_total` | counter | what the ingest of a task's pack came to, labelled `result`: `ok`, `unavailable`, `stopped` (the ingest panicked or was cancelled) or `rejected_<reason>` for each reason of `kbf_pack_ingest_rejects_total` |
-| `kbf_executor_late_starts_total` | counter | `Start`s dropped because their window ended before their job was submitted; the farm runs the action again |
 | `kbf_executor_jobs_submitted_total` | counter | submits the job service answered with the job |
 | `kbf_executor_jobs_resubmitted_after_lost_answer_total` | counter | submits sent again, with the same job id, because the answer to the one before was lost; the service answers from the job the first made |
-| `kbf_executor_jobs_cancelled_total` | counter | cancels of this process's jobs the job service answered: a farm `Cancel`, a `Start` whose window ended after a lost answer, the self-fence, a stream the farm ended, and the stop of the frontend |
-| `kbf_executor_jobs_adopted_cancelled_total` | counter | live jobs an earlier process left under this frontend's id that the executor cancelled at start |
+| `kbf_executor_jobs_cancelled_total` | counter | cancels of this process's jobs the job service answered: a `CancelOperation` of a caller |
+| `kbf_executor_attempts_resubmitted_total` | counter | operations the executor ran again as their next attempt, a new job with a new key, after an infrastructure, lost or out-of-memory ending (at most two more attempts of an operation) |
+| `kbf_executor_operations_reattached_total` | counter | unfinished operations of a process whose liveness row expired that this frontend took up, reading their jobs back from the job service (over a state store) |
 | `kbf_executor_host_silence_seen_total` | counter | jobs seen on a host that has missed its grace, once a job; the job service ends such a job as lost if the host does not come back, and nothing else changes |
-| `kbf_executor_phase_seconds` | histogram | how long the phases of an executor run took, labelled `phase`: `prepare`, `start`, `queue`, `task`, `run` and `ingest`; stamped by the executor once per pass, so `queue`, `task` and `run` are good to a pass plus the agent's heartbeat; an unobserved phase is not counted. `docs/deploy/kbf-modes.md` says how to read them |
+| `kbf_executor_phase_seconds` | histogram | how long the phases of an executor run took, labelled `phase`: `prepare`, `start`, `queue`, `task`, `run`, `ingest`, `submit` (the Execute to the job service answering the submit) and `execute` (the Execute to its callers answered); stamped by the executor once per pass, so `queue`, `task` and `run` are good to a pass plus the agent's heartbeat; an unobserved phase is not counted. `docs/deploy/kbf-modes.md` says how to read them |
 
 **What ingest of a run holds and refuses.** A digest is in one place: a record of one pack or one
 large object. A digest that is a record twice, in two packs or twice in one, is `malformed` (a task builds each pack from distinct blobs, so an honest pack has none; the check now runs across packs and before anything is stored). Large objects are streamed into the CAS before the
@@ -1707,49 +1472,14 @@ under `--job-plain-http`, where the listener has no TLS files.
 | `kbf_job_read_bytes_total` | counter | blob bytes served to jobs |
 | `kbf_job_read_seconds{op}` | histogram | seconds from a job's blob read (`op="get"`, `GET /<hex>/<size>`) or batch (`op="batch"`) to its answer, in fixed buckets from 1 ms to 60 s: one observation per answered request, refusals included; `/locate`, a refused method and a path that names no blob are not in it. A blob too large to read whole is answered when its stream starts, not when its last byte is sent |
 
-**Measured load.** A frontend with a farm exports what its scheduler has counted of node load
-readings and of placement by load. No node reports a reading in this release, so the readings
-counters stay at 0. The same families are written by the farm's scheduler core.
-
-The scheduler's counters are written on every scrape of a frontend with a farm, 0 included, and
-count since the frontend started (a restart starts them again from 0):
-
-| Family | Type | What it measures |
-|---|---|---|
-| `kbf_sched_load_readings_accepted_total` | counter | readings the scheduler accepted |
-| `kbf_sched_load_readings_dropped_total` | counter | readings the scheduler dropped: out of order, a counter or the clock going back, or implausible (more than four times the node's cores or memory). |
-| `kbf_sched_load_floor_windows_total`, `kbf_sched_load_floor_binds_total` | counter | accepted readings that gave a window, and of those the windows in which the floor from the covered leases' predictions was above the measurement |
-| `kbf_sched_load_misfit_cpu_minutes_total`, `kbf_sched_load_misfit_memory_minutes_total` | counter | lease-minutes whose mean cores were over twice the charge (and 250 millicores over it), and whose working set was above the curve's remaining maximum |
-| `kbf_sched_load_demotions_cpu_total`, `kbf_sched_load_demotions_memory_total` | counter | times the shape guard charged a key's CPU, or memory, flat for its next runs |
-| `kbf_sched_load_admitted_total` | counter | leases the load predicate admitted (`--placement-load on`) |
-| `kbf_sched_load_admitted_fallback_total`, `kbf_sched_load_admitted_cold_total`, `kbf_sched_load_curve_flat_total`, `kbf_sched_load_profile_cpu_total`, `kbf_sched_load_profile_memory_total` | counter | of those admitted: on a node charged by prediction alone; cold (a key with no usable estimate); whose key has a curve that was not used (charged flat in CPU and memory); charged by curve in CPU; charged by curve in memory |
-| `kbf_sched_load_blocked_total`, `kbf_sched_load_cold_deferred_total` | counter | queued requests, once per request per round, that had a node with room apart from the predicate and found none it admitted, and of those the ones whose only obstacle was the cold cap |
-| `kbf_sched_load_reservations_total` | counter | head reservations taken or moved |
-| `kbf_sched_load_score_evaluations_total`, `kbf_sched_load_scored_total` | counter | slot-resource evaluations of the placement score, and placements the score chose among two or more nodes |
-| `kbf_sched_load_chose_slack_total`, `kbf_sched_load_chose_distrusted_total`, `kbf_sched_load_chose_concentrated_total`, `kbf_sched_load_chose_by_tie_break_total` | counter | of the scored placements: on a node predicted above its capacity; on a distrusted node; on a node concentrated on the lease's key; decided by the last tie-break |
-| `kbf_sched_load_fallback_cpu_limited_nodes` | gauge | live nodes charged by prediction because their newest reading says the actions cgroup has a CPU limit, while `--placement-load` is on: not a running total, and above 0 means a node whose cgroup limit and pool do not match |
-
-**Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
-nodes' slots means work is waiting that placement cannot use (look at the node's booking and
-`GET /v1/nodes`). `kbf_sched_queued` low while buck2 has many Executes open means they have not
-reached the scheduler: `kbf_execute_presubmit_in_flight` counts them, `kbf_execute_walk_seconds`
-and `kbf_execute_submit_seconds` (with `kbf_sched_lock_wait_seconds`) split where they wait, and
+**Reading a stall.** `kbf_execute_presubmit_in_flight` counts the Executes that have not reached the
+executor yet, `kbf_execute_walk_seconds` and `kbf_execute_submit_seconds` split where they wait, and
 `kbf_tier_wait_seconds` near `kbf_tier_call_seconds` says the blocking pool is the queue. An
 Execute that spends 10 s or more before its first operation is also logged at `WARN` with its
-action, instance, invocation id and those phase times.
+action, instance, invocation id and those phase times. What happens to a job after its submit (queued
+for a host, placed, running) is the job service's to report; `kbf_executor_phase_seconds{phase="queue"}` is
+how long this frontend saw it wait.
 
-**Reading a slow upload.** Each ByteStream Write sends one blob, so a job's output
-tree of N files costs N Writes, but not N segments: the cache groups blobs from
-concurrent Writes and batches into one segment, sealed when it is full or
-`--write-linger` after its first blob, and a blob of `--write-own-segment-bytes` or
-more gets a segment of its own. Over a window, with `rate()`:
-
-- Writes per second is `rate(kbf_bytestream_write_requests_total)`; with
-  `kbf_bytestream_write_in_flight` near the client's upload limit, it is that limit
-  over the mean Write latency
-  (`rate(kbf_bytestream_write_seconds_sum) / rate(kbf_bytestream_write_seconds_count)`).
-- The mean of each stage (`_sum` over `_count` of `kbf_segment_put_seconds`,
-  `kbf_segment_footer_read_seconds`, `kbf_segment_commit_seconds`) says which one the
   Write waits on: the object store's PUT, its GETs, or the metadata log. A PUT tried
   again counts once per attempt, so `kbf_segment_put_seconds` can count more than
   the segments written (`kbf_segment_blobs`' count). What `kbf_store_blobs_seconds`
@@ -1764,13 +1494,6 @@ more gets a segment of its own. Over a window, with `rate()`:
   paid a PUT, two GETs and a commit of its own.
 - `kbf_bytestream_write_present_total` against the requests says how many uploads
   were of blobs already held.
-
-The server logs, per lease
-report that carries usage (an OK run or any failed one that was measured, for
-example an out-of-memory kill, a timeout or a lost run), `action usage:` with the cgroup fields, the action's
-shape `key`, its `cfg`, the `outcome` and the `lease`, then `booked_millicpus` and
-`booked_memory_bytes`, the lease's grant, to set against what it used, and names the `key` on each
-`lease granted` line.
 
 ## `GET /v1/invocations/{id}` and below
 
@@ -1835,8 +1558,10 @@ applies and the routes are as described above.
   invocation; past that the record is `rows_capped` and not complete.
 
 **`GET /v1/runs/{run_id}`** (with `--history-objects`; otherwise `404` as any unknown
-route) is one attempt: the instance, `lease` (`term.seq`), `worker`, `queued`, `granted`,
-`started` and `ended`, `class` (`ok`, `failed`, `timed_out`, `memory_killed`, `infra`,
+route) is one attempt: the instance, `lease`, `worker`, `queued`, `granted`,
+`started` and `ended` (for an operation of this release `lease` is `<operation>.<attempt>`
+and `worker` is the job's id in the job service; records of earlier releases keep the
+meaning they had: the farm's lease `term.seq` and the worker that held it), `class` (`ok`, `failed`, `timed_out`, `memory_killed`, `infra`,
 `lost`), `exit_code` for a run that exited, the memory kill and the booking, cap, raised
 booking, memory used and limit of a killed run, `booked_millicpus` and
 `booked_memory_bytes` (what the run's lease was granted, for every run, with the
@@ -2207,9 +1932,8 @@ there is nothing to mount it on.
   gates. Keep the operator API on loopback, or behind the proxy and a network you trust.
 - **Read-only.** `GET` and `HEAD`; every other method is `405`. The write routes and their
   token are unchanged, and the pages mount none of them.
-- **Pages:** `GET /ui` and `GET /ui/` (Overview: readiness, nodes by state, queue, leases and
+- **Pages:** `GET /ui` and `GET /ui/` (Overview: readiness and
   storage from `GET /v1/health`, the ten latest builds from `GET /v1/invocations`),
-  `GET /ui/nodes` (`GET /v1/nodes`), `/ui/nodes/{id}` (`GET /v1/nodes/{id}`),
   `GET /ui/builds` (the recent builds of
   `GET /v1/invocations`, filtered by `?state=open|closed` and `?instance=`, paged by
   `?page_token=`; `?id=` looks one build up by id; any other parameter, one given twice or
@@ -2218,20 +1942,17 @@ there is nothing to mount it on.
   lists), `/ui/builds/{id}/actions/{digest}` (the action; for one that failed, its failure
   class, command arguments and environment names, exit code and the end of its stdout and
   stderr from `/failures`, each with a link that downloads the whole log, which the blob
-  route answers as an attachment), `/ui/leases` (`GET /v1/leases`;
-  `?node=`, `?page_size=` and `?page_token=` are handed to the route, and the next page is
-  the route's own link on the page's path), `/ui/queue` (`GET /v1/queue`), and the
+  route answers as an attachment), and the
   stylesheet at `/ui/static/kbf.css`. Each page lists, at its foot, the `/v1` routes it read, each a link
   to the JSON. The Action page looks a failed action up in the first 5 pages of
   `/failures`, or in the one page `?failures_token=` names (the Build page's links name it).
-  The Overview, Nodes and Node pages reload themselves when asked:
+  The Overview page reloads itself when asked:
   `?refresh=N` with N one of 5, 10, 30 or 60 (`<meta http-equiv="refresh">` with only the
   integer); any other value, a repeated `refresh` or another parameter is `400`, and a page
   whose read failed does not reload.
 - **Headers on every `/ui` answer**, errors included: `Content-Security-Policy:
   default-src 'none'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri
-  'none'; form-action 'self'` (no script of any kind; the forms are the Builds id lookup and
-  the Leases node filter, both `GET`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+  'none'; form-action 'self'` (no script of any kind; the form is the Builds id lookup, a `GET`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
   `Cache-Control: no-store`, `Cross-Origin-Resource-Policy: same-origin`,
   `Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy` denying every
   powerful feature (camera, microphone, geolocation, usb, serial, hid, bluetooth,

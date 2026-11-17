@@ -290,7 +290,7 @@ fn each_mode_refuses_the_flags_of_another() {
 
 /// Catches: `--state-store` not reaching the frontend's flags, a scheme the design does not
 /// admit accepted at parse (a start would find out much later), and a storage node that takes
-/// it (it holds no scheduler state, so the flag would be silently ignored there).
+/// it (it holds no state store, so the flag would be silently ignored there).
 #[test]
 fn only_the_frontend_takes_a_state_store() {
     let path = std::path::PathBuf::from("/var/lib/kbf/state.db");

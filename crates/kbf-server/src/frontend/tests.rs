@@ -9,10 +9,9 @@ use tonic::transport::Endpoint;
 
 use super::store_of;
 use crate::StateStore;
-use crate::farm::EpochPolicy;
 
 /// Catches a frontend that probes a different store than the one it opened (or none when
-/// one is open): `/readyz` must ask the very store the scheduler writes to, and ask
+/// one is open): `/readyz` must ask the very store the executor writes to, and ask
 /// nothing when there is no store.
 #[test]
 fn readyz_probes_the_store_that_was_opened() {
@@ -22,7 +21,6 @@ fn readyz_probes_the_store_that_was_opened() {
     ));
     let state = StateStore {
         store: Arc::clone(&store),
-        epoch: EpochPolicy::Keep,
         members: crate::members::MembershipConfig::default(),
         history: None,
     };
@@ -44,29 +42,40 @@ pub(super) fn parsed(more: &[&str]) -> Result<super::FrontendFlags, clap::Error>
     super::parse(&super::command().try_get_matches_from(argv)?)
 }
 
-/// Catches a frontend that refuses `--placement-load` (scheduling runs in the frontend, so
-/// a unit file that sets it would not start), one that ignores it, and one whose default is
-/// not `off`.
+/// Catches a frontend that refuses a retired scheduler flag (a unit file written before the
+/// farm scheduler was removed that sets one would not start), one that ignores it in silence
+/// (no warning), one that reads a value into a setting (there is none to read into), and one
+/// that warns when no such flag is given.
 #[test]
-fn the_frontend_takes_placement_load_and_defaults_to_off() {
-    use crate::PlacementLoad;
-    let mode = |more: &[&str]| parsed(more).expect("flags").server.placement_load;
-    assert_eq!(mode(&[]), PlacementLoad::Off);
-    assert_eq!(mode(&["--placement-load=off"]), PlacementLoad::Off);
-    assert_eq!(mode(&["--placement-load", "on"]), PlacementLoad::On);
-    assert!(parsed(&["--placement-load=load"]).is_err());
-}
-
-/// Catches a frontend that refuses a whole-node flag (scheduling runs in the frontend, so a
-/// unit file that sets one would not start), one that ignores the ceiling, and one that is
-/// on without it.
-#[test]
-fn the_frontend_takes_the_whole_node_flags_and_defaults_to_off() {
-    let config = |more: &[&str]| parsed(more).expect("flags").server.whole_node.config();
-    assert_eq!(config(&[]), None);
-    let on = config(&["--whole-node-max=2", "--whole-node-drain-after-secs=9"]).expect("on");
-    assert_eq!((on.max_whole_node, on.drain_after_ms), (2, 9_000));
-    assert!(parsed(&["--whole-node-drain-after-secs=9"]).is_err());
+fn the_frontend_takes_the_retired_scheduler_flags_and_warns_once_each() {
+    let warned = |more: &[&str]| {
+        parsed(more)
+            .expect("flags")
+            .server
+            .retired_scheduler
+            .warnings()
+    };
+    assert!(warned(&[]).is_empty());
+    let said = warned(&[
+        "--placement-load=on",
+        "--whole-node-max=2",
+        "--whole-node-drain-after-secs=9",
+        "--exclusive-actions",
+    ]);
+    let mut flags: Vec<&str> = said
+        .iter()
+        .map(|line| line.split(' ').next().expect("a flag"))
+        .collect();
+    flags.sort_unstable();
+    assert_eq!(
+        flags,
+        [
+            "--exclusive-actions",
+            "--placement-load",
+            "--whole-node-drain-after-secs",
+            "--whole-node-max",
+        ]
+    );
 }
 
 /// All eleven flags of the removed handover and admin port, each with a value.
@@ -321,7 +330,6 @@ fn the_members_of_a_frontend_carry_the_setting_it_was_given() {
             Arc::new(ManualClock::default()),
             Flaw::None,
         )),
-        epoch: EpochPolicy::Keep,
         members: crate::members::MembershipConfig::default(),
         history: None,
     };

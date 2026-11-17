@@ -53,8 +53,7 @@ http.workspace = true
 # `tests/mixed_version.rs`: the farm of real `kbf` processes it drives and the REAPI
 # client of its frontend (`kbf_harness::reapi`).
 kbf-harness.workspace = true
-# `tests/ui_through_proxy.rs`: the real server's policy, and the scheduler's timings its
-# listeners are given.
+# `tests/ui_through_proxy.rs`: the real server's policy.
 kbf-auth.workspace = true
 kbf-cli.workspace = true
 kbf-front.workspace = true
@@ -73,7 +72,6 @@ kbf-types.workspace = true
 # `tests/mdm_layering.rs` reads the root layers.toml.
 toml.workspace = true
 kbf-proxy.workspace = true
-kbf-sched.workspace = true
 kbf-server.workspace = true
 kbf-threads.workspace = true
 # `tests/js_real_service.rs`: kbf-job-client against the pinned js-lease-server and against

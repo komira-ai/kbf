@@ -17,7 +17,7 @@ use kbf_front::Cache;
 use kbf_server::join::{Identity as NodeIdentity, Joiner};
 use kbf_server::members::{LastBoot, MembershipConfig};
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
-use kbf_server::{EpochPolicy, Listeners, StateStore, bind_server_with_state};
+use kbf_server::{Listeners, StateStore, bind_server_with_state};
 use kbf_state::Store;
 use tonic::transport::Endpoint;
 
@@ -28,7 +28,6 @@ fn frontend() -> (SocketAddr, Arc<Hooked>) {
     let store = Hooked::new();
     let state = StateStore {
         store: Arc::clone(&store) as Arc<dyn Store>,
-        epoch: EpochPolicy::Keep,
         members: MembershipConfig {
             ttl: Duration::from_secs(3600),
             dwell: Duration::from_secs(7200),
@@ -42,21 +41,10 @@ fn frontend() -> (SocketAddr, Arc<Hooked>) {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        tick: Duration::from_millis(50),
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         streams: kbf_server::StreamTiming::default(),
         stream_limits: kbf_server::StreamLimits::DEFAULT,

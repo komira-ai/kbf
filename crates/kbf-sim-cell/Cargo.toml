@@ -14,7 +14,6 @@ kbf-front.workspace = true
 kbf-log.workspace = true
 kbf-meta.workspace = true
 kbf-raft.workspace = true
-kbf-sched.workspace = true
 kbf-segments.workspace = true
 kbf-server.workspace = true
 kbf-sim.workspace = true

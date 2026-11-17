@@ -1,7 +1,7 @@
 //! A record as `kbf.invocation.v1` messages: its [`proto::Header`] and its rows as a
 //! [`proto::Chunk`].
 
-use kbf_sched::RequeueReason;
+use crate::RequeueReason;
 use kbf_types::{Digest, Failure, LostWhy};
 
 use crate::event::{Outcome, WallTime};

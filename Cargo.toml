@@ -75,14 +75,12 @@ hyper-util = { version = "0.1.21", default-features = false }
 # own, holding only the raise and the fixes it forces, and the whole CI runs on it.
 js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
 js-proto = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
-js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
 js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
 js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
 js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
 js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
 js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
 js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
-js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
 # tierstore and objstore-s3 moved to the tierstore repository (https://github.com/komira-ai/tierstore).
 # Both are taken from it at this one revision. The revision is raised by a pull request of
 # its own that runs the whole CI, never along with other changes.
@@ -215,7 +213,6 @@ kbf-proto = { path = "crates/kbf-proto" }
 kbf-proxy = { path = "crates/kbf-proxy" }
 kbf-raft = { path = "crates/kbf-raft" }
 kbf-route = { path = "crates/kbf-route" }
-kbf-sched = { path = "crates/kbf-sched" }
 kbf-seatbelt = { path = "crates/kbf-seatbelt" }
 kbf-segments = { path = "crates/kbf-segments" }
 kbf-server = { path = "crates/kbf-server" }

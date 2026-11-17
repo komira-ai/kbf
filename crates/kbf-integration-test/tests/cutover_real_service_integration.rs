@@ -5,8 +5,8 @@
 //!
 //! The verb runs as the binary runs it (`kbf_deploy::cli::run_at`), with the frontend's host
 //! scripted: `kbf --check`, `kbf cluster drain` and the `ssh` to `kbf-host-install` answer as a
-//! healthy host does, and the frontend's `/healthz`, `/readyz` and first-worker URLs answer as
-//! a frontend that exits after the drain and comes back. What is real is everything the
+//! healthy host does, and the frontend's `/healthz` and `/readyz` URLs answer as a frontend that
+//! exits after the drain and comes back. What is real is everything the
 //! cutover says to the job service: the check (`ListJobs` with the client token), and the
 //! canary job (`SubmitJob`, `GetJob` until it ends, `CancelJob` when it does not), which the
 //! service places on the agent, whose container (the stand-in `crun`) exits as the test plans
@@ -56,7 +56,7 @@ const FRONTEND: &str = "fe-a";
 /// The frontend's host as the cutover reaches it: every tool answers as on a healthy host
 /// (`kbf-host-install` says `restarted`), and each URL answers from its queue, the last
 /// answer repeating: the frontend is up until the drain, then gone; then not ready, then
-/// ready; its first worker is not there, then there. No step is applied through it: the
+/// ready. No step is applied through it: the
 /// cutover edits the frontend's `kbf.toml` itself.
 struct FrontendHost {
     statuses: std::sync::Mutex<BTreeMap<String, VecDeque<io::Result<u16>>>>,
@@ -68,10 +68,6 @@ impl FrontendHost {
         let statuses = [
             ("/healthz", vec![Ok(200), gone()]),
             ("/readyz", vec![Ok(503), Ok(200)]),
-            (
-                &*format!("/v1/nodes/js:{FRONTEND}-0"),
-                vec![Ok(404), Ok(200)],
-            ),
         ]
         .into_iter()
         .map(|(path, answers)| (path.to_owned(), answers.into()))
@@ -153,7 +149,7 @@ fn ready_config(base_tree: &std::path::Path) -> String {
          executor-base-image = \"registry.example/base@sha256:{base}\"\n\
          executor-kbf-image = \"docker://{kbf}\"\n\
          executor-base-tree = \"{base_tree}\"\n\
-         executor-secret-delivery = \"files\"\nexecutor-host-slots = 8\n\n[packs]\n\
+         executor-secret-delivery = \"files\"\n\n[packs]\n\
          pack-read = true\n",
         base = "ff".repeat(32),
         kbf = image(),
@@ -203,12 +199,6 @@ impl Rig {
             &format!("http://{}", self.server.job_addr()),
             "--token-file",
             &path("job-service.token"),
-            "--hosts",
-            "1",
-            "--host-cpus",
-            "2",
-            "--host-memory-gib",
-            "4",
             "--instance",
             "-",
             "--api-token-file",

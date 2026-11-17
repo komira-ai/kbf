@@ -1,5 +1,7 @@
 # Starvation of a large booking by small actions: who owns the rule
 
+> **Superseded by [direct-js.md](direct-js.md):** kbf no longer schedules, books or reserves anything; how many jobs run, where and when is the job service's. This page records the earlier design.
+
 Status: DESIGN, for review. Nothing here is built. Issue: komira-ai/kbf#169. Revised to the whole-node ruling: reserve the host with the least tail. Amended: the lease server's live reservation engine is `js-registry`, not `js-sched` (2.4); where the rule is placed is decided: Path S, approved 2026-11-01 (3.2).
 
 **Since this was written, the js scheduler core was removed.** `--scheduler-core js` is refused at
@@ -471,7 +473,7 @@ what it depends on. Test letters are those of 3.7.
    every large action starts before the small queue is empty. Red under the `off` default
    **[verify]** whether it is already green under `on` (nobody has run it, 2.2); then remove
    `off`, which is plumbing through about thirty files (`farm.rs:272`, `farm.rs:358`,
-   `farm/driver.rs:192` and `:94`, `crates/kbf-estimator-replay/src/replay/sim.rs:186`,
+   `farm/driver.rs:192` and `:94`,
    `crates/kbf-server/src/farm/js/tests.rs:95,128`, and the fixtures that pass
    `PlacementLoad::Off`). Depends on: nothing.
 4. **[proposed] jobscheduler: `js-sched` takes the tail rule and one pick** (jobscheduler#582).

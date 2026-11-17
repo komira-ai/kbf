@@ -20,7 +20,7 @@ use kbf_server::members::{
     Fill, Members, MembershipConfig, NodeFacts, PROTOCOL, Progress, Registrant,
 };
 use kbf_server::storage_health::Reported;
-use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
+use kbf_server::{Api, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{Cond, ManualClock, Store, Txn};
 use prost::Message as _;
@@ -30,11 +30,6 @@ use tokio::net::TcpStream;
 
 const TTL: Duration = Duration::from_secs(30);
 const DWELL: Duration = Duration::from_secs(120);
-
-/// The tick of every server here: one that does not come within a test. A server task that
-/// looks at every tick would meet the faults that a test arms for a request (`support/looks.rs`
-/// says why). No test here waits for a tick.
-const TICK: Duration = Duration::from_secs(3600);
 
 fn config() -> MembershipConfig {
     MembershipConfig {
@@ -51,19 +46,8 @@ fn listeners() -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        tick: TICK,
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
@@ -117,7 +101,6 @@ fn store() -> (Arc<ManualClock>, Arc<Fake>, StateStore) {
     let fake = Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None));
     let state = StateStore {
         store: Arc::clone(&fake) as Arc<dyn Store>,
-        epoch: EpochPolicy::Keep,
         members: config(),
         history: None,
     };
@@ -613,16 +596,16 @@ async fn a_member_lists_what_it_runs_and_where_its_log_is() {
     assert_eq!(facts_of(&view, 2), json!([null, null, null]), "{view}");
 }
 
-/// Catches `/v1/members` behind a gate `/v1/nodes` does not have (the operator scripts
-/// call both the same way), and a write verb answered on a read path. The server has no
-/// token, so a read that needed one could not succeed.
+/// Catches `/v1/members` behind a gate `/v1/frontend/drain` does not have (the operator
+/// scripts call both the same way), and a write verb answered on a read path. The server has
+/// no token, so a read that needed one could not succeed.
 #[tokio::test]
-async fn members_is_read_like_nodes_and_takes_no_write() {
+async fn members_is_read_like_the_drain_and_takes_no_write() {
     let (_clock, _fake, state) = store();
     let server = start(Some(state));
-    let (nodes, _, _) = http(server.api, "GET", "/v1/nodes", "").await;
+    let (drain, _, _) = http(server.api, "GET", "/v1/frontend/drain", "").await;
     let (members, _, _) = http(server.api, "GET", "/v1/members", "").await;
-    assert_eq!((nodes, members), (200, 200));
+    assert_eq!((drain, members), (200, 200));
     let (code, _, _) = http(
         server.api,
         "POST",
@@ -645,7 +628,6 @@ const START_LOOKS: (usize, usize) = (0, 4);
 fn failing(hooked: &Arc<Hooked>) -> Server {
     let state = StateStore {
         store: Arc::clone(hooked) as Arc<dyn Store>,
-        epoch: EpochPolicy::Keep,
         members: config(),
         history: None,
     };
@@ -654,8 +636,8 @@ fn failing(hooked: &Arc<Hooked>) -> Server {
 
 /// The error `GET /v1/members` answers once `arm` has set a fault. The fault is for the
 /// request: the server's own readers of the store have read all they do at start, which
-/// the caller has waited for (`START_LOOKS`), and not again within the test (`TICK` and the
-/// sweeper's beat).
+/// the caller has waited for (`START_LOOKS`), and not again within the test (the sweeper's
+/// beat).
 async fn error_of(api: SocketAddr, arm: impl Fn()) -> (u16, String) {
     arm();
     let (code, _, body) = http(api, "GET", "/v1/members", "").await;

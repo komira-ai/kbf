@@ -1,31 +1,14 @@
-//! When the server started: the second half of the restart banner of the Nodes, Node,
-//! Overview, Leases and Queue pages. What those pages show is held in the server's memory
-//! and fills as workers register again, so "is this empty because of an outage, or because the
-//! server started a minute ago" is answered by the start time, which `GET /v1/health`
-//! carries (`started_unix_ms`, `uptime_ms`; `docs/api.md`).
+//! When the server started: the note on the Overview page, from the start time that
+//! `GET /v1/health` carries (`started_unix_ms`, `uptime_ms`; `docs/api.md`).
 //!
-//! The banner is a note, never a precondition: a page whose health read fails, or whose
-//! server sends no start time (an older one), still renders, and the banner says that the
-//! start time is not known and why, never a guessed one.
+//! The banner is a note, never a precondition: a server that sends no start time (an
+//! older one) still gets a page, and the banner says that the start time is not known and
+//! why, never a guessed one.
 
-use serde::Deserialize;
-
-use super::sched::age;
-use crate::Source;
 use crate::html::{Html, attr};
-use crate::read::Reader;
 
 /// The route that carries the start time.
-pub(crate) const HEALTH: &str = "/v1/health";
-
-/// `GET /v1/health`: the two keys the banner shows.
-#[derive(Debug, Deserialize)]
-struct Run {
-    #[serde(default)]
-    started_unix_ms: Option<u64>,
-    #[serde(default)]
-    uptime_ms: Option<u64>,
-}
+const HEALTH: &str = "/v1/health";
 
 /// What the banner can say about the server's start.
 #[derive(Debug, PartialEq, Eq)]
@@ -49,15 +32,6 @@ impl Started {
     }
 }
 
-/// The start time, read through `reader`, whose page declares [`HEALTH`] among its routes.
-/// A read that fails is [`Started::Unsaid`], never a failure of the page.
-pub(crate) async fn read<S: Source>(reader: &mut Reader<'_, S>) -> Started {
-    match reader.json::<Run>(HEALTH).await {
-        Ok(run) => Started::of(run.started_unix_ms, run.uptime_ms),
-        Err(e) => Started::Unsaid(e.to_string()),
-    }
-}
-
 /// The banner's note: when the server started.
 pub(crate) fn note(h: &mut Html, started: &Started) {
     h.el("p", &[attr("class", "hint")], |h| match started {
@@ -72,6 +46,26 @@ pub(crate) fn note(h: &mut Html, started: &Started) {
             h.text(&format!("When this server started is not known: {why}."));
         }
     });
+}
+
+/// `ms` milliseconds as the two largest units that matter: `850 ms`, `41.2 s`,
+/// `3 min 20 s`, `2 h 5 min`, `4 d 3 h`. Truncated, never rounded up into the next unit.
+fn age(ms: u64) -> String {
+    const SECOND: u64 = 1000;
+    const MINUTE: u64 = 60 * SECOND;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    if ms < SECOND {
+        format!("{ms} ms")
+    } else if ms < MINUTE {
+        format!("{}.{} s", ms / SECOND, (ms % SECOND) / 100)
+    } else if ms < HOUR {
+        format!("{} min {} s", ms / MINUTE, (ms % MINUTE) / SECOND)
+    } else if ms < DAY {
+        format!("{} h {} min", ms / HOUR, (ms % HOUR) / MINUTE)
+    } else {
+        format!("{} d {} h", ms / DAY, (ms % DAY) / HOUR)
+    }
 }
 
 /// `ms` since the Unix epoch as an RFC 3339 UTC time.

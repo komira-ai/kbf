@@ -6,8 +6,12 @@
 //! [`Authorizers::execute`] authorizer against the instance name the operation was submitted
 //! under, as WaitExecution is, once the operation is found.
 //!
-//! The other calls of the service (ListOperations, DeleteOperation, CancelOperation and
-//! WaitOperation) are not served: they are UNIMPLEMENTED. WaitExecution is the REAPI's wait.
+//! CancelOperation asks the [`Dispatch`] to stop the job of an unfinished operation
+//! ([`Dispatch::cancel`]); an unknown name is NOT_FOUND, the call is authorized as
+//! GetOperation is, and cancelling an operation that has finished is a no-op that succeeds.
+//!
+//! The other calls of the service (ListOperations, DeleteOperation and WaitOperation) are not
+//! served: they are UNIMPLEMENTED. WaitExecution is the REAPI's wait.
 
 use std::sync::Arc;
 
@@ -19,10 +23,13 @@ use kbf_proto::google::longrunning::{
 };
 use tonic::{Request as GrpcRequest, Response, Status};
 
-use crate::execution::{Dispatch, operation};
+use crate::execution::{Dispatch, on_dispatch, operation};
 
 /// The gRPC path of GetOperation, as calls are authorized.
 const GET_OPERATION: &str = "/google.longrunning.Operations/GetOperation";
+
+/// The gRPC path of CancelOperation, as calls are authorized.
+const CANCEL_OPERATION: &str = "/google.longrunning.Operations/CancelOperation";
 
 /// The `Operations` service over a [`Dispatch`].
 #[derive(Debug)]
@@ -67,7 +74,8 @@ where
     ) -> Result<Response<Operation>, Status> {
         let caller = kbf_auth::metadata(&request);
         let name = request.into_inner().name;
-        let Some(ticket) = self.dispatch.wait(&name) else {
+        let asked = name.clone();
+        let Some(ticket) = on_dispatch(&self.dispatch, move |d| d.wait(&asked)).await? else {
             return Err(Status::not_found(format!(
                 "no operation {name:?}: finished operations are kept only briefly; \
                  Execute answers a finished one from the action cache"
@@ -93,9 +101,19 @@ where
 
     async fn cancel_operation(
         &self,
-        _request: GrpcRequest<CancelOperationRequest>,
+        request: GrpcRequest<CancelOperationRequest>,
     ) -> Result<Response<()>, Status> {
-        Err(not_served("CancelOperation"))
+        let caller = kbf_auth::metadata(&request);
+        let name = request.into_inner().name;
+        let asked = name.clone();
+        let Some(ticket) = on_dispatch(&self.dispatch, move |d| d.wait(&asked)).await? else {
+            return Err(Status::not_found(format!("no operation {name:?}")));
+        };
+        let execute = &*self.authorizers.execute;
+        authorize(execute, &caller, CANCEL_OPERATION, &ticket.instance).await?;
+        // False: the operation finished first, and cancelling a finished one is a no-op.
+        let _asked = on_dispatch(&self.dispatch, move |d| d.cancel(&name)).await?;
+        Ok(Response::new(()))
     }
 
     async fn wait_operation(

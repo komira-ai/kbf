@@ -183,8 +183,6 @@ fn every_family_is_printed_once_with_its_type() {
     metrics.execute_dir_cache_bytes.set(28);
     metrics.execute_walk_dir_read.observe(29);
     metrics.execute_walk_dir_read.observe(30);
-    metrics.sched_queued.set(18);
-    metrics.sched_leases.set(19);
     let _presubmit = metrics.execute_presubmit_in_flight.raise();
     let (_tier, _tier2) = (
         metrics.tier_in_flight.raise(),
@@ -235,7 +233,6 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_execute_walk_files_seconds histogram",
             "kbf_execute_walk_dir_read_seconds histogram",
             "kbf_execute_submit_seconds histogram",
-            "kbf_sched_lock_wait_seconds histogram",
             "kbf_tier_wait_seconds histogram",
             "kbf_tier_call_seconds histogram",
             "kbf_execute_presubmit_in_flight gauge",
@@ -253,14 +250,6 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_input_directories_skipped_total counter",
             "kbf_input_directories_joined_total counter",
             "kbf_execute_dir_cache_bytes gauge",
-            "kbf_sched_queued gauge",
-            "kbf_sched_leases gauge",
-            "kbf_estimator_shadow_total counter",
-            "kbf_estimator_shadow_skipped_total counter",
-            "kbf_prediction_made_total counter",
-            "kbf_prediction_unset_total counter",
-            "kbf_prediction_vs_run_total counter",
-            "kbf_placement_cpu_limited_nodes gauge",
             "kbf_tier_in_flight gauge",
             "kbf_storage_open_write_fds gauge",
             "kbf_storage_write_pool_queue gauge",
@@ -296,8 +285,6 @@ fn every_family_is_printed_once_with_its_type() {
         ("kbf_execute_dir_cache_present_checked_total", 27),
         ("kbf_execute_dir_cache_bytes", 28),
         ("kbf_execute_walk_dir_read_seconds_count", 2),
-        ("kbf_sched_queued", 18),
-        ("kbf_sched_leases", 19),
         ("kbf_execute_presubmit_in_flight", 1),
         ("kbf_tier_in_flight", 2),
         ("kbf_storage_open_write_fds", 21),
@@ -349,7 +336,7 @@ fn an_execute_is_recorded_however_its_stream_ends() {
     assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (0, 0));
     assert_eq!((metrics.requests.get(), metrics.errors.get()), (2, 1));
 
-    // Refused by the scheduler: its call was timed, and it was never queued.
+    // Refused by the dispatcher: its call was timed, and it was never queued.
     let mut refused = metrics.execute();
     refused.dispatching();
     refused.dispatched(false);
@@ -390,88 +377,6 @@ fn open_executions_is_raised_once_per_guard_and_only_by_a_streaming_one() {
     );
     drop(streamed);
     assert_eq!(metrics.open_executions.get(), 0);
-}
-
-/// Catches: a bucket or level printed under another's label (a dashboard would read
-/// `would_oom` as `covered`), a pair missing from the scrape, and a count of one pair
-/// leaking into its neighbour.
-#[test]
-fn the_shadow_totals_print_each_level_and_bucket_under_its_own_label() {
-    let m = CacheMetrics::default();
-    m.estimator_shadow
-        .set(ShadowLevel::L2, ShadowBucket::WouldOom, 7);
-    m.estimator_shadow
-        .set(ShadowLevel::None, ShadowBucket::Cold, 3);
-    let text = m.render();
-    let rows = lines(&text, "kbf_estimator_shadow_total{");
-    assert_eq!(rows.len(), 12);
-    assert!(rows.contains(&r#"kbf_estimator_shadow_total{level="l2",bucket="would_oom"} 7"#));
-    assert!(rows.contains(&r#"kbf_estimator_shadow_total{level="none",bucket="cold"} 3"#));
-    assert!(rows.contains(&r#"kbf_estimator_shadow_total{level="l1",bucket="covered"} 0"#));
-    assert!(rows.contains(&r#"kbf_estimator_shadow_total{level="l2",bucket="censored"} 0"#));
-    m.estimator_shadow.set_skipped(1, 4);
-    m.estimator_shadow.set_skipped(99, 1);
-    assert_eq!(m.estimator_shadow.skipped(1), 4);
-    assert_eq!(m.estimator_shadow.skipped(99), 0);
-    let text = m.render();
-    let skips = lines(&text, "kbf_estimator_shadow_skipped_total{");
-    assert_eq!(skips.len(), SHADOW_SKIPS.len());
-    assert!(skips.contains(&r#"kbf_estimator_shadow_skipped_total{reason="no_os"} 4"#));
-    assert!(skips.contains(&r#"kbf_estimator_shadow_skipped_total{reason="kind"} 0"#));
-}
-
-/// Catches: `made` printed under another series, a reason or an axis and bucket printed under
-/// another's label (a dashboard would read `cold` as `missing`, or `under` as `over`), a
-/// series missing from the scrape, a count of one pair leaking into its neighbour, and an
-/// index past the end that is not ignored.
-#[test]
-fn the_prediction_totals_print_each_series_under_its_own_label() {
-    let m = CacheMetrics::default();
-    m.prediction.set_made(11);
-    for (reason, label) in PREDICTION_UNSET.iter().enumerate() {
-        m.prediction.set_unset(reason, 100 + reason as u64);
-        assert_eq!(m.prediction.unset(reason), 100 + reason as u64, "{label}");
-    }
-    for (axis, bucket) in [(0, 2), (1, 0), (2, 1)] {
-        m.prediction
-            .set_vs_run(axis, bucket, 20 + (axis * 3 + bucket) as u64);
-    }
-    m.prediction.set_unset(99, 1);
-    m.prediction.set_vs_run(3, 0, 1);
-    m.prediction.set_vs_run(0, 3, 1);
-    m.prediction.set_cpu_limited_nodes(4);
-    assert_eq!(m.prediction.made(), 11);
-    assert_eq!(m.prediction.unset(99), 0);
-    assert_eq!(m.prediction.vs_run(3, 0), 0);
-    assert_eq!(m.prediction.vs_run(0, 3), 0);
-    assert_eq!(m.prediction.cpu_limited_nodes(), 4);
-
-    let text = m.render();
-    assert_eq!(
-        lines(&text, "kbf_prediction_made_total "),
-        ["kbf_prediction_made_total 11"]
-    );
-    let unset = lines(&text, "kbf_prediction_unset_total{");
-    assert_eq!(unset.len(), 8);
-    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="missing"} 100"#));
-    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="stale"} 101"#));
-    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="cold"} 102"#));
-    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="corrupt"} 103"#));
-    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="over_cap"} 104"#));
-    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="kind"} 105"#));
-    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="no_os"} 106"#));
-    assert!(unset.contains(&r#"kbf_prediction_unset_total{reason="no_subject"} 107"#));
-    let vs_run = lines(&text, "kbf_prediction_vs_run_total{");
-    assert_eq!(vs_run.len(), 9);
-    assert!(vs_run.contains(&r#"kbf_prediction_vs_run_total{axis="cpu",bucket="over"} 22"#));
-    assert!(vs_run.contains(&r#"kbf_prediction_vs_run_total{axis="mem",bucket="under"} 23"#));
-    assert!(vs_run.contains(&r#"kbf_prediction_vs_run_total{axis="life",bucket="fit"} 27"#));
-    assert!(vs_run.contains(&r#"kbf_prediction_vs_run_total{axis="cpu",bucket="under"} 0"#));
-    assert!(vs_run.contains(&r#"kbf_prediction_vs_run_total{axis="mem",bucket="over"} 0"#));
-    assert_eq!(
-        lines(&text, "kbf_placement_cpu_limited_nodes "),
-        ["kbf_placement_cpu_limited_nodes 4"]
-    );
 }
 
 /// Asserts that each cause of an Execute's end bumps its own series and no other: an
@@ -574,76 +479,4 @@ fn every_cause_is_rendered_from_the_start() {
             r#"kbf_execute_errors_total{cause="status"} 0"#,
         ]
     );
-}
-
-fn whole_summary(
-    held: usize,
-    waiting: &[(kbf_sched::WholeReason, usize)],
-) -> kbf_sched::WholeSummary {
-    kbf_sched::WholeSummary {
-        held,
-        marks: 2,
-        whole: held + 2,
-        draining: 1,
-        ceiling: 5,
-        max_whole_node: 6,
-        capable_hosts: 7,
-        keep_for_ordinary: 1,
-        max_draining: 2,
-        waiting: waiting.iter().copied().collect(),
-    }
-}
-
-/// Catches the whole-node gauges rendered with the option off (a scrape must be what it was),
-/// a gauge not set from the summary (each of held, marks, draining, ceiling), a reason
-/// without its series or with another's count, and a count that stays after the requests
-/// that waited for the reason have gone.
-#[test]
-fn the_whole_node_gauges_are_rendered_only_when_set_and_follow_the_summary() {
-    use kbf_sched::{Blocked, WholeReason};
-    let metrics = CacheMetrics::default();
-    assert!(!metrics.render().contains("kbf_sched_whole"), "off");
-    metrics.sched_whole.set(Some(&whole_summary(
-        3,
-        &[
-            (WholeReason::Holding, 4),
-            (WholeReason::Cap(Blocked::MaxDraining), 5),
-            (WholeReason::Unservable, 6),
-        ],
-    )));
-    let text = metrics.render();
-    for family in [
-        "kbf_sched_whole_held",
-        "kbf_sched_whole_marks",
-        "kbf_sched_whole_draining",
-        "kbf_sched_whole_ceiling",
-        "kbf_sched_whole_waiting",
-    ] {
-        assert!(text.contains(&format!("# TYPE {family} gauge")), "{family}");
-    }
-    let series = lines(&text, "kbf_sched_whole_");
-    assert_eq!(
-        series,
-        [
-            "kbf_sched_whole_held 3",
-            "kbf_sched_whole_marks 2",
-            "kbf_sched_whole_draining 1",
-            "kbf_sched_whole_ceiling 5",
-            r#"kbf_sched_whole_waiting{reason="early"} 0"#,
-            r#"kbf_sched_whole_waiting{reason="holding"} 4"#,
-            r#"kbf_sched_whole_waiting{reason="barred"} 0"#,
-            r#"kbf_sched_whole_waiting{reason="cap_ceiling"} 0"#,
-            r#"kbf_sched_whole_waiting{reason="cap_keep_for_ordinary"} 0"#,
-            r#"kbf_sched_whole_waiting{reason="cap_max_draining"} 5"#,
-            r#"kbf_sched_whole_waiting{reason="cap_per_consumer"} 0"#,
-            r#"kbf_sched_whole_waiting{reason="last_capable"} 0"#,
-            r#"kbf_sched_whole_waiting{reason="queued"} 0"#,
-            r#"kbf_sched_whole_waiting{reason="unservable"} 6"#,
-        ]
-    );
-    metrics.sched_whole.set(Some(&whole_summary(0, &[])));
-    assert_eq!(metrics.sched_whole.waiting(WholeReason::Holding), 0);
-    assert_eq!(metrics.sched_whole.held(), 0);
-    metrics.sched_whole.set(None);
-    assert!(!metrics.render().contains("kbf_sched_whole"), "off again");
 }

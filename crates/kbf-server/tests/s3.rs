@@ -1,5 +1,5 @@
-//! A server whose blobs are in a real S3 store: an Execute runs on a fake daemon registered with
-//! its farm, its result is served from the action cache, and the bytes are in the bucket.
+//! A server whose blobs are in a real S3 store: a client uploads an action's blobs over REAPI, the
+//! server answers that it holds them, and the bytes are in the bucket.
 //!
 //! Ignored by default, because it needs a store. CI's `objstore-s3` job runs it against
 //! MinIO and RustFS: `cargo test -p kbf-server --test s3 -- --ignored`, with
@@ -17,7 +17,7 @@ use kbf_front::{Cache, MemoryMetaLog};
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_objstore::{Capabilities, KeyPrefix, ObjectStore, PageSize};
 use kbf_server::{Listeners, bind_server};
-use support::{Client, Job, done, output, ran, response};
+use support::{Client, Job};
 
 const BUCKET: &str = "kbf-server-e2e";
 
@@ -47,19 +47,8 @@ fn listeners() -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        tick: Duration::from_millis(50),
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
@@ -68,17 +57,15 @@ fn listeners() -> Listeners {
     }
 }
 
-/// Catches: an S3 store that does not reach the cache (blobs kept in memory, or nowhere), and
-/// a server that cannot run the Execute join on an S3 store.
+/// Catches: an S3 store that does not reach the cache (blobs kept in memory, or nowhere).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs an S3 store; see the module docs"]
-async fn executes_with_blobs_in_s3() {
+async fn blobs_uploaded_to_a_server_over_s3_are_in_the_bucket() {
     let endpoint = env("KBF_TEST_S3_ENDPOINT");
     let bucket = store(&endpoint);
     bucket.create_bucket().await.expect("create the bucket");
 
-    // The server runs in this process, over the S3 store, so that a fake daemon registers with
-    // its farm.
+    // The server runs in this process, over the S3 store.
     let prefix = KeyPrefix::new("e2e/").expect("prefix");
     let cache = Cache::open(
         MemoryMetaLog::new(kbf_meta::Retention::default()),
@@ -88,18 +75,17 @@ async fn executes_with_blobs_in_s3() {
     .await
     .expect("open the cache");
     let bound = bind_server(Arc::new(cache), listeners(), pending()).expect("bind");
-    let (reapi, worker, farm) = (bound.reapi, bound.worker, bound.farm.clone());
+    let (reapi, worker) = (bound.reapi, bound.worker);
     tokio::spawn(async move { bound.serving.await.expect("serve") });
-    let client = Client::connect_to(reapi, worker, farm).await;
-    let mut daemon = client.daemon("node-s3", 4, 8).await;
+    let client = Client::connect(reapi, worker).await;
     let job = Job::new("on s3", &[]);
     client.upload(&job.blobs()).await;
-    let mut ops = client.execute(&job.action).await;
-    let start = daemon.start().await;
-    let result = output(&client, "an output in the bucket", 0).await;
-    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
-    assert_eq!(client.cached(&job.action).await, Ok(result));
+    for blob in job.blobs() {
+        assert!(
+            client.holds(blob).await,
+            "the server serves what it was sent"
+        );
+    }
 
     let prefix = KeyPrefix::new("e2e/").expect("prefix");
     let page = bucket

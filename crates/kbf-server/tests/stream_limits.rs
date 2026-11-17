@@ -2,8 +2,8 @@
 //!
 //! buck2 holds one Execute stream open per outstanding action, idle almost the whole
 //! time, so the REAPI listener must not hide its backlog behind a small per-connection
-//! cap (`--reapi-max-streams`, 10000 by default). A daemon holds one session stream and
-//! a few short transfer streams, so the worker listener keeps 200
+//! cap (`--reapi-max-streams`, 10000 by default). A storage node makes
+//! a few short unary calls, so the worker listener keeps 200
 //! (`--worker-max-streams`). The connection window must hold every stream's window at
 //! once, so a higher limit shrinks the stream window rather than leaving the
 //! connection window short.
@@ -112,14 +112,13 @@ async fn settles(what: &str, within: Duration, read: impl Fn() -> u64, want: u64
 /// Catches: a REAPI listener that caps one connection's streams at the worker's 200
 /// (the state before `--reapi-max-streams`): buck2's 1000 outstanding actions, each an
 /// idle Execute stream on one connection, are then held in the client, and the
-/// scheduler sees 200. Every action here is distinct, so none joins another's
-/// operation, and no worker is connected, so every one waits queued. The client is one
+/// executor sees 200. Every action here is distinct, so none joins another's
+/// operation, and no job is run on the host, so every one waits as a submitted job. The client is one
 /// tonic channel, which is one HTTP/2 connection, and its HTTP/2 client holds a request
 /// back while the server's limit is reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_thousand_idle_executes_on_one_connection_are_all_queued() {
+async fn a_thousand_idle_executes_on_one_connection_are_all_submitted() {
     let cell = Cell::start().await;
-    let m = cell.cache.metrics();
     let jobs: Vec<Job> = (0..ACTIONS)
         .map(|i| Job::new(&format!("action-{i}"), &[]))
         .collect();
@@ -142,17 +141,17 @@ async fn a_thousand_idle_executes_on_one_connection_are_all_queued() {
         });
     }
     settles(
-        "kbf_sched_queued",
+        "jobs submitted",
         Duration::from_secs(30),
-        || m.sched_queued.get(),
+        || cell.direct.submitted_jobs() as u64,
         ACTIONS as u64,
     )
     .await;
 }
 
 /// Catches: the REAPI listener left at the worker's limit, or the worker listener
-/// raised with it (the first Execute a daemon-side limit hides is a farm that looks
-/// idle; the second is a daemon connection that may hold 10000 streams); a flag that
+/// raised with it (the first Execute a worker-side limit hides is a cell that looks
+/// idle; the second is a storage node connection that may hold 10000 streams); a flag that
 /// reaches the wrong listener, shown by limits that differ (7 and 3). Read off the
 /// server's own SETTINGS frame, as a client sees it.
 #[tokio::test]

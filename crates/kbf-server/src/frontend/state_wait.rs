@@ -76,7 +76,7 @@ pub struct NotReached {
     /// How long the start waited, by the waits it asked for.
     pub waited: Duration,
     /// What the last attempt said.
-    pub last: crate::farm::StateError,
+    pub last: crate::StateError,
 }
 
 impl fmt::Display for NotReached {

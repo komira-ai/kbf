@@ -73,20 +73,6 @@ fn a_sqlite_path_and_a_postgres_url_are_accepted_and_nothing_else() {
     }
 }
 
-/// Asserts that an open of either store keeps the epoch it holds: a restart of a frontend,
-/// or the start of another one over the same Postgres, does not change it, so the workers
-/// that reconnect keep the runs of the leases they hold. The epoch changes when an
-/// operator raises it.
-#[test]
-fn every_open_of_either_store_keeps_the_epoch() {
-    for uri in [
-        local_postgres(),
-        StateStoreUri::Sqlite(PathBuf::from("/x.db")),
-    ] {
-        assert_eq!(uri.epoch_policy(), EpochPolicy::Keep, "{uri:?}");
-    }
-}
-
 /// Catches: the password of a URL printed by anything that prints the flags (`Debug` of
 /// `Args` is logged), and the store identity carrying it to another process.
 /// A URL with user information, a `password` parameter, and both.
@@ -122,7 +108,7 @@ fn a_postgres_urls_password_is_in_neither_its_debug_text_nor_its_identity() {
 }
 
 /// Catches: an open of a Postgres store that cannot be reached succeeding (the
-/// scheduler would run in memory behind a flag that promises durability), failing
+/// executor would run in memory behind a flag that promises durability), failing
 /// with anything but [`StateError::Open`], or saying the URL's password. The socket
 /// directory is one that does not exist.
 #[test]
@@ -149,10 +135,9 @@ fn mode(path: &std::path::Path) -> u32 {
         & 0o777
 }
 
-/// Catches: a `sqlite://` store that is not opened (the scheduler would run in memory
+/// Catches: a `sqlite://` store that is not opened (the executor would run in memory
 /// behind a flag that promises durability), one whose directory must exist beforehand,
-/// and one that does not hold its file against a second frontend. The epoch policy comes
-/// with the store.
+/// and one that does not hold its file against a second frontend.
 #[test]
 fn a_sqlite_value_opens_its_file_and_holds_it() {
     let dir = scratch("open");
@@ -160,7 +145,6 @@ fn a_sqlite_value_opens_its_file_and_holds_it() {
     let uri = StateStoreUri::Sqlite(file.clone());
     let store = uri.open().expect("opened");
     assert!(file.exists(), "the file is made, with its directory");
-    assert_eq!(store.epoch, EpochPolicy::Keep);
     let refused = uri.open().err().expect("held");
     assert!(
         matches!(&refused, StateError::Open(why) if why.contains("another kbf process")),
@@ -184,7 +168,7 @@ fn a_sqlite_open_writes_no_generation_row_and_the_store_is_named_by_its_file() {
     }
 }
 
-/// Catches: the scheduler's state (every operation's request, every lease) readable by
+/// Catches: the state (every operation's rows) readable by
 /// other users of the machine: the directory the open makes is 0700, and the state file,
 /// its lock and the journal files SQLite makes beside it are 0600, whatever the umask
 /// (the open does not rely on it). A directory that exists keeps its mode.
@@ -234,7 +218,7 @@ fn a_sqlite_value_that_cannot_be_opened_names_the_path() {
 }
 
 /// Catches: the flag not reaching the server's arguments, a default other than the
-/// in-memory scheduler, a Postgres socket URL the command line refuses, a URL with a
+/// in-memory executor, a Postgres socket URL the command line refuses, a URL with a
 /// password accepted on the command line (it is world-readable), and a value of another
 /// kind accepted.
 #[test]

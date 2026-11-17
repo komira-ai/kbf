@@ -199,11 +199,8 @@ impl Machine for MetaMachine {
             // go on at the version and format this machine has.
             Ok(LogCommand::MachineVersion(_)) => self.skip(entry.id.index, "MachineVersion"),
             // This log applies only metadata commands, its `Bootstrap` and the raises of
-            // its version, so a later binary wrote a control command.
-            Ok(LogCommand::Farm(_)) => self.skip(entry.id.index, "Farm"),
-            Ok(LogCommand::Report(_)) => self.skip(entry.id.index, "Report"),
-            Ok(LogCommand::Takeover(_)) => self.skip(entry.id.index, "Takeover"),
-            Ok(LogCommand::Checkpoint(_)) => self.skip(entry.id.index, "Checkpoint"),
+            // its version: a control command an earlier binary wrote, or a command of a
+            // later one, is skipped.
             Ok(LogCommand::Unknown) => self.skip(entry.id.index, "Unknown"),
             Err(e) => self.failed = Some((entry.id.index, e)),
         }

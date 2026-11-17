@@ -4,18 +4,13 @@
 //! after it apply. `tests/raft_log.rs` holds the rest of the log's tests.
 
 use std::num::{NonZeroU32, NonZeroU64};
-use std::time::UNIX_EPOCH;
 
 use kbf_front::{MetaLog, MetaLogError};
-use kbf_log::{
-    Checkpoint, FarmBatch, FarmInput, FarmLogId, Format, LogCommand, MachineVersion, Report,
-    Takeover,
-};
+use kbf_log::{FarmLogId, Format, LogCommand, MachineVersion};
 use kbf_meta::{Applied, Command, Retention, ServerId, TierId};
 use kbf_raft::{Entry, LogId, Payload, Storage};
 use kbf_server::{RaftLogError, RaftMetaLog};
 use kbf_store::{FaultFs, Options, Store};
-use kbf_types::{Failure, FarmTime, LeaseId, OperationId, Outcome};
 
 type Log = RaftMetaLog<FaultFs>;
 
@@ -77,33 +72,10 @@ fn append_all(fs: &FaultFs, payloads: Vec<Vec<u8>>) -> u64 {
     last.index.0 + 1
 }
 
-/// One command of each control kind, which the metadata log does not use.
-fn control_commands() -> [LogCommand; 4] {
-    let farm = FarmBatch {
-        now: FarmTime::default(),
-        wall: UNIX_EPOCH,
-        inputs: vec![FarmInput::Tick],
-    };
-    let report = Report {
-        now: FarmTime::default(),
-        operation: OperationId(1),
-        lease: LeaseId::new(5, 0),
-        outcome: Outcome::Failed(Failure::Invalid),
-        action_entry: None,
-    };
-    [
-        LogCommand::Farm(farm),
-        LogCommand::Report(report),
-        LogCommand::Takeover(Takeover {
-            term: NonZeroU64::MIN,
-            now: FarmTime::from_millis(1),
-        }),
-        LogCommand::Checkpoint(Checkpoint {
-            index: 1,
-            digest: [0; 32],
-        }),
-    ]
-}
+/// One entry of each control kind an earlier release wrote and this one does not apply: the
+/// `LogCommand` arms 3 (farm batch), 4 (report), 5 (takeover) and 6 (checkpoint), each with an
+/// empty message. The binary skips the entry without reading its content.
+const CONTROL_ENTRIES: [[u8; 2]; 4] = [[0x1a, 0x00], [0x22, 0x00], [0x2a, 0x00], [0x32, 0x00]];
 
 fn add_tier() -> Command {
     Command::AddTier {
@@ -126,16 +98,16 @@ async fn entries_after_a_skipped_unknown_command_still_apply() {
     assert_eq!(epoch(&log).await, 2);
 }
 
-/// Asserts that each kind of control command (`Farm`, `Report`, `Takeover` and
-/// `Checkpoint`) in the metadata log is skipped and counted, not applied and not
+/// Asserts that each kind of control command an earlier release wrote (`Farm`, `Report`,
+/// `Takeover` and `Checkpoint`) in the metadata log is skipped and counted, not applied and not
 /// refused, and that the command after it applies.
 #[tokio::test]
 async fn a_control_command_in_the_metadata_log_is_skipped() {
-    for command in control_commands() {
+    for command in CONTROL_ENTRIES {
         let fs = FaultFs::new();
         drop(open(&fs, 2).await);
         let dir = fs.restart();
-        append_all(&dir, vec![encoded(&command), alloc_epoch()]);
+        append_all(&dir, vec![command.to_vec(), alloc_epoch()]);
         let log = open(&dir.restart(), 2).await;
         assert_eq!(log.skipped_entries(), 1, "{command:?}");
         assert_eq!(epoch(&log).await, 2, "{command:?}");

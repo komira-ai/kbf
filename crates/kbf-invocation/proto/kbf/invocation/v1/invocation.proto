@@ -162,7 +162,7 @@ message AttemptEnd {
 
 message Accepted {}
 
-// Why a lease was given up (kbf-sched's RequeueReason).
+// Why a lease was given up (`kbf_invocation::RequeueReason`).
 message Requeue {
   RequeueReason reason = 1;
   // For REQUEUE_REASON_OUT_OF_MEMORY: the booking of the run killed and of the next

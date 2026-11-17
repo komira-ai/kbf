@@ -363,8 +363,8 @@ fn the_server_uses_every_cpu_and_refuses_a_reserve() {
 }
 
 /// Catches: an `--api-listen` flag that binds nothing, a start line without the API's
-/// address, an API listener that does not answer `GET /v1/nodes`, and an answer
-/// without the `server` field naming this binary's version and commit.
+/// address, an API listener that does not answer `GET /healthz`, and an answer
+/// without the version and commit of this binary.
 #[cfg(unix)]
 #[test]
 fn api_listen_serves_the_operator_api() {
@@ -374,17 +374,15 @@ fn api_listen_serves_the_operator_api() {
     let api = api_of(&line);
     let mut stream = std::net::TcpStream::connect(api).expect("connect to the API");
     stream
-        .write_all(b"GET /v1/nodes HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n")
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n")
         .expect("send");
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read");
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let version = built_version();
     let (_, commit) = version.split_once('+').expect("a + in the version");
-    let body = format!(
-        "{{\"server\":{{\"version\":\"{version}\",\"commit\":\"{commit}\"}},\"nodes\":[],\
-         \"oldest_protocol\":null,\"protocol_unknown\":0}}"
-    );
+    let body =
+        format!("{{\"status\":\"alive\",\"version\":\"{version}\",\"commit\":\"{commit}\"}}");
     assert!(response.ends_with(&format!("\r\n\r\n{body}")), "{response}");
     interrupt(child);
 }
@@ -423,10 +421,10 @@ fn api_token_file_gates_writes() {
     assert!(!line.contains(TOKEN), "{line}");
     let api = api_of(&line);
     let json = "Content-Type: application/json\r\n";
-    let refused = post(api, "/v1/nodes/ghost:cordon", json);
+    let refused = post(api, "/v1/members/ghost", json);
     assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
     let headers = format!("Authorization: Bearer {TOKEN}\r\n{json}");
-    let passed = post(api, "/v1/nodes/ghost:cordon", &headers);
+    let passed = post(api, "/v1/members/ghost", &headers);
     assert!(
         passed.starts_with("HTTP/1.1 404"),
         "past every gate: {passed}"
@@ -1157,236 +1155,34 @@ fn the_reapi_auth_policy_flag_is_read_at_start() {
     interrupt(child);
 }
 
-/// Catches: `--unservable-wait-secs` parsed but not handed to the scheduler (work no
-/// daemon can run would then wait the default 300 s whatever the operator set, or
-/// some other fixed time), and a default other than the scheduler's.
+/// Catches: a scheduler flag of an earlier release that an old unit or `kbf.toml` still names
+/// refused at start (a retired flag must parse and change nothing), and one that changes what
+/// the listeners hold: a server given every retired scheduler flag has the listeners of one
+/// given none, which hold no executor until the executor is built over a job service.
 #[test]
-fn the_unservable_wait_comes_from_its_flag() {
-    use clap::Parser;
-    use std::time::Duration;
-    let wait = |args: &[&str]| {
-        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
-            .expect("flags parse")
-            .listeners()
-            .expect("listeners")
-            .unservable_wait
-    };
-    assert_eq!(wait(&[]), kbf_sched::UNSERVABLE_WAIT);
-    assert_eq!(
-        wait(&["--unservable-wait-secs", "7"]),
-        Duration::from_secs(7)
-    );
-    assert_eq!(
-        wait(&["--unservable-wait-secs", "3600"]),
-        Duration::from_secs(3_600)
-    );
-}
-
-/// Catches: `--default-platform` parsed but not handed to the listeners (the live
-/// incident's fix would then be off whatever the operator set), a default other than
-/// linux/x86_64, `none` read as a platform, an OS or architecture no daemon runs
-/// accepted (a typo found at the first action instead of at start), and a value with
-/// no architecture.
-#[test]
-fn the_default_platform_comes_from_its_flag() {
-    use clap::Parser;
-    use kbf_front::DefaultPlatform;
-    let parse = |value: Option<&str>| {
-        let args = std::iter::once("kbf-server")
-            .chain(value.into_iter().flat_map(|v| ["--default-platform", v]));
-        kbf_server::Args::try_parse_from(args)
-    };
-    let platform = |value| {
-        parse(value)
-            .expect("flags parse")
-            .listeners()
-            .expect("listeners")
-            .default_platform
-    };
-    assert_eq!(platform(None), DefaultPlatform::LINUX_X86_64);
-    assert_eq!(platform(Some("none")), DefaultPlatform::NONE);
-    assert_eq!(
-        platform(Some("macos/arm64"))
-            .get()
-            .map(|(os, a)| (os, a.name())),
-        Some(("macos", "arm64"))
-    );
-    for bad in [
-        "windows/x86_64",
-        "linux",
-        "linux/mips",
-        "linux/",
-        "/x86_64",
-        "",
-    ] {
-        let err = parse(Some(bad)).expect_err(bad);
-        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
-    }
-}
-
-/// Catches: `--qos-allowed` parsed but not handed to the listeners (an operator who
-/// narrows the list would still grant `batch`), a default list other than `ci,batch`
-/// (`interactive` must not be open to every client unless an operator says so), and a
-/// level that is none, or an empty list, accepted.
-#[test]
-fn the_qos_levels_a_header_may_name_come_from_their_flag() {
-    use clap::Parser;
-    use kbf_front::QosAllow;
-    let parse = |value: Option<&str>| {
-        let args = std::iter::once("kbf-server")
-            .chain(value.into_iter().flat_map(|v| ["--qos-allowed", v]));
-        kbf_server::Args::try_parse_from(args)
-    };
-    let allowed = |value| {
-        parse(value)
-            .expect("flags parse")
-            .listeners()
-            .expect("listeners")
-            .qos_allowed
-    };
-    assert_eq!(allowed(None), QosAllow::DEFAULT);
-    assert_eq!(allowed(Some("ci")).to_string(), "ci");
-    assert_eq!(
-        allowed(Some("ci,batch,interactive")).to_string(),
-        "ci,batch,interactive"
-    );
-    for bad in ["", "urgent", "ci,,batch", "BATCH"] {
-        let err = parse(Some(bad)).expect_err(bad);
-        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
-    }
-}
-
-/// Catches: `--learned-sizes` not parsed into the listeners (a farm that ignores it never
-/// keys a request), a default other than `off` (the flag changes a booking only when an
-/// operator sets it), a value other than `off`, `shadow` and `on` accepted.
-#[test]
-fn learned_sizes_come_from_their_flag() {
-    use clap::Parser;
-    use kbf_server::LearnedSizes;
-    let parse = |args: &[&str]| {
-        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
-    };
-    let sizes = |args: &[&str]| {
-        parse(args)
-            .expect("flags parse")
-            .listeners()
-            .expect("listeners")
-            .learned_sizes
-    };
-    assert_eq!(sizes(&[]), LearnedSizes::Off);
-    assert_eq!(sizes(&["--learned-sizes", "off"]), LearnedSizes::Off);
-    assert_eq!(sizes(&["--learned-sizes=shadow"]), LearnedSizes::Shadow);
-    assert_eq!(sizes(&["--learned-sizes", "on"]), LearnedSizes::On);
-    for bad in ["", "ON", "true", "yes", "1"] {
-        let err = parse(&["--learned-sizes", bad]).expect_err(bad);
-        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{bad}");
-    }
-}
-
-/// Catches: `--exclusive-actions` not parsed into the listeners (a farm that ignores it
-/// books an action as it always did), a default other than off (the flag changes every
-/// booking, so only an operator sets it), and a value given to the switch.
-#[test]
-fn exclusive_actions_come_from_their_flag() {
-    use clap::Parser;
-    let args = |extra: &[&str]| {
-        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(extra.iter().copied()))
-    };
-    let on = |extra: &[&str]| {
-        args(extra)
-            .expect("flags parse")
-            .listeners()
-            .expect("listeners")
-            .exclusive_actions
-    };
-    assert!(!on(&[]));
-    assert!(on(&["--exclusive-actions"]));
-    args(&["--exclusive-actions=true"]).expect_err("a switch takes no value");
-}
-
-/// Catches `--no-memory-climb` not reaching the listeners (a server that ignores it
-/// climbs), or read the wrong way round (the default must climb), or a ladder lost with it.
-#[test]
-fn the_memory_climb_is_on_unless_its_flag_turns_it_off() {
+fn the_retired_scheduler_flags_parse_and_change_nothing() {
     use clap::Parser;
     let listeners = |args: &[&str]| {
-        kbf_server::Args::parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
+        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
+            .expect("the retired flags still parse")
             .listeners()
             .expect("listeners")
     };
-    assert!(listeners(&[]).memory_climb);
-    assert!(!listeners(&["--no-memory-climb"]).memory_climb);
-    // The ladder is still read: the first rung is the booking.
-    assert_eq!(
-        listeners(&["--no-memory-climb", "--memory-ladder-gib=2,8"]).memory_ladder,
-        kbf_server::MemoryLadder::from_gib(&[2, 8]).unwrap()
-    );
-}
-
-/// Catches `--no-memory-climb` refused by the scheduler-core check, with or without
-/// `--scheduler-core=legacy` and with learned sizes on: it is a legacy-core feature, always
-/// accepted.
-#[test]
-fn no_memory_climb_is_accepted() {
-    use clap::Parser;
-    let check = |flags: &[&str]| {
-        kbf_server::Args::parse_from(std::iter::once("kbf-server").chain(flags.iter().copied()))
-            .check_scheduler_core()
-    };
-    check(&["--no-memory-climb"]).expect("the flag alone");
-    check(&["--scheduler-core=legacy", "--no-memory-climb"]).expect("legacy");
-    check(&["--no-memory-climb", "--learned-sizes=on"]).expect("learned on");
-}
-
-/// Catches: `--memory-ladder-gib` not parsed into the listeners' ladder (a farm that
-/// ignores it books 4 GiB whatever the operator set), a default other than 4, 16 and
-/// 32 GiB, a comma that does not separate rungs, and a ladder that is not ascending
-/// and positive accepted: an empty rung, a zero, a repeated or falling rung, one that
-/// overflows bytes, or a word.
-#[test]
-fn the_memory_ladder_comes_from_its_flag() {
-    use clap::Parser;
-    use kbf_server::{ConfigError, MemoryLadder};
-    let listeners = |args: &[&str]| {
-        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
-            .map(|args| args.listeners())
-    };
-    let ladder = |args: &[&str]| listeners(args).expect("flags parse").expect("listeners");
-    assert_eq!(
-        ladder(&[]).memory_ladder,
-        MemoryLadder::from_gib(&[4, 16, 32]).unwrap()
-    );
-    assert_eq!(
-        ladder(&["--memory-ladder-gib", "2,8"]).memory_ladder,
-        MemoryLadder::from_gib(&[2, 8]).unwrap()
-    );
-    assert_eq!(
-        ladder(&["--memory-ladder-gib=1"]).memory_ladder,
-        MemoryLadder::from_gib(&[1]).unwrap(),
-        "one rung, then a whole host"
-    );
-    for bad in ["0", "0,4", "4,4", "16,4", "4,16,16", "1099511627776"] {
-        let refused = listeners(&["--memory-ladder-gib", bad])
-            .expect("the flag parses")
-            .err();
-        assert!(
-            matches!(refused, Some(ConfigError::MemoryLadder(_))),
-            "{bad}: {refused:?}"
-        );
-    }
-    for bad in ["", "4,", "four", "-4", "4,,8"] {
-        assert!(
-            listeners(&["--memory-ladder-gib", bad]).is_err(),
-            "{bad:?} parsed"
-        );
-    }
-    let error = listeners(&["--memory-ladder-gib", "4,4"])
-        .expect("parses")
-        .expect_err("refused");
-    assert_eq!(
-        error.to_string(),
-        "--memory-ladder-gib: memory rung 1 does not rise above the one before it"
-    );
+    let plain = listeners(&[]);
+    let given = listeners(&[
+        "--unservable-wait-secs=7",
+        "--default-platform=none",
+        "--qos-allowed=ci",
+        "--memory-ladder-gib=2,8",
+        "--learned-sizes=on",
+        "--exclusive-actions",
+        "--no-memory-climb",
+        "--whole-node-max=3",
+    ]);
+    assert!(plain.executor.is_none() && given.executor.is_none());
+    assert_eq!(given.finished_retention, plain.finished_retention);
+    assert_eq!(given.shutdown_timeout, plain.shutdown_timeout);
+    assert_eq!(given.stream_limits, plain.stream_limits);
 }
 
 /// Catches: `--finished-retention-secs` parsed but not handed to the scheduler, a
@@ -1402,7 +1198,7 @@ fn the_finished_retention_comes_from_its_flag() {
             .expect("listeners")
             .finished_retention
     };
-    assert_eq!(retention(&[]), kbf_sched::FINISHED_RETENTION);
+    assert_eq!(retention(&[]), kbf_server::executor::FINISHED_RETENTION);
     assert_eq!(
         retention(&["--finished-retention-secs", "0"]),
         Duration::ZERO

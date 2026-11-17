@@ -12,10 +12,9 @@ use kbf_auth::Policy;
 use kbf_front::{Cache, MemoryMetaLog, Recorder, VerifiedBlob};
 use kbf_invocation::{
     Call, CallKind, Event, ExecuteAnswer, Finished, InvocationId, LeaseEnd, Listing, Metadata,
-    Outcome, Output, Owner, RecordKey, Usage, WallTime,
+    Outcome, Output, Owner, RecordKey, RequeueReason, Usage, WallTime,
 };
 use kbf_objstore::MemoryStore;
-use kbf_sched::RequeueReason;
 use kbf_server::{Api, Listeners, StateStore, bind_server_with_ui};
 use kbf_types::{Digest, DigestFunction, LeaseId, OperationId, WorkerId};
 use serde_json::Value;
@@ -91,19 +90,8 @@ impl Server {
             worker: loopback(),
             reapi_tls: None,
             worker_tls: None,
-            tick: Duration::from_millis(50),
-            unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-            default_platform: kbf_front::DefaultPlatform::NONE,
-            qos_allowed: kbf_front::QosAllow::DEFAULT,
-            memory_ladder: kbf_server::MemoryLadder::default(),
-            memory_climb: true,
-            learned_sizes: kbf_server::LearnedSizes::Off,
-            exclusive_actions: false,
-            placement_load: kbf_server::PlacementLoad::Off,
-            placement_predictions: kbf_server::PlacementPredictions::Off,
-            usage_profiles: kbf_server::UsageProfiles::Off,
-            whole_node: None,
-            finished_retention: kbf_sched::FINISHED_RETENTION,
+            executor: None,
+            finished_retention: kbf_server::executor::FINISHED_RETENTION,
             shutdown_timeout: Duration::from_secs(10),
             streams: kbf_server::StreamTiming::default(),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,

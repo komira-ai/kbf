@@ -4,6 +4,9 @@
 
 mod support;
 
+#[path = "frontend/idle_executor.rs"]
+mod idle_executor;
+
 use std::future::pending;
 use std::sync::Arc;
 
@@ -158,9 +161,9 @@ fn the_storage_flag_is_a_url() {
 }
 
 /// Catches (kbf#791 with `--storage`): proxied REAPI routes built without
-/// the progress ticker, so an Execute stream waiting for a worker sends nothing and a
+/// the progress ticker, so an Execute stream waiting for its job sends nothing and a
 /// load balancer's idle timeout cuts it. The action is in the frontend's own cache (the
-/// scheduler still reads there); the node is unreachable and never asked. With
+/// executor still reads there); the node is unreachable and never asked. With
 /// `--progress-interval-secs 1` the idle stream is sent the same operation again, not
 /// done. Catches: `routes_proxied` without `with_progress`: the read times out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -185,6 +188,9 @@ async fn a_proxied_execute_stream_is_sent_progress() {
         )
         .await
         .expect("store");
+    let mut listeners = args.listeners().expect("listeners");
+    let (executor, fake) = idle_executor::idle_executor().await;
+    listeners.executor = Some(executor);
     let Bound {
         reapi,
         worker,
@@ -192,14 +198,17 @@ async fn a_proxied_execute_stream_is_sent_progress() {
         ..
     } = bind_server_with_storage(
         local,
-        args.listeners().expect("listeners"),
+        listeners,
         None,
         Policy::allow_all(),
         args.storage().expect("the flag"),
         pending(),
     )
     .expect("bind the frontend");
-    tokio::spawn(async move { serving.await.expect("serve the frontend") });
+    tokio::spawn(async move {
+        let _job_service = fake;
+        serving.await.expect("serve the frontend")
+    });
 
     let client = Client::connect(reapi, worker).await;
     let mut executed = client.execute(&job.action).await;

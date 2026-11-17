@@ -1,8 +1,7 @@
 # Operator verbs: every verb, the route that does it, or why it stays local
 
 Status: a reference table. Every route of `kbf-server` must have a row here by method and
-path, and the node verbs (`:cordon`, `:drain`, `:uncordon`) one row each:
-`crates/kbf-server/tests/route_docs.rs` fails otherwise (it does not check the gate column). The authority for
+path: `crates/kbf-server/tests/route_docs.rs` fails otherwise (it does not check the gate column). The authority for
 a built route is [../api.md](../api.md); for an open pull request, that pull request. This page
 is the index: the verb an operator means, the one route that does it, and the gate it passes.
 
@@ -27,7 +26,7 @@ route stays local, and the last column says why.
 ## 1. Routes, one row each
 
 Every row is one method and one path. A router `.route(` call that serves two methods has a row
-per method; a custom method (`:cordon`) has a row per verb. The sources of the router are
+per method; a custom method (`:adopt`) has a row per verb. The sources of the router are
 `crates/kbf-server/src/{api,release/http,storage_health,health,metrics,http_blobs,
 http_invocations,http_sched,http_history,enroll/api,node_self,ui_mount}.rs` and `frontend.rs`, where they are merged.
 
@@ -35,15 +34,8 @@ http_invocations,http_sched,http_history,enroll/api,node_self,ui_mount}.rs` and 
 
 | Verb | Method and route | Status | Gate |
 |---|---|---|---|
-| cluster status (nodes, software, placement) | `GET /v1/nodes` | [F] | open |
-| one node (capacity, booked, free, leases) | `GET /v1/nodes/{node}` | [F] | open |
 | a storage host's own member and the storage numbers (its updater, on the worker listener) | `GET /v1/nodes/{node}/storage-health` | [F] | the `updater` certificate of that node, over mutual TLS ([../api.md](../api.md), "Own-node calls of a host's updater") |
 | list members of the storage map | `GET /v1/members` | [F] | open |
-| leases the scheduler holds (paged, by node) | `GET /v1/leases` | [F] | open |
-| the queue: depth, ages, why work waits | `GET /v1/queue` | [F] | open |
-| cordon a node | `POST /v1/nodes/{node}:cordon` | [F] | write |
-| drain a node | `POST /v1/nodes/{node}:drain` | [F] | write |
-| uncordon a node | `POST /v1/nodes/{node}:uncordon` | [F] | write |
 | set a member active or draining (join, leave) | `POST /v1/members/{id}` | [F] | write |
 | may a storage member's host be stopped now (the update gate) | `GET /v1/members/{id}/safe-to-stop` | [F] | write |
 | deny an entry (serial, SPKI hash, node id) | `POST /v1/denied` | [F] | write |
@@ -53,7 +45,6 @@ http_invocations,http_sched,http_history,enroll/api,node_self,ui_mount}.rs` and 
 | begin the frontend's drain | `POST /v1/frontend/drain` | [F] | write |
 | frontend retire status | `GET /v1/frontend/retire` | [F] | open |
 | retire the frontend (stop its intake and worker streams, keep its callers) | `POST /v1/frontend/retire` | [F] | write |
-| raise the stored epoch (after a restore from a backup) | `POST /v1/epoch/bump` | [F] | write |
 | storage health (under-replicated blobs) | `GET /v1/storage` | [F] | open |
 
 There is no rebalance verb: handoff of data between members is not built, and none is invented
@@ -139,7 +130,7 @@ default, `--ui=false` turns them off. Open: no gate, whatever the REAPI policy s
 |---|---|---|---|
 | the Overview page | `GET /ui` | [F] | none (open) |
 | the same, with a trailing slash | `GET /ui/` | [F] | none (open) |
-| every other page and the stylesheet (`/ui/nodes`, `/ui/nodes/{id}`, `/ui/builds`, `/ui/builds/{id}`, `/ui/leases`, `/ui/queue`, `/ui/static/kbf.css`) | `GET /ui/{*rest}` | [F] | none (open) |
+| every other page and the stylesheet (`/ui/builds`, `/ui/builds/{id}`, `/ui/static/kbf.css`) | `GET /ui/{*rest}` | [F] | none (open) |
 
 ### Health
 
@@ -147,8 +138,8 @@ default, `--ui=false` turns them off. Open: no gate, whatever the REAPI policy s
 |---|---|---|---|
 | liveness | `GET /healthz` | [F] | none |
 | readiness | `GET /readyz` | [F] | none |
-| readiness for REAPI calls (`/readyz`, and a worker is connected) | `GET /readyz/reapi` | [F] | none |
-| farm summary (ready, nodes by state, queue, leases, storage) | `GET /v1/health` | [F] | open |
+| readiness for REAPI calls (`/readyz`, and the frontend has an executor: check `no_executor`) | `GET /readyz/reapi` | [F] | none |
+| farm summary (ready, failing checks, storage) | `GET /v1/health` | [F] | open |
 | metrics | `GET /metrics` | [F] | none |
 
 The Mac device manager is a separate service, not the operator API. kbf's (`kbf-mdm`, with
@@ -171,7 +162,7 @@ verb of the farm.
 | frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | removed: a frontend is updated by a roll of the `kbf-proxy` pool, driven by `kbf-updater` (`frontend-proxy.md` section 4) **[V]** |
 | render, check, install units, swap, verify certificate (the `envoy render, check, apply` verbs are retired: no Envoy) | `kbf-deploy` **[F]** | become installer logic and package units; root |
 | `mdm`, `minio`, `pilot` | `kbf-deploy` **[F]** | leave the product (distribution.md section 8); `mdm` is frozen, its successor `hostkeeper-mdm` in komira-ai/hostkeeper; `erase-request` is deleted with the gate it signed for |
-| `kbf cluster status`, `drain`, `undrain`, `member`, `denied`, `epoch-bump`, `object-store status\|audit\|connection\|bind\|unbind\|verify` | the `kbf` CLI **[F]** (the last two groups: unit G1) | a thin client of the routes above, no logic |
+| `kbf cluster status`, `drain`, `member`, `denied`, `object-store status\|audit\|connection\|bind\|unbind\|verify` | the `kbf` CLI **[F]** (the last two groups: unit G1) | a thin client of the routes above, no logic |
 | frontend log tail | none | cut (Q4) |
 | update policy, image pull | none | no source verb exists (Q5) |
 | rotate the CA | its own unit | out of the object-store series (Q5) |

@@ -1,5 +1,7 @@
 # Failure classes: farm, request, action
 
+> **Superseded by [direct-js.md](direct-js.md):** kbf no longer schedules; it has no leases, farm reruns or budgets. A job's infra, lost or out-of-memory ending is resubmitted as the next attempt at most 2 times; a timeout or an invalid action is answered at once. This page records the earlier design.
+
 When an action fails, the person reading the build log needs one answer first: is this
 mine to fix, or the farm's? This document defines the classes of failure, what the
 farm does today, and what is **proposed** so that a farm problem is never reported as
@@ -925,7 +927,7 @@ never passes the cap, and only a kill at the cap is answered as the action's.
 
 ### 10.1 Simulation (`kbf-sim`)
 
-New invariants beside [simulation.md](simulation.md#4-invariants) I1-I15:
+New invariants beside [simulation.md](simulation.md) I1-I15:
 
 - **I16. An OK answer comes only from a fit run.** An OK answer is produced only by a
   lease whose run the daemon model marked as on a node fit for the action's

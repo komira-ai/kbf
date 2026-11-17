@@ -1,607 +1,661 @@
-//! The `exec/` rows over the in-memory store, whose clock a test moves by hand.
+//! The executor's rows of the state store: ids, operation rows, answers and the claim of a gone
+//! process's operations, over the in-memory store of the state crate.
 
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{ManualClock, Revision};
+use kbf_proto::reapi::ActionResult;
+use kbf_state::ManualClock;
+use kbf_types::DigestFunction;
 
 use super::*;
+use crate::executor::tests::Faulty;
 
-const TTL: Duration = Duration::from_secs(45);
-
-struct Rig {
+struct Env {
     clock: Arc<ManualClock>,
-    fake: Arc<Fake>,
-    rows: ExecRows,
+    store: Arc<Faulty>,
 }
 
-fn rig() -> Rig {
+fn env() -> Env {
     let clock = Arc::new(ManualClock::default());
-    let fake = Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None));
-    let rows = ExecRows::new(Arc::clone(&fake) as Arc<dyn Store>);
-    Rig { clock, fake, rows }
+    let store = Arc::new(Faulty::new(Arc::clone(&clock)));
+    Env { clock, store }
 }
 
-impl Rig {
-    fn put(&self, key: &str, value: Vec<u8>) {
-        let put = Txn::new().put(key, value, Cond::Any);
-        self.fake.txn(put).expect("store").expect("no conflict");
+impl Env {
+    fn rows(&self, instance: &str) -> Rows {
+        Rows::new(self.store.clone() as Arc<dyn Store>, instance)
     }
 
-    fn expire(&self) {
-        self.clock.advance(TTL + Duration::from_secs(1));
+    fn raw(&self, key: &str) -> Option<Vec<u8>> {
+        self.store.get(key).expect("a read").map(|row| row.value)
     }
 
-    fn owner(&self, worker: &str) -> String {
-        let entries = self.rows.workers().expect("workers");
-        let entry = entries.iter().find(|e| e.worker == worker);
-        entry.expect("a worker row").row.owner_instance.clone()
+    fn put(&self, key: &str, value: &[u8]) {
+        self.store
+            .txn(Txn::new().put(key, value.to_vec(), Cond::Any))
+            .expect("a write")
+            .expect("no conflict");
     }
 
-    fn entry(&self, worker: &str) -> WorkerEntry {
-        let entries = self.rows.workers().expect("workers");
-        entries
-            .into_iter()
-            .find(|e| e.worker == worker)
-            .expect("a worker row")
+    fn pass(&self, by: Duration) {
+        self.clock.advance(by);
     }
 }
 
-fn alive() -> Liveness {
-    Liveness {
-        group: "kbf".to_owned(),
-        started_ms: 1_700_000_000_000,
-        release: "0.1.0".to_owned(),
-        draining: false,
+fn action(tag: u8) -> ActionKey {
+    ActionKey {
+        instance: "main".to_owned(),
+        action: Digest::new(DigestFunction::Sha256, [tag; 32], 4096 + u64::from(tag)),
     }
 }
 
-fn shape() -> Shape {
-    Shape {
-        cpu_millis: 8_000,
-        memory_bytes: 17_179_869_184,
-        slots: 4,
-        arch: "x86_64".to_owned(),
+fn row(tag: u8) -> OpRow {
+    let key = action(tag);
+    OpRow {
+        owner: "ignored".to_owned(),
+        instance: key.instance,
+        hash: key.action.hash_hex(),
+        size: key.action.size_bytes,
+        attempt: 1,
+        job: format!("k0-{tag}-1"),
+        key: Some(format!("cas/b/{tag}-1/aa")),
+        whole_machine: true,
     }
 }
 
-fn worker_row(owner: &str) -> WorkerRow {
-    WorkerRow {
-        owner_instance: owner.to_owned(),
-        farm_instance: format!("farm-{owner}"),
-        shape: shape(),
-    }
+fn ran(exit_code: i32) -> Finished {
+    Finished::Ran(Box::new(ActionResult {
+        exit_code,
+        ..ActionResult::default()
+    }))
 }
 
-fn job_row(seq: u64) -> JobRow {
-    JobRow {
-        lease_term: 7,
-        lease_seq: seq,
-        action: "sha256:ab/12".to_owned(),
-        pack_key: "cas/b/build/nonce-0".to_owned(),
-        submitted_ms: 1_700_000_000_500,
-    }
+fn op(n: u64) -> OperationId {
+    OperationId(n)
 }
 
-/// `owner` beats and creates `worker`: the state of a frontend that registered a worker.
-fn started(rig: &Rig, owner: &str, worker: &str) -> (Live, Held) {
-    let live = rig.rows.beat(owner, &alive(), TTL, &[]).expect("beat");
-    let held = rig
-        .rows
-        .create_worker(worker, &worker_row(owner))
-        .expect("create");
-    (live, held)
-}
+const DAY: Duration = Duration::from_secs(86_400);
 
-fn conflict(result: Result<impl std::fmt::Debug, RowsError>, key: &str) {
-    let error = result.expect_err("a conflict");
-    assert!(
-        error.conflicts_on(key),
-        "{error:?} is not a conflict on {key}"
-    );
-}
+// ---- ids
 
-/// The rows are a format: the bytes of each are what a build wrote, so a change to a key,
-/// the version byte or a field name fails here and a later build reads this one's rows.
+/// Ids come from blocks of the shared counter: two rows over one store never give one id, the
+/// first is 1, and a process that takes its next block takes it past every other's.
 #[test]
-fn each_row_has_the_bytes_of_its_format() {
-    let rig = rig();
-    rig.rows.beat("i1", &alive(), TTL, &[]).expect("beat");
-    rig.rows
-        .create_worker("js:kbf.i1-0", &worker_row("i1"))
-        .expect("create");
-    let held = Held {
-        worker: "js:kbf.i1-0".to_owned(),
-        version: rig.entry("js:kbf.i1-0").version,
-    };
-    rig.rows
-        .insert_job(&held, "k1-2-0", &job_row(9))
-        .expect("insert");
-
-    let value = |key: &str| rig.fake.get(key).expect("get").expect("a row").value;
-    let text = |key: &str| {
-        let bytes = value(key);
-        assert_eq!(bytes[0], 1, "the version byte of {key}");
-        String::from_utf8(bytes[1..].to_vec()).expect("utf-8")
-    };
-    assert_eq!(
-        text("exec/fe/i1"),
-        r#"{"draining":false,"group":"kbf","release":"0.1.0","started_ms":1700000000000}"#
-    );
-    assert_eq!(
-        text("exec/w/js:kbf.i1-0"),
-        concat!(
-            r#"{"farm_instance":"farm-i1","owner_instance":"i1","#,
-            r#""shape":{"arch":"x86_64","cpu_millis":8000,"memory_bytes":17179869184,"slots":4}}"#
-        )
-    );
-    assert_eq!(
-        text("exec/j/js:kbf.i1-0/k1-2-0"),
-        concat!(
-            r#"{"action":"sha256:ab/12","lease_seq":9,"lease_term":7,"#,
-            r#""pack_key":"cas/b/build/nonce-0","submitted_ms":1700000000500}"#
-        )
-    );
-}
-
-#[test]
-fn rows_read_back_as_written() {
-    let rig = rig();
-    let (_, held) = started(&rig, "i1", "w1");
-    rig.rows
-        .insert_job(&held, "j1", &job_row(1))
-        .expect("insert");
-    rig.rows
-        .insert_job(&held, "j2", &job_row(2))
-        .expect("insert");
-
-    assert_eq!(rig.rows.liveness("i1").expect("read"), Some(alive()));
-    assert_eq!(rig.rows.liveness("i2").expect("read"), None);
-    assert_eq!(
-        rig.rows.live_instances().expect("scan"),
-        vec![("i1".to_owned(), alive())]
-    );
-    let entry = rig.entry("w1");
-    assert_eq!(
-        (entry.row.clone(), entry.version),
-        (worker_row("i1"), held.version)
-    );
-    let jobs = rig.rows.jobs("w1").expect("jobs");
-    let seen: Vec<_> = jobs
-        .iter()
-        .map(|j| (j.job.as_str(), j.row.lease_seq))
-        .collect();
-    assert_eq!(seen, [("j1", 1), ("j2", 2)]);
-}
-
-/// Catches a claim that does not wait for the owner's liveness row to go: it must refuse
-/// while the row is there and succeed on the store's clock once it expired.
-#[test]
-fn a_claim_needs_the_owners_liveness_row_absent() {
-    let rig = rig();
-    started(&rig, "a", "w");
-    let b = rig.rows.beat("b", &alive(), TTL, &[]).expect("beat");
-
-    let entry = rig.entry("w");
-    conflict(rig.rows.claim(&b, &entry, "farm-b"), "exec/fe/a");
-    assert_eq!(rig.owner("w"), "a");
-
-    rig.expire();
-    let b = rig.rows.beat("b", &alive(), TTL, &[]).expect("beat");
-    let held = rig.rows.claim(&b, &entry, "farm-b").expect("claim");
-    assert_eq!(rig.owner("w"), "b");
-    let claimed = rig.entry("w");
-    assert_eq!(claimed.version, held.version);
-    assert_eq!(claimed.row.farm_instance, "farm-b");
-    assert_eq!(claimed.row.shape, shape());
-}
-
-#[test]
-fn a_released_worker_is_claimed_at_once_and_an_own_worker_again() {
-    let rig = rig();
-    let (_, held) = started(&rig, "a", "w");
-    let b = rig.rows.beat("b", &alive(), TTL, &[]).expect("beat");
-    rig.rows.release(&held, &worker_row("a")).expect("release");
-    assert_eq!(rig.owner("w"), "");
-    let taken = rig
-        .rows
-        .claim(&b, &rig.entry("w"), "farm-b")
-        .expect("claim");
-
-    // The owner dropped it by self-fencing and still beats: it claims its own row again.
-    let a = rig.rows.beat("b", &alive(), TTL, &[taken]).expect("beat");
-    let again = rig
-        .rows
-        .claim(&a, &rig.entry("w"), "farm-b2")
-        .expect("claim");
-    assert_eq!(rig.entry("w").version, again.version);
-    assert_eq!(rig.owner("w"), "b");
-}
-
-#[test]
-fn two_claims_of_one_worker_have_one_winner() {
-    let rig = rig();
-    started(&rig, "a", "w");
-    rig.expire();
-    let b = rig.rows.beat("b", &alive(), TTL, &[]).expect("beat");
-    let c = rig.rows.beat("c", &alive(), TTL, &[]).expect("beat");
-    let seen = rig.entry("w");
-
-    let won = rig.rows.claim(&b, &seen, "farm-b").expect("one wins");
-    conflict(rig.rows.claim(&c, &seen, "farm-c"), "exec/w/w");
-    assert_eq!(rig.owner("w"), "b");
-    assert_eq!(rig.entry("w").version, won.version);
-}
-
-#[test]
-fn a_process_whose_liveness_row_expired_claims_nothing() {
-    let rig = rig();
-    let (_, held) = started(&rig, "a", "w");
-    let b = rig.rows.beat("b", &alive(), TTL, &[]).expect("beat");
-    rig.rows.release(&held, &worker_row("a")).expect("release");
-    rig.expire();
-    conflict(rig.rows.claim(&b, &rig.entry("w"), "farm-b"), "exec/fe/b");
-    assert_eq!(rig.owner("w"), "");
-
-    // A beat after the expiry is a new row: the old token no longer matches it.
-    rig.rows.beat("b", &alive(), TTL, &[]).expect("beat");
-    conflict(rig.rows.claim(&b, &rig.entry("w"), "farm-b"), "exec/fe/b");
-}
-
-/// Every write of a holder carries a check of the worker row: after another process claimed,
-/// the job insert, the job delete, the beat, the release and the retirement of the loser all
-/// fail and write nothing.
-#[test]
-fn a_job_write_without_the_worker_version_is_refused() {
-    let rig = rig();
-    let (_, old) = started(&rig, "a", "w");
-    rig.rows
-        .insert_job(&old, "j1", &job_row(1))
-        .expect("insert");
-    rig.expire();
-    let b = rig.rows.beat("b", &alive(), TTL, &[]).expect("beat");
-    rig.rows
-        .claim(&b, &rig.entry("w"), "farm-b")
-        .expect("claim");
-
-    conflict(rig.rows.insert_job(&old, "j2", &job_row(2)), "exec/w/w");
-    conflict(rig.rows.delete_job(&old, "j1"), "exec/w/w");
-    conflict(
-        rig.rows
-            .beat("a", &alive(), TTL, std::slice::from_ref(&old)),
-        "exec/w/w",
-    );
-    conflict(rig.rows.release(&old, &worker_row("a")), "exec/w/w");
-    conflict(rig.rows.retire(&old), "exec/w/w");
-
-    assert_eq!(
-        rig.rows.liveness("a").expect("read"),
-        None,
-        "the failed beat renewed"
-    );
-    assert_eq!(rig.owner("w"), "b");
-    let jobs = rig.rows.jobs("w").expect("jobs");
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].job, "j1");
-}
-
-#[test]
-fn a_job_row_is_inserted_once_and_a_repeat_goes_on() {
-    let rig = rig();
-    let (_, held) = started(&rig, "a", "w");
-    assert_eq!(
-        rig.rows
-            .insert_job(&held, "j", &job_row(1))
-            .expect("insert"),
-        Insert::Written
-    );
-    assert_eq!(
-        rig.rows
-            .insert_job(&held, "j", &job_row(2))
-            .expect("insert"),
-        Insert::Present
-    );
-    let jobs = rig.rows.jobs("w").expect("jobs");
-    assert_eq!(jobs[0].row, job_row(1), "the repeat replaced the row");
-
-    // A repeat by a process that lost the worker meanwhile does not go on.
-    rig.expire();
-    let b = rig.rows.beat("b", &alive(), TTL, &[]).expect("beat");
-    rig.rows
-        .claim(&b, &rig.entry("w"), "farm-b")
-        .expect("claim");
-    conflict(rig.rows.insert_job(&held, "j", &job_row(1)), "exec/w/w");
-}
-
-#[test]
-fn a_job_row_goes_after_the_ack_and_a_repeat_changes_nothing() {
-    let rig = rig();
-    let (_, held) = started(&rig, "a", "w");
-    rig.rows
-        .insert_job(&held, "j", &job_row(1))
-        .expect("insert");
-    rig.rows.delete_job(&held, "j").expect("delete");
-    rig.rows.delete_job(&held, "j").expect("delete again");
-    assert!(rig.rows.jobs("w").expect("jobs").is_empty());
-    rig.rows.retire(&held).expect("retire");
-    assert!(rig.rows.workers().expect("workers").is_empty());
-}
-
-#[test]
-fn a_beat_renews_only_while_every_worker_is_held() {
-    let rig = rig();
-    let (_, w1) = started(&rig, "a", "w1");
-    let w2 = rig
-        .rows
-        .create_worker("w2", &worker_row("a"))
-        .expect("create");
-    let live = rig
-        .rows
-        .beat("a", &alive(), TTL, &[w1.clone(), w2.clone()])
-        .expect("beat");
-    assert_eq!(live.instance, "a");
-
-    rig.clock.advance(TTL / 2);
-    rig.rows.beat("a", &alive(), TTL, &[w1, w2]).expect("beat");
-    rig.clock.advance(TTL / 2 + Duration::from_secs(1));
-    assert!(
-        rig.rows.liveness("a").expect("read").is_some(),
-        "the renewal did not extend the row"
-    );
-
-    rig.rows.leave("a").expect("leave");
-    assert_eq!(rig.rows.liveness("a").expect("read"), None);
-    rig.rows.leave("a").expect("leave again");
-}
-
-#[test]
-fn jobs_of_one_worker_are_not_those_of_a_worker_it_prefixes() {
-    let rig = rig();
-    let (_, w) = started(&rig, "a", "w");
-    let wx = rig
-        .rows
-        .create_worker("wx", &worker_row("a"))
-        .expect("create");
-    rig.rows.insert_job(&w, "j", &job_row(1)).expect("insert");
-    rig.rows.insert_job(&wx, "k", &job_row(2)).expect("insert");
-    let names = |worker: &str| -> Vec<String> {
-        rig.rows
-            .jobs(worker)
-            .expect("jobs")
-            .into_iter()
-            .map(|j| j.job)
-            .collect()
-    };
-    assert_eq!(names("w"), ["j"]);
-    assert_eq!(names("wx"), ["k"]);
-}
-
-#[test]
-fn a_name_that_is_not_a_key_part_is_refused_everywhere() {
-    let rig = rig();
-    let bad = |result: Result<(), RowsError>, name: &str| {
-        assert_eq!(
-            result,
-            Err(RowsError::BadName {
-                name: name.to_owned()
-            })
+fn id_blocks_are_shared_between_two_rows_over_one_store_and_never_zero() {
+    let env = env();
+    let (a, b) = (env.rows("a"), env.rows("b"));
+    assert_eq!(a.next_id().expect("an id"), op(1));
+    assert_eq!(b.next_id().expect("an id"), op(1 + ID_BLOCK));
+    let mut seen = std::collections::BTreeSet::from([1, 1 + ID_BLOCK]);
+    for _ in 0..ID_BLOCK - 1 {
+        assert!(
+            seen.insert(a.next_id().expect("an id").0),
+            "a block id is given once"
         );
-    };
-    let held = |worker: &str| Held {
-        worker: worker.to_owned(),
-        version: Version(1),
-    };
-    let live = |instance: &str| Live {
-        instance: instance.to_owned(),
-        version: Version(1),
-    };
-    let entry = |worker: &str, owner: &str| WorkerEntry {
-        worker: worker.to_owned(),
-        row: worker_row(owner),
-        version: Version(1),
-    };
-    for name in ["", "a/b"] {
-        bad(rig.rows.beat(name, &alive(), TTL, &[]).map(drop), name);
-        bad(
-            rig.rows.beat("a", &alive(), TTL, &[held(name)]).map(drop),
-            name,
-        );
-        bad(rig.rows.leave(name), name);
-        bad(rig.rows.liveness(name).map(drop), name);
-        bad(
-            rig.rows.create_worker(name, &worker_row("a")).map(drop),
-            name,
-        );
-        bad(
-            rig.rows.claim(&live(name), &entry("w", "a"), "f").map(drop),
-            name,
-        );
-        bad(
-            rig.rows.claim(&live("b"), &entry(name, "a"), "f").map(drop),
-            name,
-        );
-        if !name.is_empty() {
-            // An empty owner is a released row, which names no liveness row to check.
-            bad(
-                rig.rows.claim(&live("b"), &entry("w", name), "f").map(drop),
-                name,
-            );
-        }
-        bad(rig.rows.release(&held(name), &worker_row("a")), name);
-        bad(rig.rows.retire(&held(name)), name);
-        bad(
-            rig.rows.insert_job(&held(name), "j", &job_row(1)).map(drop),
-            name,
-        );
-        bad(
-            rig.rows.insert_job(&held("w"), name, &job_row(1)).map(drop),
-            name,
-        );
-        bad(rig.rows.delete_job(&held(name), "j"), name);
-        bad(rig.rows.delete_job(&held("w"), name), name);
-        bad(rig.rows.jobs(name).map(drop), name);
     }
-    assert_eq!(job_key("w", "j").as_deref(), Ok("exec/j/w/j"));
-}
-
-/// A row a later release wrote is not one this build reads: a scan skips it and counts it, a
-/// single read finds none, and the rows beside it read as before.
-#[test]
-fn an_unknown_row_version_is_skipped_and_counted() {
-    let rig = rig();
-    let (_, held) = started(&rig, "a", "w");
-    rig.rows
-        .insert_job(&held, "j1", &job_row(1))
-        .expect("insert");
-    rig.put("exec/fe/z", vec![2, b'{', b'}']);
-    rig.put("exec/w/z", vec![2, b'x']);
-    rig.put("exec/j/w/j2", vec![0]);
-    assert_eq!(rig.rows.unknown_rows(), 0);
-
+    assert_eq!(a.next_id().expect("the next block").0, 1 + 2 * ID_BLOCK);
+    assert_eq!(b.next_id().expect("an id"), op(2 + ID_BLOCK));
+    assert!(!seen.contains(&0));
     assert_eq!(
-        rig.rows.live_instances().expect("scan"),
-        vec![("a".to_owned(), alive())]
+        env.raw("meta/next_op"),
+        Some((1 + 3 * ID_BLOCK).to_be_bytes().to_vec()),
+        "the counter is the next free id, 8 bytes big-endian"
     );
-    assert_eq!(rig.rows.unknown_rows(), 1);
-    let workers = rig.rows.workers().expect("scan");
-    assert_eq!(workers.len(), 1);
-    assert_eq!(rig.rows.unknown_rows(), 2);
-    assert_eq!(rig.rows.jobs("w").expect("scan").len(), 1);
-    assert_eq!(rig.rows.unknown_rows(), 3);
-    assert_eq!(rig.rows.liveness("z").expect("read"), None);
-    assert_eq!(rig.rows.unknown_rows(), 4);
 }
 
-/// A field a later release adds is ignored: the row reads as the row without it.
+/// A counter of an earlier release that reads 0 never gives id 0, one that reads more starts
+/// there, and one that is not a number is refused.
 #[test]
-fn a_field_a_later_release_adds_is_ignored() {
-    let rig = rig();
-    let live = br#"{"draining":true,"group":"g","new":[1],"release":"r","started_ms":5}"#;
-    let work = br#"{"farm_instance":"f","next":1,"owner_instance":"o","shape":{"arch":"a","cpu_millis":1,"extra":0,"memory_bytes":2,"slots":3}}"#;
-    let job =
-        br#"{"action":"d","lease_seq":2,"lease_term":1,"more":{},"pack_key":"k","submitted_ms":4}"#;
-    let versioned = |body: &[u8]| [&[VERSION][..], body].concat();
-    rig.put("exec/fe/i", versioned(live));
-    rig.put("exec/w/w", versioned(work));
-    rig.put("exec/j/w/j", versioned(job));
-
-    let expected = Liveness {
-        group: "g".to_owned(),
-        started_ms: 5,
-        release: "r".to_owned(),
-        draining: true,
-    };
-    assert_eq!(rig.rows.liveness("i").expect("read"), Some(expected));
-    let entry = rig.entry("w");
-    assert_eq!(
-        entry.row.shape,
-        Shape {
-            cpu_millis: 1,
-            memory_bytes: 2,
-            slots: 3,
-            arch: "a".to_owned()
-        }
-    );
-    let jobs = rig.rows.jobs("w").expect("jobs");
-    assert_eq!(jobs[0].row.pack_key, "k");
-    assert_eq!(rig.rows.unknown_rows(), 0);
-}
-
-/// A row of a known version that is not what it says is refused, by its key and the reason,
-/// whether it is read alone or in a scan.
-#[test]
-fn a_corrupt_row_is_refused_with_its_key() {
-    let corrupt_key = |result: Result<(), RowsError>, key: &str| match result {
-        Err(RowsError::Corrupt { key: k, why }) => {
-            assert_eq!(k, key);
-            assert!(!why.is_empty());
-        }
-        other => panic!("expected a corrupt row at {key}, got {other:?}"),
-    };
-
-    let rig = rig();
-    rig.put("exec/fe/i", vec![VERSION, b'x']);
-    corrupt_key(rig.rows.liveness("i").map(drop), "exec/fe/i");
-    corrupt_key(rig.rows.live_instances().map(drop), "exec/fe/i");
-
-    rig.put("exec/w/w", vec![VERSION, b'{', b'}']);
-    corrupt_key(rig.rows.workers().map(drop), "exec/w/w");
-
-    rig.put("exec/j/w/j", vec![VERSION, b'[', b']']);
-    corrupt_key(rig.rows.jobs("w").map(drop), "exec/j/w/j");
-
-    rig.put("exec/j/w/j", Vec::new());
-    let result = rig.rows.jobs("w");
-    let error = result.expect_err("an empty value");
+fn a_counter_that_reads_zero_starts_at_one_and_one_that_is_no_number_is_refused() {
+    let env = env();
+    env.put("meta/next_op", &0_u64.to_be_bytes());
+    assert_eq!(env.rows("a").next_id().expect("an id"), op(1));
+    env.put("meta/next_op", &5000_u64.to_be_bytes());
+    assert_eq!(env.rows("b").next_id().expect("an id"), op(5000));
+    env.put("meta/next_op", b"short");
+    let error = env.rows("c").next_id().expect_err("no number");
     assert_eq!(
         error,
         RowsError::Corrupt {
-            key: "exec/j/w/j".to_owned(),
-            why: "no version byte".to_owned()
+            key: "meta/next_op".to_owned(),
+            why: "not an 8-byte number".to_owned()
         }
     );
-    assert!(error.to_string().contains("exec/j/w/j"));
+    assert!(error.to_string().contains("is corrupt"));
 }
 
+/// A counter every other writer wins is given up on after a few tries, as a conflict; a store
+/// that fails refuses the id as a store error.
 #[test]
-fn a_failed_store_is_the_stores_error() {
-    struct Down;
-    impl Store for Down {
-        fn apply_batch(&self, _: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
-            Err(StoreError::Failed("down".to_owned()))
+fn an_id_is_refused_when_other_frontends_win_every_try_or_the_store_fails() {
+    let env = env();
+    *env.store.race.lock().expect("lock") = Some("meta/next_op".to_owned());
+    assert_eq!(
+        env.rows("a").next_id().expect_err("always beaten"),
+        RowsError::Conflict {
+            key: "meta/next_op".to_owned()
         }
-        fn get(&self, _: &str) -> Result<Option<Versioned>, StoreError> {
-            Err(StoreError::Failed("down".to_owned()))
+    );
+    *env.store.race.lock().expect("lock") = None;
+    env.store.reads_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(env.rows("b").next_id(), Err(RowsError::Store(_))));
+    env.store.reads_fail.store(false, Ordering::SeqCst);
+    env.store.writes_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(env.rows("c").next_id(), Err(RowsError::Store(_))));
+}
+
+// ---- the operation rows
+
+/// An operation's row is written new, then replaced by its owner, under its owner's name, as
+/// one version byte and JSON that names no url, token or secret; another process cannot write
+/// it.
+#[test]
+fn put_op_writes_the_row_for_its_owner_and_refuses_another_writer() {
+    let env = env();
+    let (a, b) = (env.rows("a"), env.rows("b"));
+    a.put_op(op(9), &row(1)).expect("a new row");
+    let stored = a.op(op(9)).expect("read").expect("there");
+    assert_eq!(
+        stored,
+        OpRow {
+            owner: "a".to_owned(),
+            ..row(1)
         }
-        fn scan_prefix(&self, _: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
-            Err(StoreError::Failed("down".to_owned()))
-        }
-        fn scan_range(
-            &self,
-            _: kbf_state::ScanRange<'_>,
-        ) -> Result<kbf_state::ScanPage, StoreError> {
-            Err(StoreError::Failed("down".to_owned()))
-        }
-        fn changes(&self, _: Revision, _: usize) -> Result<kbf_state::Changes, StoreError> {
-            Err(StoreError::Failed("down".to_owned()))
-        }
-        fn trim_feed(&self, _: Revision) -> Result<u64, StoreError> {
-            Err(StoreError::Failed("down".to_owned()))
-        }
-        fn reap_expired(&self) -> Result<usize, StoreError> {
-            Err(StoreError::Failed("down".to_owned()))
-        }
-        fn commit_stats(&self) -> kbf_state::CommitStats {
-            kbf_state::CommitStats::default()
-        }
-        fn now(&self) -> kbf_state::StoreTime {
-            kbf_state::StoreTime::ZERO
-        }
-    }
-    let rows = ExecRows::new(Arc::new(Down));
-    let down = Err(RowsError::Store(StoreError::Failed("down".to_owned())));
-    assert_eq!(rows.leave("a"), down);
-    assert_eq!(rows.liveness("a").map(drop), down);
-    assert_eq!(rows.live_instances().map(drop), down);
-    assert_eq!(rows.workers().map(drop), down);
-    assert_eq!(rows.jobs("w").map(drop), down);
-    let held = Held {
-        worker: "w".to_owned(),
-        version: Version(1),
+    );
+    let raw = env.raw(&op_key(op(9))).expect("a value");
+    assert_eq!(raw[0], VERSION);
+    let json = String::from_utf8(raw[1..].to_vec()).expect("json");
+    assert!(!json.contains("sig=") && !json.contains("token"), "{json}");
+    assert_eq!(op_key(op(9)), "exec/op/0000000000000009");
+    let next = OpRow {
+        attempt: 2,
+        ..row(1)
     };
-    assert_eq!(rows.insert_job(&held, "j", &job_row(1)).map(drop), down);
+    a.put_op(op(9), &next).expect("its owner replaces it");
+    assert_eq!(a.op(op(9)).expect("read").expect("there").attempt, 2);
+    assert_eq!(
+        b.put_op(op(9), &row(1)),
+        Err(RowsError::Conflict { key: op_key(op(9)) })
+    );
+    assert_eq!(a.op(op(9)).expect("read").expect("there").attempt, 2);
 }
 
-/// A repeat of a job insert for a worker whose row is gone is a lost worker, not a row that
-/// is there already.
+/// A row this build does not know, or cannot read, is not overwritten as if it were its own.
 #[test]
-fn a_repeat_insert_after_the_worker_was_retired_is_refused() {
-    let rig = rig();
-    let (_, held) = started(&rig, "a", "w");
-    rig.rows
-        .insert_job(&held, "j", &job_row(1))
-        .expect("insert");
-    // The worker row is gone (retired by another process after it claimed and finished).
-    rig.rows.retire(&held).expect("retire");
-    conflict(rig.rows.insert_job(&held, "j", &job_row(1)), "exec/w/w");
+fn put_op_does_not_overwrite_a_row_it_cannot_read_or_does_not_know() {
+    let env = env();
+    let a = env.rows("a");
+    env.put(&op_key(op(1)), &[VERSION + 1, b'{', b'}']);
+    assert_eq!(
+        a.put_op(op(1), &row(1)),
+        Err(RowsError::Conflict { key: op_key(op(1)) })
+    );
+    env.put(&op_key(op(2)), &[VERSION, b'{']);
+    assert!(matches!(
+        a.put_op(op(2), &row(1)),
+        Err(RowsError::Corrupt { .. })
+    ));
+    env.put(&op_key(op(3)), &[]);
+    assert_eq!(
+        a.put_op(op(3), &row(1)),
+        Err(RowsError::Corrupt {
+            key: op_key(op(3)),
+            why: "the row is empty".to_owned()
+        })
+    );
+    env.store.reads_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(a.put_op(op(4), &row(1)), Err(RowsError::Store(_))));
+    env.store.reads_fail.store(false, Ordering::SeqCst);
+    env.store.writes_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(a.put_op(op(4), &row(1)), Err(RowsError::Store(_))));
+}
+
+/// The row of an operation reads back as written; an unknown version reads as none, an
+/// unreadable one is an error, and a row of a later release with more fields still reads.
+#[test]
+fn op_reads_the_row_and_skips_a_version_it_does_not_know() {
+    let env = env();
+    let a = env.rows("a");
+    assert_eq!(a.op(op(1)), Ok(None));
+    env.put(&op_key(op(2)), &[VERSION + 1, 0xff]);
+    assert_eq!(a.op(op(2)), Ok(None));
+    env.put(&op_key(op(3)), b"\x01nonsense");
+    assert!(matches!(a.op(op(3)), Err(RowsError::Corrupt { .. })));
+    let mut later = vec![VERSION];
+    later.extend(
+        serde_json::to_vec(&serde_json::json!({
+            "owner": "z", "instance": "main", "hash": "ab".repeat(32), "size": 5,
+            "attempt": 0, "job": "j", "a_field_of_a_later_release": [1, 2],
+        }))
+        .expect("json"),
+    );
+    env.put(&op_key(op(4)), &later);
+    let read = a.op(op(4)).expect("read").expect("there");
+    assert_eq!(
+        (read.key, read.whole_machine),
+        (None, false),
+        "a missing field is its default"
+    );
+    env.store.reads_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(a.op(op(4)), Err(RowsError::Store(_))));
+}
+
+/// The action an operation row names is read from its hash and size, or refused.
+#[test]
+fn an_op_row_names_its_action_or_says_why_it_does_not() {
+    assert_eq!(row(3).action_key(), Ok(action(3)));
+    let bad = OpRow {
+        hash: "abc".to_owned(),
+        ..row(3)
+    };
+    assert!(bad.action_key().is_err());
+}
+
+// ---- finishing
+
+/// A finished operation's row goes, its answer and action are put under the formats of earlier
+/// releases for the retention, and at least ten minutes whatever the retention.
+#[test]
+fn finish_deletes_the_row_and_keeps_the_answer_for_its_retention_or_ten_minutes() {
+    let env = env();
+    let a = env.rows("a");
+    a.put_op(op(1), &row(1)).expect("row");
+    a.put_op(op(2), &row(2)).expect("row");
+    let key = action(1);
+    let answer = ran(5);
+    assert_eq!(
+        a.finish(op(1), &key, &answer, Duration::from_secs(1))
+            .expect("finished"),
+        answer
+    );
+    assert_eq!(a.op(op(1)), Ok(None));
+    assert_eq!(a.done(op(1)), Ok(Some((key.clone(), answer.clone()))));
+    assert!(env.raw("done/0000000000000001").is_some());
+    a.finish(op(2), &action(2), &answer, DAY).expect("finished");
+    env.pass(Duration::from_secs(599));
+    assert!(
+        a.done(op(1)).expect("read").is_some(),
+        "kept at least ten minutes"
+    );
+    env.pass(Duration::from_secs(2));
+    assert_eq!(a.done(op(1)), Ok(None));
+    assert_eq!(env.raw("done/0000000000000001"), None);
+    assert_eq!(env.raw("doneof/0000000000000001"), None);
+    env.pass(DAY - Duration::from_secs(700));
+    assert!(
+        a.done(op(2)).expect("read").is_some(),
+        "kept as long as asked"
+    );
+    env.pass(Duration::from_secs(200));
+    assert_eq!(a.done(op(2)), Ok(None));
+}
+
+/// The `doneof/` row is the format earlier releases read: version 1, the size big-endian, the
+/// hash, then the instance; the `done/` row is the answer's own.
+#[test]
+fn the_done_rows_are_in_the_format_of_earlier_releases() {
+    let env = env();
+    let a = env.rows("a");
+    let key = ActionKey {
+        instance: "main/é".to_owned(),
+        action: Digest::new(DigestFunction::Sha256, [7; 32], 0x0102_0304_0506_0708),
+    };
+    let answer = ran(0);
+    a.finish(op(0x2a), &key, &answer, DONE_FLOOR)
+        .expect("finished");
+    let mut want = vec![1_u8];
+    want.extend([1, 2, 3, 4, 5, 6, 7, 8]);
+    want.extend([7_u8; 32]);
+    want.extend("main/é".as_bytes());
+    assert_eq!(env.raw("doneof/000000000000002a"), Some(want));
+    assert_eq!(env.raw("done/000000000000002a"), Some(answer.to_row()));
+    assert_eq!(a.done(op(0x2a)), Ok(Some((key, answer))));
+}
+
+/// An operation with no row of its own (it was never written, or is gone) finishes all the
+/// same; another process's row cannot be finished.
+#[test]
+fn finish_with_no_row_succeeds_and_with_another_owners_row_conflicts() {
+    let env = env();
+    let (a, b) = (env.rows("a"), env.rows("b"));
+    a.finish(op(1), &action(1), &ran(0), DONE_FLOOR)
+        .expect("no row to delete");
+    b.put_op(op(2), &row(2)).expect("their row");
+    assert_eq!(
+        a.finish(op(2), &action(2), &ran(0), DONE_FLOOR),
+        Err(RowsError::Conflict { key: op_key(op(2)) })
+    );
+    assert!(b.op(op(2)).expect("read").is_some(), "their row stays");
+    assert_eq!(a.done(op(2)), Ok(None), "and no answer is written");
+}
+
+/// An answer another frontend wrote first stands: it is returned, this process's is dropped,
+/// and the row goes.
+#[test]
+fn finish_keeps_an_answer_another_frontend_wrote_first() {
+    let env = env();
+    let (a, b) = (env.rows("a"), env.rows("b"));
+    b.finish(op(1), &action(1), &ran(11), DONE_FLOOR)
+        .expect("first");
+    a.put_op(op(1), &row(1)).expect("row");
+    let kept = a
+        .finish(op(1), &action(1), &ran(22), DONE_FLOOR)
+        .expect("the earlier answer");
+    assert_eq!(kept, ran(11));
+    assert_eq!(a.op(op(1)), Ok(None), "the row is deleted");
+    assert_eq!(a.done(op(1)), Ok(Some((action(1), ran(11)))));
+}
+
+/// An answer that is half written (its action row missing) cannot be returned, and says so;
+/// a store that fails while the row is deleted fails the finish.
+#[test]
+fn finish_refuses_a_half_written_answer_and_a_store_that_fails() {
+    let env = env();
+    let a = env.rows("a");
+    env.put("done/0000000000000001", &ran(1).to_row());
+    let error = a
+        .finish(op(1), &action(1), &ran(2), DONE_FLOOR)
+        .expect_err("half written");
+    assert!(matches!(error, RowsError::Corrupt { .. }), "{error:?}");
+    env.put("done/0000000000000002", &ran(1).to_row());
+    env.put("doneof/0000000000000002", &[1; 0]);
+    a.put_op(op(3), &row(3)).expect("row");
+    env.put("done/0000000000000003", &ran(1).to_row());
+    env.put("doneof/0000000000000003", &{
+        let mut v = vec![1_u8];
+        v.extend([0; 8]);
+        v.extend([3; 32]);
+        v.extend(b"main");
+        v
+    });
+    env.store.fail_nth_write(2);
+    assert!(
+        matches!(
+            a.finish(op(3), &action(3), &ran(2), DONE_FLOOR),
+            Err(RowsError::Store(_))
+        ),
+        "the delete of the row after the earlier answer"
+    );
+    a.put_op(op(4), &row(4)).expect("row");
+    env.store.writes_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        a.finish(op(4), &action(4), &ran(2), DONE_FLOOR),
+        Err(RowsError::Store(_))
+    ));
+    env.store.writes_fail.store(false, Ordering::SeqCst);
+    env.store.reads_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        a.finish(op(4), &action(4), &ran(2), DONE_FLOOR),
+        Err(RowsError::Store(_))
+    ));
+}
+
+/// A row that changed between the read and the write loses the finish as a conflict on the
+/// row itself, and writes no answer.
+#[test]
+fn finish_loses_to_a_write_of_its_row_in_between() {
+    let env = env();
+    let a = env.rows("a");
+    a.put_op(op(1), &row(1)).expect("row");
+    *env.store.race.lock().expect("lock") = Some(op_key(op(1)));
+    assert_eq!(
+        a.finish(op(1), &action(1), &ran(0), DONE_FLOOR),
+        Err(RowsError::Conflict { key: op_key(op(1)) })
+    );
+    *env.store.race.lock().expect("lock") = None;
+    assert_eq!(a.done(op(1)), Ok(None));
+}
+
+// ---- reading an answer
+
+/// An answer is there only with both its rows, and a row that is not what it says is an error
+/// naming it.
+#[test]
+fn done_needs_both_rows_and_names_the_row_that_is_corrupt() {
+    let env = env();
+    let a = env.rows("a");
+    assert_eq!(a.done(op(1)), Ok(None));
+    env.put("done/0000000000000001", &ran(1).to_row());
+    assert_eq!(a.done(op(1)), Ok(None), "no action row");
+    let good = {
+        let mut v = vec![1_u8];
+        v.extend(9_u64.to_be_bytes());
+        v.extend([5; 32]);
+        v.extend(b"main");
+        v
+    };
+    env.put("doneof/0000000000000001", &good);
+    assert!(a.done(op(1)).expect("read").is_some());
+    let mut other = good.clone();
+    other[0] = 2;
+    let cut = &good[..20];
+    let mut not_utf8 = good[..41].to_vec();
+    not_utf8.push(0xff);
+    for (what, bytes) in [
+        ("version", other),
+        ("cut", cut.to_vec()),
+        ("short", vec![1, 0, 0]),
+        ("utf8", not_utf8),
+    ] {
+        env.put("doneof/0000000000000001", &bytes);
+        let error = a.done(op(1)).expect_err(what);
+        assert!(
+            matches!(&error, RowsError::Corrupt { key, .. } if key == "doneof/0000000000000001"),
+            "{what}: {error:?}"
+        );
+    }
+    env.put("doneof/0000000000000001", &good);
+    env.put("done/0000000000000001", &[0xff, 0xff]);
+    assert!(
+        matches!(a.done(op(1)), Err(RowsError::Corrupt { key, .. }) if key == "done/0000000000000001")
+    );
+    env.store.reads_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(a.done(op(1)), Err(RowsError::Store(_))));
+}
+
+// ---- liveness and orphans
+
+/// A process lives while its row does: renewed with the time to live, it expires when it is
+/// not renewed, and is deleted at once on leaving (twice is no harm).
+#[test]
+fn a_liveness_row_expires_unless_renewed_and_goes_when_its_process_leaves() {
+    let env = env();
+    let a = env.rows("a");
+    let live = Duration::from_secs(20);
+    a.beat(live).expect("beat");
+    assert!(env.raw("exec/live/a").is_some());
+    env.pass(Duration::from_secs(15));
+    a.beat(live).expect("renewed");
+    env.pass(Duration::from_secs(15));
+    assert!(env.raw("exec/live/a").is_some(), "renewed 15 s ago");
+    env.pass(Duration::from_secs(6));
+    assert!(
+        env.raw("exec/live/a").is_none(),
+        "expired 20 s after its last renewal"
+    );
+    a.beat(live).expect("beat");
+    a.leave().expect("left");
+    assert!(env.raw("exec/live/a").is_none());
+    a.leave().expect("left again");
+    env.store.writes_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(a.beat(live), Err(RowsError::Store(_))));
+    assert!(matches!(a.leave(), Err(RowsError::Store(_))));
+}
+
+/// The unfinished operations of gone processes are listed, with the version to claim them at;
+/// a live owner's, this process's own, rows of a later release's version (counted) and corrupt
+/// rows, and keys that are no operation's, are not.
+#[test]
+fn orphans_skip_live_owners_own_rows_unknown_versions_and_corrupt_rows() {
+    let env = env();
+    let (me, gone, alive) = (env.rows("me"), env.rows("gone"), env.rows("alive"));
+    me.put_op(op(1), &row(1)).expect("own");
+    gone.put_op(op(2), &row(2)).expect("gone");
+    gone.put_op(op(3), &row(3))
+        .expect("gone, the owner looked up once");
+    alive.put_op(op(4), &row(4)).expect("alive");
+    alive.beat(Duration::from_secs(20)).expect("alive");
+    env.put(&op_key(op(5)), &[VERSION + 1, 1, 2, 3]);
+    env.put(&op_key(op(6)), b"\x01{broken");
+    env.put("exec/op/short", b"\x01{}");
+    env.put("exec/op/zzzzzzzzzzzzzzzz", b"\x01{}");
+    let orphans = me.orphans().expect("a scan");
+    let named: Vec<(u64, String, u32)> = orphans
+        .iter()
+        .map(|o| (o.operation.0, o.row.owner.clone(), o.row.attempt))
+        .collect();
+    assert_eq!(
+        named,
+        [(2, "gone".to_owned(), 1), (3, "gone".to_owned(), 1)]
+    );
+    assert_eq!(me.unknown_rows(), 1);
+    me.orphans().expect("a scan");
+    assert_eq!(me.unknown_rows(), 2, "counted at each scan");
+    env.pass(Duration::from_secs(21));
+    assert_eq!(
+        me.orphans().expect("a scan").len(),
+        3,
+        "an owner that stopped beating is gone"
+    );
+    env.store.reads_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(me.orphans(), Err(RowsError::Store(_))));
+}
+
+/// An orphan is claimed by one process only: the next claimer of the same version loses, and
+/// the row is the winner's, whose copy of the fields it is.
+#[test]
+fn claim_wins_once_against_a_racer() {
+    let env = env();
+    let (gone, b, c) = (env.rows("gone"), env.rows("b"), env.rows("c"));
+    gone.put_op(op(1), &row(1)).expect("row");
+    let for_b = b.orphans().expect("scan");
+    let for_c = c.orphans().expect("scan");
+    let won = b.claim(&for_b[0]).expect("the first claim wins");
+    assert_eq!(
+        won,
+        OpRow {
+            owner: "b".to_owned(),
+            ..row(1)
+        }
+    );
+    assert_eq!(
+        c.claim(&for_c[0]),
+        Err(RowsError::Conflict { key: op_key(op(1)) })
+    );
+    assert_eq!(b.op(op(1)).expect("read").expect("there").owner, "b");
+    assert_eq!(
+        c.orphans().expect("scan").len(),
+        1,
+        "b has not beaten: its row is an orphan too"
+    );
+    b.beat(Duration::from_secs(20)).expect("beat");
+    assert!(
+        c.orphans().expect("scan").is_empty(),
+        "b owns it, and b is live"
+    );
+}
+
+/// A claim fails when the owner's liveness row is back, and when the store fails; the row is
+/// then the owner's still.
+#[test]
+fn claim_is_refused_when_the_owner_is_live_again_or_the_store_fails() {
+    let env = env();
+    let (gone, b) = (env.rows("gone"), env.rows("b"));
+    gone.put_op(op(1), &row(1)).expect("row");
+    let orphan = b.orphans().expect("scan").remove(0);
+    gone.beat(Duration::from_secs(20)).expect("it is back");
+    assert_eq!(
+        b.claim(&orphan),
+        Err(RowsError::Conflict {
+            key: "exec/live/gone".to_owned()
+        })
+    );
+    assert_eq!(b.op(op(1)).expect("read").expect("there").owner, "gone");
+    gone.leave().expect("gone again");
+    env.store.writes_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(b.claim(&orphan), Err(RowsError::Store(_))));
+}
+
+/// A store that fails at the second or third read of a call fails the call, wherever in it the
+/// read is.
+#[test]
+fn a_read_that_fails_part_way_through_a_call_fails_the_call() {
+    let env = env();
+    let a = env.rows("a");
+    a.put_op(op(1), &row(1)).expect("row");
+    env.store.fail_nth_read(2);
+    assert!(
+        matches!(a.put_op(op(1), &row(1)), Err(RowsError::Store(_))),
+        "the ownership read"
+    );
+    env.store.fail_nth_read(2);
+    assert!(
+        matches!(
+            a.finish(op(1), &action(1), &ran(0), DONE_FLOOR),
+            Err(RowsError::Store(_))
+        ),
+        "the ownership read"
+    );
+    a.put_op(op(2), &row(2)).expect("row");
+    env.rows("b")
+        .finish(op(3), &action(3), &ran(0), DONE_FLOOR)
+        .expect("their answer");
+    a.put_op(op(3), &row(3)).expect("row");
+    // The row, its ownership, then the answer's reads after the conflict.
+    env.store.fail_nth_read(3);
+    assert!(
+        matches!(
+            a.finish(op(3), &action(3), &ran(1), DONE_FLOOR),
+            Err(RowsError::Store(_))
+        ),
+        "the read of the answer that was there first"
+    );
+    env.store.fail_nth_read(2);
+    assert!(
+        matches!(a.done(op(3)), Err(RowsError::Store(_))),
+        "the second row of an answer"
+    );
+    gone_orphan(&env);
+    env.store.fail_nth_read(2);
+    assert!(
+        matches!(a.orphans(), Err(RowsError::Store(_))),
+        "the liveness read"
+    );
+}
+
+fn gone_orphan(env: &Env) {
+    env.rows("gone").put_op(op(9), &row(9)).expect("row");
+}
+
+/// Catches the answer read before the row: an operation whose owner finishes it between the
+/// two reads of a look (the row deleted and the answer put in one transaction) would read as
+/// neither open nor done, and a follower would answer its callers UNAVAILABLE for an operation
+/// that ran. The row is read first, so the look finds the answer.
+#[test]
+fn a_finish_between_the_reads_of_a_look_is_seen_done() {
+    let env = env();
+    let a = env.rows("p-1");
+    a.put_op(op(1), &row(1)).expect("written");
+    assert_eq!(
+        a.look(op(1)).expect("a look"),
+        Look::Open(OpRow {
+            owner: "p-1".to_owned(),
+            ..row(1)
+        })
+    );
+    let owner = env.rows("p-1");
+    *env.store.before_read.lock().expect("unpoisoned") = Some((
+        OP_PREFIX.to_owned(),
+        Box::new(move || {
+            owner
+                .finish(op(1), &action(1), &ran(0), DONE_FLOOR)
+                .expect("finished by its owner");
+        }),
+    ));
+    let follower = env.rows("p-2");
+    assert_eq!(
+        follower.look(op(1)).expect("a look"),
+        Look::Done(action(1), ran(0))
+    );
+    assert_eq!(follower.look(op(9)).expect("a look"), Look::Gone);
 }

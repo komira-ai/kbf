@@ -12,7 +12,7 @@ use kbf_state::fake::{Fake, Flaw};
 use super::exit_of;
 use super::state_wait::{NotReached, open_within};
 use super::tests::parsed;
-use crate::farm::{EpochPolicy, StateError};
+use crate::StateError;
 use crate::test_log::capture;
 use crate::{OpenFailure, StateStore};
 
@@ -30,7 +30,6 @@ fn open_store() -> StateStore {
             Arc::new(ManualClock::default()),
             Flaw::None,
         )),
-        epoch: EpochPolicy::Keep,
         members: crate::members::MembershipConfig::default(),
         history: None,
     }

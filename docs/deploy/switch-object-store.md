@@ -42,7 +42,7 @@ first ([below](#moving-a-node-to---cold-store-registered)).
 - Every storage member was started with `--cold-store registered` and `--frontend`. The held
   script below reads and rewrites hand-written units under `/etc/systemd/system` only.
 - **One operator at a time.** `safe-to-stop` answers for the moment it is asked; it reserves
-  nothing. For the whole walk, nobody else restarts, drains or updates a storage member, and
+  nothing. For the whole walk, nobody else restarts or updates a storage member, and
   nobody else writes the registration (`connection put`, `bind`, `repoint`). Agree it with the
   others who run the farm, and pause the farm's updater for the walk. A registration written
   during the walk raises the generation again: the members already restarted are then `pending`
@@ -77,15 +77,12 @@ Write down the `generation` of the answer: it is the one every node must apply.
 
 Restart the storage members **one at a time**. Blobs are kept on two owners, so two members down
 at once leave some blobs with no reachable copy (see [updating a host](update-a-host.md#restarting-a-storage-member)).
-Each member has three names, and the walk uses each where it belongs:
+Each member has two names, and the walk uses each where it belongs:
 
 | name | where it comes from | used by |
 |---|---|---|
 | member id `<member id>` | `id` in `GET /v1/members` | `safe-to-stop`, `member` |
 | member address | `addr` in `GET /v1/members`: the host's `--advertise-addr`, or the address it binds | the member's row in `status`'s `convergence.nodes` (its `id` is this address) |
-| node id `<node>` | the host's `--node-id`, on a host whose unit gives one | `drain`, `undrain`, `GET /v1/nodes` |
-
-A storage host whose unit gives no `--node-id` has no node id: skip the drain and the undrain for it.
 
 For each member:
 
@@ -96,23 +93,15 @@ For each member:
    kbf cluster safe-to-stop <member id> --token-file /etc/kbf/api-token
    ```
 
-2. **Drain** the node, and wait until `kbf cluster status` shows its placement `drained`.
-   The drain has no deadline: it waits for its leases however long they run.
-
-   ```text
-   kbf cluster drain <node> --token-file /etc/kbf/api-token
-   kbf cluster status
-   ```
-
-3. **Plan the restart** of its storage member, so writes go to the other owner at once. The plan
+2. **Plan the restart** of its storage member, so writes go to the other owner at once. The plan
    lasts `--for-secs` (900 here, at most 86400) or until the member registers again:
 
    ```text
    kbf cluster member <member id> --state planned-down --for-secs 900 --token-file /etc/kbf/api-token
    ```
 
-4. **Restart** its unit on its host: `sudo systemctl restart <unit>`.
-5. **Wait until it is back with the new generation applied**: its member is `active` again in
+3. **Restart** its unit on its host: `sudo systemctl restart <unit>`.
+4. **Wait until it is back with the new generation applied**: its member is `active` again in
    `GET /v1/members` (`catching_up` while its index rebuilds), and the row of its member address in
    `status`'s `convergence.nodes` has `applied_generation` equal to the generation the repoint
    answered, with `status` `ok`. A row that stays `pending` at the old generation is a node that
@@ -123,18 +112,12 @@ For each member:
    kbf cluster object-store status --token-file /etc/kbf/api-token
    ```
 
-6. **Undrain** the node, then go to the next member:
-
-   ```text
-   kbf cluster undrain <node> --token-file /etc/kbf/api-token
-   ```
-
-When the last member is done, `status` says `converged: true`.
+Then go to the next member. When the last member is done, `status` says `converged: true`.
 
 ## Moving a node to `--cold-store registered`
 
 A node whose hand-written unit says `--cold-store s3://...` stays on that store. Move it once,
-with the same walk as above: between steps 3 and 4,
+with the same walk as above: between steps 2 and 3,
 
 - in the unit's `ExecStart=` (`systemctl show -P FragmentPath <unit>` names the file), replace
   `--cold-store <uri>` with `--cold-store registered`, and remove `--cold-store-credentials-file`
@@ -153,7 +136,7 @@ with the same walk as above: between steps 3 and 4,
   file: `systemctl show -P ExecStart <unit>` holds `--cold-store registered` and no
   `--cold-store-credentials-file`.
 
-Then restart (step 4). The node fetches the registration at its start, and with no registration
+Then restart (step 3). The node fetches the registration at its start, and with no registration
 it waits for one; it never falls back to a store of its own. `/etc/kbf/s3.env` and any other key
 file on the node are no longer read by `kbf` once it is registered.
 
@@ -161,18 +144,15 @@ file on the node are no longer read by `kbf` once it is registered.
 
 The held script prints what a stop leaves behind. By that state:
 
-- **Drained, not planned down** (stopped at or before step 3): the member still serves. Undrain the
-  node (`kbf cluster undrain <node> --token-file /etc/kbf/api-token`), or run the walk again with
-  this member first.
 - **Planned down, unit running** (stopped before the restart, or the restart was never made): the
   member is out of the write path. `kbf cluster member <member id> --state active --token-file
-  /etc/kbf/api-token` undoes the plan; then undrain the node. If the unit was rewritten, the old
+  /etc/kbf/api-token` undoes the plan. If the unit was rewritten, the old
   file is `<fragment>.before-registered` beside it.
 - **Restarted but not back** (failed to start, or never applied the generation): the member stays
   `down`. After `--for-secs` the plan lapses, and after `--member-dwell-secs` (300 by default) the
   member leaves the map and its blobs move to other owners. Read the unit's journal, fix the unit
   (or put the `.before-registered` file back and `daemon-reload`), restart it, and wait until the
-  member is `active` and its row `ok` at the generation before undrain. Do not run the walk on
+  member is `active` and its row `ok` at the generation. Do not run the walk on
   other members until it is back: the script starts only when every listed member is `active`.
 
 Then run the walk again with only the members not yet done and, if the repoint was made, without
@@ -187,7 +167,7 @@ The walk above, for engineering to run on the frontend's host: save the block be
 - it stops at the first thing it does not expect: a `STOP:` line naming what the walk left behind,
   exit 1. An exit it did not plan (Ctrl-C, a signal, a failed read) prints a `STOP:` line too. It
   undoes nothing itself;
-- it never forces anything: no drain deadline, no restart of a member `safe-to-stop` refuses, no
+- it never forces anything: no restart of a member `safe-to-stop` refuses, no
   removal of a drop-in, no overwrite of an earlier `.before-registered` copy;
 - every wait has no deadline, and stops only on an answer that cannot become the one awaited (a
   failed read, a status other than `pending`, the registry moving);
@@ -196,12 +176,11 @@ The walk above, for engineering to run on the frontend's host: save the block be
 - its only inputs are its flags; it holds no endpoint and no key.
 
 ```text
-switch-object-store.sh --member ID,HOST[,NODE] [--member ...] [--connection NAME --endpoint URL --expect-generation G] [--migrate] [--apply]
+switch-object-store.sh --member ID,HOST [--member ...] [--connection NAME --endpoint URL --expect-generation G] [--migrate] [--apply]
 ```
 
-- `--member ID,HOST[,NODE]`, once per storage member, in the order to walk them: the member id,
-  the host `ssh` reaches it at, and the node id its unit names (leave it out for
-  a storage host whose unit names none).
+- `--member ID,HOST`, once per storage member, in the order to walk them: the member id and
+  the host `ssh` reaches it at.
 - `--connection`, `--endpoint`, `--expect-generation`: repoint first, then walk to the generation
   the repoint answered. Without them there is no repoint, and the walk restarts the members onto
   the registry's current generation.
@@ -217,8 +196,7 @@ Before any write it checks every listed member, and stops on the first problem:
 - the unit is a hand-written file under `/etc/systemd/system` that systemd has loaded as it is
   (`NeedDaemonReload=no`);
 - the unit's effective `ExecStart` (what systemd will run) is the member: its `--advertise-addr`,
-  or else its `--storage-listen`, is the member's address, and its `--node-id` is the node given
-  (a unit with `--node-id` and no node given is refused: its node would be restarted undrained);
+  or else its `--storage-listen`, is the member's address;
 - no drop-in names a store or sets `ExecStart=`: neither one systemd loaded (`DropInPaths`) nor
   any file in a drop-in directory of any of the unit's names (the section above);
 - its `--cold-store` is `registered`, or with `--migrate` a store URL that the rewrite can take
@@ -276,7 +254,7 @@ trap 'exit 130' INT TERM HUP
 say() { echo "== $*"; }
 
 usage() {
-  echo "usage: $0 --member ID,HOST[,NODE] [--member ...] [--connection NAME --endpoint URL --expect-generation G] [--migrate] [--unit UNIT] [--token-file FILE] [--api ADDR] [--poll-secs N] [--for-secs N] [--apply]" >&2
+  echo "usage: $0 --member ID,HOST [--member ...] [--connection NAME --endpoint URL --expect-generation G] [--migrate] [--unit UNIT] [--token-file FILE] [--api ADDR] [--poll-secs N] [--for-secs N] [--apply]" >&2
   STOPPED=1
   exit 2
 }
@@ -314,15 +292,14 @@ if [ -n "$CONNECTION$ENDPOINT$EXPECT_GENERATION" ]; then
 fi
 
 # The members, parsed: parallel arrays by index.
-MEMBERS=() HOSTS=() NODES=()
+MEMBERS=() HOSTS=()
 for spec in "${SPECS[@]}"; do
-  [[ $spec =~ ^([^,]+),([^,]+)(,([^,]+))?$ ]] || stop "--member $spec: give ID,HOST or ID,HOST,NODE"
-  id=${BASH_REMATCH[1]} host=${BASH_REMATCH[2]} node=${BASH_REMATCH[4]}
+  [[ $spec =~ ^([^,]+),([^,]+)$ ]] || stop "--member $spec: give ID,HOST"
+  id=${BASH_REMATCH[1]} host=${BASH_REMATCH[2]}
   is_count "$id" || stop "--member $spec: the member id $id is not a whole number"
   [[ $host =~ ^[A-Za-z0-9@._:-]+$ ]] || stop "--member $spec: the host $host is not a host name"
-  [ -z "$node" ] || [[ $node =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || stop "--member $spec: the node id $node is not a node id"
   for seen in "${MEMBERS[@]}"; do [ "$seen" != "$id" ] || stop "--member $spec: member $id is listed twice"; done
-  MEMBERS+=("$id") HOSTS+=("$host") NODES+=("$node")
+  MEMBERS+=("$id") HOSTS+=("$host")
 done
 
 for tool in jq curl ssh kbf; do
@@ -346,9 +323,6 @@ members_json() {
 store_json() {
   kbf cluster --api "$API" object-store status --token-file "$TOKEN_FILE" \
     || stop "cannot read the object-store status"
-}
-nodes_json() {
-  kbf cluster --api "$API" status || stop "cannot read the nodes"
 }
 member_field() { # member id, field
   local out
@@ -434,7 +408,7 @@ dropin_dirs() { # host
 # Checks a member's host and unit. Sets FRAGMENT, ARGV, NEEDS_MIGRATION (0 or 1), and the
 # forms the rewrite replaces (STORE_FORM, CREDENTIALS_FORM).
 check_unit() { # index
-  local i=$1 host=${HOSTS[$1]} node=${NODES[$1]} addr dir dirs files found f rc store creds unit_node bound
+  local i=$1 host=${HOSTS[$1]} addr dir dirs files found f rc store creds bound
   addr=$(member_field "${MEMBERS[$i]}" addr) || fail
   FRAGMENT=$(on "$host" systemctl show -P FragmentPath "$UNIT") || stop "$host: cannot read $UNIT"
   case "$FRAGMENT" in
@@ -464,12 +438,10 @@ check_unit() { # index
   bound=$(the_flag "$host" "$ARGV" --advertise-addr) || fail
   [ -n "$bound" ] || { bound=$(the_flag "$host" "$ARGV" --storage-listen) || fail; }
   [ "$bound" = "$addr" ] || stop "$host: $UNIT serves '$bound', but member ${MEMBERS[$i]} is $addr: wrong host or member"
-  unit_node=$(the_flag "$host" "$ARGV" --node-id) || fail
-  [ "$unit_node" = "$node" ] || stop "$host: $UNIT runs node '${unit_node:-(none)}', but '${node:-(none)}' was given"
   store=$(the_flag "$host" "$ARGV" --cold-store) || fail
   creds=$(the_flag "$host" "$ARGV" --cold-store-credentials-file) || fail
   [ -n "$(the_flag "$host" "$ARGV" --frontend)" ] || stop "$host: $UNIT has no --frontend; registered needs it"
-  echo "   $host: member ${MEMBERS[$i]} at $addr, node ${node:-(none)}, --cold-store ${store:-(none)}"
+  echo "   $host: member ${MEMBERS[$i]} at $addr, --cold-store ${store:-(none)}"
   case "$store" in
     registered) NEEDS_MIGRATION=0
        [ -z "$creds" ] || stop "$host: $UNIT has --cold-store registered and --cold-store-credentials-file" ;;
@@ -556,18 +528,6 @@ wait_until() { # what, check...
   echo "   done: $what"
 }
 
-drained() { # node
-  local out state
-  out=$(nodes_json) || fail
-  state=$(printf '%s' "$out" | jq -r --arg n "$1" '.nodes[] | select(.node_id == $n) | .placement.state') \
-    || stop "the nodes answer does not parse"
-  case "$state" in
-    drained) echo done ;;
-    draining | drain_paused) echo wait ;;
-    *) stop "node $1 is '${state:-absent}', not draining" ;;
-  esac
-}
-
 member_back() { # member id
   local state
   state=$(member_field "$1" state) || fail
@@ -604,11 +564,6 @@ for i in "${!MEMBERS[@]}"; do
   if [ "$NEEDS_MIGRATION" = 1 ] && [ "$MIGRATE" = 0 ]; then
     stop "${HOSTS[$i]}: $UNIT names a store URL and would not follow; run with --migrate"
   fi
-  if [ -n "${NODES[$i]}" ]; then
-    out=$(nodes_json) || fail
-    printf '%s' "$out" | jq -e --arg n "${NODES[$i]}" 'any(.nodes[]; .node_id == $n)' >/dev/null \
-      || stop "node ${NODES[$i]} is not in GET /v1/nodes"
-  fi
 done
 
 # 2. The registry, and the repoint.
@@ -633,32 +588,22 @@ say "every member must apply generation $target"
 
 # 3. One member at a time.
 for i in "${!MEMBERS[@]}"; do
-  member_id=${MEMBERS[$i]} host=${HOSTS[$i]} node_id=${NODES[$i]}
+  member_id=${MEMBERS[$i]} host=${HOSTS[$i]}
   addr=$(member_field "$member_id" addr) || fail
-  say "member $member_id at $addr ($host${node_id:+, node $node_id})"
+  say "member $member_id at $addr ($host)"
   if ! kbf cluster --api "$API" safe-to-stop "$member_id" --token-file "$TOKEN_FILE"; then
     stop "member $member_id: not safe to stop now, or the call failed (above); run the walk again later with the members not yet done"
   fi
-  if [ -n "$node_id" ]; then
-    run kbf cluster --api "$API" drain "$node_id" --token-file "$TOKEN_FILE" \
-      || stop "node $node_id: the drain was refused (above)"
-    left "node $node_id drained: undrain it"
-    [ "$APPLY" = 0 ] || wait_until "node $node_id drained" drained "$node_id"
-  fi
   run kbf cluster --api "$API" member "$member_id" --state planned-down --for-secs "$FOR_SECS" --token-file "$TOKEN_FILE" \
     || stop "member $member_id: planned-down was refused (above)"
-  left "member $member_id planned down for $FOR_SECS s, unit not yet restarted${node_id:+; node $node_id drained}"
+  left "member $member_id planned down for $FOR_SECS s, unit not yet restarted"
   check_unit "$i"
   [ "$NEEDS_MIGRATION" = 0 ] || migrate_unit "$i"
   run on "$host" sudo systemctl restart "$UNIT" || stop "$host: the restart of $UNIT failed (see its journal)"
-  left "member $member_id restarted, not yet back${node_id:+; node $node_id drained}"
+  left "member $member_id restarted, not yet back"
   if [ "$APPLY" = 1 ]; then
     wait_until "member $member_id active" member_back "$member_id"
     wait_until "member $member_id applied generation $target" applied "$addr" "$target"
-  fi
-  if [ -n "$node_id" ]; then
-    run kbf cluster --api "$API" undrain "$node_id" --token-file "$TOKEN_FILE" \
-      || stop "node $node_id: the undrain was refused (above)"
   fi
   STATE=
 done

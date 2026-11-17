@@ -1,5 +1,7 @@
 # kbf UI v1: design
 
+> **Superseded in part by [direct-js.md](direct-js.md):** the Nodes, Node, Leases and Queue pages, and the routes behind them (`GET /v1/nodes`, `/v1/leases`, `/v1/queue`), are gone with the farm scheduler: kbf holds no nodes, leases or queue. This page records the earlier design.
+
 Status: approved with the rulings below (amended 2026-10-21 from the proposal). Read-only web UI for operators and agents. Built marks were re-read against `main` on 2026-10-21, after every page and route merged, the Log page and the history-off page included: "built" means the code on `main`, "follow-up" means not built. The built and follow-up lists are in "Built on main" below; the operator guide is [deploy/kbf-ui.md](../deploy/kbf-ui.md). Where this document and `ui-data.md` differ on serving, access or tests, this one wins (`ui-data.md` carries the matching amendments).
 
 ## Built on main

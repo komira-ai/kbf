@@ -1,7 +1,9 @@
 //! The `kbf-server` binary with a `file://` `--cold-store` and a `--meta-dir`: blob bytes
 //! in a local directory, an index in a Raft log, both kept across a restart. Every check
-//! goes through the REAPI surface of a real process, except those that run an action: a fake
-//! daemon registers with the farm of the server, so those start the server in this process.
+//! goes through the REAPI surface of a real process, except those that restart over the same
+//! directories, which start the server in this process. A start of the server has no executor
+//! and a client cannot write the action cache, so no action-cache entry is made here: the entry
+//! that survives a restart under the Raft log is `cold_restart.rs`'s.
 
 #![cfg(unix)]
 
@@ -20,7 +22,7 @@ use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::{BatchUpdateBlobsRequest, batch_update_blobs_request};
 use kbf_server::Args;
-use support::{Blob, Client, Job, done, output, ran, response};
+use support::{Blob, Client, Job};
 use tokio::sync::oneshot;
 use tonic::Code;
 
@@ -165,8 +167,8 @@ fn stop(mut child: Running) {
     assert!(status.success(), "kbf-server exited with {status}");
 }
 
-/// A server started in this process over the stores of a [`Dirs`], so that a fake daemon
-/// registers with its farm: a spawned process has none to register with.
+/// A server started in this process over the stores of a [`Dirs`], so that a test can stop it
+/// and start another over the same directories, and read its start line.
 struct Here {
     stop: Option<oneshot::Sender<()>>,
     served: tokio::task::JoinHandle<Result<(), kbf_server::ServeError>>,
@@ -174,8 +176,8 @@ struct Here {
     lock: PathBuf,
 }
 
-/// Starts the server of `dirs` in this process; it, a client of both listeners with the
-/// farm, and the start line.
+/// Starts the server of `dirs` in this process; it, a client of both listeners, and the start
+/// line.
 async fn started_here(dirs: &Dirs) -> (Here, Client, String) {
     let args = Args::try_parse_from(dirs.flags()).expect("flags");
     let (stop, stopped) = oneshot::channel::<()>();
@@ -187,7 +189,7 @@ async fn started_here(dirs: &Dirs) -> (Here, Client, String) {
     .await
     .expect("starts");
     let line = handle.start_line().to_owned();
-    let client = Client::connect_to(handle.reapi, handle.worker, handle.farm.clone()).await;
+    let client = Client::connect(handle.reapi, handle.worker).await;
     let served = tokio::spawn(handle.serve());
     let here = Here {
         stop: Some(stop),
@@ -296,37 +298,23 @@ fn pattern(len: u32) -> Vec<u8> {
         .collect()
 }
 
-/// Catches a farm on one host that loses its blobs at a restart: the store in memory,
+/// Catches a cell on one host that loses its blobs at a restart: the store in memory,
 /// as a store with no directory would be, or a
 /// blob directory that is not where the objects went, or that the next start does not
-/// read. The action-cache entry must still be a hit after the restart (its result blob
-/// is read back to answer it), and every blob, a 3 MiB one included, must read back
-/// byte for byte over ByteStream.
+/// read. Every blob, a 3 MiB one included, must read back byte for byte over ByteStream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restart_keeps_the_blobs_and_the_action_cache() {
+async fn a_restart_keeps_the_blobs() {
     let dirs = Dirs::new("restart");
     let (server, before, _) = started_here(&dirs).await;
-    let mut daemon = before.daemon("node-a", 4, 8).await;
     let job = Job::new("before the restart", &[]);
     before.upload(&job.blobs()).await;
     let big = Blob::new(pattern(3 << 20));
-    before.upload(&[&big]).await;
-    let mut ops = before.execute(&job.action).await;
-    let start = daemon.start().await;
-    let result = output(&before, "ran before the restart", 0).await;
-    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
-    assert_eq!(before.cached(&job.action).await, Ok(result.clone()));
-    drop((ops, daemon, before));
+    let out = Blob::new("an output from before the restart");
+    before.upload(&[&big, &out]).await;
+    drop(before);
     stopped_here(server).await;
 
     let (server, after, _) = started_here(&dirs).await;
-    assert_eq!(
-        after.cached(&job.action).await,
-        Ok(result),
-        "the action cache entry did not survive the restart"
-    );
-    let out = Blob::new("ran before the restart");
     for blob in job.blobs().into_iter().chain([&out, &big]) {
         assert_eq!(
             read(&after, blob).await,
@@ -364,8 +352,8 @@ fn copy_tree(from: &Path, to: &Path) {
 
 /// Catches a metadata backup that is not one: a byte copy of the metadata directory
 /// (and of the `file://` store) taken while the server is stopped, started on new
-/// paths, must open the same log (the start line's `log=` id), answer the action-cache
-/// entry recorded before the copy and serve every blob byte for byte. A start that drew
+/// paths, must open the same log (the start line's `log=` id) and serve every blob byte for
+/// byte. A start that drew
 /// a new log id over a copy, or an index that does not survive the copy, goes red. And a
 /// copy that lost its `log-record` is refused at start rather than opened as a new,
 /// empty log (which would serve every blob as missing). `kbf-deploy linux meta-backup`
@@ -375,15 +363,11 @@ async fn a_copy_of_a_stopped_servers_meta_dir_is_a_backup() {
     let dirs = Dirs::new("backup");
     let (server, before, line) = started_here(&dirs).await;
     let live_log = log_id(&line);
-    let mut daemon = before.daemon("node-a", 4, 8).await;
     let job = Job::new("before the backup", &[]);
     before.upload(&job.blobs()).await;
-    let mut ops = before.execute(&job.action).await;
-    let start = daemon.start().await;
-    let result = output(&before, "ran before the backup", 0).await;
-    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
-    drop((ops, daemon, before));
+    let out = Blob::new("an output from before the backup");
+    before.upload(&[&out]).await;
+    drop(before);
     stopped_here(server).await;
 
     let copy = Dirs::new("backup-restored");
@@ -392,12 +376,6 @@ async fn a_copy_of_a_stopped_servers_meta_dir_is_a_backup() {
     dirs.remove();
     let (server, after, line) = started_here(&copy).await;
     assert_eq!(log_id(&line), live_log, "the copy opened another log");
-    assert_eq!(
-        after.cached(&job.action).await,
-        Ok(result),
-        "the action cache entry is not in the copy"
-    );
-    let out = Blob::new("ran before the backup");
     for blob in job.blobs().into_iter().chain([&out]) {
         assert_eq!(
             read(&after, blob).await,
@@ -512,35 +490,29 @@ async fn a_file_cold_store_refuses_what_it_cannot_keep() {
     dirs.remove();
 }
 
-/// Catches an action-cache hit served after the store lost one of its output files
-/// (deleted under a `file://` cold store while the server was down): the index still
-/// holds the output until the start-up pass forgets it with the entry, or a check of
-/// the store at the hit marks it. The client must get a miss (the action runs again),
-/// not a result whose output it cannot download, and FindMissing must report the
-/// output, so it is uploaded again.
+/// Catches a blob served as held after the store lost its file (deleted under a `file://`
+/// cold store while the server was down): the index still holds it until the start-up pass
+/// forgets it. FindMissing must report it, so it is uploaded again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hit_whose_output_file_is_lost_is_a_miss_after_a_restart() {
+async fn a_blob_whose_file_is_lost_is_missing_after_a_restart() {
     let dirs = Dirs::new("lost-output");
     let (server, before, _) = started_here(&dirs).await;
-    let mut daemon = before.daemon("node-a", 4, 8).await;
     let job = Job::new("its output file is lost", &[]);
     before.upload(&job.blobs()).await;
-    let mut ops = before.execute(&job.action).await;
-    let start = daemon.start().await;
-    let result = output(&before, "an output whose file is deleted", 0).await;
-    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
-    assert_eq!(before.cached(&job.action).await, Ok(result));
-    drop((ops, daemon, before));
+    let out = Blob::new("an output whose file is deleted");
+    before.upload(&[&out]).await;
+    drop(before);
     stopped_here(server).await;
 
-    let out = Blob::new("an output whose file is deleted");
     let (path, _) = object_holding(&dirs.blobs, &out.data);
     std::fs::remove_file(path).expect("delete the output's object");
 
     let (server, after, _) = started_here(&dirs).await;
-    assert_eq!(after.cached(&job.action).await, Err(Code::NotFound));
     forgotten(&after, &[&out]).await;
+    assert!(
+        after.holds(&job.action).await,
+        "the blobs whose files are there are still held"
+    );
     drop(after);
     stopped_here(server).await;
     dirs.remove();

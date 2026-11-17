@@ -25,9 +25,7 @@ fn field(name: &str, value: &str) -> String {
 }
 
 /// Catches: the Overview not reading `/v1/health` and the build list (it read nothing
-/// before); a count shown under another's label (every count has its own value in the
-/// fixture); a null oldest age or under-replicated count shown as a number; the
-/// storage members, queue depth or leases dropped; the latest builds not linked to
+/// before); a null under-replicated count shown as a number; the storage members dropped; the latest builds not linked to
 /// their pages or their counters swapped; a failing check or the readiness missing.
 #[test]
 fn the_overview_shows_health_counts_and_the_latest_builds() {
@@ -47,31 +45,21 @@ fn the_overview_shows_health_counts_and_the_latest_builds() {
         )),
         "{html}"
     );
-    for (n, label) in [
-        (21, "nodes"),
-        (5, "serving"),
-        (3, "cordoned"),
-        (2, "draining"),
-        (4, "drained"),
-        (1, "quarantined"),
-        (6, "disconnected"),
-    ] {
-        let cell = format!("<span class=\"n\">{n}</span><span class=\"label\">{label}</span>");
-        assert!(html.contains(&cell), "{label}: {html}");
-    }
     for (name, value) in [
-        ("Queue depth", "9"),
-        ("Oldest queued operation", "not measured"),
-        ("Leases held", "13"),
         ("Storage members", "2 of 3 active"),
         ("Under-replicated blobs", "unknown"),
     ] {
         assert!(html.contains(&field(name, value)), "{name}: {html}");
     }
-    assert!(
-        html.contains("<a href=\"/ui/nodes\">All nodes</a>"),
-        "{html}"
-    );
+    for gone in [
+        "Queue depth",
+        "Leases held",
+        "All nodes",
+        "/ui/nodes",
+        "held in the server's memory",
+    ] {
+        assert!(!html.contains(gone), "{gone}: {html}");
+    }
     assert!(!html.contains("/ui/updates"), "{html}");
     assert!(
         html.contains(
@@ -159,16 +147,21 @@ fn storage_is_unknown_unavailable_or_absent_and_never_a_made_up_zero() {
     );
 }
 
-/// Catches: a known oldest age dropped (shown as "not measured" when the API sends it).
+/// Catches: a health document of an older server, which still sends `nodes`, `queue` and
+/// `leases`, failing the page instead of having those keys ignored.
 #[test]
-fn a_known_oldest_queue_age_is_shown() {
+fn an_older_health_document_with_scheduler_fields_still_renders() {
     let mut health = health_doc();
-    health["queue"]["oldest_age_ms"] = json!(1234);
-    let (_, html) = page(&farm_with(&health), "/ui");
+    health["nodes"] = json!({"total": 21});
+    health["queue"] = json!({"depth": 9, "oldest_age_ms": null});
+    health["leases"] = json!(13);
+    let (status, html) = page(&farm_with(&health), "/ui");
+    assert_eq!(status, 200, "{html}");
     assert!(
-        html.contains(&field("Oldest queued operation", "1234 ms")),
+        html.contains(&field("Storage members", "2 of 3 active")),
         "{html}"
     );
+    assert!(!html.contains("Queue depth"), "{html}");
 }
 
 /// Catches: a build list that does not answer failing the whole page (the health is
@@ -193,7 +186,7 @@ fn the_build_list_is_optional_and_honest() {
         "{html}"
     );
     assert!(
-        html.contains(&field("Queue depth", "9")),
+        html.contains(&field("Storage members", "2 of 3 active")),
         "the health is still shown"
     );
 

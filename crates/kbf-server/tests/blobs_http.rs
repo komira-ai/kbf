@@ -47,19 +47,8 @@ impl Server {
             worker: loopback(),
             reapi_tls: None,
             worker_tls: None,
-            tick: Duration::from_millis(50),
-            unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-            default_platform: kbf_front::DefaultPlatform::NONE,
-            qos_allowed: kbf_front::QosAllow::DEFAULT,
-            memory_ladder: kbf_server::MemoryLadder::default(),
-            memory_climb: true,
-            learned_sizes: kbf_server::LearnedSizes::Off,
-            exclusive_actions: false,
-            placement_load: kbf_server::PlacementLoad::Off,
-            placement_predictions: kbf_server::PlacementPredictions::Off,
-            usage_profiles: kbf_server::UsageProfiles::Off,
-            whole_node: None,
-            finished_retention: kbf_sched::FINISHED_RETENTION,
+            executor: None,
+            finished_retention: kbf_server::executor::FINISHED_RETENTION,
             shutdown_timeout: Duration::from_secs(10),
             streams: kbf_server::StreamTiming::default(),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
@@ -474,8 +463,8 @@ async fn blob_reads_are_off_unless_the_policy_names_their_authorizer() {
             );
             assert!(body.contains(r#""off":"blobs""#), "{what}: {body}");
         }
-        let nodes = server.get("/v1/nodes", "").await;
-        assert_eq!(nodes.code, 200, "{what}: the rest of the API answers");
+        let drain = server.get("/v1/frontend/drain", "").await;
+        assert_eq!(drain.code, 200, "{what}: the rest of the API answers");
         server.stop().await;
     }
 }

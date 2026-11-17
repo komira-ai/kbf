@@ -68,7 +68,7 @@
     <p class="lede">Here are the memory peaks of real actions, and what the two ways of giving them memory would do with the same peaks.</p>
     <div class="note-box">
       <p><strong>This is a model applied to real peaks from our farm's builds. It is not a count of past kills.</strong> We have no machine-readable record of what the earlier farm killed. The peaks are real: the earlier farm's daemon measured the peak memory of every action, and these are <span class="mem-ok">the</span> actions that finished, from <span class="mem-source">builds</span> of a slice of a real project on a kbf test farm. Both schemes place the same peaks.</p>
-      <p><strong>Buildbarn as it ran:</strong> one fixed runner slot of 7 GiB, every action booking all 7 GiB. It was resized from 9 GiB to 7 GiB on 2026-09-27, after a measured peak of 4.98 GiB. <strong>kbf</strong> uses its default ladder of 4, 16 and 32 GiB (<code>--memory-ladder-gib</code>).</p>
+      <p><strong>Buildbarn as it ran:</strong> one fixed runner slot of 7 GiB, every action booking all 7 GiB. It was resized from 9 GiB to 7 GiB on 2026-09-27, after a measured peak of 4.98 GiB. <strong>kbf</strong>, in the recording, used its default ladder of 4, 16 and 32 GiB (<code>--memory-ladder-gib</code>, now retired: kbf no longer sizes work, the job service sizes each job from the history of its build target).</p>
     </div>
     <p class="js-only mem-line" id="mem-line"></p>
     <p class="no-js">The panel needs scripts. The text above and below holds the same story without it.</p>
@@ -84,7 +84,7 @@
           <p class="small">The 2026-09-28 survey of heavy compiles found about 120 binaries that each needed 8 to 16 GiB. That is a separate dated measurement, not part of these peaks. Work of that size never fits a 7 GiB slot.</p>
         </section>
         <section class="scheme" aria-labelledby="lad-h">
-          <h3 id="lad-h">kbf's memory ladder: 4, 16 and 32 GiB</h3>
+          <h3 id="lad-h">kbf's earlier memory ladder: 4, 16 and 32 GiB</h3>
           <p class="small muted">Every action starts on the first rung. One killed for memory is queued again one rung up, and its action key remembers that floor.</p>
           <div class="table-wrap"><table id="lad-table"></table></div>
           <p class="small" id="lad-note"></p>
@@ -93,7 +93,7 @@
       <p class="small" id="cmp-line"></p>
       <p class="small muted" id="real-oom"></p>
     </div>
-    <p class="small muted">Booked memory is what a scheme reserves for an action; idle is booked minus the action's peak. The model counts memory only. <a href="https://github.com/komira-ai/kbf/blob/feature/arch-v2/docs/design/scheduler.md">The scheduler design</a> has the rules.</p>
+    <p class="small muted">Booked memory is what a scheme reserves for an action; idle is booked minus the action's peak. The model counts memory only. <a href="https://github.com/komira-ai/kbf/blob/feature/arch-v2/docs/design/scheduler.md">The earlier scheduler design</a> has the rules.</p>
   </div>
 </section>
 

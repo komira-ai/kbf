@@ -22,7 +22,7 @@ use kbf_server::cold_apply::ColdApplyError;
 use kbf_server::history::{HistoryError, with_history};
 use kbf_server::storage_node::{command, parse, start_storage};
 use kbf_server::store_config::acks::{Convergence, NodeStatus};
-use kbf_server::{Args, EpochPolicy, StartFailure, StateStore};
+use kbf_server::{Args, StartFailure, StateStore};
 use kbf_state::ManualClock;
 use kbf_state::Store;
 use kbf_state::fake::{Fake, Flaw};
@@ -349,7 +349,6 @@ fn registered_is_not_a_history_store() {
     ));
     let state = StateStore {
         store,
-        epoch: EpochPolicy::Keep,
         members: Default::default(),
         history: None,
     };

@@ -20,12 +20,12 @@ use kbf_objstore::MemoryStore;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
 use kbf_server::storage_health::{Debts, Reported};
 use kbf_server::token::ApiToken;
-use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
+use kbf_server::{Api, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
 use kbf_types::{NodeId, Role, RoleSet, TokenId, TokenSecret};
 use serde_json::{Value, json};
-use support::{API_TOKEN, Cell, FakeDaemon, hello, hello_on};
+use support::{API_TOKEN, Cell};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -39,9 +39,6 @@ const DAY: u64 = 24 * 3600;
 fn operator_headers() -> String {
     format!("Authorization: Bearer {API_TOKEN}\r\nContent-Type: application/json\r\n")
 }
-
-/// A tick that does not come within a test: no test here waits for one.
-const TICK: Duration = Duration::from_secs(3600);
 
 fn config() -> MembershipConfig {
     MembershipConfig {
@@ -68,19 +65,8 @@ fn listeners() -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        tick: TICK,
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
@@ -91,8 +77,6 @@ fn listeners() -> Listeners {
 
 struct Server {
     api: SocketAddr,
-    /// The farm the daemons register with.
-    farm: std::sync::Weak<kbf_server::farm::Farm>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -123,11 +107,9 @@ fn start(state: Option<StateStore>) -> Server {
     )
     .expect("bind");
     let api = bound.api.expect("an API address");
-    let farm = bound.farm.clone();
     tokio::spawn(async move { bound.serving.await.expect("serve") });
     Server {
         api,
-        farm,
         stop: Some(stop),
     }
 }
@@ -161,7 +143,6 @@ fn three_members() -> (Server, Members, [Node; 3]) {
 fn three_members_over(fake: &Arc<Fake>) -> (Server, Members, [Node; 3]) {
     let state = StateStore {
         store: Arc::clone(fake) as Arc<dyn Store>,
-        epoch: EpochPolicy::Keep,
         members: config(),
         history: None,
     };
@@ -303,30 +284,16 @@ async fn an_id_that_names_nothing_is_404() {
     assert_eq!(code, 404, "{body}");
 }
 
-/// Catches: a daemon asked about as if it were a storage member that is unknown (404), or a
-/// name that is no daemon answered safe: on a server without a state store (which keeps no
-/// members) a node that registered with the farm is safe to stop with the line that says
-/// only the daemon was judged, a node that did not is 404. It catches: the farm's
-/// node lookup inverted.
+/// Catches: a node id answered safe on a server without a state store, which keeps no
+/// members and no enrollment registry: there is no node to judge, so every node id is 404.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_daemon_is_safe_to_stop() {
+async fn a_node_id_without_a_state_store_is_unknown() {
     let cell = Cell::start_with_api().await;
     let api = cell.api.expect("an API address");
-    let _daemon = cell.daemon("linux-1", 4, 8).await;
-
-    let known = "/v1/members/linux-1/safe-to-stop";
-    let (code, said) = api_http::get(api, known).await;
-    assert_eq!(code, 200, "{said}");
-    assert_eq!(said["safe"], true);
-    assert_eq!(said["planned_down"], false);
-    let reasons = said["reasons"].as_array().expect("reasons");
-    assert_eq!(reasons.len(), 1, "{said}");
-    let line = reasons[0].as_str().unwrap_or_default();
-    assert!(line.contains("worker"));
-
-    let unknown = "/v1/members/linux-2/safe-to-stop";
-    let (code, said) = api_http::get(api, unknown).await;
-    assert_eq!(code, 404, "{said}");
+    for id in ["linux-1", "mac-1"] {
+        let (code, said) = api_http::get(api, &format!("/v1/members/{id}/safe-to-stop")).await;
+        assert_eq!(code, 404, "{id}: {said}");
+    }
 }
 
 /// The certificate the registry keeps for `role` of the node enrolled with token `seed`.
@@ -387,14 +354,14 @@ async fn ask_by(server: &Server, id: &str) -> (u16, Value) {
     api_http::get(server.api, &format!("/v1/members/{id}/safe-to-stop")).await
 }
 
-/// Catches: a node id answered by the daemon line when its host has a storage member (the
+/// Catches: a node id answered as a node with no storage member when its host has one (the
 /// updater that asks by node id would stop a host with a blob on one copy), or answered
 /// safe when it cannot be told: a node that enrolled with the address member 1 registered is
 /// judged as member 1 (unsafe while member 2 owes blobs, and the same body as asking by
-/// member 1); a node enrolled with no storage address, and a Mac, are safe with the daemon
-/// line; a Linux node whose address no member registered, and one the registry does not know,
-/// are `409` with why; a node that never registered is `404`. It catches: the node
-/// answered as a daemon without asking the registry; an unlinked node answered safe.
+/// member 1); a node enrolled with no storage address is safe with one line saying no
+/// storage was judged; a node whose address no member registered is `409` with why; a node
+/// the registry does not know is `404`. It catches: the node judged without asking the
+/// registry; an unlinked node answered safe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_is_judged_as_the_storage_member_it_enrolled_with() {
     let clock = Arc::new(ManualClock::default());
@@ -405,19 +372,6 @@ async fn a_node_is_judged_as_the_storage_member_it_enrolled_with() {
     enroll(&*fake, 1, "linux-1", &both, "192.0.2.1:8982");
     enroll(&*fake, 2, "linux-2", &[Role::Daemon], "");
     enroll(&*fake, 3, "linux-3", &both, "192.0.2.9:8982");
-    let mac = [("arch", "arm64"), ("os", "macos")];
-    let hellos = [
-        hello("linux-1", 4, 8),
-        hello("linux-2", 4, 8),
-        hello("linux-3", 4, 8),
-        hello("linux-5", 4, 8),
-        hello_on("mac-1", 4, 8, &mac),
-    ];
-    let mut daemons = Vec::new();
-    for greeting in hellos {
-        let daemon = FakeDaemon::connect(server.farm.clone(), greeting).await;
-        daemons.push(daemon.expect("registered"));
-    }
 
     owes(&other, two, 5);
     let line = format!("member {} owes 5 blobs", two.id);
@@ -427,25 +381,21 @@ async fn a_node_is_judged_as_the_storage_member_it_enrolled_with() {
     assert_eq!(by_node["reasons"], json!([line]));
     assert_eq!(by_node, ask(&server, one).await);
 
-    for id in ["linux-2", "mac-1"] {
-        let (code, said) = ask_by(&server, id).await;
-        assert_eq!(code, 200, "{id}: {said}");
-        assert_eq!(said["safe"], true, "{id}");
-        let reasons = said["reasons"].as_array().expect("reasons");
-        assert_eq!(reasons.len(), 1, "{id}: {said}");
-    }
+    let (code, said) = ask_by(&server, "linux-2").await;
+    assert_eq!(code, 200, "{said}");
+    assert_eq!(said["safe"], true);
+    assert_eq!(
+        said["reasons"],
+        json!(["the host runs no storage member: nothing of the storage is judged"])
+    );
 
-    let unsure = [
-        ("linux-3", "no storage member"),
-        ("linux-5", "not in the enrollment"),
-    ];
-    for (id, why) in unsure {
-        let (code, said) = ask_by(&server, id).await;
-        assert_eq!(code, 409, "{id}: {said}");
-        let text = said["error"].as_str().unwrap_or_default();
-        assert!(text.contains(why), "{id}: {text}");
-    }
+    let (code, said) = ask_by(&server, "linux-3").await;
+    assert_eq!(code, 409, "{said}");
+    let text = said["error"].as_str().unwrap_or_default();
+    assert!(text.contains("no storage member"), "{text}");
 
-    let (code, said) = ask_by(&server, "linux-4").await;
-    assert_eq!(code, 404, "{said}");
+    for id in ["linux-4", "linux-5", "mac-1"] {
+        let (code, said) = ask_by(&server, id).await;
+        assert_eq!(code, 404, "{id}: {said}");
+    }
 }

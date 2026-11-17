@@ -1,8 +1,8 @@
 //! The executor as the frontend builds it: from the `--executor` flags, over the frontend's own
-//! seams (the ingest of the packs, the CAS, the key mint) and the real farm, against a job
-//! service in this process. An action is placed, its job is submitted with the task tool's exact
-//! command line, image and limits, the pack the task wrote is ingested by the frontend's code,
-//! the result reaches the caller, and stopping leaves nothing to cancel.
+//! seams (the ingest of the packs, the CAS, the key mint), against a job service in this
+//! process. An action's job is submitted with the task tool's exact command line, image and
+//! limits, the pack the task wrote is ingested by the frontend's code, the result reaches the
+//! caller, and stopping leaves nothing to cancel.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::{Arc, Mutex};
@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use kbf_front::{
     Backend, Cache, CacheStorage, Described, Dispatch as _, Finished, PackKeyMint, PackSettings,
-    Packs, SegmentsConfig, Stage, Submission, VerifiedBlob,
+    Packs, Recorder, SegmentsConfig, Stage, Submission, VerifiedBlob,
 };
 use kbf_job_client::fake::{Call, FakeJobServer, TOKEN};
 use kbf_objstore::{Capabilities, MemoryStore, ObjectKey, ObjectStore as _};
@@ -20,17 +20,15 @@ use kbf_pack_index::PackIndex;
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_proto::reapi::platform::Property;
 use kbf_proto::reapi::{Action, Command, Platform};
-use kbf_sched::Request;
-use kbf_server::Farm;
 use kbf_server::executor::{
     Metrics, PrepareError, PreparedRun, RunPrepare, RunSource, Running, Secret, TaskOut,
 };
 use kbf_server::frontend;
 use kbf_state::ManualClock;
-use kbf_types::{ActionKey, Digest, LeaseKind, Qos, Resources};
+use kbf_types::{ActionKey, Digest};
 use prost::Message as _;
 
-use crate::rig::{ClockHold, GIB, machine, settle};
+use crate::rig::{PROMPT, machine};
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 const KBF_IMAGE: &str =
@@ -82,7 +80,7 @@ fn wire(digest: &Digest) -> kbf_proto::reapi::Digest {
 /// kbf image, the action's wall and the frontend's label; a pack the task wrote under the issued
 /// key is ingested by the frontend's own code into the result the caller gets; and stopping the
 /// executor cancels no job, as none is left to cancel.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams() {
     // The cache lingers before it writes a batch, on the clock: the blobs are stored while it
     // still runs by itself.
@@ -114,7 +112,6 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
     };
     let action = store(action.encode_to_vec()).await;
 
-    let _hold = ClockHold::new();
     let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-wiring");
     let fake = FakeJobServer::start().await.expect("a loopback port");
     fake.add_host("host-1", machine(64, "x86_64"));
@@ -138,10 +135,6 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         format!("--executor-job-url={}", fake.origin()),
         format!("--executor-job-token-file={}", token.display()),
         "--executor-frontend-id=front-1".to_owned(),
-        "--executor-hosts=1".to_owned(),
-        "--executor-host-cpus=2".to_owned(),
-        "--executor-host-memory-gib=16".to_owned(),
-        "--executor-host-slots=2".to_owned(),
         "--executor-insecure-argv-secrets".to_owned(),
         format!("--executor-base-image={IMAGE}"),
         format!("--executor-kbf-image={KBF_IMAGE}"),
@@ -158,6 +151,7 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
     // No flag gives the executor the mode this test runs any more (the frontend refuses
     // `--task-out-mode presigned`): its settings are set here, over what the flags made.
     js.config.task_out = TaskOut::Presigned;
+    js.config.poll = Duration::from_millis(5);
 
     // The frontend's seams: packs over an object store, the CAS of a node, the key mint.
     let objects = Arc::new(MemoryStore::new(Capabilities {
@@ -184,39 +178,25 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
     let backend = Backend::remote_over(storage, Some(packs.clone()));
     let front = js.front(packs, backend, source);
 
-    let farm = Arc::new(Farm::new(
-        Arc::new(Cache::memory()),
-        kbf_sched::UNSERVABLE_WAIT,
-        kbf_sched::FINISHED_RETENTION,
-    ));
     let metrics = Arc::new(Metrics::default());
     let executor = js
         .build(
-            Arc::clone(&farm),
             Arc::new(front),
             Arc::clone(&metrics),
             None,
+            Recorder::off(),
+            Duration::from_secs(600),
         )
         .expect("an executor");
-    let running = Running::spawn(executor);
+    let running = Running::spawn(&executor);
 
-    let ticket = farm
+    let ticket = executor
         .submit(Submission {
-            request: Request {
-                key: ActionKey {
-                    instance: "main".to_owned(),
-                    action,
-                }
-                .into(),
-                qos: Qos::Ci,
-                kind: LeaseKind::Action,
-                resources: Resources::new(1_000, GIB),
-                hermetic: true,
-                do_not_cache: false,
-                needs: kbf_caps::Request::default(),
-                whole_worker: false,
-                pin: None,
+            key: ActionKey {
+                instance: "main".to_owned(),
+                action,
             },
+            whole_machine: false,
             call: None,
             described: Described {
                 arguments: vec!["/bin/run".to_owned()],
@@ -224,18 +204,22 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
                 label: Default::default(),
             },
             evidence: Default::default(),
-            max_wall: None,
         })
-        .expect("the farm takes the action");
-    let stage = ticket.stage;
+        .expect("the executor takes the action");
+    let mut stage = ticket.stage;
 
     // The job is submitted.
-    let (job, spec) = loop {
-        if let Some(job) = fake.jobs().first() {
-            break (job.id.clone(), fake.submitted(&job.id).expect("a job"));
+    let submitted = async {
+        loop {
+            if let Some(job) = fake.jobs().first() {
+                return (job.id.clone(), fake.submitted(&job.id).expect("a job"));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        step(&farm, &fake).await;
     };
+    let (job, spec) = tokio::time::timeout(PROMPT, submitted)
+        .await
+        .expect("the job is submitted");
     let (build, asked_action, wall) = preparing.asked.lock().expect("asked")[0].clone();
     assert_eq!(asked_action, action);
     assert_eq!(
@@ -314,11 +298,13 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
     assert!(fake.run(&job));
     assert!(fake.finish(&job, 0));
 
-    let finished = loop {
-        if let Stage::Done(finished) = &*stage.borrow() {
-            break finished.clone();
-        }
-        step(&farm, &fake).await;
+    let done = tokio::time::timeout(
+        PROMPT,
+        stage.wait_for(|stage| matches!(stage, Stage::Done(_))),
+    )
+    .await;
+    let Stage::Done(finished) = done.expect("answered").expect("open").clone() else {
+        unreachable!("waited for done")
     };
     let Finished::Ran(result) = finished else {
         panic!("not ran: {finished:?}");
@@ -345,17 +331,4 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         cancelled, 0,
         "the job had ended: nothing was left to cancel"
     );
-}
-
-/// Five seconds pass on the clocks, and the farm and the executor's task run.
-async fn step(farm: &Farm, fake: &FakeJobServer) {
-    // A second at a time, with the executor's task let run in between: a call in flight on
-    // loopback is answered before its bound passes.
-    for _ in 0..5 {
-        tokio::time::advance(Duration::from_secs(1)).await;
-        fake.advance(Duration::from_secs(1));
-        settle().await;
-    }
-    farm.tick().await;
-    settle().await;
 }

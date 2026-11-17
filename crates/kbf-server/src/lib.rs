@@ -1,4 +1,4 @@
-//! `kbf-server`: the farm server, single node. It wires the front, the scheduler, the
+//! `kbf-server`: the farm server, single node. It wires the front, the executor, the
 //! metadata core and storage together; the decisions are theirs.
 //!
 //! - REAPI on one listener: the cache services and `Execution` from `kbf-front`, over
@@ -9,10 +9,9 @@
 //! - The worker listener on another: storage nodes register and heartbeat with
 //!   `kbf.map.v1.Membership`, and a host's updater makes its node calls
 //!   ([`node_self`]). Under mutual TLS a certificate must name its node, and a deny list
-//!   refuses certificates and nodes ([`identity`]). No node opens a session to a server:
-//!   the farm's workers are the executor's ([`executor`]), registered in-process.
+//!   refuses certificates and nodes ([`identity`]). No node opens a session to a server.
 //! - The operator API ([`api`]): HTTP/JSON under `/v1` on a third listener, off unless
-//!   `--api-listen` is given; `GET /v1/nodes`, and cordon, drain and uncordon, which
+//!   `--api-listen` is given; the storage members and the frontend's drain, whose writes
 //!   need the token of `--api-token-file` ([`token`]), and, behind the farm's proxy
 //!   (`--proxy-auth-file`, [`proxy_auth`]), a call that came through it. On the same listener,
 //!   `GET /healthz` and `GET /readyz` for a front's health check ([`health`]), and
@@ -39,10 +38,10 @@
 //!   drops and counts when a store is slow; it never delays or fails a call.
 //! - The durable log ([`log_file`]): a size-capped rotating file in `--log-dir` (by default
 //!   `log/` in the hot store's directory) that gets every event stderr gets.
-//! - The [`farm::Farm`] core: `kbf-sched` decides, the farm carries out its effects.
-//!   `Start` only after the grant commits; a result is accepted only from the node
-//!   holding the operation's current lease, and only an accepted result is written to
-//!   the action cache, before the callers are answered. Clients never write it.
+//! - The [`executor`]: each Execute that the action cache does not answer is one job of the
+//!   job service, submitted at once and read back until it ends; the frontend's ingest of a
+//!   job that ended well writes the action cache, before the callers are answered. Clients
+//!   never write it. kbf schedules nothing: where and when a job runs is the job service's.
 //!
 //! - REAPI authentication and authorization (`kbf-auth`): the REAPI listener runs the
 //!   policy of `--reapi-auth-policy` (`docs/reapi-auth.md`), an authentication layer
@@ -52,23 +51,17 @@
 //! - The storage node ([`storage_node`], `kbf storage`): the same cache and stores,
 //!   served alone over gRPC by `kbf_storage::service` (blobs through the standard
 //!   protocols, the action cache through `kbf.storage.v1`), each call admitted by the
-//!   role in the caller's certificate. No scheduler, REAPI or state store.
+//!   role in the caller's certificate. No executor, REAPI or state store.
 //!
-//! - The frontend ([`frontend`], `kbf frontend`): the REAPI listener, the scheduler,
-//!   the worker streams and the operator API, with no cache of its own. CAS, ByteStream
-//!   and the action cache are proxied to a storage node over mutual TLS, Execute and the
-//!   scheduler read and write that node, and `/readyz` follows it and the state store.
+//! - The frontend ([`frontend`], `kbf frontend`): the REAPI listener, the executor and the
+//!   operator API, with no cache of its own. CAS, ByteStream and the action cache are
+//!   proxied to a storage node over mutual TLS, and `/readyz` follows it, the state store
+//!   and the job service.
 //!
-//! Not yet: the scheduler's state in the Raft log (the control log is in-process: a
-//! record commits as soon as it is appended, see [`farm`]), REAPI authentication other than the policies
-//! `kbf-auth` builds (`allow`, `deny`, `any`, `all`), operator roles (the
-//! API's writes need one token, [`token`]), the `x-kbf-qos` header, learned sizes,
-//! capability matching, and the worker-side `ResultAck` handling (issue #26).
+//! Not yet: REAPI authentication other than the policies `kbf-auth` builds (`allow`, `deny`,
+//! `any`, `all`), and operator roles (the API's writes need one token, [`token`]).
 
 pub mod action_usage;
-pub mod answer;
-#[cfg(test)]
-pub(crate) mod answer_tests;
 pub mod api;
 pub mod api_client;
 #[cfg(test)]
@@ -82,12 +75,8 @@ mod deny_rows;
 pub mod drain;
 pub mod enroll;
 pub mod executor;
-pub mod farm;
-mod farm_write_metrics;
-mod fault;
 pub mod fill;
 mod flag_set;
-pub mod fleet;
 pub mod front_maps;
 pub mod frontend;
 pub mod grpc_health;
@@ -97,26 +86,19 @@ pub mod history;
 pub mod http_blobs;
 mod http_history;
 pub mod http_invocations;
-pub mod http_sched;
 pub mod identity;
 pub mod job_tree;
 pub mod join;
 mod key_file;
-pub mod learned;
 mod listen;
 pub mod log_file;
-pub mod machine;
 pub mod members;
 pub mod members_rpc;
-mod memory;
 pub mod metrics;
-mod missing;
 pub mod node_map;
 pub mod node_self;
 mod notify;
 pub mod object_store;
-pub mod placement_load;
-pub mod placement_predictions;
 pub mod proxy_auth;
 pub mod raft_log;
 mod ram_drain;
@@ -127,9 +109,6 @@ pub mod release;
 pub mod replication;
 pub mod retire;
 pub mod retired;
-mod run_record;
-mod sched_load_metrics;
-pub mod scheduler_core;
 pub mod sequence;
 pub mod serve;
 #[cfg(test)]
@@ -138,8 +117,6 @@ mod serve_goaway_tests;
 mod serve_remote_tests;
 #[cfg(test)]
 mod serve_start_tests;
-mod size_key;
-pub mod stamp;
 mod stand;
 mod start;
 mod start_exit;
@@ -156,36 +133,24 @@ pub mod streams;
 mod test_dir;
 #[cfg(test)]
 mod test_log;
-mod timeout;
 pub mod token;
 pub mod ui_mount;
-pub mod update_status;
-pub mod usage_profiles;
 pub mod verbs;
 pub mod vitals;
-pub mod whole_node;
 pub mod worker;
 pub mod worker_roles;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
 pub use drain::{Drain, DrainStatus};
-pub use farm::{
-    ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, Farm, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
-    OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
-};
+pub use executor::rows::{DONE_FLOOR, ID_BLOCK};
 pub use health::Readiness;
 pub use http_history::run_json;
 pub use identity::{DenyList, DenyListError, Peers};
-pub use kbf_sched::MemoryLadder;
 pub use kbf_tls::{TlsError, TlsFiles, TlsSource};
-pub use learned::LearnedSizes;
 pub use listen::Held;
 pub use node_map::NodeMap;
-pub use placement_load::PlacementLoad;
-pub use placement_predictions::PlacementPredictions;
 pub use raft_log::{RaftLogError, RaftMetaLog};
-pub use scheduler_core::SchedulerCore;
 pub use serve::{
     Api, Behind, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming,
     WorkerTls, bind_server, bind_server_with_api, bind_server_with_policy, bind_server_with_state,
@@ -196,13 +161,10 @@ pub use start_exit::{
     NOT_READY, REFUSED, STALE_WRITER_HINT, StartFailure, hint as start_hint, said as start_said,
 };
 pub use state_store::{
-    OpenFailure, PackIndexFlagError, StateStore, StateStoreUri, StateStoreUriError,
+    OpenFailure, PackIndexFlagError, StateError, StateStore, StateStoreUri, StateStoreUriError,
 };
 pub use streams::{StreamArgs, StreamLimits};
 pub use ui_mount::{bind_server_holding, bind_server_with_options, bind_server_with_ui};
-pub use usage_profiles::UsageProfiles;
-pub use whole_node::WholeNodeFlags;
-pub use worker::HostFloor;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build
 /// had no git checkout. `build.rs` embeds it (`src/build_commit.rs` has the rule,
@@ -223,7 +185,7 @@ pub const BUILD_SEQ: u64 = match u64::from_str_radix(env!("KBF_BUILD_SEQ"), 10) 
 };
 
 /// The server's version as it reports it in `--version`, the start line and the
-/// `server` field of `GET /v1/nodes`: the package version, `+`, and [`BUILD_COMMIT`].
+/// `kbf --version --json`: the package version, `+`, and [`BUILD_COMMIT`].
 pub const SERVER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"));
 
 #[cfg(test)]
@@ -246,7 +208,7 @@ mod tests {
     }
 
     /// Catches: a version that names the package version alone, so two builds of it
-    /// read the same in `--version`, the start line and `/v1/nodes`; and a commit that
+    /// read the same in `--version` and the start line; and a commit that
     /// is not the one built (the build script fell back to `unknown`, embedded another,
     /// or ignored `KBF_BUILD_COMMIT_OVERRIDE` when the build set it).
     #[test]

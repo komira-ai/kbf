@@ -1,6 +1,6 @@
 # The kbf modes: frontend and storage
 
-`kbf` is one binary with two modes: `frontend` (the REAPI service, the scheduler and the
+`kbf` is one binary with two modes: `frontend` (the REAPI service, the executor and the
 operator API) and `storage` (a storage node). A farm is one or more frontends and the storage
 nodes they route to; the actions a frontend places run as jobs of the jobscheduler's job
 service. This page says what each mode runs, which ports it uses and who dials whom, how
@@ -19,7 +19,7 @@ refuses by name the flags that belong to another.
 
 | mode | what the process runs | listens on | state it keeps |
 |---|---|---|---|
-| `frontend` | REAPI, the scheduler, the worker listener, the operator API; no blobs | REAPI, worker listener, optional operator API, optional enrollment listener | the scheduler's state store |
+| `frontend` | REAPI, the executor, the worker listener, the operator API; no blobs | REAPI, worker listener, optional operator API, optional enrollment listener | the state store of its operations |
 | `storage` | the storage service: the cache and the metadata log | the storage port | blobs and the metadata log |
 
 ### The removed modes
@@ -46,7 +46,7 @@ The vocabulary of the removed modes stays readable, so older data and certificat
 understood: the role `daemon` (`urn:kbf:role:daemon`), the host roles `daemon` and `mac-daemon`,
 and every protobuf message.
 
-**`frontend`.** It serves REAPI (Execute, the scheduler, operations) and, when `--worker-listen` is
+**`frontend`.** It serves REAPI (Execute, operations) and, when `--worker-listen` is
 given, the worker listener (storage nodes' `Membership` calls and a host updater's node calls). Storage nodes connect to that listener, so a
 frontend that has a storage node gives the flag; a frontend with none (`--executor js-agent` and no storage
 node) binds no worker port. It routes each cache call to a storage node. It holds no blobs
@@ -120,37 +120,34 @@ that keeps sending, however slowly, is never cut and keeps its bytes until it en
 nothing holds only its reservation, never a buffer of the claimed size. Both flags are
 accepted and ignored without `--pack-store-endpoint`.
 
-Where the frontend runs the actions it places is `--executor` (the `[executor]` table of
-`kbf.toml`). `js-agent`, the only value, runs each placed action as a job of the job scheduler's
-job service. Any other value is refused, `kbf-daemon` (the value of the releases that ran a
-daemon on each node) included. Left out, the frontend builds no executor and contacts no job
-service, whatever the other `--executor-*` flags say: it serves the cache and the CAS and places
-nothing. Stopping the frontend
-cancels its jobs; a frontend that is killed (a stop timeout, SIGKILL) leaves them, and they run to
-their wall limit unless a later `js-agent` start cancels them. The frontend registers `--executor-hosts`
-virtual workers with its farm (default 4), `js:<frontend id>-<n>`, each of `--executor-host-cpus`
-cores (default 32), `--executor-host-memory-gib` GiB (default 128) and `--executor-host-slots`
-actions at once: that is how many actions of which size the farm may have in flight, a ceiling
-this frontend admits and not the hardware, and the job service decides which host runs each job.
-The Macs of the
-job service are virtual workers of their own, `js-mac:<frontend>-<n>`, with
-`--executor-mac-hosts` (0 by default: none, and no macOS action is placed on the executor),
-`--executor-mac-task-bundle` (the release's `kbf-task` bundle by its manifest digest, the image
-of a Mac job), `--executor-mac-os-version` (the least macOS the Macs run, 26 by default; an
-action's `os_version` above it is refused) and `--executor-mac-task-out-root` (the tier store's
-put directory on the Macs, `--task-out-root` by default); a macOS action becomes a job of a
-Mac's native runtime (docs/design/actions-as-jobs.md, section 14), which the job service at
-kbf's pin cannot run yet. A Linux job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
+Where the frontend runs the actions it is asked to execute is `--executor` (the `[executor]` table of
+`kbf.toml`). `js-agent`, the only value, runs every Execute that the action cache does not answer as one job of the job
+scheduler's job service ([direct-js.md](../design/direct-js.md)). Any other value is refused,
+`kbf-daemon` (the value of the releases that ran a daemon on each node) included. Left out, the
+frontend builds no executor and contacts no job service, whatever the other `--executor-*` flags
+say: it serves the cache and the CAS and answers an Execute that misses the cache
+`FAILED_PRECONDITION`.
+
+kbf does not schedule. The job is submitted at once, with no count, queue or capacity in kbf: how
+many jobs run, where and when is the job service's. The frontend reads each job back every
+`--executor-poll-ms` (250 ms; 100 to 10000) until it ends and answers the operation. Stopping the
+frontend cancels nothing: its jobs run on, and over a `--state-store` another frontend, or the same
+one restarted, takes the operations up (below). A Linux job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
 the job's arguments are the tool's flags and nothing is mounted into the container. It names no
 cores and no memory: it carries a `size-class` label, the action's build target and whether it is
 a test run (`root//crates/kbf-server:kbf-server` built is `root.crates.kbf-server.kbf-server.build`,
 its test run `….test`; an action whose output paths name no target is `shape.` and its shape key),
 and the job service books it what the past runs of that class used, or, for a class with too few
-runs, its cold size (jobscheduler's `docs/design/sizing.md`, section 7.7). A Mac job still names
-the cores and memory the farm booked (the memory as a hard cap of 1.5 times the booking plus
-512 MiB), with the same label. A job needs a host of `os=linux` and
+runs, its cold size (jobscheduler's `docs/design/sizing.md`, section 7.7). A Mac job names no
+cores or memory either, with the same label. A job needs a host of `os=linux` and
 `--executor-arch` (default `x86_64`) that runs containers, and a wall limit of the action's
-timeout plus the run margin. It books no disk: the
+timeout plus the run margin. The Macs of the job service are used when `--executor-mac-task-bundle` is given (the release's `kbf-task`
+bundle by its manifest digest, the image of a Mac job; without it no macOS action is run),
+`--executor-mac-os-version` (the least macOS the Macs run, 26 by default; an
+action's `os_version` above it is refused) and `--executor-mac-task-out-root` (the tier store's
+put directory on the Macs, `--task-out-root` by default); a macOS action becomes a job of a
+Mac's native runtime (docs/design/actions-as-jobs.md, section 14), which the job service at
+kbf's pin cannot run yet. It books no disk: the
 job carries no `disk_bytes`, so the job service places it on a host whatever scratch disk that
 host reports, and the job writes to its host's scratch with no quota. The kbf image is built from
 the base environment the actions' Commands see (`--executor-base-image`); both are named by
@@ -159,10 +156,8 @@ another image is refused as invalid (the message names both), one that names non
 and a tag is refused. It needs both image flags, and the job service (`--executor-job-url`,
 `https://`, or `http://` to loopback only; `--executor-job-token-file`, mode 0600 or 0400;
 `--executor-job-ca-file` for an `https` URL), `--executor-frontend-id` (the `kbf-frontend` label
-on the frontend's jobs, by which a restarted frontend finds and cancels those an earlier process
-left, and hashed into every job id; it must be different for each frontend, so a `kbf.toml` is
-not copied to a second frontend with it, except that the frontends of one
-`--executor-ownership shared` group give the same one), the packs (`--pack-store-endpoint`, through which the
+on the frontend's jobs, hashed into every job id; every frontend of one farm that shares a
+`--state-store` gives the same one), the packs (`--pack-store-endpoint`, through which the
 pack a task writes is read, hashed and turned into the action's result) and nothing else for the
 output: a put-dir job (the only mode, `--task-out-mode put-dir`) carries no url, no grant and no secret, and its pack is a file
 of its put directory, which the frontend ingests. The executor's presigned path (a write url, a read token, `--executor-secret-delivery`
@@ -177,26 +172,33 @@ disk a job once asked for its outputs, is gone the same way, since a job books n
 started with it, with either executor, or a `kbf.toml` whose `[executor]` table still has
 `executor-output-disk-bytes`, fails at start naming it; delete the flag or the key.
 
-Each farm lease is one job, whose id is made from the frontend id and the farm lease
-(`k<8 hex digits of the sha256 of the frontend id>-<term>-<seq>-<attempt>`): a `Start` the farm
-sends again, and a submit sent again after its answer was lost, name the job already made, so no
-action is submitted twice. A farm `Cancel` is a cancel of the job. How a job ends is mapped to the
-farm's failure classes as the table in `crates/kbf-server/src/executor/outcome.rs` says: a job
-stopped at its wall limit is the action's own timeout, one stopped for memory is rerun with more,
-a lost job is the host's fault and rerun elsewhere, and a submit the service refuses because no
-host could ever run it ends the action as invalid. A job's pack is read, and its outputs
+The flags of the farm scheduler kbf once had are retired: accepted, hidden from `--help`, ignored, and
+a start that is given one logs a single warning. They are `--executor-hosts`, `--executor-host-cpus`,
+`--executor-host-memory-gib`, `--executor-host-slots`, `--executor-prepare-concurrency`,
+`--executor-ownership`, `--executor-mac-hosts`, `--unservable-wait-secs`, `--memory-ladder-gib`,
+`--exclusive-actions`, `--no-memory-climb`, `--learned-sizes`, `--scheduler-core`,
+`--placement-load`, `--placement-predictions`, `--usage-profiles`, `--whole-node-*`,
+`--default-platform` and `--qos-allowed`. Remove them from a `kbf.toml` at the next edit.
+
+Each attempt of an operation is one job, whose id is made from the frontend id, the operation and
+the attempt (`k<8 hex digits of the sha256 of the frontend id>-<operation>-<attempt>`): a submit sent again after its
+answer was lost, and a frontend that takes the operation up, name the job already made, so no
+action is submitted twice. `CancelOperation` is a cancel of the job. How a job ends is mapped to
+failure classes as the table in `crates/kbf-server/src/executor/outcome.rs` says: a job
+stopped at its wall limit is the action's own timeout, answered `DEADLINE_EXCEEDED` at once; one
+killed for memory, a lost job (the host's fault) and any other ending of the farm's are submitted again as
+the next attempt, a new job and a new key, at most 2 times, after which the callers are answered
+`UNAVAILABLE` (`FAILED_PRECONDITION` with reason `ACTION_OUT_OF_MEMORY` for memory); and a submit the service refuses because no
+host could ever run it ends the action as invalid at once. A job's pack is read, and its outputs
 promoted, only from a clean result: the job and its result both say succeeded, the result's
 reason is the job's exit and its exit code is 0. Any other ending, a result that leaves out its
-exit code included, leaves the pack unread however complete it is, and the farm runs the action
-again (or answers it, as the table says). A whole-machine action
-(`kbf-lease=whole_machine`) is one job too: each virtual worker lists the `container` and
-`native-whole-machine` drivers, so the farm places it on a worker it books whole, and the job
-needs the whole host and nothing beside it (no cores, memory or disk of its own: the host's are
-all the job's), with the image, arguments, constraints and wall limit of any other. A whole-host
+exit code included, leaves the pack unread however complete it is, and the action runs
+again (or is answered, as the table says). A whole-machine action
+(`kbf-lease=whole_machine`) is one job too: it needs the whole host and nothing beside it (no
+cores, memory or disk of its own: the host's are all the job's), with the image, arguments,
+constraints and wall limit of any other. A whole-host
 job the job service could not ready a host for (`exclusive-not-ready`) is an infrastructure
-failure, and the farm runs the action again. A worker that has not had a heartbeat acknowledged by the farm, or an
-answer from the job service while it holds a job, for the fence time cancels all its jobs and
-falls silent until the farm has requeued them.
+failure, and the action runs again.
 
 **What an action's Command sees in its job.** In a put-dir job (`--tree`, the farm's) the task tool
 makes no sandbox of its own, since the job is one (its own user namespace, no network, a layered
@@ -223,31 +225,19 @@ whose hosts serve the provider (`--mount-provider tierstore=<socket>` on their a
 can serve is refused by the job service and the farm sees an infrastructure failure. A Mac job always
 reads manifests.
 
-`--executor-ownership` says who owns the jobs: `single`, the default, is what the next paragraph
-describes, and `shared` lets several frontends of one `--executor-frontend-id` run beside each
-other over one `--state-store`. With `shared` the frontend starts only if `--state-store` is
-given. Each process names its workers `js:<frontend id>.<the first 8 characters of its
-instance>-<n>` (its Macs `js-mac:<frontend id>.<the same 8 characters>-<n>`), keeps a liveness row in the state store that `--executor-live-secs` (default
-45) lets live after its last renewal, and writes the row of a worker before the farm hears of
-it and the row of a job before it submits the job. The liveness time must be at least the fence
-time (40 s) plus 5 s, and a smaller one is refused at start; `single` does not read it. A
-`shared` frontend does not look for another frontend's jobs, does not cancel an earlier
-process's jobs at start, and when it fences or stops it cancels no job: a worker's row is
-deleted if it has no job row and otherwise left with no owner, and the liveness row is deleted.
-It cancels a job only when the farm cancels the lease or a withdrawal reaches it, the farm
-ending a worker's stream included; the row of such a job is deleted once its cancel is
-answered. This release
-writes the rows and does not yet read another process's rows, so no frontend takes over the
-jobs of one that has gone.
+**Over a state store.** With `--state-store` the executor keeps the rows `exec/op/<operation>` (owner,
+action, attempt, job id), `exec/live/<instance>` and `done/`, `doneof/` that
+[direct-js.md](../design/direct-js.md) section 3 lists, and the operation ids come from the store's
+shared counter. Any frontend of the store answers `WaitExecution` and `GetOperation` of any operation by name,
+and a process whose liveness row has expired (`--executor-live-secs`, default 20 seconds after its
+last renewal, on the store's clock; a stopping process deletes its row at once) has its unfinished
+operations taken up by another frontend, one compare-and-set for each, which reads the job back
+where it is. A job that commits into a put directory is finished from it; one that writes to a
+presigned url, which only the process that held the url can finish, is cancelled and run again.
+Clients reattach with `WaitExecution`. Without a `--state-store` a restart loses the open operations, and its
+clients' builds fail. Every frontend of a farm may run the executor.
 
-The executor runs on exactly one frontend with `single`: it looks for another frontend's live jobs on the job
-service before its first pass and every 40 s after, and a frontend that finds some older than its
-own (or finds some before it has any) stops with an error naming it. Each job also carries the
-process that made it: a frontend that starts and finds live jobs of another process under its own
-id watches for a new one for the fence time and a step (40.5 s by default) before it cancels them,
-and stops if a new one appears; it cancels them if none does, as after a crash. Nothing is
-submitted meanwhile. A restart of the frontend fails the builds in flight, and stopping it cancels
-the jobs. The executor prepares each job with the frontend's **task runs** (below), so
+The executor prepares each job with the frontend's **task runs** (below), so
 `--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with
 `--task-out-root`) and `--pack-store-endpoint` are given, and unless they agree with it: the
 longest job (`--executor-max-run-secs` plus `--executor-run-margin-secs`) must fit 14400 s less
@@ -263,25 +253,27 @@ cannot be read is rerun. `--executor-base-image` and `--executor-kbf-image`
 flags are read. The farm's certificate authority for the task's `https` reads must be in the kbf
 image. A secret is never part of an error, a log line or a
 metric. `GET /metrics` gains the `kbf_executor_*` families, among them the jobs submitted, those
-submitted again after a lost answer, those cancelled, those of an earlier process cancelled at
-start, and the jobs seen on a host that missed its grace. The remaining settings are
-`--executor-host-slots` (default 8), `--executor-run-margin-secs` (300; what a job's wall limit
+submitted again after a lost answer, the attempts resubmitted
+(`kbf_executor_attempts_resubmitted_total`), the operations of a gone process taken up
+(`kbf_executor_operations_reattached_total`) and those cancelled; `kbf_executor_phase_seconds` has the phases `submit` (the
+Execute to the job service's answer to its submit) and `execute` (the Execute to its callers
+answered). A frontend with no executor has none of them. The remaining settings are
+`--executor-run-margin-secs` (300; what a job's wall limit
 adds to the action's timeout), `--executor-failed-stderr-log-bytes` (512, at most 8192, 0 for
 none: the end of a failed job's standard error, with the job's secrets redacted, is one WARN line
 of the frontend's log, `the end of the standard error of a job that did not end well`; the whole
 output goes with the result as before), `--executor-max-run-secs` and `--executor-default-timeout-secs`
-(3000), `--executor-call-timeout-secs` (5), `--executor-poll-ms` (1000, from 100 to 10000: how often the executor polls the job service), `--executor-prepare-limit-secs` (300: how long a run's input
-tree may take to publish; the `Start` window ends the submit, not the preparation), `--executor-prepare-concurrency` (4: how many of one
-worker's runs prepare at once; the rest wait their turn inside their window), `--executor-work-dir`, `--executor-allow-plain-http-put`, `--executor-allow-plain-http-grant` and `--executor-locate`
+(3000), `--executor-call-timeout-secs` (5), `--executor-poll-ms` (250, from 100 to 10000: how often each operation's job is read back from the job service), `--executor-prepare-limit-secs` (300: how long a run's input
+tree may take to publish), `--executor-work-dir`, `--executor-allow-plain-http-put`, `--executor-allow-plain-http-grant` and `--executor-locate`
 (read and checked at start, with no effect on a put-dir job: they belong to the presigned path that a following change deletes), and `--executor-network` (the network every job is given on its host: `allow-list`,
 the default, the endpoints the host's agent is set up to allow and nothing else, so each agent must
 allow the read listener and the pack store before the switch; `none`, no route out, with which
 every action fails; `open`, any address but those the agent always denies, refused at start unless
 `--executor-allow-open-network` is also given, and that flag is refused with any other level). A
 start the agent refuses because it cannot check the limits of a job's network (`egress-unchecked`)
-is an infrastructure failure, and the farm runs the action again. A setting that breaks a rule the
-executor's safety rests on (the fence time against the scheduler's grace and the start window, an
-open network without its opt-in) is refused at start, exit status 2.
+is an infrastructure failure, and the action runs again. An open
+network without its opt-in is refused at start, exit status 2. A server that has more than
+65 536 open operations refuses the next Execute `UNAVAILABLE`: the one bound kbf keeps.
 
 **The kbf base tree: `--executor-base-tree <DIR>`.** Needed with `--executor js-agent`: the
 frontend's cache of the base tree bundle of its release, a directory **the frontend's user may
@@ -334,22 +326,21 @@ by hand.
 
 **Switching a running frontend onto the job service.** The executor-to-job-service
 mode is `executor = "js-agent"` with the job service's keys (`executor-job-url`,
-`executor-job-token-file`, `executor-job-ca-file` for `https`) and the virtual workers'
-(`executor-hosts`, `executor-host-cpus`, `executor-host-memory-gib`, `executor-host-slots`) in
+`executor-job-token-file`, `executor-job-ca-file` for `https`) in
 the `[executor]` table. `kbf-deploy job-service plan` prints what the switch sets in a frontend's
 `kbf.toml` and the flags of the mode it runs now; `kbf-deploy job-service apply --apply` checks
 the service with kbf's client token, writes those keys (the original kept as
 `kbf.toml.pre-job-service`), drains and restarts the frontend through `kbf-host-install`, waits
-for its first virtual worker and runs one canary job. Both verbs are dry runs without `--apply`. The
+for `GET /readyz` and runs one canary job. Both verbs are dry runs without `--apply`. The
 procedure, the canary and the refusals are in [job-service-cutover.md](job-service-cutover.md).
 
 Per-action overhead of the executor is read from two places. The
 executor's own phases are the histogram `kbf_executor_phase_seconds{phase=...}` on `GET /metrics`:
-`prepare` (the `Start` first seen to its job being ready), `start` (ready to the job service
+`prepare` (the Execute to its job being ready), `start` (ready to the job service
 answering the submit with the job), `queue` (accepted to first read back as running), `task` (first
 read back as running to read back as ended), `run` (accepted to read back as ended, whether or not
-it was seen running) and `ingest` (read back as ended to the read of the pack done). They are
-stamped by the executor on its own clock, once per pass over its jobs, and the job service learns a
+it was seen running), `ingest` (read back as ended to the read of the pack done), `submit` (the Execute to the job service's answer to its submit) and `execute` (the Execute to its callers answered). They are
+stamped by the executor on its own clock, once per poll of each job, and the job service learns a
 job's state from its host's agent, which trails the host by one or two beats: `queue`, `task` and
 `run` are good to a pass plus a heartbeat or two, not to the instant the host started or ended the
 job, and a job that starts and ends between two reads has a `run` and no `queue` or `task`. A phase that was not observed
@@ -362,24 +353,24 @@ frontend read the pack. For a `task_claim` run only the three durations are data
 task said and none the frontend's own measurement: the instants, and the gaps between them and the
 server's `worker_start` and `worker_completed`, are not (the delay from the task's end to the
 frontend's read lands before `input_fetch_start`). A claim is fine for a measurement and never for a
-decision: nothing reads it to decide, and the live estimator learns from the lease's usage block, not
-from these times. A step the task reports as 0 ms has no timestamps. A task that writes into a put
+decision: nothing reads it to decide, and kbf keeps no estimator, so
+nothing is learned from these times. A step the task reports as 0 ms has no timestamps. A task that writes into a put
 directory (`kbf-task --stage-and-commit`) also writes the phase timings `walk_ms`, `hash_ms`,
 `write_ms` and `commit_ms` in the manifest's `timing`; ingest does not carry them.
 
 **Task runs** (off by default; the `[task-runs]` table of `kbf.toml`). With `--task-secret-file`
 (and `--task-out-root`, the tier store's put directory on every host, `<mp>/put`, an absolute path;
 the action trees are under `<mp>/trees` beside it) the frontend prepares the runs of a host
-executor (docs/design/jobs-on-jobscheduler-and-tierstore.md). For each lease and Action it reads
+executor (docs/design/jobs-on-jobscheduler-and-tierstore.md). For each run of an Action it reads
 the Action, its Command and the whole input tree and checks that every blob is held (a blob that is
 missing is an error, never a smaller tree, and a tree over `--task-closure-max-digests`, default
 500000, or `--task-closure-max-bytes`, default 32 GiB, is refused), writes the action tree over the
-published kbf base tree, and mints one put directory, `cas/b/<lease>/<nonce>` (its nonce a MAC over
-the lease, the action and the minute). The directory's keys are good for the run's wall limit plus
+published kbf base tree, and mints one put directory, `cas/b/<operation>-<attempt>/<nonce>` (its nonce a MAC over
+the run, the action and the minute). The directory's keys are good for the run's wall limit plus
 `--task-url-slack-secs` (default 600), and never for more than 4 hours (14400 seconds). The job has
 no image: its root is the one read-only layer `<mp>/trees/<digest>`, it runs
 `/.kbf-tools/kbf-task --tree --stage-and-commit --out-dir /out`, the directory
-`<mp>/put/cas/b/<lease>/<nonce>` is mounted read-write and `no_exec` at `/out`, and it has no
+`<mp>/put/cas/b/<operation>-<attempt>/<nonce>` is mounted read-write and `no_exec` at `/out`, and it has no
 network, no file and no secret, whatever `--executor-network` says. The host's agent must list
 `<mp>/put` as a `--mount-root` (read-write) and `<mp>/trees` as a mount root. The task commits one
 object, `pack` (the one-pass object, `--task-out-format one-pass`, the only value); the ingest
@@ -426,7 +417,7 @@ reuses it.
 large objects tasks write under `cas/b/` are not all kept: a refused run, a run that failed after
 its write, the unused keys of a key set, and a large object the ingest has already copied into the
 CAS leave keys nothing refers to. With `--task-janitor-key-file` the leader (the server that holds
-the scheduler role) lists `cas/b/` every `--task-janitor-interval-secs` (default 900) and deletes
+its roles: the `leader` flag of `/readyz`) lists `cas/b/` every `--task-janitor-interval-secs` (default 900) and deletes
 a key that is older than `--task-janitor-grace-secs` (default 21600, which is also the least: the
 18000 seconds at which an ingest refuses a key, the 4 hours a presigned write is good for and an
 hour for the ingest, and an hour more as a margin between frontends), is not one an ingest is verifying
@@ -464,8 +455,8 @@ a binary of its own, indexes those segments where they lie, with no byte copied 
 written to the object store: [pack-adopt.md](pack-adopt.md) gives the order to run it in.
 
 **The job-facing read listener** (off by default; the `[job-read]` table of `kbf.toml`). It is
-the frontend's own read listener, not an executor mode: the jobscheduler's job service, which its
-lease server serves under a `--job-listen` of its own, is another process, and the switch of
+the frontend's own read listener, not an executor mode: the jobscheduler's job service, which
+serves under a `--job-listen` of its own, is another process, and the switch of
 an executor onto it is in [job-service-cutover.md](job-service-cutover.md). A task
 that runs an action on a worker fetches the action's input files from the frontend, with a read
 grant (a token the frontend gives the run, valid until its expiry, for one Action: it reads that
@@ -564,7 +555,7 @@ response bytes are `crates/kbf-front/tests/data/job_read_batch.golden`. `/metric
 `kbf_job_batch_requests_total` (by `outcome`) and `kbf_job_batch_blobs_total` (by `status`).
 
 **`storage`.** It serves the storage service over gRPC and nothing else: no REAPI, no
-scheduler, no operator API (only `GET /metrics`, on `--metrics-listen`, off unless given).
+executor, no operator API (only `GET /metrics`, on `--metrics-listen`, off unless given).
 It has no state store; it reaches one only through a frontend. Without `--frontend` it is a
 farm of one member. With `--frontend <url>` it registers with that frontend, heartbeats to
 it, and takes the storage map from it.
@@ -752,7 +743,7 @@ one host:
 ### Distributed: a farm
 
 Choose a farm for more than one build host, for any need to survive the loss of a host, or
-to keep the scheduler's state on a host that runs no builds. A farm is one frontend (alone or behind
+to keep the state store on a host that runs no builds. A farm is one frontend (alone or behind
 the proxy), storage nodes (`storage`) and the job service with its agents, which run the actions.
 
 - **Replication.** The map places each blob on `r` owners, and `r` is 2. It is not a flag.

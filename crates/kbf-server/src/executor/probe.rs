@@ -13,7 +13,7 @@ use crate::health::Probe;
 /// index and the call writes nothing.
 const PROBE_JOB: &str = "kbf-readyz-probe";
 
-/// One read of [`PROBE_JOB`]: the check passes when the job service answers about it, whatever
+/// One read of [`PROBE_JOB`]: the check succeeds when the job service answers about it, whatever
 /// it says (see [`answered`]), and fails when the call does not reach the service, is not
 /// answered within the limit, or the service will not serve this client at all (a revoked
 /// token).

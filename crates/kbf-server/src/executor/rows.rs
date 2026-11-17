@@ -1,64 +1,82 @@
-//! The `exec/` rows of the state store: who runs the executor's workers and jobs when several
-//! frontends share one Postgres (`docs/design/n-frontends.md`, sections 4.2 to 4.4).
+//! The executor's rows of the state store: what lets any frontend of one store answer an
+//! operation by name, and take up an operation whose frontend has gone.
 //!
-//! Three row families under one prefix, [`ROOT`]. No scan of any other family reads a prefix
-//! of it, so a release that does not know them never sees them.
+//! | Key | Value | Written |
+//! |---|---|---|
+//! | `meta/next_op` | the next free operation id, 8 bytes big-endian | a block of [`ID_BLOCK`] ids reserved by compare-and-set |
+//! | `exec/live/<instance>` | empty | by its process, every quarter of `--executor-live-secs`, with that time to live |
+//! | `exec/op/<operation>` | [`OpRow`] | before each attempt's submit; deleted when the operation finishes |
+//! | `done/<operation>` | `Finished::to_row` | when the operation finishes, for at least [`DONE_FLOOR`] |
+//! | `doneof/<operation>` | the action and instance (version 1, size, hash, instance) | beside `done/` |
 //!
-//! | Key | Value |
-//! |---|---|
-//! | `exec/fe/<instance>` | [`Liveness`]: this process is alive until the key expires on the store's clock |
-//! | `exec/w/<worker>` | [`WorkerRow`]: which process holds a virtual worker |
-//! | `exec/j/<worker>/<job id>` | [`JobRow`]: a job submitted for a lease of that worker |
+//! `meta/next_op`, `done/` and `doneof/` keep the format of earlier releases, so a frontend of
+//! the release before and one of this release over one store never give one id twice and each
+//! answers by name an operation the other finished. The `exec/live/` and `exec/op/` families
+//! are new: no scan of an earlier release reads a prefix of them (B8: it loses nothing by not
+//! knowing them, they are this executor's own bookkeeping).
 //!
-//! There is no leader and no lease on a role. Every call here is one transaction that is
-//! correct whichever process runs it and however many run it at once:
-//!
-//! - The **version of the worker row is the fencing token** ([`Held`]). A write of a job row,
-//!   a renewal of a holder's liveness row, a release and a retirement carry a check of the
-//!   worker row at that version in the same transaction, so a holder that lost the worker
-//!   writes nothing.
-//! - A **claim** ([`ExecRows::claim`]) is one transaction: the owner's liveness row is absent
-//!   (or the row names no owner, or the claimer owns it already), the claimer's own liveness
-//!   row is the one it last wrote, and the worker row is put at the version read. One
-//!   claimer wins; the others get a conflict and read again.
-//! - A **job row** is inserted `Cond::Absent` before the submit and deleted after the farm
-//!   acknowledged the result.
-//!
-//! Nothing here reads a clock: expiry of a liveness row is the store's, on its own clock.
+//! **Who runs an operation.** An `exec/op/` row names the process that runs the operation, its
+//! `owner`. Only the owner writes it, each write a compare-and-set on the version it read with
+//! itself as the owner. A process whose `exec/live/` row has expired on the store's clock is
+//! gone: another frontend takes its unfinished operations ([`Rows::claim`]), each in one
+//! transaction that checks the liveness row is still absent and puts the operation row at the
+//! version read, so one claimer wins. A gone owner that comes back finds its next write refused
+//! and leaves the operation to the claimer ([`RowsError::Conflict`]).
 //!
 //! # Format
 //!
-//! A value is one version byte ([`VERSION`]) and a JSON object. A reader ignores the fields it
-//! does not name, so a later release adds a field and an earlier one still reads the row. A
-//! row whose version byte this build does not know was written by a later release: a scan
-//! skips it and counts it ([`ExecRows::unknown_rows`]), and a single read finds none. A row
-//! that has a known version and is not what it says is [`RowsError::Corrupt`].
-//!
-//! A row never holds a presigned URL, a read token or a file or environment value of a job.
+//! An `exec/op/` value is one version byte ([`VERSION`]) and a JSON object. A reader ignores the
+//! fields it does not name, so a later release adds a field and this one still reads the row. A
+//! row whose version byte this build does not know was written by a later release: a scan skips
+//! it and counts it ([`Rows::unknown_rows`]). A row never holds a presigned url, a read token or
+//! a file or environment value of a job.
 
-use std::sync::Arc;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use kbf_state::{Commit, Cond, Conflict, Store, StoreError, Txn, Version, Versioned};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use kbf_front::Finished;
+use kbf_state::{Cond, Store, StoreError, Txn, Version};
+use kbf_types::{ActionKey, Digest, DigestFunction, OperationId};
+use serde::{Deserialize, Serialize};
 
-/// The first key component of every row of this module. No scan prefix of any other family
-/// of the state store is a prefix of it.
+/// The first key component of every row family of the executor. No scan prefix of any other
+/// family of the state store is a prefix of it.
 pub const ROOT: &str = "exec/";
 
-/// The prefix of the liveness rows: `exec/fe/<instance>`.
-pub const FRONTEND_PREFIX: &str = "exec/fe/";
+/// The prefix of the liveness rows: `exec/live/<instance>`.
+pub const LIVE_PREFIX: &str = "exec/live/";
 
-/// The prefix of the worker rows: `exec/w/<worker>`.
-pub const WORKER_PREFIX: &str = "exec/w/";
+/// The prefix of the operation rows: `exec/op/<operation, 16 hex digits>`.
+pub const OP_PREFIX: &str = "exec/op/";
 
-/// The prefix of the job rows: `exec/j/<worker>/<job id>`.
-pub const JOB_PREFIX: &str = "exec/j/";
-
-/// The version byte every value begins with.
+/// The version byte every `exec/op/` value begins with.
 pub const VERSION: u8 = 1;
+
+/// The counter of operation ids every frontend of the store reserves its blocks from.
+const NEXT_OP: &str = "meta/next_op";
+
+/// The prefix of a finished operation's answer.
+const DONE: &str = "done/";
+
+/// The prefix of a finished operation's action and instance.
+const DONE_OF: &str = "doneof/";
+
+/// The version byte of a `doneof/` row.
+const DONE_OF_VERSION: u8 = 1;
+
+/// How many operation ids one reservation takes from `meta/next_op`. A frontend that stops
+/// leaves the rest of its block unused: ids are 64 bits, and an unused id costs nothing.
+pub const ID_BLOCK: u64 = 1024;
+
+/// The least time a `done/` row is kept, whatever `--finished-retention-secs` says: long
+/// enough for a client that lost its stream to ask again on another frontend.
+pub const DONE_FLOOR: Duration = Duration::from_secs(600);
+
+/// How many times a compare-and-set that another writer won is tried again, reading the row
+/// again each time.
+const CAS_TRIES: usize = 8;
 
 /// Why a row call failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -66,142 +84,136 @@ pub enum RowsError {
     /// The store itself failed (or its connection did); nothing is known of the write.
     #[error("exec rows: {0}")]
     Store(#[from] StoreError),
-    /// A precondition of the transaction failed: the row named is not as the caller read it.
-    /// What the key says: a worker row, the caller no longer holds the worker; a liveness
-    /// row of another process, it is alive; the caller's own liveness row, it is not the
-    /// last one the caller wrote (it expired); a job row, it is already there.
+    /// The row named is not as the caller read it: another process runs the operation, or
+    /// wrote the counter first every time.
     #[error("exec rows: the precondition on {key:?} failed")]
     Conflict {
         /// The key whose precondition failed.
         key: String,
     },
-    /// A name that cannot be part of a key: empty, or holding a `/`.
-    #[error("exec rows: {name:?} cannot be part of a key")]
-    BadName {
-        /// The name refused.
-        name: String,
-    },
-    /// A row of a version this build knows that is not a row of its kind.
-    #[error("exec rows: the row {key:?} is corrupt: {why}")]
+    /// A row of a known version that is not what it says.
+    #[error("exec rows: {key:?} is corrupt: {why}")]
     Corrupt {
-        /// The key of the row.
+        /// The key.
         key: String,
-        /// What is wrong with it.
+        /// What is wrong.
         why: String,
     },
 }
 
-impl RowsError {
-    /// Whether this is a failed precondition on `key`.
-    #[must_use]
-    pub fn conflicts_on(&self, key: &str) -> bool {
-        matches!(self, RowsError::Conflict { key: k } if k == key)
-    }
+/// What an unfinished operation's row holds: enough for any frontend to read its job back,
+/// finish it and answer it by name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpRow {
+    /// The process that runs the operation (its `kbf-instance`).
+    pub owner: String,
+    /// The instance name the operation was submitted under.
+    pub instance: String,
+    /// The action's SHA-256, in lower-case hex.
+    pub hash: String,
+    /// The action's size in bytes.
+    pub size: u64,
+    /// The attempt whose job is submitted, from 0.
+    pub attempt: u32,
+    /// The id of that attempt's job.
+    pub job: String,
+    /// The put directory the job commits into, `cas/b/<build>/<nonce>`; `None` for a job that
+    /// writes to a presigned url, which only the process holding the url can finish: one that
+    /// takes the operation up runs it again.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// The action's platform asks for a whole machine.
+    #[serde(default)]
+    pub whole_machine: bool,
 }
 
-/// What a process says about itself every beat: the value of `exec/fe/<instance>`.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub struct Liveness {
-    /// The frontend group (`--executor-frontend-id`).
-    pub group: String,
-    /// When the process started, in milliseconds since the Unix epoch.
-    pub started_ms: u64,
-    /// The release the process runs.
-    pub release: String,
-    /// The process has begun to drain.
-    pub draining: bool,
-}
-
-/// The shape of a virtual worker, kept in its row so an adopter registers one the leases
-/// booked on it still fit.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub struct Shape {
-    /// Thousandths of a core the farm may book.
-    pub cpu_millis: u64,
-    /// Bytes of memory the farm may book.
-    pub memory_bytes: u64,
-    /// The most actions in flight.
-    pub slots: u64,
-    /// The CPU architecture of its jobs.
-    pub arch: String,
-}
-
-/// The value of `exec/w/<worker>`.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub struct WorkerRow {
-    /// The process that holds the worker; empty once it released it.
-    pub owner_instance: String,
-    /// The daemon instance id the worker said `Hello` with, which an adopter names as the
-    /// predecessor of its own.
-    pub farm_instance: String,
-    /// The worker's shape.
-    pub shape: Shape,
-}
-
-/// The value of `exec/j/<worker>/<job id>`: what an adopter needs to finish a job.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub struct JobRow {
-    /// The farm lease's term.
-    pub lease_term: u64,
-    /// The farm lease's sequence number.
-    pub lease_seq: u64,
-    /// The action's digest, as text.
-    pub action: String,
-    /// The pack key the job writes under (a name, never a credential).
-    pub pack_key: String,
-    /// When the job was submitted, in milliseconds since the Unix epoch.
-    pub submitted_ms: u64,
-}
-
-impl Liveness {
-    fn body(&self) -> Value {
-        json!({
-            "draining": self.draining,
-            "group": self.group,
-            "release": self.release,
-            "started_ms": self.started_ms,
+impl OpRow {
+    /// The instance and action of the operation.
+    ///
+    /// # Errors
+    /// The hash is not 64 hex digits.
+    pub fn action_key(&self) -> Result<ActionKey, String> {
+        let digest = Digest::parse(
+            DigestFunction::Sha256,
+            &format!("{}/{}", self.hash, self.size),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(ActionKey {
+            instance: self.instance.clone(),
+            action: digest,
         })
     }
 }
 
-impl Shape {
-    fn body(&self) -> Value {
-        json!({
-            "arch": self.arch,
-            "cpu_millis": self.cpu_millis,
-            "memory_bytes": self.memory_bytes,
-            "slots": self.slots,
-        })
-    }
+/// Where an operation stands, as the store has it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Look {
+    /// Unfinished: its row.
+    Open(OpRow),
+    /// Finished: its action and answer.
+    Done(ActionKey, Finished),
+    /// The store has neither: it never existed, or its answer is past its retention.
+    Gone,
 }
 
-impl WorkerRow {
-    fn body(&self) -> Value {
-        json!({
-            "farm_instance": self.farm_instance,
-            "owner_instance": self.owner_instance,
-            "shape": self.shape.body(),
-        })
-    }
+/// An unfinished operation of a gone process, as read: its row and the version to claim it at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Orphan {
+    /// The operation.
+    pub operation: OperationId,
+    /// Its row.
+    pub row: OpRow,
+    /// The row's version.
+    pub version: Version,
 }
 
-impl JobRow {
-    fn body(&self) -> Value {
-        json!({
-            "action": self.action,
-            "lease_seq": self.lease_seq,
-            "lease_term": self.lease_term,
-            "pack_key": self.pack_key,
-            "submitted_ms": self.submitted_ms,
-        })
-    }
+/// The executor's handle on the state store.
+pub struct Rows {
+    store: Arc<dyn Store>,
+    /// This process's id, the `owner` of the rows it writes.
+    instance: String,
+    /// The block of operation ids this process holds; empty until the first is asked for.
+    ids: Mutex<Range<u64>>,
+    /// Rows skipped for a version byte this build does not know.
+    unknown: AtomicU64,
 }
 
-/// The bytes of a row: the version byte and the JSON object.
-fn encode(body: &Value) -> Vec<u8> {
-    let mut bytes = vec![VERSION];
-    bytes.extend_from_slice(body.to_string().as_bytes());
-    bytes
+/// The key of `operation`'s row.
+#[must_use]
+pub fn op_key(operation: OperationId) -> String {
+    format!("{OP_PREFIX}{:016x}", operation.0)
+}
+
+fn done_key(operation: OperationId) -> String {
+    format!("{DONE}{:016x}", operation.0)
+}
+
+fn done_of_key(operation: OperationId) -> String {
+    format!("{DONE_OF}{:016x}", operation.0)
+}
+
+/// `key` as the value of a `doneof/` row.
+fn encode_done_of(key: &ActionKey) -> Vec<u8> {
+    let mut row = vec![DONE_OF_VERSION];
+    row.extend(key.action.size_bytes.to_be_bytes());
+    row.extend(key.action.hash);
+    row.extend(key.instance.as_bytes());
+    row
+}
+
+/// The action a `doneof/` row holds, or what is wrong with the row.
+fn decode_done_of(row: &[u8]) -> Result<ActionKey, &'static str> {
+    let [DONE_OF_VERSION, rest @ ..] = row else {
+        return Err("not a version 1 action row");
+    };
+    let cut = "an action row is cut short";
+    let (size, rest) = rest.split_first_chunk::<8>().ok_or(cut)?;
+    let (hash, instance) = rest.split_first_chunk::<32>().ok_or(cut)?;
+    let instance = std::str::from_utf8(instance).map_err(|_| "an instance name is not UTF-8")?;
+    Ok(ActionKey {
+        instance: instance.to_owned(),
+        action: Digest::new(DigestFunction::Sha256, *hash, u64::from_be_bytes(*size)),
+    })
 }
 
 fn corrupt(key: &str, why: impl ToString) -> RowsError {
@@ -211,440 +223,308 @@ fn corrupt(key: &str, why: impl ToString) -> RowsError {
     }
 }
 
-/// The key of the liveness row of a process.
-///
-/// # Errors
-/// [`RowsError::BadName`] for an `instance` that is empty or holds a `/`.
-pub fn frontend_key(instance: &str) -> Result<String, RowsError> {
-    Ok(format!("{FRONTEND_PREFIX}{}", name(instance)?))
+/// The value of an `exec/op/` row.
+fn encode(row: &OpRow) -> Vec<u8> {
+    let mut value = vec![VERSION];
+    // A struct of strings, numbers and booleans always serializes.
+    value.extend(serde_json::to_vec(row).unwrap_or_default());
+    value
 }
 
-/// The key of the row of a worker.
-///
-/// # Errors
-/// [`RowsError::BadName`] for a `worker` that is empty or holds a `/`.
-pub fn worker_key(worker: &str) -> Result<String, RowsError> {
-    Ok(format!("{WORKER_PREFIX}{}", name(worker)?))
-}
-
-/// The key of the row of a job of a worker.
-///
-/// # Errors
-/// [`RowsError::BadName`] for a `worker` or `job` that is empty or holds a `/`.
-pub fn job_key(worker: &str, job: &str) -> Result<String, RowsError> {
-    Ok(format!("{}{}", job_prefix(worker)?, name(job)?))
-}
-
-/// The prefix that holds the job rows of one worker. It ends in `/`, so no other worker's
-/// rows lie under it (a worker's name holds none).
-///
-/// # Errors
-/// [`RowsError::BadName`] for a `worker` that is empty or holds a `/`.
-pub fn job_prefix(worker: &str) -> Result<String, RowsError> {
-    Ok(format!("{JOB_PREFIX}{}/", name(worker)?))
-}
-
-fn name(name: &str) -> Result<&str, RowsError> {
-    if name.is_empty() || name.contains('/') {
-        return Err(RowsError::BadName {
-            name: name.to_owned(),
-        });
+/// The row `value` holds; `None` for a version this build does not know.
+fn decode(key: &str, value: &[u8]) -> Result<Option<OpRow>, RowsError> {
+    match value.split_first() {
+        Some((&VERSION, json)) => serde_json::from_slice(json)
+            .map(Some)
+            .map_err(|e| corrupt(key, e)),
+        Some(_) => Ok(None),
+        None => Err(corrupt(key, "the row is empty")),
     }
-    Ok(name)
 }
 
-/// The proof that a process holds a worker: the version of the worker row it wrote. Every
-/// write of the holder carries a check of the row at this version, so once another process
-/// writes the row the check fails for good (a version is never reissued).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Held {
-    /// The worker.
-    pub worker: String,
-    /// The version of the worker row the holder wrote.
-    pub version: Version,
+/// The operation an `exec/op/` key names.
+fn operation_of(key: &str) -> Option<OperationId> {
+    let hex = key.strip_prefix(OP_PREFIX)?;
+    (hex.len() == 16)
+        .then(|| u64::from_str_radix(hex, 16).ok())
+        .flatten()
+        .map(OperationId)
 }
 
-/// The proof that a process's liveness row is the last one it wrote. A claim checks it, so a
-/// process whose row expired claims nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Live {
-    /// The process.
-    pub instance: String,
-    /// The version of the liveness row the process wrote.
-    pub version: Version,
-}
-
-/// A worker row as a scan read it: what a claim is made against.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkerEntry {
-    /// The worker.
-    pub worker: String,
-    /// Its row.
-    pub row: WorkerRow,
-    /// The version the row had.
-    pub version: Version,
-}
-
-/// A job row as a scan read it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct JobEntry {
-    /// The job id.
-    pub job: String,
-    /// Its row.
-    pub row: JobRow,
-}
-
-/// What [`ExecRows::insert_job`] found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Insert {
-    /// The row is written.
-    Written,
-    /// The row was there already, from an earlier try whose answer was lost; the caller
-    /// still holds the worker, and goes on.
-    Present,
-}
-
-/// The `exec/` rows over a state store.
-pub struct ExecRows {
-    store: Arc<dyn Store>,
-    unknown: AtomicU64,
-}
-
-impl ExecRows {
-    /// The rows of `store`.
+impl Rows {
+    /// The rows of the process `instance` over `store`.
     #[must_use]
-    pub fn new(store: Arc<dyn Store>) -> Self {
-        ExecRows {
+    pub fn new(store: Arc<dyn Store>, instance: &str) -> Self {
+        Self {
             store,
+            instance: instance.to_owned(),
+            ids: Mutex::new(0..0),
             unknown: AtomicU64::new(0),
         }
     }
 
-    /// How many rows of a version this build does not know the reads of this handle have
-    /// skipped.
+    /// Rows skipped so far for a version byte this build does not know.
     #[must_use]
     pub fn unknown_rows(&self) -> u64 {
         self.unknown.load(Ordering::Relaxed)
     }
 
-    /// Commits `txn`, which one of the `_txn` functions built (or a caller of a test took
-    /// guards out of).
-    ///
-    /// # Errors
-    /// [`RowsError::Conflict`] when a precondition failed (nothing is written),
-    /// [`RowsError::Store`] when the store failed.
-    pub fn commit(&self, txn: Txn) -> Result<Commit, RowsError> {
+    fn commit(&self, txn: Txn) -> Result<(), RowsError> {
         match self.store.txn(txn)? {
-            Ok(commit) => Ok(commit),
-            Err(Conflict { key, .. }) => Err(RowsError::Conflict { key }),
+            Ok(_) => Ok(()),
+            Err(conflict) => Err(RowsError::Conflict { key: conflict.key }),
         }
     }
 
-    // ---- liveness ----------------------------------------------------------------------
-
-    /// The transaction of a beat: the liveness row of `instance` is put with a time to live
-    /// of `ttl` (one writer, `Cond::Any`), after a check of each worker row of `held` at the
-    /// version the holder wrote, so a process that lost a worker does not renew.
+    /// The next operation id: from this process's block, or from a block reserved now with a
+    /// compare-and-set on `meta/next_op`, so no two frontends of the store give one id.
     ///
     /// # Errors
-    /// [`RowsError::BadName`] for a name that is not a key part.
-    pub fn beat_txn(
-        instance: &str,
-        row: &Liveness,
-        ttl: Duration,
-        held: &[Held],
-    ) -> Result<Txn, RowsError> {
-        let mut txn = Txn::new();
-        for held in held {
-            txn = txn.check(worker_key(&held.worker)?, Cond::Version(held.version));
+    /// The store cannot be read or written, the counter is not a number, or other frontends won
+    /// every try ([`RowsError::Conflict`]).
+    pub fn next_id(&self) -> Result<OperationId, RowsError> {
+        let mut ids = self.ids.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(id) = ids.next() {
+            return Ok(OperationId(id));
         }
-        Ok(txn.put_ttl(frontend_key(instance)?, encode(&row.body()), ttl, Cond::Any))
+        let block = self.reserve()?;
+        *ids = block;
+        Ok(OperationId(ids.next().unwrap_or_default()))
     }
 
-    /// Renews the liveness row of `instance`.
+    fn reserve(&self) -> Result<Range<u64>, RowsError> {
+        let mut tried = 1;
+        loop {
+            let (stored, cond) = match self.store.get(NEXT_OP)? {
+                Some(row) => {
+                    let bytes: [u8; 8] = row
+                        .value
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| corrupt(NEXT_OP, "not an 8-byte number"))?;
+                    (u64::from_be_bytes(bytes), Cond::Version(row.version))
+                }
+                None => (0, Cond::Absent),
+            };
+            // Id 0 is never given: a row of an earlier release reads 0 as "none".
+            let start = stored.max(1);
+            let end = start.saturating_add(ID_BLOCK);
+            match self.commit(Txn::new().put(NEXT_OP, end.to_be_bytes(), cond)) {
+                Err(RowsError::Conflict { .. }) if tried < CAS_TRIES => tried += 1,
+                Err(error) => return Err(error),
+                Ok(()) => return Ok(start..end),
+            }
+        }
+    }
+
+    /// Renews this process's liveness row for `live`.
     ///
     /// # Errors
-    /// [`RowsError::Conflict`] on the key of a worker of `held` that the caller no longer
-    /// holds (nothing is renewed), [`RowsError::BadName`], [`RowsError::Store`].
-    pub fn beat(
+    /// The store cannot be written.
+    pub fn beat(&self, live: Duration) -> Result<(), RowsError> {
+        let key = format!("{LIVE_PREFIX}{}", self.instance);
+        self.commit(Txn::new().put_ttl(key, Vec::new(), live, Cond::Any))
+    }
+
+    /// Deletes this process's liveness row: its operations may be taken up at once.
+    ///
+    /// # Errors
+    /// The store cannot be written.
+    pub fn leave(&self) -> Result<(), RowsError> {
+        let key = format!("{LIVE_PREFIX}{}", self.instance);
+        self.commit(Txn::new().delete(key, Cond::Any))
+    }
+
+    /// The row of `operation` as this process last wrote it: its version, if the row is there
+    /// and this process owns it.
+    fn owned(&self, key: &str) -> Result<Option<Version>, RowsError> {
+        let Some(found) = self.store.get(key)? else {
+            return Ok(None);
+        };
+        let row = decode(key, &found.value)?;
+        Ok(row
+            .filter(|row| row.owner == self.instance)
+            .map(|_| found.version))
+    }
+
+    /// Writes `row` as the row of `operation`, which this process runs: a new row, or one this
+    /// process owns.
+    ///
+    /// # Errors
+    /// [`RowsError::Conflict`] when another process owns the row; the store cannot be written.
+    pub fn put_op(&self, operation: OperationId, row: &OpRow) -> Result<(), RowsError> {
+        let key = op_key(operation);
+        let row = OpRow {
+            owner: self.instance.clone(),
+            ..row.clone()
+        };
+        let cond = match self.store.get(&key)? {
+            None => Cond::Absent,
+            Some(_) => match self.owned(&key)? {
+                Some(version) => Cond::Version(version),
+                None => return Err(RowsError::Conflict { key }),
+            },
+        };
+        self.commit(Txn::new().put(key, encode(&row), cond))
+    }
+
+    /// Finishes `operation` of `action` as `finished`: its row deleted, if this process owns it
+    /// (or no row is left), and its answer and action put for `retention` (at least
+    /// [`DONE_FLOOR`]). An answer another frontend wrote first is kept, and returned.
+    ///
+    /// # Errors
+    /// [`RowsError::Conflict`] when another process owns the row; the store cannot be written.
+    pub fn finish(
         &self,
-        instance: &str,
-        row: &Liveness,
-        ttl: Duration,
-        held: &[Held],
-    ) -> Result<Live, RowsError> {
-        let commit = self.commit(Self::beat_txn(instance, row, ttl, held)?)?;
-        Ok(Live {
-            instance: instance.to_owned(),
-            version: Version(commit.revision.0),
-        })
+        operation: OperationId,
+        action: &ActionKey,
+        finished: &Finished,
+        retention: Duration,
+    ) -> Result<Finished, RowsError> {
+        let key = op_key(operation);
+        let ttl = retention.max(DONE_FLOOR);
+        let txn = match self.store.get(&key)? {
+            None => Txn::new(),
+            Some(_) => match self.owned(&key)? {
+                Some(version) => Txn::new().delete(key.clone(), Cond::Version(version)),
+                None => return Err(RowsError::Conflict { key }),
+            },
+        };
+        let txn = txn
+            .put_ttl(done_key(operation), finished.to_row(), ttl, Cond::Absent)
+            .put_ttl(
+                done_of_key(operation),
+                encode_done_of(action),
+                ttl,
+                Cond::Absent,
+            );
+        match self.commit(txn) {
+            Err(RowsError::Conflict { key: lost }) if lost != key => {
+                // Another frontend answered it first: its answer stands, and the row goes.
+                let answer = self.done(operation)?.map(|(_, answer)| answer);
+                let answer = answer.ok_or_else(|| corrupt(&lost, "the answer is gone"))?;
+                self.commit(Txn::new().delete(key, Cond::Any))?;
+                Ok(answer)
+            }
+            Err(error) => Err(error),
+            Ok(()) => Ok(finished.clone()),
+        }
     }
 
-    /// Deletes the liveness row of `instance` (a process that ends says so).
+    /// How `operation` finished, with its action, if the store still has its answer.
     ///
     /// # Errors
-    /// [`RowsError::BadName`], [`RowsError::Store`].
-    pub fn leave(&self, instance: &str) -> Result<(), RowsError> {
-        let txn = Txn::new().delete(frontend_key(instance)?, Cond::Any);
-        self.commit(txn).map(drop)
+    /// The store cannot be read, or a row is not what it says.
+    pub fn done(&self, operation: OperationId) -> Result<Option<(ActionKey, Finished)>, RowsError> {
+        let of_key = done_of_key(operation);
+        let (Some(of), Some(done)) = (
+            self.store.get(&of_key)?,
+            self.store.get(&done_key(operation))?,
+        ) else {
+            return Ok(None);
+        };
+        let action = decode_done_of(&of.value).map_err(|why| corrupt(&of_key, why))?;
+        let finished =
+            Finished::from_row(&done.value).map_err(|why| corrupt(&done_key(operation), why))?;
+        Ok(Some((action, finished)))
     }
 
-    /// The liveness row of `instance`; `None` when it is absent or expired, and when a later
-    /// release wrote it (counted in [`ExecRows::unknown_rows`]).
+    /// The row of the unfinished `operation`, if the store has one of a version this build
+    /// reads.
     ///
     /// # Errors
-    /// [`RowsError::Corrupt`], [`RowsError::BadName`], [`RowsError::Store`].
-    pub fn liveness(&self, instance: &str) -> Result<Option<Liveness>, RowsError> {
-        let key = frontend_key(instance)?;
+    /// The store cannot be read, or the row is not what it says.
+    pub fn op(&self, operation: OperationId) -> Result<Option<OpRow>, RowsError> {
+        let key = op_key(operation);
         match self.store.get(&key)? {
-            Some(row) => self.liveness_row(&key, &row),
+            Some(found) => decode(&key, &found.value),
             None => Ok(None),
         }
     }
 
-    /// Every live process and what it says, in key order.
+    /// Where `operation` stands. Its row is read before its answer: an operation finishes in
+    /// one transaction that deletes the row and puts the answer, so a row not seen means the
+    /// answer, if there is one, is there for the read that follows, and a finish between the
+    /// two reads is never taken for an operation that is gone.
     ///
     /// # Errors
-    /// [`RowsError::Corrupt`], [`RowsError::Store`].
-    pub fn live_instances(&self) -> Result<Vec<(String, Liveness)>, RowsError> {
-        let mut out = Vec::new();
-        for (key, row) in self.store.scan_prefix(FRONTEND_PREFIX)? {
-            if let Some(liveness) = self.liveness_row(&key, &row)? {
-                out.push((key[FRONTEND_PREFIX.len()..].to_owned(), liveness));
-            }
+    /// The store cannot be read, or a row is not what it says.
+    pub fn look(&self, operation: OperationId) -> Result<Look, RowsError> {
+        if let Some(row) = self.op(operation)? {
+            return Ok(Look::Open(row));
         }
-        Ok(out)
+        Ok(match self.done(operation)? {
+            Some((action, finished)) => Look::Done(action, finished),
+            None => Look::Gone,
+        })
     }
 
-    fn liveness_row(&self, key: &str, row: &Versioned) -> Result<Option<Liveness>, RowsError> {
-        let Some(body) = self.body(key, row)? else {
-            return Ok(None);
-        };
-        serde_json::from_slice(body)
-            .map(Some)
-            .map_err(|e| corrupt(key, e))
-    }
-
-    // ---- workers -----------------------------------------------------------------------
-
-    /// Writes the row of a worker nobody has a row for: the first holder of a worker.
+    /// The unfinished operations of processes whose liveness row has expired, this process's
+    /// own excepted. A row of a version this build does not know is skipped and counted, and a
+    /// corrupt one is skipped and logged: neither stops the others being taken up.
     ///
     /// # Errors
-    /// [`RowsError::Conflict`] when the row exists, [`RowsError::BadName`], [`RowsError::Store`].
-    pub fn create_worker(&self, worker: &str, row: &WorkerRow) -> Result<Held, RowsError> {
-        let txn = Txn::new().put(worker_key(worker)?, encode(&row.body()), Cond::Absent);
-        let commit = self.commit(txn)?;
-        Ok(held_by(worker, &commit))
-    }
-
-    /// Every worker row, in key order. A row of a later release is skipped and counted.
-    ///
-    /// # Errors
-    /// [`RowsError::Corrupt`], [`RowsError::Store`].
-    pub fn workers(&self) -> Result<Vec<WorkerEntry>, RowsError> {
-        let mut out = Vec::new();
-        for (key, stored) in self.store.scan_prefix(WORKER_PREFIX)? {
-            let Some(body) = self.body(&key, &stored)? else {
+    /// The store cannot be read.
+    pub fn orphans(&self) -> Result<Vec<Orphan>, RowsError> {
+        let mut orphans = Vec::new();
+        let mut live = std::collections::BTreeMap::new();
+        for (key, found) in self.store.scan_prefix(OP_PREFIX)? {
+            let Some(operation) = operation_of(&key) else {
                 continue;
             };
-            let row = serde_json::from_slice(body).map_err(|e| corrupt(&key, e))?;
-            out.push(WorkerEntry {
-                worker: key[WORKER_PREFIX.len()..].to_owned(),
-                row,
-                version: stored.version,
-            });
-        }
-        Ok(out)
-    }
-
-    /// The transaction of a claim of the worker `entry` read, by the process `me`: the row is
-    /// put at the version read with `me` as its owner and `farm_instance` as the instance the
-    /// worker will say `Hello` with. It checks that the owner's liveness row is absent
-    /// unless the row names no owner or names `me`, and that `me`'s own liveness row is the
-    /// one it last wrote.
-    ///
-    /// # Errors
-    /// [`RowsError::BadName`].
-    pub fn claim_txn(
-        me: &Live,
-        entry: &WorkerEntry,
-        farm_instance: &str,
-    ) -> Result<Txn, RowsError> {
-        let mut txn = Txn::new();
-        let owner = entry.row.owner_instance.as_str();
-        if !owner.is_empty() && owner != me.instance {
-            txn = txn.check(frontend_key(owner)?, Cond::Absent);
-        }
-        let row = WorkerRow {
-            owner_instance: me.instance.clone(),
-            farm_instance: farm_instance.to_owned(),
-            shape: entry.row.shape.clone(),
-        };
-        Ok(txn
-            .check(frontend_key(&me.instance)?, Cond::Version(me.version))
-            .put(
-                worker_key(&entry.worker)?,
-                encode(&row.body()),
-                Cond::Version(entry.version),
-            ))
-    }
-
-    /// Claims the worker `entry` read: one transaction, so of several claimers one wins and
-    /// the others get [`RowsError::Conflict`] and read again.
-    ///
-    /// # Errors
-    /// [`RowsError::Conflict`] (on the owner's liveness row, the owner is alive; on the
-    /// worker row, another process wrote it since the read; on `me`'s liveness row, `me` is
-    /// not alive), [`RowsError::BadName`], [`RowsError::Store`].
-    pub fn claim(
-        &self,
-        me: &Live,
-        entry: &WorkerEntry,
-        farm_instance: &str,
-    ) -> Result<Held, RowsError> {
-        let commit = self.commit(Self::claim_txn(me, entry, farm_instance)?)?;
-        Ok(held_by(&entry.worker, &commit))
-    }
-
-    /// The transaction of a release: the worker row is put with no owner, at the version the
-    /// holder wrote.
-    ///
-    /// # Errors
-    /// [`RowsError::BadName`].
-    pub fn release_txn(held: &Held, row: &WorkerRow) -> Result<Txn, RowsError> {
-        let row = WorkerRow {
-            owner_instance: String::new(),
-            ..row.clone()
-        };
-        Ok(Txn::new().put(
-            worker_key(&held.worker)?,
-            encode(&row.body()),
-            Cond::Version(held.version),
-        ))
-    }
-
-    /// Hands the worker back (a hard stop): any live process may claim it at once. `row` is
-    /// what the holder last wrote.
-    ///
-    /// # Errors
-    /// [`RowsError::Conflict`] when the caller no longer holds the worker,
-    /// [`RowsError::BadName`], [`RowsError::Store`].
-    pub fn release(&self, held: &Held, row: &WorkerRow) -> Result<(), RowsError> {
-        self.commit(Self::release_txn(held, row)?).map(drop)
-    }
-
-    /// Deletes the row of a worker whose jobs are all done. The caller has seen
-    /// [`ExecRows::jobs`] empty; a job row inserted after is not found by anyone.
-    ///
-    /// # Errors
-    /// [`RowsError::Conflict`] when the caller no longer holds the worker,
-    /// [`RowsError::BadName`], [`RowsError::Store`].
-    pub fn retire(&self, held: &Held) -> Result<(), RowsError> {
-        let txn = Txn::new().delete(worker_key(&held.worker)?, Cond::Version(held.version));
-        self.commit(txn).map(drop)
-    }
-
-    // ---- jobs --------------------------------------------------------------------------
-
-    /// The transaction of a job row insert: a check of the worker row at the holder's
-    /// version, and the row put `Cond::Absent`.
-    ///
-    /// # Errors
-    /// [`RowsError::BadName`].
-    pub fn insert_job_txn(held: &Held, job: &str, row: &JobRow) -> Result<Txn, RowsError> {
-        Ok(Txn::new()
-            .check(worker_key(&held.worker)?, Cond::Version(held.version))
-            .put(
-                job_key(&held.worker, job)?,
-                encode(&row.body()),
-                Cond::Absent,
-            ))
-    }
-
-    /// Writes the row of `job` before it is submitted. A row that is there already (an
-    /// earlier try whose answer was lost) is [`Insert::Present`], provided the caller
-    /// still holds the worker.
-    ///
-    /// # Errors
-    /// [`RowsError::Conflict`] on the worker row when the caller no longer holds the worker
-    /// (it submits nothing), [`RowsError::BadName`], [`RowsError::Store`].
-    pub fn insert_job(&self, held: &Held, job: &str, row: &JobRow) -> Result<Insert, RowsError> {
-        match self.commit(Self::insert_job_txn(held, job, row)?) {
-            Ok(_) => Ok(Insert::Written),
-            Err(e) if e.conflicts_on(&job_key(&held.worker, job)?) => {
-                // The store names one failed precondition; the worker row may have failed
-                // too, and the holder must not go on then.
-                let key = worker_key(&held.worker)?;
-                match self.store.get(&key)? {
-                    Some(row) if row.version == held.version => Ok(Insert::Present),
-                    _ => Err(RowsError::Conflict { key }),
+            let row = match decode(&key, &found.value) {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    self.unknown.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// The transaction of a job row delete: a check of the worker row at the holder's
-    /// version, and the delete (of an absent row, nothing).
-    ///
-    /// # Errors
-    /// [`RowsError::BadName`].
-    pub fn delete_job_txn(held: &Held, job: &str) -> Result<Txn, RowsError> {
-        Ok(Txn::new()
-            .check(worker_key(&held.worker)?, Cond::Version(held.version))
-            .delete(job_key(&held.worker, job)?, Cond::Any))
-    }
-
-    /// Deletes the row of `job`, after the farm acknowledged its result.
-    ///
-    /// # Errors
-    /// [`RowsError::Conflict`] when the caller no longer holds the worker,
-    /// [`RowsError::BadName`], [`RowsError::Store`].
-    pub fn delete_job(&self, held: &Held, job: &str) -> Result<(), RowsError> {
-        self.commit(Self::delete_job_txn(held, job)?).map(drop)
-    }
-
-    /// The job rows of a worker, in key order. A row of a later release is skipped and
-    /// counted.
-    ///
-    /// # Errors
-    /// [`RowsError::Corrupt`], [`RowsError::BadName`], [`RowsError::Store`].
-    pub fn jobs(&self, worker: &str) -> Result<Vec<JobEntry>, RowsError> {
-        let prefix = job_prefix(worker)?;
-        let mut out = Vec::new();
-        for (key, stored) in self.store.scan_prefix(&prefix)? {
-            let Some(body) = self.body(&key, &stored)? else {
-                continue;
+                Err(error) => {
+                    tracing::warn!(%error, "an operation row is skipped");
+                    continue;
+                }
             };
-            let row = serde_json::from_slice(body).map_err(|e| corrupt(&key, e))?;
-            out.push(JobEntry {
-                job: key[prefix.len()..].to_owned(),
-                row,
-            });
-        }
-        Ok(out)
-    }
-
-    /// The JSON of a row's value: `None` when its version byte is not [`VERSION`] (counted),
-    /// an error when it is empty.
-    fn body<'a>(&self, key: &str, stored: &'a Versioned) -> Result<Option<&'a [u8]>, RowsError> {
-        match stored.value.split_first() {
-            None => Err(corrupt(key, "no version byte")),
-            Some((&VERSION, body)) => Ok(Some(body)),
-            Some(_) => {
-                self.unknown.fetch_add(1, Ordering::Relaxed);
-                Ok(None)
+            if row.owner == self.instance {
+                continue;
+            }
+            let alive = match live.get(&row.owner) {
+                Some(alive) => *alive,
+                None => {
+                    let key = format!("{LIVE_PREFIX}{}", row.owner);
+                    let alive = self.store.get(&key)?.is_some();
+                    live.insert(row.owner.clone(), alive);
+                    alive
+                }
+            };
+            if !alive {
+                orphans.push(Orphan {
+                    operation,
+                    row,
+                    version: found.version,
+                });
             }
         }
+        Ok(orphans)
     }
-}
 
-/// The token of the holder whose write of the worker row `commit` is. The transactions that
-/// make one have a single write, so the revision they return is that row's version.
-fn held_by(worker: &str, commit: &Commit) -> Held {
-    Held {
-        worker: worker.to_owned(),
-        version: Version(commit.revision.0),
+    /// Takes `orphan` up: its row is this process's from now on, if its owner is still gone and
+    /// no other process took it first. Returns the row as written.
+    ///
+    /// # Errors
+    /// [`RowsError::Conflict`] when another process took it, or its owner came back; the store
+    /// cannot be written.
+    pub fn claim(&self, orphan: &Orphan) -> Result<OpRow, RowsError> {
+        let row = OpRow {
+            owner: self.instance.clone(),
+            ..orphan.row.clone()
+        };
+        let owner_live = format!("{LIVE_PREFIX}{}", orphan.row.owner);
+        let txn = Txn::new().check(owner_live, Cond::Absent).put(
+            op_key(orphan.operation),
+            encode(&row),
+            Cond::Version(orphan.version),
+        );
+        self.commit(txn)?;
+        Ok(row)
     }
 }
 

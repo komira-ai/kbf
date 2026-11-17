@@ -1,5 +1,7 @@
 # Every build action is a jobscheduler job on Linux, its root file system one tierstore tree over the kbf base tree
 
+> **Superseded in part by [direct-js.md](direct-js.md):** kbf no longer schedules. Sections 2 and 6 (the farm, virtual workers, leases, slots, sizes) describe the earlier design; an Execute is now one job submitted at once, with no CPU or memory and the build target as its size class. This page records the earlier design.
+
 Superseded in part by [jobs-on-jobscheduler-and-tierstore.md](jobs-on-jobscheduler-and-tierstore.md), together with
 the places that repeat these parts (sections 0, 6, 9 and 10.1):
 

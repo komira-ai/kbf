@@ -10,8 +10,7 @@ use kbf_auth::{
     AllowAuthenticator, AllowAuthorizer, AuthenticationMetadata, Authorizer, Authorizers,
     BoxFuture, Policy,
 };
-use kbf_invocation::{CallKind, LeaseEnd, Outcome};
-use kbf_sched::RequeueReason;
+use kbf_invocation::{CallKind, LeaseEnd, Outcome, RequeueReason};
 use kbf_types::Failure;
 use pages::{
     OPEN, PAGES_ONLY, Server, at, cached, call, digest, ended, finished, granted, hit, listing,
@@ -85,7 +84,7 @@ async fn the_pages_are_off_unless_the_policy_names_their_authorizer() {
         let no_record = missing.json["error"] == "no_record";
         assert_eq!(no_record, on, "{what}: {}", missing.json);
         assert_eq!(missing.json["off"] == "invocations", !on, "{what}");
-        assert_eq!(server.get("/v1/nodes").await.code, 200, "{what}");
+        assert_eq!(server.get("/v1/health").await.code, 200, "{what}");
         server.stop().await;
     }
 }
@@ -792,8 +791,8 @@ async fn metrics_aggregate_queue_and_run_times_reruns_and_usage() {
 async fn a_record_held_nowhere_is_no_record_when_history_is_on() {
     use kbf_history::{HistoryRoot, IndexRoot};
     use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+    use kbf_server::StateStore;
     use kbf_server::history::{Options, over};
-    use kbf_server::{EpochPolicy, StateStore};
     use kbf_state::fake::{Fake, Flaw};
     use kbf_state::{ManualClock, Store};
 
@@ -811,7 +810,6 @@ async fn a_record_held_nowhere_is_no_record_when_history_is_on() {
     );
     let state = StateStore {
         store,
-        epoch: EpochPolicy::Keep,
         members: Default::default(),
         history: Some(history),
     };

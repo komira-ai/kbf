@@ -18,7 +18,7 @@ use kbf_front::Cache;
 use kbf_map::{MemberId, MemberState};
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
 use kbf_server::storage_health::{Debts, Reported};
-use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
+use kbf_server::{Api, Listeners, StateStore, bind_server_with_state};
 use kbf_state::{Cond, Store, Txn};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -49,7 +49,6 @@ fn start() -> Server {
     let store = Hooked::new();
     let state = StateStore {
         store: Arc::clone(&store) as Arc<dyn Store>,
-        epoch: EpochPolicy::Keep,
         members: config(),
         history: None,
     };
@@ -58,19 +57,8 @@ fn start() -> Server {
         worker: loopback(),
         reapi_tls: None,
         worker_tls: None,
-        tick: Duration::from_millis(50),
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        default_platform: kbf_front::DefaultPlatform::NONE,
-        qos_allowed: kbf_front::QosAllow::DEFAULT,
-        memory_ladder: kbf_server::MemoryLadder::default(),
-        memory_climb: true,
-        learned_sizes: kbf_server::LearnedSizes::Off,
-        exclusive_actions: false,
-        placement_load: kbf_server::PlacementLoad::Off,
-        placement_predictions: kbf_server::PlacementPredictions::Off,
-        usage_profiles: kbf_server::UsageProfiles::Off,
-        whole_node: None,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
+        executor: None,
+        finished_retention: kbf_server::executor::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,

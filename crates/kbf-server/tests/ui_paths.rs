@@ -39,18 +39,18 @@ impl Source for Api<'_> {
 
 /// Path segments of `/ui` that try to walk to, or smuggle, another route.
 const HOSTILE_SEGMENTS: [&str; 12] = [
-    "..%2F..%2Fv1%2Fnodes",
-    "%2e%2e%2f%2e%2e%2fv1%2Fnodes",
+    "..%2F..%2Fv1%2Fhealth",
+    "%2e%2e%2f%2e%2e%2fv1%2Fhealth",
     "%252e%252e",
     "%252e%252e%252fv1",
-    "a%5C..%5Cnodes",
+    "a%5C..%5Chealth",
     "a%3Fb%23c",
     "x%2Fy",
     "%2F",
     "..%2F",
     "a%20b%0D%0AHost%3A%20evil",
-    "%E2%80%AEnodes",
-    "v1%2Fnodes%3Fx%3D1",
+    "%E2%80%AEhealth",
+    "v1%2Fhealth%3Fx%3D1",
 ];
 
 /// Whether `url` is one of the three routes of the build pages with its parameters each
@@ -99,7 +99,7 @@ fn v1_mentions(html: &str) -> Vec<&str> {
 
 /// Catches: a page that writes the id or the digest it was asked for into a `/v1` URL
 /// without encoding it (a `segment` that encodes nothing reads
-/// `/v1/invocations/../../v1/nodes`, which a URL client resolves to `/v1/nodes`), or one
+/// `/v1/invocations/../../v1/health`, which a URL client resolves to `/v1/health`), or one
 /// that does not refuse a dot segment before it is written into one: whatever the path or
 /// the query, every URL the page asks the real routes for is one of its declared routes
 /// with one segment per parameter, and a build that does not exist answers no page with
@@ -124,7 +124,7 @@ async fn a_crafted_path_or_query_reads_only_the_declared_routes() {
         "id=%2e%2e",
         "id=.",
         "id=%2E",
-        "id=..%2F..%2Fv1%2Fnodes",
+        "id=..%2F..%2Fv1%2Fhealth",
     ] {
         cases.push(("/ui/builds".to_owned(), query.to_owned()));
     }
@@ -161,9 +161,9 @@ async fn a_crafted_path_or_query_reads_only_the_declared_routes() {
 #[tokio::test]
 async fn the_mounted_ui_answers_a_crafted_raw_path_with_its_own_404_and_refuses_writes() {
     let server = Server::with(OPEN);
-    let nodes = server.get("/v1/nodes").await;
-    assert_eq!(nodes.code, 200, "{}", nodes.head);
-    let nodes_text = nodes.text();
+    let health = server.get("/v1/health").await;
+    assert_eq!(health.code, 200, "{}", health.head);
+    let health_text = health.text();
     for seg in HOSTILE_SEGMENTS {
         for path in [
             format!("/ui/builds/{seg}"),
@@ -180,7 +180,7 @@ async fn the_mounted_ui_answers_a_crafted_raw_path_with_its_own_404_and_refuses_
             );
             let html = answer.text();
             assert!(
-                !html.contains(&nodes_text),
+                !html.contains(&health_text),
                 "{path}: another route's document"
             );
             for url in v1_mentions(&html) {

@@ -23,10 +23,6 @@
 /// Files that name a cold store directory and no floor, and why that is fine.
 const ALLOWED: &[(&str, &str)] = &[
     (
-        "crates/kbf-server/tests/scheduler_core_flag.rs",
-        "its cold store is a path that does not exist and the test only parses the flag set",
-    ),
-    (
         "crates/kbf-cli/src/node_tests.rs",
         "its cold store is an s3 URI; the file:// URI is the hot store's, and nothing is started",
     ),

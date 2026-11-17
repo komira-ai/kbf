@@ -9,8 +9,6 @@ use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
 
 use super::*;
-use crate::StateStore;
-use crate::farm::{EpochPolicy, Farm};
 use crate::health::Readiness;
 use crate::members::{Fill, Handoff, MembershipConfig, PROTOCOL, Progress, Registrant};
 use crate::storage_health::Reported;
@@ -28,23 +26,12 @@ fn registrant(i: u32) -> Registrant {
 }
 
 /// The state of an API over `members`.
-fn api_over(members: Arc<Members>, store: Arc<dyn Store>) -> Arc<ApiState> {
-    let farm = Farm::new(
-        Backend::from(Arc::new(Cache::memory())),
-        kbf_sched::UNSERVABLE_WAIT,
-        kbf_sched::FINISHED_RETENTION,
-    )
-    .with_state(Some(StateStore {
-        store,
-        epoch: EpochPolicy::Keep,
-        members: MembershipConfig::default(),
-        history: None,
-    }))
-    .expect("a farm");
+fn api_over(members: Arc<Members>, _store: Arc<dyn Store>) -> Arc<ApiState> {
+    let backend = Backend::from(Arc::new(Cache::memory()));
     let (closer, _closing) = closing();
     let (drain, _goaway) = Drain::new(closer, Arc::new(Readiness::default()));
     Arc::new(ApiState {
-        farm: Arc::new(farm),
+        backend,
         token: None,
         drain: Arc::new(drain),
         retire: Arc::default(),

@@ -265,3 +265,71 @@ async fn a_hanging_probe_delays_no_other() {
     );
     keeping.abort();
 }
+
+/// What `GET path` answers from `router`: the status and the JSON body.
+async fn get_json(router: &mut Router, path: &str) -> (StatusCode, serde_json::Value) {
+    use tower_service::Service as _;
+    let request = axum::http::Request::builder()
+        .uri(path)
+        .body(axum::body::Body::empty())
+        .expect("a request");
+    let answer = router.call(request).await.expect("an answer");
+    let code = answer.status();
+    let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
+        .await
+        .expect("a body");
+    (code, serde_json::from_slice(&bytes).expect("JSON"))
+}
+
+/// Asserts that `/readyz/reapi` fails with the check `no_executor` (and its reason) on a server
+/// that has no executor, while `/readyz` of the same server answers ready: an Execute there
+/// would be refused, so the REAPI balancer must not send it any; and that the check is gone
+/// when the server has an executor, the other checks still apply to it, and the check follows
+/// a failing probe's own name.
+#[tokio::test]
+async fn readyz_reapi_fails_no_executor_without_an_executor_and_passes_with_one() {
+    let rig = rig(UP);
+    let mut without = routes(&rig.checks, false, None);
+    let (code, body) = get_json(&mut without, "/readyz/reapi").await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["ready"], false);
+    assert_eq!(body["failing"].as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(body["failing"][0]["check"], "no_executor");
+    assert_eq!(
+        body["failing"][0]["reason"],
+        "this server runs no executor (--executor js-agent)"
+    );
+    let (code, body) = get_json(&mut without, "/readyz").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+
+    let mut with = routes(&rig.checks, true, None);
+    let (code, body) = get_json(&mut with, "/readyz/reapi").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["failing"].as_array().map(Vec::len), Some(0), "{body}");
+
+    rig.mode.store(DOWN, Ordering::SeqCst);
+    let (code, body) = get_json(&mut with, "/readyz/reapi").await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["failing"][0]["check"], "dependency");
+    let (_, body) = get_json(&mut without, "/readyz/reapi").await;
+    let checks: Vec<&str> = body["failing"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter_map(|f| f["check"].as_str())
+        .collect();
+    assert_eq!(checks, ["dependency", "no_executor"]);
+}
+
+/// Asserts that a stop signal turns `/readyz/reapi` to 503 on a server with an executor, so a
+/// drain takes the server out of the REAPI balancer's rotation.
+#[tokio::test]
+async fn readyz_reapi_follows_the_stop_signal_with_an_executor() {
+    let rig = rig(UP);
+    let mut with = routes(&rig.checks, true, None);
+    rig.readiness.stop();
+    let (code, body) = get_json(&mut with, "/readyz/reapi").await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["failing"][0]["check"], "stopping");
+}

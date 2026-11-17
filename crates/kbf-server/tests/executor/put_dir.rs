@@ -8,9 +8,7 @@ use js_proto::v1::{
 use kbf_front::Finished;
 use kbf_server::executor::{InputTree, PutDirRoots, TASK_IN_TREE, TaskOut};
 
-use crate::rig::{Rig, TREE};
-
-const HOST: &str = "host-1";
+use crate::rig::{HOST, Rig, TREE};
 
 /// Asserts the job the service receives for a put-directory run, over the client and the fake
 /// service: no image; one layer, the action tree under the trees beside the put root; the base
@@ -18,15 +16,12 @@ const HOST: &str = "host-1";
 /// mounted read-write, `no_exec` and private at `/out`; no network, no file, no host port, and
 /// no url, grant or token anywhere in it (no write was presigned). Then, once the job ends
 /// clean, the frontend is asked to read exactly that directory, and the caller gets the result.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_put_dir_run_is_submitted_as_the_tree_and_its_dir_and_read_back() {
     let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
-    let mut rig = Rig::start(&[HOST], 1, |cfg| cfg.task_out = TaskOut::PutDir(roots)).await;
-    rig.pump().await;
-    let caller = rig.submit(5);
-    rig.pump().await;
-
-    let jobs = rig.jobs_of(5);
+    let rig = Rig::start(&[HOST], |cfg| cfg.task_out = TaskOut::PutDir(roots)).await;
+    let mut caller = rig.submit(5);
+    let jobs = rig.until_jobs(5, 1).await;
     assert_eq!(jobs.len(), 1);
     let job = &jobs[0];
     let spec = &job.spec;
@@ -71,48 +66,11 @@ async fn a_put_dir_run_is_submitted_as_the_tree_and_its_dir_and_read_back() {
     assert!(rig.presign.keys().is_empty(), "no write was presigned");
 
     rig.host_finishes(job.id(), HOST, 0);
-    match rig.until_done(&caller, 4).await {
+    match caller.done().await {
         Finished::Ran(result) => assert_eq!(result.exit_code, 0),
         other => panic!("did not run: {other:?}"),
     }
-    let read: Vec<String> = rig
-        .ingest
-        .calls
-        .lock()
-        .expect("calls")
-        .iter()
-        .map(|c| c.1.clone())
-        .collect();
-    assert_eq!(read, vec![dir]);
-}
-
-/// Asserts that a frontend with no storage node, whose run committed into a put directory and
-/// was accepted, has the action's result in its action cache: a client that asks for the action
-/// afterwards is answered the result the callers got, with the exit code of the run. (The farm
-/// wrote the accepted result's record through a plane that refused every record it was handed.)
-#[tokio::test(start_paused = true)]
-async fn an_accepted_put_dir_run_is_cached_by_a_frontend_with_no_storage_node() {
-    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
-    let stored = Rig::no_storage_node();
-    let cache = kbf_front::Backend::stored(std::sync::Arc::clone(&stored));
-    let mut rig = Rig::over(&[HOST], 1, 16, cache, |cfg| {
-        cfg.task_out = TaskOut::PutDir(roots)
-    })
-    .await;
-    rig.pump().await;
-    let caller = rig.submit(5);
-    rig.pump().await;
-    let job = rig.jobs_of(5).remove(0);
-
-    rig.host_finishes(job.id(), HOST, 0);
-    let Finished::Ran(ran) = rig.until_done(&caller, 4).await else {
-        panic!("the run did not finish ok");
-    };
-    rig.pump().await;
-
-    let cached = stored.action_result(&crate::rig::digest_of(5)).await;
-    let (_, held) = cached.expect("asked").expect("the result is cached");
-    assert_eq!(held, *ran);
+    assert_eq!(rig.ingest.keys_read(), vec![dir]);
 }
 
 /// Asserts the job the service receives for a put-directory run with
@@ -123,21 +81,18 @@ async fn an_accepted_put_dir_run_is_cached_by_a_frontend_with_no_storage_node() 
 /// manifests' host-path layer (a host the provider serves would not be chosen for it), a
 /// provider other than tierstore, a ref other than the list's key, or a mint asked for
 /// manifests.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_provider_run_is_submitted_as_tierstores_provider_naming_the_tree_list() {
     let key = format!("cas/l/{}", "ab".repeat(32));
     let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
-    let mut rig = Rig::start(&[HOST], 1, |cfg| {
+    let rig = Rig::start(&[HOST], |cfg| {
         cfg.task_out = TaskOut::PutDir(roots);
         cfg.input_tree = InputTree::Provider;
     })
     .await;
     *rig.inputs.tree.lock().expect("tree") = Ok(key.clone());
-    rig.pump().await;
-    let caller = rig.submit(5);
-    rig.pump().await;
-
-    let jobs = rig.jobs_of(5);
+    let mut caller = rig.submit(5);
+    let jobs = rig.until_jobs(5, 1).await;
     assert_eq!(jobs.len(), 1);
     let job = &jobs[0];
     let spec = &job.spec;
@@ -171,7 +126,7 @@ async fn a_provider_run_is_submitted_as_tierstores_provider_naming_the_tree_list
     assert_eq!(spec.network(), NetworkLevel::None);
 
     rig.host_finishes(job.id(), HOST, 0);
-    match rig.until_done(&caller, 4).await {
+    match caller.done().await {
         Finished::Ran(result) => assert_eq!(result.exit_code, 0),
         other => panic!("did not run: {other:?}"),
     }

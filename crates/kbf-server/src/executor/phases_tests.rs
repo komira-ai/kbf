@@ -35,13 +35,43 @@ fn phases_are_recorded_in_order_from_the_injected_clock() {
         line.mark(Mark::Prepared, at(2)),
         [(Phase::Prepare, secs(2))]
     );
-    assert_eq!(line.mark(Mark::Posted, at(3)), [(Phase::Start, secs(1))]);
+    assert_eq!(
+        line.mark(Mark::Posted, at(3)),
+        [(Phase::Start, secs(1)), (Phase::Submit, secs(3))]
+    );
     assert_eq!(line.mark(Mark::Running, at(8)), [(Phase::Queue, secs(5))]);
     assert_eq!(
         line.mark(Mark::Ended, at(20)),
         [(Phase::Task, secs(12)), (Phase::Run, secs(17))]
     );
     assert_eq!(line.mark(Mark::Done, at(21)), [(Phase::Ingest, secs(1))]);
+    assert_eq!(
+        line.mark(Mark::Answered, at(22)),
+        [(Phase::Execute, secs(22))]
+    );
+}
+
+/// Catches `submit` and `execute` measured from the wrong stamp: both begin at the Execute, so
+/// a later attempt whose own stamps are set after the first's ends them from the first's time,
+/// and a run with no Execute stamp observes neither.
+#[test]
+fn submit_and_execute_are_measured_from_the_execute() {
+    let base = Instant::now();
+    let at = |n: u64| base + secs(n);
+
+    let mut line = Timeline::default();
+    line.mark(Mark::Seen, at(10));
+    line.mark(Mark::Prepared, at(12));
+    let posted = line.mark(Mark::Posted, at(15));
+    assert!(posted.contains(&(Phase::Submit, secs(5))), "{posted:?}");
+    assert_eq!(
+        line.mark(Mark::Answered, at(60)),
+        [(Phase::Execute, secs(50))]
+    );
+
+    let mut unseen = Timeline::default();
+    assert!(unseen.mark(Mark::Posted, at(1)).is_empty());
+    assert!(unseen.mark(Mark::Answered, at(2)).is_empty());
 }
 
 /// Catches a phase made up for a run that was not seen: a run posted and never read back running
@@ -110,6 +140,8 @@ fn a_stamp_is_observed_into_the_metric() {
         Phase::Task,
         Phase::Run,
         Phase::Ingest,
+        Phase::Submit,
+        Phase::Execute,
     ] {
         let series = format!(
             "kbf_executor_phase_seconds_count{{phase=\"{}\"}}",
@@ -129,7 +161,7 @@ fn the_metric_family_renders_every_phase_label_once() {
             .count(),
         1
     );
-    assert_eq!(Phase::ALL.len(), 6);
+    assert_eq!(Phase::ALL.len(), 8);
     for phase in Phase::ALL {
         let label = phase.label();
         let family = "kbf_executor_phase_seconds";

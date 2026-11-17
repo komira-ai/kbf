@@ -55,8 +55,7 @@ impl CapabilitiesService {
 ///   only once reads and writes decode it, since a client that sees it will send it.
 /// - REAPI 2.0 to 2.3.
 /// - With `execution`: execution enabled, SHA-256. No priorities and no node
-///   properties are advertised yet; QoS is a header, never a property
-///   (`docs/design/scheduler.md#qos`).
+///   properties are advertised yet.
 #[must_use]
 pub fn server_capabilities(execution: bool) -> ServerCapabilities {
     let sha256 = reapi::digest_function::Value::Sha256 as i32;

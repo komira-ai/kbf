@@ -1,9 +1,8 @@
-//! The job service, as the executor calls it: the six calls it makes, every one bounded.
+//! The job service, as the executor calls it: the five calls it makes, every one bounded.
 //!
-//! The client gives a call its connect timeout and then 30 s, and a pass of the executor makes
-//! several calls one after another, with the heartbeats and the self-fence between them. A job
-//! service that accepts and never answers would hold a pass for minutes, and the farm hears
-//! nothing meanwhile. Each call here gives up after [`Config::call_timeout`], and the answer
+//! The client gives a call its connect timeout and then 30 s. A job service that accepts and
+//! never answers would hold an operation's task for that long a read. Each call here gives up
+//! after [`Config::call_timeout`], and the answer
 //! is the one a lost answer gives ([`Error::Transport`]): the request may have been sent, so
 //! [`Error::may_have_applied`] is true and the caller repeats it.
 //!
@@ -12,7 +11,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use js_proto::v1::{Job, JobResult, JobSpec, ListJobsRequest};
+use js_proto::v1::{Job, JobResult, JobSpec};
 use kbf_job_client::{Broken, Client, Error};
 
 use crate::executor::output::Tail;
@@ -42,12 +41,6 @@ impl Api<'_> {
         self.within(self.client.get_job(id)).await
     }
 
-    /// `ListJobs`, every page: for the adoption of an earlier process's jobs and the rival
-    /// check only.
-    pub(crate) async fn list_all_jobs(&self, filter: ListJobsRequest) -> Result<Vec<Job>, Error> {
-        self.within(self.client.list_all_jobs(filter)).await
-    }
-
     /// `CancelJob`: idempotent on the job.
     pub(crate) async fn cancel_job(&self, id: &str) -> Result<Job, Error> {
         self.within(self.client.cancel_job(id)).await
@@ -74,7 +67,7 @@ impl Api<'_> {
 /// it. A call never sent, an answer lost, and a status that says the service will not serve
 /// this client at all (`UNAUTHENTICATED`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`,
 /// `UNIMPLEMENTED`, ...) are not: a revoked token is a service that cannot be reached, for the
-/// self-fence and for a cancel, not one that answers.
+/// readiness probe and for a cancel, not one that answers.
 pub(crate) fn answered<T>(answer: &Result<T, Error>) -> bool {
     use tonic::Code;
     match answer {

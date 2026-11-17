@@ -1,4 +1,4 @@
-//! [`Backend`]: what Execute and the scheduler need of the store, and nothing more. Four
+//! [`Backend`]: what Execute and the executor need of the store, and nothing more. Four
 //! implementations: a [`Cache`] in this process (what `kbf-server` runs), a [`Storage`] reached over gRPC (`kbf frontend` without members,
 //! which holds no blobs of its own: `docs/design/architecture-v2.md`, sections 2 and 7),
 //! the storage nodes of a map ([`Backend::routed`], `kbf frontend` with members),
@@ -6,7 +6,7 @@
 //! ([`Backend::stored`]: the packs, the pack index and the action cache table of the state
 //! store; `stored` has the rules).
 //!
-//! The calls are the ones the scheduler side makes: the action-cache lookup before a
+//! The calls are the ones the executor side makes: the action-cache lookup before a
 //! run, the Action and Command blobs, the check that every input is held, and the two
 //! halves of the action-cache write after one. Client CAS, ByteStream and action-cache
 //! calls are not here: they are the cache's services, or the proxy's.
@@ -64,7 +64,7 @@ use crate::metrics::CacheMetrics;
 use crate::proxy::{Packs, Stored};
 use crate::routed::Routed;
 
-/// The store behind Execute and the scheduler. Cheap to clone.
+/// The store behind Execute and the executor. Cheap to clone.
 #[derive(Clone)]
 pub struct Backend(Arc<dyn Plane>);
 

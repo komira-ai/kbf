@@ -1,83 +1,72 @@
-//! The host executor: running a placed action as a job of the job service.
+//! The executor: every REAPI Execute is one job of the job service.
 //!
 //! # How it sits in the server
 //!
-//! The scheduler core knows nothing of this. The executor registers virtual workers, `js:<frontend>-<n>`,
-//! each a node of the declared shape whose drivers are `container` and `native-whole-machine`
-//! (and, with `--executor-mac-hosts`, Mac workers `js-mac:<frontend>-<n>` whose one driver is
-//! `native`, [`mac`]; with [`Ownership::Shared`] both carry the process's instance,
-//! `js:<frontend>.<instance>-<n>` and `js-mac:<frontend>.<instance>-<n>`),
-//! and takes the messages the farm sends a worker on the channel it owns the receiving end of.
-//! A `Start` is submitted to the job service as a job of the kbf image, whose entrypoint is the
-//! task tool (a `whole_machine` lease's as a job that needs the whole host), under an id
-//! made from the farm lease, so a submit sent again makes no second job; the job is read back
-//! until it ends, its ending is mapped to the farm's failure classes ([`outcome`]), and the
-//! result is reported the way a worker reports one. A `Cancel` is a cancel of the job. The
-//! executor holds no capacity, renews nothing and never sees where a job runs. `worker.rs`, the
-//! scheduler core and the sched crates are untouched, and a server that never builds an
-//! [`Executor`] never opens a connection to a job service.
+//! [`Executor`] is the dispatcher the REAPI front hands each Execute to
+//! ([`kbf_front::Dispatch`]). An Execute that names an action another Execute is already running
+//! joins that operation; any other is a new operation, `operations/<id>`, and its run is
+//! submitted to the job service at once as a job of the kbf image, whose entrypoint is the task
+//! tool ([`submit`]). Nothing in kbf queues it, places it or counts it against a capacity: how
+//! many jobs run, and where, is the job service's. The only bound is a guard on the memory the
+//! open operations hold ([`MAX_OPEN`]).
 //!
-//! Who owns the jobs is [`Config::ownership`]. With [`Ownership::Single`], the default, the
-//! executor runs on exactly one frontend: it labels its jobs with its frontend id and an id of
-//! the process that made them, and on start cancels every live job an earlier process left
-//! under that frontend id, which nothing of the farm maps to any more. Those are taken only
-//! once no new job of that process is seen over [`Config::adopt_watch`]: a process that makes
-//! new jobs is alive under the same id (a copied config), and the executor stops instead of
-//! cancelling its jobs. [`Executor::rival`] finds another frontend's live jobs on the job
-//! service, and the task that steps the executor ([`Running`]) stops when it does. The id must
-//! be different for each frontend.
+//! Each operation is driven by a task of its own ([`run`]): the job is read back every
+//! [`Config::poll`] until it ends; an ending of the farm's (the host lost, the job service
+//! restarted, the job refused at its start) submits the operation again as its next attempt, a
+//! new job with a new key, at most [`outcome::RESUBMITS`] times; anything else, and the last
+//! attempt, answers the operation's callers ([`outcome`]). A job that ended well has its pack
+//! read by the frontend ([`Ingest`]), which writes the action cache. `CancelOperation` cancels
+//! the job and answers the callers `CANCELLED` ([`kbf_front::Dispatch::cancel`]).
 //!
-//! With [`Ownership::Shared`] the frontend id names a group of frontends over one state
-//! store, and each process keeps the `exec/` rows of its workers and jobs there (`share.rs`,
-//! `docs/design/n-frontends.md`): no rival check, no cancel at start, at a fence or at the
-//! end. A process that ends with jobs open hands its workers back for another to take up.
+//! # Over a state store
+//!
+//! With `--state-store`, the operation ids come from the store's shared counter and each
+//! operation keeps a row from before its first submit until it finishes ([`rows`]): any frontend
+//! of the store answers `WaitExecution` and `GetOperation` of any operation from the rows, and a
+//! frontend takes up the unfinished operations of a process whose liveness row has expired,
+//! reading their jobs back where they are ([`Running`]). A restart is such a process: the new
+//! one takes up the old one's jobs. Nothing is cancelled when a frontend ends.
 //!
 //! The frontend builds one only for `--executor js-agent` (`frontend/executor_flags.rs`), over
 //! [`Front`], which implements the three seams ([`Ingest`], [`Presign`], [`Inputs`]) with the
-//! frontend's own packs, CAS, key mint and run preparation, and steps it from
-//! [`FrontendHandle::serve`](crate::frontend::FrontendHandle::serve) until the frontend stops.
+//! frontend's own packs, CAS, key mint and run preparation. A frontend with no executor answers
+//! every Execute that is not a cache hit `FAILED_PRECONDITION`.
 
 mod api;
 mod config;
 mod driver;
 mod front;
-mod host;
 mod mac;
 mod metrics;
+mod ops;
 mod out;
 mod outcome;
 mod output;
 mod phases;
-mod pool;
 mod probe;
+mod record;
 pub mod rows;
-mod runs;
-mod share;
+mod run;
 mod size_class;
 mod submit;
 mod task;
 mod traits;
 
-#[cfg(test)]
-#[path = "support_tests.rs"]
-mod test_support;
-
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use futures::future::join_all;
-use js_proto::v1::Job;
+use kbf_front::{Dispatch, Recorder, Stage, Submission, Ticket};
 use kbf_job_client::Client;
-use kbf_types::WorkerId;
+use kbf_types::OperationId;
+use tokio::sync::watch;
 use tokio::time::Instant;
+use tonic::Status;
 
-use crate::Farm;
-use host::HostWorker;
-use pool::{Adopted, Adoption};
-use share::Share;
-use submit::{FRONTEND_LABEL, INSTANCE_LABEL};
+use ops::{Joined, Ops};
+use rows::Rows;
+use run::{Op, Start};
 
-pub use config::{Config, ConfigError, InputTree, Network, Ownership};
+pub use config::{Config, ConfigError, FINISHED_RETENTION, InputTree, LIVE, Network};
 pub use driver::Running;
 pub use front::{
     Front, FrontParts, PrepareError, PreparedPutDir, PreparedRun, PutDirParts, RunPrepare,
@@ -88,19 +77,44 @@ pub use mac::{
 };
 pub use metrics::Metrics;
 pub use out::{MAX_ROOT_BYTES, OUT_TARGET, PutDirRoots, RootError, TASK_IN_TREE, TaskOut};
+pub use outcome::OUT_OF_MEMORY_REASON;
 pub use size_class::SizeClass;
 pub use submit::job_id;
-pub use task::{Delivery, PackKey, Secret, TaskArgs, build_id};
+pub use task::{Delivery, PackKey, RunId, Secret, TaskArgs, build_id};
 pub use traits::{
     ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
     ReadGrant, RejectReason, UntrustedLimits,
 };
 
+/// The most operations the executor holds open at once: a guard on the memory they hold (a
+/// prepared job's spec, a stage channel and a task each), not a bound on how many jobs run.
+/// An Execute past it is refused UNAVAILABLE, which a client retries.
+pub const MAX_OPEN: usize = 65_536;
+
+/// The REAPI name of `operation`: `operations/<id>`.
+#[must_use]
+pub fn stored_name(operation: OperationId) -> String {
+    format!("operations/{}", operation.0)
+}
+
+/// The operation a name of the form [`stored_name`] writes names: `None` for any other
+/// spelling, a cached result's name (`operations/cached/...`) among them, and for a spelling
+/// [`stored_name`] does not write (signs, leading zeros, white space).
+#[must_use]
+pub fn parse_stored_name(name: &str) -> Option<OperationId> {
+    let digits = name.strip_prefix("operations/")?;
+    let canonical = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    canonical
+        .then(|| digits.parse().ok())
+        .flatten()
+        .map(OperationId)
+}
+
 /// What the executor is built over.
 #[derive(Clone)]
 pub struct Deps {
-    /// The farm the workers register with.
-    pub farm: Arc<Farm>,
     /// The job service.
     pub client: Client,
     /// The frontend's read of a task's pack.
@@ -111,42 +125,21 @@ pub struct Deps {
     pub inputs: Arc<dyn Inputs>,
     /// What the executor counts.
     pub metrics: Arc<Metrics>,
-    /// The state store the `exec/` rows are kept in: what [`Ownership::Shared`] needs, and
-    /// nothing else reads.
+    /// The state store the operations' rows are kept in, if the frontend has one.
     pub store: Option<Arc<dyn kbf_state::Store>>,
+    /// The invocation recorder the operations' events go to.
+    pub recorder: Recorder,
 }
 
-/// Why the executor must stop, as a worker found it: another process holds this frontend's id.
-#[derive(Default)]
-pub(crate) struct Twin(Mutex<Option<String>>);
-
-impl Twin {
-    pub(crate) fn flag(&self, why: String) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
-    }
-
-    fn take(&self) -> Option<String> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
-    }
+/// The executor's state, shared by the dispatcher and the tasks of its operations.
+pub(crate) struct Inner {
+    pub(crate) cfg: Config,
+    pub(crate) deps: Deps,
+    pub(crate) rows: Option<Rows>,
+    pub(crate) ops: Mutex<Ops>,
 }
 
-/// The message the executor stops with when another process runs under its frontend id.
-pub(crate) fn twin_message(frontend: &str) -> String {
-    format!(
-        "another frontend runs under the same id {frontend:?}: --executor-frontend-id must be different for each frontend"
-    )
-}
-
-/// What one pass reads once for every worker.
-pub(crate) struct Ctx<'a> {
-    pub(crate) cfg: &'a Config,
-    pub(crate) deps: &'a Deps,
-    pub(crate) twin: &'a Twin,
-    /// The process's rows, with shared ownership.
-    pub(crate) share: Option<&'a Share>,
-}
-
-impl Ctx<'_> {
+impl Inner {
     /// The job service, each call limited to [`Config::call_timeout`].
     pub(crate) fn api(&self) -> api::Api<'_> {
         api::Api {
@@ -155,233 +148,236 @@ impl Ctx<'_> {
         }
     }
 
-    /// The executor's clock: tokio's, so a test that pauses it moves it with `advance`.
-    pub(crate) fn now(&self) -> Instant {
-        Instant::now()
+    pub(crate) fn ops(&self) -> std::sync::MutexGuard<'_, Ops> {
+        self.ops.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// A virtual worker, as an operator or a test looks at it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkerInfo {
-    /// The worker the farm knows.
-    pub worker: WorkerId,
-    /// The farm leases it holds: submitted, ingesting, being withdrawn or waiting for an
-    /// acknowledgement.
-    pub runs: usize,
-    /// Whether it has stopped taking work.
-    pub draining: bool,
-    /// Whether it has fenced itself and is silent.
-    pub silent: bool,
-}
-
-/// The virtual workers, and what runs as their jobs.
+/// The dispatcher of Executes to the job service.
+#[derive(Clone)]
 pub struct Executor {
-    cfg: Config,
-    deps: Deps,
-    workers: Vec<HostWorker>,
-    /// Whether the jobs an earlier process of this frontend left have been taken up.
-    adoption: Adoption,
-    /// Why the executor stopped itself: another process runs under this frontend's id.
-    twin: Option<String>,
-    flagged: Twin,
-    /// The process's rows, with shared ownership.
-    share: Option<Share>,
+    inner: Arc<Inner>,
 }
 
 impl Executor {
-    /// An executor of `cfg` over `deps`. Nothing is asked of the job service until the first
-    /// [`step`](Self::step).
+    /// An executor of `cfg` over `deps`. Nothing is asked of the job service until an Execute.
     ///
     /// # Errors
-    /// `cfg` breaks a rule of [`Config::validate`], or asks for [`Ownership::Shared`] over
-    /// `deps` with no state store.
+    /// `cfg` breaks a rule of [`Config::validate`].
     pub fn new(cfg: Config, deps: Deps) -> Result<Self, ConfigError> {
         cfg.validate()?;
-        let share = match (cfg.shared(), &deps.store) {
-            (false, _) => None,
-            (true, Some(store)) => Some(Share::new(&cfg, Arc::clone(store), Instant::now())),
-            (true, None) => return Err(ConfigError::SharedStore),
-        };
+        let rows = deps
+            .store
+            .as_ref()
+            .map(|store| Rows::new(Arc::clone(store), &cfg.instance));
+        let ops = Ops::new(rows.is_none().then(process_base));
         Ok(Self {
-            cfg,
-            deps,
-            workers: Vec::new(),
-            adoption: Adoption::Unread,
-            twin: None,
-            flagged: Twin::default(),
-            share,
+            inner: Arc::new(Inner {
+                cfg,
+                deps,
+                rows,
+                ops: Mutex::new(ops),
+            }),
         })
-    }
-
-    /// The workers registered now.
-    #[must_use]
-    pub fn workers(&self) -> Vec<WorkerInfo> {
-        self.workers.iter().map(HostWorker::info).collect()
     }
 
     /// The job service as a readiness check asks about it: one read of a job no one made, which
     /// the service answers whether it has it or not, bounded by `limit`.
     #[must_use]
     pub fn probe(&self, limit: Duration) -> probe::ServiceProbe {
-        probe::ServiceProbe::new(self.deps.client.clone(), limit)
+        probe::ServiceProbe::new(self.inner.deps.client.clone(), limit)
     }
 
-    /// How often the caller steps the executor.
+    /// How many operations are open: submitted and not yet answered.
     #[must_use]
-    pub fn poll(&self) -> Duration {
-        self.cfg.poll
+    pub fn open(&self) -> usize {
+        self.inner.ops().open_count()
     }
 
-    /// How often the caller checks that no other frontend has jobs: every
-    /// [`Config::adopt_watch`].
-    #[must_use]
-    pub fn rival_check(&self) -> Duration {
-        self.cfg.adopt_watch()
+    pub(crate) fn inner(&self) -> &Arc<Inner> {
+        &self.inner
     }
 
-    /// Why this executor must stop, if another frontend (or another process under this
-    /// frontend's id) has live jobs on the job service and is older: the executor runs on
-    /// exactly one frontend, and two would each register workers the farm knows one set of,
-    /// and a restart under one id cancels the other's jobs. Of two that have jobs the one whose
-    /// oldest live job is younger stops (ties go to the lower frontend id, then instance), so
-    /// two that started together and both submitted are not both stopped, and a frontend that
-    /// finds another's jobs before it has any stops at once. A job whose cancel was asked for is
-    /// on its way out and is no one's. Nothing is concluded from a list that could not be read
-    /// (one of more jobs than the client lists at once included).
-    ///
-    /// Jobs of another process under this frontend's own id are not judged here until the jobs
-    /// of an earlier process have been taken up: that is [`Adoption`]'s question.
-    ///
-    /// With [`Ownership::Shared`] there is no rival: any number of frontends of the group serve
-    /// beside each other, and nothing is asked.
-    pub async fn rival(&self) -> Option<String> {
-        if self.share.is_some() {
-            return None;
-        }
-        let ctx = self.ctx();
-        let jobs = ctx.api().list_all_jobs(pool::live_jobs(&[])).await.ok()?;
-        let me = (self.cfg.frontend.as_str(), self.cfg.instance.as_str());
-        let mut mine = u64::MAX;
-        let mut others = Vec::new();
-        for job in jobs.iter().filter(|job| !job.cancel_requested) {
-            let Some((frontend, instance)) = owner(job) else {
-                continue;
-            };
-            let queued = job.times.as_ref().map_or(0, |times| times.queued_at_ms);
-            if (frontend, instance) == me {
-                mine = mine.min(queued);
-            } else if frontend != self.cfg.frontend || self.adoption.is_done() {
-                others.push((queued, frontend.to_owned(), instance.to_owned()));
+    /// A ticket on the open operation `operation`, or on one finished within the retention.
+    fn held(&self, operation: OperationId) -> Option<Ticket> {
+        let mut ops = self.inner.ops();
+        ops.prune(Instant::now(), self.inner.cfg.finished_retention);
+        ops.ticket(operation)
+    }
+
+    /// A ticket on `operation` from the state store: done if its answer is there, else a
+    /// follower that shows the answer once another frontend (or this one, having taken it up)
+    /// writes it.
+    fn stored(&self, operation: OperationId) -> Option<Ticket> {
+        let rows = self.inner.rows.as_ref()?;
+        let looked = rows.look(operation).and_then(|look| match look {
+            rows::Look::Done(key, finished) => Ok(Some((key, Some(finished)))),
+            rows::Look::Open(row) => row
+                .action_key()
+                .map(|key| Some((key, None)))
+                .map_err(|why| rows::RowsError::Corrupt {
+                    key: rows::op_key(operation),
+                    why,
+                }),
+            rows::Look::Gone => Ok(None),
+        });
+        let (key, finished) = match looked {
+            Ok(found) => found?,
+            Err(error) => {
+                tracing::warn!(%error, %operation, "the state store could not say where an operation is");
+                return None;
             }
-        }
-        let older = others
-            .into_iter()
-            .filter(|(since, frontend, instance)| {
-                (*since, frontend.as_str(), instance.as_str()) < (mine, me.0, me.1)
-            })
-            .min()?;
-        Some(match older.1 == self.cfg.frontend {
-            true => twin_message(&older.1),
-            false => format!(
-                "the frontend {:?} has jobs on the job service too: the executor runs on exactly one frontend",
-                older.1
-            ),
+        };
+        let (instance, action) = (key.instance.clone(), key.action);
+        let stage = match finished {
+            Some(finished) => watch::channel(Stage::Done(finished)).1,
+            None => run::follow(&self.inner, operation, key.clone()),
+        };
+        Some(Ticket {
+            name: stored_name(operation),
+            instance,
+            action,
+            stage,
+        })
+    }
+}
+
+impl Dispatch for Executor {
+    fn submit(&self, submission: Submission) -> Result<Ticket, Status> {
+        let Submission {
+            key,
+            whole_machine,
+            call,
+            ..
+        } = submission;
+        // An operation id of the state store is reserved with no lock held: once a block of
+        // ids, that is a read and a write of the store.
+        let mut reserved = None;
+        let (name, stage) = loop {
+            let mut ops = self.inner.ops();
+            ops.prune(Instant::now(), self.inner.cfg.finished_retention);
+            if let Some(Joined { operation, stage }) = ops.join(&key) {
+                let name = stored_name(operation);
+                record::answered(&self.inner.deps.recorder, call, &name, operation, true);
+                break (name, stage);
+            }
+            if ops.open_count() >= MAX_OPEN {
+                return Err(Status::unavailable(format!(
+                    "the executor holds {MAX_OPEN} open operations, the most its memory guard \
+                     allows: try again"
+                )));
+            }
+            let operation = match (&self.inner.rows, reserved) {
+                (None, _) => ops.next_id(),
+                (Some(_), Some(operation)) => operation,
+                (Some(rows), None) => {
+                    drop(ops);
+                    let operation = rows.next_id().map_err(|e| {
+                        Status::unavailable(format!("no operation id from the state store: {e}"))
+                    })?;
+                    // Another Execute of the action may have opened it meanwhile: look again.
+                    reserved = Some(operation);
+                    continue;
+                }
+            };
+            let name = stored_name(operation);
+            let recorded =
+                record::answered(&self.inner.deps.recorder, call, &name, operation, false);
+            let (stage, cancel) = ops.open(operation, key.clone());
+            let op = Op::new(operation, key.clone(), whole_machine, recorded);
+            run::spawn(Arc::clone(&self.inner), op, Start::Fresh, cancel);
+            break (name, stage);
+        };
+        Ok(Ticket {
+            name,
+            instance: key.instance,
+            action: key.action,
+            stage,
         })
     }
 
-    /// Why the executor stopped itself without being asked, if it did: another process runs
-    /// under this frontend's id ([`Executor::new`]'s `Config::frontend`).
+    fn wait(&self, name: &str) -> Option<Ticket> {
+        let operation = parse_stored_name(name)?;
+        self.held(operation).or_else(|| self.stored(operation))
+    }
+
+    fn cancel(&self, name: &str) -> bool {
+        parse_stored_name(name).is_some_and(|operation| self.inner.ops().cancel(operation))
+    }
+}
+
+/// What a server hands its Executes to: its executor, or, on a server that runs none, a refusal
+/// of each Execute the action cache did not answer.
+pub enum Dispatcher {
+    /// The executor.
+    Executor(Executor),
+    /// No executor: every Execute is refused FAILED_PRECONDITION.
+    None,
+}
+
+impl Dispatcher {
+    /// The dispatcher of a server with `executor`.
     #[must_use]
-    pub fn twin(&self) -> Option<&str> {
-        self.twin.as_deref()
-    }
-
-    /// The view of one pass.
-    fn ctx(&self) -> Ctx<'_> {
-        Ctx {
-            cfg: &self.cfg,
-            deps: &self.deps,
-            twin: &self.flagged,
-            share: self.share.as_ref(),
-        }
-    }
-
-    /// One pass over every worker: the farm's messages taken, jobs submitted, read and
-    /// cancelled, results reported, heartbeats sent. A caller steps it every [`Config::poll`];
-    /// a pass never waits on a job. Before the first pass that registers the workers, the jobs
-    /// an earlier process left are taken up; with [`Ownership::Shared`] the liveness row is
-    /// renewed instead, and the workers are registered once their rows are written.
-    pub async fn step(&mut self) {
-        if self.twin.is_some() {
-            return;
-        }
-        let now = Instant::now();
-        if let Some(share) = &mut self.share {
-            let held: Vec<_> = self.workers.iter().filter_map(HostWorker::held).collect();
-            share.beat(&self.cfg, &held, self.deps.farm.intake_closed(), now);
-            let ctx = Ctx {
-                cfg: &self.cfg,
-                deps: &self.deps,
-                twin: &self.flagged,
-                share: Some(share),
-            };
-            share.open(&ctx, &mut self.workers, now);
-            join_all(self.workers.iter_mut().map(|worker| worker.step(&ctx, now))).await;
-            return;
-        }
-        let ctx = Ctx {
-            cfg: &self.cfg,
-            deps: &self.deps,
-            twin: &self.flagged,
-            share: None,
-        };
-        if !self.adoption.is_done() {
-            match pool::adopt_jobs(&ctx, now, &mut self.adoption).await {
-                Adopted::Done => {
-                    self.adoption = Adoption::Done;
-                    self.workers = pool::workers(&ctx, now);
-                }
-                // The jobs of an earlier process are not yet known to be nobody's: nothing is
-                // submitted while a live twin might own them.
-                Adopted::Watching | Adopted::Unread => return,
-                Adopted::Twin(why) => {
-                    self.twin = Some(why);
-                    return;
-                }
-            }
-        }
-        join_all(self.workers.iter_mut().map(|worker| worker.step(&ctx, now))).await;
-        self.twin = self.flagged.take();
-    }
-
-    /// Cancels every job and tells the farm the workers take no more work. The executor holds
-    /// nothing afterwards, and asks for nothing more unless it is stepped.
-    ///
-    /// With [`Ownership::Shared`] nothing is cancelled: each worker is handed back (its row
-    /// deleted when no job row is left under it, else written with no owner, for another
-    /// process of the group to take up) and the liveness row is deleted.
-    pub async fn shutdown(&mut self) {
-        let workers = std::mem::take(&mut self.workers);
-        let ctx = self.ctx();
-        if let Some(share) = ctx.share {
-            workers
-                .into_iter()
-                .for_each(|worker| worker.hand_back(&ctx));
-            share.leave();
-            return;
-        }
-        join_all(workers.into_iter().map(|worker| worker.retire(&ctx))).await;
-        self.adoption = Adoption::Unread;
-        self.twin = None;
-        self.flagged.take();
+    pub fn of(executor: Option<Executor>) -> Arc<Self> {
+        Arc::new(executor.map_or(Self::None, Self::Executor))
     }
 }
 
-/// The frontend and the instance labels of `job`, if it is one of a kbf executor's.
-fn owner(job: &Job) -> Option<(&str, &str)> {
-    let labels = &job.spec.as_ref()?.labels;
-    let frontend = labels.get(FRONTEND_LABEL)?;
-    let instance = labels.get(INSTANCE_LABEL).map_or("", String::as_str);
-    Some((frontend.as_str(), instance))
+impl Dispatch for Dispatcher {
+    fn submit(&self, submission: Submission) -> Result<Ticket, Status> {
+        match self {
+            Self::Executor(executor) => executor.submit(submission),
+            Self::None => Err(Status::failed_precondition(
+                "this server runs no executor (--executor js-agent): it answers an Execute \
+                 only from the action cache",
+            )),
+        }
+    }
+
+    fn wait(&self, name: &str) -> Option<Ticket> {
+        match self {
+            Self::Executor(executor) => executor.wait(name),
+            Self::None => None,
+        }
+    }
+
+    fn cancel(&self, name: &str) -> bool {
+        match self {
+            Self::Executor(executor) => executor.cancel(name),
+            Self::None => false,
+        }
+    }
 }
+
+impl std::fmt::Debug for Executor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Executor")
+            .field("frontend", &self.inner.cfg.frontend)
+            .field("instance", &self.inner.cfg.instance)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The first operation id of a process with no state store: the wall-clock time of its start in
+/// milliseconds, times 2^16, plus 16 random bits, so a name a client holds from an earlier
+/// process names no operation of this one unless the clock stepped back to that very
+/// millisecond and the bits match.
+fn process_base() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+    // A `RandomState` is keyed from the operating system's random source.
+    let random = RandomState::new().hash_one(start) & 0xffff;
+    (start << 16) | random
+}
+
+#[cfg(test)]
+#[path = "dispatch_tests.rs"]
+mod dispatch_tests;
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

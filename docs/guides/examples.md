@@ -86,8 +86,8 @@ platform(
 )
 
 cc_binary(
-    name = "server",
-    exec_properties = {"kbf-book-cpus": "4", "kbf-book-mem-gib": "12"},
+    name = "link_everything",
+    exec_properties = {"kbf-lease": "whole_machine"},
     ...
 )
 ```
@@ -205,26 +205,19 @@ examples use:
 
 | Property | Value | Effect |
 |---|---|---|
-| `OSFamily` | `linux`, or `darwin`, `macos`, `macosx`, `osx` | The operating system of the worker. |
-| `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; or `arm-a64`, `arm64`, `aarch64`; or an ISA level such as `x86-64-v3` | The CPU architecture of the worker. |
+| `OSFamily` | `linux`, or `darwin`, `macos`, `macosx`, `osx` | `linux` (the default) or a Mac job. |
 | `container-image` | `docker://<repo>@sha256:<digest>` | The base image a Linux action's Command sees; it must be the frontend's base image. |
-| `kbf-book-cpus` | whole number, 1 or more | Cores the action books. |
-| `kbf-book-mem-gib` | whole number, 1 or more | GiB of memory the action books. |
 
 Rules for the names and values:
 
-- Names and the values of `OSFamily`, `ISA` and `Arch` are read in any case, so
-  `osfamily=darwin`, `OSFamily=Darwin` and `OSFAMILY=DARWIN` all ask for a Mac. `Arch` is
-  accepted as `ISA`. A name sent twice, in any two spellings, is refused with
-  `INVALID_ARGUMENT`.
+- The name and the value of `OSFamily` are read in any case, so
+  `osfamily=darwin`, `OSFamily=Darwin` and `OSFAMILY=DARWIN` all ask for a Mac. A name sent
+  twice, in any two spellings, is refused with `INVALID_ARGUMENT`.
 - `container-image` is the exception: it is read only in exactly that spelling.
   `Container-Image` is ignored, and the action gets the frontend's base image.
-- An action that names no OS, no architecture and no ISA level goes where
-  `--default-platform` says, `linux/x86_64` by default. Name `OSFamily` and `ISA` so a
-  Mac and a Linux box are never confused.
-- An action that no connected worker can run waits, `QUEUED`, with the reason
-  `NO_WORKER_CAN_RUN` in its metadata, and fails with `FAILED_PRECONDITION` after
-  `--unservable-wait-secs` (300 by default).
+- kbf does not match an action to a worker: `ISA`, `Arch`, `gpu`, `kbf-book-cpus` and
+  `kbf-book-mem-gib` are accepted and do nothing. The job asks for no CPU and no memory, and the job
+  service sizes it from the history of the action's build target.
 
 ### The container image
 
@@ -243,31 +236,13 @@ container-image=docker://registry.example.com/build@sha256:<digest>
 - An action that runs on a Mac ignores `container-image`: a Mac's agent runs the release's
   `kbf-task` bundle.
 
-### Memory booking
+### Memory
 
-Every action books 1 core and 4 GiB of memory on the worker it runs on. Two properties
-change the booking:
-
-- `kbf-book-cpus=N` books `N` whole cores.
-- `kbf-book-mem-gib=N` books `N` GiB of memory.
-
-Cores are reserved on the worker for the lease. Memory is the limit the action runs under: the worker's memory must be at least `N` GiB, but the memory other actions on the worker hold does not keep this one off it.
-
-Write `N` in plain digits with no sign or leading zero: `+4` and `04` are refused,
-because each would book the same as `4` under a different action digest. Either key may be
-given alone. The scheduler places the action only where that much is free.
-
-A job needs 1.5 times its memory booking plus 512 MiB of its worker (a virtual worker of the
-frontend's executor, `--executor-host-memory-gib`), and the bookings of a worker add up to what
-is left after that: 12.5 GiB for `kbf-book-mem-gib=8`.
-
-When the job service reports that an action ran past its memory limit, the server runs it
-again one step up the memory ladder (4, 16, 32 GiB, then a whole host) and remembers the
-raised booking for that action, so the next run starts there. A large `swiftc` or `ld`
-step that dies at the default needs a larger `kbf-book-mem-gib`. Both keys are part of the
-action digest, so changing a booking reruns the action once.
-
-Neither key is allowed on a `kbf-lease=whole_machine` action, which books the whole worker.
+An action books no memory: the job carries no CPU or memory, and the job service sizes it from the
+history of the action's build target (its `size-class` label). When the job service reports that an
+action ran past its memory limit, the frontend submits it again as the next attempt, at most twice,
+and then answers `FAILED_PRECONDITION` (out of memory). `kbf-lease=whole_machine` makes the job ask
+for a whole host instead.
 
 ## A frontend and a storage node on one machine
 
@@ -311,7 +286,7 @@ and base tree); they are listed in [kbf-modes.md](../deploy/kbf-modes.md) and
   off one machine, give both processes the certificate flags.
 - `--cold-store=file://...` is a directory, so the box needs no S3 service and holds no key.
   Add `--hot-store=file:///fast/kbf` to the storage node to put a fast disk in front of it.
-- `--state-store` names the scheduler's state: a Postgres URL. A `sqlite://` store still starts in
+- `--state-store` names where the executor keeps its open operations and finished answers: a Postgres URL. A `sqlite://` store still starts in
   this release and logs a warning that it is removed in the next.
 - `--api-token-file` must be a file of mode 0600 or 0400 holding one token of at least 32
   characters. The operator API refuses writes without it.
@@ -338,9 +313,7 @@ build:kbf --remote_default_exec_properties=container-image=docker://registry.exa
   tls = false
 ```
 
-A farm whose job hosts are arm64 machines should start with `--default-platform=none`, or its
-actions must name `ISA=arm64`; the default places an action that names no platform on
-`linux/x86_64`.
+A farm whose job hosts are arm64 machines starts the frontend with `--executor-arch=arm64`.
 
 Planned: client-certificate and token variants of `--reapi-auth-policy` on the REAPI
 listener itself; today the bundled proxy supplies bearer and mTLS authentication in front

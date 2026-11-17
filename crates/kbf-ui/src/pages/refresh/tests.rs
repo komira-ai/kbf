@@ -1,11 +1,11 @@
-//! The opt-in refresh of the Overview, Nodes and Node pages. Each test names the
+//! The opt-in refresh of the Overview page. Each test names the
 //! defect it catches.
 
 use super::{INTERVALS, parse};
 use crate::tests::{body, fleet_farm, render};
 
 /// The pages that take `?refresh=`, with their paths.
-const PAGES: [&str; 3] = ["/ui", "/ui/nodes", "/ui/nodes/mac-1"];
+const PAGES: [&str; 1] = ["/ui"];
 
 /// Catches: a query that is not exactly one `refresh` of an allowed interval accepted
 /// (clamped, defaulted or ignored): a value outside the set, empty, negative, with a
@@ -91,7 +91,7 @@ fn a_page_refreshes_only_when_asked_and_only_to_itself() {
         }
     }
     // The parameter's name is the caller's: it is text on the refusal page.
-    let html = body(&render(&fake, "/ui/nodes?%3Cscript%3E=1"));
+    let html = body(&render(&fake, "/ui?%3Cscript%3E=1"));
     assert!(html.contains("&lt;script&gt; is not a parameter"), "{html}");
     assert!(!html.contains("<script"), "{html}");
 }

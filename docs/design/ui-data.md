@@ -1,5 +1,7 @@
 # kbf UI data: what the UI and its read API present
 
+> **Superseded in part by [direct-js.md](direct-js.md):** the node, lease and queue data and pages described here are gone: kbf no longer schedules and holds none. This page records the earlier design.
+
 > **Status: kbf-daemon is deleted.** Where this page describes the daemon, the `daemon`, `storage-and-daemon` or `all-in-one` modes or a Mac daemon, it records the design as it was written. Placed actions now run only as js-agent jobs of the job service, storage nodes run `kbf --mode=storage`, and Macs run js-agent only ([kbf-modes.md](../deploy/kbf-modes.md#the-removed-modes)).
 
 Status: design, nothing built beyond what is marked [F]. Data before visuals: this document says what the UI and its machine-readable read API must present, where each item comes from, how long it is kept and what it costs. It says nothing about layout. Labels as in `architecture-v2.md`: **[F]** fact checked in the code at this branch's merge-base with `feature/arch-v2`, `364da4ae` (this branch's commits above it touch only this document, `invocations-api.md` (4.7 and the passages that named PRs 7 and 8 or stage 2), supersession notes in `invocations.md` and the frontend and state-store text of `architecture-v2.md`, so code cites are the same at this branch's head), **[D]** owner decision, **[I]** inference, **[V]** verify before building on it. Sizes are arithmetic from stated rates, not measurements.

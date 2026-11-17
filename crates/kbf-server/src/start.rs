@@ -98,10 +98,6 @@ pub struct ServerHandle {
     _pass: Option<AbortOnDrop>,
     /// The pack index `--pack-index` opened, if the flag was given.
     pack_index: Option<Arc<dyn PackIndex>>,
-    /// The farm the serving future ticks, not owned here (it goes when serving ends): tests
-    /// register nodes with it in-process, as the executor's virtual workers register.
-    #[doc(hidden)]
-    pub farm: std::sync::Weak<crate::farm::Farm>,
 }
 
 impl ServerHandle {
@@ -184,7 +180,6 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    args.check_scheduler_core()?;
     let stores = args.stores(&Statvfs)?;
     args.check_cold_key_file()?;
     for line in stores.describe() {
@@ -271,7 +266,6 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    args.check_scheduler_core()?;
     assemble(args, hot, meta, store, prefix, log, shutdown, None).await
 }
 
@@ -295,6 +289,7 @@ where
 {
     args.retired_release.warn();
     args.retired_worker.warn();
+    args.retired_scheduler.warn();
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
     let pack_index = args.open_pack_index()?;
@@ -337,7 +332,6 @@ where
         worker: bound.worker,
         api: bound.api,
         drain: bound.drain,
-        farm: bound.farm.clone(),
         escalation: None,
         start_line: start_line(
             bound.reapi,
@@ -500,13 +494,11 @@ mod tests {
                 Arc::new(ManualClock::default()),
                 Flaw::None,
             )),
-            epoch: crate::farm::EpochPolicy::Keep,
             members: crate::members::MembershipConfig::default(),
             history: None,
         };
         let got = with_members(Some(state), members).expect("still a store");
         assert_eq!(got.members, members);
-        assert_eq!(got.epoch, crate::farm::EpochPolicy::Keep);
         assert!(with_members(None, members).is_none());
     }
 

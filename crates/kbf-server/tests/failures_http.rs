@@ -4,9 +4,8 @@
 
 mod pages;
 
-use kbf_invocation::{Event, InvocationId, LeaseEnd, Outcome, Owner};
+use kbf_invocation::{Event, InvocationId, LeaseEnd, Outcome, Owner, RequeueReason};
 use kbf_proto::reapi::{Action, Command, Digest as WireDigest, Platform, command, platform};
-use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure, LostWhy};
 use pages::{
     OPEN, PAGES_ONLY, Server, at, digest, ended, finished, granted, hit, listing, queued, requeued,

@@ -1,7 +1,6 @@
 //! A fake build client: for each of its actions it asks `FindMissingBlobs` for the
-//! input, uploads it if missing and asks again, then `Execute`s the action, resending
-//! the step it is on every [`RETRY`] until it is answered (as a client retries a
-//! dropped stream).
+//! input, uploads it if missing and asks again, until the input is present, resending
+//! the step it is on every [`RETRY`] (as a client retries a dropped stream).
 
 use std::time::Duration;
 
@@ -18,7 +17,6 @@ pub const RETRY: Duration = Duration::from_secs(8);
 pub enum Step {
     Upload,
     Check,
-    Execute,
     Done,
 }
 
@@ -29,7 +27,7 @@ pub struct Job {
     /// When the client starts on it.
     pub at: FarmTime,
     pub step: Step,
-    /// When it was answered.
+    /// When its input was answered present.
     pub answered: Option<FarmTime>,
 }
 
@@ -40,9 +38,6 @@ impl Job {
             Step::Upload => Some(Msg::Upload { digest: input }),
             Step::Check => Some(Msg::FindMissing {
                 digests: vec![input],
-            }),
-            Step::Execute => Some(Msg::Execute {
-                action: self.action,
             }),
             Step::Done => None,
         }
@@ -141,24 +136,19 @@ impl StateMachine for FakeClient {
                         |_| Step::Check,
                     );
                 }
-                Msg::Missing { asked, missing } => self.advance(
-                    Step::Check,
-                    |j| asked.contains(&input_of(&j.action)),
-                    |j| {
-                        if missing.contains(&input_of(&j.action)) {
-                            Step::Upload
-                        } else {
-                            Step::Execute
-                        }
-                    },
-                ),
-                Msg::Answered { action, .. } => {
-                    for job in self.jobs.iter_mut().filter(|j| j.action == action) {
-                        if job.step != Step::Done {
+                Msg::Missing { asked, missing } => {
+                    for job in self.jobs.iter_mut().filter(|j| j.step == Step::Check) {
+                        let input = input_of(&job.action);
+                        if asked.contains(&input) && !missing.contains(&input) {
                             job.step = Step::Done;
                             job.answered = Some(now);
                         }
                     }
+                    self.advance(
+                        Step::Check,
+                        |j| asked.contains(&input_of(&j.action)),
+                        |_| Step::Upload,
+                    );
                 }
                 _ => {}
             },
