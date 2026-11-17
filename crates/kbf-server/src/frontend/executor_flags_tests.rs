@@ -775,6 +775,88 @@ fn the_poll_interval_outside_its_range_is_refused() {
     );
 }
 
+/// The flags that make a frontend's task output a put directory, which shared ownership needs.
+const PUT_DIR: [&str; 2] = ["--task-out-mode=put-dir", "--task-out-root=/mnt/ts/put"];
+
+/// [`js_with`] and the put-directory flags, with `more`.
+fn shared_with(more: &[&str]) -> Result<FrontendFlags, String> {
+    let mut all = PUT_DIR.to_vec();
+    all.push("--executor-ownership=shared");
+    all.extend(more);
+    js_with(&all)
+}
+
+/// Catches defaults that turn shared ownership on or change the liveness time: given no
+/// ownership flag a frontend is single and its liveness time is 45 s, and the same flags with
+/// a put directory change nothing of that.
+#[test]
+fn ownership_defaults_to_single_and_live_secs_to_45() {
+    for flags in [js_with(&[]), js_with(&PUT_DIR)] {
+        let config = flags.expect("flags").executor.js.expect("js-agent").config;
+        assert_eq!(config.ownership, Ownership::Single);
+        assert!(!config.shared());
+        assert_eq!(config.live, Duration::from_secs(45));
+    }
+}
+
+/// Catches `--executor-ownership shared` and `--executor-live-secs` that do not reach the
+/// executor's config, or a live time that is not read in seconds: shared with a put
+/// directory parses to `Ownership::Shared`, a given live time is the config's, and `single`
+/// named outright is the default.
+#[test]
+fn ownership_shared_and_live_secs_become_the_config() {
+    let config = |more: &[&str]| {
+        let flags = shared_with(more).expect("flags");
+        flags.executor.js.expect("js-agent").config
+    };
+    let default = config(&[]);
+    assert_eq!(default.ownership, Ownership::Shared);
+    assert!(default.shared());
+    assert_eq!(default.live, Duration::from_secs(45));
+    assert_eq!(
+        config(&["--executor-live-secs=90"]).live,
+        Duration::from_secs(90)
+    );
+    let single = js_with(&["--executor-ownership=single", "--executor-live-secs=7"])
+        .expect("flags")
+        .executor
+        .js
+        .expect("js-agent")
+        .config;
+    assert_eq!(single.ownership, Ownership::Single);
+    assert_eq!(single.live, Duration::from_secs(7));
+}
+
+/// Catches a mode that clap lets through: a value other than `single` or `shared` is refused
+/// at parse, the message names the flag and the values it takes, and a live time that is not a
+/// number is refused.
+#[test]
+fn an_unknown_ownership_mode_or_a_live_time_that_is_no_number_is_refused() {
+    for mode in ["--executor-ownership=both", "--executor-ownership="] {
+        let why = refused(&[mode]);
+        assert!(why.contains("--executor-ownership"), "{mode}: {why}");
+        assert!(why.contains("single") && why.contains("shared"), "{why}");
+    }
+    let why = refused(&["--executor-live-secs=soon"]);
+    assert!(why.contains("--executor-live-secs"), "{why}");
+}
+
+/// Catches a liveness time under the fence time parsed with shared ownership, and the same
+/// time refused where it is not used: 44 s is refused naming the flag (the fence time is 40 s
+/// and the margin 5 s), 45 s parses, and under single ownership any time parses.
+#[test]
+fn a_live_time_under_the_fence_time_is_refused_with_shared_ownership_only() {
+    let why = shared_with(&["--executor-live-secs=44"]).expect_err("refused");
+    assert!(
+        why.contains(
+            "--executor-live-secs must be at least the fence time plus 5 s with \
+             --executor-ownership shared"
+        ),
+        "{why}"
+    );
+    assert!(shared_with(&["--executor-live-secs=45"]).is_ok());
+    assert!(js_with(&["--executor-live-secs=1"]).is_ok());
+}
 /// Asserts the Macs' flags: none by default; `--executor-mac-hosts` with
 /// `--executor-mac-task-bundle` becomes the pool, the least macOS 26 unless `--executor-mac-os-version` says otherwise and
 /// the roots `--task-out-root`'s unless `--executor-mac-task-out-root` names others; and each

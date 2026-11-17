@@ -1,6 +1,8 @@
 # N frontends: a leaderless executor
 
-Status: **DESIGN, for the owner's review. Nothing here is built.** A living document: it is changed in the pull request that
+Status: **DESIGN, partly built.** Built: the row API and its model search (PR 3) and shared ownership part 1 (PR 4:
+`--executor-ownership shared`, `--executor-live-secs`, the rows written and deleted, no rival check and no cancel at start, at a
+fence or at the end). Not built: adoption (PR 5) and what follows it. A living document: it is changed in the pull request that
 changes the thing it describes.
 
 Read against kbf `main` at `8408618` (the executor is `crates/kbf-server/src/executor/`), komira-internal `main` at `1d2fdbd`
@@ -100,7 +102,8 @@ These need no change; the new design stands on them. Test names are the ones to 
 `--executor-frontend-id` today names one frontend. It becomes the name of the **group**: every frontend of one farm uses one value
 (the default `kbf`), it is the `kbf-frontend` label of every job and the input of the job id hash, and it is no longer unique.
 What is unique is the **process**: the `instance` id the executor already draws at start (`config.rs` `instance_id`), kept as the
-`kbf-instance` label. Virtual workers are named by the process: `js:<group>.<instance, first 8 hex>-<n>`. Two live frontends
+`kbf-instance` label. Virtual workers are named by the process: `js:<group>.<instance, first 8 hex>-<n>` (as built, the Macs' workers of
+`--executor-mac-hosts` likewise: `js-mac:<group>.<instance, first 8 hex>-<n>`, each with its row, arch `arm64`). Two live frontends
 therefore never register one worker id, and no code asks whether another frontend exists: `rival`, `Twin` and the cancel-on-start of
 `adopt_jobs` are removed in `shared` mode (section 7, key `executor-ownership`). The per-slot `kbf.toml` of komira-internal is no longer
 needed; neither is a per-slot `pack-writer` (pack keys carry the process's start id: `cas/f/<writer>/<start>/<sequence>`,
@@ -149,6 +152,10 @@ sequenceDiagram
 The row insert depends on the key `K` (known after the mint) and the deterministic job id, not on the presigned URL or the grant, so
 it is issued **in parallel with** the presign and the grant calls; the submit waits for both (latency, section 7). If the check of
 `exec/w/W` fails, this process no longer holds the worker: it drops the task and submits nothing.
+
+As built (PR 4), the insert is not yet in parallel: it is one transaction after the preparation and just before the submit
+(`executor/share.rs` `write_row`), so a start pays it in full. A row the store cannot take holds the submit to a later pass inside
+the `Start`'s window. PR 6's measurement decides whether the parallel insert is worth its code.
 
 #### 4.3.2 The end of a job
 
@@ -443,13 +450,13 @@ connection life, and the drain's GOAWAY (step 3) tells a client to reconnect for
 | Flag / `kbf.toml` key | Default | Meaning |
 |---|---|---|
 | `--executor-ownership` | `single` | `single` is today's behaviour, byte for byte (rival check, cancel-on-start, cancel on end). `shared` is this design. The default changes to `shared` one release after the cutover, and `single` is deleted one release after that. |
-| `--executor-live-secs` | 45 | TTL of `exec/fe/<instance>`. Must be at least `fence_after + 5 s`, and `live + adopt_poll + 10 s + 5 s` must stay under `LEASE_GRACE + ORPHAN_WAIT` (85 s). Refused at start otherwise. |
+| `--executor-live-secs` | 45 | TTL of `exec/fe/<instance>`. Must be at least `fence_after + 5 s` with `shared`, refused at start otherwise (PR 4). PR 5 adds the upper bound with `adopt_poll`: `live + adopt_poll + 10 s + 5 s` must stay under `LEASE_GRACE + ORPHAN_WAIT` (85 s). |
 | `--executor-adopt-poll-secs` | 5 | How often the claim scan runs. |
 | `--executor-sweep-secs` | 300 | Rowless-job sweep interval (4.3.7). |
 | `--history-credentials-file` | none | PR 2. |
 
-The renewal rides the executor's existing heartbeat (`--executor-heartbeat`, 1 s): one more transaction per beat, written by the
-step that already beats, so a stalled step stops beating (and its row expires) exactly when its farm heartbeat would stop.
+The renewal rides the executor's step, at most once per the workers' heartbeat interval (`Config::heartbeat`, 1 s; not a
+flag): one more transaction per beat, written by the step that already beats, so a stalled step stops beating (and its row expires) exactly when its farm heartbeat would stop.
 
 ### 7.2 Budget per operation
 

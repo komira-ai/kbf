@@ -13,10 +13,14 @@ use kbf_job_client::fake::{Call, FakeJobServer, Machine};
 use kbf_proto::reapi::{ActionResult, Digest};
 use kbf_sched::Request;
 use kbf_server::Farm;
+use kbf_server::executor::rows::ExecRows;
 use kbf_server::executor::{
     ActionFacts, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, Metrics, MintError,
-    PackKey, Presign, PresignError, ReadGrant, Secret, UntrustedLimits, build_id,
+    Ownership, PackKey, Presign, PresignError, PutDirRoots, ReadGrant, Secret, TaskOut,
+    UntrustedLimits, build_id,
 };
+use kbf_state::fake::{Fake, Flaw};
+use kbf_state::{ManualClock, Store};
 use kbf_types::{ActionKey, LeaseKind, Qos, Resources};
 use tokio::sync::watch;
 
@@ -270,6 +274,37 @@ impl Drop for ClockHold {
     }
 }
 
+/// The state store the executors of one group share (`--executor-ownership shared`): the
+/// in-memory store and the clock its rows expire on, which a test moves by hand.
+pub struct Shared {
+    pub clock: Arc<ManualClock>,
+    pub store: Arc<Fake>,
+}
+
+impl Shared {
+    pub fn new() -> Self {
+        let clock = Arc::new(ManualClock::default());
+        let store = Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None));
+        Self { clock, store }
+    }
+
+    /// The `exec/` rows as the store holds them.
+    pub fn rows(&self) -> ExecRows {
+        ExecRows::new(Arc::clone(&self.store) as Arc<dyn Store>)
+    }
+
+    /// Every key under `exec/`.
+    pub fn keys(&self) -> Vec<String> {
+        let rows = self.store.scan_prefix("exec/").expect("a scan");
+        rows.into_iter().map(|(key, _)| key).collect()
+    }
+
+    /// Time passes on the store's clock.
+    pub fn advance(&self, by: Duration) {
+        self.clock.advance(by);
+    }
+}
+
 /// A farm, a job service with `hosts`, and an executor that submits to it.
 pub struct Rig {
     pub fake: FakeJobServer,
@@ -434,6 +469,7 @@ impl Rig {
             presign: presign.clone(),
             inputs: inputs.clone(),
             metrics: Arc::clone(metrics),
+            store: None,
         };
         Executor::new(cfg.clone(), deps).expect("a valid config")
     }
@@ -442,6 +478,32 @@ impl Rig {
     /// same frontend id, and a process of its own.
     pub fn restarted_executor(&self) -> Executor {
         self.other_executor(&self.cfg.frontend)
+    }
+
+    /// A new executor of this rig's frontend id, in shared ownership over the store of `shared`,
+    /// with a process of its own: any number of them serve beside each other.
+    pub fn shared_executor(&self, shared: &Shared) -> Executor {
+        let mut cfg = self.shared_config();
+        cfg.instance = fresh_instance();
+        let deps = Deps {
+            farm: Arc::clone(&self.farm),
+            client: self.fake.client().expect("a client"),
+            ingest: self.ingest.clone(),
+            presign: self.presign.clone(),
+            inputs: self.inputs.clone(),
+            metrics: Arc::clone(&self.metrics),
+            store: Some(Arc::clone(&shared.store) as Arc<dyn Store>),
+        };
+        Executor::new(cfg, deps).expect("a valid shared config")
+    }
+
+    /// The config of this rig as a shared executor has it: its tasks write into a put
+    /// directory, as a presigned write is refused with shared ownership.
+    pub fn shared_config(&self) -> Config {
+        let mut cfg = self.cfg.clone();
+        cfg.ownership = Ownership::Shared;
+        cfg.task_out = TaskOut::PutDir(PutDirRoots::new("/mnt/ts/put").expect("roots"));
+        cfg
     }
 
     /// A new executor over the same farm and job service, of the frontend `frontend` and a

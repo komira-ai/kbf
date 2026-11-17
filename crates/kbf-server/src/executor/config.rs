@@ -73,13 +73,31 @@ impl Network {
     }
 }
 
+/// Who owns the jobs of the executor's workers when several frontends share one state store
+/// (`--executor-ownership`, `docs/design/n-frontends.md`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ownership {
+    /// One frontend per frontend id: it looks for another frontend's jobs and stops if it
+    /// finds one, cancels at start the jobs an earlier process of its id left, and cancels its
+    /// jobs when it ends or fences. The default.
+    #[default]
+    Single,
+    /// Any number of frontends under one frontend id (the group), over one state store. Each
+    /// process names its workers by its own instance, writes the `exec/` rows of its workers
+    /// and jobs, renews its liveness row, and never cancels a job but on the farm's `Cancel` or
+    /// a withdrawal (the farm ending a worker's stream withdraws all its leases): not at start,
+    /// not when it fences, not when it ends.
+    Shared,
+}
+
 /// The executor's settings. Every duration is an upper or lower bound the executor holds
 /// itself to; [`Config::validate`] refuses a set that breaks the ones the scheduler's
 /// safety rests on.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// This frontend's id: the value of the `kbf-frontend` label on its jobs, hashed into
-    /// their ids, and the name of its virtual workers (`js:<frontend>-<n>`).
+    /// their ids, and the name of its virtual workers ([`Config::worker_name`]). With
+    /// [`Ownership::Shared`] it names the group, and every frontend of the group gives the same.
     pub frontend: String,
     /// Which process of this frontend id this is: the value of the `kbf-instance` label on its
     /// jobs, made up at start. A job of another process under the same frontend id is cancelled
@@ -132,8 +150,9 @@ pub struct Config {
     /// at their window, unprepared, only if their turn did not come.
     pub prepare_concurrency: usize,
     /// T: how long a worker goes on with its jobs after the farm last acknowledged a
-    /// heartbeat, or the job service last answered a call about a job it holds, before it
-    /// cancels them and goes silent.
+    /// heartbeat, or the job service last answered a call about a job it holds (or, with
+    /// [`Ownership::Shared`], the state store last took a renewal of the liveness row), before
+    /// it cancels them (with [`Ownership::Shared`], drops them) and goes silent.
     pub fence_after: Duration,
     /// How the secrets reach the task.
     pub delivery: Delivery,
@@ -176,6 +195,13 @@ pub struct Config {
     /// Where a task's outputs go (`--task-out-mode`, `--task-out-root`). A job of a put
     /// directory has no network, whatever [`Config::network`] says.
     pub task_out: TaskOut,
+    /// Who owns the jobs ([`Ownership`]; `--executor-ownership`).
+    pub ownership: Ownership,
+    /// How long the liveness row of this process lives after a renewal, on the store's clock
+    /// (`--executor-live-secs`): with [`Ownership::Shared`], at least
+    /// [`Config::fence_after`] and [`LEADER_LEASE_MARGIN`], so the process has stopped acting
+    /// before its row can expire.
+    pub live: Duration,
     /// The Macs (`--executor-mac-*`): `None`, the default, registers no Mac worker, and the farm
     /// places no Mac action on this executor ([`crate::executor::mac`]).
     pub mac: Option<MacPool>,
@@ -239,6 +265,23 @@ pub enum ConfigError {
     /// later change of one flag.
     #[error("--executor-allow-open-network is only for --executor-network open: drop it")]
     OpenNetworkUnused,
+    /// A liveness row that may expire while its process still acts.
+    #[error(
+        "--executor-live-secs must be at least the fence time plus {} s with \
+         --executor-ownership shared",
+        LEADER_LEASE_MARGIN.as_secs()
+    )]
+    Live,
+    /// Shared ownership with presigned task outputs: a job's write URL is fixed at its submit
+    /// and is in no row, so no other frontend could ever finish it.
+    #[error(
+        "--executor-ownership shared needs --task-out-mode put-dir: a presigned job's URL is \
+         in no row, so no other frontend could finish it"
+    )]
+    SharedPresigned,
+    /// Shared ownership with no state store to keep the rows in.
+    #[error("--executor-ownership shared needs --state-store: the rows of the jobs are kept there")]
+    SharedStore,
     /// The pool of Macs is not one.
     #[error("{0}")]
     Mac(#[from] MacPoolError),
@@ -283,6 +326,8 @@ impl Config {
             network: Network::AllowList,
             allow_open_network: false,
             task_out: TaskOut::Presigned,
+            ownership: Ownership::Single,
+            live: SELF_FENCE + LEADER_LEASE_MARGIN,
             mac: None,
         }
     }
@@ -379,6 +424,14 @@ impl Config {
                 self.network == Network::Open || !self.allow_open_network,
                 ConfigError::OpenNetworkUnused,
             ),
+            (
+                !self.shared() || self.live >= self.fence_after + LEADER_LEASE_MARGIN,
+                ConfigError::Live,
+            ),
+            (
+                !self.shared() || self.task_out != TaskOut::Presigned,
+                ConfigError::SharedPresigned,
+            ),
         ];
         let first = checks
             .into_iter()
@@ -387,6 +440,36 @@ impl Config {
             (Some(error), _) => Err(error),
             (None, Some(mac)) => Ok(mac.validate()?),
             (None, None) => Ok(()),
+        }
+    }
+
+    /// Whether the jobs are owned by the group ([`Ownership::Shared`]).
+    #[must_use]
+    pub fn shared(&self) -> bool {
+        self.ownership == Ownership::Shared
+    }
+
+    /// The id of the `n`th Linux virtual worker: `js:<frontend>-<n>` for one frontend per id,
+    /// and `js:<frontend>.<the first 8 characters of the instance>-<n>` when the group shares
+    /// the id, so two live processes never register one worker.
+    #[must_use]
+    pub fn worker_name(&self, n: usize) -> String {
+        self.worker_of(WorkerOs::Linux, n)
+    }
+
+    /// The id of the `n`th virtual worker for `os`: [`Config::worker_name`] for Linux, and the
+    /// same under the prefix `js-mac:` for the Macs, so no frontend id makes one the other's.
+    pub(super) fn worker_of(&self, os: WorkerOs, n: usize) -> String {
+        let kind = match os {
+            WorkerOs::Linux => "js",
+            WorkerOs::Mac => "js-mac",
+        };
+        match self.ownership {
+            Ownership::Single => format!("{kind}:{}-{n}", self.frontend),
+            Ownership::Shared => {
+                let short: String = self.instance.chars().take(8).collect();
+                format!("{kind}:{}.{short}-{n}", self.frontend)
+            }
         }
     }
 

@@ -6,7 +6,8 @@
 //! The scheduler core knows nothing of this. The executor registers virtual workers, `js:<frontend>-<n>`,
 //! each a node of the declared shape whose drivers are `container` and `native-whole-machine`
 //! (and, with `--executor-mac-hosts`, Mac workers `js-mac:<frontend>-<n>` whose one driver is
-//! `native`, [`mac`]),
+//! `native`, [`mac`]; with [`Ownership::Shared`] both carry the process's instance,
+//! `js:<frontend>.<instance>-<n>` and `js-mac:<frontend>.<instance>-<n>`),
 //! and takes the messages the farm sends a daemon on the channel it owns the receiving end of.
 //! A `Start` is submitted to the job service as a job of the kbf image, whose entrypoint is the
 //! task tool (a `whole_machine` lease's as a job that needs the whole host), under an id
@@ -18,14 +19,20 @@
 //! [`Executor`] never opens a connection to a job service: [`ExecutorKind::KbfDaemon`] is the
 //! path every server runs by default.
 //!
-//! The executor runs on exactly one frontend: it labels its jobs with its frontend id and an id
-//! of the process that made them, and on start cancels every live job an earlier process left
+//! Who owns the jobs is [`Config::ownership`]. With [`Ownership::Single`], the default, the
+//! executor runs on exactly one frontend: it labels its jobs with its frontend id and an id of
+//! the process that made them, and on start cancels every live job an earlier process left
 //! under that frontend id, which nothing of the farm maps to any more. Those are taken only
 //! once no new job of that process is seen over [`Config::adopt_watch`]: a process that makes
 //! new jobs is alive under the same id (a copied config), and the executor stops instead of
 //! cancelling its jobs. [`Executor::rival`] finds another frontend's live jobs on the job
 //! service, and the task that steps the executor ([`Running`]) stops when it does. The id must
 //! be different for each frontend.
+//!
+//! With [`Ownership::Shared`] the frontend id names a group of frontends over one state
+//! store, and each process keeps the `exec/` rows of its workers and jobs there (`share.rs`,
+//! `docs/design/n-frontends.md`): no rival check, no cancel at start, at a fence or at the
+//! end. A process that ends with jobs open hands its workers back for another to take up.
 //!
 //! The frontend builds one only for `--executor js-agent` (`frontend/executor_flags.rs`), over
 //! [`Front`], which implements the three seams ([`Ingest`], [`Presign`], [`Inputs`]) with the
@@ -45,7 +52,9 @@ mod output;
 mod phases;
 mod pool;
 mod probe;
+pub mod rows;
 mod runs;
+mod share;
 mod submit;
 mod task;
 mod traits;
@@ -66,9 +75,10 @@ use tokio::time::Instant;
 use crate::Farm;
 use host::HostWorker;
 use pool::{Adopted, Adoption};
+use share::Share;
 use submit::{FRONTEND_LABEL, INSTANCE_LABEL};
 
-pub use config::{Config, ConfigError, Network};
+pub use config::{Config, ConfigError, Network, Ownership};
 pub use driver::Running;
 pub use front::{
     Front, FrontParts, PrepareError, PreparedPutDir, PreparedRun, PutDirParts, RunPrepare,
@@ -112,6 +122,9 @@ pub struct Deps {
     pub inputs: Arc<dyn Inputs>,
     /// What the executor counts.
     pub metrics: Arc<Metrics>,
+    /// The state store the `exec/` rows are kept in: what [`Ownership::Shared`] needs, and
+    /// nothing else reads.
+    pub store: Option<Arc<dyn kbf_state::Store>>,
 }
 
 /// Why the executor must stop, as a worker found it: another process holds this frontend's id.
@@ -140,6 +153,8 @@ pub(crate) struct Ctx<'a> {
     pub(crate) cfg: &'a Config,
     pub(crate) deps: &'a Deps,
     pub(crate) twin: &'a Twin,
+    /// The process's rows, with shared ownership.
+    pub(crate) share: Option<&'a Share>,
 }
 
 impl Ctx<'_> {
@@ -181,6 +196,8 @@ pub struct Executor {
     /// Why the executor stopped itself: another process runs under this frontend's id.
     twin: Option<String>,
     flagged: Twin,
+    /// The process's rows, with shared ownership.
+    share: Option<Share>,
 }
 
 impl Executor {
@@ -188,9 +205,15 @@ impl Executor {
     /// [`step`](Self::step).
     ///
     /// # Errors
-    /// `cfg` breaks a rule of [`Config::validate`].
+    /// `cfg` breaks a rule of [`Config::validate`], or asks for [`Ownership::Shared`] over
+    /// `deps` with no state store.
     pub fn new(cfg: Config, deps: Deps) -> Result<Self, ConfigError> {
         cfg.validate()?;
+        let share = match (cfg.shared(), &deps.store) {
+            (false, _) => None,
+            (true, Some(store)) => Some(Share::new(&cfg, Arc::clone(store), Instant::now())),
+            (true, None) => return Err(ConfigError::SharedStore),
+        };
         Ok(Self {
             cfg,
             deps,
@@ -198,6 +221,7 @@ impl Executor {
             adoption: Adoption::Unread,
             twin: None,
             flagged: Twin::default(),
+            share,
         })
     }
 
@@ -239,12 +263,14 @@ impl Executor {
     ///
     /// Jobs of another process under this frontend's own id are not judged here until the jobs
     /// of an earlier process have been taken up: that is [`Adoption`]'s question.
+    ///
+    /// With [`Ownership::Shared`] there is no rival: any number of frontends of the group serve
+    /// beside each other, and nothing is asked.
     pub async fn rival(&self) -> Option<String> {
-        let ctx = Ctx {
-            cfg: &self.cfg,
-            deps: &self.deps,
-            twin: &self.flagged,
-        };
+        if self.share.is_some() {
+            return None;
+        }
+        let ctx = self.ctx();
         let jobs = ctx.api().list_all_jobs(pool::live_jobs(&[])).await.ok()?;
         let me = (self.cfg.frontend.as_str(), self.cfg.instance.as_str());
         let mut mine = u64::MAX;
@@ -282,19 +308,44 @@ impl Executor {
         self.twin.as_deref()
     }
 
+    /// The view of one pass.
+    fn ctx(&self) -> Ctx<'_> {
+        Ctx {
+            cfg: &self.cfg,
+            deps: &self.deps,
+            twin: &self.flagged,
+            share: self.share.as_ref(),
+        }
+    }
+
     /// One pass over every worker: the farm's messages taken, jobs submitted, read and
     /// cancelled, results reported, heartbeats sent. A caller steps it every [`Config::poll`];
     /// a pass never waits on a job. Before the first pass that registers the workers, the jobs
-    /// an earlier process left are taken up.
+    /// an earlier process left are taken up; with [`Ownership::Shared`] the liveness row is
+    /// renewed instead, and the workers are registered once their rows are written.
     pub async fn step(&mut self) {
         if self.twin.is_some() {
             return;
         }
         let now = Instant::now();
+        if let Some(share) = &mut self.share {
+            let held: Vec<_> = self.workers.iter().filter_map(HostWorker::held).collect();
+            share.beat(&self.cfg, &held, self.deps.farm.intake_closed(), now);
+            let ctx = Ctx {
+                cfg: &self.cfg,
+                deps: &self.deps,
+                twin: &self.flagged,
+                share: Some(share),
+            };
+            share.open(&ctx, &mut self.workers, now);
+            join_all(self.workers.iter_mut().map(|worker| worker.step(&ctx, now))).await;
+            return;
+        }
         let ctx = Ctx {
             cfg: &self.cfg,
             deps: &self.deps,
             twin: &self.flagged,
+            share: None,
         };
         if !self.adoption.is_done() {
             match pool::adopt_jobs(&ctx, now, &mut self.adoption).await {
@@ -317,13 +368,20 @@ impl Executor {
 
     /// Cancels every job and tells the farm the workers take no more work. The executor holds
     /// nothing afterwards, and asks for nothing more unless it is stepped.
+    ///
+    /// With [`Ownership::Shared`] nothing is cancelled: each worker is handed back (its row
+    /// deleted when no job row is left under it, else written with no owner, for another
+    /// process of the group to take up) and the liveness row is deleted.
     pub async fn shutdown(&mut self) {
-        let ctx = Ctx {
-            cfg: &self.cfg,
-            deps: &self.deps,
-            twin: &self.flagged,
-        };
         let workers = std::mem::take(&mut self.workers);
+        let ctx = self.ctx();
+        if let Some(share) = ctx.share {
+            workers
+                .into_iter()
+                .for_each(|worker| worker.hand_back(&ctx));
+            share.leave();
+            return;
+        }
         join_all(workers.into_iter().map(|worker| worker.retire(&ctx))).await;
         self.adoption = Adoption::Unread;
         self.twin = None;

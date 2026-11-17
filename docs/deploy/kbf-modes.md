@@ -158,7 +158,8 @@ and a tag is refused. It needs both image flags, and the job service (`--executo
 `--executor-job-ca-file` for an `https` URL), `--executor-frontend-id` (the `kbf-frontend` label
 on the frontend's jobs, by which a restarted frontend finds and cancels those an earlier process
 left, and hashed into every job id; it must be different for each frontend, so a `kbf.toml` is
-not copied to a second frontend with it), the packs (`--pack-store-endpoint`, through which the
+not copied to a second frontend with it, except that the frontends of one
+`--executor-ownership shared` group give the same one), the packs (`--pack-store-endpoint`, through which the
 pack a task writes is read, hashed and turned into the action's result) and nothing else for the
 output: a put-dir job (the only mode, `--task-out-mode put-dir`) carries no url, no grant and no secret, and its pack is a file
 of its put directory, which the frontend ingests. The executor's presigned path (a write url, a read token, `--executor-secret-delivery`
@@ -210,7 +211,24 @@ network line for it: nothing is made, so nothing is unusual.
 of `/run/js-files` and `/scratch` no longer exist for a job. Its confinement code (`crates/kbf-task/src/sandbox.rs`) is
 reached only by `kbf-task --probe-confinement`, which prints `probe sandbox:`.
 
-The executor runs on exactly one frontend: it looks for another frontend's live jobs on the job
+`--executor-ownership` says who owns the jobs: `single`, the default, is what the next paragraph
+describes, and `shared` lets several frontends of one `--executor-frontend-id` run beside each
+other over one `--state-store`. With `shared` the frontend starts only if `--state-store` is
+given. Each process names its workers `js:<frontend id>.<the first 8 characters of its
+instance>-<n>` (its Macs `js-mac:<frontend id>.<the same 8 characters>-<n>`), keeps a liveness row in the state store that `--executor-live-secs` (default
+45) lets live after its last renewal, and writes the row of a worker before the farm hears of
+it and the row of a job before it submits the job. The liveness time must be at least the fence
+time (40 s) plus 5 s, and a smaller one is refused at start; `single` does not read it. A
+`shared` frontend does not look for another frontend's jobs, does not cancel an earlier
+process's jobs at start, and when it fences or stops it cancels no job: a worker's row is
+deleted if it has no job row and otherwise left with no owner, and the liveness row is deleted.
+It cancels a job only when the farm cancels the lease or a withdrawal reaches it, the farm
+ending a worker's stream included; the row of such a job is deleted once its cancel is
+answered. This release
+writes the rows and does not yet read another process's rows, so no frontend takes over the
+jobs of one that has gone.
+
+The executor runs on exactly one frontend with `single`: it looks for another frontend's live jobs on the job
 service before its first pass and every 40 s after, and a frontend that finds some older than its
 own (or finds some before it has any) stops with an error naming it. Each job also carries the
 process that made it: a frontend that starts and finds live jobs of another process under its own

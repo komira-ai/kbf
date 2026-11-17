@@ -922,6 +922,8 @@ async fn a_tree_that_only_the_pack_holds_is_read_through_the_same_packs() {
 #[path = "front_put_dir_tests.rs"]
 mod put_dir;
 
+#[path = "front_twice_tests.rs"]
+mod twice;
 fn props(pairs: &[(&str, &str)]) -> Platform {
     let property = |(name, value): &(&str, &str)| Property {
         name: (*name).to_owned(),

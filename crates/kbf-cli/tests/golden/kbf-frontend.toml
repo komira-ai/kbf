@@ -65,7 +65,7 @@ executor-call-timeout-secs = 5
 executor-default-timeout-secs = 3000
 # The most bytes of a failed job's standard error the frontend writes to its log, at WARN, with the job's secrets redacted: the end of the stream. 0 writes none. The whole output (up to 8 KiB with standard output) goes with the result either way. Used only with `--executor js-agent`
 executor-failed-stderr-log-bytes = 512
-# The name of this frontend on the job service: the value of the `kbf-frontend` label on its jobs, by which a restarted frontend finds and cancels the ones an earlier process left, hashed into every job id, and the name of its virtual workers (`js:<ID>-<n>`). 1 to 63 of letters, digits, `-`, `_` and `.`. It must be different for each frontend (not copied with the config). Used only with `--executor js-agent`
+# The name of this frontend on the job service: the value of the `kbf-frontend` label on its jobs, by which a restarted frontend finds and cancels the ones an earlier process left, hashed into every job id, and the name of its virtual workers (`js:<ID>-<n>`, and `js-mac:<ID>-<n>` for the Macs; with `--executor-ownership shared`, `<ID>.<the first 8 characters of the process's instance>` in place of `<ID>`). 1 to 63 of letters, digits, `-`, `_` and `.`. It must be different for each frontend (not copied with the config), except that the frontends of one `--executor-ownership shared` group give the same one. Used only with `--executor js-agent`
 # executor-frontend-id = "ID"
 # The CPU cores of a virtual worker: the most the farm books on it at once. At least 1. A ceiling, as for `--executor-hosts`. Used only with `--executor js-agent`
 executor-host-cpus = 32
@@ -85,6 +85,8 @@ executor-insecure-argv-secrets = false
 # executor-job-url = "URL"
 # The kbf image, pinned by digest like `--executor-base-image` and built from it, that every job is launched from. It keeps the task tool as its `ENTRYPOINT`, so the job's arguments are the tool's flags and the action runs inside this image. Must be another image than the base. Needed with `--executor js-agent`
 # executor-kbf-image = "IMAGE"
+# How long the liveness row of a frontend lives after its last renewal, on the state store's clock, with `--executor-ownership shared`: at least the fence time (40 s) and 5 s. Used only with `--executor js-agent`
+executor-live-secs = 45
 # Has the task tool ask the read listener where each input is kept (`GET /locate`). The answer names no store and no grant (tierstore v0.3.29 removed the store read grants), so the task still reads every input through the listener, as without the flag; every byte is checked against its digest. Off by default. Used only with `--executor js-agent`, and refused with `--executor kbf-daemon`
 executor-locate = false
 # How many virtual workers stand for the job service's Macs, each of the shape of `--executor-host-*`, reporting `os=macos` and `arch=arm64`: the farm places an action whose platform asks for macOS on them, and each becomes a job of a Mac's native runtime that runs `--executor-mac-task-bundle`. 0, the default, registers none, and the farm places no macOS action on this executor. Needs `--executor-mac-task-bundle`. Used only with `--executor js-agent`
@@ -99,6 +101,8 @@ executor-mac-os-version = 26
 executor-max-run-secs = 3000
 # The network every job is given on its host. `allow-list`, the default, is the endpoints the host's agent is set up to allow and nothing else: the task reaches the read listener and the pack store only once each agent allows them, and a host whose agent cannot check those limits refuses the job (`egress-unchecked`), which the farm runs again. `none` is no route out: every action fails, as the task can reach neither. `open` is any address but those the agent always denies, and needs `--executor-allow-open-network`. Used only with `--executor js-agent`
 executor-network = "allow-list"
+# Who owns the jobs. `single`, the default, runs the executor on exactly one frontend per `--executor-frontend-id`: it stops if another frontend has jobs, cancels at start the jobs an earlier process left, and cancels its jobs when it ends. `shared` lets any number of frontends of one `--executor-frontend-id` serve beside each other over one `--state-store`: each keeps the rows of its jobs there, and cancels a job only when the farm withdraws it (a lease or the worker's whole stream), never at start or at its end. `shared` needs `--state-store`. Used only with `--executor js-agent`
+executor-ownership = "single"
 # How often the executor polls the job service for its jobs, in milliseconds: 100 to 10000. Together with the fence time it must stay under the scheduler's re-dispatch grace, which is checked at start. Used only with `--executor js-agent`
 executor-poll-ms = 1000
 # How many runs of one virtual worker prepare their inputs at once. The farm gives a worker a full set of `Start`s at one instant, and preparing them all together slows each until none is ready inside its window; the ones past this wait their turn. Used only with `--executor js-agent`

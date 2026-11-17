@@ -1,7 +1,8 @@
 //! A virtual worker: the daemon the job service stands behind.
 //!
 //! The farm sees an ordinary worker, `js:<frontend>-<n>` (or, for the Macs,
-//! `js-mac:<frontend>-<n>`, [`crate::executor::mac`]), that registers, takes `Start`s,
+//! `js-mac:<frontend>-<n>`, [`crate::executor::mac`]; `js:<frontend>.<instance>-<n>` and
+//! `js-mac:<frontend>.<instance>-<n>` with shared ownership), that registers, takes `Start`s,
 //! lists what it runs in its heartbeats and reports results. Nothing of the farm knows
 //! otherwise but its registration: the worker owns the receiving end of the `Outbound` channel
 //! the farm sends a daemon's messages on, and calls the farm's own `register_virtual` and
@@ -39,6 +40,14 @@
 //! scheduler's margin stays under `G` ([`Config::validate`]), so a silent worker's jobs were
 //! cancelled before the farm starts their retry. A worker that holds no job makes no call, and
 //! the service's silence is not counted against it.
+//!
+//! With shared ownership (`share.rs`) the state store's silence counts too: `T` runs from the
+//! last renewal of the process's liveness row the store took, as well. And a fenced worker
+//! cancels nothing: it drops its tasks and falls silent, and the rows written before each
+//! submit keep its jobs findable for whichever process of the group takes them up. The farm's
+//! retry after `G` may then run beside the first copy until that copy's wall limit or until the
+//! farm's `Cancel` reaches it: wasted work, never a second result, as each job writes only its
+//! own key and the farm takes one result per lease.
 //!
 //! What that needs, and what it does not give:
 //!
@@ -79,6 +88,7 @@ use tokio::time::Instant;
 use crate::executor::api::answered;
 use crate::executor::mac::WorkerOs;
 use crate::executor::runs::Task;
+use crate::executor::share::Own;
 use crate::executor::{Ctx, WorkerInfo};
 use crate::farm::{Outbound, Reported, StreamId};
 use crate::worker::{HostFloor, PROTOCOL_VERSION, reported};
@@ -118,6 +128,10 @@ pub(super) struct HostWorker {
     silent_until: Option<Instant>,
     /// The farm lease whose job was read last: the next pass's reads begin after it.
     pub(super) read_after: Option<kbf_types::LeaseId>,
+    /// The worker's row, with shared ownership.
+    pub(super) own: Option<Own>,
+    /// The job ids whose rows are to be deleted: nothing is owed for them any more.
+    pub(super) unrow: Vec<String>,
 }
 
 impl Drop for HostWorker {
@@ -127,19 +141,21 @@ impl Drop for HostWorker {
 }
 
 impl HostWorker {
+    /// The daemon instance the worker `id` says `Hello` with at its `generation`th
+    /// registration.
+    pub(super) fn farm_instance(ctx: &Ctx<'_>, id: &str, generation: u32) -> String {
+        format!("kbf-executor/{id}/{}/{generation}", ctx.cfg.instance)
+    }
+
     /// Registers the `n`th Linux virtual worker of this frontend.
     pub(super) fn start(ctx: &Ctx<'_>, n: usize, now: Instant) -> Self {
         Self::start_of(ctx, WorkerOs::Linux, n, now)
     }
 
-    /// Registers the `n`th virtual worker of this frontend for `os`: `js:<frontend>-<n>` for
-    /// Linux, `js-mac:<frontend>-<n>` for the Macs (a prefix of its own, so no frontend id makes
-    /// one the other's).
+    /// Registers the `n`th virtual worker of this frontend for `os`, named by
+    /// [`Config::worker_of`](super::Config::worker_of).
     pub(super) fn start_of(ctx: &Ctx<'_>, os: WorkerOs, n: usize, now: Instant) -> Self {
-        let id = match os {
-            WorkerOs::Linux => WorkerId::new(format!("js:{}-{n}", ctx.cfg.frontend)),
-            WorkerOs::Mac => WorkerId::new(format!("js-mac:{}-{n}", ctx.cfg.frontend)),
-        };
+        let id = WorkerId::new(ctx.cfg.worker_of(os, n));
         let (stream, instance, reported, inbox) = register(ctx, os, &id, 0, "");
         Self {
             id,
@@ -158,6 +174,8 @@ impl HostWorker {
             tasks: BTreeMap::new(),
             silent_until: None,
             read_after: None,
+            own: None,
+            unrow: Vec::new(),
         }
     }
 
@@ -209,6 +227,7 @@ impl HostWorker {
         self.launch(ctx, now).await;
         self.poll(ctx, now).await;
         self.settle(ctx, now);
+        self.flush_rows(ctx);
         self.beat(ctx).await
     }
 
@@ -255,10 +274,15 @@ impl HostWorker {
     }
 
     /// The farm closed the stream, or replaced it: it gave up the leases it knew. Cancels the
-    /// jobs, and registers again as a new process that names the old one its predecessor.
+    /// jobs (the farm withdrew them all), drops the rows of those whose cancel the service
+    /// answered (a job whose cancel was not answered may still run, so its row stays), and
+    /// registers again as a new process that names the old one its predecessor.
     async fn reconnect(&mut self, ctx: &Ctx<'_>, now: Instant) {
         tracing::warn!(worker = %self.id, "the farm's stream ended: cancelling the jobs and registering again");
-        self.cancel_all(ctx).await;
+        let cancelled = self.cancel_all(ctx).await;
+        let rows = self.tasks.values().filter_map(|task| task.row.clone());
+        let rows = rows.filter(|row| cancelled.contains(row));
+        self.unrow.extend(rows.collect::<Vec<_>>());
         self.forget();
         self.register_again(ctx, now);
     }
@@ -282,14 +306,25 @@ impl HostWorker {
         self.last_ack = now;
         self.server_ok = now;
         self.draining = false;
+        let instance = self.instance.clone();
+        self.renamed(ctx, &instance);
     }
 
     /// The fence: every job is cancelled, as far as the service can be reached, the tasks are
     /// forgotten, and the worker says nothing to the farm for [`LEASE_GRACE`], by when the farm
-    /// has requeued every lease it held.
+    /// has requeued every lease it held. With shared ownership nothing is cancelled: another
+    /// process of the group may have taken the worker and its jobs up by then, and its rows
+    /// keep the jobs findable.
     async fn fence(&mut self, ctx: &Ctx<'_>, now: Instant) {
-        tracing::warn!(worker = %self.id, "the farm or the job service has been silent for the fence time: cancelling the jobs and falling silent");
-        self.cancel_all(ctx).await;
+        match ctx.share {
+            Some(_) => {
+                tracing::warn!(worker = %self.id, "the farm, the job service or the state store has been silent for the fence time: dropping the tasks without a cancel and falling silent");
+            }
+            None => {
+                tracing::warn!(worker = %self.id, "the farm or the job service has been silent for the fence time: cancelling the jobs and falling silent");
+                self.cancel_all(ctx).await;
+            }
+        }
         self.forget();
         self.silent_until = Some(now + LEASE_GRACE);
     }
@@ -326,7 +361,8 @@ impl HostWorker {
         if !self.holds_jobs() {
             self.server_ok = now;
         }
-        let older = self.last_ack.min(self.server_ok);
+        let renewed = ctx.share.map_or(now, |share| share.renewed());
+        let older = self.last_ack.min(self.server_ok).min(renewed);
         if now.saturating_duration_since(older) > ctx.cfg.fence_after {
             return ControlFlow::Break(Retire::Fenced);
         }
@@ -368,7 +404,7 @@ fn register(
     generation: u32,
     predecessor: &str,
 ) -> (StreamId, String, Reported, Inbox) {
-    let instance = format!("kbf-executor/{id}/{}/{generation}", ctx.cfg.instance);
+    let instance = HostWorker::farm_instance(ctx, &id.to_string(), generation);
     let hello = ctx.cfg.hello(os, &id.to_string(), &instance, predecessor);
     let mut reported =
         reported(&hello, HostFloor::DEFAULT).expect("a validated config makes a valid Hello");

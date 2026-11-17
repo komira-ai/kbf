@@ -129,6 +129,7 @@ async fn prepared(case: Case) -> Result<Arc<super::Prepared>, Settled> {
         cfg: &harness.cfg,
         deps: &deps,
         twin: &harness.twin,
+        share: None,
     };
     prepare(
         &ctx.preparer(),
