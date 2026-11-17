@@ -261,7 +261,7 @@ pub(crate) fn failure(digest: &str, target: &str, stderr: &Value) -> Value {
     let extra = json!({
         "failure": {"class": "infra", "reason": "<b>worker lost</b>"},
         "command": {"arguments": ["clang", ARGUMENT, "-o", "out/lib.o"],
-            "environment_names": ["PATH", "<ENV>"], "working_directory": "/work/<dir>",
+            "environment_names": ["PATH", "<ENV>"], "working_directory": "/kbf-work/<dir>",
             "platform": {"OSFamily": "linux", "<k>": "v&"}, "timeout_micros": 90_000_000,
             "output_paths": ["out/lib.o"], "truncated": false},
         "command_available": true,

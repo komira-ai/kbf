@@ -210,7 +210,7 @@ fn a_failed_action_shows_its_failure_command_and_log_tail() {
         "{html}"
     );
     for (name, value) in [
-        ("Working directory", "/work/&lt;dir&gt;"),
+        ("Working directory", "/kbf-work/&lt;dir&gt;"),
         ("Platform", "&lt;k&gt;=v&amp;, OSFamily=linux"),
         ("Timeout", "90.00 s"),
     ] {
