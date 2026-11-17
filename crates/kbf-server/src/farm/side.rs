@@ -32,18 +32,18 @@ use crate::stamp::Stamp;
 #[derive(Debug)]
 pub(in crate::farm) struct Link {
     pub stream: StreamId,
-    /// The daemon process that opened it.
+    /// The worker process that opened it.
     pub instance: DaemonInstance,
     pub outbound: Outbound,
     /// The seq of the newest heartbeat taken on the stream; 0 before the first. Each
-    /// `Start` names it, and the daemon acts on the `Start` only within
+    /// `Start` names it, and the worker acts on the `Start` only within
     /// `START_VALIDITY` of having sent that heartbeat (or, for 0, its `Hello`).
     pub newest_beat: u64,
     /// The `os` and `arch` its newest `Hello` reported (empty if it named none).
     pub os: String,
     pub arch: &'static str,
     /// The version `Welcome` named for its first `Hello`: the lesser of the `Hello`'s and
-    /// the server's newest (`None` if the `Hello` named none). Like the link, it is the newest stream's: a daemon that returns on
+    /// the server's newest (`None` if the `Hello` named none). Like the link, it is the newest stream's: a worker that returns on
     /// another version replaces it, and a `Hello` resent on the stream does not.
     pub protocol: Option<u32>,
 }
@@ -237,7 +237,7 @@ impl Adapter for Side {
             grant.lease,
             &grant.worker,
         );
-        // The key joins the daemon's `lease phases:` line (`lease=`) to the action, also
+        // The key joins the worker's `lease phases:` line (`lease=`) to the action, also
         // for a lease whose result is never taken (cancelled).
         let first = self.first_waiter(view.sched, grant.operation);
         let key = first.map(|(_, w)| tracing::field::display(w.usage.key));
@@ -259,7 +259,7 @@ impl Adapter for Side {
 
     /// Sends the `Start` of a committed lease and marks its callers executing. The
     /// `Start` names the newest heartbeat taken on the worker's stream and the window
-    /// after it in which the daemon may still act on the `Start` (issue #23).
+    /// after it in which the worker may still act on the `Start` (issue #23).
     fn start(&mut self, view: &View<'_>, start: &StartLease) {
         // Its callers are shown executing before the `Start` leaves: a stream that reads
         // the stage later never sees an operation that has a `Start` in flight as one

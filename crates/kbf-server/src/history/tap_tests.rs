@@ -471,8 +471,8 @@ fn a_memory_kill_keeps_its_booking_cap_and_limit() {
 }
 
 /// Catches: the booking written only for a memory kill (an accepted run's record without
-/// what its lease held), the CPU booking dropped or taken from the wrong place (the daemon's
-/// grant wins, the daemon's report fills in when none is known), and a booking mistaken for a
+/// what its lease held), the CPU booking dropped or taken from the wrong place (the worker's
+/// grant wins, the worker's report fills in when none is known), and a booking mistaken for a
 /// kill's limit.
 #[test]
 fn an_accepted_run_records_the_booking_its_lease_was_granted() {

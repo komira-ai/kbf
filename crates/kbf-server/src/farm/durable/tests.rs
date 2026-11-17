@@ -252,9 +252,9 @@ fn reserve_ids(durable: &Durable, op: u64, seq: u64) {
 }
 
 /// Catches: an epoch that is not kept across starts that keep it, not raised by one that
-/// bumps it (a daemon would keep the runs of leases from before a restored file), a new
+/// bumps it (a worker would keep the runs of leases from before a restored file), a new
 /// store that does not start from the seed it is given (two stores could both begin at
-/// 1 and a daemon would take one for the other), and an epoch that is not durable.
+/// 1 and a worker would take one for the other), and an epoch that is not durable.
 #[test]
 fn the_epoch_is_seeded_kept_and_bumped() {
     let store = Flaky::new();
@@ -312,8 +312,8 @@ fn a_submitted_operation_is_loaded_queued() {
 }
 
 /// Asserts that a grant puts its lease in the store (a restart remembers the claim a
-/// daemon was told), that its operation leaves the queue, and that the block of lease
-/// sequences is kept (a restart would grant the lease id again: a stale daemon's result
+/// worker was told), that its operation leaves the queue, and that the block of lease
+/// sequences is kept (a restart would grant the lease id again: a stale worker's result
 /// taken as the new lease's).
 #[test]
 fn a_grant_holds_the_lease_and_leaves_the_queue() {
@@ -338,7 +338,7 @@ fn a_grant_holds_the_lease_and_leaves_the_queue() {
     assert!(!keys(&store).iter().any(|k| k.starts_with("queue/")));
 }
 
-/// Catches: a second live lease for one operation (two daemons run it and either
+/// Catches: a second live lease for one operation (two workers run it and either
 /// result is accepted): a grant needs the operation queued, which the first grant ended.
 #[test]
 fn an_operation_never_holds_two_leases() {
@@ -687,8 +687,8 @@ fn a_refusal_removes_the_loss_count() {
     assert!(!keys(&store).iter().any(|k| k.starts_with("loss/")));
 }
 
-/// Catches: a session row that never expires (a daemon that left would look live for
-/// ever), a renewal that does not extend it, one that writes a row for a daemon with
+/// Catches: a session row that never expires (a worker that left would look live for
+/// ever), a renewal that does not extend it, one that writes a row for a worker with
 /// none, and a probe write that does not reach the store.
 #[test]
 fn a_session_row_expires_unless_renewed() {

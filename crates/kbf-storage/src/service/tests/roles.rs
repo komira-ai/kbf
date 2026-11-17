@@ -507,10 +507,10 @@ async fn every_method_refuses_an_unexpected_role_over_mutual_tls() {
 }
 
 /// Catches the role read from a certificate of the presented chain other than the leaf
-/// (the last, or any of them): a peer holding a frontend key could append a daemon's
-/// public certificate after its own and write segments as a daemon. Over real mutual
-/// TLS, chains of two certificates from the same CA: frontend first, daemon second, is
-/// refused PERMISSION_DENIED on `Segments` (daemon only); daemon first, frontend
+/// (the last, or any of them): a peer holding a frontend key could append a worker's
+/// public certificate after its own and write segments as a worker. Over real mutual
+/// TLS, chains of two certificates from the same CA: frontend first, worker second, is
+/// refused PERMISSION_DENIED on `Segments` (worker only); worker first, frontend
 /// second, is refused on `ActionStore.Get` (frontend only) and gets past the check on
 /// `Segments`.
 ///
@@ -546,9 +546,9 @@ async fn the_role_is_read_from_the_leaf_certificate_alone() {
 
 /// Catches `Daemon` among the roles of `ActionStore.Prepare` and `ActionStore.Commit`.
 /// `Writer` is a field of the request body, so the certificate's role is what decides who
-/// may write the action cache. Over real mutual TLS, a daemon's `Prepare` and a complete
+/// may write the action cache. Over real mutual TLS, a worker's `Prepare` and a complete
 /// `Commit` are refused PERMISSION_DENIED and the store holds no entry afterwards; a
-/// frontend's `Prepare` and the same `Commit` are accepted and leave the entry; a daemon
+/// frontend's `Prepare` and the same `Commit` are accepted and leave the entry; a worker
 /// still reads blobs.
 #[tokio::test]
 async fn a_daemon_certificate_is_not_admitted_to_action_commit() {

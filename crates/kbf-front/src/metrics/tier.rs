@@ -25,7 +25,7 @@ pub struct TierCounters {
     /// Objects with a record that failed its digest on the tier: marked corrupt.
     pub corrupt: Counter,
     /// Records the flusher found not to hash to their digests, and dropped instead of
-    /// uploading (alert): the daemon's digests are trusted when an upload is
+    /// uploading (alert): the worker's digests are trusted when an upload is
     /// acknowledged, and checked here.
     pub digest_mismatch: Counter,
     /// Blobs read from the tier's disk (a block or a flushed copy).

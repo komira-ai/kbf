@@ -71,7 +71,7 @@ fn proto(digest: &Digest) -> reapi::Digest {
 
 /// Asserts that a frontend with the executor, the pack index and the packs and no `--storage`
 /// parses with no storage node, and that every one of the three it needs, named by its flag, is
-/// refused when it is left out, as is the default executor, which needs a node for its daemons.
+/// refused when it is left out, as is the default executor, which needs a node for its workers.
 #[tokio::test]
 async fn a_frontend_with_no_storage_needs_the_executor_the_pack_index_and_the_packs() {
     let s3 = FakeS3::start().await;

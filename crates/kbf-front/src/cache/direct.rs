@@ -2,7 +2,7 @@
 //! ByteStream `Write` of a blob over
 //! [`MAX_UNSTAGED_BLOB_BYTES`](crate::MAX_UNSTAGED_BLOB_BYTES) is stored when there is
 //! no write tier, or it has no room for the blob, whatever its size, holding a piece of
-//! it at a time; and how a daemon in the server's own process stores an output over it
+//! it at a time; and how a caller in the server's own process stores an output over it
 //! when the write tier is missing or has no room ([`Cache::store_streamed_claimed`]),
 //! its digest named once the bytes ended.
 
@@ -47,7 +47,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// [`Cache::store_streamed`] for a blob of `size` bytes whose digest is known only
-    /// once its bytes are read: an output file a daemon in the server's own process
+    /// once its bytes are read: an output file a caller in the server's own process
     /// hashes as it reads it. `claim` names the digest once the bytes ended, or `None`
     /// to withdraw the blob (the file changed, or the blob is held already): then the
     /// upload is aborted, nothing is stored, and this answers `None`. Otherwise the

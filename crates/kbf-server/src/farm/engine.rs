@@ -184,7 +184,7 @@ pub(in crate::farm) struct Engine {
     /// ([`ACK_WINDOW`](super::ACK_WINDOW)).
     pub(in crate::farm) session_ok: BTreeMap<WorkerId, FarmTime>,
     /// The nodes whose `Hello` found the state store unreachable, so this frontend has not
-    /// claimed them, with the daemon process that said it ([`Engine::claim_pending`]).
+    /// claimed them, with the worker process that said it ([`Engine::claim_pending`]).
     pub(in crate::farm) unclaimed: BTreeMap<WorkerId, DaemonInstance>,
     /// A handover took the work from this farm ([`Farm::fence`](super::Farm::fence)): it
     /// feeds the scheduler nothing and queues nothing.
@@ -199,7 +199,7 @@ pub(in crate::farm) struct Engine {
     pub(in crate::farm) unplaced: BTreeSet<LeaseId>,
     /// The operations whose lease was withdrawn at a drain with its job never placed on a
     /// host: nothing of them ran, so a drain ends their streams as it ends those of any
-    /// operation that never started and that nothing here can run, unless a daemon session of
+    /// operation that never started and that nothing here can run, unless a worker session of
     /// another frontend could run it, which keeps them ([`Engine::stage_for`]).
     /// The operation stays queued in the state store for the next frontend.
     pub(in crate::farm) withdrawn: BTreeSet<OperationId>,
@@ -304,7 +304,7 @@ impl Engine {
         while let Some(effect) = effects.pop_front() {
             match effect {
                 Effect::Commit(record) => {
-                    // A refusal for want of a daemon waits on if another frontend's could
+                    // A refusal for want of a worker waits on if another frontend's could
                     // run the operation: it is not committed, and is proposed again after
                     // another unservable wait.
                     if self.held_for_other_frontends(&record) {
@@ -394,7 +394,7 @@ impl Engine {
 
     /// Marks the operation of a committed lease started, then has the adapter send its
     /// `Start`. The `Start` names the newest heartbeat taken on the worker's stream and
-    /// the window after it in which the daemon may still act on the `Start`.
+    /// the window after it in which the worker may still act on the `Start`.
     fn start(&mut self, a: &mut dyn Adapter, start: &StartLease) {
         // Marked before the `Start` leaves: a stream that reads the stage later never
         // sees an operation that has a `Start` in flight as one that cannot start.
@@ -429,7 +429,7 @@ impl Engine {
         a.show(&self.view(), operation, &stage);
     }
 
-    /// Whether a daemon session of another frontend, as the last intake poll listed them,
+    /// Whether a worker session of another frontend, as the last intake poll listed them,
     /// could run `operation`. Its work is taken by that frontend's intake, which takes the
     /// queued operations it did not enqueue.
     fn runnable_elsewhere(&self, operation: OperationId) -> bool {
@@ -447,13 +447,13 @@ impl Engine {
     /// to a caller:
     ///
     /// - `WaitingKept`: a drain keeps its streams. The operation has started before, or a
-    ///   daemon session of another frontend could run it.
+    ///   worker session of another frontend could run it.
     /// - `Queued`: the only thing between it and a worker is this drain's own cordon, with
     ///   the intake closed, so it is queued for the other frontends like any queued work.
-    /// - `Waiting`: a drain ends its streams. It never started, no daemon session of
+    /// - `Waiting`: a drain ends its streams. It never started, no worker session of
     ///   another frontend could run it, and it is held by an operator's cordon (alone, or
     ///   beside the drain's) or by no worker at all; or its lease was withdrawn at the drain
-    ///   with its job never placed on a host (`withdrawn`) and no daemon session of another
+    ///   with its job never placed on a host (`withdrawn`) and no worker session of another
     ///   frontend could run it, whatever holds it now. A withdrawn operation another frontend
     ///   could run is `WaitingKept`: Buck2 never re-attaches an ended stream, so ending it would
     ///   fail an action the other frontend runs.
@@ -475,7 +475,7 @@ impl Engine {
     }
 
     /// Decides again the stage of every operation that waits for a worker, after the
-    /// daemons of the other frontends were read.
+    /// workers of the other frontends were read.
     pub(in crate::farm) fn republish_stuck(&mut self, a: &mut dyn Adapter) {
         let alive: BTreeSet<OperationId> = self.sched.queued().collect();
         self.stuck.retain(|operation, _| alive.contains(operation));

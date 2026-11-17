@@ -5,13 +5,13 @@
 //! The software a node runs arrives in `NodeStatus` (`docs/design/fleet-updates.md`
 //! section 3.1). The server keeps the newest one per node, from the node's current
 //! stream only, **in memory**: like the scheduler's state it is gone after a restart,
-//! and each daemon sends it again after its next `Welcome`.
+//! and each worker sends it again after its next `Welcome`.
 //!
 //! **Attention.** What a node needs a human for is listed in its `needs_attention`:
 //! each installed Xcode that is not ready, with why and the command that fixes it
-//! (issue #164), and a quarantine its daemon reported (`quarantined: <why>`, its
+//! (issue #164), and a quarantine its worker reported (`quarantined: <why>`, its
 //! `phase` too; [`quarantine_change`] logs it once raised and once cleared, at the
-//! levels below). An Xcode its node has not surveyed yet (`not_surveyed`: a daemon
+//! levels below). An Xcode its node has not surveyed yet (`not_surveyed`: a worker
 //! says Hello before its first survey ends, so a restarted one first sends every
 //! Xcode in that state) is listed in `xcodes` with that state, and **holds the item
 //! the same app had in the node's previous status**: that item stays in
@@ -36,7 +36,7 @@ use crate::machine::FarmMachine;
 /// One node, as `GET /v1/nodes` lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NodeView {
-    /// The node id its daemon registered with.
+    /// The node id its worker registered with.
     pub node_id: String,
     /// Whether its newest stream is still open.
     pub connected: bool,
@@ -44,7 +44,7 @@ pub struct NodeView {
     /// its first `Hello`'s and the server's newest); `None` if no version is known. It is kept after the stream closes, as the version the node last
     /// spoke.
     pub protocol: Option<u32>,
-    /// The newest software status it sent; `None` if it sent none (a daemon that
+    /// The newest software status it sent; `None` if it sent none (a worker that
     /// predates `NodeStatus`).
     pub software: Option<SoftwareView>,
     /// What an operator must do on the node, one line each
@@ -99,13 +99,13 @@ pub struct NodeDetail {
     pub free: ResourcesView,
     /// The leases it holds, as `term.seq`, in lease order.
     pub leases: Vec<String>,
-    /// What its daemon reports of the CPU and memory its actions use. Left out when the
-    /// node has sent no reading this frontend accepted (a daemon or runtime that takes
+    /// What its worker reports of the CPU and memory its actions use. Left out when the
+    /// node has sent no reading this frontend accepted (a worker or runtime that takes
     /// none, or a node another frontend holds).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load: Option<LoadView>,
-    /// What the node's input cache has done since its daemon process started, from the
-    /// newest heartbeat that carried it. Left out when the node sent none (a daemon with its
+    /// What the node's input cache has done since its worker process started, from the
+    /// newest heartbeat that carried it. Left out when the node sent none (a worker with its
     /// cache off or built before the counts, or a node another frontend holds): absent is
     /// not zero.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,7 +144,7 @@ impl Serialize for Owner {
 }
 
 /// The counts of a node's input cache (`docs/api.md`, "Input cache counts"): cumulative since
-/// its daemon process started, so they start again from 0 when the daemon restarts.
+/// its worker process started, so they start again from 0 when the worker restarts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct InputCacheView {
     /// Entries written into the cache from the content store, and their bytes.
@@ -161,7 +161,7 @@ pub struct InputCacheView {
     pub trees: Option<TreeCountsView>,
 }
 
-/// The counts of a node's shared tree store, cumulative since its daemon process started.
+/// The counts of a node's shared tree store, cumulative since its worker process started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct TreeCountsView {
     pub builds: u64,
@@ -207,10 +207,10 @@ pub struct LoadView {
     pub covered: Vec<String>,
     /// Whether the cgroup has a CPU quota.
     pub actions_cpu_limited: bool,
-    /// Cumulative CPU throttled time, in microseconds, when the daemon read it.
+    /// Cumulative CPU throttled time, in microseconds, when the worker read it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_throttled_usec: Option<u64>,
-    /// Cumulative CPU pressure (`some` total), in microseconds, when the daemon read it.
+    /// Cumulative CPU pressure (`some` total), in microseconds, when the worker read it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_pressure_some_total_usec: Option<u64>,
     /// What the lists of the readings carried, and what was not taken.
@@ -220,7 +220,7 @@ pub struct LoadView {
 }
 
 /// What the `lease_clocks` and `minutes` lists of a node's readings have come to since its
-/// daemon process began (`docs/api.md`, "Node load"), so that a dropped record, or a feed
+/// worker process began (`docs/api.md`, "Node load"), so that a dropped record, or a feed
 /// that is empty, can be seen.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ListsView {
@@ -269,7 +269,7 @@ pub enum PhaseView {
     },
     /// Its memory is under pressure: it takes no new lease until that falls.
     MemoryPressure,
-    /// The daemon was told to stop: it takes no new lease and finishes the ones it runs.
+    /// The worker was told to stop: it takes no new lease and finishes the ones it runs.
     Draining,
 }
 
@@ -380,11 +380,11 @@ pub struct SoftwareView {
     pub os_build: String,
     /// The kernel release (Linux).
     pub kernel: String,
-    /// The daemon version a session reported.
+    /// The worker version a session reported.
     pub daemon_version: String,
     /// The Xcode builds actions can use on it (Mac).
     pub xcode_builds: Vec<String>,
-    /// Every installed Xcode, ready or not (Mac; empty from a daemon that predates it).
+    /// Every installed Xcode, ready or not (Mac; empty from a worker that predates it).
     pub xcodes: Vec<XcodeView>,
     /// The container images the node checked present at its start (`--image`),
     /// sorted. Status only: no work is placed by image.
@@ -804,7 +804,7 @@ mod tests {
     }
 
     /// Catches (review of PR #258): an Xcode that is not ready, reported as not
-    /// surveyed yet (the first status of a restarted daemon), logged as resolved, or
+    /// surveyed yet (the first status of a restarted worker), logged as resolved, or
     /// raised again when its survey reports it unchanged; and the item it held never
     /// cleared once the survey finds it ready.
     #[test]

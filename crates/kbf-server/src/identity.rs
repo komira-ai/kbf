@@ -72,7 +72,7 @@ use crate::members::Members;
 use crate::proxy_auth::{Identity, Trust};
 
 /// What the server takes from a client certificate: the identity a deny entry is compared
-/// with (`kbf-peer`'s reader, which the storage service uses too) and, for a daemon, the
+/// with (`kbf-peer`'s reader, which the storage service uses too) and, for a worker, the
 /// one node it names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerCert {
@@ -399,7 +399,7 @@ pub enum DenyListError {
 
 impl DenyList {
     /// The deny list at `path`, read once now so that a bad file stops the server at
-    /// start rather than at the first daemon.
+    /// start rather than at the first worker.
     ///
     /// # Errors
     /// The file cannot be read or parsed.

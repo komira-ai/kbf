@@ -21,7 +21,7 @@
 //!    sets `deadline_passed` in the drain status, and the wait goes on. The streams of
 //!    operations that were never started and that no worker on this frontend can run (every
 //!    capable worker is cordoned by an operator, or there is none), with no other frontend
-//!    of the store to take them (no daemon of another frontend could run them: the
+//!    of the store to take them (no worker of another frontend could run them: the
 //!    `session/` rows, read at each intake poll), end UNAVAILABLE as step 3 begins, at the
 //!    end of the load balancer wait, and do not wait: nothing here could ever run them. Every other stream waits, as Buck2
 //!    does not recover one that ends, including the stream of an operation that waits only
@@ -30,12 +30,12 @@
 //!    still queued on the job service when the intake closes (no host took it) is cancelled and
 //!    its lease given up, since nothing has run and a queue that no host serves would hold the
 //!    drain for ever: its operation is queued again and its stream ends as that of any
-//!    operation that never started, or is kept and followed in the state store when a daemon
+//!    operation that never started, or is kept and followed in the state store when a worker
 //!    session of another frontend could run it ([`crate::executor::Executor`]). An execution that runs on a node of
 //!    this frontend finishes here: its result is taken, and its caller is answered. An execution
 //!    whose operation another frontend took is followed in the state store.
 //! 5. It stands down as a retire does ([`Stand::release`]: the farm is fenced, the worker
-//!    streams that are left end UNAVAILABLE and their daemons dial another frontend, whose
+//!    streams that are left end UNAVAILABLE and their workers dial another frontend, whose
 //!    owner rows keep their leases), closes the client streams that are left
 //!    ([`Drain::close`]) and, after a short grace for the clients to take their status when
 //!    there was a stream to close, ends the drain ([`Drain::sequence_ended`]); the serving

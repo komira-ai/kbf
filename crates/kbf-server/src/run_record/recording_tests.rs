@@ -290,7 +290,7 @@ async fn an_end_is_answered_ok_timed_out_or_failed_as_the_callers_were_told() {
     }
 }
 
-/// Asserts what an end carries beyond its answer: the daemon's reason on the attempt of a
+/// Asserts what an end carries beyond its answer: the worker's reason on the attempt of a
 /// failure (and nothing when the lease reported none), the listing of a stored result, the
 /// listing of a timed-out run's partial result, and no listing for a failure. Catches: a
 /// reason dropped or invented, a listing built for an end that has none, or a stored result

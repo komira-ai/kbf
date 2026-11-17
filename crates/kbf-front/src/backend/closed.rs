@@ -1,7 +1,7 @@
 //! The closure check of the action cache when the frontend keeps blobs in packs.
 //!
 //! The nodes check an action-cache entry against the blobs they hold themselves, and a blob a
-//! daemon wrote into a pack is not on a node. A frontend given [`Packs`] therefore works the
+//! worker wrote into a pack is not on a node. A frontend given [`Packs`] therefore works the
 //! closure out itself, on every write and on every hit, and counts a blob as held when the pack
 //! index has it ([`Layered`](super::layered::Layered): the index first, the nodes for the
 //! rest):

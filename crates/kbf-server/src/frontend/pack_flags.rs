@@ -81,7 +81,7 @@ pub(super) fn args() -> [Arg; 10] {
                  as before, and a blob over 64 MiB and any compressed blob still go to them. \
                  At start the frontend checks that the store refuses to replace an object \
                  and does not serve if it does not. Needs `--pack-index`, \
-                 `--pack-store-bucket` and `--pack-store-credentials-file`. Daemons read blobs \
+                 `--pack-store-bucket` and `--pack-store-credentials-file`. Workers read blobs \
                  from the storage nodes only, so a farm must not enable this before they can \
                  read a blob that is only in a pack. Left out, no pack store is built or \
                  contacted and blobs go where they always did",
@@ -316,7 +316,7 @@ pub(super) fn open(
         (Some(_), None) => Err("--pack-store-endpoint needs --pack-index".into()),
         (Some(flags), Some(index)) => {
             tracing::warn!(
-                "packs are on: daemons read blobs from the storage nodes only, so they cannot \
+                "packs are on: workers read blobs from the storage nodes only, so they cannot \
                  read a blob that is only in a pack"
             );
             Ok(Some(flags.open(Arc::clone(index))?))
@@ -325,7 +325,7 @@ pub(super) fn open(
 }
 
 /// [`open`] for a frontend with no storage node: the packs are the blob plane, so there is no
-/// daemon that cannot read a blob only they hold, and nothing to warn about.
+/// worker that cannot read a blob only they hold, and nothing to warn about.
 ///
 /// # Errors
 /// As [`open`].

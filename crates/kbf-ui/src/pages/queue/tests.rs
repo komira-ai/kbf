@@ -89,7 +89,10 @@ fn the_page_shows_depth_groups_reasons_and_avoided_operations() {
         "{html}"
     );
     assert!(!html.contains("Showing"), "{html}");
-    assert!(html.contains("empty until the daemons reconnect"), "{html}");
+    assert!(
+        html.contains("empty until the workers register again"),
+        "{html}"
+    );
     assert_eq!(fake.seen(), ["/v1/queue", "/v1/health"]);
 }
 

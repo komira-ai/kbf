@@ -3,7 +3,7 @@
 //! which `kbf-server` serves as `GET /metrics` on its operator API listener.
 //!
 //! Every [`crate::Cache`] owns one [`CacheMetrics`], so the REAPI listener's services
-//! and the worker listener's (daemons' uploads) count into the same families. Each
+//! and the worker listener's (workers' uploads) count into the same families. Each
 //! family's `# HELP` line says what it measures; `docs/api.md#get-metrics` says how to
 //! read them together.
 //!

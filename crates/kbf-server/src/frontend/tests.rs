@@ -152,7 +152,7 @@ async fn an_operator_api_address_in_use_fails_the_start() {
 /// the operator API are bound, and the flag reads as absent), and that one given it still binds
 /// it where the flag says: the start line then carries `worker=<addr>` and without it carries
 /// none. Catches: a worker listener bound on 127.0.0.1:8981 by default, which a frontend with no
-/// storage nodes and no daemons has no use for, and a start line that names a listener that
+/// storage nodes and no workers has no use for, and a start line that names a listener that
 /// is not there.
 #[tokio::test]
 async fn a_frontend_binds_a_worker_listener_only_when_asked() {

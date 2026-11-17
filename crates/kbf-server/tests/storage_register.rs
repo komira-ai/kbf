@@ -1441,7 +1441,7 @@ async fn a_node_over_mutual_tls_keeps_a_repair_journal_and_a_worker_settles_it()
 /// Catches an unowned-copy marker that does not survive the real listener's TLS: the
 /// frontend's closure copy reached a node's listener (a `TlsSource`, not a bare tonic
 /// config) and was refused as a plain write because the caller's certificate was read from
-/// the wrong place, so an action-cache entry was refused on a farm of three. A real half
+/// the wrong place, so an action-cache entry was refused on a farm of three. A real node
 /// holds a map in which another member owns the blob (r = 1): a plain write from a frontend
 /// is refused "not the primary"; the marker from a `daemon` certificate is refused the same;
 /// from the `frontend` certificate the blob is stored here as one copy.
@@ -1460,7 +1460,7 @@ async fn the_frontends_unowned_copy_is_stored_through_the_real_listener() {
         deny_list: None,
     };
     let f = frontend(Some(worker_tls));
-    let d = dir("half-unowned");
+    let d = dir("node-unowned");
     let write = |name: &str, text: String| {
         let path = d.join(name);
         std::fs::write(&path, text).expect("write");
@@ -1473,11 +1473,11 @@ async fn the_frontends_unowned_copy_is_stored_through_the_real_listener() {
         format!("--storage-tls-key={}", write("node.key", key)),
         format!("--storage-client-ca={}", write("ca.pem", pki.ca.pem())),
     ];
-    let half = kbf_server::storage_half::start(&flags(&d, &more).expect("flags"), never)
+    let node = start_storage(&flags(&d, &more).expect("flags"), never)
         .await
         .expect("starts");
-    let (storage, maps, here) = (half.storage(), half.maps(), half.addr);
-    let _serving = tokio::spawn(half.serve());
+    let (storage, maps, here) = (node.storage(), node.maps(), node.addr);
+    let _serving = tokio::spawn(node.serve());
     until("the node to register", || row(&f, 1)).await;
     until("the node to hold a map", || {
         (maps.generation() > 0).then_some(())
@@ -1673,10 +1673,10 @@ async fn a_started_node_with_a_journal_reports_what_it_owes() {
         format!("--storage-tls-key={}", write("node.key", key)),
         format!("--storage-client-ca={}", write("ca.pem", pki.ca.pem())),
     ];
-    let half = kbf_server::storage_half::start(&flags(&d, &more).expect("flags"), never)
+    let node = start_storage(&flags(&d, &more).expect("flags"), never)
         .await
         .expect("starts");
-    let _serving = tokio::spawn(half.serve());
+    let _serving = tokio::spawn(node.serve());
     until("the node to register", || row(&f, 1)).await;
     let node = until_node(&f, "debts and writes known", |n| {
         n.repair_debts.is_some() && n.open_writes.is_some()
@@ -2031,39 +2031,21 @@ async fn a_denied_certificate_is_refused_by_a_real_storage_node_when_the_generat
     .await;
 }
 
-/// Starts `kbf storage` (`half` false) or the storage half of `kbf storage-and-daemon`
-/// (`half` true) over `dir` with `--frontend` at `f`, writes `text` through its listener
-/// and stops it. A previous start's background tasks may still hold the directory's locks
+/// Starts `kbf storage` over `dir` with `--frontend` at `f`, writes `text` through its
+/// listener and stops it. A previous start's background tasks may still hold the directory's locks
 /// as it stops; the start is retried while they do.
-async fn write_as_registered(
-    f: &Frontend,
-    dir: &Path,
-    half: bool,
-    text: &str,
-) -> kbf_types::Digest {
+async fn write_as_registered(f: &Frontend, dir: &Path, text: &str) -> kbf_types::Digest {
     let url = format!("--frontend=http://{}", f.worker);
     let flags = flags(dir, &[url]).expect("flags");
     let (addr, maps, serving) = 'start: {
         for _ in 0..500 {
-            let started = if half {
-                kbf_server::storage_half::start(&flags, never)
-                    .await
-                    .map(|n| {
-                        (
-                            n.addr,
-                            n.maps(),
-                            tokio::spawn(async move { n.serve().await }),
-                        )
-                    })
-            } else {
-                start_storage(&flags, never).await.map(|n| {
-                    (
-                        n.addr,
-                        n.maps(),
-                        tokio::spawn(async move { n.serve().await }),
-                    )
-                })
-            };
+            let started = start_storage(&flags, never).await.map(|n| {
+                (
+                    n.addr,
+                    n.maps(),
+                    tokio::spawn(async move { n.serve().await }),
+                )
+            });
             match started {
                 Ok(node) => break 'start node,
                 Err(e) if e.to_string().contains("Locked") => {
@@ -2126,40 +2108,32 @@ async fn written_by(dir: &Path, digest: &kbf_types::Digest) -> Option<(u64, u64)
 
 /// Catches: a registered node that names its objects in an epoch of its own log (defect:
 /// `Cache::open_under` taken under `--frontend` in `assemble`, or `Cache::open` in the
-/// storage half), which a wiped node would then name again. A node of each kind
-/// registers with a frontend and writes: its metadata log says the object was written by
+/// storage half), which a wiped node would then name again. A node registers with a
+/// frontend and writes: its metadata log says the object was written by
 /// the node writer of that registration (member and boot), not an epoch. The log can only
 /// say so if it committed `SetWriter` for that member and boot.
 #[tokio::test]
 async fn a_registered_node_writes_objects_named_by_member_and_boot() {
-    for (half, name) in [(false, "keys-node"), (true, "keys-half")] {
-        let (f, dir) = (frontend(None), dir(name));
-        let digest = write_as_registered(&f, &dir, half, "a registered node's blob").await;
-        let by = written_by(&dir, &digest).await;
-        assert!(by.is_some_and(|(m, b)| m > 0 && b > 0), "{name}: {by:?}");
-    }
+    let (f, dir) = (frontend(None), dir("keys-node"));
+    let digest = write_as_registered(&f, &dir, "a registered node's blob").await;
+    let by = written_by(&dir, &digest).await;
+    assert!(by.is_some_and(|(m, b)| m > 0 && b > 0), "{by:?}");
 }
 
 /// Catches: a storage node that loses its metadata directory and names new objects as
-/// the old ones (the storage half of `kbf storage-and-daemon` opened its cache before it
-/// registered, as an epoch writer of its own log). Each kind of node writes, loses its
-/// metadata directory (the cold store stays), registers again at the same frontend and
-/// writes: both blobs are node-named, by pairs of `(member, boot)` that differ.
+/// the old ones. A node writes, loses its metadata directory (the cold store stays),
+/// registers again at the same frontend and writes: both blobs are node-named, by pairs of
+/// `(member, boot)` that differ.
 #[tokio::test]
-async fn a_wiped_node_of_either_kind_never_reuses_its_keys() {
-    for (half, name) in [(false, "wipe-node"), (true, "wipe-half")] {
-        let (f, dir) = (frontend(None), dir(name));
-        let first = write_as_registered(&f, &dir, half, "before the wipe").await;
-        let before = written_by(&dir, &first).await;
-        std::fs::remove_dir_all(dir.join("meta")).expect("wipe");
-        let second = write_as_registered(&f, &dir, half, "after the wipe").await;
-        let after = written_by(&dir, &second).await;
-        assert!(
-            before.is_some() && after.is_some(),
-            "{name}: {before:?} {after:?}"
-        );
-        assert_ne!(before, after, "{name}: the wiped node is the same writer");
-    }
+async fn a_wiped_node_never_reuses_its_keys() {
+    let (f, dir) = (frontend(None), dir("wipe-node"));
+    let first = write_as_registered(&f, &dir, "before the wipe").await;
+    let before = written_by(&dir, &first).await;
+    std::fs::remove_dir_all(dir.join("meta")).expect("wipe");
+    let second = write_as_registered(&f, &dir, "after the wipe").await;
+    let after = written_by(&dir, &second).await;
+    assert!(before.is_some() && after.is_some(), "{before:?} {after:?}");
+    assert_ne!(before, after, "the wiped node is the same writer");
 }
 
 /// Catches: a real new node (empty store: it registers `CatchingUp`, rebuilds, and beats

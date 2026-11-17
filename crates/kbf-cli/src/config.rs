@@ -351,8 +351,8 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
     ("identity", &["frontend"]),
     (
-        // The runtime's thread counts, in the table that files written when a daemon read them
-        // already hold them in: the table keeps its name so that those files go on parsing.
+        // The runtime's thread counts. The table is named `[daemon]` as in the files written
+        // before the daemon was removed; it keeps its name so that those files go on parsing.
         "daemon",
         &["async-threads", "blocking-threads", "cpu-threads"],
     ),
@@ -507,7 +507,8 @@ pub fn file_args(
     for (group, body) in &table {
         // Enrollment's own keys share the file (`kbf_enroll::config::KEYS`): the top-level
         // `mode`, and the tables of `[enroll]`, `[frontend]`, `[node]`, `[dirs]` and
-        // `[storage]`, which hold no flag; `[daemon]` and `[tls]` hold both.
+        // `[storage]`, which hold no flag; `[daemon]` (the runtime's thread counts, and the removed
+        // daemon's `data_dir` and `reserve_cpus`, ignored) and `[tls]` hold both.
         if kbf_enroll::config::is_key("", group) {
             continue;
         }

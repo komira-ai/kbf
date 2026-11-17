@@ -27,9 +27,9 @@ use crate::stamp::Stamp;
 /// `received`, measured; `booked` is what its lease was granted (`None` for a lease the
 /// server never started) and `usage` the `ResourceUsage` its result carried, as
 /// [`crate::action_usage::Measured`] decoded it. The times are those its
-/// `ActionResult` would carry once stamped ([`Stamp::times`]): the daemon's own,
+/// `ActionResult` would carry once stamped ([`Stamp::times`]): the worker's own,
 /// `queued` from the server, and the worker start and completion the server saw when
-/// the daemon left them out (a killed or lost run reports none of its own).
+/// the worker left them out (a killed or lost run reports none of its own).
 pub(crate) fn of(
     result: &worker::Result,
     usage: Option<&ResourceUsage>,
@@ -83,7 +83,7 @@ pub(crate) fn killed(run: Run, killed: &MemoryRun) -> Run {
 
 /// The run's usage, from the block its basis names and no other: a footprint basis
 /// reads the footprint block and leaves every cgroup field `None`; a cgroup basis, or
-/// none (a daemon that predates the field), reads the cgroup block when there is one,
+/// none (a worker that predates the field), reads the cgroup block when there is one,
 /// and the basis is never inferred from which block is there. A block that is absent
 /// stays absent; it is never filled from the other or made zero.
 pub(crate) fn run_usage(u: &ResourceUsage) -> RunUsage {
@@ -112,7 +112,7 @@ pub(crate) fn run_usage(u: &ResourceUsage) -> RunUsage {
         RunBasis::Unspecified
     };
     // No block, no counters: nothing is made up for a runtime that has no cgroup (the
-    // daemon's own `wait4` figures), and the basis is whatever the runtime said.
+    // worker's own `wait4` figures), and the basis is whatever the runtime said.
     let Some(c) = u.cgroup.as_ref() else {
         return RunUsage {
             wall_micros: u.wall_micros,
@@ -178,7 +178,7 @@ mod tests {
     }
 
     /// Catches: a REAPI time dropped or copied into the wrong field (each of the
-    /// daemon's eight has its own second), `queued` not the server's, a cgroup
+    /// worker's eight has its own second), `queued` not the server's, a cgroup
     /// counter dropped or swapped, or the NUMA list lost.
     #[test]
     fn every_time_and_every_cgroup_counter_is_kept() {
@@ -281,7 +281,7 @@ mod tests {
 
     /// Catches an executor run's record missing a time: the task's three phases reach the record
     /// unchanged beside the server's three (queued, Start sent, result taken in), so the record
-    /// has all nine, as a daemon's run does, and the two ends bracket the task's phases.
+    /// has all nine, as a worker's run does, and the two ends bracket the task's phases.
     #[test]
     fn the_invocation_record_of_an_executor_run_has_all_nine_times() {
         let stamp = Stamp {
@@ -331,7 +331,7 @@ mod tests {
     }
 
     /// Catches the provenance read off the wrong thing: metadata the frontend marked as a
-    /// task's claim is a `TaskClaim` run, a daemon's metadata (its usage entry, no mark) and a
+    /// task's claim is a `TaskClaim` run, a worker's metadata (its usage entry, no mark) and a
     /// report with none are `Measured`.
     #[test]
     fn an_executor_run_is_task_claim_and_a_daemon_run_is_measured() {
@@ -491,7 +491,7 @@ mod tests {
         );
     }
 
-    /// Catches: a cgroup run (or an older daemon's, with no basis) reading the
+    /// Catches: a cgroup run (or an older worker's, with no basis) reading the
     /// footprint block, which would file a footprint where a cgroup peak belongs; a
     /// basis lost; and an absent footprint made into a zero or a block of zeros.
     #[test]
@@ -544,7 +544,7 @@ mod tests {
     }
 
     /// Catches: the node's CPU pressure or the booked CPU dropped on the way to the
-    /// record, on either basis, or read as zero when the daemon did not report them.
+    /// record, on either basis, or read as zero when the worker did not report them.
     #[test]
     fn the_cpu_pressure_and_booking_ride_on_either_basis_and_stay_absent_when_unreported() {
         for basis in [UsageBasis::Cgroup, UsageBasis::MacFootprint] {
@@ -569,7 +569,7 @@ mod tests {
 
     /// Catches: the lease counters (events, swap peak, anon + swap peak, pressure
     /// totals, CPUs) dropped on the way to the record, and a runtime with no cgroup
-    /// block (the daemon's own `wait4` figures) given a basis, a peak or counters it
+    /// block (the worker's own `wait4` figures) given a basis, a peak or counters it
     /// did not measure: the basis is what the runtime said, never inferred.
     #[test]
     fn the_lease_counters_are_kept_and_no_block_means_no_sample_and_no_inferred_basis() {

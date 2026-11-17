@@ -205,8 +205,8 @@ fn an_attempt_falls_into_the_bucket_its_numbers_name() {
     }
 }
 
-/// Catches: a run counted from a daemon that did not say which instrument measured it
-/// (its peak could be the daemon's `wait4` figure), a macOS run read from the cgroup
+/// Catches: a run counted from a worker that did not say which instrument measured it
+/// (its peak could be the worker's `wait4` figure), a macOS run read from the cgroup
 /// block or the other way round, an own-limit kill, a node-pressure kill, a lost run and
 /// a plain failure confused, an absent peak made zero, the node's CPU pressure
 /// (hundredths of a percent) not turned into the estimator's tenths, and a swap or limit
@@ -237,7 +237,7 @@ fn a_run_is_read_from_the_block_its_basis_names() {
     let mac = RunUsage {
         wall_micros: 1,
         basis: UsageBasis::MacFootprint,
-        // A cgroup block the daemon must not have sent beside it is not read.
+        // A cgroup block the worker must not have sent beside it is not read.
         memory_peak_bytes: Some(1),
         footprint: Some(FootprintUsage {
             peak_footprint_bytes: Some(11),

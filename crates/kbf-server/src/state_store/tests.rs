@@ -12,6 +12,11 @@ fn parse(value: &str) -> Result<StateStoreUri, StateStoreUriError> {
     value.parse()
 }
 
+/// The Postgres store on the OS package's socket directory, reached by peer authentication.
+fn local_postgres() -> StateStoreUri {
+    parse("postgres:///kbf?host=/run/postgresql").expect("a socket URL the parser accepts")
+}
+
 /// Catches: a value the design does not admit accepted (a `file://` store the server
 /// could not open), a relative or empty SQLite path (a database created wherever the
 /// process happens to run), a Postgres URL that this client cannot use (no host,
@@ -68,29 +73,14 @@ fn a_sqlite_path_and_a_postgres_url_are_accepted_and_nothing_else() {
     }
 }
 
-/// Catches: the default Postgres store of an all-in-one drifting from the URL the design
-/// names (`postgres:///kbf?host=/run/postgresql`, role and database `kbf`, the OS
-/// package's socket directory), or being a value the parser would refuse.
-#[test]
-fn the_local_postgres_store_is_the_designs_socket_url() {
-    assert_eq!(
-        StateStoreUri::local_postgres(),
-        parse("postgres:///kbf?host=/run/postgresql").expect("parses")
-    );
-    assert_eq!(
-        StateStoreUri::local_postgres().identity(),
-        PathBuf::from("postgres:///kbf?host=/run/postgresql")
-    );
-}
-
 /// Asserts that an open of either store keeps the epoch it holds: a restart of a frontend,
-/// or the start of another one over the same Postgres, does not change it, so the daemons
+/// or the start of another one over the same Postgres, does not change it, so the workers
 /// that reconnect keep the runs of the leases they hold. The epoch changes when an
 /// operator raises it.
 #[test]
 fn every_open_of_either_store_keeps_the_epoch() {
     for uri in [
-        StateStoreUri::local_postgres(),
+        local_postgres(),
         StateStoreUri::Sqlite(PathBuf::from("/x.db")),
     ] {
         assert_eq!(uri.epoch_policy(), EpochPolicy::Keep, "{uri:?}");
@@ -262,7 +252,7 @@ fn the_flag_takes_a_sqlite_path_or_a_postgres_socket_url_and_defaults_to_none() 
         "--state-store=postgres:///kbf?host=/run/postgresql",
     ])
     .expect("flag");
-    assert_eq!(args.state_store, Some(StateStoreUri::local_postgres()));
+    assert_eq!(args.state_store, Some(local_postgres()));
     let refused =
         Args::try_parse_from(["kbf-server", "--state-store=file:///x"]).expect_err("scheme");
     assert!(
@@ -303,7 +293,7 @@ fn the_pack_index_flag_is_off_by_default_and_needs_a_postgres_state_store() {
     assert!(matches!(refused, PackIndexFlagError::NeedsPostgres));
     let said = refused.to_string();
     assert!(said.contains("not SQLite"), "{said}");
-    args.state_store = Some(StateStoreUri::local_postgres());
+    args.state_store = Some(local_postgres());
     let url = args.pack_index_url().expect("a Postgres store");
     assert!(url.is_some());
     let dir = scratch("pack-index-no-socket");

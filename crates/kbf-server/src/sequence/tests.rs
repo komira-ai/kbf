@@ -147,7 +147,7 @@ fn submit(farm: &Farm, request: Request) -> Result<kbf_front::Ticket, Status> {
     })
 }
 
-/// Registers the node `node-a` on the rig's farm, as a daemon's first stream does.
+/// Registers the node `node-a` on the rig's farm, as a worker's first stream does.
 fn register(rig: &Rig) -> Inbox {
     register_stream(rig).1
 }
@@ -431,7 +431,7 @@ async fn pass_feeding(rig: &Rig, secs: u64) {
     pass(Duration::from_millis(1)).await;
 }
 
-/// Lets `secs` seconds of paused time pass as [`pass_feeding`] does, with the node's daemon
+/// Lets `secs` seconds of paused time pass as [`pass_feeding`] does, with the node's worker
 /// heartbeating on `stream` every second and listing `lease` as running, so that the lease
 /// is not given up as a silent node's would be.
 async fn pass_beating(

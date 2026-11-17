@@ -173,10 +173,6 @@ impl clap::builder::TypedValueParser for StateStoreParser {
     }
 }
 
-/// The Postgres store of a host that runs it beside kbf: the database and role `kbf` on
-/// the OS package's socket directory, reached by peer authentication.
-const LOCAL_POSTGRES: &str = "postgres:///kbf?host=/run/postgresql";
-
 /// What a start on a `sqlite://` store logs, once: SQLite is on its way out.
 const SQLITE_REMOVED: &str = "the SQLite state store is removed in the next release: move the \
      scheduler's state to Postgres before upgrading (see the upgrade notes)";
@@ -188,28 +184,19 @@ fn has_password(url: &PostgresUrl) -> bool {
 impl StateStoreUri {
     /// What an [`open`](Self::open) does with the store's epoch: it keeps it, so a restart
     /// of a frontend, or the start of another one over the same Postgres, does not make
-    /// the daemons drop the runs of the leases they hold. A fresh store has no epoch to
+    /// the workers drop the runs of the leases they hold. A fresh store has no epoch to
     /// keep: it is given a first one no other store's is likely to equal (`Durable::open`),
     /// and when several frontends open an empty store together they end with one.
     ///
     /// The epoch changes when an operator raises it (`POST /v1/epoch/bump`,
     /// [`Farm::bump_epoch`](crate::Farm::bump_epoch)), which a restore of the store from a
     /// backup calls for: the frontends that start after it serve the new epoch, and the
-    /// daemons drop the leases a lost history granted.
+    /// workers drop the leases a lost history granted.
     #[must_use]
     pub const fn epoch_policy(&self) -> EpochPolicy {
         match self {
             Self::Sqlite(_) | Self::Postgres(_) => EpochPolicy::Keep,
         }
-    }
-
-    /// The Postgres store on this host's own socket (`postgres:///kbf?host=/run/postgresql`):
-    /// what `kbf all-in-one` opens when `--state-store` is left out.
-    #[must_use]
-    pub fn local_postgres() -> Self {
-        LOCAL_POSTGRES
-            .parse()
-            .expect("LOCAL_POSTGRES is a socket URL the parser accepts")
     }
 
     /// What names the store, for two processes to agree they mean the same one: a SQLite

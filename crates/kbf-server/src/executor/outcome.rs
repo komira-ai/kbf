@@ -29,7 +29,7 @@
 //! | failed, any other reason | `infra` | `UNAVAILABLE`: rerun |
 //! | cancelled by anyone else | `infra` | `UNAVAILABLE`: rerun |
 //! | lost | `fenced` | lost (fenced): the container is gone with no result, the host's fault, rerun elsewhere |
-//! | not found after it was seen | `restarted` | lost (daemon restarted): the service no longer knows the id, rerun |
+//! | not found after it was seen | `restarted` | lost (worker restarted): the service no longer knows the id, rerun |
 //! | failed to start quota-unavailable | `fenced` | lost (fenced): the host's scratch quota is out of order, rerun elsewhere |
 //! | failed to start files-unsupported | `infra` | `UNAVAILABLE`: the host cannot write the files of a job, rerun |
 //! | failed to start invalid-file | `invalid` | `INVALID_ARGUMENT`: a file of the job is ours to fix |

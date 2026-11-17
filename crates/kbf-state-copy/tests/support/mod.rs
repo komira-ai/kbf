@@ -345,7 +345,7 @@ pub fn config_with(value: &str) -> String {
          [scheduler]\n\
          # where the scheduler keeps its state\n\
          state-store = \"{value}\"   # moved by the cutover\n\
-         heartbeat-interval-ms = 500"
+         unservable-wait-secs = 500"
     )
 }
 

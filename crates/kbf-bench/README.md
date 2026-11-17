@@ -34,8 +34,7 @@ one blob).
 
 ## The connection
 
-`--cas` is the blob service: a server's worker listener (`https://<server>:<worker
-port>`), or its REAPI listener (`https://`, or `http://` when
+`--cas` is the blob service: a server's REAPI listener (`https://`, or `http://` when
 it serves plain text). The TLS flags are `--ca-cert`, `--cert`, `--key`,
 `--tls-server-name`; with `--cert` and `--key` the client presents that identity, and
 the CA is the only one trusted. One HTTP/2 connection carries every request, with the
@@ -132,12 +131,12 @@ cargo build --release -p kbf-bench
 ```
 
 Copy `target/release/kbf-bench` to the node and run it as the user who can
-read a node's key, with that node's TLS files and a `--cas` URL (placeholders as in
-[docs/deploy/linux-build-host.md](../../docs/deploy/linux-build-host.md)):
+read a node's key, with that node's TLS files and a `--cas` URL (placeholders for the
+server and its REAPI port):
 
 ```sh
 sudo -u kbf ./kbf-bench upload \
-    --cas https://<server>:<worker port> \
+    --cas https://<server>:<reapi port> \
     --ca-cert /etc/kbf/ca.pem --cert /etc/kbf/node.pem --key /etc/kbf/node.key \
     --in-flight 64 --timeout-secs 600 --json upload-64.json
 ```
@@ -147,7 +146,7 @@ with `--method batch`, and a read of the first run's tree (its seed is in the re
 
 ```sh
 sudo -u kbf ./kbf-bench read --seed <seed from upload-64.json> \
-    --cas https://<server>:<worker port> \
+    --cas https://<server>:<reapi port> \
     --ca-cert /etc/kbf/ca.pem --cert /etc/kbf/node.pem --key /etc/kbf/node.key \
     --json read-64.json
 ```

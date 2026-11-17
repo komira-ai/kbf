@@ -59,7 +59,7 @@ pub const PUT_BACKOFF_FACTOR: u32 = 4;
 pub const MAX_ADMISSION_BYTES: u64 = Semaphore::MAX_PERMITS as u64;
 
 /// The default most HTTP/2 streams one connection may have open on the worker
-/// listener (`--worker-max-streams`): a daemon holds one persistent session stream
+/// listener (`--worker-max-streams`): a worker holds one persistent session stream
 /// and a few short, busy transfer streams. A `BatchUpdateBlobs` request is decoded (up
 /// to [`MAX_MESSAGE_BYTES`](crate::MAX_MESSAGE_BYTES)) before [`Cache::admit`] sees
 /// it, and so is a ByteStream `Write`'s first message, so what one connection can make

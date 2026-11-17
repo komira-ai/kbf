@@ -1,7 +1,7 @@
 //! The blobs a lease reads and writes: the [`Cas`] trait, and the helpers every store
 //! shares ([`digest_of`], [`fetch`], [`label`]).
 //!
-//! A runtime fetches an action, its command and its input tree through a `Cas`, and
+//! A client fetches an action, its command and its input tree through a `Cas`, and
 //! stores outputs, stdout and stderr through it. Every blob is hashed on arrival: a
 //! `Cas` that hands back other bytes than the digest names is caught by [`fetch`] (or
 //! by the store itself, as [`crate::Transfers`] does), not trusted. The front verifies

@@ -149,7 +149,7 @@ async fn a_listed_certificate_is_refused_on_every_method_and_the_role_comes_firs
 
 /// Catches an entry kind that is not applied, or applied too widely: a certificate listed
 /// by its serial and one listed by a node id (the DNS name it carries) are refused on a
-/// method every role may call and on one only a daemon may call, saying the entry; a
+/// method every role may call and on one only a worker may call, saying the entry; a
 /// certificate whose only name is an IP address spelled like a listed node, and one that
 /// no entry names, are not refused.
 ///

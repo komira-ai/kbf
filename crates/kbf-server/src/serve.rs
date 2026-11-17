@@ -42,7 +42,7 @@ use crate::worker_roles::WorkerRolesLayer;
 use kbf_proto::kbf::enroll::v1::cold_store_server::ColdStoreServer;
 use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 
-/// How the server listens and paces its daemons.
+/// How the server listens and paces its workers.
 #[derive(Clone, Debug)]
 pub struct Listeners {
     /// The REAPI listener (clients: buck2, Bazel).
@@ -143,11 +143,11 @@ impl Default for StreamTiming {
 /// waits for the clients to take it before it stops.
 pub(crate) const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
-/// The worker listener's mutual TLS: every daemon's certificate must name its node
+/// The worker listener's mutual TLS: every worker's certificate must name its node
 /// (see [`crate::identity`]).
 #[derive(Clone, Debug)]
 pub struct WorkerTls {
-    /// The listener's identity and the client CA daemons' certificates chain to, both
+    /// The listener's identity and the client CA workers' certificates chain to, both
     /// re-read from their files as they change.
     pub server: TlsSource,
     /// The certificates and nodes refused, read again at every check.
@@ -507,8 +507,7 @@ pub(crate) fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Outp
 }
 
 /// Logs the core a server runs, the usage profiles mode of `farm`, and whether an
-/// own-limit kill climbs the ladder (`--no-memory-climb`), in the words the all-in-one server
-/// and the frontend both use.
+/// own-limit kill climbs the ladder (`--no-memory-climb`), in the words every server uses.
 pub(crate) fn log_core(farm: &Farm) {
     tracing::info!("{}", crate::SchedulerCore::Legacy.start_line());
     tracing::info!("{}", farm.usage_profiles().start_line());
@@ -613,7 +612,7 @@ where
 /// the future returns within a short grace even if a connection stays open (a client
 /// still uploading, say). Until then the worker listener, the operator API and the
 /// tick go on; once the REAPI listener is done the operator API finishes the requests
-/// it is answering and stops. Daemon streams never end on their own, so the worker
+/// it is answering and stops. Worker streams never end on their own, so the worker
 /// listener is not drained: it stops when the future returns.
 ///
 /// # Errors
@@ -758,7 +757,7 @@ where
         listeners.worker_tls,
         proxy.as_ref(),
     );
-    // The rows a revocation writes, beside the file: a revoked daemon is refused here.
+    // The rows a revocation writes, beside the file: a revoked worker is refused here.
     let peers = crate::deny_rows::denying(peers, members.as_ref());
     let tls_sources: Vec<TlsSource> = listeners
         .reapi_tls
@@ -923,15 +922,8 @@ where
         };
         let mut reapi_done = false;
         let outcome = tokio::select! {
-            // The connections closed after GOAWAY, so no execution is open (`settle`); a
-            // daemon beside the server may hold the end ([`Drain::hold`]), and the worker
-            // listener serves meanwhile.
-            served = async {
-                let served = reapi_serve.await;
-                stopper.settle();
-                stopper.may_stand_down().await;
-                served
-            } => {
+            // The connections closed after GOAWAY, so no execution is open.
+            served = reapi_serve => {
                 reapi_done = true;
                 served.map_err(ServeError::from)
             }

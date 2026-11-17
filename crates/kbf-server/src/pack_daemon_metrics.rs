@@ -1,10 +1,14 @@
-//! `kbf_pack_daemon_*` on `GET /metrics`: what each daemon that reads packs (`--pack-read`, or
+//! `kbf_pack_daemon_*` on `GET /metrics`: what each worker that reads packs (`--pack-read`, or
 //! through a local tierstore with `--tierstore-endpoint`) says its reads did, from the counts on its heartbeats ([`crate::farm::Farm::pack_reads`]).
 //!
-//! One sample per node and family, labelled `node`, as the counters of the daemon's process
+//! No current worker sends these counts: the farm's workers are the executor's job-service
+//! hosts ([`crate::executor`]), which send none, so the families are absent and the route
+//! output holds none. They are read, and shown, for a worker that does send them.
+//!
+//! One sample per node and family, labelled `node`, as the counters of the worker's process
 //! (they start again from 0 when it restarts, as a counter may). A node that sent no counts
-//! has no sample, and with no node sending any, no family is written: a daemon that does not
-//! read packs is not a daemon that read none.
+//! has no sample, and with no node sending any, no family is written: a worker that does not
+//! read packs is not a worker that read none.
 //!
 //! The gate of a farm's move to packs is the sum of `kbf_pack_daemon_elsewhere_total` and the
 //! frontend's own `kbf_pack_read_fallbacks_total` no longer rising (reads that still go to the
@@ -12,10 +16,10 @@
 //! count in `elsewhere`), with `kbf_pack_daemon_unasked_total` flat and
 //! `kbf_pack_daemon_lost_total` and `kbf_pack_daemon_damaged_total` staying 0 (`docs/api.md`,
 //! "Packs"). `kbf_pack_daemon_fallback_lost_total` and `kbf_pack_daemon_fallback_damaged_total`
-//! are reads a daemon's local tierstore did not serve, which it then sent to the storage nodes:
+//! are reads a worker's local tierstore did not serve, which it then sent to the storage nodes:
 //! each read's outcome is theirs (the blob, or their failure), never a failure of the tierstore.
 //!
-//! The daemons that write packs (`--pack-write`) say what their writes did in the same way
+//! The workers that write packs (`--pack-write`) say what their writes did in the same way
 //! ([`crate::farm::Farm::pack_writes`]): `kbf_pack_daemon_packs_written_total`,
 //! `kbf_pack_daemon_blobs_packed_total`, `kbf_pack_daemon_packed_bytes_total`,
 //! `kbf_pack_daemon_missing_indexed_total`, `kbf_pack_daemon_missing_unasked_total` and
@@ -141,7 +145,7 @@ const WRITE_FAMILIES: [WriteFamily; 5] = [
     ),
 ];
 
-/// The name and help of the family of blobs a daemon wrote to the storage nodes instead of into
+/// The name and help of the family of blobs a worker wrote to the storage nodes instead of into
 /// a pack, which has one sample per node and reason.
 const FALLBACKS: (&str, &str) = (
     "kbf_pack_daemon_write_fallbacks_total",
@@ -188,7 +192,7 @@ pub(crate) fn render_writes(out: &mut String, nodes: &[(WorkerId, PackWriteCount
     }
 }
 
-/// Appends what the daemons of `farm` report of their pack reads and writes to `out`.
+/// Appends what the workers of `farm` report of their pack reads and writes to `out`.
 pub(crate) fn render_farm(out: &mut String, farm: &Farm) {
     render(out, &farm.pack_reads());
     render_writes(out, &farm.pack_writes());

@@ -1,6 +1,6 @@
 //! Runs the Command of an action in its laid-out input root.
 //!
-//! [`run`] does what the daemon's local runtime does for one Command: the working directory and
+//! [`run`] runs one Command the way a worker does: the working directory and
 //! the parent of every declared output are made first (REAPI makes the worker do it), then the
 //! program is started with the inherited environment cleared, standard input closed, and standard
 //! output and error written to files. Its environment is the run's own `HOME`, `TMPDIR`,
@@ -29,7 +29,7 @@
 //! (in a PID namespace, the kill of its first process ends every process in it), and the run is
 //! reported as timed out with exit code 137. The group is also killed when the run is dropped
 //! before it ends. A process a signal ended reports 128 plus the signal
-//! number, as the daemon does.
+//! number, as a shell does.
 //!
 //! CPU time and peak memory come from `getrusage(RUSAGE_CHILDREN)`: the difference in CPU time
 //! over the run, and the largest resident set of any child this process has reaped. They cover

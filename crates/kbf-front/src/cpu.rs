@@ -187,7 +187,7 @@ mod tests {
             failed.to_string().starts_with("a hashing job failed"),
             "{failed:?}"
         );
-        // Each caller's error type names it: INTERNAL to a daemon, internal to the cache.
+        // Each caller's error type names it: INTERNAL to a worker, internal to the cache.
         let status = Status::from(failed.clone());
         assert_eq!(status.code(), Code::Internal, "{status:?}");
         let cache = CacheError::from(failed);

@@ -214,7 +214,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
 ///
 /// [`RecordStream::finish`] checks the size and the CRC-32C, not the hash: onto the
 /// tier the cache trusts the digest at the commit (the flusher hashes the record later),
-/// which is right for the in-process plane, whose digests are its own hashes, and wrong
+/// which is right for a caller in the server's own process, whose digests are its own hashes, and wrong
 /// for a caller of this trait, whose bytes come from another process. So the hash is
 /// checked here, as the cache's own `stage_streamed` checks a ByteStream `Write` before
 /// its commit: a blob is never present under a digest its bytes do not have. The cost

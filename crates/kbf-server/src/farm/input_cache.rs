@@ -1,6 +1,10 @@
-//! The input cache counts of each daemon, from its heartbeats (`Heartbeat.input_cache`), for the
+//! The input cache counts of each worker, from its heartbeats (`Heartbeat.input_cache`), for the
 //! `kbf_node_input_cache_*` families of `GET /metrics` ([`crate::input_cache_metrics`]) and the
 //! `input_cache` object of `GET /v1/nodes/{id}`.
+//!
+//! No current worker sends these counts: the farm's workers are the executor's job-service
+//! hosts ([`crate::executor`]), which send none, so the families are absent and the route
+//! output holds none. They are read, and shown, for a worker that does send them.
 
 use kbf_proto::worker::InputCacheCounts;
 use kbf_types::WorkerId;
@@ -10,7 +14,7 @@ use super::{Farm, StreamId};
 impl Farm {
     /// The input cache counts of a heartbeat of `worker` on `stream`: kept as the node's newest
     /// when the heartbeat carries them, and, when it carries none, the node's are forgotten (a
-    /// daemon restarted with its cache off has none, and must not show the counts of the process
+    /// worker restarted with its cache off has none, and must not show the counts of the process
     /// before). Ignored if `stream` was replaced. A node that is gone keeps the counts of its
     /// last heartbeat until this frontend restarts or the node's next stream says otherwise.
     pub fn note_input_cache(

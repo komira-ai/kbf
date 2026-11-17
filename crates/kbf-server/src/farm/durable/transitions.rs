@@ -39,7 +39,7 @@
 //!
 //! A grant, a lease given up and a result that finds its lease row also check the `owner/`
 //! row of the lease's node (the `owner` module): the transaction fails, whatever else it
-//! read, if the daemon has said `Hello` to another frontend since this one did. The grant
+//! read, if the worker has said `Hello` to another frontend since this one did. The grant
 //! puts the operation's `lease-by-op/` row beside the lease row (the `leases` module), and
 //! the lease given up, like every ending, deletes it.
 
@@ -350,12 +350,12 @@ impl Durable {
         }
     }
 
-    /// The capabilities and capacity of every daemon the session rows list that is not in
-    /// `connected` (the nodes of this frontend): the daemons of the other frontends of the
+    /// The capabilities and capacity of every worker the session rows list that is not in
+    /// `connected` (the nodes of this frontend): the workers of the other frontends of the
     /// state store, each renewed by the frontend it is connected to.
     ///
     /// # Errors
-    /// The store cannot be read, or a session row is not a daemon's registration.
+    /// The store cannot be read, or a session row is not a worker's registration.
     pub(super) fn remote_sessions(
         &self,
         connected: &std::collections::BTreeSet<WorkerId>,
@@ -371,13 +371,13 @@ impl Durable {
         Ok(remote)
     }
 
-    /// Whether a daemon session in the store, of any frontend, could run `request`: the
-    /// session rows hold each connected daemon's capabilities and capacity, written by the
+    /// Whether a worker session in the store, of any frontend, could run `request`: the
+    /// session rows hold each connected worker's capabilities and capacity, written by the
     /// frontend it is connected to, and expire unless that frontend renews them. An
     /// operation is unservable only if none could.
     ///
     /// # Errors
-    /// The store cannot be read, or a session row is not a daemon's registration.
+    /// The store cannot be read, or a session row is not a worker's registration.
     pub(super) fn session_could_run(&self, request: &Request) -> Result<bool, StateError> {
         for (key, row) in self.store.scan_prefix(SESSION)? {
             let up = self.session_row(&key, &row)?;

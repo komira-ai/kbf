@@ -118,7 +118,6 @@ async fn a_frontend_with_enroll_listen_enrolls_a_node_with_a_token_from_its_api(
         &text,
         &Host {
             hostname: "node-07".to_owned(),
-            cpus: 4,
         },
     )
     .unwrap_or_else(|e| panic!("config: {e}"));

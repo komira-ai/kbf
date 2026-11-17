@@ -1,11 +1,11 @@
 //! The server's per-lease `action usage:` log line: what each lease that reported a
 //! `ResourceUsage` used, keyed by the action's shape so one target's action can be
-//! followed across builds (`docs/design/daemon.md#where-a-leases-time-went`).
+//! followed across builds (`docs/design/worker.md#where-a-leases-time-went`).
 //!
 //! **Lines.**
 //!
 //! - `action usage:`, one per accepted report whose result carries a `ResourceUsage`
-//!   (an OK run, and a failed one the daemon measured, whatever the outcome: for
+//!   (an OK run, and a failed one the worker measured, whatever the outcome: for
 //!   example an out-of-memory kill, a timeout, an infrastructure failure, a lost run),
 //!   whatever the scheduler does next (a killed
 //!   rung runs again higher up the memory ladder; each rung has its line):
@@ -17,7 +17,7 @@
 //!     booked_millicpus=<n|-> booked_memory_bytes=<n|->
 //!   ```
 //!
-//!   (one line). `exit_code` is the run's, as the daemon reported it for a run it says
+//!   (one line). `exit_code` is the run's, as the worker reported it for a run it says
 //!   ended (an OK status), and `-` for one it reports failed (a killed run has no exit
 //!   code). `mnemonic` and `target_hint` are what the client's `RequestMetadata`
 //!   said (buck2 says neither); a hint only, never a key. `target` and `target_kind`
@@ -36,7 +36,7 @@
 //!   (`key=… program="…" outputs=<n> patterns="<up to 8>…"`).
 //!
 //! A cancelled lease's result is refused (its holder is no longer current) and has no
-//! line here; the daemon's `lease phases:` line has its usage, and joins on `lease=` to
+//! line here; the worker's `lease phases:` line has its usage, and joins on `lease=` to
 //! the `lease granted` line, which names the key.
 //!
 //! **What the farm does** (`crate::farm`), one call at each seam, so a rewrite of the
@@ -179,7 +179,7 @@ pub fn shape_line(shape: &Shape) -> String {
     )
 }
 
-/// The exit code `result` reports: the action's, for a run the daemon says ended (an OK
+/// The exit code `result` reports: the action's, for a run the worker says ended (an OK
 /// status with an `action_result`); `None` for one it reports failed or without a result.
 #[must_use]
 pub fn exit_code(result: &worker::Result) -> Option<i32> {

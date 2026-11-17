@@ -85,14 +85,14 @@ impl<M: MetaLog, O: ObjectStore + 'static> ActionCache for ActionCacheService<M,
     }
 
     /// Always PERMISSION_DENIED, before the request is read: a client never writes the
-    /// action cache (`docs/design/storage.md#the-closure-check`). The daemon that ran an
+    /// action cache (`docs/design/storage.md#the-closure-check`). The worker that ran an
     /// action writes its result through [`Cache::write_action_result`].
     async fn update_action_result(
         &self,
         _request: Request<UpdateActionResultRequest>,
     ) -> Result<Response<ActionResult>, Status> {
         Err(Status::permission_denied(
-            "clients cannot write the action cache; only the daemon that ran an action does",
+            "clients cannot write the action cache; only the worker that ran an action does",
         ))
     }
 }

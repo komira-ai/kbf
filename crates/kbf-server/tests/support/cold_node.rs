@@ -13,8 +13,8 @@ use kbf_map::MemberState;
 use kbf_objstore::s3::fake::FakeS3;
 use kbf_proto::kbf::enroll::v1::StoreConfig;
 use kbf_server::StartFailure;
-use kbf_server::storage_half::{StorageHalf, start};
 use kbf_server::storage_node::{StorageFlags, command, parse};
+use kbf_server::storage_node::{StorageHandle, start_storage};
 use kbf_server::store_config::acks::Convergence;
 
 use kbf_state::Store as _;
@@ -157,8 +157,8 @@ pub fn bucket(rig: &Rig) -> String {
     format!("s3://bkt/kbf/?endpoint={}", rig.s3.endpoint())
 }
 
-pub async fn started(flags: &StorageFlags) -> Result<StorageHalf, Box<dyn Error>> {
-    start(flags, never).await
+pub async fn started(flags: &StorageFlags) -> Result<StorageHandle, Box<dyn Error>> {
+    start_storage(flags, never).await
 }
 
 /// The most turns [`spin_until`] takes. A turn is one yield, microseconds, so this is far
@@ -237,8 +237,8 @@ pub fn class(error: &(dyn Error + 'static)) -> StartFailure {
 
 /// Writes a blob through the node's storage and reads it back; the cache is open on
 /// whatever store the node chose, and a write that store refuses fails here.
-pub async fn round_trip(half: &StorageHalf, text: &str) {
-    let storage = half.storage();
+pub async fn round_trip(node: &StorageHandle, text: &str) {
+    let storage = node.storage();
     let digest = storage
         .put(Bytes::copy_from_slice(text.as_bytes()))
         .await

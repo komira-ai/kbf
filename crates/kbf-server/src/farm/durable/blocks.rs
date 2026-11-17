@@ -70,7 +70,7 @@ impl Durable {
     }
 
     /// Raises the stored epoch by one: an operator's bump, for the day the store was
-    /// restored from a backup and the daemons must drop the leases the lost history
+    /// restored from a backup and the workers must drop the leases the lost history
     /// granted. A frontend reads the epoch when it starts, so one that runs now keeps the
     /// epoch it started with. Returns the epoch before and the one stored now. A bump
     /// that loses to another writer reads the new row and bumps that.

@@ -10,7 +10,6 @@ use super::*;
 fn host() -> Host {
     Host {
         hostname: "Node-02.farm.example.com".to_owned(),
-        cpus: 8,
     }
 }
 
@@ -227,7 +226,6 @@ fn node_id_follows_the_pattern_and_the_default_is_refused_when_it_fails() {
     );
     let bad_host = Host {
         hostname: "build_box.lan".to_owned(),
-        cpus: 4,
     };
     let err = Config::parse(MINIMAL, &bad_host).expect_err("refused");
     assert_eq!(err.0.len(), 1);
@@ -336,6 +334,23 @@ fn a_typo_a_wrong_type_and_bad_toml_are_not_silently_ignored() {
     // Not TOML at all, and a repeated key (TOML itself refuses it).
     assert!(one("[frontend\nurl = 1").starts_with("@"));
     assert!(one(&format!("{MINIMAL}url = \"https://b.example.com\"\n")).contains("duplicate"));
+}
+
+/// Catches a file written for a node that ran the removed daemon being refused, or its
+/// `[daemon]` table letting any other key through: `data_dir` and `reserve_cpus` are read
+/// and ignored, whatever their value, and another key there is still unknown.
+#[test]
+fn the_removed_daemons_keys_are_ignored_and_another_key_of_its_table_is_unknown() {
+    let old = format!("{MINIMAL}[daemon]\ndata_dir = \"/var/lib/kbf/data\"\nreserve_cpus = 99\n");
+    assert_eq!(ok(&old), ok(MINIMAL));
+    assert_eq!(
+        one(&format!(
+            "{MINIMAL}[daemon]\ndata_dir = \"/d\"\ncpu-threads = 2\n"
+        )),
+        "daemon.cpu-threads@0: unknown field `cpu-threads`"
+    );
+    assert!(is_key("daemon", "data_dir") && is_key("daemon", "reserve_cpus"));
+    assert!(!is_own_table("daemon"));
 }
 
 #[test]
@@ -497,8 +512,8 @@ fn a_root_owned_system_alias_is_not_a_symlink_the_service_user_could_plant() {
 
 /// Catches a key that `kbf.toml` puts in `[tls]` and that is not enrollment's being accepted
 /// by an enrollment-only file (a typo of `trust` would start the node with the default), or
-/// reported without its table in the key, or only the first of several reported; a `[daemon]`
-/// table (an earlier release's) being taken for a table of enrollment's; and the same file
+/// reported without its table in the key, or only the first of several reported; the same for
+/// a key of `[daemon]` that is not one of the removed daemon's two ignored keys; and the same file
 /// read as a shared one (the flags' parser checks those keys) being refused.
 #[test]
 fn an_unknown_key_in_tls_is_refused_unless_the_file_is_shared() {
@@ -510,7 +525,10 @@ fn an_unknown_key_in_tls_is_refused_unless_the_file_is_shared() {
     assert_eq!(
         got,
         [
-            (String::new(), "unknown field `daemon`".to_owned()),
+            (
+                "daemon.driver".to_owned(),
+                "unknown field `driver`".to_owned()
+            ),
             ("tls.bogus".to_owned(), "unknown field `bogus`".to_owned()),
             ("tls.trsut".to_owned(), "unknown field `trsut`".to_owned()),
         ]

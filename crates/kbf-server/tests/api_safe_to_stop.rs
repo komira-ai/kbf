@@ -322,7 +322,7 @@ async fn a_daemon_is_safe_to_stop() {
     let reasons = said["reasons"].as_array().expect("reasons");
     assert_eq!(reasons.len(), 1, "{said}");
     let line = reasons[0].as_str().unwrap_or_default();
-    assert!(line.contains("daemon"));
+    assert!(line.contains("worker"));
 
     let unknown = "/v1/members/linux-2/safe-to-stop";
     let (code, said) = api_http::get(api, unknown).await;

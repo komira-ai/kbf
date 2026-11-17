@@ -3,9 +3,7 @@
 //!
 //! CAS reads and writes, FindMissing, the action cache and the `Segments` service, over
 //! one store. Today the one implementation is `kbf-front`'s adapter over its own cache
-//! (`kbf_front::CacheStorage`), and `kbf-server`'s in-process store
-//! (`kbf_server::LocalStore`, what an in-process caller reads and writes through)
-//! holds an `Arc<dyn Storage>`. The cache's code moves into this crate later; the trait
+//! (`kbf_front::CacheStorage`). The cache's code moves into this crate later; the trait
 //! is the boundary it moves behind, so the callers do not change when it does. A storage
 //! process of its own serves one over gRPC, and [`service::RemoteStorage`] is the
 //! implementation that calls it ([`service`]).
@@ -28,7 +26,6 @@
 pub mod flush;
 pub mod in_flight;
 pub mod legacy;
-pub mod local_cache;
 pub mod repair;
 pub mod replicate;
 pub mod service;

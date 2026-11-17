@@ -3,7 +3,7 @@
 //! The manifest's `timing` is the task's own account of how long its steps took (fetching the
 //! inputs, running the command, writing the packs), in milliseconds. It is a claim, not a
 //! measurement of the frontend's: it is carried so that run history and the estimator read an
-//! executor run as they read a daemon's (`input_fetch_*`, `execution_*`, `output_upload_*`),
+//! executor run as they read a worker's (`input_fetch_*`, `execution_*`, `output_upload_*`),
 //! and is never used to decide anything.
 
 use std::time::{Duration, SystemTime};

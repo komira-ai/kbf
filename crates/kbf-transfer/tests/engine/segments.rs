@@ -635,7 +635,7 @@ async fn uploads_of_one_spool_are_in_flight_together() {
     }
 }
 
-/// Files in a scratch directory, hashed the way a driver's walk hashes them, as records
+/// Files in a scratch directory, hashed the way a client's walk hashes them, as records
 /// whose bytes are read from the files when they are sent; and their REAPI digests.
 fn file_records(name: &str, blobs: &[Vec<u8>]) -> (PathBuf, Vec<Record>, Vec<Digest>) {
     let dir = scratch(name);
@@ -873,7 +873,7 @@ async fn a_record_shorter_than_its_digest_fails_with_a_read_error() {
 }
 
 /// The sparse file `name` of `size` bytes in a scratch directory, as the source a
-/// driver's walk leaves for it.
+/// client's walk leaves for it.
 fn sparse_source(name: &str, size: u64) -> (File, Source) {
     let dir = scratch(name);
     let path = dir.join("f");
@@ -893,7 +893,7 @@ fn sparse_source(name: &str, size: u64) -> (File, Source) {
 }
 
 /// The record of the sparse file `name` of `size` bytes, hashed a megabyte at a time
-/// as a driver's walk hashes it, whose bytes are read from the file when it is sent.
+/// as a client's walk hashes it, whose bytes are read from the file when it is sent.
 fn sparse_record(name: &str, size: u64) -> Record {
     use std::os::unix::fs::FileExt as _;
     let (file, source) = sparse_source(name, size);

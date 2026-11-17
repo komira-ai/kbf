@@ -41,7 +41,7 @@ const HEARTBEAT: Duration = Duration::from_secs(1);
 /// What the container driver adds to 1.5 times a booking for the hard memory cap of a run
 /// (`kbf-driver-container`, `cgroup.rs`). A job needs the memory it is sent and its host caps
 /// it there, so the executor sends the same number and an out-of-memory job is the same event
-/// as an out-of-memory run on a daemon.
+/// as an out-of-memory run on a worker.
 const HARD_CAP_PAD: u64 = 512 << 20;
 
 /// The network a job of the executor is given on its host (`--executor-network`): the

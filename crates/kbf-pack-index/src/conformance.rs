@@ -654,7 +654,7 @@ pub fn p9_a_pack_that_cannot_exist_is_refused<B: PackBackend>(backend: &B) {
     );
 }
 
-/// P10: two connections record the same pack at once, as a daemon's retry does while its first
+/// P10: two connections record the same pack at once, as a client's retry does while its first
 /// attempt is still in flight. Both succeed, exactly one answers that the pack was new, both
 /// report the rows the pack was recorded with, and the index holds one pack and one row per
 /// blob.

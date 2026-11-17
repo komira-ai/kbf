@@ -86,7 +86,7 @@ fn a_finish_puts_the_action_beside_its_result_for_as_long() {
 }
 
 /// Asserts that a refusal puts the `doneof/` row too: an operation refused for want of a
-/// daemon is found by its name afterwards, with the reason it was refused for.
+/// worker is found by its name afterwards, with the reason it was refused for.
 #[test]
 fn a_refusal_puts_the_action_beside_its_result_too() {
     let store = Racing::new();

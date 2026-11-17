@@ -1,5 +1,5 @@
-//! The storage half (`kbf_server::storage_half`): the storage node `kbf storage` starts,
-//! with the storage it serves handed to the caller.
+//! The storage node `kbf storage` starts (`kbf_server::storage_node`): the storage it serves
+//! handed to a test, and its stop draining a write in flight.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -9,8 +9,7 @@ use futures::stream;
 use kbf_front::{Cache, CacheStorage, SegmentsConfig};
 use kbf_proto::google::bytestream::WriteRequest;
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
-use kbf_server::storage_half::start;
-use kbf_server::storage_node::{StorageFlags, command, parse};
+use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
 use kbf_server::{BoundStorage, StorageListener, bind_storage};
 use kbf_storage::Storage as _;
 use kbf_storage::service::RemoteStorage;
@@ -18,7 +17,10 @@ use sha2::Digest as _;
 
 /// A directory of its own, removed when it drops.
 fn dir(name: &str) -> kbf_testkit::dir::TestDir {
-    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("storage-half-{name}"))
+    kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("storage-handle-{name}"),
+    )
 }
 
 /// The flags of `kbf storage`, plain text on a loopback port, and these.
@@ -40,48 +42,29 @@ fn file_stores(dir: &Path) -> Vec<String> {
     ]
 }
 
-/// Whether any file under `dir` holds `needle`, as bytes anywhere in it.
-fn on_disk(dir: &Path, needle: &[u8]) -> bool {
-    std::fs::read_dir(dir).expect("dir").flatten().any(|entry| {
-        let path = entry.path();
-        if path.is_dir() {
-            return on_disk(&path, needle);
-        }
-        let body = std::fs::read(&path).unwrap_or_default();
-        body.windows(needle.len()).any(|w| w == needle)
-    })
-}
-
-/// A blob of a size and content nothing else in the directory has, and its bytes.
-fn marked(seed: u8) -> (kbf_front::VerifiedBlob, Bytes) {
-    let body: Vec<u8> = (0..4096_usize).map(|i| (i % 251) as u8 ^ seed).collect();
-    let bytes = Bytes::from(body);
-    (kbf_front::VerifiedBlob::hashed(bytes.clone()), bytes)
-}
-
 fn never() -> std::io::Result<std::future::Pending<()>> {
     Ok(std::future::pending())
 }
 
-/// Catches a handle that is not the storage the listener serves (the daemon half would
-/// read and write another store than other nodes reach over gRPC), and a start line that
-/// is not `kbf storage`'s: a blob put through the handle is read back over gRPC from the
-/// listener, and one written over gRPC is read through the handle.
+/// Catches a handle that is not the storage the listener serves (a test would read and write
+/// another store than other nodes reach over gRPC), and a start line that is not
+/// `kbf storage`'s: a blob put through the handle is read back over gRPC from the listener,
+/// and one written over gRPC is read through the handle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_handle_is_the_storage_the_listener_serves() {
     let dir = dir("same");
-    let half = start(&flags(&file_stores(&dir)), never)
+    let node = start_storage(&flags(&file_stores(&dir)), never)
         .await
         .expect("starts");
-    let line = half.start_line().to_owned();
+    let line = node.start_line().to_owned();
     let want = format!(
         "kbf-storage {} storage={} log=",
         kbf_server::SERVER_VERSION,
-        half.addr
+        node.addr
     );
     assert!(line.starts_with(&want), "{line}");
-    let (storage, addr) = (half.storage(), half.addr);
-    tokio::spawn(half.serve());
+    let (storage, addr) = (node.storage(), node.addr);
+    tokio::spawn(node.serve());
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .expect("endpoint")
         .connect()
@@ -94,37 +77,6 @@ async fn the_handle_is_the_storage_the_listener_serves() {
     let there = Bytes::from_static(b"put over gRPC, read in-process");
     let digest = remote.put(there.clone()).await.expect("put");
     assert_eq!(storage.read_blob(&digest).await.expect("read"), there);
-}
-
-/// Catches a half that serves past its shutdown future, or never starts serving.
-#[tokio::test]
-async fn the_half_stops_when_told() {
-    let dir = dir("stop");
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let half = start(&flags(&file_stores(&dir)), || {
-        Ok(async move {
-            let _ = stopped.await;
-        })
-    })
-    .await
-    .expect("starts");
-    let serving = tokio::spawn(half.serve());
-    stop.send(()).expect("stop");
-    serving.await.expect("task").expect("serves to the end");
-}
-
-/// Catches a start whose listener is checked after a store is opened, or not at all: a
-/// plain-text listener off loopback is refused as `kbf storage` refuses it, and no store
-/// is made.
-#[tokio::test]
-async fn a_listener_kbf_storage_refuses_is_refused_first() {
-    let d = dir("refused");
-    let mut wide = file_stores(&d);
-    wide.push("--storage-listen=0.0.0.0:0".to_owned());
-    let refused = start(&flags(&wide), never).await.err().expect("refused");
-    let said = refused.to_string();
-    assert!(said.contains("0.0.0.0:0"), "{said}");
-    assert!(!d.join("hot").exists(), "a refused start opened a store");
 }
 
 /// A storage that tells the test when the service first asks it about a blob: a ByteStream
@@ -328,62 +280,4 @@ async fn a_stop_drains_a_write_in_flight() {
         kbf_types::Digest::parse(kbf_types::DigestFunction::Sha256, &format!("{hash}/2048"))
             .expect("digest");
     assert_eq!(held.read_blob(&digest).await.expect("read"), blob);
-}
-
-/// The storage half's own assembly of `--ram-ack-bytes` (it is not `kbf storage`'s): the
-/// half holds a blob with the budget in its cache, and its stop writes it to the disk.
-#[tokio::test]
-async fn the_half_with_a_ram_budget_writes_what_it_holds_when_it_stops() {
-    let dir = dir("ram-stop");
-    let mut more = file_stores(&dir);
-    more.extend([
-        "--ram-ack-bytes=1048576".to_owned(),
-        "--ram-drain-deadline=5".to_owned(),
-    ]);
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let half = start(&flags(&more), || {
-        Ok(async move {
-            let _ = stopped.await;
-        })
-    })
-    .await
-    .expect("starts");
-    let (blob, bytes) = marked(9);
-    assert!(!on_disk(&dir, &bytes), "not on disk before the hold");
-    assert_eq!(half.hold(&blob), Some(kbf_front::Hold::Held));
-    let serving = tokio::spawn(half.serve());
-    stop.send(()).expect("stop");
-    serving.await.expect("task").expect("serves to the end");
-    assert!(on_disk(&dir, &bytes), "the stop wrote the held blob");
-}
-
-/// The storage half's own assembly of the stop's flush (it is not `kbf storage`'s): a blob
-/// put through the handle is acknowledged from the open block of the half's write tier,
-/// which the flusher seals only 30 s after it opened, so the cold store holds none of its
-/// bytes until the stop and holds them when `serve` returns, with no RAM budget set.
-/// Catches: the half's assembly leaves out `ram.after(..)`; the stop flushes only when
-/// `--ram-ack-bytes` is set.
-#[tokio::test]
-async fn the_half_with_a_hot_store_flushes_what_it_staged_when_it_stops() {
-    let dir = dir("hot-stop");
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let half = start(&flags(&file_stores(&dir)), || {
-        Ok(async move {
-            let _ = stopped.await;
-        })
-    })
-    .await
-    .expect("starts");
-    let (_, bytes) = marked(11);
-    let storage = half.storage();
-    storage.put(bytes.clone()).await.expect("acknowledged");
-    let cold = dir.join("cold");
-    assert!(
-        !on_disk(&cold, &bytes),
-        "staged on the hot store, not flushed"
-    );
-    let serving = tokio::spawn(half.serve());
-    stop.send(()).expect("stop");
-    serving.await.expect("task").expect("serves to the end");
-    assert!(on_disk(&cold, &bytes), "the stop flushed the staged block");
 }

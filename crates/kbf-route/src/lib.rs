@@ -1,6 +1,6 @@
 //! Calls to the storage nodes of a farm, routed by the storage map
-//! (`docs/design/architecture-v2.md`, sections 6 to 8). The frontend and the daemon use
-//! one [`Router`]: it answers which node holds a blob, reads it from the first owner that
+//! (`docs/design/architecture-v2.md`, sections 6 to 8). The frontend and the clients of
+//! `kbf-transfer` use one [`Router`]: it answers which node holds a blob, reads it from the first owner that
 //! does, and sends a write to the owner that takes it first.
 //!
 //! # What the router does
@@ -61,7 +61,7 @@
 //!   as it always was. It covers every call that takes a blob or an entry to its owners
 //!   and a read before its first byte. A read that fails after bytes have passed on is
 //!   resumed ([`MAX_RESUMES`]) without a hold. A router made by [`Router::new`] holds
-//!   nothing; the frontend and the daemon use [`DEFAULT_HOLD`]. A caller that talks to the
+//!   nothing; the frontend and those clients use [`DEFAULT_HOLD`]. A caller that talks to the
 //!   nodes itself from a [`Placement`] (the frontend's pass-through of a ByteStream) holds
 //!   with the same primitives: a [`Hold`] of its own, begun for each call, and its
 //!   [`Waiting::again`] between tries, which pauses and ends as the router's hold does.

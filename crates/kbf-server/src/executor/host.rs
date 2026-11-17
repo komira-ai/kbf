@@ -1,10 +1,10 @@
-//! A virtual worker: the daemon the job service stands behind.
+//! A virtual worker: the worker the job service stands behind.
 //!
 //! The farm sees an ordinary worker, `js:<frontend>-<n>` (or, for the Macs,
 //! `js-mac:<frontend>-<n>`, [`crate::executor::mac`]), that registers, takes `Start`s,
 //! lists what it runs in its heartbeats and reports results. Nothing of the farm knows
 //! otherwise but its registration: the worker owns the receiving end of the `Outbound` channel
-//! the farm sends a daemon's messages on, and calls the farm's own `register`, `resize`, `heartbeat`
+//! the farm sends a worker's messages on, and calls the farm's own `register`, `resize`, `heartbeat`
 //! and `report`. Its shape (the cores, the memory and the slots the flags declare) is how many
 //! actions of which size the farm may have in flight on it; each becomes a job, and the job
 //! service decides which host runs it. The worker holds no host, and is never retired because a host went
@@ -23,7 +23,7 @@
 //!   and `native-whole-machine` drivers ([`DRIVERS`](super::config::DRIVERS)), a Mac worker's
 //!   only `native`, and neither a device, so the farm places `action` leases on both and
 //!   `whole_machine` leases on a Linux one, never a device or a `job`; the
-//!   worker fences every job it submits, as a daemon does that is told nothing else.
+//!   worker fences every job it submits, as a worker does that is told nothing else.
 //!   `Start.kind` is read: a `whole_machine` lease is submitted as a job that needs the whole
 //!   host, any other as one that needs the share the farm booked.
 //!
@@ -245,7 +245,7 @@ impl HostWorker {
     }
 
     /// The send time of the heartbeat `seq` (0 is the registration), if it is one the worker
-    /// sent and still remembers: a `Start` that names another is refused, as a daemon refuses.
+    /// sent and still remembers: a `Start` that names another is refused, as a worker refuses.
     pub(super) fn sent_at(&self, seq: u64) -> Option<Instant> {
         self.beats
             .iter()

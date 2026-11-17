@@ -15,9 +15,6 @@ publish = false
 # ahead keeps version choices in one place. A dependency enters Cargo.lock only when
 # a member first uses it.
 [workspace.dependencies]
-# `Io` and `Spawner` of the `runc` client (below) are async traits; the container driver
-# implements both. Already in the tree through runc.
-async-trait = "0.1.92"
 # The operator API's HTTP server (kbf-server). Already in the tree through tonic; no
 # default features: no form, query or json extractors, whose parsers are not needed.
 axum = { version = "0.8.9", default-features = false }
@@ -27,8 +24,8 @@ clap = { version = "4.6.7", features = ["derive"] }
 # The hardware CRC-32C (SSE4.2 / ARMv8) of segment records (kbf-segments), with a portable
 # fallback; the same values as the table the crate had before.
 crc32c = "0.6.8"
-# The CRC-32 of the worker input cache's index snapshot (kbf-daemon). Already in the
-# tree through flate2.
+# The CRC-32 of the one-pass object a task writes (kbf-task-pack). Already in the tree
+# through flate2.
 crc32fast = "1.5.2"
 # gzip for the tar.gz archives kbf-deploy installs (`mdm install`) and `cargo xtask
 # fetch` unpacks, and the deflate behind zip (below); the pure-Rust backend, no C zlib.
@@ -58,8 +55,8 @@ httpdate = "1.0.3"
 # The kernel's random source behind the MDM host layer's secrets (mdm-host); already in the
 # tree through ring.
 getrandom = "0.2.17"
-# `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
-# standard library reaps children without returning their resource usage.
+# System calls the standard library does not wrap (process, file and user ids, signals,
+# `wait4`): the crates that own those resources.
 libc = "0.2.190"
 # xz for the tar.xz archives `cargo xtask fetch` unpacks; pure Rust, no C liblzma.
 lzma-rs = "0.3.0"
@@ -76,7 +73,6 @@ hyper-util = { version = "0.1.21", default-features = false }
 # (a lease id, say) is the same type in every kbf crate; a test in kbf-integration-test
 # reads Cargo.lock and refuses a second source. The revision is raised by a commit of its
 # own, holding only the raise and the fixes it forces, and the whole CI runs on it.
-js-agent-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "60b75be836ad4c0a3a8f01306aae683b703dda8d" }
 js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "60b75be836ad4c0a3a8f01306aae683b703dda8d" }
 js-proto = { git = "https://github.com/komira-ai/jobscheduler", rev = "60b75be836ad4c0a3a8f01306aae683b703dda8d" }
 js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "60b75be836ad4c0a3a8f01306aae683b703dda8d" }
@@ -95,10 +91,6 @@ tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "309ad2d71b7
 # The trees API's wire contract (TreesService: its proto and generated stubs), at the same
 # revision; members take its `client` feature, and kbf-trees-client's fake the `server` one.
 tierstore-trees-api = { git = "https://github.com/komira-ai/tierstore", rev = "309ad2d71b745f1827f9292976411e25e8b991e9" } # v0.3.111
-md-5 = "0.11.0"
-# Typed OCI runtime configuration (`config.json`) for the container driver's crun
-# backend. The 0.7 line is the one `runc` (below) uses, so the tree holds one copy.
-oci-spec = "0.7.1"
 # The enrollment profile kbf-deploy writes (`mdm push-cert`), an XML property list.
 # No default features: the profile is built as a value, not through serde.
 plist = { version = "1.10.1", default-features = false }
@@ -116,8 +108,6 @@ pulldown-cmark = { version = "0.13.5", default-features = false }
 # the tree through axum.
 percent-encoding = "2.3.2"
 protox = "0.9.1"
-rand = "0.10.3"
-rand_chacha = "0.10.0"
 # Test certificates only. ring is the crypto provider tonic's `tls-ring` uses too.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 # Plain HTTP only: TLS brings a crypto provider, added with the first TLS endpoint.
@@ -125,7 +115,6 @@ reqwest = { version = "0.13.5", default-features = false }
 # ed25519 checks of software sets and key statements. Already in the tree
 # through rustls.
 ring = "0.17.14"
-roxmltree = "0.21.1"
 # TLS on the ring provider tonic's `tls-ring` uses too.
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 # The host's trusted roots for kbf-deploy's HTTPS downloads and checks (`mdm fetch`,
@@ -133,10 +122,6 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 rustls-native-certs = "0.8.4"
 # zstd for the .zst downloads `cargo xtask fetch` unpacks; pure Rust, no C zstd.
 ruzstd = "0.9.1"
-# The OCI runtime client (containerd/rust-extensions) the container driver's crun backend
-# drives `crun` through: run, kill and delete. The async client; the crate has no
-# synchronous client in the same build.
-runc = { version = "0.3.0", features = ["async"] }
 # The SQLite state store (kbf-state): the C library is compiled in (`bundled`), so the file
 # format and WAL behaviour do not depend on the host's libsqlite3; `hooks` for the commit
 # counter. No default features: no wasm shim. The version is the one js-state takes (one
@@ -275,7 +260,7 @@ xtask = { path = "crates/xtask" }
 # its `lib.rs` (an in-source attribute overrides this table), and the layering test in
 # `kbf-integration-test` checks that the deny is present.
 [workspace.lints.rust]
-# `coverage` is set by cargo-llvm-cov (crates/kbf-farm-test and crates/kbf-daemon-test compile their tests out under it).
+# `coverage` is set by cargo-llvm-cov (crates/kbf-integration-test/tests/mixed_version.rs compiles its tests out under it).
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 
 [workspace.lints.clippy]

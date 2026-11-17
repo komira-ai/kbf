@@ -91,6 +91,15 @@ rcgen = { workspace = true, features = ["x509-parser"] }
 sha2.workspace = true
 time.workspace = true
 x509-parser = { workspace = true, features = ["verify"] }
+# tests/frontend_shutdown.rs: a job service in the process (`kbf_job_client::fake`) that a
+# `kbf frontend` child places actions on, and the messages of the REAPI calls made to the child.
+js-proto.workspace = true
+kbf-job-client = { workspace = true, features = ["fake"] }
+# The S3 service on loopback that the frontend's pack store flags (which the executor needs) point at.
+kbf-objstore = { workspace = true, features = ["testkit"] }
+# The kbf base tree bundle of this build's release that `--executor-base-tree` names.
+kbf-tree-bundle.workspace = true
+prost.workspace = true
 
 # The farm of real `kbf` processes the rehearsal (tests/rehearsal_in_a_box.rs) drives.
 [target.'cfg(target_os = "linux")'.dev-dependencies]

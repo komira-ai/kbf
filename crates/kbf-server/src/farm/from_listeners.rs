@@ -1,6 +1,5 @@
 //! The farm a server runs, built from its listeners' settings: the one place the
-//! all-in-one server and the frontend both take them from, so a setting added here reaches
-//! both.
+//! frontend takes them from.
 
 use kbf_front::Backend;
 use kbf_sched::WholeNodeConfig;

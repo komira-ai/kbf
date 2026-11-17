@@ -6,8 +6,8 @@
 //! (`objstore_generation`); a node whose applied generation differs calls
 //! `ColdStore.GetStoreConfig` ([`service`]) over its storage certificate and reports what
 //! it did in its next `Heartbeat` (`applied_objstore_generation`, `apply_status`), which
-//! [`acks`] keeps in the state store with a time to live. Nothing here reaches a daemon: the daemon's wire has no
-//! such field (`kbf-proto`'s `tests/daemon_wire.rs`).
+//! [`acks`] keeps in the state store with a time to live. Nothing here reaches a worker:
+//! only the storage role may call `GetStoreConfig` (`worker_roles`).
 //!
 //! **The source** ([`StoreConfigSource`]) is whatever holds the registration: the state
 //! store's rows and the secret file. It is a trait because the rows and the files belong

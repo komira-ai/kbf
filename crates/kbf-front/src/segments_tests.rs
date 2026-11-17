@@ -104,7 +104,7 @@ fn a_job_outliving_its_receiving_upload_sees_nothing() {
 }
 
 /// Catches: an object ref that drops a node writer's member or boot on the wire (a
-/// daemon would read another object, or an epoch writer's), or a read that takes a ref
+/// worker would read another object, or an epoch writer's), or a read that takes a ref
 /// naming two writers, or half a node, as one of them.
 #[test]
 fn object_refs_name_one_writer_or_are_refused() {

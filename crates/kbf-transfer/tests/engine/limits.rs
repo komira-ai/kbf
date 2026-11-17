@@ -15,7 +15,7 @@ use super::fake::{Fake, lock, until, within};
 use super::proxy::{Proxy, windows};
 use super::{engine, patterned};
 
-/// T-1 (docs/design/worker-cache.md#10-test-plan). 16 leases each read the same 1,000
+/// 16 leases each read the same 1,000
 /// blobs (half of them in reverse order) while the server holds every read: the reads
 /// in flight never pass `--transfer-in-flight` (and reach it), each digest is read from
 /// the server once, the other 15,000 requests join those reads, and all of it goes over
@@ -75,7 +75,7 @@ async fn t1_sixteen_leases_share_one_limit_one_connection_and_one_read_per_diges
     assert_eq!(engine.stats().fetches, 0);
 }
 
-/// T-1 for the other requests the limit counts. 16 leases upload blobs from memory
+/// The test above, for the other requests the limit counts. 16 leases upload blobs from memory
 /// (`put`) and from chunks (`put_chunks`), each after its FindMissing, while the server
 /// holds every write before it commits. Three held phases:
 /// 1. The server holds FindMissing too. Calls go one at a time and uploads wait for
@@ -88,8 +88,7 @@ async fn t1_sixteen_leases_share_one_limit_one_connection_and_one_read_per_diges
 ///    4 permits and stay at the server, and one that took no permit is counted past
 ///    the limit. FindMissing asks four digests a call, so calls keep coming.
 /// Then the gates open, and the most requests ever served at once (reads, writes and
-/// FindMissing together) is the limit. The per-walk limits of kbf-outputs and the
-/// container driver are per lease, so 16 leases are held to the process's limit only
+/// FindMissing together) is the limit. The per-walk limits of kbf-outputs are per lease, so 16 leases are held to the process's limit only
 /// by the engine. Catches: no permit in `put` (phase 2), in
 /// `put_chunks` (phase 2), in FindMissing (phases 1 and 3), FindMissing releasing its
 /// permit before the call (phase 1).
@@ -358,7 +357,7 @@ async fn a_message_up_to_sixteen_mib_and_framing_is_decoded() {
     assert_eq!(engine.get(&digest).await, Ok(bytes));
 }
 
-/// T-3. With one request in flight, lease A asks for X, Y and Z: X is being read (held
+/// With one request in flight, lease A asks for X, Y and Z: X is being read (held
 /// by the server), Y and Z are queued. Lease B asks for Y too. Lease A is dropped. X
 /// and Z are given up, Z never reaching the server; Y, which B still waits for, is read
 /// once and B gets it. Catches leaked work (a dropped lease's queued reads still run)

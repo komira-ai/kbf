@@ -11,7 +11,7 @@ use super::engine;
 use super::fake::{Fake, Find, lock, within};
 use super::front::{chunked, failing};
 
-/// C-11, first half (docs/design/worker-cache.md#10-test-plan). A blob the server
+/// A blob the server
 /// holds is not uploaded, as bytes or as chunks (`outputs_present`); one the node read
 /// from the server earlier, but the server has since lost, is uploaded; a new one is.
 /// Catches FindMissing answered by anything but the server (the node's own copy of a
@@ -49,7 +49,7 @@ async fn c11_the_server_decides_what_is_uploaded() {
     assert_eq!(stats.written_bytes, lost.size_bytes as u64 + 5000);
 }
 
-/// C-11, second half. Against a worker listener that does not serve FindMissing
+/// Against a worker listener that does not serve FindMissing
 /// (UNIMPLEMENTED), every blob is uploaded, held or not, and none fails; FindMissing is
 /// asked once for the life of the engine (the uploads queued behind that call are not
 /// asked either) and counted in `find_missing_unavailable`. Catches UNIMPLEMENTED
@@ -110,7 +110,7 @@ async fn a_find_missing_that_fails_leaves_the_blob_to_be_uploaded() {
     assert_eq!(engine.stats().find_missing_unavailable, 0);
 }
 
-/// One question for a lease's whole output set, the way the container driver asks
+/// One question for a lease's whole output set, the way a client asks
 /// (the 14,245 distinct outputs of one action took 785 s to upload when each upload
 /// asked for itself, 64 uploads at a time). `missing` over 15,000 digests, 14,000 of them
 /// held, asks in 15 calls of 1000 (`--transfer-find-missing-chunk`), all 15 out at the
@@ -348,7 +348,7 @@ async fn a_write_in_memory_is_retried_and_a_streamed_one_is_not() {
 }
 
 /// Catches `written_blobs` left uncounted for a streamed write that stored a new blob
-/// (the native driver uploads outputs this way), and counted for a write before it is
+/// (a streamed upload of an output file), and counted for a write before it is
 /// sent (a write refused on every attempt stores nothing). Catches: no
 /// `written_blobs` add on `put_chunks`' success, `(1, 0, 3000)`; `put`'s add moved before
 /// the write, counting every attempt, `2` for the refused blob.
@@ -415,8 +415,8 @@ async fn writes_are_cut_to_the_chunk_size() {
     assert!(lock(&fake.writes).contains(&label(&empty)));
 }
 
-/// Catches a lease's counters left out of its log line, or named otherwise than the
-/// design's `TransferStats`.
+/// Catches a lease's counters left out of its log line, or named otherwise than
+/// `TransferStats`.
 #[test]
 fn a_leases_stats_print_every_counter() {
     let stats = TransferStats {

@@ -301,8 +301,7 @@ fn a_block_deleted_under_the_tier_reads_as_not_here() {
     ));
 }
 
-/// Catches a tier whose node keeps its local copies in the one cache
-/// (`kbf_storage::local_cache`) still keeping a flushed copy: a second copy of every
+/// Catches a tier with its flushed copies off still keeping one: a second copy of every
 /// flushed blob on the same disk (defect "two directories"). Without flushed
 /// copies, a flushed block is deleted, stops counting, is read by no one (a reader goes
 /// to the store), and a reservation does not see it.

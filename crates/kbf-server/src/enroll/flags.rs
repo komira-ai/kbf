@@ -164,13 +164,13 @@ pub fn args() -> Vec<Arg> {
             WORKER,
             "enroll-worker-endpoint",
             "URL",
-            "The https URL a daemon dials (--server), told to every node. Empty: none.",
+            "The https URL a worker dials (--server), told to every node. Empty: none.",
         ),
         flag(
             CAS,
             "enroll-cas-endpoint",
             "URL",
-            "What --cas is for a daemon-only node, told to every node. Empty: none.",
+            "What --cas is for a worker-only node, told to every node. Empty: none.",
         ),
         flag(
             STORAGE_PORT,

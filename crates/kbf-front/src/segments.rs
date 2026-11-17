@@ -1,4 +1,4 @@
-//! `kbf.worker.v1.Segments`: a daemon uploads an action's outputs as whole segments
+//! `kbf.worker.v1.Segments`: a worker uploads an action's outputs as whole segments
 //! with one commit, and reads blobs as ranges of the objects that hold them
 //! (`docs/design/write-path.md`, section 4).
 //!
@@ -24,7 +24,7 @@
 //!   bytes received unbroken from its start, whichever order the ranges come in, on
 //!   the cache's hashing pool (`--cpu-threads`, blocking pool, off the runtime
 //!   workers), and a record that does not hash to its digest is refused at once, since
-//!   the PUT is the only copy. *With a write tier* nothing is hashed here: the daemon's
+//!   the PUT is the only copy. *With a write tier* nothing is hashed here: the worker's
 //!   digests are trusted when the upload is acknowledged, and the flusher checks every
 //!   record before the PUT (`docs/design/write-path.md`, section 6.7).
 //! - **Commit** runs in a task of its own, detached from the call and the connection,
@@ -36,7 +36,7 @@
 //!   with a footer it builds from its own hashing. A segment the tier does not take (at
 //!   its budget, a disk error before the commit) is hashed then, if it was not, and PUT
 //!   and read back as a grouped segment is (a `--write-puts-in-flight` slot, the PUT
-//!   retried under a new key) with a footer built here (the daemon's CRC-32C values
+//!   retried under a new key) with a footer built here (the worker's CRC-32C values
 //!   never reach the store), and one `PutBlobs` commits the records of every PUT
 //!   segment. A second Commit waits for the first and returns its answer.
 //! - **ReadRange** is served from the write tier while the object is staged on it (or
@@ -84,7 +84,7 @@ pub const MAX_UPLOAD_RECORDS: usize = 16_384;
 pub const MAX_RANGE_BYTES: u64 = 4 << 20;
 
 /// The smallest `--segment-upload-max-bytes`, the most bytes one upload may hold in
-/// memory: 33 MiB, a daemon's upload of small files (32 MiB,
+/// memory: 33 MiB, a worker's upload of small files (32 MiB,
 /// `kbf_transfer::SEGMENT_UPLOAD_BYTES`) with room to spare. No record held in memory
 /// is over [`MAX_UNSTAGED_BLOB_BYTES`], and records written to the write tier as they
 /// arrive are not held, so an upload of any size can be admitted.
@@ -311,7 +311,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
 
     /// The service counting each upload in `open_writes` from its `Begin` until its commit
     /// ends or it is dropped, so a node that reports its open writes does not report none
-    /// while a daemon is uploading. Call before the service is cloned or served.
+    /// while a worker is uploading. Call before the service is cloned or served.
     ///
     /// # Panics
     /// If the service has been cloned.
@@ -421,7 +421,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                 "an upload of {records} records is over the {MAX_UPLOAD_RECORDS}-record limit"
             )));
         }
-        // With a write tier the daemon's digests are trusted here and checked by the
+        // With a write tier the worker's digests are trusted here and checked by the
         // flusher before the PUT; without one, the only copy is the PUT, so each record
         // is hashed as its bytes arrive. With one, each segment's records are written
         // to a range of their own on it as they arrive, if it has room (else held here).
@@ -568,7 +568,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                     .zip(&upload.declared)
                     .find_map(|(r, d)| r.first_missing(d));
                 if let Some(digest) = missing {
-                    // The upload stays open: the daemon may send what is missing.
+                    // The upload stays open: the worker may send what is missing.
                     return Err(Status::failed_precondition(format!(
                         "record {digest} was not wholly received"
                     )));

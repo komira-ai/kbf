@@ -93,8 +93,8 @@ impl Router {
     /// owner `Down` in the map, or every attempt UNAVAILABLE) and trying it again, with
     /// growing pauses, until an owner answers or `bound` has passed since the call began;
     /// then the call is UNAVAILABLE, as it is without a hold. A router made by
-    /// [`Router::new`] holds nothing (a bound of zero). The frontend and the daemon use
-    /// [`crate::DEFAULT_HOLD`].
+    /// [`Router::new`] holds nothing (a bound of zero). The frontend and the routed clients
+    /// use [`crate::DEFAULT_HOLD`].
     ///
     /// The hold covers every call that takes a blob or an entry to its owners, and a read
     /// before its first byte (an owner that accepts the read and fails as its first frame

@@ -46,7 +46,7 @@ impl CapabilitiesService {
 /// The capabilities the cache half serves.
 ///
 /// - SHA-256 only.
-/// - `update_enabled: false`: only daemons write the action cache.
+/// - `update_enabled: false`: only workers write the action cache.
 /// - One cache priority range, `[0, 0]`: retention follows the last touch alone
 ///   (`docs/design/storage.md#retention-and-touches`), so a priority is accepted and
 ///   changes nothing.

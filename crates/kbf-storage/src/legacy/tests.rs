@@ -14,13 +14,12 @@ fn every_path_renders_and_a_count_moves_only_its_own_row() {
     for labels in [
         r#"{kind="cas",source="bytestream"}"#,
         r#"{kind="cas",source="segments"}"#,
-        r#"{kind="cas",source="in_process"}"#,
         r#"{kind="ac",source="action_store"}"#,
-        r#"{kind="ac",source="in_process"}"#,
     ] {
         let row = format!("{name}{labels} 0");
         assert!(text.lines().any(|line| line == row), "{row} in {text}");
     }
+    assert!(!text.contains("in_process"), "{text}");
     assert_eq!(reads.total(), 0);
 
     reads.count(Path::AcActionStore);

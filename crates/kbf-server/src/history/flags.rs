@@ -12,8 +12,8 @@ use crate::config::{ConfigError, s3_store, s3_store_keyed};
 use crate::key_file::read_key_pair;
 use crate::stores::{FILE_PREFIX_ROOT, StoreUri};
 
-/// Display order of the history flags: after every other flag of the server and of the
-/// daemon that shares its help (`kbf all-in-one`), before `--help` (999).
+/// Display order of the history flags: after every other flag of the server, before
+/// `--help` (999).
 const AFTER_ALL: usize = 900;
 
 // The flags that turn build history on. With neither, nothing is recorded and the server
@@ -21,8 +21,7 @@ const AFTER_ALL: usize = 900;
 // on a flattened struct for the program's description.
 //
 // `--history-objects` needs a state store, which `HistoryFlags::open` checks when the
-// server starts rather than clap when it parses: `kbf all-in-one` always has one, though
-// its command line may not name it.
+// server starts rather than clap when it parses.
 #[derive(Clone, Debug, Default, clap::Args)]
 pub struct HistoryFlags {
     /// Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the one in `--history-credentials-file`, else the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory this process owns, not the cold store's). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded

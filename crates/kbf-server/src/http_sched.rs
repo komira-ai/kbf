@@ -1,7 +1,7 @@
 //! `GET /v1/leases` and `GET /v1/queue` on the operator API listener: what the scheduler
 //! holds and what waits for it (`docs/design/kbf-ui-v1.md` appendix A, N3 and N4).
 //!
-//! Both are reads of memory-only state: after a restart they are empty until the daemons
+//! Both are reads of memory-only state: after a restart they are empty until the workers
 //! reconnect, and a frontend lists only what its own scheduler holds. Like `GET /v1/nodes`
 //! they answer anyone who reaches the listener, and nothing is redacted.
 //!

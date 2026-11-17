@@ -1,7 +1,6 @@
 //! An input the worker could not fetch, end to end in one process: a REAPI client, the
-//! server, and a fake daemon that reports the lease FAILED_PRECONDITION with `MISSING`
-//! violations, as the real daemon does for a driver's `MissingBlob`
-//! (`kbf-daemon`, `lease::missing`). The client must get the answer REAPI asks for, on
+//! server, and a fake worker that reports the lease FAILED_PRECONDITION with `MISSING`
+//! violations, as a worker does for a driver's missing blob. The client must get the answer REAPI asks for, on
 //! which Bazel re-uploads the blobs and executes again (failure classes, section 3).
 //!
 //! A module of the `execute` test binary, not a binary of its own: `Farm` is generic,

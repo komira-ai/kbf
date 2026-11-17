@@ -28,7 +28,7 @@ use super::tails::{Job, Tails};
 /// the list, and its records leave by the writer's age cut instead of at a close.
 const OPEN_CAP: usize = 4096;
 
-/// The NUMA node numbers a run record keeps memory for: a daemon reports a handful, and
+/// The NUMA node numbers a run record keeps memory for: a worker reports a handful, and
 /// the list is indexed by node.
 const MAX_NUMA_NODES: u32 = 64;
 
@@ -399,7 +399,7 @@ pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
                 wall_us: f.wall_micros.or((wall > 0).then_some(wall)),
             }),
         node_cpu_pressure_centi: usage.and_then(|u| u.node_cpu_pressure_centi),
-        // What the lease was granted, as the build pages show it; the daemon's own report
+        // What the lease was granted, as the build pages show it; the worker's own report
         // (the same figure) only for a lease the server never started.
         booked_millicpus: run
             .and_then(|r| r.booked_millicpus)

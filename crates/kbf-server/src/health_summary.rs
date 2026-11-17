@@ -9,7 +9,7 @@
 //!   whether or not the server is ready, and says which in `ready`.
 //! - `nodes`: [`Farm::nodes`], the list of `GET /v1/nodes`, each node counted once, in
 //!   the first of these that holds: `disconnected` (its stream is closed), `quarantined`
-//!   (its daemon reported a quarantine), then its placement: `cordoned`, `draining` (a
+//!   (its worker reported a quarantine), then its placement: `cordoned`, `draining` (a
 //!   drain running or paused at its deadline), `drained`, or `serving`. `total` is the
 //!   number of nodes listed, and is the sum of the six.
 //! - `queue`: `depth` and `oldest_age_ms`, both from one [`Farm::queue_view`] snapshot,

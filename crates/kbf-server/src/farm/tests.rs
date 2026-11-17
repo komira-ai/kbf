@@ -80,7 +80,7 @@ fn only_a_taken_or_a_refused_result_is_acknowledged() {
 }
 
 /// Catches a `Result` the scheduler gave no answer to taken as what it is not. The current
-/// lease's is not acknowledged, so the daemon sends it again (a refusal would lose it),
+/// lease's is not acknowledged, so the worker sends it again (a refusal would lose it),
 /// unless the farm is fenced, which refuses every `Result` as stale. A held finish waits
 /// for the store, a copy of an answered one is dropped, and any other refusal stands.
 #[test]

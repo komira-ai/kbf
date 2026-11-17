@@ -345,7 +345,7 @@ async fn a_streamed_put_through_a_backend_lands_the_blob_and_refuses_other_bytes
 }
 
 /// Catches: the two kinds answering a call differently: the action-cache write (both
-/// halves, as a daemon's result) and read, blob reads, FindMissing, and the leadership
+/// halves, as a worker's result) and read, blob reads, FindMissing, and the leadership
 /// and metrics each reports (a cache in memory has no log to lead; the metrics render).
 #[tokio::test]
 async fn both_kinds_answer_the_scheduler_calls_alike() {

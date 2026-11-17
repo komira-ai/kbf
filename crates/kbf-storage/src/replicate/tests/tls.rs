@@ -111,7 +111,7 @@ fn payload(pair: &Pair) -> Vec<u8> {
 /// primary's copy reaches the replica with the primary's certificate (role `storage`,
 /// clientAuth and serverAuth on the one certificate) and is admitted, so both nodes hold the
 /// blob; the writer is a frontend. With the primary calling its peer under a `daemon`
-/// certificate, the replica refuses the copy (a daemon may not send one), the write fails
+/// certificate, the replica refuses the copy (a worker may not send one), the write fails
 /// and neither node holds the blob. Catches: `WriteLeg` open to every role; the leg sent
 /// without the primary's certificate.
 #[tokio::test]

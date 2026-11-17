@@ -225,7 +225,7 @@ async fn with_an_unsettled_requeue(rig: &Rig) -> String {
     assert_eq!(keys(rig, "lease/").len(), 1, "the operation is leased");
     let operation = keys(rig, "op/").remove(0).replace("op/", "");
 
-    // The daemon's process is proven stopped and its replacement registers, the frontend
+    // The worker's process is proven stopped and its replacement registers, the frontend
     // becoming the node's owner and writing its session row; the store refuses what follows.
     drop(inbox);
     let (outbound, _kept) = mpsc::unbounded_channel();

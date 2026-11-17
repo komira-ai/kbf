@@ -83,7 +83,7 @@
 //! keys). A malformed one is INVALID_ARGUMENT: among others, an `ios.device` other than
 //! `1`, an `ios.device.<attribute>` without `ios.device=1` or that kbf does not know,
 //! and `ios.device` with an OS other than macOS or on a `whole_machine` lease. One no
-//! kbf daemon can ever
+//! worker can ever
 //! run (an OS other than Linux or macOS, an architecture other than x86-64 or arm64) is
 //! FAILED_PRECONDITION at once, with no `PreconditionFailure` detail: there is nothing
 //! for the client to upload, and Bazel and Buck2 do not retry it.
@@ -190,7 +190,7 @@ pub struct Submission {
     /// not part of the scheduler's [`Request`], which the log codec writes.
     pub evidence: Evidence,
     /// The longest the action may run: its `timeout`, `None` when it names none or names
-    /// zero (the daemon then applies its own default, which the front does not know). The
+    /// zero (the worker then applies its own default, which the front does not know). The
     /// scheduler reads it for the drain order and the deadlines of whole-machine requests
     /// when those are on (`Scheduler::set_max_wall`); it is not part of the [`Request`].
     pub max_wall: Option<Duration>,
@@ -879,7 +879,7 @@ impl<D> ExecutionService<D> {
 
     /// What the platform of an action asks of the scheduler, or the status that refuses
     /// it: INVALID_ARGUMENT for a malformed platform, FAILED_PRECONDITION for one no
-    /// daemon can run. Reads nothing: it runs before any input of the action is read,
+    /// worker can run. Reads nothing: it runs before any input of the action is read,
     /// and for a cached result too ([`Self::refuse_platform_of`]).
     fn place(&self, action: &Action, command: Option<&Command>) -> Result<Placed, Status> {
         let platform = properties(platform(action, command))?;
@@ -1177,7 +1177,7 @@ fn starts_plain(value: &str) -> bool {
 }
 
 /// What a worker must offer to run an action with `platform`: INVALID_ARGUMENT for a
-/// malformed platform, FAILED_PRECONDITION for one no kbf daemon can ever run.
+/// malformed platform, FAILED_PRECONDITION for one no kbf worker can ever run.
 fn needs(platform: &Platform) -> Result<kbf_caps::Request, Status> {
     kbf_caps::Request::from_platform(platform.canonical()).map_err(|e| match e {
         FromPlatformError::Invalid(e) => {
@@ -1202,7 +1202,7 @@ fn device_kind(kind: LeaseKind, needs: &kbf_caps::Request) -> Result<(), Status>
 }
 
 /// How long `action` may run, from its `timeout`: `None` when it has none, when it is
-/// zero, and when it is negative (the daemon refuses such an action when it runs it).
+/// zero, and when it is negative (the worker refuses such an action when it runs it).
 fn wall_of(action: &Action) -> Option<Duration> {
     let timeout = action.timeout.as_ref()?;
     let wall = Duration::new(

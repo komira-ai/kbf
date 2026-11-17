@@ -93,8 +93,7 @@ fn unavailable(what: &str) -> Status {
 }
 
 // The rules below are the one place the service decides what a miss means. The gRPC handlers
-// and the in-process view ([`super::InProcess`]) both ask them, each with the state it read
-// before its lookup, so a caller gets the same answer by either road.
+// ask them, each with the state it read before its lookup.
 
 /// The answer to a read of `digest` that failed with `error`: UNAVAILABLE when the store did
 /// not find it and the node is catching up; `None` (the error stands) otherwise.

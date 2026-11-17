@@ -1,11 +1,9 @@
 //! `CommitPack` for a writer that is not trusted: a build that wrote one pack object through a
 //! presigned write.
 //!
-//! [`Packs::commit_pack`] takes the word of a certified daemon: it checks a sample of the blobs
-//! and does not read the footer. This is the other entry, [`Packs::commit_untrusted_pack`], and
-//! nothing a daemon sends can reach it or be mistaken for it: it takes an [`IssuedPackKey`], which
-//! only the frontend that issued the write can make, and it records the pack as written by
-//! `b/<build>`. It trusts nothing the object says about itself:
+//! The entry is [`Packs::commit_untrusted_pack`]: it takes an [`IssuedPackKey`], which only the
+//! frontend that issued the write can make, and it records the pack as written by `b/<build>`.
+//! It trusts nothing the object says about itself:
 //!
 //! - **Authorization.** The pack's key must be exactly the key issued for the build's lease
 //!   (`cas/b/<build>/<nonce>`) and the manifest must name that build. The manifest (key, size and
@@ -25,7 +23,7 @@
 //! - **Every byte.** Each record is read, in ranges of at most `READ_CHUNK_BYTES`, and hashed; its
 //!   SHA-256 must be the manifest's and its CRC-32C the footer's.
 //!
-//! The pack is then recorded where it lies, with no copy, as for a daemon's. The record is
+//! The pack is then recorded where it lies, with no copy. The record is
 //! idempotent on the key: the same contents are answered `created: false` and other contents are
 //! [`CommitError::Conflict`].
 //!
@@ -59,7 +57,7 @@ pub use self::task::{Ingested, RejectReason, StoreError, ingest, ingest_set};
 /// The most bytes a pack of an untrusted writer may have: the most a segment may have.
 pub const MAX_UNTRUSTED_PACK_BYTES: u64 = MAX_SEGMENT_BYTES;
 
-/// The most bytes a blob of an untrusted writer's pack may have: the most a daemon puts in a pack
+/// The most bytes a blob of an untrusted writer's pack may have: the most the packer puts in a pack
 /// (a blob over it is not read from packs).
 pub const MAX_UNTRUSTED_BLOB_BYTES: u64 = 64 << 20;
 

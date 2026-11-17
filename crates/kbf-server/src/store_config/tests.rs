@@ -464,7 +464,7 @@ fn certified(source: Arc<dyn StoreConfigSource>) -> ColdStoreService {
 }
 
 /// Catches: a role other than storage let in, and the certificate checks the service
-/// repeats behind the listener's table: no certificate is UNAUTHENTICATED, a daemon, a
+/// repeats behind the listener's table: no certificate is UNAUTHENTICATED, a worker, a
 /// frontend, no role and a role that is not one are PERMISSION_DENIED; plain text refuses, with a
 /// certificate or without (the secret is never served unauthenticated).
 #[tokio::test]

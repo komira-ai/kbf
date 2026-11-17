@@ -169,7 +169,7 @@ fn a_lease_that_changed_starts_the_wait_over() {
     assert_eq!((rows(&store, "lease/"), rows(&store, "queue/")), (0, 1));
 }
 
-/// Asserts that the wait starts over when a daemon has said `Hello` to a frontend since the
+/// Asserts that the wait starts over when a worker has said `Hello` to a frontend since the
 /// first look (the node's owner row is another write), and that the requeue is then made
 /// with that owner row checked.
 #[test]

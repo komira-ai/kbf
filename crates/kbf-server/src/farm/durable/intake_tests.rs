@@ -37,7 +37,7 @@ pub(super) fn caller(farm: &Farm, tag: u8) -> kbf_front::Ticket {
     farm.submit(submission).expect("submitted")
 }
 
-/// Registers the daemon `name` with room for four actions, as a stream opening does.
+/// Registers the worker `name` with room for four actions, as a stream opening does.
 pub(super) fn register(farm: &Farm, name: &str) -> Inbox {
     let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
         .expect("caps")
@@ -226,7 +226,7 @@ async fn callers_follow_an_operation_through_a_failed_look_until_they_cancel() {
     let other = durable_over(&store);
     grant(&other, operation.0, 0, "node-b").expect("granted by another frontend");
 
-    // The farm has no daemon, so its callers were told at the submit that no worker can run
+    // The farm has no worker, so its callers were told at the submit that no worker can run
     // the operation: that is what a look that fails must leave them showing.
     assert!(matches!(*ticket.stage.borrow(), Stage::Waiting(_)));
     store.fail_reads(Some("done/"));
@@ -361,10 +361,10 @@ async fn a_queued_operation_granted_since_the_poll_read_the_queue_is_not_taken_i
     assert_eq!(rows(&store, "lease/"), 1);
 }
 
-/// Asserts that a daemon whose `Hello` reaches a frontend before the frontend's next poll
+/// Asserts that a worker whose `Hello` reaches a frontend before the frontend's next poll
 /// still has its lease taken up there, when the frontend took the operation in while it was
 /// queued and another frontend has granted it since: the lease stands in the store for the
-/// node, the new owner holds it, and the daemon's result is accepted and answers the caller
+/// node, the new owner holds it, and the worker's result is accepted and answers the caller
 /// waiting on this frontend, once. (The frontend that granted the lease is not told it is
 /// gone, so its own caller is not asserted.)
 #[tokio::test(start_paused = true)]
@@ -396,7 +396,7 @@ async fn a_hello_before_the_poll_takes_up_the_lease_of_an_operation_held_queued(
     assert_eq!(rows(&store, "done/"), 1);
 }
 
-/// Asserts that a daemon's `Hello` to a frontend that gave the node's lease up, whose requeue
+/// Asserts that a worker's `Hello` to a frontend that gave the node's lease up, whose requeue
 /// the store has not taken, keeps the operation on this frontend with its callers, not handed
 /// off to be followed in the store: the lease row still names the node, but the operation is
 /// this frontend's own, requeued. (The node, which has room, is then placed the operation as
@@ -460,7 +460,7 @@ async fn a_result_the_store_refuses_as_stale_is_answered_from_the_store() {
     assert_eq!(farm.lock().intake.following(), 0);
 }
 
-/// Asserts that a result the store refuses because the daemon said `Hello` to another
+/// Asserts that a result the store refuses because the worker said `Hello` to another
 /// frontend since (the node's owner row is not this frontend's) does not leave its callers
 /// waiting on this frontend: they are answered with the result the other frontend recorded.
 #[tokio::test(start_paused = true)]
@@ -810,7 +810,7 @@ async fn a_stored_epoch_past_the_served_one_is_reported() {
 }
 
 /// Asserts that the lease of a node no frontend hears is requeued by a poll, only after the
-/// wait, and runs on a daemon of the frontend that polls once it is taken in.
+/// wait, and runs on a worker of the frontend that polls once it is taken in.
 #[tokio::test(start_paused = true)]
 async fn a_poll_requeues_the_lease_of_a_node_no_frontend_hears() {
     let store = Racing::new();
@@ -883,7 +883,7 @@ async fn a_farm_whose_intake_is_closed_places_nothing_and_finishes_what_it_holds
     assert_eq!(done_with(&running), "test");
 }
 
-/// Asserts that a farm with a daemon connected does not requeue the lease of that daemon
+/// Asserts that a farm with a worker connected does not requeue the lease of that worker
 /// whatever the store says of its session, however short the wait.
 #[tokio::test(start_paused = true)]
 async fn a_connected_daemons_lease_is_never_swept() {
@@ -918,7 +918,7 @@ fn queue(farm: &Farm, request: kbf_sched::Request) -> kbf_front::Ticket {
     .expect("queued")
 }
 
-/// Asserts what the intake poll's look at the other frontends' daemons does, while an
+/// Asserts what the intake poll's look at the other frontends' workers does, while an
 /// operation waits for a worker: a node this frontend holds is not listed as another's,
 /// one whose stream has closed is (its session row is there), a row that cannot be read
 /// leaves the list as it was, and an operation the scheduler refused after the unservable
@@ -962,7 +962,7 @@ async fn the_poll_lists_a_closed_stream_as_remote_and_forgets_refused_operations
     assert!(farm.lock().intake.remote.is_empty(), "nothing waits");
 }
 
-/// Asserts that an operation which no worker of this frontend can run, while a daemon
+/// Asserts that an operation which no worker of this frontend can run, while a worker
 /// session of another frontend could, waits as `WaitingKept`: a drain keeps its streams,
 /// since that frontend's intake takes the queued operation.
 #[tokio::test(start_paused = true)]
@@ -993,7 +993,7 @@ async fn an_operation_another_frontends_daemon_could_run_waits_kept() {
 }
 
 /// Asserts that a poll reads the `session/` rows once, for the orphan sweep, while no
-/// operation waits for a worker, and a second time for the other frontends' daemons while
+/// operation waits for a worker, and a second time for the other frontends' workers while
 /// one does: the second scan is only worth its load when something needs its answer.
 #[test]
 fn a_poll_with_nothing_waiting_reads_the_session_rows_only_for_the_sweep() {

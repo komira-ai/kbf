@@ -12,7 +12,7 @@ impl Farm {
     /// Heartbeat `seq` on `stream`. Returns whether it was taken and is to be
     /// acknowledged: a heartbeat from a replaced stream is dropped, and one is not
     /// acknowledged (though the scheduler hears it) when this frontend no longer owns the
-    /// worker, or has not written the worker's session row lately, so a daemon that the
+    /// worker, or has not written the worker's session row lately, so a worker that the
     /// other frontends cannot see alive, or that has moved, fences on time. Each lease it
     /// lists that the scheduler no longer holds on `worker` is sent a `Cancel`. A lease it
     /// leaves out that a proven restart lost past its operation's farm reruns finishes the

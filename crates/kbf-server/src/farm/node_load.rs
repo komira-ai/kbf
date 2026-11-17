@@ -1,11 +1,15 @@
-//! What each node's daemon reports of its `actions/` cgroup (`Heartbeat.node_load`): the
+//! What each node's worker reports of its `actions/` cgroup (`Heartbeat.node_load`): the
 //! readings the server accepts, and the load it shows in the node view
 //! (`GET /v1/nodes/{id}`). Nothing here admits or ranks: it parses, keeps and shows, and
 //! hands each accepted reading to the scheduler, which does.
 //!
+//! No current worker sends a reading: the farm's workers are the executor's job-service hosts
+//! ([`crate::executor`]), which send none, so no node has a load. The route output and the
+//! families below are read for a worker that does send one.
+//!
 //! The accept rule, per node:
-//! - A reading is taken only if its `seq` is above the last accepted one of the same daemon
-//!   session. A session is one daemon process (`Hello.instance_id`; a daemon that sends none
+//! - A reading is taken only if its `seq` is above the last accepted one of the same worker
+//!   session. A session is one worker process (`Hello.instance_id`; a worker that sends none
 //!   is taken to be a new session on each stream). A new session resets the baseline: its
 //!   first reading is accepted whatever its `seq`, and it is not measured against the
 //!   readings of the process before.
@@ -58,17 +62,17 @@ const STALE_AFTER_WINDOWS: u128 = 3;
 /// reading through [`accept`] and shows a node's through [`shown`].
 pub(crate) type NodeLoads = BTreeMap<WorkerId, Kept>;
 
-/// Which daemon session a reading belongs to.
+/// Which worker session a reading belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Session {
-    /// The daemon process that named itself.
+    /// The worker process that named itself.
     Process(String),
-    /// A daemon that named no process: the stream it sent on.
+    /// A worker that named no process: the stream it sent on.
     Stream(StreamId),
 }
 
 impl Session {
-    /// The session of a stream opened by the daemon process `instance` (empty when it named
+    /// The session of a stream opened by the worker process `instance` (empty when it named
     /// none).
     pub(crate) fn of(instance: &str, stream: StreamId) -> Self {
         if instance.is_empty() {
@@ -325,7 +329,7 @@ impl Farm {
     /// The load of every node the farm has accepted a reading of, as `GET /v1/nodes/{id}`
     /// shows it now, in node-id order: the source of the `kbf_node_load_*` families of
     /// `GET /metrics` ([`crate::load_metrics`]). A node keeps its load, aging to stale, until
-    /// the server restarts or its daemon's next stream starts a new session.
+    /// the server restarts or its worker's next stream starts a new session.
     #[must_use]
     pub fn node_loads(&self) -> Vec<(WorkerId, LoadView)> {
         let state = self.lock();

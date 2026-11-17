@@ -61,6 +61,7 @@ use kbf_log::FarmLogId;
 use kbf_mapsync::MapHolder;
 use kbf_meta::{NodeWriter, Retention};
 use kbf_objstore::{KeyPrefix, ObjectStore, StillHeld};
+use kbf_storage::Storage;
 use kbf_storage::legacy::LegacyReads;
 use kbf_storage::repair::{RepairConfig, Repairs};
 use kbf_storage::service::CatchUp;
@@ -180,7 +181,7 @@ pub fn refused_flags() -> std::collections::BTreeSet<String> {
 pub fn command() -> Command {
     let cmd = crate::flag_set::command(
         "storage",
-        "The storage node: the cache, served over gRPC to frontends and daemons.",
+        "The storage node: the cache, served over gRPC to frontends and workers.",
         ALLOWED,
     );
     let path =
@@ -451,6 +452,8 @@ pub struct StorageHandle {
     /// Where it serves `/metrics`, when `--metrics-listen` is given.
     pub metrics: Option<SocketAddr>,
     start_line: String,
+    /// The storage the listener serves: [`StorageHandle::storage`].
+    storage: Arc<dyn Storage>,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
     _background: Background,
@@ -487,6 +490,15 @@ impl StorageHandle {
     #[doc(hidden)]
     pub fn hold(&self, blob: &VerifiedBlob) -> Option<Hold> {
         (self.holder)(blob)
+    }
+
+    /// The storage the listener serves, itself, with none of the service's checks: what a
+    /// test writes and reads without a connection. It holds the node's cache, so a test that
+    /// waits for [`StorageHandle::serve_checked`] to release the cold store drops it first.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn storage(&self) -> Arc<dyn Storage> {
+        Arc::clone(&self.storage)
     }
 
     /// The copies this node owes: its repair journal. `None` for a node that does not
@@ -533,8 +545,8 @@ impl StorageHandle {
     /// lock whatever still holds it, and the units run this with `TimeoutStopSec=infinity`,
     /// where a wait with no end would be a stop with none.
     ///
-    /// The other serve paths (`storage_half::serve`, `start::serve`) wait for nothing: the
-    /// process exits when they return, and its exit frees the lock.
+    /// The other serve path (`start::serve`) waits for nothing: the process exits when it
+    /// returns, and its exit frees the lock.
     ///
     /// The tasks that hold handles on the cold store, to look at when the warning shows:
     /// the cache's touch flusher (`kbf-front`, `cache/touches.rs`) and its write-pool
@@ -568,6 +580,7 @@ impl StorageHandle {
             addr: _,
             metrics: _,
             start_line: _,
+            storage,
             serving,
             _flusher,
             _background,
@@ -587,6 +600,7 @@ impl StorageHandle {
             _flusher,
             _background,
             _fill,
+            storage,
             maps,
             catch_up,
             repairs,
@@ -770,13 +784,13 @@ where
         flags.server.ram_drain_deadline(),
     );
     let holder = holder_of(&cache);
-    let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
+    let storage: Arc<dyn Storage> = Arc::new(CacheStorage::new(cache, flags.segments()));
     let stop = Box::pin(shutdown()?);
     let node = bind_node(
         flags,
         listener,
         registered,
-        storage,
+        Arc::clone(&storage),
         legacy_reads,
         repair_dir,
         stop,
@@ -788,6 +802,7 @@ where
             "kbf-storage {SERVER_VERSION} storage={} log={log}",
             node.addr
         ),
+        storage,
         serving: Box::pin(ram.after(node.serving)),
         _flusher,
         _background,
@@ -813,7 +828,6 @@ where
 /// registration, so the map ranks it last until it is done ([`catch_up_for`]). A node without
 /// `--frontend` owes none: it keeps its objects under its log's own prefix, which no other log's loss
 /// can orphan.
-/// `kbf storage` and the storage half of `kbf storage-and-daemon` both open theirs here.
 ///
 /// # Errors
 /// A TLS file or the frontend URL is refused, or the cache cannot be opened

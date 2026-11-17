@@ -1,7 +1,7 @@
 //! The frontend's storage calls routed by the storage map (`docs/design/architecture-v2.md`,
 //! sections 6 to 8): one [`Router`] over the frontend's own map of the members, which the
 //! proxy ([`crate::Owners::routed`]) and the backend Execute and the scheduler use
-//! ([`crate::Backend::routed`]) share, so a blob is written and read where the daemons
+//! ([`crate::Backend::routed`]) share, so a blob is written and read where the workers
 //! put it.
 //!
 //! **When it routes.** [`Routed::active`] is true once the map has had two members or

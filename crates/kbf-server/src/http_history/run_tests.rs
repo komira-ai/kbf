@@ -608,7 +608,7 @@ mod recorder_side {
 }
 
 /// Catches an export that does not say where the phase times came from: a task's claim is
-/// `task_claim`, a daemon's run is `measured`, and a record written before the marker reads
+/// `task_claim`, a worker's run is `measured`, and a record written before the marker reads
 /// `measured`, which is what it was.
 #[test]
 fn a_run_says_where_its_phase_times_came_from() {

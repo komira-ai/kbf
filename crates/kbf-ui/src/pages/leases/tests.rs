@@ -187,7 +187,10 @@ fn an_empty_farm_says_so_and_why_it_may_be_empty() {
     assert_eq!(status, 200);
     assert!(html.contains("The scheduler holds no lease."), "{html}");
     assert!(html.contains("0 leases on this page."), "{html}");
-    assert!(html.contains("empty until the daemons reconnect"), "{html}");
+    assert!(
+        html.contains("empty until the workers register again"),
+        "{html}"
+    );
     assert!(!html.contains("<table"), "{html}");
     let (_, html) = page(&fake, "/ui/leases?node=ghost");
     assert!(

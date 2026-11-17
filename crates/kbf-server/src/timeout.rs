@@ -1,6 +1,6 @@
 //! A timed-out action's partial result as the server answers it (issue #45). REAPI
 //! lets a server return what an action wrote before its timeout stopped it, with
-//! `DEADLINE_EXCEEDED`. The daemon reports that as an `action_result` beside the
+//! `DEADLINE_EXCEEDED`. The worker reports that as an `action_result` beside the
 //! status; the server keeps only its stdout and stderr digests (an output of a
 //! stopped action may be half written, and its exit code is no exit), and only those
 //! whose blobs the CAS holds, so the client can fetch every digest it is given. The
@@ -9,7 +9,7 @@
 use kbf_front::{Backend, digest_from_proto};
 use kbf_proto::reapi::{ActionResult, Digest};
 
-/// The partial result to answer a timed-out action with, from what the daemon
+/// The partial result to answer a timed-out action with, from what the worker
 /// `reported`: its stdout and stderr digests that the CAS holds, nothing else. `None`
 /// when neither is held, or the CAS cannot say (the timeout is still answered).
 pub(crate) async fn partial(cache: &Backend, reported: ActionResult) -> Option<ActionResult> {

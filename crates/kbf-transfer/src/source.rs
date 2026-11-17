@@ -1,7 +1,7 @@
 //! [`Record`]: one blob on its way out, and the [`Source`] its bytes are read from when
 //! the upload needs them.
 //!
-//! A driver that has walked an action's outputs hashes every file once, and hands the
+//! A client that has walked an action's outputs hashes every file once, and hands the
 //! engine the digests with the places the bytes are ([`Cas::put_records`]). The engine
 //! reads them straight from there, a range at a time, as it sends them: nothing is
 //! copied first, and nothing is hashed again here (the server checks every record

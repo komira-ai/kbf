@@ -18,7 +18,7 @@ pub(crate) const QUIESCE_WAIT: Duration = Duration::from_secs(10);
 /// How often a retire looks again for the work that keeps it from standing down.
 const QUIET_LOOK: Duration = Duration::from_millis(10);
 
-/// What a retire tells a daemon whose stream it ends.
+/// What a retire tells a worker whose stream it ends.
 const STANDING_DOWN: &str = "this frontend is standing down; connect again";
 
 /// Everything a retire stops to let go, in the order it stops it.

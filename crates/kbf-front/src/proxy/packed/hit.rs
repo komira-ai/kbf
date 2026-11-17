@@ -2,7 +2,7 @@
 //! blobs in packs.
 //!
 //! The storage node that answers a `GetActionResult` checks the blobs of its entry's closure
-//! that it holds itself; a blob that a daemon wrote into a pack is not among them (the entry a
+//! that it holds itself; a blob that a worker wrote into a pack is not among them (the entry a
 //! frontend commits names only the blobs the nodes hold, `crate::Backend`). So the hit is
 //! checked here, as every hit is: the closure of its result is worked out again, and every
 //! blob in it must be in the pack index or on the nodes. A result with a blob that is in neither

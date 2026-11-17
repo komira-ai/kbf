@@ -35,7 +35,7 @@ fn submits(harness: &Harness) -> usize {
         .count()
 }
 
-/// Catches a `Start` acted on that names a heartbeat the worker never sent (a daemon refuses
+/// Catches a `Start` acted on that names a heartbeat the worker never sent (a worker refuses
 /// it: it may be a copy from another stream), and one with no window (a server that sent none
 /// bounds nothing, which here is read as no time at all, the safe way): neither is submitted,
 /// and neither is kept.

@@ -3,7 +3,9 @@
 //! closes is cut off at `--shutdown-timeout-secs`, after which the server exits 0. The same file
 //! holds the stream-liveness flags: an idle Execute stream is sent progress operations, and the
 //! listeners send HTTP/2 PINGs. A stream that a worker runs is drained in process, where a test
-//! registers the worker with the farm (`frontend_drain.rs`, `frontend/drain.rs`).
+//! registers the worker with the farm (`frontend_drain.rs`, `frontend/drain.rs`), and in the
+//! `kbf frontend` process, where the worker is a job of the job service
+//! (`kbf-cli`'s `tests/frontend_shutdown.rs`).
 
 #![cfg(unix)]
 

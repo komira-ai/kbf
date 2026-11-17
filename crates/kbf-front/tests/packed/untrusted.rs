@@ -163,51 +163,31 @@ async fn a_large_record_is_hashed_in_ranges_of_at_most_eight_mebibytes() {
     assert_eq!(ranges[2..], [whole, rest]);
 }
 
-/// Asserts that a build whose manifest lies about the bytes of one blob is refused, for a blob
-/// that a daemon's two-blob sample does not look at. Six blobs are stored with one byte of one
-/// record changed; the daemon commit, which checks two blobs, records the pack for some blob it
-/// does not sample; the same bytes committed as an untrusted pack are refused as a mismatch,
-/// whichever blob changed, and nothing is recorded. Catches an untrusted commit that samples.
+/// Asserts that a build whose manifest lies about the bytes of one blob is refused, whichever
+/// blob it is. Six blobs are stored, and in turn one byte of each record is changed: the same
+/// bytes committed as an untrusted pack are refused as a mismatch every time, and nothing is
+/// recorded. Catches an untrusted commit that samples.
 #[tokio::test]
-async fn a_blob_outside_the_daemon_sample_is_still_hashed() {
+async fn every_blob_of_the_pack_is_hashed() {
     let texts: Vec<String> = (0..6).map(|n| format!("blob number {n}")).collect();
     let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
     let (bytes, manifest) = segment_of(&texts);
-    let daemons = NewPack {
-        key: DAEMON_KEY.to_owned(),
-        writer: "node1".to_owned(),
-        ..manifest.clone()
-    };
-    let mut accepted = None;
     for blob in &manifest.blobs {
         let mut lying = bytes.clone();
         lying[blob.offset as usize] ^= 1;
         let rig = Rig::new().await;
-        rig.store.seed(DAEMON_KEY, &lying).await;
-        if rig
-            .packs
-            .commit_pack("node1", daemons.clone(), 2)
-            .await
-            .is_ok()
-        {
-            accepted = Some(lying);
-            break;
-        }
+        rig.store.seed(KEY, &lying).await;
+        let refused = commit(&rig, manifest.clone()).await;
+
+        let refused = refused.expect_err("refused");
+        assert!(matches!(refused, CommitError::Mismatch(_)), "{refused:?}");
+        assert!(
+            refused.message().contains("holds other bytes"),
+            "{refused:?}"
+        );
+        assert!(rig.index.pack(KEY).expect("asked").is_none());
+        assert_eq!(rig.packs.metrics().commit_rejects.get(), 1);
     }
-    let lying = accepted.expect("a sample of two cannot look at all six blobs");
-
-    let rig = Rig::new().await;
-    rig.store.seed(KEY, &lying).await;
-    let refused = commit(&rig, manifest).await;
-
-    let refused = refused.expect_err("refused");
-    assert!(matches!(refused, CommitError::Mismatch(_)), "{refused:?}");
-    assert!(
-        refused.message().contains("holds other bytes"),
-        "{refused:?}"
-    );
-    assert!(rig.index.pack(KEY).expect("asked").is_none());
-    assert_eq!(rig.packs.metrics().commit_rejects.get(), 1);
 }
 
 /// Asserts that a record whose bytes are its digest but whose CRC-32C in the footer is another is
@@ -496,12 +476,11 @@ async fn a_pack_of_another_size_than_said_is_refused() {
 }
 
 /// Asserts that only the key the frontend issued for the build is committed: another nonce,
-/// another build's key, a daemon's key, and a manifest that names another writer are each
-/// refused as forbidden though the issued key holds a good pack, with no read; and a daemon's
-/// commit of a pack named under `cas/b/` is refused as invalid. Catches a build that commits an
-/// object it was not issued, and the weak path and the daemon path being taken for each other.
+/// another build's key, a key under `cas/d/` (the prefix the removed daemon wrote under), and
+/// a manifest that names another writer are each refused as forbidden though the issued key
+/// holds a good pack, with no read. Catches a build that commits an object it was not issued.
 #[tokio::test]
-async fn only_the_issued_key_is_committed_and_the_two_paths_do_not_cross() {
+async fn only_the_issued_key_is_committed() {
     let (bytes, manifest) = segment_of(&[FIRST]);
     let rig = Rig::new().await;
     rig.store.seed(KEY, &bytes).await;
@@ -533,12 +512,6 @@ async fn only_the_issued_key_is_committed_and_the_two_paths_do_not_cross() {
         rig.packs.metrics().commit_rejects.get(),
         others.len() as u64
     );
-
-    let daemons = rig.packs.commit_pack(BUILD, manifest, 2).await;
-    let daemons = daemons.expect_err("refused");
-    assert!(matches!(daemons, CommitError::Invalid(_)), "{daemons:?}");
-    assert!(rig.store.ranges().is_empty());
-    assert!(rig.index.pack(KEY).expect("asked").is_none());
 }
 
 /// Asserts what an issued key can be: `cas/b/<build>/<nonce>` of two parts that are not empty and

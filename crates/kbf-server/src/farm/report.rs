@@ -1,4 +1,4 @@
-//! A worker's `Result` from the report to the answer: what the daemon reported, the
+//! A worker's `Result` from the report to the answer: what the worker reported, the
 //! scheduler's outcome for it, and what the callers of the operation it finishes are told.
 
 use kbf_front::{Finished, Stage};
@@ -48,7 +48,7 @@ pub(super) enum Taken {
     /// The scheduler took it, and the record was dropped unwritten: never acknowledged.
     Dropped,
     /// It names the operation's current lease, and the scheduler took no answer from it:
-    /// never acknowledged, so the daemon keeps it and sends it again. A refusal would lose
+    /// never acknowledged, so the worker keeps it and sends it again. A refusal would lose
     /// it, and leave the lease on the node.
     Unanswered,
 }
@@ -69,7 +69,7 @@ impl Taken {
 /// for now (`standing`, `Ok` while it is the operation's current lease) and whether the farm
 /// is fenced.
 ///
-/// A current lease the scheduler took no answer from is not acknowledged, so that the daemon
+/// A current lease the scheduler took no answer from is not acknowledged, so that the worker
 /// keeps the `Result` and sends it again: a refusal would lose it, and leave the lease on the
 /// node. A fenced farm feeds nothing, so it refuses every `Result` as stale, the current
 /// lease's too, by design.
@@ -88,7 +88,7 @@ pub(super) fn not_answered(
         Ok(()) => {
             tracing::error!(
                 %operation, %lease, %worker,
-                "the scheduler took no answer from the result of the operation's current lease; not acknowledged, so the daemon sends it again"
+                "the scheduler took no answer from the result of the operation's current lease; not acknowledged, so the worker sends it again"
             );
             Taken::Unanswered
         }
@@ -121,9 +121,9 @@ impl Farm {
     /// answered. Before it is checked, its `ActionResult` gets the node id and the
     /// server's times ([`Stamp::apply`]), so callers and the cache see them. Returns
     /// the acknowledgement, or `None` for a `Result` without a lease id, and for one the
-    /// state store has not taken yet or the farm dropped over its cap: a daemon forgets a
+    /// state store has not taken yet or the farm dropped over its cap: a worker forgets a
     /// `Result` on its ack, so none is sent for a record that is not durable. A held
-    /// result is acknowledged when its record is written ([`State::settle`]); the daemon
+    /// result is acknowledged when its record is written ([`State::settle`]); the worker
     /// resends what it is not acknowledged for, and a copy of a held result gets no ack
     /// either.
     pub async fn report(&self, worker: &WorkerId, result: worker::Result) -> Option<ResultAck> {
@@ -157,7 +157,7 @@ impl Farm {
             }
         };
         // The lease id is this process's, so the run it reports was started for this
-        // operation; a daemon that says it ran another action is refused all the same
+        // operation; a worker that says it ran another action is refused all the same
         // (issue #137).
         if let Some(named) = &result.action_digest
             && *named != kbf_front::digest_to_proto(&action)
@@ -224,7 +224,7 @@ impl Farm {
             stage.send_replace(Stage::Done(settled.finished.clone()));
         }
         if let Some((outbound, ack)) = settled.ack {
-            // A stream that has just ended drops it; the daemon sends the result again.
+            // A stream that has just ended drops it; the worker sends the result again.
             let message = server_message::Message::ResultAck(ack);
             let _ = outbound.send(Ok(ServerMessage {
                 message: Some(message),

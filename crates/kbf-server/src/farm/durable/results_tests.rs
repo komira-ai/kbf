@@ -104,7 +104,7 @@ async fn a_farm_with_no_state_store_answers_no_name_by_id() {
 }
 
 /// Asserts that a frontend whose scheduler does not hold an operation answers its name from
-/// the store: executing while another frontend's daemon runs it, the result once that
+/// the store: executing while another frontend's worker runs it, the result once that
 /// frontend has recorded it, with the instance and action it ran; that it answers at once,
 /// from the result, a client that asks after the finish; and that a name nobody gave is not
 /// found.

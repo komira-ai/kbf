@@ -166,7 +166,7 @@ pub(crate) fn memory_note(h: &mut Html, started: &Started) {
     h.el("p", &[attr("class", "hint")], |h| {
         h.text(
             "The scheduler holds this in memory: after a restart or a handover it is empty \
-             until the daemons reconnect, so an empty page is not by itself an outage.",
+             until the workers register again, so an empty page is not by itself an outage.",
         );
     });
     super::started::note(h, started);

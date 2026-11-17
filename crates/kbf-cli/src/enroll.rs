@@ -68,7 +68,6 @@ impl Env {
                     .nodename()
                     .to_string_lossy()
                     .into_owned(),
-                cpus: std::thread::available_parallelism().map_or(1, usize::from),
             },
             euid: rustix::process::geteuid().as_raw(),
             now: Arc::new(|| {

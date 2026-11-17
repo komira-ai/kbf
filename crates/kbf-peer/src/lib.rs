@@ -1,5 +1,6 @@
 //! The role a peer's certificate names (`docs/design/architecture-v2.md`, section 9: mTLS
-//! on every hop with the role, frontend, storage or daemon, in the certificate).
+//! on every hop with the role, frontend, storage or (in a certificate an earlier release
+//! issued) daemon, in the certificate).
 //!
 //! A certificate names its role as exactly one URI subjectAltName
 //! `urn:kbf:role:<name>` ([`ROLE_URI_PREFIX`]). [`role_of`] is the one place that reads
@@ -40,11 +41,12 @@ pub const ROLE_URI_PREFIX: &str = "urn:kbf:role:";
 /// The role a peer's certificate names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerRole {
-    /// A frontend, on behalf of a client or of a daemon's result.
+    /// A frontend, on behalf of a client.
     Frontend,
     /// A storage node (replication, repair).
     Storage,
-    /// A build node.
+    /// A build node of an earlier release: no kbf process runs as one now, but its certificate
+    /// is still read, and still admitted to the worker listener.
     Daemon,
     /// A host's updater: it dials the update coordinator, and calls the frontend's worker
     /// listener for its own node only. Its certificate also names the host's role

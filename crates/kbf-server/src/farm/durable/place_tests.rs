@@ -39,7 +39,7 @@ fn placement(farm: &Farm, node: &WorkerId) -> PlacementView {
 
 /// Asserts that an action on a node this frontend is not connected to is a store error, not
 /// "no such node", when the store cannot say who holds the node: its `owner/` row, or every
-/// row, cannot be read. Catches: a host updater that takes the 404 for "no daemon here" and
+/// row, cannot be read. Catches: a host updater that takes the 404 for "no worker here" and
 /// goes on to switch a node that is draining on another frontend.
 #[tokio::test(start_paused = true)]
 async fn an_action_on_a_node_the_store_cannot_place_is_a_store_error() {

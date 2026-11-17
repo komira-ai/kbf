@@ -16,8 +16,8 @@
 //! [`engine::Engine::carry_out`]). The replicated log replaces exactly that step. Each
 //! process grants leases under its own term (and a store continues the sequence), so a
 //! lease id names one lease ever (issue #137). Under a state store the predecessor's own
-//! leases are restored (`take_stored`) when their daemon says `Hello`: its `Result` ends
-//! its own operation until the daemon's heartbeat omits the lease, and one naming another
+//! leases are restored (`take_stored`) when their worker says `Hello`: its `Result` ends
+//! its own operation until the worker's heartbeat omits the lease, and one naming another
 //! action is a MISMATCH; an id no row holds is UNKNOWN_LEASE.
 //! Operations die with it too, so the term is part of every operation name (issue
 //! #154). A farm over a state store names its operations by their ids instead,
@@ -28,10 +28,10 @@
 //!
 //! - Under the in-memory metadata log (tests only) the log is this process's, so the term is a new
 //!   [`process_term`] and the epoch is the same number: every start names another
-//!   epoch, and a daemon kills the runs of the leases it held before.
+//!   epoch, and a worker kills the runs of the leases it held before.
 //! - Under the Raft metadata log the term is the Raft term the log elected this server in,
 //!   greater at every start, and the epoch is the log id, the same at every start over
-//!   one `--meta-dir`. A daemon that reconnects after a restart therefore keeps the
+//!   one `--meta-dir`. A worker that reconnects after a restart therefore keeps the
 //!   runs of its old leases, which this process never granted: until the scheduler's
 //!   state is in the log they are orphans, whose results are refused and which no
 //!   heartbeat cancels (docs/design/worker-protocol.md#server-restarts-and-the-lease-epoch
@@ -478,7 +478,7 @@ impl Farm {
         self.driver.lock()
     }
 
-    /// The first `Hello` of a stream, from the daemon process `instance`: queues
+    /// The first `Hello` of a stream, from the worker process `instance`: queues
     /// `welcome` on `outbound`, makes this the worker's stream for every `Start` from now
     /// on, and registers the worker (a new session) with what it `reported`. Its phase
     /// is taken before any placement, and may send a `Start` again or a `Cancel` on this
@@ -486,7 +486,7 @@ impl Farm {
     /// stream are ignored from now on. A stream of another process than the earlier
     /// stream's is logged: leases that process ran are kept until it has fenced (issue
     /// #140), unless it is proven stopped. It is when the new process names it as its
-    /// `predecessor` (whose runs the new daemon's drivers killed before its `Hello`) and
+    /// `predecessor` (whose runs the new worker's drivers killed before its `Hello`) and
     /// the earlier stream has closed: a process still connected may be another
     /// machine's, with a copy of this one's disk (issue #22). The executor's virtual workers
     /// register through this too.
@@ -523,11 +523,11 @@ impl Farm {
         if stopped {
             // Its runs were killed: its leases go at once, as farm faults.
             let predecessor = predecessor.as_str();
-            tracing::info!(%worker, predecessor, "the daemon restarted and names its predecessor stopped");
+            tracing::info!(%worker, predecessor, "the worker restarted and names its predecessor stopped");
         } else if replaced.is_some_and(|old| !old.instance.same_as(&instance)) {
             // The earlier process's leases are kept until it has fenced.
-            let cause = "the daemon restarted, or two daemons hold this node's certificate";
-            tracing::warn!(%worker, cause, "another daemon process registered as this node");
+            let cause = "the worker restarted, or two workers hold this node's certificate";
+            tracing::warn!(%worker, cause, "another worker process registered as this node");
         }
         // Before the registration replaces the session row it reads, and before the
         // scheduler hears of the worker, whose recovered leases it books.
@@ -557,8 +557,8 @@ impl Farm {
     ///
     /// A `Preparing` or `Restoring` phase naming a lease the scheduler holds on the
     /// worker, whose `Start` went to an earlier session, sends that `Start` again (the
-    /// daemon restarted for the session switch); one naming a lease of this process it
-    /// does not hold there is sent a `Cancel`, so the daemon cleans up after it. A
+    /// worker restarted for the session switch); one naming a lease of this process it
+    /// does not hold there is sent a `Cancel`, so the worker cleans up after it. A
     /// change into or out of quarantine is logged as an attention item.
     pub fn resize(&self, worker: &WorkerId, stream: StreamId, reported: Reported) {
         let now = self.now();
@@ -833,7 +833,7 @@ impl Dispatch for Farm {
             Held::Elsewhere(_) => state.engine.keep_following(operation, vec![waiter]),
         }
         // A caller that joined a twin already started sees it executing, and so does one
-        // that follows an operation another frontend's daemon runs.
+        // that follows an operation another frontend's worker runs.
         let joined_started = state.side.machine.started_operations().any(|operation| {
             state
                 .engine

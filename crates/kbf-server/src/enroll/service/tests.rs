@@ -131,11 +131,11 @@ async fn an_enrollment_answers_a_certificate_per_key_with_the_bundle_and_the_clo
     assert_eq!(uses(&farm), 1);
 }
 
-/// A storage certificate names the advertise host and a daemon-only one carries no
+/// A storage certificate names the advertise host and a worker-only one carries no
 /// storage name.
 ///
 /// Catches: the advertise host left out of the storage certificate (a client verifying
-/// storage by name would refuse every storage node), or put in a daemon certificate.
+/// storage by name would refuse every storage node), or put in a worker certificate.
 #[tokio::test]
 async fn only_a_storage_certificate_names_the_advertise_host() {
     let farm = farm("enroll-san");
@@ -613,7 +613,7 @@ fn a_frontend_ip_name_in_any_spelling_refuses_the_canonical_advertise_and_the_re
 ///
 /// Catches: the cap removed (the request is then enrolled: the registry's `is_host`, the
 /// port parse and the CA all accept it); an off-by-one in the cap. The case in
-/// `a_malformed_request_is_refused_before_the_store_is_read` is a daemon token with an
+/// `a_malformed_request_is_refused_before_the_store_is_read` is a worker token with an
 /// advertise, which the registry refuses first, so it cannot pin the cap.
 #[tokio::test]
 async fn an_advertise_over_the_cap_is_refused_by_the_cap_and_one_at_it_is_not() {
@@ -646,7 +646,7 @@ fn the_service_debug_form_shows_no_state() {
     assert_eq!(format!("{:?}", farm.service), "EnrollService { .. }");
 }
 
-/// A daemon certificate never carries an advertise host, and a host that is no name is
+/// A worker certificate never carries an advertise host, and a host that is no name is
 /// not certified: the CA's refusals are told as `AdvertiseInvalid`, not as a signer fault
 /// the node would retry.
 ///
@@ -844,7 +844,7 @@ async fn the_answer_carries_no_key_of_the_registered_store() {
 /// A node with no storage role is told no store, and a farm with none registered tells
 /// none and keeps the base generation.
 ///
-/// Catches: a daemon-only node learning where the farm's objects are (it has no use for
+/// Catches: a worker-only node learning where the farm's objects are (it has no use for
 /// them), and a farm without a registration sending a made-up store or a generation that
 /// moved for nothing.
 #[tokio::test]
@@ -870,7 +870,7 @@ async fn only_a_storage_node_with_a_registration_is_told_a_cold_store() {
         .expect("config");
     assert_eq!(config.cold_store, "", "a daemon is told no store");
 
-    // The generation follows what the node receives: a daemon is told no store, so a
+    // The generation follows what the node receives: a worker is told no store, so a
     // registration changes nothing it holds; a storage node is told it.
     let bare = self::farm("enroll-cold-roles-bare");
     let tok = token(&bare, 2, &spec(&[Role::Daemon]));

@@ -37,6 +37,9 @@ const HTTPS_PORT: u16 = 443;
 /// The keys of the file that are enrollment's: the top-level `mode` and, per table, the
 /// keys [`Config`] reads. The rest of a shared `kbf.toml` is the mode's flags, one table
 /// per group ([`Config::parse_shared`]); `kbf-cli` leaves these out of the flags.
+///
+/// `daemon.data_dir` and `daemon.reserve_cpus` were the removed daemon's: they are read and
+/// ignored, so that a file written for a node that ran the daemon still starts its storage.
 pub const KEYS: &[(&str, &[&str])] = &[
     ("", &["mode"]),
     ("frontend", &["url"]),
@@ -44,6 +47,7 @@ pub const KEYS: &[(&str, &[&str])] = &[
     ("node", &["id", "advertise", "zone"]),
     ("dirs", &["state"]),
     ("storage", &["hot_dir", "meta_dir"]),
+    ("daemon", &["data_dir", "reserve_cpus"]),
     ("tls", &["trust"]),
 ];
 
@@ -58,12 +62,12 @@ pub fn is_key(table: &str, key: &str) -> bool {
 /// not put a flag in it.
 #[must_use]
 pub fn is_own_table(table: &str) -> bool {
-    !table.is_empty() && table != "tls" && KEYS.iter().any(|(t, _)| *t == table)
+    !table.is_empty() && !matches!(table, "daemon" | "tls") && KEYS.iter().any(|(t, _)| *t == table)
 }
 
 /// The tables and keys of the file. In a shared file the tables of the mode's flags are
-/// let through (`other`), and in the table `tls`, which flags also use, the keys that are not
-/// enrollment's.
+/// let through (`other`), and in the tables `daemon` and `tls`, which flags also use, the keys
+/// that are not enrollment's.
 #[derive(Deserialize)]
 struct Raw {
     mode: Option<Spanned<String>>,
@@ -72,9 +76,18 @@ struct Raw {
     node: Option<RawNode>,
     dirs: Option<RawDirs>,
     storage: Option<RawStorage>,
+    daemon: Option<RawDaemon>,
     tls: Option<RawTls>,
     #[serde(flatten)]
     other: BTreeMap<String, toml::Value>,
+}
+
+/// `[daemon]`: the runtime's thread-count flags, and the removed daemon's two keys, which
+/// are ignored (see [`KEYS`]).
+#[derive(Deserialize)]
+struct RawDaemon {
+    #[serde(flatten)]
+    keys: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -122,9 +135,6 @@ struct RawTls {
 pub struct Host {
     /// The host name as the machine reports it (the short form is derived).
     pub hostname: String,
-    /// The CPU count. Nothing here reads it since the `[daemon]` table went; callers still
-    /// fill it in.
-    pub cpus: usize,
 }
 
 /// One thing wrong with the file.
@@ -293,6 +303,14 @@ impl Check<'_> {
                 key: String::new(),
                 line,
                 message: format!("unknown field `{table}`"),
+            });
+        }
+        let daemon = raw.daemon.iter().flat_map(|d| d.keys.keys());
+        for key in daemon.filter(|key| !is_key("daemon", key)) {
+            self.problems.push(Problem {
+                key: format!("daemon.{key}"),
+                line: None,
+                message: format!("unknown field `{key}`"),
             });
         }
         for key in raw.tls.iter().flat_map(|t| t.other.keys()) {

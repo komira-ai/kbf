@@ -121,7 +121,6 @@ impl Harness {
         Env {
             host: Host {
                 hostname: "node-02".to_owned(),
-                cpus: 8,
             },
             euid: rustix::process::geteuid().as_raw(),
             now: Arc::new(move || fake.now()),

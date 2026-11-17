@@ -1,11 +1,11 @@
 //! The orphan sweep: a lease whose node no frontend hears is requeued.
 //!
-//! A lease is held by a daemon connected to one frontend of the state store, and the
-//! store's `lease/` row is the frontend's. If the frontend dies with its daemons (the host
+//! A lease is held by a worker connected to one frontend of the state store, and the
+//! store's `lease/` row is the frontend's. If the frontend dies with its workers (the host
 //! fails), nothing gives the lease up: the frontends that remain hold no state for it. Every
 //! frontend therefore looks, at each intake poll, for leases whose node has no `session/`
 //! row: the rows expire [`LEASE_GRACE`] after the last write of the frontend that owns the
-//! node, which writes one every [`SESSION_RENEWAL`] while the daemon heartbeats, and no
+//! node, which writes one every [`SESSION_RENEWAL`] while the worker heartbeats, and no
 //! frontend writes a row for a node it does not hear. A lease whose node is connected to
 //! this frontend is left alone, whatever its session row says.
 //!
@@ -14,16 +14,16 @@
 //! as it was, and its node still without a session, [`ORPHAN_WAIT`] after the first (by two
 //! readings of the store's clock, never this host's), requeues it in one transaction that
 //! checks the rows it read: the `lease/` row at its version, the `op/` row, the `owner/`
-//! row at its version (a daemon that said `Hello` to a frontend since has a session there
+//! row at its version (a worker that said `Hello` to a frontend since has a session there
 //! within moments, and owns its lease again), and writes the `queue/` row where there is
 //! none and the loss count one higher, as any lease lost to a silent node is counted. A
 //! lease that changed, or whose node came back, starts the wait over; so does one whose
 //! requeue lost to a write of another frontend between the look and the transaction, and
 //! the pass goes on to the other leases.
 //!
-//! Why the wait is safe. A daemon stops its work `SELF_FENCE` after the newest heartbeat
+//! Why the wait is safe. A worker stops its work `SELF_FENCE` after the newest heartbeat
 //! its frontend acknowledged, and a frontend acknowledges only while it wrote the node's
-//! session row within `ACK_WINDOW`, so the daemon runs no longer than `ACK_WINDOW` plus
+//! session row within `ACK_WINDOW`, so the worker runs no longer than `ACK_WINDOW` plus
 //! `SELF_FENCE` (and the margin the fence keeps) past the last write of the row. The row
 //! was there `LEASE_GRACE` after that write, so the first look that misses it is made at
 //! least that long after the write, and the second at least [`ORPHAN_WAIT`] after the first:
@@ -43,7 +43,7 @@ use super::*;
 /// first look that misses the row is made after its expiry) and the margin of the fence.
 pub const ORPHAN_WAIT: Duration = SESSION_RENEWAL.saturating_add(LEADER_LEASE_MARGIN);
 
-// The daemon of a lease has stopped its work by the second look: it ran at most `ACK_WINDOW`
+// The worker of a lease has stopped its work by the second look: it ran at most `ACK_WINDOW`
 // and `SELF_FENCE` (and the margin) past the last write of its session row, which was
 // `LEASE_GRACE` before the first look at the latest.
 const _: () = assert!(

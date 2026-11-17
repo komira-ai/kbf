@@ -653,10 +653,9 @@ impl ColdPick for RegisteredOnly {
 ///
 /// Not dumpable makes a process's `/proc/self` entries root-owned, but the kernel lets a
 /// process open its own `/proc/self/fd` and follow its entries whatever their owner
-/// (`proc_fd_permission`, `proc_fd_access_allowed`). The worker daemon of
-/// `kbf storage-and-daemon` shares the process and needs exactly that to chmod a read-only
-/// directory before it removes the tree (`kbf_outputs::remove_tree`); a test of that
-/// mode pins that it still works.
+/// (`proc_fd_permission`, `proc_fd_access_allowed`). A caller that shares the process with a storage node (the removed
+/// `kbf storage-and-worker` mode did) needs exactly that to chmod a read-only directory
+/// before it removes the tree (`kbf_outputs::remove_tree`).
 ///
 /// # Errors
 /// The limit cannot be set.

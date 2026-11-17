@@ -149,7 +149,7 @@ pub(super) fn node_of(
 }
 
 /// `node`, which is `worker` as [`node_of`] lists it, with what it can run, what is left of
-/// that, its leases and the `load` its daemon reported, as `GET /v1/nodes/{id}` answers.
+/// that, its leases and the `load` its worker reported, as `GET /v1/nodes/{id}` answers.
 pub(super) fn detail_of(
     node: NodeView,
     sched: &Scheduler,

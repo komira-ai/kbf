@@ -700,7 +700,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// `result`, checks every blob in it is held, and stores `result` as a blob. The
     /// action cache is not touched; [`Cache::commit_action_record`] writes the entry.
     ///
-    /// The server runs this when a daemon reports a result, before the scheduler accepts
+    /// The server runs this when a worker reports a result, before the scheduler accepts
     /// it, and commits the entry only once the result is accepted: so a result whose
     /// outputs are not all stored is never accepted, and a result that is not accepted
     /// never reaches the action cache.

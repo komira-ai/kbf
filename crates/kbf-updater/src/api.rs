@@ -148,8 +148,7 @@ pub enum ErrorCode {
     HealthTimeout,
     /// The host's swap was abandoned.
     SwapAbandoned,
-    /// A daemon host is not the node the inventory lists for it, or lists none; nothing was
-    /// drained.
+    /// A host's own node id is not the one the inventory lists for it; nothing was drained.
     NodeIdentity,
     /// The frontend could not drain the host's node, or did not answer; the node may be left
     /// drained. For a frontend member: it did not exit within the bound

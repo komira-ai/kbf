@@ -2,7 +2,7 @@
 //! as whole segments (`docs/design/write-path.md`, section 4.1), so a tree of thousands
 //! of files is not held in memory and is sent in a few large calls, not one per file.
 //!
-//! A spool is a [`Cas`]: a driver's walk stores its outputs into it as it would into
+//! A spool is a [`Cas`]: a client's walk stores its outputs into it as it would into
 //! the engine, and then hands it to [`Cas::put_spool`] of the lease's store. Each
 //! distinct blob is written once, at an offset reserved for it, by positioned writes,
 //! so concurrent puts never interleave. A blob is recorded only after all its bytes are

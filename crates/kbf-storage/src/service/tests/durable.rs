@@ -106,14 +106,12 @@ async fn any_other_value_of_the_header_is_refused() {
     assert_eq!(mem.durable_asked.load(Ordering::SeqCst), 1);
 }
 
-/// Catches an in-process call that goes around the durable question (it would answer the
-/// plain one, which counts a RAM-held blob present) and one that skips the catching-up
-/// rule: in-process, `find_durable` answers as the wire does, and while the node is
-/// catching up a durable answer with a digest missing is UNAVAILABLE, as the plain one is
-/// (an answer that left out only the missing ones would tell the caller they are held),
-/// over the wire and in process; a durable answer with nothing missing is served.
+/// Catches a call that skips the catching-up rule: while the node is catching up a durable
+/// answer with a digest missing is UNAVAILABLE, as the plain one is (an answer that left out
+/// only the missing ones would tell the caller they are held); a durable answer with nothing
+/// missing is served.
 #[tokio::test]
-async fn the_durable_question_is_judged_as_the_plain_one_in_process_and_while_catching_up() {
+async fn the_durable_question_is_judged_as_the_plain_one_while_catching_up() {
     let mem = Arc::new(Mem::default());
     let (disk, ram) = held_in(&mem, b"on disk", b"in ram");
     let catch_up = CatchUp::rebuilding();
@@ -127,12 +125,11 @@ async fn the_durable_question_is_judged_as_the_plain_one_in_process_and_while_ca
         )
         .with_catch_up(catch_up.clone()),
     );
-    let local = service.in_process().at(0);
     let wire: Arc<dyn Storage> = Arc::new(RemoteStorage::new(
         connect(serve_routes(service.shared_routes(), None).await).await,
         0,
     ));
-    let both = [local, wire];
+    let both = [wire];
 
     for storage in &both {
         let missing = storage.find_durable(&[ram]).await;
@@ -241,13 +238,13 @@ async fn a_storage_with_nothing_in_ram_answers_the_durable_question_as_the_plain
 
 /// Catches `kbf-durable: wait` answered as `only` (the node would not wait for its held
 /// blobs), a client that does not send it, and one that sends it for the other questions:
-/// over the wire and in process, `find_durable_waiting` names the RAM-held blob and the
+/// over the wire, `find_durable_waiting` names the RAM-held blob and the
 /// absent one missing and reaches the store's `find_durable_waiting` once, and neither
 /// `find_durable` nor `find_missing`; the other two questions do not reach it. While the
 /// node is catching up a waiting answer with a digest missing is UNAVAILABLE as the others
 /// are.
 #[tokio::test]
-async fn the_wait_header_selects_the_waiting_question_over_the_wire_and_in_process() {
+async fn the_wait_header_selects_the_waiting_question_over_the_wire() {
     let mem = Arc::new(Mem::default());
     let (disk, ram) = held_in(&mem, b"on disk", b"in ram");
     let absent = sha(b"nowhere");
@@ -262,7 +259,6 @@ async fn the_wait_header_selects_the_waiting_question_over_the_wire_and_in_proce
         )
         .with_catch_up(catch_up.clone()),
     );
-    let local = service.in_process().at(0);
     let wire: Arc<dyn Storage> = Arc::new(RemoteStorage::new(
         connect(serve_routes(service.shared_routes(), None).await).await,
         0,
@@ -270,7 +266,7 @@ async fn the_wait_header_selects_the_waiting_question_over_the_wire_and_in_proce
     catch_up.finish();
 
     let mut waited = 0;
-    for storage in [local, wire] {
+    for storage in [wire] {
         assert_eq!(
             storage
                 .find_durable_waiting(&[disk, ram, absent])
@@ -296,13 +292,10 @@ async fn the_wait_header_selects_the_waiting_question_over_the_wire_and_in_proce
         )
         .with_catch_up(catching),
     );
-    let both = [
-        rebuilding.in_process().at(0),
-        Arc::new(RemoteStorage::new(
-            connect(serve_routes(rebuilding.shared_routes(), None).await).await,
-            0,
-        )) as Arc<dyn Storage>,
-    ];
+    let both = [Arc::new(RemoteStorage::new(
+        connect(serve_routes(rebuilding.shared_routes(), None).await).await,
+        0,
+    )) as Arc<dyn Storage>];
     for storage in &both {
         let missing = storage.find_durable_waiting(&[ram]).await;
         assert!(

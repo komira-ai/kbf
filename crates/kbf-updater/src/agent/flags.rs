@@ -51,8 +51,8 @@
 //!   names no service, so the agent's helper would install `kbf` at the service's version.
 //!   Without the flag the agent is a `kbf`-only agent, as before.
 //! - Times, in seconds: `--heartbeat-secs` (default 15), `--drain-deadline-secs` (no default, 1 or
-//!   more with no upper bound: without it the node's leases are waited for however long they take;
-//!   a deadline that passes fails the update with the node left drained and nothing switched), `--health-timeout-secs` (300, how long the release on
+//!   more with no upper bound; accepted, and without effect while every host's drain is
+//!   `NoDrain`, which holds no lease to wait for), `--health-timeout-secs` (300, how long the release on
 //!   trial has to show healthy), `--health-poll-secs` (5) and `--retry-secs` (900, how long a
 //!   target that failed is left alone before the same order is tried again).
 
@@ -104,7 +104,8 @@ pub struct Timing {
     /// Between two heartbeats.
     pub heartbeat: Duration,
     /// How long the node's leases are waited for once it is drained; `None`, the default,
-    /// waits however long they take. When a set time is out the host is not switched.
+    /// waits however long they take. When a set time is out the host is not switched. The
+    /// drain of every host holds no lease, so the time never runs out.
     pub drain_deadline: Option<Duration>,
     /// How often they are looked at.
     pub drain_poll: Duration,
@@ -417,7 +418,7 @@ fn parse_service(value: &str) -> Result<ServiceConfig, String> {
             "--service {name}: helper-socket may not hold a .. component"
         ));
     }
-    // Read for the units written when a node was drained around an update; it changes nothing.
+    // Read for the units written before drains were dropped; it changes nothing.
     if !matches!(take("drain"), None | Some("node" | "none")) {
         return Err(format!("--service {name}: drain is node or none"));
     }

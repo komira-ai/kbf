@@ -4,10 +4,13 @@
 //! ([`crate::farm::Farm::node_loads`], `docs/api.md`, "Node load"), so that placement by
 //! measured load can be watched before and after `--placement-load` is turned on.
 //!
+//! No current worker sends a node-load reading ([`crate::executor`] reports none), so the
+//! `kbf_node_load_*` families hold no sample; the scheduler's own counts are written as always.
+//!
 //! The scheduler's counts are written on every scrape, 0 included: a scheduler that has
 //! counted nothing is a fact. A node's gauges are written as the view shows them: a value the
 //! view leaves out (`measured_cpu_millicores` is `null` with fewer than two windows and when
-//! stale; the two telemetry counters when the daemon could not read them) has no sample, never
+//! stale; the two telemetry counters when the worker could not read them) has no sample, never
 //! a 0, and a family no node has a sample of is not written. One sample per node that has a
 //! load, labelled `node` as the pack families are, so the series are as many as there are
 //! nodes. A node that has gone keeps its sample, stale, until the server restarts, as the
@@ -267,7 +270,7 @@ const NODE_FAMILIES: [Gauge; 9] = [
     ),
 ];
 
-/// The list counters of a node's readings, since its daemon process began.
+/// The list counters of a node's readings, since its worker process began.
 const LISTS: [Gauge; 2] = [
     (
         "kbf_node_load_clocks_total",

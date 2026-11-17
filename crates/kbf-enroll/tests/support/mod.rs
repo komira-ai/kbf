@@ -26,7 +26,6 @@ pub fn config_for(root: &std::path::Path, port: u16, extra: &str) -> Config {
         &text,
         &Host {
             hostname: "node-02".to_owned(),
-            cpus: 8,
         },
     )
     .unwrap_or_else(|e| panic!("config: {e}"))

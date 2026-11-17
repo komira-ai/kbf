@@ -52,7 +52,7 @@
 //!
 //! - `POST /v1/epoch/bump`: raises the epoch the state store holds by one ([`Farm::bump_epoch`])
 //!   and answers `{"previous", "epoch", "serving"}`. A frontend reads the stored epoch when
-//!   it starts and keeps it, so daemons drop the leases of the older epoch when they reach a
+//!   it starts and keeps it, so workers drop the leases of the older epoch when they reach a
 //!   frontend started after the bump; the one that answers goes on serving the epoch it
 //!   started under (`serving`). The operator's step after a restore from a backup.
 //!
@@ -948,7 +948,7 @@ mod tests {
 
     /// Asserts that a refused node action is a 404 only for a node no frontend has held, and a
     /// 503 naming the node when the store failed. Catches: an updater that takes a store
-    /// failure for "no daemon here".
+    /// failure for "no worker here".
     #[tokio::test]
     async fn a_refused_node_action_is_a_404_only_for_an_unknown_node() {
         let node = || "node-b".to_owned();

@@ -1,7 +1,7 @@
-//! FindMissing before every upload (`docs/design/worker-cache.md#43-api`, `upload_missing`).
+//! FindMissing before every upload (`upload_missing`).
 //!
 //! An upload asks whether the server holds its blob; the server is the truth, so
-//! nothing local answers (`docs/design/worker-cache.md#3-contracts-every-stage-keeps`, 1).
+//! nothing local answers.
 //! The questions of every upload in the process queue here, and one task asks them
 //! in calls of at most `--transfer-find-missing-chunk` digests, one call at a time:
 //! while a call is out, the questions that arrive meanwhile gather for the next. So

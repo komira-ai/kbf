@@ -148,7 +148,7 @@ pub enum PackIndexError {
         key: String,
     },
     /// The index behind this call does not take the call, and will not until it is set up to:
-    /// a daemon's commit of a pack to a frontend that has no pack store.
+    /// a client's commit of a pack to a frontend that has no pack store.
     #[error("pack index: the index takes no such call")]
     Unsupported,
     /// The index refused the call for a reason that a repeat does not change (the caller is not

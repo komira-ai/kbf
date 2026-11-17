@@ -156,13 +156,13 @@ async fn a_write_that_fails_or_is_dropped_is_not_left_open() {
 }
 
 /// Catches an action-cache commit that is not counted: a commit held in the store is a
-/// write the node is still taking, over the wire and in-process. Catches: the guard
-/// missing from the `ActionStore` commit; missing from the in-process commit.
+/// write the node is still taking. Catches: the guard missing from the `ActionStore`
+/// commit.
 #[tokio::test]
 async fn a_commit_in_flight_is_an_open_write() {
     let mem = Arc::new(Mem::default());
     let open = OpenWrites::new();
-    let (_, remote, service) = node(&mem, &open).await;
+    let (_, remote, _) = node(&mem, &open).await;
     let remote = Arc::new(remote);
     let record = ActionRecord {
         result: sha(b"result"),
@@ -179,19 +179,9 @@ async fn a_commit_in_flight_is_an_open_write() {
         })
     };
     count_reaches(&open, 1).await;
-    let in_process = {
-        let view = service.in_process().at(0);
-        let record = record.clone();
-        tokio::spawn(async move {
-            view.commit_action_record(Role::Daemon, sha(b"other action"), record)
-                .await
-        })
-    };
-    count_reaches(&open, 2).await;
 
     mem.knobs.release_commits();
     over_the_wire.await.expect("joins").expect("committed");
-    in_process.await.expect("joins").expect("committed");
     count_reaches(&open, 0).await;
 }
 
@@ -215,12 +205,12 @@ async fn the_store_counts_its_segment_uploads_in_the_services_handle() {
 }
 
 /// A node holding map 7, the open-writes handle, and a refetch wait of `wait` for a caller
-/// that is ahead of it; the caller's clients at generation 9, over the wire and in-process.
+/// that is ahead of it; the caller's client at generation 9, over the wire.
 async fn node_waiting_for_a_map(
     mem: &Arc<Mem>,
     open: &OpenWrites,
     wait: Duration,
-) -> (RemoteStorage, Arc<dyn Storage>) {
+) -> RemoteStorage {
     use super::fake::Held;
     use crate::replicate::MapSource;
 
@@ -260,94 +250,67 @@ async fn node_waiting_for_a_map(
         .with_open_writes(open.clone()),
     );
     let channel = connect(serve_routes(service.shared_routes(), None).await).await;
-    (RemoteStorage::new(channel, 9), service.in_process().at(9))
+    RemoteStorage::new(channel, 9)
 }
 
 /// Catches a write that is not counted while it waits for the map: a caller ahead of the
 /// node makes it fetch the map, and that wait can be seconds with the call already taken in.
-/// A rollout that read zero then would stop the node under it. The write, over the wire and
-/// in-process, is open while it waits and gives the count back when it is refused. Catches:
+/// A rollout that read zero then would stop the node under it. The write, over the wire,
+/// is open while it waits and gives the count back when it is refused. Catches:
 /// the guard taken after the map is judged.
 #[tokio::test]
 async fn a_write_waiting_for_the_map_is_open() {
     let mem = Arc::new(Mem::default());
     let open = OpenWrites::new();
-    let (remote, in_process) =
-        node_waiting_for_a_map(&mem, &open, Duration::from_millis(600)).await;
+    let remote = node_waiting_for_a_map(&mem, &open, Duration::from_millis(600)).await;
     let wire = tokio::spawn(async move {
         remote
             .put(bytes::Bytes::from_static(b"over the wire"))
             .await
     });
     count_reaches(&open, 1).await;
-    let local = tokio::spawn(async move {
-        in_process
-            .put(bytes::Bytes::from_static(b"in-process"))
-            .await
-    });
-    count_reaches(&open, 2).await;
     assert!(wire.await.expect("joins").is_err(), "no map that new");
-    assert!(local.await.expect("joins").is_err(), "no map that new");
     count_reaches(&open, 0).await;
 }
 
 /// Catches an action-cache commit that is not counted while it waits for the map, over the
-/// wire and in-process. Catches: the guard taken after the map is judged, in either path.
+/// wire. Catches: the guard taken after the map is judged.
 #[tokio::test]
 async fn a_commit_waiting_for_the_map_is_open() {
     let mem = Arc::new(Mem::default());
     let open = OpenWrites::new();
-    let (remote, in_process) =
-        node_waiting_for_a_map(&mem, &open, Duration::from_millis(600)).await;
+    let remote = node_waiting_for_a_map(&mem, &open, Duration::from_millis(600)).await;
     let record = ActionRecord {
         result: sha(b"result"),
         closure: Default::default(),
     };
-    let wire = {
-        let record = record.clone();
-        tokio::spawn(async move {
-            remote
-                .commit_action_record(Role::Daemon, sha(b"action"), record)
-                .await
-        })
-    };
-    count_reaches(&open, 1).await;
-    let local = tokio::spawn(async move {
-        in_process
-            .commit_action_record(Role::Daemon, sha(b"other"), record)
+    let wire = tokio::spawn(async move {
+        remote
+            .commit_action_record(Role::Daemon, sha(b"action"), record)
             .await
     });
-    count_reaches(&open, 2).await;
+    count_reaches(&open, 1).await;
     assert!(wire.await.expect("joins").is_err());
-    assert!(local.await.expect("joins").is_err());
     count_reaches(&open, 0).await;
 }
 
 /// Catches a segment upload's `Begin` that is not counted while it waits for the map: the
 /// service judges the map before the store's handlers (which count the upload) see the call.
 /// A `Begin` from a caller ahead of the node is open while the node fetches the map, over the
-/// wire and in-process. Catches: the count taken after the map is judged.
+/// wire. Catches: the count taken after the map is judged.
 #[tokio::test]
 async fn a_segment_begin_waiting_for_the_map_is_open() {
     use kbf_proto::worker::BeginRequest;
     let mem = Arc::new(Mem::default());
     let open = OpenWrites::new();
-    let (remote, in_process) =
-        node_waiting_for_a_map(&mem, &open, Duration::from_millis(600)).await;
-    let (wire, local) = (remote.segments(), in_process.segments());
+    let remote = node_waiting_for_a_map(&mem, &open, Duration::from_millis(600)).await;
+    let wire = remote.segments();
     let over_the_wire = tokio::spawn(async move {
         wire.begin(tonic::Request::new(BeginRequest::default()))
             .await
     });
     count_reaches(&open, 1).await;
-    let in_this_process = tokio::spawn(async move {
-        local
-            .begin(tonic::Request::new(BeginRequest::default()))
-            .await
-    });
-    count_reaches(&open, 2).await;
     assert!(over_the_wire.await.expect("joins").is_err());
-    assert!(in_this_process.await.expect("joins").is_err());
     count_reaches(&open, 0).await;
 }
 

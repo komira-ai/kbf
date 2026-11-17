@@ -18,12 +18,12 @@
 //! signals that come after it is made, so `kbf frontend` makes the watch
 //! ([`watch_stops_from_here`]) as soon as it has installed its own handlers, before its
 //! start, and a stop sent at any point of the start (the state store's wait included)
-//! ends this wait at its first pause. A start that did not make one early (an
-//! in-process start) makes its own before the first attempt. The signals are watched
+//! ends this wait at its first pause. A start that did not make one early
+//! makes its own before the first attempt. The signals are watched
 //! only inside a Tokio runtime (every server's start runs in one); outside one the wait
 //! only sleeps.
 //!
-//! Only the frontend waits. A storage node or `all-in-one` whose history directory is
+//! Only the frontend waits. A storage node whose history directory is
 //! held exits 75 ("not ready", `crate::start_exit`), and its unit starts it again.
 
 use std::error::Error;

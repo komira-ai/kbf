@@ -120,7 +120,7 @@ async fn reads_served_from_a_pack_are_not_counted() {
         "both came from the pack"
     );
     assert_eq!(farm.reads.total(), 0);
-    assert_eq!(farm.scraped(), [0, 0, 0, 0, 0]);
+    assert_eq!(farm.scraped(), [0, 0, 0]);
 }
 
 /// Asserts that a blob only the node holds (written before packs) is a pack miss that the
@@ -151,7 +151,7 @@ async fn reads_the_node_serves_after_a_pack_miss_are_counted_once_each() {
         "both missed the pack"
     );
     assert_eq!(farm.reads.total(), 2);
-    assert_eq!(farm.scraped(), [2, 0, 0, 0, 0]);
+    assert_eq!(farm.scraped(), [2, 0, 0]);
 }
 
 /// Asserts that a read nobody can serve, a ByteStream Read of a blob in neither a pack nor the
@@ -179,7 +179,7 @@ async fn a_read_that_finds_nothing_is_not_counted() {
     assert!(answer.is_err(), "{answer:?}");
 
     assert_eq!(farm.reads.total(), 0);
-    assert_eq!(farm.scraped(), [0, 0, 0, 0, 0]);
+    assert_eq!(farm.scraped(), [0, 0, 0]);
 }
 
 /// Asserts that a GetActionResult the node answers with an entry is one count on
@@ -213,7 +213,7 @@ async fn an_action_cache_lookup_counts_a_hit_and_not_a_miss() {
     assert_eq!(hit.exit_code, 3);
     assert_eq!(farm.reads.get(Path::AcActionStore), 1);
     assert_eq!(farm.reads.total(), 1);
-    assert_eq!(farm.scraped(), [0, 0, 0, 1, 0]);
+    assert_eq!(farm.scraped(), [0, 0, 1]);
 }
 
 fn harness_digest(text: &str) -> Digest {

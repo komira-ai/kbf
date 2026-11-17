@@ -1,4 +1,4 @@
-//! The ownership of a daemon's node when several frontends share one state store: the
+//! The ownership of a worker's node when several frontends share one state store: the
 //! `Hello` that makes a frontend the owner, the writes of a node's leases that only the
 //! owner may make, and the look at the owner row that a heartbeat's acknowledgement waits
 //! on. Each test stands two handles over one store for two frontends.
@@ -92,7 +92,7 @@ fn reported() -> Reported {
     Reported::serving(Resources::new(2_000, 1 << 30), caps)
 }
 
-/// Asserts that a daemon's `Hello` makes the frontend the owner of the node at the next
+/// Asserts that a worker's `Hello` makes the frontend the owner of the node at the next
 /// counter, and says who owned it before. The row is the frontend's id and the counter,
 /// eight bytes each, big-endian, pinned byte for byte because another release reads it.
 #[test]
@@ -142,8 +142,8 @@ fn a_frontend_a_daemon_has_left_grants_its_node_nothing() {
     assert_eq!(rows(&store, "lease-by-op/"), 2);
 }
 
-/// Asserts that a lease given up, and a result taken, by the frontend a daemon has left are
-/// refused as stale and write nothing, and that the frontend the daemon moved to takes the
+/// Asserts that a lease given up, and a result taken, by the frontend a worker has left are
+/// refused as stale and write nothing, and that the frontend the worker moved to takes the
 /// result as it would have.
 #[test]
 fn a_lease_is_given_up_and_finished_only_by_the_owner_of_its_node() {
@@ -202,7 +202,7 @@ fn a_frontend_whose_owner_row_is_gone_writes_nothing_for_the_node() {
 }
 
 /// Asserts that a grant that read the owner row as its own, and finds it changed when it
-/// commits because the daemon said `Hello` to another frontend in between, writes nothing and
+/// commits because the worker said `Hello` to another frontend in between, writes nothing and
 /// fails as stale.
 #[test]
 fn a_node_that_changes_hands_between_the_read_and_the_commit_is_stale() {
@@ -307,7 +307,7 @@ fn a_node_another_frontend_claimed_is_not_owned() {
 
 /// Asserts that a `Hello` reads what it takes over: the owner before, the unfinished
 /// operations whose leases name the node (not another node's, and not a lease whose
-/// operation has no row), and the daemon process the node's session row names (none when
+/// operation has no row), and the worker process the node's session row names (none when
 /// the row is missing, or is not a registration).
 #[test]
 fn a_hello_reads_the_leases_and_the_session_of_the_node_it_takes_over() {
@@ -437,7 +437,7 @@ fn a_store_with_owner_and_index_rows_reads_as_it_did_without_them() {
     }
 }
 
-/// Asserts that a lease given up by the frontend a daemon has left, which is refused as
+/// Asserts that a lease given up by the frontend a worker has left, which is refused as
 /// stale, still writes the floor the kill raised: a floor is the farm's, and the refused
 /// give-up is not tried again. The lease and the queue stay as the owner has them.
 #[test]

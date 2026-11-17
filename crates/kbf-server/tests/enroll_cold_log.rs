@@ -224,7 +224,6 @@ async fn join(
         &text,
         &Host {
             hostname: node.to_owned(),
-            cpus: 8,
         },
     )
     .expect("config");

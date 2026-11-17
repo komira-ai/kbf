@@ -25,7 +25,7 @@
 //!   hashed on the tier path, so a record the disk had damaged is found, as for any
 //!   staged object, by the new object's flush.
 //! - **Every record is hashed** as its pieces are read, on the cache's hashing pool
-//!   (off the runtime workers): the daemon's digests were trusted when the upload was
+//!   (off the runtime workers): the worker's digests were trusted when the upload was
 //!   acknowledged, so this is where they are checked. The footer is written only once
 //!   every record hashed to its digest; a record that fails ends the write in its
 //!   place, so the store keeps nothing (an S3 multipart upload is aborted). The record

@@ -19,7 +19,7 @@ use crate::wire;
 /// The empty blob is left out of the closure: it is always present. An output directory's
 /// `root_directory_digest`, when set, is required as well, so a hit never names a root
 /// `Directory` a client cannot fetch. REAPI does not make the server hold that blob; here
-/// the writer (the daemon) must upload it with the tree, or the entry is refused as absent.
+/// the writer (the worker) must upload it with the tree, or the entry is refused as absent.
 ///
 /// # Errors
 /// [`CacheError::Invalid`] for a digest of the result that is malformed.

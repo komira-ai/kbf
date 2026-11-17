@@ -31,9 +31,7 @@ pub(super) struct Origin {
     pub(super) asks_held: bool,
 }
 
-/// The messages of a `Write` after the first: a call's request stream, or the chunks of a
-/// blob an in-process caller holds ([`StorageService::in_process`]). One type for both so
-/// a write is taken in by one body of code. Owned, so that a blob too large to hold can be
+/// The messages of a `Write` after the first: a call's request stream. Owned, so that a blob too large to hold can be
 /// handed on to [`crate::Storage::put_streamed`] as it arrives.
 pub(super) type Messages = BoxStream<'static, Result<WriteRequest, Status>>;
 
@@ -55,8 +53,7 @@ impl StorageService {
     /// A whole `Write` once its caller is admitted: judges it by map generation `requested`,
     /// takes the first message and then the rest from `messages`, and stores the blob as
     /// this node's [`Plan`] says (forwarded to the replica when this node is the primary of
-    /// a chain). The answer is the blob's size. The one body of code a `Write` call and an
-    /// in-process write ([`StorageService::in_process`]) both run.
+    /// a chain). The answer is the blob's size.
     ///
     /// `leg` says whether the write is a replica's copy and who sent it, and whether the
     /// sender asked for a held answer ([`crate::replicate::LEG_HELD_HEADER`]).

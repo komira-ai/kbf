@@ -53,8 +53,6 @@
 //!   served alone over gRPC by `kbf_storage::service` (blobs through the standard
 //!   protocols, the action cache through `kbf.storage.v1`), each call admitted by the
 //!   role in the caller's certificate. No scheduler, REAPI or state store.
-//!   [`storage_half`] is the same start for `kbf storage-and-daemon`, keeping the storage
-//!   its listener serves for the daemon half in the same process.
 //!
 //! - The frontend ([`frontend`], `kbf frontend`): the REAPI listener, the scheduler,
 //!   the worker streams and the operator API, with no cache of its own. CAS, ByteStream
@@ -65,7 +63,7 @@
 //! record commits as soon as it is appended, see [`farm`]), REAPI authentication other than the policies
 //! `kbf-auth` builds (`allow`, `deny`, `any`, `all`), operator roles (the
 //! API's writes need one token, [`token`]), the `x-kbf-qos` header, learned sizes,
-//! capability matching, and the daemon-side `ResultAck` handling (issue #26).
+//! capability matching, and the worker-side `ResultAck` handling (issue #26).
 
 pub mod action_usage;
 pub mod answer;
@@ -150,7 +148,6 @@ mod startup_pass;
 pub mod state_store;
 mod stop;
 pub mod storage_gate;
-pub mod storage_half;
 pub mod storage_health;
 pub mod storage_node;
 pub mod store_config;
@@ -173,7 +170,7 @@ pub mod worker_roles;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
-pub use drain::{Drain, DrainStatus, Hold};
+pub use drain::{Drain, DrainStatus};
 pub use farm::{
     ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, Farm, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
     OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,

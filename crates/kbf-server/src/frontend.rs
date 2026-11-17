@@ -464,7 +464,7 @@ impl FrontendFlags {
 /// everything) without a state store, which is where the members and their map live, and
 /// without the TLS flags, which every connection to a member needs: a member is dialled
 /// at `https://` and verified against its own address. With a state store but no TLS flags
-/// the start logs a warning that says so, since the farm may have members the daemons
+/// the start logs a warning that says so, since the farm may have members the workers
 /// place blobs on that this frontend will not look at. A call no member could answer is
 /// held for [`DEFAULT_HOLD`] before it fails (there is no flag for the bound yet; the raw
 /// ByteStream calls have the same bound, `proxy_owners`). Not generic, for the same reason
@@ -483,7 +483,7 @@ fn routed_of(
     let Some((ca, identity)) = flags.storage_identity()? else {
         tracing::warn!(
             "a state store is configured but the TLS flags are not: members cannot be dialled, \
-             so every storage call goes to the --storage node alone, and blobs the daemons \
+             so every storage call goes to the --storage node alone, and blobs the workers \
              place on other members by the map will not be found"
         );
         return Ok(None);
@@ -574,7 +574,7 @@ impl FrontendHandle {
     }
 
     /// The pack index `--pack-index` opened on the Postgres state store, or `None` without the
-    /// flag. The worker listener's `PackIndex` service answers daemons from it, and with the
+    /// flag. The worker listener's `PackIndex` service answers workers from it, and with the
     /// pack store flags too, the frontend writes and reads it.
     #[must_use]
     pub fn pack_index(&self) -> Option<Arc<dyn PackIndex>> {
@@ -994,7 +994,7 @@ impl<'a> Prepared<'a> {
             listeners.worker_tls,
             proxy.as_ref(),
         );
-        // The rows a revocation writes, beside the file: a revoked daemon is refused here,
+        // The rows a revocation writes, beside the file: a revoked worker is refused here,
         // read again now that the slow steps of the start are done; `/readyz` waits for them.
         let peers = crate::deny_rows::denying(peers, members.as_ref());
         let checks = Arc::new(crate::deny_rows::probing(checks, &peers));
@@ -1396,7 +1396,7 @@ struct Counters {
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
 /// counters when it keeps history, the storage health of `members` when there are any, the
 /// reloads of the listeners' `tls` files, the counters of the `packs` when there are any, those
-/// of the job-facing read when there is one, and the pack reads the daemons of `farm` report
+/// of the job-facing read when there is one, and the pack reads the workers of `farm` report
 /// and its failed actions by class.
 fn metrics_route(
     backend: Backend,

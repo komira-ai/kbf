@@ -1,6 +1,5 @@
 //! [`Backend`]: what Execute and the scheduler need of the store, and nothing more. Four
-//! implementations: a [`Cache`] in this process (what `kbf-server` and `kbf all-in-one`
-//! have always run), a [`Storage`] reached over gRPC (`kbf frontend` without members,
+//! implementations: a [`Cache`] in this process (what `kbf-server` runs), a [`Storage`] reached over gRPC (`kbf frontend` without members,
 //! which holds no blobs of its own: `docs/design/architecture-v2.md`, sections 2 and 7),
 //! the storage nodes of a map ([`Backend::routed`], `kbf frontend` with members),
 //! which is the second until the map has two members, and no node at all
@@ -32,7 +31,7 @@
 //! has the blobs clients upload in packs, not on its nodes, so the Action and Command blobs, the
 //! input check and the walk of the input tree look in the pack index first and ask the nodes
 //! about what it lacks (`layered`). The action cache and the result blobs are the nodes', but
-//! the closure check is not: a blob a daemon wrote into a pack is not on a node, so the check
+//! the closure check is not: a blob a worker wrote into a pack is not on a node, so the check
 //! of an action-cache write and of every hit asks the pack index first and the nodes for the
 //! rest (`closed`), and the entry handed to the nodes names only the blobs they hold.
 //! Without packs the nodes check the entry alone, as they always did.
@@ -282,7 +281,7 @@ impl Backend {
         self.0.prepare_action_result(result).await
     }
 
-    /// The second half, as a daemon's result ([`Storage::commit_action_record`]).
+    /// The second half, as a worker's result ([`Storage::commit_action_record`]).
     ///
     /// # Errors
     /// As the store answers.

@@ -149,7 +149,7 @@ fn a_seq_not_above_the_last_is_dropped() {
     assert_eq!(newest_seq(&next), Some(6));
 }
 
-/// Catches a restarted daemon (readings counted again from 1, its clock and counters from 0)
+/// Catches a restarted worker (readings counted again from 1, its clock and counters from 0)
 /// being dropped for a low seq or measured against the process before it.
 #[test]
 fn a_new_session_resets_the_baseline() {
@@ -176,7 +176,7 @@ fn a_new_session_resets_the_baseline() {
     );
     assert_eq!(restarted.windows, [None, None]);
 
-    // A daemon that names no process is a new session on each stream.
+    // A worker that names no process is a new session on each stream.
     let a = Session::of("", StreamId(1));
     let b = Session::of("", StreamId(2));
     assert_ne!(a, b);
@@ -352,7 +352,7 @@ fn serving() -> Reported {
     )
 }
 
-/// `name` registered by daemon process `instance` on a new stream, kept open for the rest of
+/// `name` registered by worker process `instance` on a new stream, kept open for the rest of
 /// the test.
 fn register(farm: &Farm, name: &str, instance: &str) -> StreamId {
     let (outbound, inbox) = tokio::sync::mpsc::unbounded_channel();
@@ -375,7 +375,7 @@ fn detail(farm: &Farm, name: &str) -> crate::fleet::NodeDetail {
 
 /// Asserts the wiring: a node with no accepted reading shows no load, readings of a heartbeat
 /// reach the node view, a heartbeat without one changes nothing, a reading on a replaced stream
-/// or of a node that never registered is ignored, the same daemon process on a new stream
+/// or of a node that never registered is ignored, the same worker process on a new stream
 /// keeps its baseline, a restarted one resets it, and the view goes stale on the farm's clock.
 #[tokio::test(start_paused = true)]
 async fn readings_reach_the_node_view() {
@@ -411,7 +411,7 @@ async fn readings_reach_the_node_view() {
         Some(2_000)
     );
 
-    // A restarted daemon counts again from 1.
+    // A restarted worker counts again from 1.
     let third = register(&farm, "a", "proc-2");
     farm.note_node_load(&a, third, Some(&reading(1, SECOND / 2, 0)));
     let load = detail(&farm, "a").load.expect("a load");
@@ -588,7 +588,7 @@ async fn an_accepted_reading_is_handed_to_the_scheduler_with_its_lists() {
 /// Asserts that a reading the accept rule refuses (a repeat of the last seq, an older one, a
 /// clock that went back) is not handed to the scheduler, and that the minutes it carried are
 /// counted as refused in the node view; and that the refused first reading of a restarted
-/// daemon feeds nothing either and leaves the node without a load.
+/// worker feeds nothing either and leaves the node without a load.
 #[tokio::test(start_paused = true)]
 async fn a_refused_reading_feeds_nothing_and_counts_its_minutes() {
     let farm = farm();
@@ -621,7 +621,7 @@ async fn a_refused_reading_feeds_nothing_and_counts_its_minutes() {
     let lists = detail(&farm, "a").load.expect("a load").lists;
     assert_eq!(lists, counts((0, 1), (0, 0, 0), 9));
 
-    // The first reading of a restarted daemon that is refused has no counts to add to: it
+    // The first reading of a restarted worker that is refused has no counts to add to: it
     // feeds nothing, and the node has no load to show until one is accepted.
     let restarted = register(&farm, "a", "proc-2");
     let bad = with_minutes(0, SECOND, vec![minute(7, 0)]);
@@ -667,7 +667,7 @@ async fn the_feed_reaches_the_scheduler_in_every_placement_mode() {
     }
 }
 
-/// Asserts that a restarted daemon whose first reading fails validation leaves the node with
+/// Asserts that a restarted worker whose first reading fails validation leaves the node with
 /// no load: the earlier process's reading is not shown for it, and a first reading that
 /// cannot be believed is not kept as a baseline. Catches the old session's reading kept
 /// after a restart, and a refused first reading stored anyway.

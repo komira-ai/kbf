@@ -124,7 +124,7 @@ pub(super) struct Receiving {
     records: Vec<Record>,
     /// The first record found not to hash to its digest.
     bad: Option<String>,
-    /// The daemon's digests are trusted: nothing is hashed here (the flusher does it
+    /// The worker's digests are trusted: nothing is hashed here (the flusher does it
     /// before the PUT, or the cache does if the tier does not take the segment).
     trusted: bool,
 }
@@ -401,7 +401,7 @@ impl Receiving {
 
     /// Builds the segment to store from the received records, then a footer built here
     /// from the declared (digest, offset) entries and the CRC-32C the check computed.
-    /// For a trusted upload nothing was computed: the footer carries the daemon's
+    /// For a trusted upload nothing was computed: the footer carries the worker's
     /// CRC-32C and the segment is not [`BuiltSegment::verified`], so the cache hashes
     /// it before any PUT.
     ///

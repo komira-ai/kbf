@@ -1,8 +1,7 @@
-//! `kbf-transfer`: the shared blob transfer engine of a process that moves the farm's blobs
-//! (`docs/design/worker-cache.md#4-the-shared-transfer-engine`).
+//! `kbf-transfer`: the shared blob transfer engine of a process that moves the farm's blobs.
 //!
-//! Every blob such a process moves goes through one [`Transfers`] per process: input files,
-//! output uploads, and the input cache's fills. It speaks gRPC to kbf-server over one
+//! Every blob such a process moves goes through one [`Transfers`] per process: input reads and
+//! output uploads. It speaks gRPC to kbf-server over one
 //! HTTP/2 connection with many streams, and bounds the whole process with one
 //! in-flight limit and one byte budget, not one per call. Uploads hold at most all but
 //! a quarter of the limit, so a slow store under one lease's upload leaves permits for
@@ -27,16 +26,14 @@
 //!   each from its source as it sends it, in whole segments over `kbf.worker.v1.Segments`
 //!   (`docs/design/write-path.md`, section 4), blob by blob when the server cannot take
 //!   them.
-//! - [`Spool`]: outputs gathered in one local file ([`Cas::put_spool`]); the native
-//!   driver's way, a [`Record`] each.
+//! - [`Spool`]: outputs gathered in one local file ([`Cas::put_spool`]), each blob in it a
+//!   [`Record`].
 //!
 //! The engine's core (the permits, the byte budget, the shared fetches and the counters)
 //! is in `engine` and `flights`; the REAPI backend (ByteStream and FindMissing calls)
-//! is `wire`. Batching small blobs (BatchReadBlobs, BatchUpdateBlobs) is stage T2 and
-//! not here.
+//! is `wire`. Batching small blobs (BatchReadBlobs, BatchUpdateBlobs) is not here.
 //!
-//! The engine has no TLS policy: it connects to whatever endpoint it is given
-//! (`docs/design/worker-cache.md#47-tls`).
+//! The engine has no TLS policy: it connects to whatever endpoint it is given.
 
 pub mod cas;
 mod config;

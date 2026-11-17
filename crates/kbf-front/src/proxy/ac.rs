@@ -61,7 +61,7 @@ impl ActionCache for ProxyActionCache {
         _request: Request<UpdateActionResultRequest>,
     ) -> Result<Response<ActionResult>, Status> {
         Err(Status::permission_denied(
-            "clients cannot write the action cache; only the daemon that ran an action does",
+            "clients cannot write the action cache; only the worker that ran an action does",
         ))
     }
 }

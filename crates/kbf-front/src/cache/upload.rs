@@ -1,5 +1,5 @@
 //! What the `Segments` service asks of the cache (`docs/design/write-path.md`, section
-//! 4): storing segments the server built from a daemon's checked records under one
+//! 4): storing segments the server built from a worker's checked records under one
 //! commit, locating blobs, and reading ranges of stored objects.
 
 use bytes::Bytes;
@@ -22,7 +22,7 @@ pub(crate) struct BuiltSegment {
     pub entries: Vec<IndexEntry>,
     /// Whether every record was hashed to its digest, and `entries` carry the CRC-32C
     /// of that pass. An unverified segment (an upload on a write tier, which trusts the
-    /// daemon's digests) is staged as it is, and the flusher hashes it before the PUT;
+    /// worker's digests) is staged as it is, and the flusher hashes it before the PUT;
     /// one the tier does not take is hashed here before it is PUT.
     pub verified: bool,
     /// The records' range on the write tier when they were written there as they
@@ -126,7 +126,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// Hashes every record of an unverified `segment` against its entry's digest, on the
     /// hashing pool, and rebuilds the footer from the CRC-32C of that pass (the
-    /// daemon's never reaches the store).
+    /// worker's never reaches the store).
     ///
     /// # Errors
     /// [`CacheError::DigestMismatch`] for the first record that does not hash to its

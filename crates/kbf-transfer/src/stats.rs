@@ -1,5 +1,5 @@
-//! What the engine counts: [`TransferStats`] per lease (`docs/design/worker-cache.md#46-metrics-through-the-api`)
-//! and [`EngineStats`] for the process.
+//! What the engine counts: [`TransferStats`] per lease and
+//! [`EngineStats`] for the process.
 //!
 //! A lease's counters are logged once, when the last handle on them goes (its
 //! [`crate::Scope`], and any fetch it started that is still finishing). Carrying them

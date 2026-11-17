@@ -1,14 +1,14 @@
-//! An input the worker could not fetch, as the server reads the daemon's `Result`
+//! An input the worker could not fetch, as the server reads a worker's `Result`
 //! (failure classes, "Missing blob at the worker").
 //!
-//! The daemon reports a missing input as FAILED_PRECONDITION with a
+//! A worker reports a missing input as FAILED_PRECONDITION with a
 //! `google.rpc.PreconditionFailure` holding a `MISSING` violation per blob, subject
-//! `blobs/<hash>/<size>` (`kbf-daemon`, `lease::missing`). The daemon's only CAS is this
+//! `blobs/<hash>/<size>`. The worker's only CAS is this
 //! server, which answers NOT_FOUND only for a blob its index does not hold, so the
 //! report means the farm lost the blob after the front checked the inputs. The callers
 //! get the same answer the front gives before queueing ([`kbf_front::missing_status`]),
 //! rebuilt from the digests rather than forwarded as sent, so that it carries the one
-//! detail Bazel re-uploads on and nothing a daemon added.
+//! detail Bazel re-uploads on and nothing a worker added.
 //!
 //! Any other FAILED_PRECONDITION (no detail, a violation of another type, a subject
 //! that is not a digest) is not a missing input: it stays the farm's failure.
@@ -21,7 +21,7 @@ use tonic::Code;
 /// The `type_url` of a `google.rpc.PreconditionFailure` detail.
 const PRECONDITION_FAILURE: &str = "type.googleapis.com/google.rpc.PreconditionFailure";
 
-/// The blobs a daemon's `status` says are missing, each once, in the order it named
+/// The blobs a worker's `status` says are missing, each once, in the order it named
 /// them; `None` unless the status is FAILED_PRECONDITION whose `PreconditionFailure`
 /// details hold at least one violation and every violation is `MISSING` with a
 /// `blobs/<hash>/<size>` subject. Details of other types are ignored.
@@ -81,12 +81,12 @@ mod tests {
     fn status(code: Code, details: Vec<prost_types::Any>) -> rpc::Status {
         rpc::Status {
             code: code as i32,
-            message: "from the daemon".to_owned(),
+            message: "from the worker".to_owned(),
             details,
         }
     }
 
-    /// Catches a reader that drops a blob, repeats one the daemon named twice (in one
+    /// Catches a reader that drops a blob, repeats one the worker named twice (in one
     /// detail or across two), or reorders them; and one that refuses a report for a
     /// detail of another type next to the `PreconditionFailure`, which the answer
     /// leaves out anyway.
@@ -117,7 +117,7 @@ mod tests {
     }
 
     /// Catches a FAILED_PRECONDITION that is not a missing input answered as one: the
-    /// daemon's "no driver serves the lease kind" (no detail), a violation of another
+    /// worker's "no driver serves the lease kind" (no detail), a violation of another
     /// type next to a `MISSING` one (Bazel would not re-upload on it, and the farm
     /// would claim the client's blob is gone), a subject that is not
     /// `blobs/<hash>/<size>`, a detail that does not decode, and another code with a

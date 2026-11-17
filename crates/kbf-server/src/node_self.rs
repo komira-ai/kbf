@@ -2,7 +2,7 @@
 //! own node, and no others (`docs/design/updates.md`).
 //!
 //! The worker listener is where the frontend already authenticates node certificates (mutual
-//! TLS against `--worker-client-ca`), and every host that runs a daemon or a storage node
+//! TLS against `--worker-client-ca`), and every host that runs a worker or a storage node
 //! reaches it. A host's updater presents the certificate the farm CA made for it
 //! (`urn:kbf:role:updater`, one DNS name: the node id), and no token is involved:
 //!
@@ -15,7 +15,7 @@
 //!
 //! **Who may.** [`admit`] decides, in [`crate::worker_roles::WorkerRoles`] before anything is
 //! routed: the certificate TLS verified must name the role `updater` and exactly one node, and
-//! that node must be the `{id}` of the call. A daemon, storage, frontend or coordinator
+//! that node must be the `{id}` of the call. A worker, storage, frontend or coordinator
 //! certificate, a call with no certificate, and an updater of another node are refused (401
 //! without a certificate, 403 otherwise). The worker listener's deny list then applies to the
 //! node, as it does to a storage node's calls ([`crate::identity::Peers::admit`]). Every other call

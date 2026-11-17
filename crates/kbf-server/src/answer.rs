@@ -35,14 +35,14 @@ pub struct Pending {
 pub enum Detail {
     /// An OK result to answer with and maybe cache.
     Ran(Box<Pending>),
-    /// The daemon's reason the action is invalid, passed to the callers.
+    /// The worker's reason the action is invalid, passed to the callers.
     Invalid(String),
     /// The input blobs the worker could not fetch, which the callers are asked to
     /// upload again (`crate::missing`).
     Missing(Vec<Digest>),
     /// A timed-out action's partial result ([`crate::timeout`]), answered, never cached.
     TimedOut(Box<ActionResult>),
-    /// The daemon's reason for an infrastructure failure (a missing image, a full
+    /// The worker's reason for an infrastructure failure (a missing image, a full
     /// disk), or why an OK result could not be accepted: the callers are told only
     /// that the farm could not run the action, and the invocation record keeps it.
     Infra(String),
@@ -170,7 +170,7 @@ pub(crate) async fn outcome_pausing(
             }
             None => {
                 // The client is told only that the farm could not run the action: the
-                // daemon's reason (a missing image, a full disk) is in this line and
+                // worker's reason (a missing image, a full disk) is in this line and
                 // in the invocation record.
                 let why = result.status.map(|s| s.message).unwrap_or_default();
                 tracing::warn!(%lease, node = %ran_on.0, ?code, reason = %why, "lease failed");

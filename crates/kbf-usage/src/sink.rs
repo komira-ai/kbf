@@ -96,7 +96,7 @@ impl ProfileSink {
     }
 
     /// Judges one reading of `host` (see [`Recorder::observe`]) and returns the lease
-    /// minutes in it that are new. `epoch` changes when the node's daemon restarts, and
+    /// minutes in it that are new. `epoch` changes when the node's worker restarts, and
     /// `now_wall_minute` is the farm's wall clock in minutes.
     pub fn observe(
         &self,

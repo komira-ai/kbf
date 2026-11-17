@@ -261,7 +261,7 @@ pub(crate) fn advertised(store: &dyn Store) -> Result<BTreeMap<String, String>, 
 /// The operator API's safe-to-stop query asks it of a node id (`crate::api`).
 ///
 /// # Errors
-/// Why the host cannot be told from a daemon-only host: the registry could not be read, does
+/// Why the host cannot be told from a worker-only host: the registry could not be read, does
 /// not know it, or its address is no member's or more than one member's.
 pub fn storage_half(
     store: &dyn Store,
@@ -396,7 +396,7 @@ mod tests {
         ));
     }
 
-    /// An empty advertised address is a daemon-only host; an unknown host and an address
+    /// An empty advertised address is a worker-only host; an unknown host and an address
     /// two members share are unlinked.
     #[test]
     fn link_tells_no_storage_from_unlinked() {

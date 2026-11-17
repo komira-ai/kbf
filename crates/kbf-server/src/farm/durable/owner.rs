@@ -1,32 +1,32 @@
-//! Which frontend owns a daemon, when several frontends share one state store.
+//! Which frontend owns a worker, when several frontends share one state store.
 //!
-//! A daemon is connected to one frontend at a time, and only that frontend may write the
-//! leases of the daemon's node: grant one, give one up, take a result for one. Two
+//! A worker is connected to one frontend at a time, and only that frontend may write the
+//! leases of the worker's node: grant one, give one up, take a result for one. Two
 //! frontends that both believed they were its owner could each grant the node an
-//! operation, or one could give up a lease the daemon still runs under the other.
+//! operation, or one could give up a lease the worker still runs under the other.
 //!
 //! The `owner/<worker>` row says who owns a node: the id of a frontend and a counter, eight
-//! bytes each, big-endian. A daemon's `Hello` makes the frontend it says it to the owner,
+//! bytes each, big-endian. A worker's `Hello` makes the frontend it says it to the owner,
 //! by a compare-and-set that adds one to the counter. The frontend remembers the counter
 //! it wrote, and every write of a lease of that node (a grant, a lease given up, a result)
 //! reads the row and is conditional on it: it names this frontend at that counter, in the
-//! very transaction. A frontend that finds another name or counter, because the daemon
+//! very transaction. A frontend that finds another name or counter, because the worker
 //! said `Hello` elsewhere meanwhile, writes nothing and fails with
 //! [`StateError::StaleOwner`]. That error is about one node: it drops what the frontend
 //! holds for that node and nothing else, and does not mark the frontend as superseded as
 //! a refusal of the store as `Fenced` does ([`kbf_state::StoreError::Fenced`]).
 //!
 //! A node this frontend never claimed (a lease taken up by a request that joined its
-//! operation, before its daemon said `Hello` here) has no counter to check: a write for it
+//! operation, before its worker said `Hello` here) has no counter to check: a write for it
 //! is conditional on its lease rows alone. A node whose claim failed after a `Hello` (the
 //! store could not be read or written, or another frontend won every try) is lost like one
-//! the daemon left: nothing is written for it until a claim succeeds.
+//! the worker left: nothing is written for it until a claim succeeds.
 //!
 //! The frontend also acknowledges a node's heartbeats only while it owns the node, looking
 //! at the row again when the last look is [`OWNER_CACHE_TTL`] old, and only while it has
-//! written the node's `session/` row within [`ACK_WINDOW`]. A daemon stops its work `T`
+//! written the node's `session/` row within [`ACK_WINDOW`]. A worker stops its work `T`
 //! after the last heartbeat that was acknowledged, so a frontend that cannot tell whether
-//! the daemon still belongs to it, or whether the other frontends can see that the daemon
+//! the worker still belongs to it, or whether the other frontends can see that the worker
 //! is alive, stops acknowledging.
 
 use kbf_sched::fence::{HANDOVER_GRACE, LEADER_LEASE_MARGIN, SELF_FENCE};
@@ -38,35 +38,35 @@ use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
 pub(super) const OWNER: &str = "owner/";
 
 /// How long a frontend trusts its last look at an `owner/` row before it reads the row
-/// again to acknowledge a heartbeat. The frontend a daemon moved to waits this long beyond
-/// the handover grace ([`OWNER_HANDOVER_WAIT`]) before it takes a lease the daemon does not
-/// list as lost, because the frontend the daemon left may go on acknowledging the old
-/// daemon process this long after the move.
+/// again to acknowledge a heartbeat. The frontend a worker moved to waits this long beyond
+/// the handover grace ([`OWNER_HANDOVER_WAIT`]) before it takes a lease the worker does not
+/// list as lost, because the frontend the worker left may go on acknowledging the old
+/// worker process this long after the move.
 pub const OWNER_CACHE_TTL: Duration = Duration::from_secs(2);
 
-/// How long the leases a daemon that moved to this frontend does not list are kept after it
-/// registers, when the daemon process may be another than the one that ran them: the
+/// How long the leases a worker that moved to this frontend does not list are kept after it
+/// registers, when the worker process may be another than the one that ran them: the
 /// handover grace, which ends when the old process has fenced, and [`OWNER_CACHE_TTL`].
 pub(super) const OWNER_HANDOVER_WAIT: Duration = HANDOVER_GRACE.saturating_add(OWNER_CACHE_TTL);
 
-/// How old this frontend's last write of a daemon's `session/` row may be for it still to
-/// acknowledge the daemon's heartbeats.
+/// How old this frontend's last write of a worker's `session/` row may be for it still to
+/// acknowledge the worker's heartbeats.
 ///
-/// A daemon's work ends `T` ([`SELF_FENCE`]) after the last heartbeat that was acknowledged,
+/// A worker's work ends `T` ([`SELF_FENCE`]) after the last heartbeat that was acknowledged,
 /// and the fence keeps a margin ([`LEADER_LEASE_MARGIN`]) beyond that. The row is there for
 /// [`LEASE_GRACE`] after its last write, and a reader that takes a missing row to mean the
-/// daemon is gone would wait one renewal interval ([`SESSION_RENEWAL`]) beyond that. The
+/// worker is gone would wait one renewal interval ([`SESSION_RENEWAL`]) beyond that. The
 /// window is what is left of the two after the work and twice the margin: a derived
 /// constant, which the orphan sweep relies on ([`ORPHAN_WAIT`]). It is longer than a
 /// renewal interval and a heartbeat interval together, checked at compile time, so a
 /// frontend that renews its rows on schedule never withholds an acknowledgement.
 pub const ACK_WINDOW: Duration = ROW_LIFE.saturating_sub(RUN_LIFE);
 
-/// How long after its last write a daemon's session row, written on schedule, is certain
+/// How long after its last write a worker's session row, written on schedule, is certain
 /// to be there to be read, with the wait beyond its expiry.
 pub(super) const ROW_LIFE: Duration = LEASE_GRACE.saturating_add(SESSION_RENEWAL);
 
-/// How long after its last acknowledged heartbeat a daemon may run, with twice the margin
+/// How long after its last acknowledged heartbeat a worker may run, with twice the margin
 /// of the fence.
 pub(super) const RUN_LIFE: Duration =
     SELF_FENCE.saturating_add(LEADER_LEASE_MARGIN.saturating_mul(2));
@@ -98,7 +98,7 @@ pub(super) fn owner_key(worker: &WorkerId) -> String {
 }
 
 /// What an `owner/<worker>` row says: the frontend that owns the node, and how many times
-/// a daemon has said `Hello` to a frontend as the node.
+/// a worker has said `Hello` to a frontend as the node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Owner {
     pub(super) frontend: u64,
@@ -140,13 +140,13 @@ pub(super) struct Arrival {
     pub(super) previous: Option<Owner>,
     /// The unfinished operations whose lease rows name the node.
     pub(super) leases: Vec<StoredOperation>,
-    /// The daemon process the node's `session/` row names: the one that said `Hello` to the
+    /// The worker process the node's `session/` row names: the one that said `Hello` to the
     /// frontend that owned the node, as far as the row has not expired.
     pub(super) session: Option<DaemonInstance>,
 }
 
 impl Durable {
-    /// A daemon said `Hello` as `worker` to this frontend: it becomes the node's owner at
+    /// A worker said `Hello` as `worker` to this frontend: it becomes the node's owner at
     /// the next counter, and reads what it takes over ([`Arrival`]). The write is retried
     /// when another frontend writes the row first, and if every try loses, the node is
     /// given up to the other (nothing is written for it until it says `Hello` here again).
@@ -249,7 +249,7 @@ impl Durable {
         }
     }
 
-    /// The daemon process the `session/` row of `worker` names, if the row is there and is
+    /// The worker process the `session/` row of `worker` names, if the row is there and is
     /// a registration.
     fn session_instance(&self, worker: &WorkerId) -> Result<Option<DaemonInstance>, StateError> {
         let key = format!("{SESSION}{worker}");
@@ -346,7 +346,7 @@ impl Durable {
 }
 
 impl Engine {
-    /// A daemon said `Hello` here as `worker`, whose newest stream is `instance`'s: this
+    /// A worker said `Hello` here as `worker`, whose newest stream is `instance`'s: this
     /// frontend becomes its owner, takes up the leases the store holds for it that the
     /// scheduler does not hold (a drain of the node that ended at the start, for want of a
     /// lease, is put back in force: [`State::resume_drain`]), and reads what the node's
@@ -355,7 +355,7 @@ impl Engine {
     ///
     /// The leases the scheduler recovered for the node wait for it to register, as they
     /// do after a start. Those of a node whose owner was another frontend are kept for
-    /// [`OWNER_HANDOVER_WAIT`] after the registration when the daemon process may be
+    /// [`OWNER_HANDOVER_WAIT`] after the registration when the worker process may be
     /// another than the one the other frontend heard (the session row names another, or
     /// has expired): that process may go on running them, acknowledged by the other
     /// frontend, until it fences, so a heartbeat that leaves them out is not taken as
@@ -409,7 +409,7 @@ impl Engine {
     /// What the store says of `worker` once this frontend owns it; `None` if the farm has
     /// no state store, or the store did not take the claim. A claim refused because the
     /// store could not be reached is kept to be made again, in place of an older one for
-    /// the node, which was made for a daemon process that has been replaced.
+    /// the node, which was made for a worker process that has been replaced.
     fn take_arrival(
         &mut self,
         now: FarmTime,

@@ -1,6 +1,6 @@
 //! The updater's own update (docs/design/host-updates.md, 3.5, "Updating the updater itself").
 //!
-//! The updater is part of the kbf release and is updated by the kbf daemon's hook as any
+//! The updater is part of the kbf release and is updated by the kbf update hook as any
 //! service, but never inside the trial it guards. After the update of the release has finished
 //! and `verify` has succeeded, a follow-on step ([`follow_on`]) stages the new updater binary
 //! beside the old, points `current` at it and tells the caller to reply and exit cleanly; the

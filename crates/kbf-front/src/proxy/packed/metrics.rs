@@ -71,10 +71,10 @@ pub struct PackMetrics {
     /// Uploads ended DEADLINE_EXCEEDED because no byte of their body arrived for
     /// `--pack-upload-idle-timeout`.
     pub upload_idle_timeouts: Counter,
-    /// Packs a daemon stored that were recorded in the index by `CommitPack`.
+    /// Packs that were recorded in the index by `CommitPack`.
     pub commits: Counter,
     /// Commits of a pack that were refused, and nothing was recorded: the pack is not in the
-    /// store, a sampled blob is not its digest, the name or the list is not one a daemon may
+    /// store, a blob is not its digest, the key or the manifest is not one the build may
     /// commit, or the pack was recorded before with other contents.
     pub commit_rejects: Counter,
     /// Packs a build wrote through a presigned write that were recorded by
@@ -312,13 +312,13 @@ impl PackMetrics {
             ),
             (
                 "kbf_pack_commits_total",
-                "Packs a daemon stored that CommitPack recorded in the pack index",
+                "Packs that CommitPack recorded in the pack index",
                 &self.commits,
             ),
             (
                 "kbf_pack_commit_rejects_total",
                 "Commits of a pack refused, nothing recorded: the pack was not in the store, a \
-                 sampled blob was not its digest, or the commit was not one a daemon may make",
+                 blob was not its digest, or the commit was not one the build may make",
                 &self.commit_rejects,
             ),
         ];

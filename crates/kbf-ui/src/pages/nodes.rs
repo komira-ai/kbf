@@ -3,8 +3,8 @@
 //!
 //! Both read only the nodes routes: `GET /v1/nodes` and `GET /v1/nodes/{id}`. Counts and
 //! sums are the API's (`lease_count`, `booked`, `free`): a page adds up nothing. The list is
-//! in memory on the server, so both pages say that a restart empties it until the daemons
-//! reconnect.
+//! in memory on the server, so both pages say that a restart empties it until the workers
+//! register again.
 
 use serde::Deserialize;
 

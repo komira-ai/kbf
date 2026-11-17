@@ -1,6 +1,6 @@
 //! The start of a frontend with a state store reads the deny rows when it opens the members,
 //! before any listener serves (and again just before, `crate::deny_rows`), so the worker
-//! listener does not refuse every daemon until the sweeper's first beat.
+//! listener does not refuse every worker until the sweeper's first beat.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,11 +38,11 @@ fn peer(node: &str) -> PeerCert {
     PeerCert::proxied(node, &[])
 }
 
-/// Right after the members are made, with no sweeper running, a daemon is admitted and a
+/// Right after the members are made, with no sweeper running, a worker is admitted and a
 /// node whose deny row is already in the store is refused.
 ///
 /// Catches: a start that leaves the first read of the deny rows to the sweeper, so that every
-/// daemon that connects before its first beat (a whole beat if that refresh fails) is refused
+/// worker that connects before its first beat (a whole beat if that refresh fails) is refused
 /// UNAVAILABLE at every frontend restart.
 #[tokio::test]
 async fn the_start_reads_the_deny_rows_before_any_listener_serves() {

@@ -6,12 +6,12 @@
 //! each a node of the declared shape whose drivers are `container` and `native-whole-machine`
 //! (and, with `--executor-mac-hosts`, Mac workers `js-mac:<frontend>-<n>` whose one driver is
 //! `native`, [`mac`]),
-//! and takes the messages the farm sends a daemon on the channel it owns the receiving end of.
+//! and takes the messages the farm sends a worker on the channel it owns the receiving end of.
 //! A `Start` is submitted to the job service as a job of the kbf image, whose entrypoint is the
 //! task tool (a `whole_machine` lease's as a job that needs the whole host), under an id
 //! made from the farm lease, so a submit sent again makes no second job; the job is read back
 //! until it ends, its ending is mapped to the farm's failure classes ([`outcome`]), and the
-//! result is reported the way a daemon reports one. A `Cancel` is a cancel of the job. The
+//! result is reported the way a worker reports one. A `Cancel` is a cancel of the job. The
 //! executor holds no capacity, renews nothing and never sees where a job runs. `worker.rs`, the
 //! scheduler core and the sched crates are untouched, and a server that never builds an
 //! [`Executor`] never opens a connection to a job service.

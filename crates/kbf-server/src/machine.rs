@@ -107,7 +107,7 @@ pub struct Waiter {
 /// property's raw text never reaches the log.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Platform {
-    /// `linux` or `macos` (a daemon runs on no other); `-` for none, and for a value
+    /// `linux` or `macos` (a worker runs on no other); `-` for none, and for a value
     /// that is neither.
     pub os_family: &'static str,
     /// The architecture's report name (`x86_64`, `arm64`); `-` for none.
@@ -359,7 +359,7 @@ mod tests {
     }
 
     /// Catches: a platform line that logs the request's raw text (an `os` that is not
-    /// one a daemon runs on is `-`), or a part the request does not name that is not `-`.
+    /// one a worker runs on is `-`), or a part the request does not name that is not `-`.
     #[test]
     fn a_platform_is_the_parsed_os_family_and_isa_or_dashes() {
         let of = |properties: &[(&str, &str)]| {

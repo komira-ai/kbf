@@ -8,9 +8,9 @@ use kbf_types::sched::usage::{self, LeaseClock, LeaseMinute};
 
 use crate::fleet::{DroppedView, ListsView};
 
-/// What the lists of one daemon process's readings have come to since it began: the records
+/// What the lists of one worker process's readings have come to since it began: the records
 /// kept, the records dropped by reason, and the minutes of the readings the accept rule
-/// refused. The counts of a daemon that restarts begin again.
+/// refused. The counts of a worker that restarts begin again.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Lists {
     clocks: u64,
@@ -61,12 +61,12 @@ fn lease(id: &WireLease) -> LeaseId {
 }
 
 /// `load` as the scheduler takes it, with the lists of `vetted` (what `NodeLoad::vet` kept
-/// of `load`'s own): the scalars are copied, the two telemetry counters the daemon may leave
+/// of `load`'s own): the scalars are copied, the two telemetry counters the worker may leave
 /// out read as 0 (the scheduler's fields are plain numbers and only shown), and a record that
 /// names no lease is left out (`vet` has dropped each, so none is).
 ///
 /// A free function: both types are foreign here, so `From` cannot be written. Whatever else
-/// hands a daemon's load to the scheduler calls this one.
+/// hands a worker's load to the scheduler calls this one.
 pub(crate) fn sched_load(load: &NodeLoad, vetted: &Vetted) -> usage::NodeLoad {
     usage::NodeLoad {
         seq: load.seq,

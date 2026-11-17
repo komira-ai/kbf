@@ -1,7 +1,7 @@
 //! The encoding of the values of the `op/`, `lease/` and `session/` rows ([`RowCodec`]).
 //!
 //! The store layer decides which rows exist, what their keys are and when each is written;
-//! the codec decides only what bytes a request, a lease grant and a daemon's registration
+//! the codec decides only what bytes a request, a lease grant and a worker's registration
 //! are as a row value. [`KbfLog`], the one implementation, writes the `kbf-log` encoding of
 //! the scheduler's own input for each, so the codec the replicated log already runs decides
 //! what a row may hold.
@@ -94,14 +94,14 @@ impl Durable {
     }
 }
 
-/// What a daemon's registration says, as its `session/` row keeps it.
+/// What a worker's registration says, as its `session/` row keeps it.
 #[derive(Debug, Clone)]
 pub(super) struct WorkerUp {
     /// The worker.
     pub(super) worker: WorkerId,
-    /// The daemon process that registered it.
+    /// The worker process that registered it.
     pub(super) instance: DaemonInstance,
-    /// The server found the daemon process before it stopped, its runs killed.
+    /// The server found the worker process before it stopped, its runs killed.
     pub(super) predecessor_stopped: bool,
     /// What placement may book on it.
     pub(super) capacity: Resources,
@@ -116,7 +116,7 @@ pub(super) enum Value {
     Submit(Request),
     /// A lease grant (`lease/`).
     Lease(LeaseGrant),
-    /// A daemon's registration (`session/`).
+    /// A worker's registration (`session/`).
     Session(WorkerUp),
     /// A value the codec reads, but of a kind no row holds.
     Other,

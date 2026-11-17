@@ -1,10 +1,14 @@
-//! `kbf_node_input_cache_*` on `GET /metrics`: what each daemon says its input cache did, from
+//! `kbf_node_input_cache_*` on `GET /metrics`: what each worker says its input cache did, from
 //! the counts on its heartbeats ([`crate::farm::Farm::input_caches`]).
 //!
-//! One sample per node and family, labelled `node`, as the counters of the daemon's process
+//! No current worker sends these counts: the farm's workers are the executor's job-service
+//! hosts ([`crate::executor`]), which send none, so the families are absent and the route
+//! output holds none. They are read, and shown, for a worker that does send them.
+//!
+//! One sample per node and family, labelled `node`, as the counters of the worker's process
 //! (they start again from 0 when it restarts, as a counter may; nothing here keeps them across
 //! a restart). A node that sent no counts has no sample, and with no node sending any, no family
-//! is written: a daemon whose cache is off is not a daemon whose cache did nothing.
+//! is written: a worker whose cache is off is not a worker whose cache did nothing.
 //!
 //! The unit is the cache entry (one blob by digest and executable bit), not the file name a
 //! lease places it under. The tree store's counts are families of their own, written only for
@@ -101,7 +105,7 @@ pub(crate) fn render(out: &mut String, nodes: &[(WorkerId, InputCacheCounts)]) {
     }
 }
 
-/// Appends what the daemons of `farm` report of their input caches to `out`.
+/// Appends what the workers of `farm` report of their input caches to `out`.
 pub(crate) fn render_farm(out: &mut String, farm: &Farm) {
     render(out, &farm.input_caches());
 }

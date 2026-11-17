@@ -1,5 +1,5 @@
 //! Memory kills as the server sees them (failure classes, 6.1): the scheduler's outcome
-//! for a daemon `Result` that names one, the attention line for a busy node's kill, and
+//! for a worker `Result` that names one, the attention line for a busy node's kill, and
 //! what callers are told once the scheduler finishes an operation with one.
 //!
 //! The scheduler decides whether a killed run runs again (`kbf_types::MemoryRun`); the

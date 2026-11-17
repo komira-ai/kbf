@@ -151,7 +151,7 @@ mod tests {
         assert_ne!(glued("ab", "c"), glued("a", "bc"));
     }
 
-    /// Catches a key for a platform that pins no OS (`-`, or a name no daemon runs).
+    /// Catches a key for a platform that pins no OS (`-`, or a name no worker runs).
     #[test]
     fn a_platform_with_no_os_has_no_key() {
         for os_family in ["-", "windows"] {

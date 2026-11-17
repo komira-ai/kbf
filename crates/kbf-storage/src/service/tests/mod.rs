@@ -13,7 +13,6 @@ mod every_call;
 pub(crate) mod fake;
 mod generation;
 mod in_flight;
-mod in_process;
 mod legacy_reads;
 mod open_writes;
 mod put_streamed;

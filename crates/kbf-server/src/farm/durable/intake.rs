@@ -1,6 +1,6 @@
 //! What a frontend takes in from the other frontends of its state store: the intake poll.
 //!
-//! Several frontends may share one store. Each schedules onto the daemons connected to it,
+//! Several frontends may share one store. Each schedules onto the workers connected to it,
 //! and the store, written conditionally ([`transitions`](super::transitions)), decides
 //! which of them runs an operation. A frontend learns what the others did by looking at the
 //! store every [`INTAKE_POLL`] ([`Farm::intake`]):
@@ -93,7 +93,7 @@ pub(in crate::farm) struct Intake {
     pub(in crate::farm) orphan_wait: Duration,
     /// The stored epoch, if it is past the one this frontend serves.
     epoch_ahead: Option<u64>,
-    /// The daemons connected to the other frontends of the state store (capabilities and
+    /// The workers connected to the other frontends of the state store (capabilities and
     /// capacity), as the `session/` rows listed at the last poll: an in-memory view of
     /// whether another frontend has a worker that could take this one's queued work.
     pub(in crate::farm) remote: Vec<(kbf_caps::NodeCaps, kbf_types::Resources)>,
@@ -307,7 +307,7 @@ impl Engine {
             .send_modify(|polls| *polls = polls.saturating_add(1));
     }
 
-    /// Reads the daemons of the other frontends from the `session/` rows, and tells the
+    /// Reads the workers of the other frontends from the `session/` rows, and tells the
     /// callers of the operations that wait for a worker whether one of them could run it
     /// ([`State::republish_stuck`]). Nothing needs the list unless an operation waits, so
     /// with none the scan is skipped (a scan on top of the orphan sweep's, five times a
@@ -457,7 +457,7 @@ impl Engine {
     }
 
     /// Keeps the callers of the results and refusals among the `dropped` effects, to be
-    /// answered from the store: a finish that was not written (the daemon moved to another
+    /// answered from the store: a finish that was not written (the worker moved to another
     /// frontend, or another frontend finished the operation) is the store's to tell.
     pub(in crate::farm) fn follow_finishes(&mut self, dropped: &VecDeque<Effect>) {
         for effect in dropped {

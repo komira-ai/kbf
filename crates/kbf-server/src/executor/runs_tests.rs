@@ -270,7 +270,7 @@ async fn a_cancel_of_a_start_never_submitted_makes_no_call() {
 
 /// Catches a lost job told to the farm as anything but the host's fault, and a job the service
 /// forgot told as the same: a lost job is `fenced` even when a cancel was asked for (the cancel
-/// is not the cause), and a job the service no longer knows after it was seen is `daemon
+/// is not the cause), and a job the service no longer knows after it was seen is `worker
 /// restarted`.
 #[tokio::test(start_paused = true)]
 async fn a_lost_job_maps_to_the_node_lost_class() {

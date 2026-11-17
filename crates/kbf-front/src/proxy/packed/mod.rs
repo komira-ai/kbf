@@ -50,8 +50,8 @@
 //! **Not packed:** `QueryWriteStatus` (a blob is reported as the storage node reports it), a
 //! ByteStream `Read` of a compressed blob, and blobs over [`Packs::max_blob_bytes`].
 //!
-//! **Packs a daemon wrote.** [`Packs::commit_pack`] records a pack that a daemon stored in the
-//! object store, after checking a sample of its blobs against their digests (`commit` has the
+//! **Packs a build wrote.** [`Packs::commit_untrusted_pack`] records a pack that a build stored in
+//! the object store through a presigned write, after hashing every byte of it (`commit` has the
 //! rules). **GetActionResult** of a client checks that everything an entry's result names is
 //! held, by the index or by the storage nodes (`hit`).
 

@@ -144,7 +144,7 @@ impl Router {
     /// of a blob it is not a write owner of. When a write is acknowledged by its replicas
     /// (av2-11, av2-12), the entry carries those acknowledgements and this copy goes away.
     /// The copy is an extra, not the replicated one: each blob is still held by its own
-    /// owners (the daemon's upload or [`Router::put`] went through the chain), and the node
+    /// owners (the client's upload or [`Router::put`] went through the chain), and the node
     /// takes the marker only from the frontend's certificate.
     ///
     /// **An owner that cannot be reached** is followed by the next, as for

@@ -4,7 +4,7 @@ use kbf_invocation::{AttemptEnd, EndedKind, Run};
 use super::*;
 
 /// Catches the marker lost between a run and its record: a task's claim is recorded as
-/// one, a daemon's run as measured, and an attempt with no run records none (unspecified).
+/// one, a worker's run as measured, and an attempt with no run records none (unspecified).
 #[test]
 fn a_record_keeps_where_the_phase_times_came_from() {
     let record = |run: Option<Run>| {

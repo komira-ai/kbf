@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 
-/// The bound the frontend and the daemon hold a call for: 60 seconds. A placeholder: it must
+/// The bound the frontend and the routed clients hold a call for: 60 seconds. A placeholder: it must
 /// exceed one storage node's stop plus start, and neither has been measured yet. There is
 /// no flag for it: the processes pass this constant.
 pub const DEFAULT_HOLD: Duration = Duration::from_secs(60);

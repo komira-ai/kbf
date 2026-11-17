@@ -114,7 +114,7 @@ impl Default for HostFloor {
 }
 
 /// What placement may book on a node: its `cpus` and `mem_gib` entries, its `gpu` entry
-/// (0 when absent: a daemon that does not detect GPUs has none to book) and its
+/// (0 when absent: a worker that does not detect GPUs has none to book) and its
 /// `vm.slots` entry (0 when absent), clamped to [`MAX_VM_SLOTS`]. Its
 /// `action_slots` entry, when reported (it counts the usable slots, busy ones
 /// included), caps how many Action and VM leases it holds at once

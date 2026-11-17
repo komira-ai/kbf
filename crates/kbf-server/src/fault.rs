@@ -1,5 +1,5 @@
 //! Farm faults as the server sees them (failure classes, 6.5; issue #22): the
-//! scheduler's outcome for a daemon `Result` that says the farm lost the run, and what
+//! scheduler's outcome for a worker `Result` that says the farm lost the run, and what
 //! callers are told once the scheduler finishes an operation whose farm reruns are
 //! used up.
 //!

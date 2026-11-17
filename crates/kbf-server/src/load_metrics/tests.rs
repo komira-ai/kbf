@@ -25,7 +25,7 @@ fn farm() -> Farm {
     )
 }
 
-/// `name` registered by daemon process `instance` on a new stream, on a node of 4 CPUs and
+/// `name` registered by worker process `instance` on a new stream, on a node of 4 CPUs and
 /// 64 GiB, kept open for the rest of the test.
 fn register(farm: &Farm, name: &str, instance: &str) -> StreamId {
     let report = [("arch", "x86_64"), ("os", "linux")];
@@ -230,8 +230,8 @@ async fn a_farm_with_no_readings_writes_zero_counters_and_no_node_family() {
 /// each node with a reading, one sample of each gauge and of each list counter with the values of
 /// its view (`GET /v1/nodes/{id}`): the measured CPU of two windows, the working set, the active
 /// file pages, the admission working set, `stale` and `actions_cpu_limited` as 0 or 1, the
-/// telemetry the daemon read, what the vet kept and what it dropped by reason. A node's own
-/// values are not another's, and a telemetry value the daemon did not read has no sample.
+/// telemetry the worker read, what the vet kept and what it dropped by reason. A node's own
+/// values are not another's, and a telemetry value the worker did not read has no sample.
 #[tokio::test(start_paused = true)]
 async fn a_scrape_after_accepted_readings_shows_the_counters_and_each_nodes_load() {
     let farm = farm();
@@ -499,7 +499,7 @@ async fn a_reading_the_scheduler_drops_is_counted_apart_from_one_the_server_refu
     );
 }
 
-/// Asserts that a new daemon session (a new `Hello.instance_id`) starts the node's list counters
+/// Asserts that a new worker session (a new `Hello.instance_id`) starts the node's list counters
 /// again from 0, as the docs say, and that the refused first reading of yet another session has
 /// no state to count in and removes the node's series altogether (the node view has no load then
 /// either).
@@ -533,7 +533,7 @@ async fn a_new_session_resets_the_list_counters_and_a_refused_first_reading_drop
         ],
     );
 
-    // The daemon restarted: its first reading is a new baseline and its counts start again.
+    // The worker restarted: its first reading is a new baseline and its counts start again.
     let second = register(&farm, "a", "proc-2");
     farm.note_node_load(&a, second, Some(&reading(1, SECOND, 0)));
     assert_samples(

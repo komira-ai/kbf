@@ -13,7 +13,7 @@
 //!   restored one says `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED` or `UNAVAILABLE` and a
 //!   fenced node by the class alone; an attempt that is not the last of its action is a
 //!   requeue.
-//! - **Zero is not absent:** a cgroup counter the daemon could not read is kept as 0, and
+//! - **Zero is not absent:** a cgroup counter the worker could not read is kept as 0, and
 //!   a NUMA node that was not reported is left out when its bytes are 0.
 //! - **One row per action:** an action run twice in one invocation (a rerun past the
 //!   cache) is one row with every attempt history holds.

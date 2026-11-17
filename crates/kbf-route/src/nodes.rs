@@ -3,7 +3,7 @@
 //! [`TlsNodes`] dials a member over mutual TLS and verifies it against **its own** name
 //! from the map (the host of its address, which is the name its certificate carries),
 //! never against one name for every node: a
-//! daemon that dialled node-03 and accepted node-02's certificate would send its
+//! client that dialled node-03 and accepted node-02's certificate would send its
 //! blobs to whoever holds any certificate of the farm's CA. There is no parameter that
 //! sets a name, so there is nothing to override.
 
@@ -88,7 +88,7 @@ impl TlsNodes {
     }
 
     /// How these nodes give up on a silent one: what [`TlsNodes::with_liveness`] set, or
-    /// [`Liveness::default`]. Read by the daemon's tests to see that its flags arrived.
+    /// [`Liveness::default`]. Read by tests to see that a setting arrived.
     #[must_use]
     pub fn liveness(&self) -> Liveness {
         self.liveness

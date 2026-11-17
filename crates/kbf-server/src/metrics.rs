@@ -7,7 +7,7 @@
 //!
 //! A read, open like `GET /v1/nodes` and `/readyz`: it names no blob, build or node,
 //! only counts and latencies. Every listener that serves the cache (REAPI and the
-//! daemons' worker listener) counts into the same families.
+//! workers' worker listener) counts into the same families.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// What a scrape adds to the cache's own metrics: build history's counters if the server
 /// keeps history, and the pack
-/// reads the daemons report if the process has a farm. Not generic: nothing here depends on
+/// reads the workers report if the process has a farm. Not generic: nothing here depends on
 /// the cache.
 #[derive(Clone)]
 struct Extras {
@@ -55,9 +55,8 @@ impl Extras {
 }
 
 /// Appends what a farm reports: the scheduler core gauge, the usage profiles mode, the pack
-/// daemons' and input caches' counts, the scheduler's load counters and each node's load, and
-/// the failed actions. The one call every server's `/metrics` makes, so the all-in-one and the
-/// frontend pages cannot differ.
+/// workers' and input caches' counts, the scheduler's load counters and each node's load, and
+/// the failed actions. The one call every server's `/metrics` makes.
 pub(crate) fn render_farm(out: &mut String, farm: &Farm) {
     crate::scheduler_core::render(out);
     crate::usage_profiles::render(out, farm.usage_profiles());
@@ -88,7 +87,7 @@ impl<M, O> Clone for Sources<M, O> {
 
 /// The `/metrics` route over `cache`'s metrics, when the server keeps
 /// build history its counters, the storage health of `members`, the reloads of the
-/// listeners' `tls` files and, given the `farm` its daemons register with, the pack reads
+/// listeners' `tls` files and, given the `farm` its workers register with, the pack reads
 /// they report.
 pub fn router<M, O>(
     cache: Arc<Cache<M, O>>,

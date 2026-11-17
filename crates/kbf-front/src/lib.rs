@@ -1,4 +1,4 @@
-//! The front end: the gRPC services that clients and daemons talk to,
+//! The front end: the gRPC services that clients and workers talk to,
 //! authentication, and the HTTP endpoints for health and status.
 //!
 //! The cache half: `Capabilities`, `ContentAddressableStorage`, `ByteStream` and
@@ -184,22 +184,22 @@ pub const MAX_MESSAGE_BYTES: usize = MAX_BATCH_TOTAL_BYTES + (1 << 20);
 /// No blob is too large for the cache, on any path, and none is held whole in memory
 /// past [`MAX_UNSTAGED_BLOB_BYTES`]: a ByteStream `Write` of a larger blob is handed to
 /// the store as it arrives (a multipart upload on S3), a segment upload's large records
-/// and the in-process plane's large outputs are written to the write tier as they
+/// and the large outputs of a caller in the server's own process are written to the write tier as they
 /// arrive, the tier's flusher reads a block in pieces, and every read of a blob is
 /// served in windows of [`READ_WINDOW_BYTES`]. A digest's size is an `i64`, so no blob
 /// is over `i64::MAX` bytes; sizes are added as `u64`, saturating.
 ///
-/// The largest blob a daemon's data plane holds in memory on its way into the cache:
+/// The largest blob a worker's data plane holds in memory on its way into the cache:
 /// 16 MiB. A larger one is never held whole: with a write tier that has room for it, it
-/// is written onto the tier as it arrives (a segment upload's range, the in-process
-/// plane's stream); without one, or when the tier is full, it is streamed to the object
-/// store as it arrives (a ByteStream `Write`, the in-process plane's
-/// `Cache::store_streamed_claimed`). A segment upload that would have to hold one in
+/// is written onto the tier as it arrives (a segment upload's range, the stream of a caller in the
+/// server's own process); without one, or when the tier is full, it is streamed to the object
+/// store as it arrives (a ByteStream `Write`, a caller in the
+/// server's own process through `Cache::store_streamed_claimed`). A segment upload that would have to hold one in
 /// memory until its commit is answered FAILED_PRECONDITION at `Begin`
-/// ([`unstaged_refusal`]), and the daemon sends its records by ByteStream instead. No
+/// ([`unstaged_refusal`]), and the worker sends its records by ByteStream instead. No
 /// blob is refused for its size. 16 MiB is where the write group already writes a blob
 /// as a segment of its own (`--write-own-segment-bytes`), four PutRange messages, and
-/// well under the 32 MiB upload a daemon batches small files into, so small outputs
+/// well under the 32 MiB upload a worker batches small files into, so small outputs
 /// keep the in-memory path unchanged.
 pub const MAX_UNSTAGED_BLOB_BYTES: u64 = 16 << 20;
 

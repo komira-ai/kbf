@@ -22,7 +22,7 @@
 //! - `kbf cluster denied`: `GET /v1/denied`, the storage deny list with its reasons.
 //! - `kbf cluster epoch-bump`: `POST /v1/epoch/bump`, raises the epoch the state store
 //!   holds by one, for a store restored from a backup (the frontends that start after it
-//!   serve the new epoch, so the daemons drop the leases the lost history granted; a
+//!   serve the new epoch, so the workers drop the leases the lost history granted; a
 //!   frontend that runs keeps the one it started under). The answer names the epoch
 //!   before, the epoch stored now and the epoch the frontend serves.
 //! - `kbf cluster object-store ...`: the object-store registration routes
@@ -132,7 +132,7 @@ pub enum Verb {
     /// (the reasons are printed).
     SafeToStop {
         /// The storage member's number (see `GET /v1/members`), or the node id of its host;
-        /// the node id of a host with no storage member is safe, judged as a daemon.
+        /// the node id of a host with no storage member is safe, judged as a worker.
         id: String,
         /// The file holding the server's operator API token.
         #[arg(long, value_name = "FILE")]
@@ -144,7 +144,7 @@ pub enum Verb {
         token: object_store::Token,
     },
     /// Raise the epoch the state store holds by one, after a restore from a backup: the
-    /// frontends that start after it serve the new epoch, so the daemons drop the leases the
+    /// frontends that start after it serve the new epoch, so the workers drop the leases the
     /// lost history granted. The frontend that answers goes on serving its own until it is
     /// restarted.
     EpochBump {

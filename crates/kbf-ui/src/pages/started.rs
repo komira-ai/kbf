@@ -1,6 +1,6 @@
 //! When the server started: the second half of the restart banner of the Nodes, Node,
 //! Overview, Leases and Queue pages. What those pages show is held in the server's memory
-//! and fills as daemons reconnect, so "is this empty because of an outage, or because the
+//! and fills as workers register again, so "is this empty because of an outage, or because the
 //! server started a minute ago" is answered by the start time, which `GET /v1/health`
 //! carries (`started_unix_ms`, `uptime_ms`; `docs/api.md`).
 //!

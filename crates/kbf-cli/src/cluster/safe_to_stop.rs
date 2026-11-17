@@ -68,8 +68,8 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(out, "safe to stop 7\n");
         assert!(err.is_empty(), "{err}");
-        let daemon = r#"{"safe":true,"reasons":["a daemon"],"planned_down":false}"#;
-        assert_eq!(reported(daemon).1, "safe to stop 7\n- a daemon\n");
+        let worker = r#"{"safe":true,"reasons":["a worker"],"planned_down":false}"#;
+        assert_eq!(reported(worker).1, "safe to stop 7\n- a worker\n");
     }
 
     /// Catches: an unsafe verdict that exits 0 (a host stopped with a blob on one copy), one

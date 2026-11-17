@@ -30,7 +30,6 @@ fn config(root: &std::path::Path, extra: &str) -> Config {
         &text,
         &Host {
             hostname: "node-02".to_owned(),
-            cpus: 8,
         },
     )
     .unwrap_or_else(|e| panic!("config: {e}"))
@@ -382,5 +381,4 @@ fn the_system_env_sleeps_what_it_is_told_and_reads_the_clock() {
     let after = unix(std::time::SystemTime::now());
     assert!((before..=after).contains(&read), "{before} {read} {after}");
     assert!(!env.host.hostname.is_empty());
-    assert!(env.host.cpus >= 1);
 }

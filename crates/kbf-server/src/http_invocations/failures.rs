@@ -151,7 +151,7 @@ pub(super) fn entry(b: &mut Builder, r: &ActionRow, base: &str, index: usize) ->
     })
 }
 
-/// The last attempt's failure class and the daemon's reason for it (the record keeps
+/// The last attempt's failure class and the worker's reason for it (the record keeps
 /// at most [`kbf_invocation::REASON_CAP`] bytes of it, cut on a character); `null` when
 /// the last attempt did not end in a failure (an action that ran to a non-zero exit, or
 /// was refused).

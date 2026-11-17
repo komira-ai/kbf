@@ -11,13 +11,13 @@
 //! - `lease/<lease>`: the fencing token of a committed grant, present while the
 //!   operation holds the lease. A result is accepted only while it is there, which is the
 //!   compare-and-set on the operation's lease;
-//! - `session/<worker>`: what the scheduler knows of a daemon's newest session (its
+//! - `session/<worker>`: what the scheduler knows of a worker's newest session (its
 //!   instance, capacity and capabilities). It expires unless renewed: one write per
-//!   session per [`SESSION_RENEWAL`], however many leases the daemon holds (a lease row
+//!   session per [`SESSION_RENEWAL`], however many leases the worker holds (a lease row
 //!   is written at the grant and at the end, never to renew it);
-//! - `owner/<worker>`: the frontend that owns a daemon's node, and a counter that each
-//!   `Hello` of the daemon to a frontend raises by one (sixteen bytes, big-endian). A write
-//!   of a lease of the node is conditional on it, so a frontend the daemon has left
+//! - `owner/<worker>`: the frontend that owns a worker's node, and a counter that each
+//!   `Hello` of the worker to a frontend raises by one (sixteen bytes, big-endian). A write
+//!   of a lease of the node is conditional on it, so a frontend the worker has left
 //!   cannot grant, give up or finish a lease of the node (see the `owner` module);
 //! - `lease-by-op/<operation>`: the id of the lease the operation holds, put in the
 //!   transaction of the grant and deleted with the lease, so a request that joins a running
@@ -112,12 +112,12 @@
 //! queued again, one another frontend runs is not refused, and a result that arrives twice
 //! is taken once. The write that loses is dropped as stale, and the callers waiting on its
 //! operation at that frontend are not answered by it. The `transitions` module says how
-//! each one is conditional. A write of a lease of a daemon's node is conditional on the
-//! node's `owner/` row too: the frontend the daemon last said `Hello` to is the only one
-//! that may write the node's leases, and one the daemon has left fails with
+//! each one is conditional. A write of a lease of a worker's node is conditional on the
+//! node's `owner/` row too: the frontend the worker last said `Hello` to is the only one
+//! that may write the node's leases, and one the worker has left fails with
 //! [`StateError::StaleOwner`] for that node alone (the `owner` module). Whether an
 //! operation is unservable is judged from the `session/` rows, which hold every
-//! frontend's daemons, and not from the daemons of one frontend.
+//! frontend's workers, and not from the workers of one frontend.
 //!
 //! A frontend learns what the others did by looking at the rows every [`INTAKE_POLL`] (the
 //! `intake` module): it takes in the operations they queued, forgets the ones they took
@@ -201,7 +201,7 @@ pub use self::intake::INTAKE_POLL;
 pub use self::owner::{ACK_WINDOW, OWNER_CACHE_TTL};
 pub use self::sweep::ORPHAN_WAIT;
 
-/// How often a daemon session's row in the store is renewed while the daemon heartbeats:
+/// How often a worker session's row in the store is renewed while the worker heartbeats:
 /// a third of the lease grace, so the row outlives two missed renewals. One write per
 /// session per interval, whatever the number of leases it holds.
 pub const SESSION_RENEWAL: Duration = Duration::from_secs(LEASE_GRACE.as_secs() / 3);
@@ -236,10 +236,10 @@ pub const DONE_FLOOR: Duration = Duration::from_secs(600);
 /// What a start does with the store's epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EpochPolicy {
-    /// Keep it: the scheduler resumes the store's incarnation, and a daemon that
+    /// Keep it: the scheduler resumes the store's incarnation, and a worker that
     /// reconnects keeps the runs of its leases.
     Keep,
-    /// Take the next one: the start is a new incarnation, and a daemon that sees it
+    /// Take the next one: the start is a new incarnation, and a worker that sees it
     /// kills the runs of the leases it held before.
     Bump,
 }
@@ -266,7 +266,7 @@ pub enum StateError {
     /// the operation no longer holds, a grant of an operation that is not queued).
     #[error("the state store has no {0}: the write is stale")]
     Missing(String),
-    /// The write is for a daemon's node that another frontend owns now (the daemon said
+    /// The write is for a worker's node that another frontend owns now (the worker said
     /// `Hello` there since this frontend did): the write is stale, and only this node's
     /// writes are.
     #[error("the node {0} belongs to another frontend: the write is stale")]
@@ -484,7 +484,7 @@ enum Attempt {
     /// ([`Durable::granted`], [`Durable::finished`], [`Durable::refused`] and
     /// [`Durable::requeued`]), so a retry of it is `Taken`.
     Stale,
-    /// The write is for a daemon's node that another frontend owns now: it is dropped, as
+    /// The write is for a worker's node that another frontend owns now: it is dropped, as
     /// a stale write is, and trying again cannot help. The node's other writes, held or to
     /// come, meet the same refusal; the store as a whole is not superseded.
     Disowned,
@@ -681,7 +681,7 @@ fn number(key: &str, row: &Versioned) -> Result<u64, StateError> {
 
 impl Durable {
     /// Opens the scheduler's rows in `store` and settles its epoch: a store that has
-    /// none gets a first one that no other store's epoch is likely to equal (a daemon
+    /// none gets a first one that no other store's epoch is likely to equal (a worker
     /// must not mistake a new store for the one it knew), `policy` decides for one that
     /// has. Returns the handle and the epoch. `first` is the process term, which also names
     /// the handle's frontend in the `owner/` rows it writes: two frontends of a store start
@@ -1087,7 +1087,7 @@ impl Durable {
         Ok(())
     }
 
-    /// A daemon registered: its session row, as of the registration.
+    /// A worker registered: its session row, as of the registration.
     pub(super) fn session(
         &self,
         worker: &WorkerId,
@@ -1111,9 +1111,9 @@ impl Durable {
     }
 
     /// Extends `worker`'s session row by the lease grace, from the store's clock. A
-    /// daemon with no row (its registration was not written, or the row expired) gets the
+    /// worker with no row (its registration was not written, or the row expired) gets the
     /// registration this handle wrote last put again, where there is still no row; a
-    /// daemon this handle never wrote a registration for is left for its next
+    /// worker this handle never wrote a registration for is left for its next
     /// registration to write.
     pub(super) fn renew(&self, worker: &WorkerId) -> Result<(), StateError> {
         let key = format!("{SESSION}{worker}");
@@ -1216,7 +1216,7 @@ impl Farm {
     /// the farm is as [`Farm::new`] made it: its state is in memory.
     ///
     /// The term and the lease epoch `Welcome` names are the store's epoch, which
-    /// [`StateStore::epoch`] decides: kept, a daemon that reconnects keeps the runs of
+    /// [`StateStore::epoch`] decides: kept, a worker that reconnects keeps the runs of
     /// its leases; bumped, it kills them. Call it before the farm serves anything.
     ///
     /// The farm numbers its operations and leases in blocks it reserves in the store
@@ -1254,7 +1254,7 @@ impl Farm {
     /// Raises the epoch the state store holds by one, and returns the epoch before and the
     /// one stored now; `None` if the farm has no state store. This farm keeps the epoch it
     /// started under (its leases and its `Welcome` name it): the stored one is read by a
-    /// frontend when it starts, so the daemons drop the leases of the older epoch when
+    /// frontend when it starts, so the workers drop the leases of the older epoch when
     /// they reach a frontend started after the bump.
     ///
     /// # Errors
@@ -1404,7 +1404,7 @@ impl Engine {
                     }
                     // Another frontend's work stands in its place: this one gives up what
                     // it did for the operation and follows the store. A finish dropped for
-                    // another reason (the node moved to another frontend, and its daemon
+                    // another reason (the node moved to another frontend, and its worker
                     // keeps the result for that frontend) is followed too, but its grants
                     // stay: nothing in the store says they lost.
                     if attempt == Attempt::Stale {
@@ -1442,7 +1442,7 @@ impl Engine {
         for effect in dropped {
             if let Effect::Answer(answer) = effect {
                 a.forget_parcel(answer.lease);
-                // Never written, so never acknowledged: the daemon keeps the result.
+                // Never written, so never acknowledged: the worker keeps the result.
                 self.owed.remove(&answer.lease);
             }
         }
@@ -1572,9 +1572,9 @@ impl Engine {
         self.write_estimates(a, &kills);
     }
 
-    /// Whether the refusal that `record` proposes is taken back because a daemon connected
+    /// Whether the refusal that `record` proposes is taken back because a worker connected
     /// to another frontend of the state store could run the operation. The scheduler judged
-    /// the operation unservable from its own daemons; the session rows of the store hold
+    /// the operation unservable from its own workers; the session rows of the store hold
     /// every frontend's, so they decide whether the operation is refused. An operation
     /// held waits again for the unservable wait, and the rows are read again then. A store
     /// whose session rows cannot be read holds it too: a refusal is never final on a guess.
@@ -1587,14 +1587,14 @@ impl Engine {
         };
         self.sched.hold_refusal(refusal.operation, |request| {
             durable.session_could_run(request).unwrap_or_else(|error| {
-                tracing::warn!(%error, "the daemon sessions cannot be read: the refusal waits");
+                tracing::warn!(%error, "the worker sessions cannot be read: the refusal waits");
                 true
             })
         })
     }
 
     /// Renews `worker`'s session row if its last write is a renewal interval old: one
-    /// write per daemon session, never one per lease. Called for a heartbeat taken.
+    /// write per worker session, never one per lease. Called for a heartbeat taken.
     pub(super) fn renew_session(&mut self, now: FarmTime, worker: &WorkerId) {
         // A fenced farm writes nothing: the successor's rows are the truth.
         if self.durable.is_none() || self.fenced {
@@ -1803,8 +1803,8 @@ impl Engine {
         Ok(Held::Here)
     }
 
-    /// Whether `op` holds a lease on a node this frontend does not own at `now`: its daemon
-    /// is connected to another frontend, or to none (the daemon that ran it has not said
+    /// Whether `op` holds a lease on a node this frontend does not own at `now`: its worker
+    /// is connected to another frontend, or to none (the worker that ran it has not said
     /// `Hello` anywhere since the lease was written, and the orphan sweep requeues the lease
     /// if it never does). A store whose owner row cannot be read is the same: nothing is
     /// taken up on a guess.
@@ -1834,7 +1834,7 @@ impl Engine {
         debug_assert!(taken, "the stored operation was already in the scheduler");
     }
 
-    /// Writes the session row of a daemon that registered. Not generic, unlike
+    /// Writes the session row of a worker that registered. Not generic, unlike
     /// `Farm::register`.
     pub(super) fn record_session(
         &mut self,
@@ -1848,7 +1848,7 @@ impl Engine {
             d.session(worker, instance, predecessor_stopped, reported)
         });
         // A registration the store refused is written at the next heartbeat, which
-        // renews: a daemon whose row is not there is not acknowledged.
+        // renews: a worker whose row is not there is not acknowledged.
         if written {
             self.renewed.insert(worker.clone(), now);
             self.session_ok.insert(worker.clone(), now);

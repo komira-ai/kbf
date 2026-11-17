@@ -1,5 +1,5 @@
-//! Where a process learns the storage map: the seam av2-08 fills (the daemon's holder
-//! of the pushed map, and `kbf-server`'s `FrontMaps` over the members).
+//! Where a process learns the storage map: the seam av2-08 fills (the holder of the
+//! pushed map, and `kbf-server`'s `FrontMaps` over the members).
 //!
 //! A node holds the newest map it has been sent (`Welcome.map`, then each `MapUpdate`)
 //! and the one before it while a change settles. The router asks for them with
@@ -48,8 +48,8 @@ pub struct RefetchError {
 
 /// A process's view of the storage map.
 ///
-/// The frontend implements it over its state store, a daemon over the stream it holds to
-/// a frontend; a test implements it over a cell it sets.
+/// The frontend implements it over its state store, a client over the map it
+/// was last given; a test implements it over a cell it sets.
 pub trait MapSource: Send + Sync {
     /// The map the process has now, or `None` before the first one arrived: nothing can
     /// be routed until a map has.

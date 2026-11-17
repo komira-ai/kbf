@@ -192,7 +192,7 @@ async fn a_sweep_held_up_by_a_write_does_not_age_the_deny_rows() {
 }
 
 /// The rows read just before the listeners serve: a copy made at the start of a start that
-/// then took four beats (the farm's state restored) is read again, so the first daemon is
+/// then took four beats (the farm's state restored) is read again, so the first worker is
 /// admitted, and the denied one refused, without waiting for the sweeper. The same peers
 /// made without that read refuse both UNAVAILABLE: the copy is too old.
 ///

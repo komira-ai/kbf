@@ -55,9 +55,9 @@ const TLS_RELOAD_INTERVAL_S: u32 = 30;
 /// `--enroll-storage-port` flags). Nothing here is a secret.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NodeSettings {
-    /// The https URL a daemon dials; empty for none.
+    /// The https URL a worker dials; empty for none.
     pub worker_endpoint: String,
-    /// What `--cas` is for a daemon-only node; empty for none.
+    /// What `--cas` is for a worker-only node; empty for none.
     pub cas_endpoint: String,
     /// The port a storage node serves on; 0 for none.
     pub storage_port: u32,
@@ -331,7 +331,7 @@ impl Core {
 
     /// The `NodeConfig` of an answer (its generation: [`content_generation`]) for a node that holds `enrolled`'s roles. The cold
     /// store (its URI, with no key in it) goes to a node with the storage role only: a
-    /// daemon has no use for it.
+    /// worker has no use for it.
     pub(super) fn config(&self, enrolled: &Enrolled, cold: &ColdStoreView) -> pb::NodeConfig {
         let storage = enrolled.certs.iter().any(|cert| cert.role == Role::Storage);
         let config = pb::NodeConfig {

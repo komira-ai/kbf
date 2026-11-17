@@ -5,7 +5,7 @@
 //! task kept, after its answer was lost, names the job already made, and the service answers
 //! from it (design section 5.3). The job is the kbf image, whose entrypoint is the
 //! task tool, run with the tool's flags; it needs what the farm booked, with the hard memory cap
-//! a daemon would set and no disk, or, for a `whole_machine`
+//! a worker would set and no disk, or, for a `whole_machine`
 //! lease, the whole host and nothing beside it ([`Booking`]), of a Linux host of the
 //! configured architecture in a container, for the action's timeout and the run margin. The
 //! read grant and the presigned `PUT` travel as the job's files, or as arguments where the

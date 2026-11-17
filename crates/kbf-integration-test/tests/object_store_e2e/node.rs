@@ -1,4 +1,4 @@
-//! A real storage node (`kbf_server::storage_half`) of the farm: registered with the
+//! A real storage node (`kbf_server::storage_node::start_storage`) of the farm: registered with the
 //! frontend over mutual TLS, its `--cold-store` flag naming the farm's S3 bucket, started
 //! and stopped as many times as a scenario needs, on the same directory and under the same
 //! advertised address (so the frontend sees one member come back, not a new one).
@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use kbf_server::storage_half::start;
+use kbf_server::storage_node::start_storage as start;
 use kbf_server::storage_node::{StorageFlags, command, parse};
 use kbf_storage::Storage;
 use tokio::sync::oneshot;

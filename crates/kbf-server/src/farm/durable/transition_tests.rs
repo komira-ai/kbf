@@ -261,7 +261,7 @@ fn a_result_that_loses_to_a_grant_of_another_frontend_after_it_read_the_rows_is_
     assert_eq!(rows(&store, "done/"), 0);
 }
 
-/// Asserts that a finish repeated by another frontend (a daemon's result that reaches two
+/// Asserts that a finish repeated by another frontend (a worker's result that reaches two
 /// of them) is acknowledged as a duplicate, writes nothing, and leaves the first result
 /// standing.
 #[test]
@@ -457,7 +457,7 @@ fn a_refusal_is_a_duplicate_only_of_itself() {
     assert_eq!(store.commit_stats().txns, txns, "a repeated refusal wrote");
 }
 
-/// Asserts that an operation could run if any daemon session in the store could run it,
+/// Asserts that an operation could run if any worker session in the store could run it,
 /// whichever frontend wrote the session; and that none could when the store holds no
 /// session, or only sessions too small for it or of another platform.
 #[test]
@@ -484,7 +484,7 @@ fn a_request_could_run_if_any_daemon_session_of_the_store_could_run_it() {
     assert!(!mine.session_could_run(&mac).expect("a session"));
 }
 
-/// Asserts that a session row that is not a daemon's registration is refused naming the
+/// Asserts that a session row that is not a worker's registration is refused naming the
 /// row, whether its bytes are not a scheduler input at all or are another input.
 #[test]
 fn a_session_row_that_is_not_a_registration_is_refused_naming_it() {
@@ -508,7 +508,7 @@ fn a_session_row_that_is_not_a_registration_is_refused_naming_it() {
     }
 }
 
-/// Asserts that the daemons of the other frontends are the session rows of the nodes this
+/// Asserts that the workers of the other frontends are the session rows of the nodes this
 /// frontend does not hold: a node in `connected` is left out, the others are listed with
 /// their capacity, and a row that is not a registration is refused naming it.
 #[test]

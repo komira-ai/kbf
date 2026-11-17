@@ -2,7 +2,7 @@
 //! frontend's timer that expires members (`docs/design/architecture-v2.md`, section 6).
 //!
 //! **Why two unary calls and not the worker stream's `Hello`.** `Hello`/`Welcome` belongs
-//! to a daemon: its node id is bound to its certificate and its session is scheduler
+//! to a worker: its node id is bound to its certificate and its session is scheduler
 //! state. A storage node has no session; membership lives in the state store, so nothing
 //! is kept per connection and a node that reconnects to another frontend loses nothing.
 //! `Register` is the `Hello` (and says `NOT_FOUND`-then-register-again on a lapse) and

@@ -284,12 +284,13 @@ pub struct LossMark {
 
 /// Who is asking to write the action cache.
 ///
-/// The front sets this from the caller's authenticated identity. Only a daemon, which
-/// ran the action itself, may write a result; a client never can, so one client cannot
+/// The front sets this from the caller's authenticated identity. Only [`Role::Daemon`], the
+/// role of a worker that ran the action itself, may write a result; a client never can, so one client cannot
 /// poison the cache for everyone else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// A `kbf-daemon` reporting the result of an action it ran.
+    /// A worker reporting the result of an action it ran (the role the frontend gives a
+    /// result it commits for an action a job ran).
     Daemon,
     /// A build client (buck2, Bazel) calling `UpdateActionResult`.
     Client,

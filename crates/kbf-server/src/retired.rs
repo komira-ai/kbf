@@ -15,7 +15,7 @@
 //! over to, and the flags of a unit written before the removal must still parse.
 //!
 //! And the flags of the worker session (`--heartbeat-interval-ms`, `--vm-host-floor-cpus`,
-//! `--vm-host-floor-mem-gib`, `--pack-commit-sample`): no daemon opens a session or commits a
+//! `--vm-host-floor-mem-gib`, `--pack-commit-sample`): no worker opens a session or commits a
 //! pack to a server, so nothing reads them ([`RetiredWorkerFlags`]).
 
 use std::path::PathBuf;
@@ -165,8 +165,8 @@ impl RetiredHandoverFlags {
     }
 }
 
-/// The flags of the removed worker session: the heartbeat interval daemons were asked for, the
-/// share of a node with VM slots kept for its host, and how many blobs of a daemon's committed
+/// The flags of the removed worker session: the heartbeat interval workers were asked for, the
+/// share of a node with VM slots kept for its host, and how many blobs of a worker's committed
 /// pack were checked. Values are not checked: nothing reads them, and a value that was valid
 /// before must stay accepted.
 #[derive(Clone, Debug, Default, Args)]
@@ -180,7 +180,7 @@ pub struct RetiredWorkerFlags {
     /// Retired: no longer read, the worker session was removed. Accepted and ignored for one release
     #[arg(long, hide = true, value_name = "GIB")]
     pub vm_host_floor_mem_gib: Option<String>,
-    /// Retired: no longer read, a daemon's committed pack is no longer taken. Accepted and ignored for one release
+    /// Retired: no longer read, a worker's committed pack is no longer taken. Accepted and ignored for one release
     #[arg(long, hide = true, value_name = "BLOBS")]
     pub pack_commit_sample: Option<String>,
 }

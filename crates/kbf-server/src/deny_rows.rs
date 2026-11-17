@@ -10,7 +10,7 @@
 //!   ([`Members::refresh_denied`]). The sweeper's map refresh and reap are writes, and every
 //!   write of the state store queues on one commit head that all the frontends of the store
 //!   share, so a long write of another frontend (one that is starting) holds them up; were the
-//!   rows read only between them, every frontend of the store would refuse every daemon while
+//!   rows read only between them, every frontend of the store would refuse every worker while
 //!   one of them starts.
 //! - **A read just before the listeners serve** ([`denying`]). The read the start makes when
 //!   it opens the members (`crate::serve::members_of`) comes before the farm's state is

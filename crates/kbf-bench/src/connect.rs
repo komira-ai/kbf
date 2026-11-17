@@ -13,9 +13,8 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 /// Where the blobs go, and how to authenticate.
 #[derive(Clone, Debug, clap::Args)]
 pub struct Target {
-    /// The blob service: a kbf-server worker listener (`https://`, mutual TLS with a node
-    /// certificate) or a REAPI listener (`https://`, or `http://` when it serves
-    /// plain text).
+    /// The blob service: a kbf-server REAPI listener (`https://`, or `http://` when it
+    /// serves plain text).
     #[arg(long)]
     pub cas: String,
     #[command(flatten)]
@@ -29,8 +28,7 @@ pub struct Tls {
     /// only; required there).
     #[arg(long)]
     pub ca_cert: Option<PathBuf>,
-    /// PEM file of the client certificate chain: a node
-    /// certificate for a worker listener.
+    /// PEM file of the client certificate chain, for a listener that asks for one.
     #[arg(long, requires = "key")]
     pub cert: Option<PathBuf>,
     /// PEM file of the client's private key.

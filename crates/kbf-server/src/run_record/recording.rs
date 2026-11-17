@@ -1,6 +1,6 @@
 //! What the farm tells the invocation recorder (`docs/design/invocations.md`, section 3.4):
 //! each lease granted, started and given up, and each operation's end, with the lease that
-//! ended it and, for a failure, the daemon's reason. The farm's `Side` holds one
+//! ended it and, for a failure, the worker's reason. The farm's `Side` holds one
 //! [`Recording`]. Every event is sent under the core's lock, in the order the scheduler made
 //! the change and after the Execute call that queued or joined the operation, which the
 //! dispatcher sends before it queues anything.
@@ -117,7 +117,7 @@ impl Recording {
 
     /// Sends the end of `answer`'s operation: its callers were told `finished`; the
     /// listing of its result, stored as `stored`, if it ran, or of a timed-out run's
-    /// partial result (its logs); and `reason`, the daemon's text, if its lease
+    /// partial result (its logs); and `reason`, the worker's text, if its lease
     /// reported a failure.
     pub(crate) fn finished(
         &mut self,

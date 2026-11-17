@@ -9,7 +9,7 @@
 //! 2. the frontend waits, for a bounded time, for the calls between their request and their
 //!    queueing, fences its farm (no intake from the store, no grant, no claim), writes the
 //!    requeues the store refused, stops the task that expires the store's rows, stops the
-//!    worker listener, ends the worker streams `UNAVAILABLE` (the daemons dial another
+//!    worker listener, ends the worker streams `UNAVAILABLE` (the workers dial another
 //!    frontend) and goes not ready ([`Stand::release`]);
 //! 3. it answers the calls it still holds from the `done/` rows the others write
 //!    ([`crate::farm::Farm::follow_every`]), for as long as the process lives.

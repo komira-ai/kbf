@@ -1,5 +1,4 @@
-//! What a fetch does when the last caller waiting for it leaves
-//! (`docs/design/worker-cache.md#44-limits-retries-cancellation`), against the fake
+//! What a fetch does when the last caller waiting for it leaves, against the fake
 //! source: the order of events is fixed by the test, not by timing.
 //!
 //! Every test holds the source's read after its first message, so the fetch cannot end

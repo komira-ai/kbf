@@ -26,7 +26,7 @@ pub fn command() -> Command {
         };
     crate::flag_set::command(
         "frontend",
-        "The REAPI front end: schedules actions on daemons or as jobs, and keeps blobs on a \
+        "The REAPI front end: schedules actions as jobs of the job service, and keeps blobs on a \
          storage node (--storage) or in packs (--pack-store-endpoint, with no --storage).",
         ALLOWED,
     )

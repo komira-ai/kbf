@@ -41,7 +41,7 @@
 //! - a read that reports or serves something returns a [`Touch`] to commit first, which
 //!   keeps the retention promise of [`Retention`].
 //!
-//! Only a daemon may write the action cache ([`Role`]), and only once every blob the
+//! Only [`Role::Daemon`] may write the action cache ([`Role`]), and only once every blob the
 //! entry needs is held.
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed

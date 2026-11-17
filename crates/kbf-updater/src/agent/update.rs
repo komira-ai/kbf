@@ -9,12 +9,13 @@
 //!    and lays it out beside A. An unattested, mismatched or unknown build is refused here,
 //!    before the node is touched. The updater never takes a URL or a path from the
 //!    coordinator's reply: the version is the only input, and it is looked up by the helper.
-//! 2. **Drain** the node at the frontend and wait until it holds no lease, however long that
-//!    takes (`NodeDrain`: cordon, drain, uncordon over the operator API; a cordon is durable).
-//!    A `--drain-deadline-secs` that passes first fails the update with the node left drained
-//!    and nothing switched; the order is tried again after `--retry-secs`. To a coordinator
-//!    that advertises `deferred-v1` that is a [`Hold::Deferred`] (reason `drain_bound`), not a
-//!    failure, and the order is declined until `--retry-secs` have passed.
+//! 2. **Drain** the node through the [`Drain`] port and wait until it holds no lease. Every
+//!    host's drain is [`NoDrain`](super::build::NoDrain): the node is in placement, takes
+//!    nothing out and holds no lease, so this step ends at once and `--drain-deadline-secs`
+//!    never comes into play. A port that did hold leases would be waited for however long
+//!    that takes, or until the deadline: a deadline that passes first fails the update with
+//!    the node left drained and nothing switched, and to a coordinator that advertises
+//!    `deferred-v1` that is a [`Hold::Deferred`] (reason `drain_bound`), not a failure.
 //! 3. **Switch**: the helper puts B in place on trial, with a pending marker and a deadline on
 //!    its disk, and restarts the service on it.
 //! 4. **Health**: the node's health check (`node_health`) until B shows healthy, for no longer
@@ -23,11 +24,11 @@
 //!    it by itself at the deadline whatever this process is doing; here it is asked at once.
 //! 6. **Undrain** only if the node is healthy: on B after a confirm, or on A after a revert. A
 //!    node that is not healthy stays drained. A node that was out of placement before step 2
-//!    (an operator drained or cordoned it) is drained and waited for as any other but is never
-//!    undrained: it is left out, and the log says so. "Before step 2" means before the
-//!    updater's own drain: a node this updater drained on an earlier attempt (the drain
-//!    deadline passed, an undrain failed, the agent restarted) is still the updater's, and a
-//!    retry or a resume gives it back (`cordon`: the drain leaves a mark on disk).
+//!    is drained and waited for as any other but is never undrained: it is left out, and the
+//!    log says so. "Before step 2" means before the updater's own drain: a node this updater
+//!    drained on an earlier attempt is still the updater's, and a retry or a resume gives it
+//!    back (`cordon`: the drain leaves a mark on disk). With [`NoDrain`](super::build::NoDrain)
+//!    both steps do nothing.
 //!
 //! The result is [`UpdateResult`]: the target and whether it succeeded. It goes into the next
 //! heartbeat. Two endings are more than that, for a coordinator that advertises them

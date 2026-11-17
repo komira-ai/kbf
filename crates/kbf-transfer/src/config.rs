@@ -1,5 +1,4 @@
-//! [`TransferConfig`]: the engine's limits, one value per `--transfer-*` flag
-//! (`docs/design/worker-cache.md#45-knobs-flags-not-environment-variables`).
+//! [`TransferConfig`]: the engine's limits, one value per `--transfer-*` flag.
 
 use crate::cas::WRITE_CHUNK_BYTES;
 

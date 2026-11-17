@@ -75,8 +75,8 @@ async fn a_blob_is_complete_when_empty_held_or_indexed() {
     assert_eq!(complete, [true, true, true, false]);
 }
 
-/// Asserts that only the daemon writes the action cache: a client's write is refused as
-/// PERMISSION_DENIED and leaves no entry, and the daemon's write is accepted and hit.
+/// Asserts that only the worker writes the action cache: a client's write is refused as
+/// PERMISSION_DENIED and leaves no entry, and the worker's write is accepted and hit.
 #[tokio::test]
 async fn only_the_daemon_writes_an_action_result() {
     let cache = Cache::memory();

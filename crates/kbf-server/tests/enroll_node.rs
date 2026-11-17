@@ -175,7 +175,6 @@ fn node(name: &str, farm: &Farm, token: &Token, storage: bool) -> Node {
         &text,
         &Host {
             hostname: "node-02".to_owned(),
-            cpus: 8,
         },
     )
     .unwrap_or_else(|e| panic!("config: {e}"));

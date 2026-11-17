@@ -21,7 +21,7 @@ hex.workspace = true
 kbf-segments.workspace = true
 # `Digest`, the key of a segment's index.
 kbf-types.workspace = true
-# The free-space floor and the filesystem numbers (`disk`), shared with the daemon.
+# The free-space floor and the filesystem numbers (`disk`).
 kbf-threads.workspace = true
 # The trait, the key types and the S3 client, which this crate re-exports.
 objstore-s3.workspace = true

@@ -240,7 +240,7 @@ fn killed(kill: MemoryKill) -> RunRecord {
 /// Catches: an attempt's end or the row's outcome read wrong from the run's class: an
 /// exit code of 0 and non-zero swapped, a timeout not a timeout, a memory kill of one
 /// kind taken for the other (the page would say `out_of_memory` for a node's kill), a
-/// failure the daemon reported lost as one the client caused, a class with no end
+/// failure the worker reported lost as one the client caused, a class with no end
 /// given one, an attempt another followed not a requeue, and the requeue of an own-limit
 /// kill losing its booking and the raised booking.
 #[test]
@@ -699,7 +699,7 @@ fn the_basis_the_footprint_and_the_cpu_evidence_survive_the_history_round_trip()
     };
     assert_eq!(through_history(old).memory_peak_bytes, None);
 
-    // A daemon that reports neither: they come back absent, not zero.
+    // A worker that reports neither: they come back absent, not zero.
     let bare = RunUsage {
         basis: UsageBasis::Cgroup,
         ..RunUsage::default()
@@ -829,7 +829,7 @@ fn a_record_that_kept_one_evidence_field_comes_back_with_evidence() {
 }
 
 /// Catches the marker lost on a restore: a record of a task's claim restores to a run that
-/// says so, a record of a daemon's run to a measured one, and a record written before the
+/// says so, a record of a worker's run to a measured one, and a record written before the
 /// marker (unspecified) to a measured one, which is what such a record was.
 #[test]
 fn an_attempt_keeps_where_its_phase_times_came_from() {

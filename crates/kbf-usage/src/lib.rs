@@ -1,6 +1,6 @@
 //! What kbf learns from the measured use of its leases, for the job scheduler's admission.
 //!
-//! A daemon reports the closed minutes of each lease on its heartbeat. The scheduler
+//! A worker's report of the closed minutes of each lease is what this crate takes in. The scheduler
 //! libraries (`js-usage`) turn them into per-key profiles (the last runs of an action key,
 //! the curve admission charges from them) and keep the rows in the farm's state store. This
 //! crate holds the parts that are kbf's own and need no farm:

@@ -87,7 +87,7 @@
 //! There is no seccomp or namespace on macOS. The Command alone runs under `sandbox-exec`
 //! ([`launch`]): this tool runs outside any sandbox (a sandbox cannot be nested on macOS) and starts
 //! `/usr/bin/sandbox-exec -p <profile> <program> <args...>`. The profile ([`seatbelt_profile`],
-//! written by `kbf-seatbelt`, the code the Mac daemon's driver also uses) allows everything, then:
+//! written by `kbf-seatbelt`) allows everything, then:
 //!
 //! - for a Command denied the network, denies every network operation but to loopback and to Unix
 //!   sockets; for one allowed it, adds no network clause;

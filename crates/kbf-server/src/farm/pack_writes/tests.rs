@@ -82,7 +82,7 @@ fn the_newest_counts_of_each_node_are_kept() {
     assert_eq!(farm.pack_writes(), want);
 }
 
-/// Asserts that a heartbeat without counts forgets the node's, so a daemon restarted without
+/// Asserts that a heartbeat without counts forgets the node's, so a worker restarted without
 /// `--pack-write` does not show the counts of the process before it, and leaves the other
 /// nodes' alone.
 #[test]

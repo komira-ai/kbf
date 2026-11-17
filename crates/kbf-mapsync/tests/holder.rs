@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
-use kbf_mapsync::{FakeMapSource, MapHolder, MapSource, RETAINED_MAPS};
+use kbf_mapsync::{MapHolder, RETAINED_MAPS};
 use tokio::time::timeout;
 
 fn map(generation: u64) -> Map {
@@ -139,20 +139,6 @@ async fn reach_records_the_generation_wanted() {
     let fresh = MapHolder::new();
     fresh.offer(map(1));
     assert_eq!(fresh.reach(0).await.generation(), 1);
-}
-
-/// Catches a fake that does not announce a change, or announces a generation other than
-/// the map's it now serves.
-#[tokio::test(start_paused = true)]
-async fn the_fake_source_serves_the_map_it_announced() {
-    let source = FakeMapSource::new(map(1));
-    let mut changes = source.changes();
-    assert_eq!(*changes.borrow(), 1);
-    assert_eq!(source.current().expect("map").generation(), 1);
-    source.set(map(2));
-    changes.changed().await.expect("notified");
-    assert_eq!(*changes.borrow_and_update(), 2);
-    assert_eq!(source.current().expect("map").generation(), 2);
 }
 
 /// Catches a `follow` that misses the map already held (a client built after the first

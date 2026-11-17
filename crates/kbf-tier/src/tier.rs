@@ -23,9 +23,8 @@ pub struct TierOptions {
     /// The size at which the open grouped block is sealed: [`MAX_SEGMENT_BYTES`].
     pub segment_limit: u64,
     /// Whether a flushed block is kept as a flushed copy (`.seg`) for local reads. Off
-    /// on a node whose one cache keeps the local copies (`kbf_storage::local_cache`):
-    /// a flushed block is then deleted, and a start deletes the copies an earlier run
-    /// kept.
+    /// ([`TierOptions::without_flushed_copies`]), a flushed block is deleted, and a start
+    /// deletes the copies an earlier run kept. Every node this release starts keeps them.
     pub flushed_copies: bool,
 }
 

@@ -67,7 +67,7 @@ async fn the_nodes_own_frontend_shows_a_drain_another_frontend_wrote_at_once() {
 /// Asserts that a frontend the node is not connected to answers it from the state store: the
 /// drain its `cordon/` row holds and the lease the node holds on its own frontend, never "no
 /// such node" and never no lease. Catches: an updater whose read lands there takes the node
-/// for one with no daemon (a 404) or for one with no lease left, and switches it while its
+/// for one with no worker (a 404) or for one with no lease left, and switches it while its
 /// work still runs.
 #[tokio::test(start_paused = true)]
 async fn a_frontend_the_node_is_not_connected_to_answers_its_drain_and_leases_from_the_store() {
@@ -132,7 +132,7 @@ async fn a_node_another_frontend_holds_is_unreadable_when_its_leases_cannot_be_r
 /// Asserts that a read of a node another frontend holds is an error when the store cannot
 /// tell who holds it: its `owner/` row cannot be read. Catches: a frontend that takes a store
 /// it cannot read for "nobody holds the node" and answers "no such node", which a storage
-/// host's updater takes for no daemon and no lease.
+/// host's updater takes for no worker and no lease.
 #[tokio::test(start_paused = true)]
 async fn a_node_another_frontend_holds_is_unreadable_when_its_owner_cannot_be_read() {
     let store = Racing::new();

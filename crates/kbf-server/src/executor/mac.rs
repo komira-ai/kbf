@@ -1,6 +1,6 @@
 //! The Macs: an action whose platform names `os=macos` becomes a job of the job service's
 //! macOS hosts, run by their agent's native runtime (a user of the agent's pool, under its
-//! `sandbox-exec` profile), not by a `kbf-daemon` (docs/design/actions-as-jobs.md, section 14).
+//! `sandbox-exec` profile), (docs/design/actions-as-jobs.md, section 14).
 //!
 //! # Which actions, and where the farm places them
 //!

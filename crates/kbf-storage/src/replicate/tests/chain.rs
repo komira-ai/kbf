@@ -369,7 +369,7 @@ async fn an_unowned_copy_is_stored_on_a_node_that_owns_nothing() {
 }
 
 /// Catches an unowned-copy marker honoured from any caller: it skips the chain (no forward,
-/// no repair debt), so only the frontend's identity may send it. A daemon or a storage node
+/// no repair debt), so only the frontend's identity may send it. A worker or a storage node
 /// that sends the header gets the plain-write rule (INVALID_ARGUMENT, not the primary) and
 /// nothing is stored; a frontend's is stored as one copy. Catches: the node honouring the
 /// header whatever the certificate names.

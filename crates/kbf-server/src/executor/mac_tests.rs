@@ -106,7 +106,7 @@ fn a_mac_actions_os_version_is_its_least_major_version() {
 }
 
 /// Asserts that a platform the farm refuses is refused here with the farm's reason: an `os` no
-/// daemon runs, and `OSFamily` beside `os`.
+/// worker runs, and `OSFamily` beside `os`.
 #[test]
 fn a_platform_the_farm_refuses_is_refused() {
     for bad in [

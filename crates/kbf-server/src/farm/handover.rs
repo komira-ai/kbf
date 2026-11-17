@@ -1,6 +1,6 @@
 //! What a farm does when the other frontends of its state store take its work over (a
 //! retire, `crate::retire`): it stops taking any ([`Farm::fence`]), ends the worker streams
-//! so the daemons reconnect to another frontend ([`Farm::end_worker_streams`]), answers the
+//! so the workers reconnect to another frontend ([`Farm::end_worker_streams`]), answers the
 //! callers it still holds from what the others write to the state store ([`Farm::follow`]),
 //! and keeps an operator's cordons across the change.
 
@@ -121,7 +121,7 @@ impl Farm {
     /// never reached a host, so nothing of the operation ran. Once the scheduler gives the
     /// lease up the operation is requeued (the next frontend takes it from the state store)
     /// and its streams here are ended by the drain, as those of any operation that never
-    /// started, instead of holding the drain for a job that nothing will place, unless a daemon
+    /// started, instead of holding the drain for a job that nothing will place, unless a worker
     /// session of another frontend could run it: its streams are kept and followed in the
     /// state store, since Buck2 never re-attaches an ended stream.
     pub fn unplaced(&self, lease: kbf_types::LeaseId) {
@@ -183,7 +183,7 @@ impl Farm {
         left
     }
 
-    /// Ends every worker stream with `status`, so each daemon dials again (to the
+    /// Ends every worker stream with `status`, so each worker dials again (to the
     /// successor, once this process no longer accepts). Returns how many streams were
     /// still open.
     pub fn end_worker_streams(&self, status: &Status) -> usize {

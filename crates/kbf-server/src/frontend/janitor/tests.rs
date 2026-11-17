@@ -282,7 +282,7 @@ async fn young_keys_are_kept() {
 }
 
 /// Asserts that old keys under `cas/l/` (content-bound large objects), `cas/f/<writer>/`
-/// (frontend packs), `cas/d/` (daemon packs) and a prefix that only starts like `cas/b/` are
+/// (frontend packs), `cas/d/` (worker packs) and a prefix that only starts like `cas/b/` are
 /// never listed, so never deleted, and that the old task keys under `cas/b/` beside them are.
 #[tokio::test]
 async fn keys_under_other_prefixes_are_kept() {

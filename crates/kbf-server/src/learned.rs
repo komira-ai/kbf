@@ -8,7 +8,7 @@
 //! On the result path, in the order results commit, for every attempt the scheduler took
 //! ([`crate::farm`]'s report): not at submit, and not in the recorder, which sees only
 //! recorded calls. An attempt is a sample only if its run carries a usage block that
-//! names its instrument (`basis`); a run with none, or whose daemon predates the tag, is
+//! names its instrument (`basis`); a run with none, or whose worker predates the tag, is
 //! counted as skipped and teaches nothing. Only `LeaseKind::Action` leases with no GPU
 //! are shown, and only when the request's `needs` pin the OS (the key's platform class
 //! would otherwise be a guess). An own-limit kill that carries no usage still counts: its
@@ -122,7 +122,7 @@ pub enum Skip {
     NoOs,
     /// The farm did not see the lease start (a lease taken over from a predecessor).
     NoBooking,
-    /// The run carried no usage, or its daemon did not say which instrument measured it.
+    /// The run carried no usage, or its worker did not say which instrument measured it.
     NoBasis,
     /// The operation's subject is unknown (restored from a row that kept none), so every
     /// such action would share one key.

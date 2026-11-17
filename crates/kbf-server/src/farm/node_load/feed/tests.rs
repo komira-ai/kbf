@@ -37,7 +37,7 @@ fn full_load() -> NodeLoad {
 }
 
 /// Asserts that every field of a reading reaches the scheduler's load, each on its own field,
-/// with the lease ids of the scheduler's own type: the scalars, the telemetry a daemon sent,
+/// with the lease ids of the scheduler's own type: the scalars, the telemetry a worker sent,
 /// `covered`, each clock and each minute. The lists are the vetted ones, so a record the vet
 /// dropped is not in it even though the reading carries it.
 #[test]
@@ -75,7 +75,7 @@ fn a_reading_reaches_the_scheduler_field_by_field() {
     assert_eq!(fed, expected);
 }
 
-/// Asserts that telemetry the daemon could not read, which the scheduler holds as a plain
+/// Asserts that telemetry the worker could not read, which the scheduler holds as a plain
 /// number, is 0, and that a reading with no lists gives a load with none.
 #[test]
 fn telemetry_a_daemon_did_not_send_reads_as_zero() {

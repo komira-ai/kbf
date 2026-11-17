@@ -186,7 +186,7 @@ struct Dropped {
 
 impl HostWorker {
     /// A `Start` from the farm. It is acted on only inside the window it names, counted from
-    /// the heartbeat it names, as a daemon does: a `Start` that is late is dropped without a
+    /// the heartbeat it names, as a worker does: a `Start` that is late is dropped without a
     /// result, and the farm, which no longer lists it, runs the lease again. A window of
     /// zero (a server that names none) is no time at all, the safe way.
     pub(super) fn accept(&mut self, start: &Start) {
@@ -237,7 +237,7 @@ impl HostWorker {
     }
 
     /// The leases a heartbeat lists: those running, and those whose result the farm has
-    /// not acknowledged. A `Start` not yet submitted is not listed, as a daemon lists only what
+    /// not acknowledged. A `Start` not yet submitted is not listed, as a worker lists only what
     /// it started, and nor is a job being withdrawn, which the farm no longer runs here.
     pub(super) fn listed(&self) -> Vec<LeaseId> {
         self.tasks

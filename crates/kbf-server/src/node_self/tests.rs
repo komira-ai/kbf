@@ -158,7 +158,7 @@ fn an_updater_certificate_is_admitted_for_its_own_node_only() {
 }
 
 /// Every other certificate is refused, and a call with none is unauthenticated: a node, a
-/// frontend, a storage or a daemon certificate for the very node of the call, a certificate
+/// frontend, a storage or a worker certificate for the very node of the call, a certificate
 /// with no role, with two nodes or with no node, bytes that are no certificate, no certificate
 /// at all, plain text, and the identity a proxy forwarded.
 #[test]
@@ -359,7 +359,7 @@ async fn a_large_body_is_refused() {
     assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
-/// The listener's deny list applies to the node of an updater as it does to a daemon's calls:
+/// The listener's deny list applies to the node of an updater as it does to a worker's calls:
 /// a listed node is refused (403), and a list that cannot be read refuses the call as
 /// unavailable (503).
 #[tokio::test]

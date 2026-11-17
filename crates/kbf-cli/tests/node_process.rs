@@ -300,10 +300,10 @@ async fn an_enrolled_start_runs_the_host_checks_before_the_mode() {
     assert!(root.join("state/pki/node.json").exists());
 }
 
-/// Catches a top-level `storage = ...` or `daemon = ...` (a value where enrollment's table
+/// Catches a top-level `storage = ...` or `tls = ...` (a value where enrollment's table
 /// is) being ignored, passing `--check`, or refused with a message that names no file: for
 /// a string, a number and a bool, `--mode=storage --check --config FILE` exits 2 and stderr
-/// names the key and the file; a `[storage]` and a `[daemon]` table in the same file stay
+/// names the key and the file; a `[storage]` and a `[tls]` table in the same file stay
 /// fine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_value_where_a_table_of_the_file_is_exits_2_naming_key_and_file() {
@@ -313,8 +313,8 @@ async fn a_value_where_a_table_of_the_file_is_exits_2_naming_key_and_file() {
     for (key, value) in [
         ("storage", "\"x\""),
         ("storage", "true"),
-        ("daemon", "1"),
-        ("daemon", "true"),
+        ("tls", "1"),
+        ("tls", "true"),
     ] {
         let top = format!("mode = \"storage\"\n{key} = {value}\n");
         let path = config(&root, run.enroll_addr.port(), &top);
@@ -329,10 +329,43 @@ async fn a_value_where_a_table_of_the_file_is_exits_2_naming_key_and_file() {
             out.stderr
         );
     }
-    let tables = "mode = \"storage\"\n[storage]\nhot_dir = \"/var/lib/kbf/hot\"\n[daemon]\nreserve_cpus = 1\n";
+    let tables =
+        "mode = \"storage\"\n[storage]\nhot_dir = \"/var/lib/kbf/hot\"\n[tls]\ntrust = \"pin\"\n";
     let path = config(&root, run.enroll_addr.port(), "");
     let text = std::fs::read_to_string(&path).expect("read");
     write_config(&path, &format!("{tables}{text}"));
     let out = kbf(args(&["--check"], &path)).await;
     assert_eq!(out.code, Some(0), "{}", out.stderr);
+}
+
+/// Catches a file written for a node that ran the removed daemon stopping its storage, or a
+/// key of the removed daemon being taken for a flag: `data_dir` and `reserve_cpus` in
+/// `[daemon]` are read and ignored and the file passes `--check`, the table's thread-count
+/// flags (`async-threads`, `blocking-threads`, `cpu-threads`) still pass, and any other key
+/// there exits 2 naming the key and the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_removed_daemons_keys_are_ignored_and_another_key_of_its_table_exits_2() {
+    let run = fake::start();
+    let root = scratch("process-daemon-table");
+    token(&root, &run.fake.mint(1, 1).to_line());
+    for removed in ["data_dir = \"/var/lib/kbf/data\"", "reserve_cpus = 1"] {
+        let top = format!("mode = \"storage\"\n[daemon]\n{removed}\n");
+        let path = config(&root, run.enroll_addr.port(), &top);
+        let out = kbf(args(&["--mode=storage", "--check"], &path)).await;
+        assert_eq!(out.code, Some(0), "{removed}: {}", out.stderr);
+    }
+    let top = "mode = \"storage\"\n[daemon]\nasync-threads = 2\ncpu-threads = 2\n";
+    let path = config(&root, run.enroll_addr.port(), top);
+    let out = kbf(args(&["--mode=storage", "--check"], &path)).await;
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    let top = "mode = \"storage\"\n[daemon]\nworkers = 2\n";
+    let path = config(&root, run.enroll_addr.port(), top);
+    let out = kbf(args(&["--mode=storage", "--check"], &path)).await;
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("unknown key `daemon.workers`")
+            && out.stderr.contains(&path.display().to_string()),
+        "{}",
+        out.stderr
+    );
 }

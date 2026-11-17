@@ -100,7 +100,7 @@ fn assert_moved_all(report: &Report, tree: &Tree) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn five_hundred_files_round_trip_by_bytestream_over_the_worker_listener() {
+async fn five_hundred_files_round_trip_by_bytestream_over_the_reapi_listener() {
     let server = Server::start("bytestream");
     let tree = tree::generate(&SHAPE, 1).expect("tree");
     assert_eq!(
@@ -108,7 +108,7 @@ async fn five_hundred_files_round_trip_by_bytestream_over_the_worker_listener() 
         495 + 1 + 21 + 1,
         "the files, the empty blob, the 21 Directories, the Tree"
     );
-    let target = server.worker_target();
+    let target = server.reapi_target();
 
     let sent = upload(&target, &tree, options(Method::Bytestream)).await;
     assert_moved_all(&sent, &tree);

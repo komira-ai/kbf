@@ -18,7 +18,7 @@ fn scratch(name: &str) -> PathBuf {
     path
 }
 
-/// T-2 (docs/design/worker-cache.md#10-test-plan). Four reads are in flight, two into
+/// Four reads are in flight, two into
 /// memory and two streamed into files, each having received its first 1,000 of 3,000
 /// bytes, when every connection is cut. Each stream fails, the engine connects again,
 /// and each read resumes at offset 1,000: every blob hashes right, `retries` is 4 (one

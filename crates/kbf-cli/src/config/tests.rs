@@ -145,11 +145,11 @@ fn refusals(text: &str) -> Result<(), String> {
 #[test]
 fn a_value_where_an_enrollment_table_belongs_is_refused_naming_key_and_file() {
     let err =
-        refusals("node = 1\nstorage = \"http://x\"\ndaemon = true\n[enroll]\ntoken_file = \"t\"\n")
+        refusals("node = 1\nstorage = \"http://x\"\ndirs = true\n[enroll]\ntoken_file = \"t\"\n")
             .unwrap_err();
     let lines: Vec<&str> = err.lines().collect();
     assert_eq!(lines.len(), 3, "{err}");
-    for (line, key) in lines.iter().zip(["daemon", "node", "storage"]) {
+    for (line, key) in lines.iter().zip(["dirs", "node", "storage"]) {
         assert_eq!(
             *line,
             format!(

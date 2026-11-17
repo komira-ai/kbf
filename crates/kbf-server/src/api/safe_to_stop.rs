@@ -13,8 +13,8 @@
 //! `{id}` is a storage member's number (`2` for member `m2`) or a node's id. A node is judged
 //! as the member that is its storage half, joined by the address it enrolled with as the
 //! controller joins a host to its member ([`storage_half`]), so asking by either name gives
-//! the same answer. A node that has no storage half (a Mac, a daemon-only host, any host of a
-//! server without a state store) is a daemon, which drains in its own stop and needs no
+//! the same answer. A node that has no storage half (a Mac, a worker-only host, any host of a
+//! server without a state store) is a worker, which drains in its own stop and needs no
 //! permit: it answers safe, with a line that says what was judged. A node that cannot be told
 //! from one that has a member (the enrollment registry does not know it or cannot be read, or
 //! its address is no member's or two members') is `409`, never safe. An id that is neither a
@@ -43,9 +43,9 @@ use crate::storage_gate::{member_facts, storage_gate, storage_half};
 /// is about thirty-five years after the epoch.
 const LOOK_AT: FarmTime = FarmTime::from_millis(1 << 40);
 
-/// What a daemon-only answer says: only the daemon is judged.
-const DAEMON: &str = "judged as a daemon only: the host runs no storage member, and a \
-                      daemon drains in its own stop";
+/// What a worker-only answer says: only the worker is judged.
+const DAEMON: &str = "judged as a worker only: the host runs no storage member, and a \
+                      worker drains in its own stop";
 
 /// The answer of the query.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,7 +53,7 @@ pub struct Verdict {
     /// Whether the host may be stopped now.
     pub safe: bool,
     /// Why not: what keeps the storage gate shut (the worst thing found, one line), or, for
-    /// a daemon, what was judged. Empty for a storage member that is safe to stop.
+    /// a worker, what was judged. Empty for a storage member that is safe to stop.
     pub reasons: Vec<String>,
     /// Whether the member is already planned down. It does not make the stop unsafe: the
     /// member is already out of the write path.
@@ -103,7 +103,7 @@ fn member_verdict(id: &str, look: &MembersLook, ttl: Duration) -> Option<Verdict
 enum Node {
     /// No node of that name has registered (or the id named a member, and none was asked).
     Unknown,
-    /// A node with no storage half: a daemon.
+    /// A node with no storage half: a worker.
     Daemon,
     /// A node whose storage half is this member.
     Member(MemberLook),
@@ -198,7 +198,7 @@ pub(super) async fn check(
     if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
-    // A server without a state store keeps no members: every host it knows is a daemon.
+    // A server without a state store keeps no members: every host it knows is a worker.
     let members = api.members.clone();
     let store = api.store.clone();
     let (farm, name) = (Arc::clone(&api.farm), id.clone());
@@ -437,11 +437,11 @@ mod tests {
     /// Catches: each outcome answered with the wrong status or body: a member is `200` with
     /// its verdict, and wins over a node of the same name; an id that is no member and no
     /// node is `404` naming it; a node with no storage half, and a number that is no
-    /// member's but a node's, are `200` and safe with the line that says only the daemon was
+    /// member's but a node's, are `200` and safe with the line that says only the worker was
     /// judged; a node whose storage half is a member is `200` with that member's verdict, the
     /// gate run; a node that cannot be told from one with a member is `409` with the reason;
     /// and the membership failing is `503`, a row that does not decode and a panicked task
-    /// `500`. It catches: a node with a member answered as a daemon; an unsure node
+    /// `500`. It catches: a node with a member answered as a worker; an unsure node
     /// answered safe.
     #[tokio::test]
     async fn each_outcome_is_answered_with_its_status() {

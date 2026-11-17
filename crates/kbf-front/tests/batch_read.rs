@@ -23,7 +23,7 @@ use kbf_proto::reapi::{self, BatchReadBlobsRequest, FindMissingBlobsRequest};
 use kbf_types::FarmTime;
 use tonic::{Code, Request};
 
-/// How long each GET takes once [`Store::slow`] is set, as the design's test C-15 says.
+/// How long each GET takes once [`Store::slow`] is set.
 const GET_TIME: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Default)]
@@ -252,7 +252,7 @@ async fn hundred_apart() -> (Farm, Vec<Blob>) {
     (farm, blobs)
 }
 
-/// Test C-15 (`docs/design/worker-cache.md#10-test-plan`). Catches (defect "revert to
+/// Catches (defect "revert to
 /// the serial loop", `buffer_unordered(1)`): a batch read that waits for each blob's
 /// GET before it starts the next, so a 100-blob batch costs 100 store round trips. At
 /// 10 ms a GET that is 1,000 ms; 32 at a time it is 4 rounds, 40 ms.
@@ -276,7 +276,7 @@ async fn a_hundred_blob_batch_read_is_not_a_hundred_gets_in_a_row() {
 /// Catches (defect "unbounded", `buffer_unordered(usize::MAX)` or a `join_all`): one
 /// BatchReadBlobs call opening a GET per blob at once, so a client's batch sets how
 /// many requests the store sees; and (defect "bound 1") no concurrency at all. The
-/// design's bound is 32 (`docs/design/worker-cache.md#9-rollout`, stage S1).
+/// bound is 32.
 #[tokio::test(start_paused = true)]
 async fn a_batch_read_keeps_at_most_thirty_two_gets_in_flight() {
     let (farm, blobs) = hundred_apart().await;

@@ -46,7 +46,7 @@ async fn withdrawn_at_a_drain(farm: &Farm, node: &WorkerId) -> kbf_front::Ticket
     ticket
 }
 
-/// Asserts that a caller whose operation was withdrawn at a drain keeps its stream while a daemon
+/// Asserts that a caller whose operation was withdrawn at a drain keeps its stream while a worker
 /// session of another frontend could run the operation (`WaitingKept`), and is not answered: Buck2
 /// never re-attaches a stream that ends, so ending it fails the user's action, and the other
 /// frontend takes the operation from the state store and answers it.

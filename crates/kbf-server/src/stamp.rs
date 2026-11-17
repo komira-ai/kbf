@@ -1,5 +1,5 @@
 //! What the server adds to an accepted result's `ExecutedActionMetadata` (issue #166):
-//! the node that ran it, when it was queued, and the times the daemon left out that
+//! the node that ran it, when it was queued, and the times the worker left out that
 //! the server saw for itself.
 
 use std::time::SystemTime;
@@ -21,14 +21,14 @@ impl Stamp {
     /// Writes into `result`'s metadata, which is made if it has none:
     ///
     /// - `worker`: `node`, the node id the server holds the lease under, replacing
-    ///   whatever the daemon wrote;
+    ///   whatever the worker wrote;
     /// - `queued_timestamp`: when the operation was submitted. Only the server knows
     ///   it; a requeued operation keeps its first submission's time;
-    /// - `worker_start_timestamp`, if the daemon left it out: when the `Start` was sent;
-    /// - `worker_completed_timestamp`, if the daemon left it out: `received`, when the
+    /// - `worker_start_timestamp`, if the worker left it out: when the `Start` was sent;
+    /// - `worker_completed_timestamp`, if the worker left it out: `received`, when the
     ///   server took the result in.
     ///
-    /// The daemon's own timestamps are kept: it saw its run more closely.
+    /// The worker's own timestamps are kept: it saw its run more closely.
     pub(crate) fn apply(self, result: &mut ActionResult, node: &WorkerId, received: SystemTime) {
         let metadata = result
             .execution_metadata
@@ -41,7 +41,7 @@ impl Stamp {
     }
 
     /// The three times [`Stamp::apply`] writes into `metadata`, without writing them:
-    /// `queued` the server's, the worker start and completion the daemon's when it
+    /// `queued` the server's, the worker start and completion the worker's when it
     /// sent them, else the `Start` and `received`.
     pub(crate) fn times(self, metadata: &ExecutedActionMetadata, received: SystemTime) -> Stamped {
         Stamped {
@@ -101,9 +101,9 @@ mod tests {
         assert_eq!(metadata.worker_completed_timestamp, ts(20));
     }
 
-    /// Catches: the daemon's own run times overwritten by the server's coarser ones,
-    /// the daemon's other metadata dropped, and a `worker` or `queued_timestamp` the
-    /// daemon wrote kept (only the server knows either).
+    /// Catches: the worker's own run times overwritten by the server's coarser ones,
+    /// the worker's other metadata dropped, and a `worker` or `queued_timestamp` the
+    /// worker wrote kept (only the server knows either).
     #[test]
     fn the_daemon_s_times_are_kept_and_worker_and_queued_replaced() {
         let mut result = ActionResult {
