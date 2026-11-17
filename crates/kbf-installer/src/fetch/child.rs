@@ -113,8 +113,7 @@ pub enum ChildFault {
 /// `/proc/<pid>/fd`, `environ` and `mem` are root's alone and `ptrace` is refused. The first
 /// thing `fetch-child` does (`main`), because the `exec` that started it made it dumpable again
 /// (a `prctl` before the `exec` does not last), and a process this user's earlier child left
-/// behind could otherwise open the lent identity through `/proc`. Linux only: macOS has no
-/// such setting, and its confinement of the child is weaker for it (not built, not run).
+/// behind could otherwise open the lent identity through `/proc`.
 ///
 /// Panics (so the child ends, holding nothing) if the call fails; it fails only for an argument
 /// other than 0 and 1.

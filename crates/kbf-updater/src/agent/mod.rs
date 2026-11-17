@@ -11,7 +11,6 @@
 //!   agent at half its life; [`enrolled`]: an agent started before the host is enrolled waits for
 //!   the enrollment;
 //! - [`service_health`]: a service's readiness URL;
-//! - [`cordon`]: which cordons on the node are the updater's own, kept on disk;
 //! - [`hold`]: `Deferred` and `halt`: the features announced, the deferral kept on disk, the
 //!   heartbeat's size;
 //! - [`pin`]: root's hold file, which keeps the host on a release while it is there;
@@ -35,7 +34,6 @@ pub mod status;
 pub mod update;
 
 mod build;
-pub mod cordon;
 
 #[cfg(test)]
 use build::run_config_waiting;
@@ -48,8 +46,6 @@ mod build_tests;
 mod container_health_tests;
 #[cfg(test)]
 mod coordinator_tests;
-#[cfg(test)]
-mod cordon_tests;
 #[cfg(test)]
 mod enroll_tests;
 #[cfg(test)]

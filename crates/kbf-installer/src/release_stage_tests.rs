@@ -1,54 +1,14 @@
-//! Installs onto a Mac layout, the `stage` verb that copies a release without moving a link, and a stage that meets a full disk.
+//! The `stage` verb that copies a release without moving a link, and a stage that meets a full disk.
 
 use super::*;
 
-/// Catches a release of two binaries not being copied whole: both come out 0755 with their
-/// bytes, the first is named in the release line as a release of one always was, and the
-/// second has a line of its own with its size and sha256.
+/// Catches a source without `kbf` being accepted or misreported: a source with `kbf` reads it,
+/// one with none is refused naming `kbf`, and a `kbf` that cannot be read is an error.
 #[test]
-fn a_release_of_two_binaries_is_installed_whole_and_reported() {
-    let (mut exec, root) = host("two-binaries");
-    let from = source("two-binaries-src", "kbf A", None);
-    fs::write(from.join("kbf-daemon"), "daemon A").expect("daemon");
-    let out = install_on(&mut exec, &root, A, &from, Mode::Apply).expect("install");
-    for (file, text) in [("kbf", "kbf A"), ("kbf-daemon", "daemon A")] {
-        let path = format!("/var/lib/kbf-installer/releases/{A}/{file}");
-        assert_eq!(fs::read_to_string(exec.at(&path)).expect(file), text);
-        assert_eq!(mode_of(&exec, &path), 0o755);
-    }
-    let r = format!("/var/lib/kbf-installer/releases/{A}");
-    assert!(
-        out.starts_with(&format!(
-            "release {A}: {r} (5 bytes, sha256 {}), 0 unit(s)\nalso kbf-daemon (8 bytes, sha256 {})\n",
-            sha256(b"kbf A"),
-            sha256(b"daemon A")
-        )),
-        "{out}"
-    );
-
-    // The release is whole or not there: a second binary the directory lacks is a
-    // different release, and is refused.
-    let (mut exec2, root2) = host("two-binaries-differs");
-    let only_kbf = source("two-binaries-only", "kbf A", None);
-    install_on(&mut exec2, &root2, A, &only_kbf, Mode::Apply).expect("install");
-    let err = install_on(&mut exec2, &root2, A, &from, Mode::Apply).expect_err("a new binary");
-    assert!(
-        matches!(&err, ReleaseError::Differs { path } if path.as_str().ends_with("/kbf-daemon")),
-        "{err}"
-    );
-}
-
-/// Catches a source with only `kbf` (all a Mac release has) or only `kbf-daemon` being
-/// refused, and a source with neither being refused naming `kbf` as before.
-#[test]
-fn a_source_needs_one_binary_and_either_will_do() {
-    let only = mac_source("kbf-only", "kbf A");
+fn a_source_needs_kbf() {
+    let only = source("kbf-only", "kbf A", None);
     let s = Source::read(&only).expect("reads");
-    assert_eq!(s.binaries, [("kbf", b"kbf A".to_vec())]);
-    let daemon = scratch("deploy-release-src-daemon-only");
-    fs::write(daemon.join("kbf-daemon"), "daemon A").expect("daemon");
-    let s = Source::read(&daemon).expect("reads");
-    assert_eq!(s.binaries, [("kbf-daemon", b"daemon A".to_vec())]);
+    assert_eq!(s.binary, b"kbf A".to_vec());
     let none = scratch("deploy-release-src-none");
     let err = Source::read(&none).expect_err("nothing");
     assert!(
@@ -61,98 +21,6 @@ fn a_source_needs_one_binary_and_either_will_do() {
     fs::create_dir(unreadable.join("kbf")).expect("a directory");
     let err = Source::read(&unreadable).expect_err("a directory");
     assert!(err.to_string().starts_with("cannot read "), "{err}");
-}
-
-/// Catches the macOS layout not being used: an install on a Mac puts the state under
-/// `/var/db/kbf-installer` and takes the lock at `/var/run/kbf-installer/lock`, never at
-/// `/var/lib` or `/run`; it makes the `/usr/local` a fresh Mac lacks (root's, 0755) and
-/// the state directory; the links point at the release; the next-steps line names the
-/// daemon and `launchctl`, not `kbf` and `systemctl`.
-///
-/// Catches: `Locked::acquire` taking the Linux lock (`/run` is not there).
-#[test]
-fn a_mac_install_uses_the_mac_layout_and_makes_its_missing_parents() {
-    let (mut exec, layout) = mac("flow");
-    let a = mac_source("mac-flow-a", "daemon A");
-    let b = mac_source("mac-flow-b", "daemon B");
-    assert!(!exec.at("/usr/local").exists());
-    let out = install_on(&mut exec, &layout, A, &a, Mode::Apply).expect("install A");
-    install_on(&mut exec, &layout, B, &b, Mode::Apply).expect("install B");
-    assert!(
-        out.contains("state: written to /var/db/kbf-installer/state.json\n"),
-        "{out}"
-    );
-    assert!(
-        out.contains("restart the units that run /usr/local/kbf-installer/releases/current/kbf (launchctl kickstart -k system/<label>)"),
-        "{out}"
-    );
-    assert!(exec.at("/var/db/kbf-installer/state.json").is_file());
-    assert!(exec.at("/var/run/kbf-installer/lock").is_file());
-    assert!(!exec.at("/var/lib").exists() && !exec.at("/run").exists());
-    for dir in [
-        "/usr/local",
-        "/var/db/kbf-installer",
-        "/usr/local/kbf-installer",
-    ] {
-        assert_eq!(mode_of(&exec, dir), 0o755, "{dir}");
-    }
-    assert_eq!(link(&exec, "current"), Some(B.to_owned()));
-    assert_eq!(link(&exec, "previous"), Some(A.to_owned()));
-    assert_eq!(state_of(&layout).current, Some(c(B)));
-    assert!(
-        !exec
-            .at(&format!("/usr/local/kbf-installer/releases/{A}/kbf-daemon"))
-            .exists()
-    );
-
-    // Rolling back finds the previous release by its daemon.
-    let out = rollback_on(&mut exec, &layout, Mode::Apply).expect("rollback");
-    assert!(
-        out.contains(&format!("links: current {B} -> {A}, previous {A} -> none")),
-        "{out}"
-    );
-    assert_eq!(link(&exec, "current"), Some(A.to_owned()));
-}
-
-/// Catches `/usr/local` being touched when the host has one: a Mac (or any host) whose
-/// `/usr/local` is 0775 keeps that mode (its owner is the host's business; the trust
-/// check refuses what others can write), the plan has no step for it, and a host without
-/// one gets `mkdir /usr/local` as the first step.
-///
-/// Catches: `/usr/local` always planned (the 0775 becomes 0755).
-#[test]
-fn usr_local_is_made_when_missing_and_left_alone_when_there() {
-    // The installer tree is under `/usr/local` on a Mac only.
-    let (mut exec, root) = mac("usr-local");
-    fs::create_dir(exec.at("/usr/local")).expect("seed");
-    fs::set_permissions(exec.at("/usr/local"), fs::Permissions::from_mode(0o775)).expect("mode");
-    let from = mac_source("usr-local-src", "daemon A");
-    let out = install_on(&mut exec, &root, A, &from, Mode::Apply).expect("install");
-    assert!(!out.contains("/usr/local ("), "{out}");
-    assert_eq!(mode_of(&exec, "/usr/local"), 0o775);
-
-    let (mut exec, root) = mac("usr-local-missing");
-    let out = install_on(&mut exec, &root, A, &from, Mode::DryRun).expect("dry run");
-    let first_step = out
-        .lines()
-        .find(|l| l.starts_with("DRY-RUN"))
-        .expect("a step");
-    let owner = me();
-    assert_eq!(
-        first_step,
-        format!(
-            "DRY-RUN: mkdir /usr/local (0755, owner {}:{})",
-            owner.uid, owner.gid
-        )
-    );
-    install_on(&mut exec, &root, A, &from, Mode::Apply).expect("install");
-    assert_eq!(mode_of(&exec, "/usr/local"), 0o755);
-
-    // A Linux host's tree is not under it: no step for `/usr/local` at all.
-    let (mut exec, root) = host("usr-local-linux");
-    let linux = source("usr-local-linux-src", "kbf A", None);
-    let out = install_on(&mut exec, &root, A, &linux, Mode::DryRun).expect("dry run");
-    assert!(!out.contains("/usr/local"), "{out}");
 }
 
 /// Catches `stage` doing what `install` does: it must copy and check the release, record
@@ -388,14 +256,13 @@ impl Exec for DiskFull<'_> {
 fn a_stage_that_fills_the_disk_leaves_no_partial_release_and_can_be_retried() {
     let (mut exec, root) = host("disk-full");
     let from = source("disk-full", "kbf B", Some(UNITS));
-    fs::write(from.join("kbf-daemon"), "daemon B").expect("a second binary");
     let dir = exec.at(&format!("/var/lib/kbf-installer/releases/{B}"));
     let want = Install {
         commit: c(B),
         from: from.clone(),
     };
 
-    // The first binary is written, the second is not.
+    // The binary is written, the first unit is not.
     let err = stage(
         &mut DiskFull {
             host: &mut exec,
@@ -429,10 +296,6 @@ fn a_stage_that_fills_the_disk_leaves_no_partial_release_and_can_be_retried() {
     )
     .expect("retry");
     assert_eq!(fs::read_to_string(dir.join("kbf")).expect("kbf"), "kbf B");
-    assert_eq!(
-        fs::read_to_string(dir.join("kbf-daemon")).expect("daemon"),
-        "daemon B"
-    );
     assert_eq!(state_of(&root).staged, Some(c(B)));
 
     // A repeat of a stage that was whole, failing on a full disk, removes nothing. (The

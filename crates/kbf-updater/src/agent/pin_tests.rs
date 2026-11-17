@@ -5,7 +5,7 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
-use super::pin::{LINUX_PIN, Look, MAC_PIN, PinFile, ROOT};
+use super::pin::{LINUX_PIN, Look, PinFile, ROOT};
 use super::testing::COMMIT_B;
 use crate::testutil::scratch;
 use crate::wire::{Commit, PinReport};
@@ -226,8 +226,7 @@ fn a_name_that_cannot_be_looked_at_holds_the_host() {
 /// Catches: the agent and the helper disagreeing on where the pin is.
 #[test]
 fn the_hold_file_is_the_helpers() {
-    use kbf_host_install::contract::local::{LINUX_HOLD, MAC_HOLD};
-    assert_eq!((LINUX_PIN, MAC_PIN), (LINUX_HOLD, MAC_HOLD));
-    assert_eq!(PinFile::of_platform("linux"), PinFile::new(LINUX_PIN, ROOT));
-    assert_eq!(PinFile::of_platform("macos"), PinFile::new(MAC_PIN, ROOT));
+    use kbf_host_install::contract::local::LINUX_HOLD;
+    assert_eq!(LINUX_PIN, LINUX_HOLD);
+    assert_eq!(PinFile::helper(), PinFile::new(LINUX_PIN, ROOT));
 }

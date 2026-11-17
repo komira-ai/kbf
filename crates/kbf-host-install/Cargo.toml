@@ -11,8 +11,7 @@ publish.workspace = true
 # `kbf-updater` holds (docs/deploy/host-install.md). sshd runs it with the command the
 # updater asked for in `SSH_ORIGINAL_COMMAND`; it accepts three verbs, checks an install
 # against a root-owned allowlist and runs `apt-get` for the one package, one source, no shell,
-# and restarts a frontend unit with `systemctl`. On a Mac it installs the release tarball into
-# the kit layout instead.
+# and restarts a frontend unit with `systemctl`.
 [[bin]]
 name = "kbf-host-install"
 path = "src/main.rs"
@@ -25,21 +24,18 @@ thiserror.workspace = true
 # The audit line's time, and `O_NOFOLLOW` for the files read as root.
 time.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
-# The privilege drop of a macOS child (`setgroups`, `setgid`, `setuid` before it executes).
+# `O_NONBLOCK` for the files read as root.
 libc.workspace = true
 toml.workspace = true
 # The `approve` subcommand and the rules a declaration is loaded under (docs/design/host-updates.md).
 update-rights.workspace = true
-# Which releases a host keeps (`retain.json`, the rule, the commit id): both platforms.
+# Which releases a host keeps (`retain.json`, the rule, the commit id).
 kbf-retain.workspace = true
-# The Mac side: the release tarball (gzip and tar) and its sha256.
-flate2.workspace = true
+# The sha256 of a staged release file.
 sha2.workspace = true
-tar.workspace = true
 
-# The Linux side of the local socket moves releases in the layout, with the state and the
-# verify pipeline of `kbf-installer`, so a host has one of each. (The Mac side does not need
-# them, and the program builds without them there.)
+# The local socket moves releases in the layout, with the state and the verify pipeline of
+# `kbf-installer`, so a host has one of each.
 [target.'cfg(target_os = "linux")'.dependencies]
 kbf-host.workspace = true
 kbf-installer.workspace = true

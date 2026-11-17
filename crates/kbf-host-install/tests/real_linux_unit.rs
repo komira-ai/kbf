@@ -21,7 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use kbf_host_install::mac_tools::{Cmd, Exec, Identity, Runner, SystemRunner};
+use kbf_host_install::test_runner::{Cmd, Exec, Identity, Runner, SystemRunner};
 use kbf_testkit::dir::TestDir;
 
 const LIMIT: Duration = Duration::from_secs(60);

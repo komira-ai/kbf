@@ -1,10 +1,9 @@
 use super::*;
 
-/// Catches the user's name drifting from the contract's: `kbf-fetch`, and `_kbf-fetch` on macOS.
+/// Catches the user's name drifting from the contract's: `kbf-fetch`.
 #[test]
-fn the_fetch_user_is_named_per_platform() {
+fn the_fetch_user_is_named_for_the_platform() {
     assert_eq!(name(Platform::Linux), "kbf-fetch");
-    assert_eq!(name(Platform::MacOs), "_kbf-fetch");
 }
 
 /// Catches a lookup that would run untrusted bytes as root (`root` has uid 0), one that

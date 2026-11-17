@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::inventory::Role;
 
 /// How long the roll waits for each thing. The defaults are the package-update design's
-/// (node health 300 s, daemon 780 s, no answer 120 s); the frontend's bound, the safe-to-stop
+/// (node health 300 s, no answer 120 s); the frontend's bound, the safe-to-stop
 /// bound and the cap on an install in progress are this crate's choices.
 #[derive(Clone, Debug)]
 pub struct Timing {
@@ -20,16 +20,6 @@ pub struct Timing {
     pub query_bound: Duration,
     pub healthy_frontend: Duration,
     pub healthy_storage: Duration,
-    pub healthy_daemon: Duration,
-    /// How long a daemon host's node is waited for to finish its leases once it is drained.
-    /// `None`, the default, waits however long they take. When a set time is out the host is
-    /// not installed: the roll stops with the node left drained.
-    pub drain_deadline: Option<Duration>,
-    /// Between two asks of a Mac host how its apply stands.
-    pub apply_poll: Duration,
-    /// How long a Mac host's apply may take, from the answer `apply_started` (or from a
-    /// restart that resumes the wait), to be `done` for the target.
-    pub apply_deadline: Duration,
     /// For a frontend member rolled without a proxy: how long every other member must answer
     /// `/readyz` 200 without a miss before the member is drained. The wait for that window,
     /// which a miss restarts, is given this and [`Timing::healthy_frontend`] on top.
@@ -49,10 +39,6 @@ impl Default for Timing {
             query_bound: Duration::from_secs(120),
             healthy_frontend: Duration::from_secs(300),
             healthy_storage: Duration::from_secs(300),
-            healthy_daemon: Duration::from_secs(780),
-            drain_deadline: None,
-            apply_poll: Duration::from_secs(5),
-            apply_deadline: Duration::from_secs(600),
             peer_ready: Duration::from_secs(30),
             frontend_drain: None,
         }
@@ -64,7 +50,6 @@ impl Timing {
         match role {
             Role::Frontend => self.healthy_frontend,
             Role::Storage => self.healthy_storage,
-            Role::Daemon | Role::MacDaemon => self.healthy_daemon,
         }
     }
 }

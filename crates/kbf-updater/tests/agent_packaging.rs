@@ -33,35 +33,6 @@ fn names_no_user(text: &str) -> bool {
     !text.lines().any(|l| l.trim_start().starts_with("User="))
 }
 
-/// The strings of the `ProgramArguments` array of a property list.
-fn program_arguments(plist: &str) -> Vec<String> {
-    let start = plist
-        .find("<key>ProgramArguments</key>")
-        .expect("ProgramArguments");
-    let array = &plist[start..];
-    let begin = array.find("<array>").expect("an array") + "<array>".len();
-    let end = array.find("</array>").expect("the end of the array");
-    array[begin..end]
-        .split("<string>")
-        .skip(1)
-        .map(|s| s.split("</string>").next().expect("closed").to_owned())
-        .collect()
-}
-
-/// The string after `<key>name</key>`.
-fn plist_value(plist: &str, key: &str) -> String {
-    let at = plist
-        .find(&format!("<key>{key}</key>"))
-        .unwrap_or_else(|| panic!("{key}"));
-    let rest = &plist[at..];
-    let open = rest.find("<string>").expect("a string") + "<string>".len();
-    rest[open..]
-        .split("</string>")
-        .next()
-        .expect("closed")
-        .to_owned()
-}
-
 fn words(line: &str) -> Vec<String> {
     line.split_whitespace().map(str::to_owned).collect()
 }
@@ -173,44 +144,6 @@ fn the_frontend_container_unit_and_its_configuration_agree_with_the_program() {
         config.ready_secs <= serve.window_secs,
         "the readiness wait has to fit the window of a trial"
     );
-}
-
-/// The same on a Mac: the agent's job parses, runs as an account that is not root, and reaches the
-/// helper at the socket the helper's job binds, for the account the helper lets in.
-#[test]
-fn the_macos_jobs_agree_with_the_programs_and_with_each_other() {
-    let agent = read("macos/com.komira.kbf-updater-agent.plist");
-    let args = program_arguments(&agent);
-    assert_eq!(args[1], "agent");
-    let config = parse_flags(&args[2..]).expect("the agent's flags");
-    assert_eq!(
-        config.node_api, None,
-        "the shipped job carries no operator token"
-    );
-    for word in ["--token-file", "--operator-api", "proxy"] {
-        assert!(!agent.contains(&format!("{word}</string>")), "{word}");
-    }
-    assert!(config.frontend.is_some());
-    assert!(config.enroll_frontend.is_some());
-    assert_eq!(config.state_dir, Some(PathBuf::from("/var/db/kbf-updater")));
-    let user = plist_value(&agent, "UserName");
-    assert_ne!(user, "root");
-
-    let helper = read("macos/com.komira.kbf-host-install-local.plist");
-    let args = program_arguments(&helper);
-    assert_eq!(args[1], "--serve");
-    let serve = ServeConfig::parse(&args[2..]).expect("the helper's flags");
-    assert_eq!(config.helper_socket, serve.socket);
-    assert_eq!(serve.user, user);
-    assert!(
-        serve.units.is_empty(),
-        "a Mac restarts the daemon's job, not a unit"
-    );
-    assert_eq!(plist_value(&helper, "UserName"), "root");
-    for plist in [&agent, &helper] {
-        assert!(plist.contains("<key>KeepAlive</key>\n\t<true/>"));
-        assert!(plist.contains("<key>RunAtLoad</key>\n\t<true/>"));
-    }
 }
 
 /// The words of the `install` command of `install-declaration.txt` that ends in `destination`.
@@ -353,7 +286,7 @@ fn the_root_part_unit_agrees_with_the_agent_and_its_registration_directory() {
 }
 
 /// The two units the `kbf` deb ships and enables (`packaging/linux/README.md`): the helper's
-/// installs the attested package (`--layout deb`, with the daemon's unit to restart), and each is
+/// installs the attested package (`--layout deb`, with the storage unit to restart), and each is
 /// gated on the program its `ExecStart` runs, which no package carries, so that a host with the
 /// package and not yet the program skips the unit at boot instead of failing it in a loop. Both are
 /// wanted by `multi-user.target`, the target whose `.wants` directory the package links them into.
@@ -377,7 +310,7 @@ fn the_packaged_units_install_the_package_and_wait_for_their_programs() {
     );
     assert!(
         line.windows(2)
-            .any(|w| w == ["--restart-unit", "kbf-daemon.service"]),
+            .any(|w| w == ["--restart-unit", "kbf-storage.service"]),
         "{line:?}"
     );
     for (unit, program) in [

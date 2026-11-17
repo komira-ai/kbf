@@ -4,21 +4,19 @@
 //! # alias   address               role      host key (type and base64, as in known_hosts)  [node id]
 //! fe1       fe1.farm.example:22   frontend  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample
 //! st1       st1.farm.example      storage   ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample
-//! dm1       dm1.farm.example      daemon    ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample  dm1
-//! mac1      mac1.farm.example     mac-daemon ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample  mac1
 //! ```
 //!
-//! The roles are `frontend`, `storage`, `daemon` (a Linux host that runs only a daemon) and
-//! `mac-daemon` (a Mac that runs a daemon). A `mac-daemon` host is rolled like a `daemon`
-//! host (it needs a node id, and its node is drained and given back) except for the
-//! install: its `kbf-host-install` starts the apply and answers at once, and the roll then
-//! polls the host until the apply is done ([`Role::MacDaemon`]).
+//! The roles are `frontend` and `storage`. The words `daemon` and `mac-daemon` (the roles of
+//! the hosts of a worker daemon, which kbf no longer has) are still read, so that an inventory
+//! written for an earlier release is not refused as a whole, but such a line lists no host:
+//! it is checked like any other and then left out, so no roll touches it and a roll that names
+//! its alias is refused as unknown (`unknown_alias`).
 //!
 //! Blank lines and `#` lines are skipped. A line is five words, or six: the alias, the
 //! address, the role, the key as its type and its base64, and optionally the node id the
 //! host's kbf configuration names (a DNS label: what `kbf-host-install query` reports as
 //! `node_id`, and what the frontend knows the node by). The roll checks it against the host
-//! before it drains the node, and a daemon host without one is refused. The updater never
+//! before it installs on the host. The updater never
 //! learns a host key by asking the host: the pinned key here is the one ssh must see.
 //!
 //! # Frontend pool members
@@ -74,30 +72,21 @@ pub enum Role {
     /// [`Member`] drains itself, is updated and restarted; one that is not is refused by the
     /// real health check.
     Frontend,
-    /// A storage node, possibly with a daemon.
+    /// A storage node.
     Storage,
-    /// A daemon-only Linux host.
-    Daemon,
-    /// A Mac that runs a daemon. Like [`Role::Daemon`] in everything but the install: its
-    /// `install` answers `apply_started` and the apply goes on by itself, so the roll polls
-    /// the host's `query` until the apply is done (or has failed, or the bound is out).
-    MacDaemon,
 }
+
+/// The roles of an earlier release's hosts of a worker daemon: read, and the line they are on
+/// lists no host.
+const RETIRED_ROLES: [&str; 2] = ["daemon", "mac-daemon"];
 
 impl Role {
     fn parse(s: &str) -> Option<Role> {
         match s {
             "frontend" => Some(Role::Frontend),
             "storage" => Some(Role::Storage),
-            "daemon" => Some(Role::Daemon),
-            "mac-daemon" => Some(Role::MacDaemon),
             _ => None,
         }
-    }
-
-    /// A host whose node the frontend knows and the roll drains: a daemon of either kind.
-    pub fn is_daemon(self) -> bool {
-        matches!(self, Role::Daemon | Role::MacDaemon)
     }
 }
 
@@ -227,7 +216,9 @@ impl Inventory {
                 line: n + 1,
                 reason,
             };
-            let host = parse_line(line).map_err(at)?;
+            let Some(host) = parse_line(line).map_err(at)? else {
+                continue;
+            };
             if hosts.iter().any(|h| h.alias == host.alias) {
                 return Err(at(format!("alias {} is listed twice", host.alias)));
             }
@@ -383,7 +374,8 @@ fn parse_member(role: Role, fields: &[&str]) -> Result<Option<Member>, String> {
     }
 }
 
-fn parse_line(line: &str) -> Result<Host, String> {
+/// The host a line lists, or `None` for a line of a retired role ([`RETIRED_ROLES`]).
+fn parse_line(line: &str) -> Result<Option<Host>, String> {
     let words: Vec<&str> = line.split_whitespace().collect();
     // The five words and the node id come first. The key, the fifth, may end in `=` as base64
     // does, so the `name=value` words are looked for after it.
@@ -408,8 +400,12 @@ fn parse_line(line: &str) -> Result<Host, String> {
     if !valid_address(address) {
         return Err(format!("address {address:?} is not a host or host:port"));
     }
-    let role = Role::parse(role)
-        .ok_or_else(|| format!("role {role:?} is not frontend, storage, daemon or mac-daemon"))?;
+    let retired = RETIRED_ROLES.contains(&role);
+    let role = match Role::parse(role) {
+        Some(role) => role,
+        None if retired => Role::Storage,
+        None => return Err(format!("role {role:?} is not frontend or storage")),
+    };
     if !KEY_TYPES.contains(&key_type) {
         return Err(format!(
             "host key type {key_type:?} is not a supported type"
@@ -428,14 +424,15 @@ fn parse_line(line: &str) -> Result<Host, String> {
             "node id {id:?} must be a DNS label: 1..=63 of a-z, 0-9 and -, not starting or ending with -"
         ));
     }
-    Ok(Host {
+    let member = parse_member(role, fields)?;
+    Ok((!retired).then(|| Host {
         alias: alias.to_owned(),
         address: address.to_owned(),
         role,
         host_key: format!("{key_type} {key}"),
         node_id: node_id.map(str::to_owned),
-        member: parse_member(role, fields)?,
-    })
+        member,
+    }))
 }
 
 /// A node id as the host reports one and the frontend knows one: a DNS label,
@@ -506,9 +503,8 @@ mod tests {
             "",
             &format!("st1 st1.farm.example storage {KEY}"),
             &format!("fe1 fe1.farm.example:2222 frontend {KEY}"),
-            &format!("  dm1\tdm1.farm.example  daemon  {KEY}  dm-1  "),
+            &format!("  st3\tst3.farm.example  storage  {KEY}  st-3  "),
             &format!("st2 st2.farm.example storage {KEY}"),
-            &format!("mac1 mac1.farm.example mac-daemon {KEY} mac-1"),
         ]))
         .expect("inventory")
     }
@@ -517,22 +513,48 @@ mod tests {
         plan.iter().map(|h| h.alias.clone()).collect()
     }
 
-    /// Catches the Mac role named wrongly or taken for a daemon: only `mac-daemon` is the Mac's
-    /// role (not `mac`, `macos` or `Mac-Daemon`), both daemon roles are the roll's daemons, and
-    /// a frontend and a storage host are not.
+    /// Catches a role word read loosely: only `frontend`, `storage` and the two retired
+    /// daemon words are roles, spelled exactly, and the refusal names the two roles that are kept.
     #[test]
-    fn the_mac_daemon_role_is_its_own() {
-        for word in ["mac", "macos", "Mac-Daemon", "mac_daemon", "mac-daemon2"] {
+    fn only_the_listed_role_words_are_roles() {
+        for word in [
+            "mac",
+            "macos",
+            "Mac-Daemon",
+            "mac_daemon",
+            "mac-daemon2",
+            "Daemon",
+        ] {
             let e = line_error(&format!("m m.farm.example {word} {KEY} m-1"));
-            assert!(
-                e.contains("is not frontend, storage, daemon or mac-daemon"),
-                "{e}"
-            );
+            assert!(e.contains("is not frontend or storage"), "{e}");
         }
-        let daemons =
-            [Role::Frontend, Role::Storage, Role::Daemon, Role::MacDaemon].map(Role::is_daemon);
-        assert_eq!(daemons, [false, false, true, true]);
-        assert_ne!(Role::MacDaemon, Role::Daemon);
+    }
+
+    /// Asserts that a line of the retired role `daemon` or `mac-daemon` lists no host: it is
+    /// read (so the file is not refused), checked like any line (a bad key still refuses it),
+    /// and then left out, so the plan of "all" does not hold it and a roll that names its alias
+    /// is refused as unknown. A file of nothing else has no hosts.
+    #[test]
+    fn a_line_of_a_retired_daemon_role_lists_no_host() {
+        let inv = Inventory::parse(&file(&[
+            &format!("st1 st1.farm.example storage {KEY}"),
+            &format!("dm1 dm1.farm.example daemon {KEY} dm-1"),
+            &format!("mac1 mac1.farm.example mac-daemon {KEY} mac-1"),
+        ]))
+        .expect("inventory");
+        assert!(inv.host("dm1").is_none());
+        assert!(inv.host("mac1").is_none());
+        let all = inv.plan(&Hosts::All(All::All)).expect("all");
+        assert_eq!(aliases(&all), ["st1"]);
+        let named = inv.plan(&Hosts::Aliases(vec!["dm1".into()]));
+        assert_eq!(named.expect_err("unknown").code, ErrorCode::UnknownAlias);
+        let bad_key = "dm1 dm1.farm.example daemon ssh-bogus AAAA dm-1";
+        assert!(line_error(bad_key).contains("host key type"));
+        let only = format!("dm1 dm1.farm.example daemon {KEY} dm-1");
+        assert!(matches!(
+            Inventory::parse(&only),
+            Err(InventoryError::Empty)
+        ));
     }
 
     /// The refusal as text: `line N: reason`.
@@ -549,13 +571,9 @@ mod tests {
         assert_eq!(fe.address, "fe1.farm.example:2222");
         assert_eq!(fe.role, Role::Frontend);
         assert_eq!(fe.host_key, KEY);
-        assert_eq!(inv.host("dm1").expect("dm1").role, Role::Daemon);
-        let mac = inv.host("mac1").expect("mac1");
-        assert_eq!(mac.role, Role::MacDaemon);
-        assert_eq!(mac.node_id.as_deref(), Some("mac-1"));
         assert_eq!(
-            inv.host("dm1").expect("dm1").node_id.as_deref(),
-            Some("dm-1")
+            inv.host("st3").expect("st3").node_id.as_deref(),
+            Some("st-3")
         );
         assert_eq!(fe.node_id, None);
         assert_eq!(inv.host("st1").expect("st1").role, Role::Storage);
@@ -581,14 +599,14 @@ mod tests {
     fn the_plan_puts_the_frontend_first_and_keeps_the_rest_in_order() {
         let inv = sample();
         let all = inv.plan(&Hosts::All(All::All)).expect("all");
-        assert_eq!(aliases(&all), ["fe1", "st1", "dm1", "st2", "mac1"]);
+        assert_eq!(aliases(&all), ["fe1", "st1", "st3", "st2"]);
         let list = Hosts::Aliases(vec!["st2".into(), "fe1".into(), "st1".into()]);
         assert_eq!(
             aliases(&inv.plan(&list).expect("list")),
             ["fe1", "st2", "st1"]
         );
-        let nodes = Hosts::Aliases(vec!["dm1".into(), "st2".into()]);
-        assert_eq!(aliases(&inv.plan(&nodes).expect("nodes")), ["dm1", "st2"]);
+        let nodes = Hosts::Aliases(vec!["st3".into(), "st2".into()]);
+        assert_eq!(aliases(&inv.plan(&nodes).expect("nodes")), ["st3", "st2"]);
     }
 
     /// Catches a host rolled twice by a repeated alias.

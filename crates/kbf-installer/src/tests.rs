@@ -81,19 +81,14 @@ fn the_layout_names_every_path_under_its_directory() {
     assert_eq!(release_link(&a), std::path::PathBuf::from(A));
 }
 
-/// Catches the platforms' paths mixed up, and a path that has drifted from the contract
-/// (`docs/design/kbf-installer.md`, section 3): the installer tree, the links inside
-/// `releases/`, the state and its backup, the lock under its own directory, and the trust
-/// directory. Linux keeps its state in the install root; macOS keeps the tree under
-/// `/usr/local/kbf-installer` and the state in `/var/db/kbf-installer`.
-///
-/// Catches: the macOS lock path returning the Linux one.
+/// Catches a path that has drifted from the contract (`docs/design/kbf-installer.md`, section
+/// 3): the installer tree, the links inside `releases/`, the state and its backup, the lock
+/// under its own directory, and the trust directory. The state is kept in the install root.
 #[test]
-fn the_platforms_differ_in_the_tree_the_state_the_lock_and_the_trust_directory() {
+fn the_layout_names_the_tree_the_state_the_lock_and_the_trust_directory() {
     use kbf_host::path::Root;
     use layout::{Layout, Platform};
     let linux = Layout::linux(Root::host());
-    let mac = Layout::new(Root::host(), Platform::MacOs);
     assert_eq!(linux.platform(), Platform::Linux);
     assert_eq!(linux.root(), &Root::host());
     let paths = |l: &Layout| {
@@ -132,46 +127,23 @@ fn the_platforms_differ_in_the_tree_the_state_the_lock_and_the_trust_directory()
         ]
     );
     assert_eq!(
-        paths(&mac),
-        [
-            "/usr/local/kbf-installer",
-            "/usr/local/kbf-installer/releases",
-            "/usr/local/kbf-installer/releases/current",
-            "/usr/local/kbf-installer/releases/previous",
-            "/var/db/kbf-installer",
-            "/var/db/kbf-installer/state.json",
-            "/var/db/kbf-installer/state.json.bak",
-            "/var/run/kbf-installer/lock",
-            "/var/db/kbf-installer/work",
-            "/usr/local/kbf-installer/trust",
-            "/usr/local/kbf-installer/trust/gh",
-            "/usr/local/kbf-installer/trust/trusted_root.jsonl",
-            "/usr/local/kbf-installer/trust/installer.conf",
-        ]
-    );
-    assert_eq!(
         linux.join(&linux.current()),
         std::path::PathBuf::from("/var/lib/kbf-installer/releases/current")
     );
-    assert_eq!(layout::RELEASE_BINARIES, ["kbf", "kbf-daemon"]);
 }
 
 /// Catches the platform spelled differently on the command line than it prints, and an
 /// unknown name accepted.
 #[test]
-fn a_platform_is_named_linux_or_macos() {
+fn a_platform_is_named_linux() {
     use layout::Platform;
-    for p in [Platform::Linux, Platform::MacOs] {
-        assert_eq!(p.name().parse::<Platform>(), Ok(p));
-    }
     assert_eq!(
-        "windows".parse::<Platform>(),
-        Err("\"windows\" is not a platform (linux or macos)".to_owned())
+        Platform::Linux.name().parse::<Platform>(),
+        Ok(Platform::Linux)
     );
-    assert_eq!(Platform::named("macos"), Platform::MacOs);
-    assert_eq!(Platform::named("linux"), Platform::Linux);
     assert_eq!(
-        Platform::current() == Platform::MacOs,
-        cfg!(target_os = "macos")
+        "macos".parse::<Platform>(),
+        Err("\"macos\" is not a platform (linux)".to_owned())
     );
+    assert_eq!(Platform::current(), Platform::Linux);
 }

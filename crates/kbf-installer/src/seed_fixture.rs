@@ -25,7 +25,6 @@ use crate::helper::fetcher::ReleaseLocator;
 use crate::helper::fetcher_host::HostFetcher;
 use crate::helper::fetcher_real::Parts;
 use crate::helper::fetcher_seed::SeedFetcher;
-use crate::helper::leases::fake::FakeLeases;
 use crate::layout::{Layout, path};
 use crate::seed::MANIFEST;
 use crate::settings::Settings;
@@ -86,8 +85,6 @@ pub struct Seeded {
     /// What any other release's binary prints (the cycle tests' A, which runs before the seed
     /// is installed): an older `seq`, and a commit of its own.
     pub earlier: String,
-    /// The host's lease source, shared with the fetcher this makes.
-    pub leases: FakeLeases,
 }
 
 impl Seeded {
@@ -130,7 +127,6 @@ impl Seeded {
             manifest,
             probe,
             earlier: earlier_probe(EARLIER_SEQ),
-            leases: FakeLeases::default(),
         };
         seeded.write_tarball();
         seeded
@@ -259,7 +255,6 @@ impl Seeded {
         Parts {
             trust: Box::new(exec),
             runner: Box::new(self.runner()),
-            leases: Box::new(self.leases.clone()),
             owner: Owner {
                 uid: me().uid,
                 gid: me().gid,

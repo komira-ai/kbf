@@ -1,5 +1,5 @@
 //! The process around the socket: exit codes of the flags, the private state directory, and the
-//! serving of a backend on a socket until it is told to stop, on each platform.
+//! serving of a backend on a socket until it is told to stop.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -16,11 +16,9 @@ use serde_json::Value;
 use super::core_tests::{A, Fake, Fx};
 use super::production::{
     LinuxEnv, Place, bound_container, log, main_with, private_dir, run, serve_linux,
-    serve_linux_with, serve_mac, serve_mac_with, serve_with, unix_now,
+    serve_linux_with, serve_with, unix_now,
 };
 use super::serve::ServeConfig;
-use crate::mac::tests::fx::{Fx as MacFx, Sim, mkdir};
-use crate::runner::{Cmd, Exec, Runner};
 use crate::trust::Trust;
 
 fn trust(dir: &Path) -> Trust {
@@ -49,7 +47,7 @@ fn linux_config(socket: &Path, user: &str) -> ServeConfig {
         "--socket-user",
         user,
         "--restart-unit",
-        "kbf-daemon.service",
+        "kbf-storage.service",
     ]))
     .unwrap()
 }
@@ -123,29 +121,14 @@ fn the_clock_is_unix_seconds() {
     assert!(unix_now() > 1_700_000_000);
 }
 
-/// A Linux host needs a unit to restart, a Mac takes none; both say so before anything is
-/// bound or written, and the program runs the side of the platform it is built for.
+/// A host needs a unit to restart, and says so before anything is bound or written.
 #[test]
-fn each_platform_names_what_it_needs_before_it_touches_anything() {
+fn a_host_names_what_it_needs_before_it_touches_anything() {
     let no_units = config(Path::new("/run/kbf/s"), "u");
     assert!(
         serve_linux(&no_units)
             .unwrap_err()
             .contains("--restart-unit is required")
-    );
-    let with_unit = ServeConfig::parse(&words(&[
-        "--socket",
-        "/run/kbf/s",
-        "--socket-user",
-        "u",
-        "--restart-unit",
-        "kbf-daemon.service",
-    ]))
-    .unwrap();
-    assert!(
-        serve_mac(&with_unit)
-            .unwrap_err()
-            .contains("a Mac restarts the daemon's job")
     );
     if cfg!(target_os = "linux") {
         assert!(
@@ -339,95 +322,15 @@ fn a_linux_host_looks_up_the_account_and_makes_its_state_directory() {
         let err = serve_linux(&container).unwrap_err();
         assert!(err.contains("nobody-here has no usable ids"), "{err}");
     }
-    // And a Mac has no container to serve.
-    let err = serve_mac(&container).unwrap_err();
-    assert!(err.contains("--frontend-container"), "{err}");
     let production = LinuxEnv::production();
     assert_eq!(production.passwd, Path::new("/etc/passwd"));
     assert_eq!(production.state_dir, Path::new("/var/lib/kbf-host-install"));
 }
 
-/// A Runner for a tool that cannot be started.
-struct Broken;
-
-impl Runner for Broken {
-    fn run(&self, _cmd: &Cmd) -> std::io::Result<Exec> {
-        Err(std::io::Error::other("cannot start"))
-    }
-}
-
-/// A Mac: the account of the socket is asked of the directory service, the work directory is
-/// made, and the kit is served; a directory service that is not there, an account without
-/// usable ids and a work directory that cannot be made are each an error that says which.
-#[test]
-fn a_mac_asks_the_directory_service_and_makes_its_work_directory() {
-    let mac = MacFx::new("pr-mac");
-    let sim = Rc::new(mac.sim());
-    let run = mac.dir.join("run");
-    mkdir(&run, 0o755);
-    let socket = run.join("host.sock");
-    let stop = Arc::new(AtomicBool::new(false));
-    let client = ask_then_stop(socket.clone(), Arc::clone(&stop));
-    serve_mac_with(
-        &config(&socket, "_kbf"),
-        mac.host.clone(),
-        &*sim,
-        Box::new(Shared(Rc::clone(&sim))),
-        &stop,
-    )
-    .unwrap();
-    let answer: Value = serde_json::from_str(&client.join().unwrap()).unwrap();
-    assert_eq!(answer["node_id"], "mac-a");
-
-    let stopped = AtomicBool::new(true);
-    let err = serve_mac_with(
-        &config(&socket, "_kbf"),
-        mac.host.clone(),
-        &Broken,
-        Box::new(Broken),
-        &stopped,
-    )
-    .unwrap_err();
-    assert!(err.contains("dscl: cannot start"), "{err}");
-    sim.nobody_ids.set(Some((0, 0)));
-    let err = serve_mac_with(
-        &config(&socket, "nobody"),
-        mac.host.clone(),
-        &*sim,
-        Box::new(Shared(Rc::clone(&sim))),
-        &stopped,
-    )
-    .unwrap_err();
-    assert!(err.contains("has no usable ids"), "{err}");
-    // A work directory that is a file.
-    let mut blocked = mac.host.clone();
-    blocked.work = run.join("work-file");
-    fs::write(&blocked.work, "a file").unwrap();
-    let err = serve_mac_with(
-        &config(&socket, "_kbf"),
-        blocked,
-        &*sim,
-        Box::new(Shared(Rc::clone(&sim))),
-        &stopped,
-    )
-    .unwrap_err();
-    assert!(err.contains("work directory"), "{err}");
-}
-
-/// A runner that is the scripted Mac, kept by the test.
-struct Shared(Rc<Sim>);
-
-impl Runner for Shared {
-    fn run(&self, cmd: &Cmd) -> std::io::Result<Exec> {
-        self.0.run(cmd)
-    }
-}
-
 /// Each layout reaches its own backend before anything is bound or written (an account this
-/// host does not have stops all three at the same place), and a Mac, which keeps its releases
-/// in the kit, refuses a package layout.
+/// host does not have stops all three at the same place).
 #[test]
-fn each_layout_reaches_its_backend_and_a_mac_takes_only_its_own() {
+fn each_layout_reaches_its_backend() {
     for layout in ["installer", "deb", "rpm"] {
         let config = ServeConfig::parse(&words(&[
             "--socket",
@@ -437,17 +340,11 @@ fn each_layout_reaches_its_backend_and_a_mac_takes_only_its_own() {
             "--layout",
             layout,
             "--restart-unit",
-            "kbf-daemon.service",
+            "kbf-storage.service",
         ]))
         .unwrap();
         if cfg!(target_os = "linux") {
             assert!(serve_linux(&config).is_err(), "{layout}");
-        }
-        let mac = serve_mac(&config).unwrap_err();
-        if layout == "installer" {
-            assert!(mac.contains("a Mac restarts the daemon's job"), "{mac}");
-        } else {
-            assert!(mac.contains("--layout is for a Linux host"), "{mac}");
         }
     }
 }

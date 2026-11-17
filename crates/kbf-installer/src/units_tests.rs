@@ -1,10 +1,10 @@
-//! The paths the packaged units and the launchd job files run, read against the layout
+//! The paths the packaged units run, read against the layout
 //! (`kbf-setup`'s `layout.rs`) that the installer makes them true with.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::layout::{Layout, Platform};
+use crate::layout::Layout;
 use kbf_host::path::Root;
 
 fn repo_file(rel: &str) -> PathBuf {
@@ -71,12 +71,8 @@ fn every_linux_unit_runs_the_kbf_the_package_installs() {
             }
         }
     }
-    // kbf-daemon, kbf-storage, kbf-storage-and-daemon, kbf-all-in-one: a boot check, a
-    // check and a start each; kbf-frontend: a boot check, a check and a start.
-    assert!(
-        checked >= 15,
-        "only {checked} kbf commands found in {dir:?}"
-    );
+    // kbf-storage and kbf-frontend: a boot check, a check and a start each.
+    assert!(checked >= 6, "only {checked} kbf commands found in {dir:?}");
 }
 
 /// Catches the installer's own unit running a program from the release tree (a
@@ -94,22 +90,6 @@ fn the_installer_unit_runs_the_installed_binary() {
     for (key, program) in progs {
         assert_eq!(program, "/usr/bin/kbf-installer", "{key}");
     }
-}
-
-/// Catches a launchd job file for the installer whose program is outside the macOS
-/// installer tree.
-#[test]
-fn the_macos_job_files_run_programs_under_the_macos_layout() {
-    let layout = Layout::new(Root::host(), Platform::MacOs);
-    let tree = layout.install_root().to_string();
-    let plist = fs::read_to_string(repo_file("packaging/macos/com.komira.kbf-installer.plist"))
-        .expect("plist");
-    let program = plist
-        .split("<string>")
-        .map(|s| s.split("</string>").next().unwrap_or(""))
-        .find(|s| s.starts_with('/'))
-        .expect("a program");
-    assert!(program.starts_with(&format!("{tree}/")), "{program}");
 }
 
 /// Catches the release store's components for a platform not naming the binary that platform

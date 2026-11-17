@@ -7,7 +7,7 @@ use kbf_host::path::Root;
 use kbf_host::testkit::ScratchHost;
 
 use super::*;
-use crate::activate::{self, Arm, Boot, Order};
+use crate::activate::{self, Boot, Order};
 use crate::state::{Locked, State};
 use crate::testkit::{A, B, C, c};
 
@@ -15,7 +15,7 @@ const LOG_DIR: &str = "var/lib/kbf-meta";
 /// What an older binary needs to see in the log to start, and what the new one leaves.
 const OLD: &[u8] = b"machine version 4\n";
 const RAISED: &[u8] = b"machine version 5\n";
-const START: Arm = Arm::FromFirstStart { starts: 3 };
+const START: u32 = 3;
 
 /// A host that runs `A` with `B` installed beside it, on a storage node's `kbf.toml` that names
 /// its metadata log, which holds a record, a segment in a directory and a file only its owner
@@ -100,15 +100,8 @@ impl Rig {
             commit: c(B),
             order_id: "o1".to_owned(),
         };
-        activate::activate(
-            &mut self.exec,
-            &self.layout,
-            &order,
-            START,
-            1_000,
-            &mut Vec::new(),
-        )
-        .expect("activate");
+        activate::activate(&mut self.exec, &self.layout, &order, START, &mut Vec::new())
+            .expect("activate");
     }
 
     fn boot(&mut self, now: u64) -> Boot {
@@ -536,9 +529,9 @@ fn a_log_directory_that_is_gone_is_made_again() {
     );
 }
 
-/// Catches the host's mode deciding whether and where the log is: each mode's `kbf.toml`
-/// gives the directory its node reads, and a file that names none, a path that is no path or
-/// `/` is refused rather than guessed.
+/// Catches the host's mode deciding whether and where the log is: a storage node's `kbf.toml`
+/// gives the directory it reads, the other modes and the names of the modes that were removed
+/// keep none, and a path that is no path or `/` is refused rather than guessed.
 ///
 /// Catches: the default state directory dropped; a mode without a log given one.
 #[test]
@@ -550,15 +543,11 @@ fn the_log_is_where_the_modes_kbf_toml_names_it() {
     };
     let under = |p: &str| rig.exec.root.join(p.trim_start_matches('/'));
     assert_eq!(
-        at("mode = \"all-in-one\"\n[stores]\nmeta-dir = \"/m/a\"\n").expect("ok"),
-        Some(under("/m/a"))
-    );
-    assert_eq!(
         at("mode = \"storage\"\n").expect("ok"),
         Some(under("/var/lib/kbf/meta"))
     );
     assert_eq!(
-        at("mode = \"storage-and-daemon\"\n[dirs]\nstate = \"/srv/kbf/\"\n").expect("ok"),
+        at("mode = \"storage\"\n[dirs]\nstate = \"/srv/kbf/\"\n").expect("ok"),
         Some(under("/srv/kbf/meta"))
     );
     assert_eq!(
@@ -566,11 +555,15 @@ fn the_log_is_where_the_modes_kbf_toml_names_it() {
             .expect("ok"),
         Some(under("/x"))
     );
-    for none in ["mode = \"frontend\"\n", "mode = \"daemon\"\n", "x = 1\n"] {
+    for none in [
+        "mode = \"frontend\"\n",
+        "mode = \"daemon\"\n",
+        "mode = \"all-in-one\"\n[stores]\nmeta-dir = \"/m/a\"\n",
+        "x = 1\n",
+    ] {
         assert_eq!(at(none).expect("ok"), None, "{none}");
     }
     for bad in [
-        "mode = \"all-in-one\"\n",
         "mode = \"storage\"\n[storage]\nmeta_dir = \"relative\"\n",
         "mode = \"storage\"\n[storage]\nmeta_dir = \"/\"\n",
         "not toml [",
@@ -588,7 +581,7 @@ fn the_log_is_where_the_modes_kbf_toml_names_it() {
 #[test]
 fn a_mode_with_no_log_saves_nothing() {
     let mut rig = rig("nolog-mode");
-    rig.kbf_toml("mode = \"daemon\"\n");
+    rig.kbf_toml("mode = \"frontend\"\n");
     assert_eq!(save(&rig.layout, &c(A), &c(B)).expect("save"), Saved::NoLog);
     rig.activate_b();
     assert_eq!(
@@ -614,7 +607,7 @@ fn a_copy_that_cannot_be_read_or_placed_is_refused() {
         Err(MetaLogError::For(_))
     ));
     fs::write(rig.backup(A).join("for"), format!("{B}\n")).expect("for");
-    rig.kbf_toml("mode = \"daemon\"\n");
+    rig.kbf_toml("mode = \"frontend\"\n");
     let why = restore_owed(&rig.layout, &c(A))
         .expect_err("no log named")
         .to_string();

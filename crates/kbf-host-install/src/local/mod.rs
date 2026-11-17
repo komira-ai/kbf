@@ -1,7 +1,7 @@
 //! The local mode: `kbf-host-install --serve`, an update of a host by the account that
 //! owns the socket, without ssh and without the apt package.
 //!
-//! The ssh forced command ([`crate::host`], [`crate::mac`]) is unchanged and is reached the
+//! The ssh forced command ([`crate::host`]) is unchanged and is reached the
 //! same way as before. This is the other door, for `kbf-updater`'s agent mode
 //! (`docs/design/updates.md`, section 4): a unix socket, mode 0600, and the requests
 //! ([`request`]) that make up one host's A/B:
@@ -22,8 +22,7 @@
 //! or the host is still up, and the first tick after a start does the same for a deadline
 //! that passed while the host was down. The platform does the rest ([`backend::Backend`]):
 //! [`linux`] on the layout of `kbf-installer`, [`package`] on the `kbf` package (a Linux
-//! daemon host whose units run `/usr/bin/kbf`; `--layout deb` or `--layout rpm`),
-//! [`mac_backend`] on the kit tree.
+//! host whose units run `/usr/bin/kbf`; `--layout deb` or `--layout rpm`).
 
 pub mod activate_cli;
 pub mod answer;
@@ -50,9 +49,6 @@ pub mod package;
 pub mod package_format;
 #[cfg(target_os = "linux")]
 pub mod package_store;
-// Compiled and tested everywhere, used by the program on a Mac only.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub mod mac_backend;
 
 #[cfg(test)]
 mod activate_cli_tests;
@@ -64,8 +60,6 @@ mod core_activate_tests;
 mod core_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod linux_tests;
-#[cfg(test)]
-mod mac_backend_tests;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod package_tests;
 #[cfg(test)]

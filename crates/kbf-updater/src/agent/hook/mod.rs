@@ -78,11 +78,10 @@ pub enum WorldError {
     /// The certificate cannot be read, holds no certificate, or is no updater's.
     #[error("{0}")]
     Certificate(String),
-    /// The certificate names a role the updater has no duties for, or `--daemon-node` was
-    /// given on a host that is not a frontend's.
+    /// The certificate names a role the updater has no duties for.
     #[error("{0}")]
     Host(String),
-    /// The ports cannot be made: a cordon directory that cannot be written, an operator token
+    /// The ports cannot be made: an operator token
     /// that cannot be read.
     #[error("{0}")]
     Ports(String),

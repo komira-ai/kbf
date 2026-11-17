@@ -1,7 +1,7 @@
 //! What an invocation did, as the one JSON line on stdout and the exit status.
 //!
 //! Every line has a `result` (`installed`, `already_installed`, `restarted`, `query`,
-//! `refused` or `failed`; a Mac also answers `apply_started`).
+//! `refused` or `failed`).
 //!
 //! Exit 0: done (installed, already installed, restarted, or a query answered). Exit 2:
 //! refused, and nothing ran. Exit 3: failed after a step started (or the audit log could
@@ -16,7 +16,7 @@ pub const MAX_DETAIL_LEN: usize = 2048;
 /// Why a request was refused. Nothing ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// Not one of the three forms (on a Mac, not one of its two: it restarts no unit).
+    /// Not one of the three forms.
     BadCommand,
     /// A channel the allowlist does not name.
     ChannelNotAllowed,
@@ -31,12 +31,12 @@ pub enum Refusal {
     /// The source switches signature checking off or weakens it (`trusted`,
     /// `allow-insecure`, `allow-weak`, `allow-downgrade-to-insecure`), even if it names a key.
     ChannelInsecure,
-    /// A Mac's `github` channel: no release asset of the repository starts with the version's
+    /// A `github` channel: no release asset of the repository starts with the version's
     /// 12 hex digits.
     UnknownRelease,
-    /// A Mac's `github` channel: the assets of two different commits start with them.
+    /// A `github` channel: the assets of two different commits start with them.
     AmbiguousRelease,
-    /// A Mac's `github` channel: the release could not be fetched (the network, a time limit,
+    /// A `github` channel: the release could not be fetched (the network, a time limit,
     /// a file over its size limit, an answer that is not a listing). Nothing was staged.
     FetchFailed,
 }
@@ -172,15 +172,6 @@ pub enum Outcome {
     Restarted { unit: String },
     /// `query`.
     Queried(QueryReport),
-    /// A Mac's install is checked and its apply job is launched; the apply goes on by
-    /// itself and `query` reports how it ends. Only a Mac gives this answer.
-    ApplyStarted { version: String, commit: String },
-    /// A Mac's `query`: the same report, and how the last apply stands (`running`, `done`
-    /// or `failed:<reason>`; none when there has been none). Only a Mac gives this answer.
-    MacQueried {
-        report: QueryReport,
-        apply: Option<String>,
-    },
     /// Refused.
     Refused(Refusal),
     /// Refused, and why in words: the answer, the exit status and the audit line are those
@@ -197,9 +188,7 @@ impl Outcome {
             Self::Installed { .. }
             | Self::AlreadyInstalled { .. }
             | Self::Restarted { .. }
-            | Self::Queried(_)
-            | Self::ApplyStarted { .. }
-            | Self::MacQueried { .. } => 0,
+            | Self::Queried(_) => 0,
             Self::Refused(_) | Self::RefusedBecause(..) => 2,
             Self::Failed(_) => 3,
         }
@@ -228,22 +217,6 @@ impl Outcome {
                 running_commit: report.running_commit.as_deref(),
                 node_id: report.node_id.as_deref(),
                 in_progress: report.in_progress,
-            }),
-            Self::ApplyStarted { version, commit } => to_json(&Started {
-                result: "apply_started",
-                version,
-                commit,
-                apply: "running",
-            }),
-            Self::MacQueried { report, apply } => to_json(&MacQueried {
-                query: Queried {
-                    result: "query",
-                    installed_version: report.installed_version.as_deref(),
-                    running_commit: report.running_commit.as_deref(),
-                    node_id: report.node_id.as_deref(),
-                    in_progress: report.in_progress,
-                },
-                apply: apply.as_deref(),
             }),
             Self::Refused(refusal) | Self::RefusedBecause(refusal, _) => to_json(&Reason {
                 result: "refused",
@@ -292,8 +265,7 @@ impl Outcome {
             Self::Installed { .. } => ("installed", None),
             Self::AlreadyInstalled { .. } => ("already_installed", None),
             Self::Restarted { .. } => ("restarted", None),
-            Self::Queried(_) | Self::MacQueried { .. } => ("query", None),
-            Self::ApplyStarted { .. } => ("apply_started", None),
+            Self::Queried(_) => ("query", None),
             Self::Refused(refusal) | Self::RefusedBecause(refusal, _) => {
                 ("refused", Some(refusal.code()))
             }
@@ -338,21 +310,6 @@ struct Queried<'a> {
     running_commit: Option<&'a str>,
     node_id: Option<&'a str>,
     in_progress: bool,
-}
-
-#[derive(Serialize)]
-struct MacQueried<'a> {
-    #[serde(flatten)]
-    query: Queried<'a>,
-    apply: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-struct Started<'a> {
-    result: &'static str,
-    version: &'a str,
-    commit: &'a str,
-    apply: &'static str,
 }
 
 /// A line an install unit printed, as `Outcome::from_unit_line` reads it.

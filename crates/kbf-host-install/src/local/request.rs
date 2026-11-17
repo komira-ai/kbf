@@ -15,7 +15,7 @@
 //! no path, no URL and no unit name: where a release comes from and what is restarted are the
 //! root-owned configuration's.
 
-use crate::mac::release::commit_prefix;
+use crate::release::commit_prefix;
 use crate::request::{BadCommand, Channel, Version};
 
 /// The longest request line, in bytes.

@@ -18,7 +18,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use crate::CommitId;
-use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
+use crate::activate::{self, Activated, Confirmed, Expiry};
 use crate::layout::{self, Layout, Platform};
 use crate::meta_log;
 use crate::release::{self, ReleaseError};
@@ -37,7 +37,6 @@ use self::notice::Notice;
 use self::staged::{Held, refusal_of};
 use crate::database::SchemaStep;
 use crate::helper::fetcher::{Fetcher, InstalledRelease};
-use crate::helper::leases::{self, LeaseSource};
 use crate::helper::memory::{Event, Memory, StagedFacts};
 use crate::helper::order::{self, Claims, Order, Verb};
 use crate::helper::restart::{self, Restart};
@@ -89,7 +88,6 @@ pub struct Helper<E: Exec> {
     /// a host that has no database (a node).
     schema: Option<Box<dyn SchemaStep>>,
     fetcher: Box<dyn Fetcher>,
-    leases: Box<dyn LeaseSource>,
     procs: Box<dyn Procs>,
     /// A swap was confirmed in this pass: the release it replaced may now be collected.
     gc_due: bool,
@@ -108,7 +106,6 @@ impl<E: Exec> Helper<E> {
         exec: E,
         cfg: Config,
         fetcher: Box<dyn Fetcher>,
-        leases: Box<dyn LeaseSource>,
         procs: Box<dyn Procs>,
     ) -> Helper<E> {
         Helper {
@@ -119,7 +116,6 @@ impl<E: Exec> Helper<E> {
             written: Vec::new(),
             schema: None,
             fetcher,
-            leases,
             procs,
             gc_due: false,
             notice: Notice::default(),
@@ -137,18 +133,6 @@ impl<E: Exec> Helper<E> {
     #[cfg(test)]
     pub(crate) fn schema_step_mut(&mut self) -> Option<&mut (dyn SchemaStep + 'static)> {
         self.schema.as_deref_mut()
-    }
-
-    /// The lease source, for a test to see what a caller wired.
-    #[cfg(test)]
-    pub(crate) fn leases(&self) -> &dyn LeaseSource {
-        self.leases.as_ref()
-    }
-
-    /// Replace the lease source, for a test that plays a Mac's.
-    #[cfg(test)]
-    pub(crate) fn set_leases(&mut self, leases: Box<dyn LeaseSource>) {
-        self.leases = leases;
     }
 
     /// The host's executor, for a test to read what was done.
@@ -569,7 +553,7 @@ impl<E: Exec> Helper<E> {
             self.save(memory)?;
         }
         let result = match order.verb {
-            Verb::Activate => self.activate(order, now, memory),
+            Verb::Activate => self.activate(order, memory),
             Verb::Confirm => self.confirm(order, &before),
             Verb::Revert => self.revert(),
             // Taken before this point, by `kind_of`; never carried out as a node verb.
@@ -608,9 +592,9 @@ impl<E: Exec> Helper<E> {
         memory: &mut Memory,
     ) -> Result<(), String> {
         let id = order.id;
-        // A frontend holds no leases, so the lease check below would let this through, and
-        // the swap would restart it: a frontend moves by `frontend_update`, never by this.
-        if let Some(unit) = leases::frontend_unit(&self.cfg.restart) {
+        // A swap would restart the frontend's unit: a frontend moves by `frontend_update`,
+        // never by this.
+        if let Some(unit) = restart::frontend_unit(&self.cfg.restart) {
             return Err(format!(
                 "denied: order {id}: {unit:?} is a frontend's unit; a frontend moves by \
                  frontend_update, and an activate would restart it"
@@ -632,16 +616,6 @@ impl<E: Exec> Helper<E> {
                 "order {id}: {} is on trial and not yet confirmed or reverted; not activating",
                 p.commit
             ));
-        }
-        // The lease check again, from what the installer observes.
-        match self.leases.live_noted() {
-            Ok((0, note)) => {
-                if let Some(note) = note {
-                    let _ = writeln!(self.log, "leases: {note}");
-                }
-            }
-            Ok((n, _)) => return Err(format!("{n} leases are live; not activating")),
-            Err(why) => return Err(format!("cannot tell whether leases are live: {why}")),
         }
         // Already the running release: nothing to fetch, `activate` says so.
         if before.current.as_ref() == Some(&order.commit) {
@@ -695,7 +669,7 @@ impl<E: Exec> Helper<E> {
 
     /// An activation that fetches carries the release's claims, complete and for this host:
     /// fail closed without them. `kbf` is the one component a release of either platform
-    /// carries that an order may name (a Mac is given no `kbf-daemon`).
+    /// carries that an order may name.
     fn vet_claims<'o>(&self, order: &'o Order) -> Result<&'o Claims, String> {
         let id = order.id;
         let Some(claims) = &order.claims else {
@@ -721,19 +695,7 @@ impl<E: Exec> Helper<E> {
         Ok(claims)
     }
 
-    fn arm(&self, order: &Order) -> Arm {
-        match self.host.platform() {
-            Platform::Linux => Arm::FromFirstStart {
-                starts: self.cfg.starts,
-            },
-            Platform::MacOs => Arm::FromActivation {
-                window_secs: u64::from(order.window_s)
-                    .clamp(activate::WINDOW_MIN_SECS, activate::WINDOW_MAX_SECS),
-            },
-        }
-    }
-
-    fn activate(&mut self, order: &Order, now: u64, memory: &Memory) -> Result<Done, String> {
+    fn activate(&mut self, order: &Order, memory: &Memory) -> Result<Done, String> {
         // Before the links move: a release must not start on a schema it cannot run on.
         // The schema is known here only for the release this helper has staged (its own
         // report): the rule is "the staged commit equals the order's". An order for any other
@@ -771,13 +733,11 @@ impl<E: Exec> Helper<E> {
             // under the same id as a pending one would be taken for its repeat.
             order_id: format!("{}-{}", order.epoch, order.id),
         };
-        let arm = self.arm(order);
         match activate::activate(
             &mut self.exec,
             &self.host,
             &ordered,
-            arm,
-            now,
+            self.cfg.starts,
             &mut self.log,
         ) {
             Ok(Activated::Swapped) => Ok(Done {
@@ -916,10 +876,8 @@ impl Done {
 
 /// What a release for this host's platform declares its platform starts with.
 fn platform_prefix(host: &Layout) -> &'static str {
-    match host.platform() {
-        Platform::Linux => "linux-",
-        Platform::MacOs => "darwin-",
-    }
+    let Platform::Linux = host.platform();
+    "linux-"
 }
 
 /// Record a refusal that is no order's (a record that could not be read, a restart that failed,

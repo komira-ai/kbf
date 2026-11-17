@@ -386,7 +386,7 @@ fn a_replaced_binary_is_re_executed_before_the_next_order_is_read() {
 }
 
 /// Catches a `frontend_update` taken on a host that runs no frontend (KI section 6: only a
-/// frontend or all-in-one host accepts it), or moving a floor: the record parses (it is a
+/// frontend host accepts it), or moving a floor: the record parses (it is a
 /// locator: no components, no facts), is refused in status.json with the word `denied`,
 /// changes nothing, is removed, and does not advance the acknowledged id or epoch, so a real
 /// order of a lower id in the same epoch still runs.
@@ -532,8 +532,8 @@ fn vetting_and_acting_refuse_what_parsing_already_refuses() {
 }
 
 /// Catches an activation naming a component set the platform does not take: a Linux host takes
-/// exactly `kbf`; a second component is refused before the fetch, with both names in the
-/// reason.
+/// exactly `kbf`; a second component, one of the names a record of an earlier release may still
+/// carry, is refused before the fetch, with both names in the reason.
 ///
 /// Catches: the set compared as a prefix (an extra component passes).
 #[test]

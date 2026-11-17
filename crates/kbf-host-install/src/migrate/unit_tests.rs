@@ -17,7 +17,7 @@ fn unit(service: &str) -> String {
 fn a_unit_is_read_the_way_systemd_reads_it() {
     let text = format!(
         "[Unit]\nUser=not-this-one\n\n[Service]\n# a comment\nUser=a\nUser=kbf\nGroup=kbf\n\
-         ; another\nExecStart=/bin/false\nExecStart=\nExecStart={R}/current/kbf --mode=daemon \\\n   --server https://frontend.example:8981 \\\n --node-id st1\n\
+         ; another\nExecStart=/bin/false\nExecStart=\nExecStart={R}/current/kbf --mode=storage \\\n   --server https://frontend.example:8981 \\\n --node-id st1\n\
          Environment=A=1\nEnvironment=\nEnvironment=B=2\nEnvironmentFile=-/etc/kbf/env\n\
          WorkingDirectory=/srv\nWorkingDirectory=/var/lib/kbf\nWorkingDirectory=\nWorkingDirectory=/var/lib/kbf\nSupplementaryGroups=a\nSupplementaryGroups=b\n\
          NoSuchThing=1\nthis line has no assignment\n[Install]\nUser=late\n"
@@ -27,7 +27,7 @@ fn a_unit_is_read_the_way_systemd_reads_it() {
     assert_eq!(
         unit.args,
         [
-            "--mode=daemon",
+            "--mode=storage",
             "--server",
             "https://frontend.example:8981",
             "--node-id",
@@ -56,7 +56,7 @@ fn a_unit_is_read_the_way_systemd_reads_it() {
 fn an_emptied_account_is_none() {
     let unit = parse(
         &unit(&format!(
-            "User=kbf\nUser=\nGroup=\nExecStart={R}/abc/kbf --mode=daemon\n"
+            "User=kbf\nUser=\nGroup=\nExecStart={R}/abc/kbf --mode=storage\n"
         )),
         R,
     )
@@ -77,7 +77,7 @@ fn what_would_have_to_be_guessed_is_refused() {
         (&format!("ExecStart=-{R}/current/kbf\n"), "prefix character"),
         (&format!("ExecStart=+{R}/current/kbf\n"), "prefix character"),
         (
-            "ExecStart=/usr/bin/kbf --mode=daemon\n",
+            "ExecStart=/usr/bin/kbf --mode=storage\n",
             "not the kbf of a release",
         ),
         (
@@ -127,9 +127,9 @@ fn what_would_have_to_be_guessed_is_refused() {
 /// A last line that ends with a backslash still counts.
 #[test]
 fn a_dangling_continuation_is_read_as_it_is() {
-    let text = format!("[Service]\nExecStart={R}/current/kbf --mode=daemon \\");
+    let text = format!("[Service]\nExecStart={R}/current/kbf --mode=storage \\");
     let unit = parse(&text, R).unwrap();
-    assert_eq!(unit.args, ["--mode=daemon"]);
+    assert_eq!(unit.args, ["--mode=storage"]);
 }
 
 /// A cold-store URL with a query (`?` and `&`) is one plain word and is read unchanged.
@@ -186,10 +186,10 @@ fn the_mode_is_named_by_the_flag_alone() {
 #[test]
 fn another_mode_is_refused_by_word_and_by_flag() {
     for args in [
-        "daemon --cold-store=x",
-        "--mode=daemon --cold-store=x",
-        "--mode daemon --cold-store=x",
-        "storage --mode=daemon",
+        "frontend --cold-store=x",
+        "--mode=frontend --cold-store=x",
+        "--mode frontend --cold-store=x",
+        "storage --mode=frontend",
         "bogus",
     ] {
         let why = flags_of(args, "storage").unwrap_err();

@@ -20,8 +20,8 @@
 //! once if the deadline passed while it was down.
 //!
 //! `--window-secs` is how long a release on trial has to be confirmed (120 to 1800, default
-//! 600). `--restart-unit` names a unit that runs the release (repeatable; a Linux host
-//! needs one at least, and a Mac restarts the daemon's job). The paths this program reads as
+//! 600). `--restart-unit` names a unit that runs the release (repeatable; a host
+//! needs one at least). The paths this program reads as
 //! root are constants, as they are for the ssh path; no flag moves them. `--frontend-container`
 //! serves a frontend that runs as a container instead of units ([`super::frontend`]); it takes
 //! no `--restart-unit`.
@@ -33,7 +33,7 @@
 //! `--layout` says how a Linux host keeps its releases: `installer` (the default) is the
 //! hand-placed layout of `kbf-installer` (`releases/<commit>` with the links `current` and
 //! `previous`); `deb` and `rpm` are a host whose units run the `kbf` package's `/usr/bin/kbf`,
-//! updated by installing that package ([`super::package`]). A Mac takes none.
+//! updated by installing that package ([`super::package`]).
 //!
 //! Every request but `query` and `revert` is audited, and is not run when the audit log
 //! cannot be opened (an `activate` with them). A revert is never held back by it.
@@ -79,7 +79,7 @@ pub const USAGE: &str = "usage: kbf-host-install --serve --socket PATH --socket-
 /// How a host keeps the releases it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layout {
-    /// The hand-placed layout of `kbf-installer` (a Mac's kit tree is its counterpart).
+    /// The hand-placed layout of `kbf-installer`.
     #[default]
     Installer,
     /// The `kbf` package, as a `.deb`.

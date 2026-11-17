@@ -1,5 +1,5 @@
 //! `kbf-host-install --serve` as a process: the flags, the account, the socket, the backend
-//! of the platform this program runs on, and the loop.
+//! of the host, and the loop.
 //!
 //! The paths this program reads and writes as root are constants here and in the backends;
 //! the serving itself takes them as arguments ([`Place`], [`LinuxEnv`]) so that a test serves
@@ -15,9 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::backend::Backend;
 use super::core::Ab;
 use super::serve::{self, Layout, ServeConfig, Serving};
-use crate::mac::layout::MacHost;
 use crate::pace::Pace;
-use crate::runner::{Runner, SystemRunner};
 use crate::trust::Trust;
 
 /// Root's directory for this program's state on a Linux host.
@@ -62,14 +60,7 @@ pub(super) fn main_with(
     }
 }
 
-/// The platform's serving. (Selected by the target, not by an `if`: the other is compiled and
-/// tested on every platform all the same.)
-#[cfg(target_os = "macos")]
-pub(super) fn run(config: &ServeConfig) -> Result<(), String> {
-    serve_mac(config)
-}
-
-#[cfg(not(target_os = "macos"))]
+/// The serving of the host.
 pub(super) fn run(config: &ServeConfig) -> Result<(), String> {
     serve_linux(config)
 }
@@ -250,56 +241,4 @@ fn serve_linux_for(config: &ServeConfig) -> Result<(), String> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn serve_linux_for(_config: &ServeConfig) -> Result<(), String> {
     Err("this program serves a Linux host on Linux only".to_owned())
-}
-
-/// A Mac: the account of the socket from `dscl` (through `runner`, never root), the work
-/// directory made, then the serving of the kit by `backend_runner`'s tools.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(super) fn serve_mac_with(
-    config: &ServeConfig,
-    host: MacHost,
-    runner: &dyn Runner,
-    backend_runner: Box<dyn Runner>,
-    stop: &AtomicBool,
-) -> Result<(), String> {
-    use crate::mac::tools;
-    if config.layout != Layout::Installer {
-        return Err("--layout is for a Linux host: a Mac keeps its releases in the kit".to_owned());
-    }
-    if !config.units.is_empty() || config.frontend_container {
-        return Err(
-            "--restart-unit and --frontend-container are for a Linux host: a Mac restarts the \
-             daemon's job"
-                .to_owned(),
-        );
-    }
-    let exec = runner
-        .run(&tools::dscl_ids(&config.user, host.tuning.tool))
-        .map_err(|e| format!("dscl: {e}"))?;
-    let who = tools::parse_ids(&exec.stdout_text())
-        .filter(|id| id.uid != 0 && id.gid != 0)
-        .ok_or_else(|| format!("the account {} has no usable ids", config.user))?;
-    crate::mac::ensure_work(&host).map_err(|_| "the work directory is not usable".to_owned())?;
-    let (trust, work, audit) = (host.trust.clone(), host.work.clone(), host.audit.clone());
-    let backend = super::mac_backend::MacBackend::new(host, backend_runner);
-    let place = Place {
-        state_dir: &work,
-        state_name: "state.json",
-        trust: &trust,
-        ids: (who.uid, who.gid),
-        audit: &audit,
-    };
-    serve_with(config, backend, &place, stop)
-}
-
-/// The Mac side as the program runs it.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(super) fn serve_mac(config: &ServeConfig) -> Result<(), String> {
-    serve_mac_with(
-        config,
-        MacHost::production(),
-        &SystemRunner,
-        Box::new(SystemRunner),
-        &AtomicBool::new(false),
-    )
 }

@@ -1,5 +1,5 @@
 //! The installer's state, `state.json` (schema 2) in the state directory
-//! (`/var/lib/kbf-installer` on Linux, `/var/db/kbf-installer` on macOS), the copy of the last
+//! (`/var/lib/kbf-installer`), the copy of the last
 //! good one beside it (`state.json.bak`), and the lock it is changed under.
 //!
 //! The file is one JSON object: a `schema` number ([`SCHEMA`]) and the fields of [`State`]. It
@@ -115,7 +115,7 @@ pub struct PendingConfirm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_mono_s: Option<u64>,
     /// How many starts of the new release are still allowed before it is reverted
-    /// unconfirmed; `None` where nothing counts starts (macOS).
+    /// unconfirmed; `None` before the swap's first start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub starts_left: Option<u32>,
 }

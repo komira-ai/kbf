@@ -8,13 +8,14 @@
 # Put no secret in this file. kbf-server's S3 key pair lives only in the 0600 file
 # --s3-env-file names, outside every repository.
 #
-# The kit's other steps read more keys from the same file: KBF_DAEMON_NODES,
-# KBF_DRIVER, KBF_DAEMON_EXTRA_ARGS, KBF_USER, KBF_ROOT, KBF_LABEL_PREFIX,
-# KBF_MIN_MACOS, KBF_MIN_FREE_GB, MINIO_NAMESPACE, MINIO_SERVICE, MINIO_NODEPORT
-# and KBF_EXIT_TARGET. These two verbs accept them and read none of them.
+# The kit's other steps read more keys from the same file: KBF_USER, KBF_ROOT,
+# KBF_LABEL_PREFIX, KBF_MIN_MACOS, KBF_MIN_FREE_GB, MINIO_NAMESPACE, MINIO_SERVICE,
+# MINIO_NODEPORT and KBF_EXIT_TARGET. These two verbs accept them and read none of them.
+# A file that still sets KBF_DAEMON_NODES, KBF_DRIVER or KBF_DAEMON_EXTRA_ARGS (the
+# retired daemon steps' keys) loads: they are accepted and ignored.
 
 # --- kbf-server (server-install) ---------------------------------------------------
-# The server host's address: what the daemons and the buck2 client dial.
+# The server host's address: what the agents and the buck2 client dial.
 KBF_SERVER_HOST=192.0.2.10
 # The address kbf-server binds; it must be an IPv4 address the interface below
 # carries. Empty: KBF_SERVER_HOST.
@@ -22,7 +23,7 @@ KBF_SERVER_BIND=
 KBF_TAILNET_IFACE=tailscale0
 KBF_REAPI_PORT=8980
 KBF_WORKER_PORT=8981
-# The DNS name in the server certificate (pki/server.pem). Daemons verify it, so it
+# The DNS name in the server certificate (pki/server.pem). Agents verify it, so it
 # need not resolve.
 KBF_TLS_SERVER_NAME=kbf-pilot-server
 # Where the binary, the logs and removed units go. Empty: $HOME/.local/share/kbf-pilot.

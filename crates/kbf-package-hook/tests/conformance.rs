@@ -44,7 +44,7 @@ impl FakeService for FakeHost {
         let mut params = Params::default();
         for (key, value) in [
             ("unit", "kbf-fake.service"),
-            ("mode", "storage-and-daemon"),
+            ("mode", "storage"),
             ("state_dir", "record"),
         ] {
             params.insert(key, Scalar::Text(value.to_owned()));

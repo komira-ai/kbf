@@ -71,10 +71,15 @@ fn order(commit: &str, id: &str, _label: u64) -> Order {
     }
 }
 
-const START: Arm = Arm::FromFirstStart { starts: 3 };
+const START: u32 = 3;
 
-fn go(exec: &mut ScratchHost, layout: &Layout, o: &Order, arm: Arm) -> Result<Activated, String> {
-    activate(exec, layout, o, arm, 1_000, &mut Vec::new()).map_err(|e| e.to_string())
+fn go(
+    exec: &mut ScratchHost,
+    layout: &Layout,
+    o: &Order,
+    starts: u32,
+) -> Result<Activated, String> {
+    activate(exec, layout, o, starts, &mut Vec::new()).map_err(|e| e.to_string())
 }
 
 fn state_of(layout: &Layout) -> State {
@@ -454,9 +459,8 @@ fn a_revert_whose_previous_release_is_gone_changes_nothing() {
 fn the_window_starts_at_the_first_start_and_a_crash_loop_runs_out_of_starts() {
     let (mut exec, layout) = host("boot");
     running(&exec, &layout, A, &[B]);
-    let arm = Arm::FromFirstStart { starts: 2 };
     assert_eq!(
-        go(&mut exec, &layout, &order(B, "o1", 5), arm),
+        go(&mut exec, &layout, &order(B, "o1", 5), 2),
         Ok(Activated::Swapped)
     );
 
@@ -509,12 +513,7 @@ fn a_start_after_the_deadline_reverts_and_one_before_it_does_not() {
     let (mut exec, layout) = host("boot-late");
     running(&exec, &layout, A, &[B]);
     assert_eq!(
-        go(
-            &mut exec,
-            &layout,
-            &order(B, "o1", 5),
-            Arm::FromFirstStart { starts: 9 }
-        ),
+        go(&mut exec, &layout, &order(B, "o1", 5), 9),
         Ok(Activated::Swapped)
     );
     assert_eq!(
@@ -539,8 +538,8 @@ fn a_start_after_the_deadline_reverts_and_one_before_it_does_not() {
     );
 }
 
-/// Catches a swap that is never reverted when nobody confirms it (macOS: the timer is
-/// the only trigger), one reverted a second early, one confirmed in time that is
+/// Catches a swap that is never reverted when nobody confirms it (the window started by the
+/// first start is the trigger), one reverted a second early, one confirmed in time that is
 /// reverted anyway, and a revert that happens at the exact second as a wait.
 ///
 /// Catches: `now < deadline` written `now <= deadline`; the confirm not
@@ -549,11 +548,11 @@ fn a_start_after_the_deadline_reverts_and_one_before_it_does_not() {
 fn a_swap_not_confirmed_within_its_window_is_reverted() {
     let (mut exec, layout) = host("expire");
     running(&exec, &layout, A, &[B, C]);
-    let arm = Arm::FromActivation { window_secs: 300 };
     assert_eq!(
-        go(&mut exec, &layout, &order(B, "o1", 5), arm),
+        go(&mut exec, &layout, &order(B, "o1", 5), START),
         Ok(Activated::Swapped)
     );
+    boot_check(&mut exec, &layout, 1_000, 300, &mut Vec::new()).expect("first start");
     assert_eq!(
         state_of(&layout).pending_confirm.expect("p").deadline_wall,
         Some(1_300)
@@ -578,9 +577,10 @@ fn a_swap_not_confirmed_within_its_window_is_reverted() {
     // Confirmed in time: a later expiry finds nothing.
     seed(&exec, C, 1_002);
     assert_eq!(
-        go(&mut exec, &layout, &order(C, "o2", 6), arm),
+        go(&mut exec, &layout, &order(C, "o2", 6), START),
         Ok(Activated::Swapped)
     );
+    boot_check(&mut exec, &layout, 1_000, 300, &mut Vec::new()).expect("first start");
     confirm(&layout, "o2", &c(C)).expect("kept");
     assert_eq!(
         expire(&mut exec, &layout, 99_999, &mut out).expect("e"),
@@ -589,45 +589,33 @@ fn a_swap_not_confirmed_within_its_window_is_reverted() {
     assert_eq!(link(&exec, "current"), at(C));
 }
 
-/// Catches a window the order (or a hostile frontend) can set to a year or to nothing:
-/// the host's bounds are enforced at both places a window is taken, inclusive.
+/// Catches a window the operator's flag can set to a year or to nothing: the host's bounds are
+/// enforced where a window is taken, inclusive.
 ///
 /// Catches: either bound moved by one; the check missing from `boot_check`.
 #[test]
 fn a_window_outside_the_hosts_bounds_is_refused() {
     let (mut exec, layout) = host("bounds");
     running(&exec, &layout, A, &[B]);
+    assert_eq!(
+        go(&mut exec, &layout, &order(B, "o1", 5), START),
+        Ok(Activated::Swapped)
+    );
     for secs in [WINDOW_MIN_SECS - 1, WINDOW_MAX_SECS + 1, 0, 31_536_000] {
-        let err = go(
-            &mut exec,
-            &layout,
-            &order(B, "o1", 5),
-            Arm::FromActivation { window_secs: secs },
-        )
-        .expect_err("window");
-        assert!(
-            err.contains(&format!("window of {secs} s is outside")),
-            "{err}"
-        );
         let err = boot_check(&mut exec, &layout, 1, secs, &mut Vec::new()).expect_err("window");
         assert!(
             err.to_string().contains(&format!("window of {secs} s")),
             "{err}"
         );
     }
-    assert_eq!(link_steps(&exec), 0);
     for secs in [WINDOW_MIN_SECS, WINDOW_MAX_SECS] {
         let (mut exec, layout) = host(&format!("bounds-{secs}"));
         running(&exec, &layout, A, &[B]);
         assert_eq!(
-            go(
-                &mut exec,
-                &layout,
-                &order(B, "o1", 5),
-                Arm::FromActivation { window_secs: secs }
-            ),
+            go(&mut exec, &layout, &order(B, "o1", 5), START),
             Ok(Activated::Swapped)
         );
+        boot_check(&mut exec, &layout, 1_000, secs, &mut Vec::new()).expect("a window in bounds");
     }
 }
 
@@ -655,7 +643,6 @@ fn a_host_killed_between_any_two_steps_of_a_swap_or_a_revert_converges() {
             &layout,
             &o,
             START,
-            1_000,
             &mut Vec::new(),
         );
         if kill_after < 2 {

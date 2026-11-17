@@ -46,13 +46,6 @@ pub enum Refusal {
         found: BinaryKind,
         want: BinaryKind,
     },
-    #[error("inbox file {name:?} carries the quarantine attribute")]
-    Quarantined { name: String },
-    #[error("{component}: its code signature is refused: {fault}")]
-    BadSignature {
-        component: String,
-        fault: SignatureFault,
-    },
     #[error("{component}: its version check is refused: {fault}")]
     Version {
         component: String,
@@ -81,9 +74,6 @@ pub enum Refusal {
     /// The release is below a floor the operator set.
     #[error("{component}: the release is below the operator's floor: {what}")]
     Floor { component: String, what: String },
-    /// Work is running on this host, or the installer cannot tell.
-    #[error("not activating: {0}")]
-    Lease(String),
     /// The commit's release directory is there, with other bytes: it is never replaced.
     #[error("{path} differs from the release being staged: a release is never replaced")]
     Differs { path: String },
@@ -114,15 +104,12 @@ impl Refusal {
             Refusal::NotAttested { .. } => "not-attested",
             Refusal::Archive { fault, .. } => fault.code(),
             Refusal::WrongPlatform { .. } => "wrong-platform",
-            Refusal::Quarantined { .. } => "quarantined",
-            Refusal::BadSignature { fault, .. } => fault.code(),
             Refusal::Version { fault, .. } => fault.code(),
             Refusal::Size { .. } => "size-mismatch",
             Refusal::Components(_) => "components",
             Refusal::Facts { fault, .. } => fault.code(),
             Refusal::InstallerTooOld { .. } => "installer-too-old",
             Refusal::Floor { .. } => "below-floor",
-            Refusal::Lease(_) => "lease-live",
             Refusal::Differs { .. } => "release-differs",
             Refusal::Install(_) => "install-failed",
             Refusal::Tool { .. } => "tool-failed",
@@ -135,13 +122,13 @@ impl Refusal {
 impl Refusal {
     /// The stable word of the contract's refusal list (docs/design/kbf-installer.md,
     /// section 5: `trust_chain`, `hash`, `attestation`, `commit_or_ref`, `facts`,
-    /// `installer_too_old`, `platform`, `size`, `fetch`, `floor`, `lease`, ...) this
+    /// `installer_too_old`, `platform`, `size`, `fetch`, `floor`, ...) this
     /// refusal is reported as in `status.json`; the exit status is 3. `None` is a failure
     /// that is not a verdict on the release (a tool that would not start, a scratch
     /// directory that could not be made): exit 1.
     ///
-    /// The contract names no word for a release whose archive or code signature is
-    /// refused; those are `shape`, which the contract should list.
+    /// The contract names no word for a release whose archive is refused; that is `shape`,
+    /// which the contract should list.
     pub fn word(&self) -> Option<&'static str> {
         Some(match self {
             Refusal::Untrusted { .. } => "trust_chain",
@@ -152,9 +139,7 @@ impl Refusal {
                 ..
             }
             | Refusal::Size { .. } => "size",
-            Refusal::Archive { .. }
-            | Refusal::Quarantined { .. }
-            | Refusal::BadSignature { .. } => "shape",
+            Refusal::Archive { .. } => "shape",
             Refusal::WrongPlatform { .. } => "platform",
             Refusal::Version {
                 fault: VersionFault::Commit { .. },
@@ -164,7 +149,6 @@ impl Refusal {
             Refusal::Components(_) => "fetch",
             Refusal::InstallerTooOld { .. } => "installer_too_old",
             Refusal::Floor { .. } => "floor",
-            Refusal::Lease(_) => "lease",
             Refusal::TimedOut { what } => match *what {
                 WHAT_GH => "attestation",
                 WHAT_PROBE => "facts",
@@ -351,24 +335,6 @@ impl ArchiveFault {
             ArchiveFault::Oversize { .. } => "archive-oversize",
             ArchiveFault::TrailingData => "archive-trailing",
             ArchiveFault::TimedOut => "archive-timeout",
-        }
-    }
-}
-
-/// Why a macOS binary's code signature is refused.
-#[derive(Debug, thiserror::Error)]
-pub enum SignatureFault {
-    #[error("`codesign --verify --strict` does not accept it")]
-    NotValid,
-    #[error("its code directory flags are {found:?}, not \"adhoc,runtime\"")]
-    Flags { found: String },
-}
-
-impl SignatureFault {
-    pub fn code(&self) -> &'static str {
-        match self {
-            SignatureFault::NotValid => "signature-invalid",
-            SignatureFault::Flags { .. } => "signature-flags",
         }
     }
 }

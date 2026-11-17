@@ -387,7 +387,7 @@ pub fn restore(
     let epoch = execute(&lock, src, &plan)?;
     let _ = writeln!(
         out,
-        "restored {} (store epoch {epoch}); for the daemons to drop the leases the lost \
+        "restored {} (store epoch {epoch}); for the workers to drop the leases the lost \
          history granted, start the frontend, run `kbf cluster epoch-bump` and restart it",
         db.display()
     );

@@ -221,8 +221,18 @@ pub fn coordinator(
     (addr, handle)
 }
 
-/// The frontend's operator API on loopback: checks the bearer token, keeps the node's placement,
-/// and says what the roll mode's adapters read.
+/// What the frontend says of the enrolled nodes: node `n1` advertises `192.0.2.1:8982`.
+const ENROLLED: &str = r#"{"nodes":[{"id":"n1","advertise":"192.0.2.1:8982"}]}"#;
+
+/// The storage members: the member at that address is active on the commit of [`VB`].
+const MEMBERS: &str = r#"{"members":[{"id":1,"addr":"192.0.2.1:8982","state":"active","build_commit":"bbbbbbbbbbbb"}]}"#;
+
+/// The node's own view of its storage: its member active on the commit of [`VB`], nothing owed.
+const STORAGE_HEALTH: &str = r#"{"node":"n1","half":"member","member":{"id":1,"state":"active","build_commit":"bbbbbbbbbbbb"},"storage":{"members_active":1,"under_replicated_blobs":0}}"#;
+
+/// The frontend's operator API on loopback: checks the bearer token and says what the roll
+/// mode's storage health reads: the enrollment registry and the storage members. Each read of
+/// the members is an event, `api:members`.
 pub fn operator_api(
     events: &Events,
     stop: &Arc<std::sync::atomic::AtomicBool>,
@@ -232,7 +242,6 @@ pub fn operator_api(
     let addr = listener.local_addr().unwrap();
     let (events, stop) = (events.clone(), Arc::clone(stop));
     let handle = std::thread::spawn(move || {
-        let mut placement = "serving";
         while !stop.load(std::sync::atomic::Ordering::SeqCst) {
             let Ok((tcp, _)) = listener.accept() else {
                 std::thread::sleep(Duration::from_millis(5));
@@ -272,22 +281,11 @@ pub fn operator_api(
                 .to_owned();
             let (status, text) = if !authorized {
                 (401, "{}".to_owned())
-            } else if method == "POST" && target == "/v1/nodes/n1:drain" {
-                events.push("api:drain");
-                placement = "drained";
-                (200, "{}".to_owned())
-            } else if method == "POST" && target == "/v1/nodes/n1:uncordon" {
-                events.push("api:uncordon");
-                placement = "serving";
-                (200, "{}".to_owned())
-            } else if method == "GET" && target == "/v1/nodes/n1" {
-                events.push(format!("api:node {placement}"));
-                (
-                    200,
-                    format!(
-                        r#"{{"connected":true,"placement":{{"state":"{placement}"}},"leases":[]}}"#
-                    ),
-                )
+            } else if method == "GET" && target == "/v1/enroll/nodes" {
+                (200, ENROLLED.to_owned())
+            } else if method == "GET" && target == "/v1/members" {
+                events.push("api:members");
+                (200, MEMBERS.to_owned())
             } else {
                 (404, "{}".to_owned())
             };
@@ -306,8 +304,8 @@ pub fn operator_api(
 
 /// The frontend's worker listener as an updater meets it: mutual TLS with the farm's frontend
 /// certificate, and the node calls of node `n1` (and no other) answered as the real frontend
-/// answers them, with the node's placement kept. Each call is an event: `api:drain`,
-/// `api:uncordon`, `api:node <placement>`, `api:client <node id of the client certificate>`
+/// answers them. Each call is an event: `api:storage-health`, `api:client <node id of the client
+/// certificate>`
 /// before it, and `api:credential` if the request carried an `Authorization` header.
 pub fn frontend_worker(
     pki: &Pki,
@@ -349,7 +347,6 @@ pub fn frontend_worker(
     let addr = listener.local_addr().unwrap();
     let (events, stop) = (events.clone(), Arc::clone(stop));
     let handle = std::thread::spawn(move || {
-        let mut placement = "serving";
         while !stop.load(std::sync::atomic::Ordering::SeqCst) {
             let Ok((tcp, _)) = listener.accept() else {
                 std::thread::sleep(Duration::from_millis(5));
@@ -396,22 +393,9 @@ pub fn frontend_worker(
             let (method, target) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
             let (status, text) = if who != "n1" {
                 (403, "{}".to_owned())
-            } else if method == "POST" && target == "/v1/nodes/n1:drain" {
-                events.push("api:drain");
-                placement = "drained";
-                (200, "{}".to_owned())
-            } else if method == "POST" && target == "/v1/nodes/n1:uncordon" {
-                events.push("api:uncordon");
-                placement = "serving";
-                (200, "{}".to_owned())
-            } else if method == "GET" && target == "/v1/nodes/n1" {
-                events.push(format!("api:node {placement}"));
-                (
-                    200,
-                    format!(
-                        r#"{{"connected":true,"placement":{{"state":"{placement}"}},"leases":[]}}"#
-                    ),
-                )
+            } else if method == "GET" && target == "/v1/nodes/n1/storage-health" {
+                events.push("api:storage-health");
+                (200, STORAGE_HEALTH.to_owned())
             } else {
                 (403, "{}".to_owned())
             };

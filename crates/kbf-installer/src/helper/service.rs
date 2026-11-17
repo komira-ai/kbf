@@ -3,25 +3,19 @@
 //!
 //! Two decisions rest on it. A confirm is accepted only if the new release is what runs
 //! ([`accept_confirm`]): the unit is active, its main process's executable is inside the
-//! pending release's directory, and (Linux) the first boot check has run. And `gc` never
+//! pending release's directory, and the first boot check has run. And `gc` never
 //! removes a release a process executes from ([`in_use`]). Neither is taken from a record.
 
 use std::collections::BTreeSet;
-use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use kbf_host::{Cmd, Exec, HostPath};
 
 use crate::CommitId;
 use crate::helper::restart::Restart;
-use crate::layout::{Layout, Platform};
-use crate::run::{Runner, Spawn, SystemRunner};
+use crate::layout::Layout;
 use crate::state::PendingConfirm;
-
-/// How long a `ps` may take.
-const PS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Executables of the processes on the host.
 pub trait Procs {
@@ -31,84 +25,29 @@ pub trait Procs {
     fn executables(&self) -> io::Result<Vec<PathBuf>>;
 }
 
-/// The real host: `/proc` on Linux, `ps` on macOS.
-pub struct HostProcs {
-    platform: Platform,
-    runner: Box<dyn Runner>,
-}
-
-impl HostProcs {
-    pub fn new(platform: Platform) -> HostProcs {
-        HostProcs::with_runner(platform, Box::new(SystemRunner))
-    }
-
-    pub fn with_runner(platform: Platform, runner: Box<dyn Runner>) -> HostProcs {
-        HostProcs { platform, runner }
-    }
-}
+/// The real host: `/proc`.
+pub struct HostProcs;
 
 impl Procs for HostProcs {
     fn exe_of(&self, pid: u32) -> io::Result<PathBuf> {
-        match self.platform {
-            Platform::Linux => std::fs::read_link(format!("/proc/{pid}/exe")),
-            Platform::MacOs => {
-                let out = ps(&*self.runner, &["-p", &pid.to_string(), "-o", "comm="])?;
-                parse_ps(&out)
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such process"))
-            }
-        }
+        std::fs::read_link(format!("/proc/{pid}/exe"))
     }
 
     fn executables(&self) -> io::Result<Vec<PathBuf>> {
-        match self.platform {
-            Platform::Linux => {
-                let mut found = Vec::new();
-                for entry in std::fs::read_dir("/proc")? {
-                    let name = entry?.file_name();
-                    if name.to_str().is_none_or(|n| n.parse::<u32>().is_err()) {
-                        continue;
-                    }
-                    // A process that exited meanwhile, or whose link root cannot read,
-                    // has no executable to protect.
-                    if let Ok(exe) = std::fs::read_link(Path::new("/proc").join(&name).join("exe"))
-                    {
-                        found.push(exe);
-                    }
-                }
-                Ok(found)
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc")? {
+            let name = entry?.file_name();
+            if name.to_str().is_none_or(|n| n.parse::<u32>().is_err()) {
+                continue;
             }
-            Platform::MacOs => Ok(parse_ps(&ps(&*self.runner, &["-ax", "-o", "comm="])?)),
+            // A process that exited meanwhile, or whose link root cannot read, has no
+            // executable to protect.
+            if let Ok(exe) = std::fs::read_link(Path::new("/proc").join(&name).join("exe")) {
+                found.push(exe);
+            }
         }
+        Ok(found)
     }
-}
-
-fn ps(runner: &dyn Runner, args: &[&str]) -> io::Result<Vec<u8>> {
-    let spawn = Spawn {
-        program: PathBuf::from("/bin/ps"),
-        args: args.iter().map(OsString::from).collect(),
-        env: Vec::new(),
-        cwd: PathBuf::from("/"),
-        run_as: None,
-        timeout: PS_TIMEOUT,
-    };
-    let ran = runner.run(&spawn)?;
-    if ran.code != Some(0) || ran.timed_out {
-        return Err(io::Error::other("ps failed"));
-    }
-    Ok(ran.stdout)
-}
-
-/// The absolute paths among the lines `ps -o comm=` printed (a name that is not a path is a
-/// kernel thread or a process whose path is hidden).
-pub fn parse_ps(out: &[u8]) -> Vec<PathBuf> {
-    String::from_utf8_lossy(out)
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with('/'))
-        .map(PathBuf::from)
-        .collect()
 }
 
 fn query<E: Exec>(exec: &E, program: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -118,56 +57,36 @@ fn query<E: Exec>(exec: &E, program: &str, args: &[&str]) -> Result<std::process
         .map_err(|e| format!("cannot ask the service manager: {e}"))
 }
 
-/// The main process of the service, if the unit is active (Linux) or the job is running
-/// (macOS); otherwise why not.
+/// The main process of the service, if the unit is active; otherwise why not.
 pub fn main_pid<E: Exec>(exec: &E, restart: &Restart) -> Result<u32, String> {
-    match restart {
-        Restart::Systemd(unit) => {
-            let out = query(
-                exec,
-                "/usr/bin/systemctl",
-                &[
-                    "show",
-                    "--property=ActiveState",
-                    "--property=MainPID",
-                    "--",
-                    unit,
-                ],
-            )?;
-            if !out.status.success() {
-                return Err(format!("systemctl cannot show {unit}"));
-            }
-            let text = String::from_utf8_lossy(&out.stdout);
-            let field = |key: &str| {
-                text.lines()
-                    .find_map(|l| l.strip_prefix(key))
-                    .map(str::trim)
-            };
-            match (field("ActiveState="), field("MainPID=")) {
-                (Some("active"), Some(pid)) => match pid.parse::<u32>() {
-                    Ok(0) | Err(_) => Err(format!("{unit} is active and has no main process")),
-                    Ok(pid) => Ok(pid),
-                },
-                (Some(state), _) => Err(format!("{unit} is {state}, not active")),
-                (None, _) => Err(format!("systemctl did not say whether {unit} is active")),
-            }
-        }
-        Restart::Launchd(label) => {
-            let out = query(
-                exec,
-                "/bin/launchctl",
-                &["print", &format!("system/{label}")],
-            )?;
-            if !out.status.success() {
-                return Err(format!("{label} is not loaded"));
-            }
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("pid = "))
-                .and_then(|p| p.trim().parse::<u32>().ok())
-                .filter(|p| *p != 0)
-                .ok_or_else(|| format!("{label} is loaded and not running"))
-        }
+    let Restart::Systemd(unit) = restart;
+    let out = query(
+        exec,
+        "/usr/bin/systemctl",
+        &[
+            "show",
+            "--property=ActiveState",
+            "--property=MainPID",
+            "--",
+            unit,
+        ],
+    )?;
+    if !out.status.success() {
+        return Err(format!("systemctl cannot show {unit}"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(str::trim)
+    };
+    match (field("ActiveState="), field("MainPID=")) {
+        (Some("active"), Some(pid)) => match pid.parse::<u32>() {
+            Ok(0) | Err(_) => Err(format!("{unit} is active and has no main process")),
+            Ok(pid) => Ok(pid),
+        },
+        (Some(state), _) => Err(format!("{unit} is {state}, not active")),
+        (None, _) => Err(format!("systemctl did not say whether {unit} is active")),
     }
 }
 
@@ -187,9 +106,8 @@ fn inside(exe: &Path, dir: &Path) -> bool {
     !deleted && resolved(exe).starts_with(resolved(dir))
 }
 
-/// The checks a confirm passes: the first boot check has run (Linux; macOS arms at the
-/// swap and has no boot check), the unit is active, and the executable of its main process
-/// is inside the pending release's directory.
+/// The checks a confirm passes: the first boot check has run, the unit is active, and the
+/// executable of its main process is inside the pending release's directory.
 pub fn accept_confirm<E: Exec>(
     exec: &E,
     procs: &dyn Procs,
@@ -197,7 +115,7 @@ pub fn accept_confirm<E: Exec>(
     restart: &Restart,
     pending: &PendingConfirm,
 ) -> Result<(), String> {
-    if host.platform() == Platform::Linux && pending.deadline_wall.is_none() {
+    if pending.deadline_wall.is_none() {
         return Err(format!(
             "{} has not been started since the swap: the first boot check has not run",
             pending.commit
@@ -233,7 +151,7 @@ pub fn in_use(procs: &dyn Procs, host: &Layout) -> io::Result<BTreeSet<CommitId>
         .collect())
 }
 
-/// Test doubles: a service manager that answers `systemctl show` and `launchctl print`
+/// Test doubles: a service manager that answers `systemctl show`
 /// as the test sets it and records every question, and a table of process executables.
 #[cfg(test)]
 pub(crate) mod fake {
@@ -255,8 +173,6 @@ pub(crate) mod fake {
         pub exes: Vec<(u32, PathBuf)>,
         /// Every command asked, as `program arg arg`.
         pub asked: Vec<String>,
-        /// The job is loaded (launchd).
-        pub loaded: bool,
         /// `executables` cannot be told.
         pub blind: bool,
     }
@@ -275,7 +191,6 @@ pub(crate) mod fake {
                 w.active = "active".to_owned();
                 w.main_pid = pid;
                 w.exes = vec![(pid, exe)];
-                w.loaded = true;
             }
             r
         }
@@ -284,8 +199,7 @@ pub(crate) mod fake {
             self.0.borrow().asked.clone()
         }
 
-        /// The host's command answers: `systemctl show` and `launchctl print`; anything
-        /// else (a restart) exits 0.
+        /// The host's command answers: `systemctl show`; anything else (a restart) exits 0.
         pub fn answer(&self) -> Answer {
             let world = self.0.clone();
             Box::new(move |cmd| {
@@ -297,23 +211,6 @@ pub(crate) mod fake {
                 {
                     let text = format!("ActiveState={}\nMainPID={}\n", w.active, w.main_pid);
                     return Ok(reply(0, &text, ""));
-                }
-                if cmd.program.as_str().ends_with("launchctl")
-                    && cmd.args.first().map(String::as_str) == Some("print")
-                {
-                    if !w.loaded {
-                        return Ok(reply(113, "", "not found"));
-                    }
-                    let pid = if w.main_pid == 0 {
-                        String::new()
-                    } else {
-                        format!("\tpid = {}\n", w.main_pid)
-                    };
-                    return Ok(reply(
-                        0,
-                        &format!("system/x = {{\n\tstate = running\n{pid}}}\n"),
-                        "",
-                    ));
                 }
                 Ok(reply(0, "", ""))
             })

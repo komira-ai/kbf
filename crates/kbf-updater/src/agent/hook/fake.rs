@@ -321,12 +321,12 @@ pub(super) fn own_flags(args: &[String]) -> Result<(Own, &[String]), OwnError> {
     Ok((Own { world, faults }, &args[at..]))
 }
 
-/// The host this program plays: node `n1`, a daemon's.
+/// The host this program plays: the storage node `n1`.
 pub(super) fn host() -> Host {
     Host {
         alias: "n1".to_owned(),
         address: "localhost".to_owned(),
-        role: Role::Daemon,
+        role: Role::Storage,
         host_key: String::new(),
         node_id: Some("n1".to_owned()),
         member: None,

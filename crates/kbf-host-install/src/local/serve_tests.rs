@@ -89,7 +89,7 @@ fn the_flags_make_one_config_and_refuse_the_rest() {
         "--window-secs",
         "300",
         "--restart-unit",
-        "kbf-daemon.service",
+        "kbf-storage.service",
         "--restart-unit=kbf-frontend@a.service",
     ]))
     .unwrap();
@@ -97,7 +97,7 @@ fn the_flags_make_one_config_and_refuse_the_rest() {
     assert_eq!(config.user, "kbf-updater");
     assert_eq!(config.window_secs, 300);
     let units: Vec<_> = config.units.iter().map(|u| u.as_str()).collect();
-    assert_eq!(units, ["kbf-daemon.service", "kbf-frontend@a.service"]);
+    assert_eq!(units, ["kbf-storage.service", "kbf-frontend@a.service"]);
 
     let minimal = ServeConfig::parse(&args(&["--socket", "/s", "--socket-user", "u"])).unwrap();
     assert_eq!((minimal.window_secs, minimal.units.len()), (600, 0));
@@ -700,11 +700,11 @@ fn the_frontend_container_flag_stands_for_the_units() {
         &[
             "--frontend-container",
             "--restart-unit",
-            "kbf-daemon.service",
+            "kbf-storage.service",
         ],
         &[
             "--restart-unit",
-            "kbf-daemon.service",
+            "kbf-storage.service",
             "--frontend-container",
         ],
         &["--frontend-container", "--layout", "deb"],
@@ -774,7 +774,7 @@ fn the_frontend_config_flag_names_the_file() {
         "--socket-user",
         "u",
         "--restart-unit",
-        "kbf-daemon.service",
+        "kbf-storage.service",
         "--frontend-config=/a",
     ]));
     assert!(units.unwrap_err().contains("needs --frontend-container"));

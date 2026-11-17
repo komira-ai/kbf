@@ -45,7 +45,9 @@ pub enum OrderVerb {
     FrontendUpdate,
 }
 
-/// The platforms a release is built for.
+/// The platforms a release is built for. `darwin-arm64` stays: an order record another release
+/// wrote may name it, and the reader still parses it (the host then refuses it as another
+/// platform's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TargetPlatform {
     #[serde(rename = "linux-x86_64")]

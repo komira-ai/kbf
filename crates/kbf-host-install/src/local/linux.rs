@@ -7,7 +7,7 @@
 //! has one layout and one state file whoever moved it:
 //!
 //! - **stage**: the release the version names is listed on GitHub and downloaded as the
-//!   installer's unprivileged user ([`crate::mac::fetch`], the same code as a Mac's); root
+//!   installer's unprivileged user ([`crate::fetch`]); root
 //!   copies the two files once, by descriptor, into the installer's scratch and runs the
 //!   installer's verify pipeline over the copy ([`kbf_installer::stage::Pipeline`]): size,
 //!   digest, `gh attestation verify` offline (signer `komira-ai/kbf` `artifacts.yml`, hosted
@@ -24,8 +24,8 @@
 //!   current, the one that ran `previous` and nothing on trial, then moves the links; the units
 //!   are restarted on it, and nothing goes back if they do not come up.
 //!
-//! The channels are named in `/etc/kbf/host-install-releases.toml`, in the format of a Mac's
-//! allowlist ([`crate::mac::channel`]); the ssh forced command's `host-install.toml` is the
+//! The channels are named in `/etc/kbf/host-install-releases.toml`, in the format of the
+//! allowlist of [`crate::channel`]; the ssh forced command's `host-install.toml` is the
 //! apt channels' and is not read.
 
 use std::cell::RefCell;
@@ -39,9 +39,8 @@ use kbf_host::exec::Exec;
 use kbf_host::path::Root;
 use kbf_host::plan::Mode;
 use kbf_host::step::Owner;
-use kbf_installer::activate::{self, Activated, Arm};
+use kbf_installer::activate::{self, Activated};
 use kbf_installer::attest::{GhCheck, Signer};
-use kbf_installer::helper::leases::LeaseSource;
 use kbf_installer::helper::service::{self, HostProcs, Procs};
 use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::refusal::Refusal as InstallerRefusal;
@@ -59,18 +58,22 @@ use sha2::{Digest, Sha256};
 
 use super::backend::{Backend, Fault, Pending};
 use super::units::restart_and_wait;
+use crate::channel::{Allowlist, ChannelError, Source};
+use crate::fetch::{AssetKind, FetchError, Fetcher, Limits};
 use crate::host::Host;
-use crate::mac::channel::{ChannelError, MacAllowlist, Source};
-use crate::mac::fetch::{AssetKind, FetchError, Fetcher, Limits};
-use crate::mac::release::Origin;
-use crate::mac::stage::read_token;
 use crate::outcome::Refusal;
 use crate::plan::Wait;
+use crate::release::Origin;
 use crate::request::{Channel, Unit, Version};
 use crate::runner::{Identity, Runner};
+use crate::token::read_token;
 use crate::trust::{Trust, nofollow};
 
 use super::answer::Code;
+
+/// The starts a release on trial gets before the installer's boot check reverts it: the
+/// installer's own default.
+const TRIAL_STARTS: u32 = 3;
 
 /// The channels of the local socket on a Linux host.
 pub const ALLOWLIST: &str = "/etc/kbf/host-install-releases.toml";
@@ -105,16 +108,6 @@ impl Tools {
             tarball_max: TARBALL_MAX,
             image_max: IMAGE_MAX,
         }
-    }
-}
-
-/// No lease is waited for: a stage of the update path moves no link and the updater has
-/// drained the node before it switches.
-pub(super) struct NoLeases;
-
-impl LeaseSource for NoLeases {
-    fn live(&self) -> Result<usize, String> {
-        Ok(0)
     }
 }
 
@@ -241,6 +234,22 @@ pub(crate) fn signed_by(mut settings: Settings, origin: &Origin) -> Settings {
 }
 
 impl<E: Exec> Linux<E> {
+    /// Start the window of the swap on trial at the swap: the confirm is due at `deadline`
+    /// (Unix seconds), whatever the number of starts of the release. The installer's own
+    /// activation starts the window at the release's first start; the update of this socket
+    /// owns its revert and counts from its own swap.
+    fn arm(&self, deadline: u64) -> Result<(), state::StateError> {
+        let lock = state::Locked::acquire(&self.layout)?;
+        let Some(mut now) = lock.read()? else {
+            return Ok(());
+        };
+        if let Some(pending) = now.pending_confirm.as_mut() {
+            pending.deadline_wall = Some(deadline);
+            pending.starts_left = None;
+        }
+        lock.write(&now)
+    }
+
     fn restart_units(&self) -> Result<(), String> {
         for unit in &self.units {
             restart_and_wait(&*self.runner, unit, self.restart_wait, &self.pace)?;
@@ -299,14 +308,14 @@ impl<E: Exec> Linux<E> {
     /// fetch runs as. Nothing is fetched that cannot be checked: the pinned `gh` and the
     /// trusted root are root's, or this host does not believe what they would say.
     pub(super) fn prepare(&self, version: &Version, channel: &Channel) -> Result<Prepared, Fault> {
-        let prefix = crate::mac::release::commit_prefix(version.as_str()).ok_or_else(|| {
+        let prefix = crate::release::commit_prefix(version.as_str()).ok_or_else(|| {
             Fault::refused(
                 Code::UnknownRelease,
                 "the version carries no commit (+g or +, then 12 hex digits)",
             )
         })?;
         let trust: &Trust = &self.host.trust;
-        let allowlist = MacAllowlist::load(trust, &self.allowlist).map_err(config_fault)?;
+        let allowlist = Allowlist::load(trust, &self.allowlist).map_err(config_fault)?;
         let channel = allowlist.channel(trust, channel).map_err(channel_fault)?;
         let Source::Github { token_file } = &channel.source else {
             return Err(Fault::refused(
@@ -392,7 +401,7 @@ impl<E: Exec> Linux<E> {
         let partial = Partial::create(&self.layout, &id, self.owner)
             .map_err(|e| Fault::failed(Code::StageFailed, e.to_string()))?;
         let tarball_name = AssetKind::Tarball.name_on(origin.prefix(), &platform, &commit);
-        let bundle_name = crate::mac::release::bundle_of(&tarball_name);
+        let bundle_name = crate::release::bundle_of(&tarball_name);
         let target = partial.dl().join("kbf.tar.gz");
         let copied = copy_hashing(
             &scratch.join(&tarball_name),
@@ -423,7 +432,6 @@ impl<E: Exec> Linux<E> {
             policy: policy(self.tools.tarball_max),
             trust: &*self.trust,
             runner: &*self.installer_runner,
-            leases: &NoLeases,
             owner: self.owner,
         };
         let order = Order {
@@ -566,6 +574,12 @@ impl<E: Exec> Backend for Linux<E> {
     }
 
     fn switch(&self, commit: &str, window_secs: u64, now: u64) -> Result<u64, Fault> {
+        if !(activate::WINDOW_MIN_SECS..=activate::WINDOW_MAX_SECS).contains(&window_secs) {
+            return Err(Fault::failed(
+                Code::SwitchFailed,
+                ReleaseError::Window(window_secs).to_string(),
+            ));
+        }
         let order = activate::Order {
             commit: commit_id(commit)?,
             order_id: format!("host-install-{}", &commit[..12]),
@@ -575,12 +589,14 @@ impl<E: Exec> Backend for Linux<E> {
             &mut *self.exec.borrow_mut(),
             &self.layout,
             &order,
-            Arm::FromActivation { window_secs },
-            now,
+            TRIAL_STARTS,
             &mut out,
         );
         match swapped.map_err(|e| Fault::failed(Code::SwitchFailed, e.to_string()))? {
-            Activated::Swapped | Activated::Repeat => {}
+            Activated::Swapped | Activated::Repeat => {
+                self.arm(now + window_secs)
+                    .map_err(|e| Fault::failed(Code::SwitchFailed, e.to_string()))?;
+            }
             Activated::AlreadyCurrent => {
                 return Err(Fault::refused(
                     Code::NotStaged,
@@ -685,6 +701,6 @@ pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
         tools: Tools::production(),
         owner: Owner { uid: 0, gid: 0 },
         scratch_tag: None,
-        procs: Box::new(HostProcs::new(Platform::current())),
+        procs: Box::new(HostProcs),
     }
 }

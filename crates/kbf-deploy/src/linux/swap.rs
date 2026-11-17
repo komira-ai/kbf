@@ -1,8 +1,6 @@
 //! `linux swap`: the host's swapfile for builds, `KBF_SWAP_SIZE` at `KBF_SWAP_FILE`.
 //!
-//! Builds may swap (no lease gets `memory.swap.max`; the daemon's swap watch kills a
-//! lease that swaps at its own cap); MinIO and kbf-server may not (their units set
-//! `MemorySwapMax=0`). docs/deploy/linux-build-host.md, "Swap: 128 GB".
+//! Builds may swap; MinIO and kbf-server may not (their units set `MemorySwapMax=0`). docs/deploy/linux-build-host.md, "Swap: 128 GB".
 //!
 //! The plan has each of these only when the host does not have it yet:
 //! 1. `fallocate -l <size> <file>`, `chmod 600 <file>`, `mkswap <file>`;

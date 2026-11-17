@@ -47,9 +47,9 @@ pub const HOOK_COMMAND: [&str; 2] = ["/usr/bin/kbf", "package-hook"];
 /// The package name.
 pub const PACKAGE: &str = "kbf";
 /// The systemd unit the package runs.
-pub const RUN_UNIT: &str = "kbf-storage-and-daemon.service";
+pub const RUN_UNIT: &str = "kbf-storage.service";
 /// The `--mode` the staged binary is checked in.
-pub const MODE: &str = "storage-and-daemon";
+pub const MODE: &str = "storage";
 /// The hook's record directory.
 pub const STATE_DIR: &str = "/var/lib/kbf-package-hook";
 /// The keys of the manifest's `[params]`.

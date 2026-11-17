@@ -1,6 +1,6 @@
 //! The real wiring of the hook from its flags, with certificates in a scratch directory, the
 //! time a test gives it, and a frontend of the test's own on a port the system picked: who the
-//! host is, which node it drains, what it can reach and what it asks.
+//! host is, what it can reach and what it asks.
 
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
@@ -22,6 +22,12 @@ use crate::agent::testing::ManualClock;
 use crate::inventory::Role;
 use crate::ports::Clock;
 use crate::testutil::scratch;
+use crate::version::Version;
+
+/// The target of a health check the test's frontend never answers.
+fn target() -> Version {
+    Version::parse("0.1.5+gaaaaaaaaaaaa-2").unwrap()
+}
 
 /// Unix seconds "now" of the time the tests give the world.
 const NOW: u64 = 10_000;
@@ -91,8 +97,6 @@ impl Rig {
         let token_file = dir.join("token");
         std::fs::write(&token_file, &token).unwrap();
         std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let cordons = dir.join("cordons");
-        std::fs::create_dir(&cordons).unwrap();
         let frontend = HangUp::start();
         let flags = Flags {
             record_dir: dir.join("record"),
@@ -105,8 +109,6 @@ impl Rig {
                     addr: frontend.addr,
                     token_file,
                 }),
-                cordon_dir: cordons,
-                daemon_node: None,
             },
             timing: Timing::DEFAULT,
         };
@@ -130,19 +132,19 @@ fn manual() -> (Arc<ManualClock>, Time) {
 }
 
 /// The host is who its certificate says: the node and the role, the helper at the flag's
-/// socket (nothing there here, which is said when it is asked), and a drain that is the
-/// frontend's at the flag's address, asked about the host's own node with the operator token
-/// (the test's frontend hangs up, which is said when it is asked).
+/// socket (nothing there here, which is said when it is asked), and a health check that is the
+/// frontend's at the flag's address, asked with the operator token (the test's frontend hangs
+/// up, which is said when it is asked).
 ///
 /// Catches: a hook that wires another node than the host's own, or that calls the frontend
 /// without the token it was given.
 #[test]
-fn a_daemon_host_is_its_certificates_node() {
-    let rig = Rig::new("hook-real-daemon", HostRole::DAEMON);
+fn a_storage_host_is_its_certificates_node() {
+    let rig = Rig::new("hook-real-storage-node", HostRole::STORAGE);
     let world = world_at(&rig.flags, manual().1).unwrap();
     assert_eq!(
         (world.host.alias.as_str(), world.host.role),
-        ("n1", Role::Daemon)
+        ("n1", Role::Storage)
     );
     assert_eq!(world.host.node_id.as_deref(), Some("n1"));
     assert!(
@@ -150,10 +152,10 @@ fn a_daemon_host_is_its_certificates_node() {
         "no helper listens at the socket"
     );
     assert!(
-        world.drain.leases(&world.host).is_err(),
+        world.health.check(&world.host, &target()).is_err(),
         "the frontend hangs up"
     );
-    assert_eq!(rig.frontend.requests(), ["GET /v1/nodes/n1 HTTP/1.1"]);
+    assert_eq!(rig.frontend.requests(), ["GET /v1/enroll/nodes HTTP/1.1"]);
     assert!(rig.frontend.all_carried(&rig.token));
 }
 
@@ -168,7 +170,7 @@ fn a_daemon_host_is_its_certificates_node() {
 /// deadline would then be measured from the start of the step, not from now).
 #[test]
 fn the_world_reads_and_waits_on_the_time_it_is_given() {
-    let rig = Rig::new("hook-real-time", HostRole::DAEMON);
+    let rig = Rig::new("hook-real-time", HostRole::STORAGE);
     let clock = Arc::new(ManualClock::default());
     let unix = Arc::new(AtomicU64::new(NOW));
     let source = unix.clone();
@@ -189,73 +191,46 @@ fn the_world_reads_and_waits_on_the_time_it_is_given() {
     assert_eq!((world.unix_now)(), NOW + 600);
 }
 
-/// The drain dials the frontend the flags name, and no other: with another listener up on the
-/// same loopback (as a program on some fixed port would be), the call reaches the rig's own
+/// The health check dials the frontend the flags name, and no other: with another listener up on
+/// the same loopback (as a program on some fixed port would be), the call reaches the rig's own
 /// frontend, on the port the system picked for it, and the other listener is never asked.
 ///
 /// Catches: wiring that dials an address of its own (a fixed port), whose outcome then depends
 /// on what happens to listen there on the host the test runs on.
 #[test]
-fn the_drain_dials_the_frontend_it_is_given_and_no_other() {
+fn the_health_check_dials_the_frontend_it_is_given_and_no_other() {
     let squatter = HangUp::start();
-    let rig = Rig::new("hook-real-port", HostRole::DAEMON);
+    let rig = Rig::new("hook-real-port", HostRole::STORAGE);
     assert_ne!(rig.frontend.addr, squatter.addr);
     let world = world_at(&rig.flags, manual().1).unwrap();
-    assert!(world.drain.placed(&world.host).is_err());
-    assert!(world.drain.undrain(&world.host).is_err());
-    assert_eq!(
-        rig.frontend.requests(),
-        [
-            "GET /v1/nodes/n1 HTTP/1.1",
-            "POST /v1/nodes/n1:uncordon HTTP/1.1"
-        ]
-    );
+    assert!(world.health.check(&world.host, &target()).is_err());
+    assert_eq!(rig.frontend.requests(), ["GET /v1/enroll/nodes HTTP/1.1"]);
     assert!(squatter.requests().is_empty());
 }
 
-/// A frontend host drains nothing unless it was told it runs a daemon; with `--daemon-node`
-/// it drains that node, through the frontend. `--daemon-node` on any other host is refused.
+/// A frontend host drains nothing and asks the frontend nothing: its health is the helper's. A
+/// host whose certificate names the role `daemon` or `mac-daemon` has no duties and is refused.
 ///
-/// Catches: a frontend's own drain done twice (the helper does it), or a daemon node's skipped.
+/// Catches: a frontend's own drain done twice (the helper does it), or a host of a retired role
+/// given a world.
 #[test]
-fn a_frontend_host_drains_only_the_daemon_it_runs() {
+fn a_frontend_host_drains_nothing_and_a_daemon_host_is_refused() {
     let rig = Rig::new("hook-real-frontend", HostRole::FRONTEND);
-    let world_of = |flags: &Flags| world_at(flags, manual().1).unwrap();
-    let plain = world_of(&rig.flags);
+    let plain = world_at(&rig.flags, manual().1).unwrap();
     assert_eq!(plain.host.role, Role::Frontend);
     assert_eq!(plain.drain.drain(&plain.host, None), Ok(()));
     assert_eq!(plain.drain.leases(&plain.host), Ok(0));
     assert_eq!(plain.health.refusal(&plain.host), None);
     assert!(rig.frontend.requests().is_empty(), "nothing to drain");
 
-    let mut with_daemon = rig.flags.clone();
-    with_daemon.access.daemon_node = Some("d1".to_owned());
-    let with = world_of(&with_daemon);
-    assert_eq!(with.host.node_id.as_deref(), Some("d1"));
-    assert!(
-        with.drain.drain(&with.host, None).is_err(),
-        "the frontend hangs up"
-    );
-    // The cordon marks read the daemon's node before they drain it; the hang-up ends there.
-    assert_eq!(rig.frontend.requests(), ["GET /v1/nodes/d1 HTTP/1.1"]);
-    assert!(rig.frontend.all_carried(&rig.token));
-
-    // The node of a daemon it runs cannot be recorded: the same refusal as a daemon host's.
-    let mut unwritable = with_daemon.clone();
-    unwritable.access.cordon_dir = rig.dir.join("missing");
-    let why = world_at(&unwritable, manual().1).err().unwrap();
-    assert!(
-        matches!(&why, WorldError::Ports(text) if text.contains("--cordon-dir")),
-        "{why:?}"
-    );
-
-    for role in [HostRole::STORAGE, HostRole::DAEMON, HostRole::MAC_DAEMON] {
-        let mut other = Rig::new("hook-real-flag", role.clone());
-        other.flags.access.daemon_node = Some("d1".to_owned());
+    for role in [HostRole::DAEMON, HostRole::MAC_DAEMON] {
+        let other = Rig::new("hook-real-retired", role.clone());
         let why = world_at(&other.flags, manual().1).err().unwrap();
-        assert!(
-            matches!(&why, WorldError::Host(text) if text.contains("--daemon-node")),
-            "{role}: {why:?}"
+        assert_eq!(
+            why,
+            WorldError::Host(format!(
+                "{role} is a host role this agent has no duties for"
+            ))
         );
     }
 }
@@ -263,37 +238,27 @@ fn a_frontend_host_drains_only_the_daemon_it_runs() {
 /// With no way to the frontend (neither `--frontend` nor an operator token) the host is still
 /// built, and every update is refused by the health precondition with the reason that says so.
 ///
-/// Catches: a hook that drains a node with a credential it was not given.
+/// Catches: a hook that asks the frontend with a credential it was not given.
 #[test]
 fn a_host_with_no_way_to_the_frontend_refuses_in_its_health_check() {
-    let mut rig = Rig::new("hook-real-bare", HostRole::DAEMON);
+    let mut rig = Rig::new("hook-real-bare", HostRole::STORAGE);
     rig.flags.access.node_api = None;
     let world = world_at(&rig.flags, manual().1).unwrap();
     assert_eq!(
         world.health.refusal(&world.host).as_deref(),
         Some(NO_CREDENTIAL)
     );
-    assert!(world.drain.placed(&world.host).is_err());
+    assert!(world.health.check(&world.host, &target()).is_err());
     assert!(rig.frontend.requests().is_empty());
 }
 
-/// A cordon directory the hook cannot write stops it with the flag named, a certificate that is
-/// no updater's with the file named, each as its own kind; a storage host is built like a
-/// daemon's. `world` (the system's time) refuses the same as `world_at`.
+/// A certificate that is no updater's stops the hook with the file named, as its own kind; a
+/// storage host is built. `world` (the system's time) refuses the same as `world_at`.
 ///
-/// Catches: a drain made with no way to remember it was ours; a missing certificate reported
-/// as a port that cannot be made.
+/// Catches: a missing certificate reported as a port that cannot be made.
 #[test]
-fn a_directory_or_certificate_that_cannot_be_used_names_what_is_wrong() {
-    let mut rig = Rig::new("hook-real-cordon", HostRole::DAEMON);
-    rig.flags.access.cordon_dir = rig.dir.join("missing");
-    let why = world(&rig.flags).err().unwrap();
-    assert!(
-        matches!(&why, WorldError::Ports(text) if text.contains("--cordon-dir")),
-        "{why:?}"
-    );
-
-    let mut rig = Rig::new("hook-real-cert", HostRole::DAEMON);
+fn a_certificate_that_cannot_be_used_names_what_is_wrong() {
+    let mut rig = Rig::new("hook-real-cert", HostRole::STORAGE);
     rig.flags.access.files.cert = rig.dir.join("none.pem");
     let why = world(&rig.flags).err().unwrap();
     assert!(

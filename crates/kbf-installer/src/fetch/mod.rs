@@ -50,7 +50,7 @@ use kbf_types::ReleasePlatform;
 use pipe::{Caps, ChildSpec, PipeFault, Received};
 use user::UserFault;
 
-/// The file name of the unprivileged account the child runs as (Linux; `_kbf-fetch` on macOS).
+/// The file name of the unprivileged account the child runs as .
 pub const FETCH_USER: &str = "kbf-fetch";
 /// The longest the child waits to connect.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);

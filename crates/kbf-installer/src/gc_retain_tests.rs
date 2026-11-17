@@ -8,9 +8,9 @@ use std::time::{Duration, UNIX_EPOCH};
 use super::*;
 use crate::retain::{self, RetainError, Retained};
 
-/// The Linux host and the macOS host of the release tests.
+/// The host of the release tests.
 fn platforms(name: &str) -> Vec<(ScratchHost, Layout)> {
-    vec![host(&format!("ret-{name}")), mac(&format!("ret-{name}"))]
+    vec![host(&format!("ret-{name}"))]
 }
 
 fn id(i: u64) -> String {

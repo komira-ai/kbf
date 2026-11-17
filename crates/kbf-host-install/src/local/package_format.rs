@@ -1,4 +1,4 @@
-//! The two package formats of a Linux daemon host: the commands that ask the package
+//! The two package formats of a Linux host: the commands that ask the package
 //! manager what it has, what a package file is, and put a package file in place, and the
 //! readers of what they print. Pure: nothing here runs anything.
 //!
@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use kbf_installer::binary::Arch;
 
-use crate::mac::fetch::AssetKind;
-use crate::mac::release::PREFIX_LEN;
+use crate::fetch::AssetKind;
+use crate::release::PREFIX_LEN;
 use crate::runner::{Cmd, Exec};
 
 /// The package every release carries, in both formats.

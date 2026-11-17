@@ -233,7 +233,7 @@ fn each_bad_overlay_setting_is_refused() {
     }
 }
 
-/// Catches `KBF_DARWIN_LABELS` (the daemons' node labels, removed) read again: the key is
+/// Catches `KBF_DARWIN_LABELS` (the agents' node labels, removed) read again: the key is
 /// no key of the kit's config, so a file that still sets it is refused naming it, not
 /// read with the value ignored.
 #[test]

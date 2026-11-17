@@ -1,16 +1,9 @@
-//! The runner's privilege drop to `nobody`, made for real by a root process on macOS and on
-//! Linux: a program started with `run_as` runs, ends with status 0, and is `nobody` with the
-//! groups it should have.
-//!
-//! On macOS a process that calls `chroot(2)` and then executes a program is killed by the
-//! system at once (`SIGKILL`, even for `/` and `/usr/bin/true`), so a drop through
-//! `chroot(8)` ends every command it starts that way. No unit test sees that: it needs the
-//! system and root.
+//! The runner's privilege drop to `nobody`, made for real by a root process on Linux: a program
+//! started with `run_as` runs, ends with status 0, and is `nobody` with no supplementary group.
 //!
 //! These tests need root, so they are `#[ignore]`d and run through `cargo xtask sudo-test
-//! -p kbf-host-install --test real_drop` in the `host-install-mac` workflow (a GitHub-hosted
-//! macOS runner) and in the `host-install-linux` workflow (a hosted Ubuntu runner), both with
-//! passwordless sudo. Run without root they fail, and say to use the xtask.
+//! -p kbf-host-install --test real_drop` in the `host-install-linux` workflow (a hosted Ubuntu
+//! runner) with passwordless sudo. Run without root they fail, and say to use the xtask.
 
 #![cfg(unix)]
 
@@ -18,7 +11,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use kbf_host_install::mac_tools::{Cmd, Exec, Identity, Runner, SystemRunner};
+use kbf_host_install::test_runner::{Cmd, Exec, Identity, Runner, SystemRunner};
 use kbf_testkit::dir::TestDir;
 
 const LIMIT: Duration = Duration::from_secs(30);
@@ -30,22 +23,11 @@ fn assert_root() {
     );
 }
 
-/// The account `nobody`: `dscl` says on macOS (the same ids the install reads); 65534 on Linux.
+/// The account `nobody`: 65534.
 fn nobody() -> Identity {
-    #[cfg(target_os = "macos")]
-    {
-        use kbf_host_install::mac_tools::tools;
-        let exec = run(&tools::dscl_ids("nobody", LIMIT));
-        assert!(exec.success(), "{}", exec.stderr_text());
-        let text = exec.stdout_text();
-        tools::parse_ids(&text).unwrap_or_else(|| panic!("the ids are not read from: {text}"))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Identity {
-            uid: 65534,
-            gid: 65534,
-        }
+    Identity {
+        uid: 65534,
+        gid: 65534,
     }
 }
 
@@ -76,7 +58,7 @@ fn print_my_ids() {
 }
 
 /// Catches a drop that cannot start a system program: `/usr/bin/true` run as `nobody` ends
-/// with status 0. (A drop through `chroot(8)` on macOS ends it with `SIGKILL`.)
+/// with status 0.
 #[test]
 #[ignore = "needs root: cargo xtask sudo-test"]
 fn a_system_program_runs_as_nobody_and_succeeds() {
@@ -97,8 +79,7 @@ fn a_system_program_runs_as_nobody_and_succeeds() {
 }
 
 /// Catches a drop that leaves root's identity or groups on the child: the child's real and
-/// effective uid and gid are `nobody`'s, and its supplementary groups are only `nobody`'s
-/// group on macOS (exactly that one, never group 0) and none on Linux.
+/// effective uid and gid are `nobody`'s, and it has no supplementary group.
 #[test]
 #[ignore = "needs root: cargo xtask sudo-test"]
 fn a_dropped_child_has_the_ids_and_groups_of_nobody() {
@@ -143,12 +124,11 @@ fn a_dropped_child_has_the_ids_and_groups_of_nobody() {
         [ids.uid, ids.uid, ids.gid, ids.gid],
         "uid, euid, gid, egid"
     );
-    let want: Vec<u32> = if cfg!(target_os = "macos") {
-        vec![ids.gid]
-    } else {
-        vec![]
-    };
-    assert_eq!(numbers("groups:"), want, "supplementary groups");
+    assert_eq!(
+        numbers("groups:"),
+        Vec::<u32>::new(),
+        "supplementary groups"
+    );
     // No drop at all is root, so the probe above is a probe of the drop.
     cmd.run_as = None;
     let as_root = run(&cmd).stdout_text();

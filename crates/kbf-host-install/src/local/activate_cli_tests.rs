@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use kbf_retain::{CommitId, Kept};
 use kbf_testkit::dir::TestDir;
 
-use super::activate_cli::{Command, LINUX_HOLD, MAC_HOLD, Place, main_with, run};
+use super::activate_cli::{Command, LINUX_HOLD, Place, main_with, run};
 use super::answer::{Answer, Code};
 use super::backend::{Backend, Fault, Pending};
 use super::core::Ab;
@@ -32,14 +32,14 @@ fn args(line: &str) -> Vec<String> {
 #[test]
 fn the_command_line_is_read() {
     let command = Command::parse(&args(
-        "--force-lock kbf=bbbbbbbbbbbb --restart-unit kbf-daemon.service --pin \
+        "--force-lock kbf=bbbbbbbbbbbb --restart-unit kbf-storage.service --pin \
          --restart-unit kbf-frontend@a.service",
     ))
     .unwrap();
     assert!(matches!(&command.target, Target::Commit(c) if c == "bbbbbbbbbbbb"));
     assert!(command.how.pin && command.how.force_lock);
     let units: Vec<&str> = command.units.iter().map(|u| u.as_str()).collect();
-    assert_eq!(units, ["kbf-daemon.service", "kbf-frontend@a.service"]);
+    assert_eq!(units, ["kbf-storage.service", "kbf-frontend@a.service"]);
     let plain = Command::parse(&args("kbf=0.1.7+gbbbbbbbbbbbb-3")).unwrap();
     assert!(!plain.how.pin && !plain.how.force_lock && plain.units.is_empty());
 
@@ -93,7 +93,6 @@ fn only_root_with_a_sound_command_reaches_the_run() {
     );
     assert_eq!(ran.get(), 1);
     assert_eq!(LINUX_HOLD, "/var/lib/kbf-updater/pin.json");
-    assert_eq!(MAC_HOLD, "/var/db/kbf-updater/pin.json");
 }
 
 /// A host with release A current and B kept, which swaps as it is asked.

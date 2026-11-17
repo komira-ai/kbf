@@ -146,32 +146,21 @@ fn the_fetch_child_takes_a_blob_or_a_release() {
     );
 }
 
-/// Catches `run` watching the Linux state directory on a Mac: without `--update-dir` and
-/// `--orders-dir` the directories are the layout's, the ones `setup` and the Mac provisioner
-/// write, for each platform; the flags still win.
+/// Catches `run` watching another directory than the host's: without `--update-dir` and
+/// `--orders-dir` the directories are the layout's, the ones `setup` writes; the flags still win.
 #[test]
-fn run_defaults_its_directories_to_the_layouts_on_every_platform() {
-    for platform in [Platform::Linux, Platform::MacOs] {
-        let (layout, _) = crate::testkit::host_root_on("run-dirs", platform);
-        let Verb::Run(args) = parse(&["run"]).verb else {
-            panic!("run");
-        };
-        assert_eq!(
-            args.update_dir_in(&layout),
-            layout.update_dir(),
-            "{platform:?}"
-        );
-        assert_eq!(
-            args.orders_dir_in(&layout),
-            layout.orders_dir(),
-            "{platform:?}"
-        );
-    }
+fn run_defaults_its_directories_to_the_layouts() {
+    let (layout, _) = crate::testkit::host_root_on("run-dirs", Platform::Linux);
+    let Verb::Run(args) = parse(&["run"]).verb else {
+        panic!("run");
+    };
+    assert_eq!(args.update_dir_in(&layout), layout.update_dir());
+    assert_eq!(args.orders_dir_in(&layout), layout.orders_dir());
     let Verb::Run(args) = parse(&["run", "--update-dir", "/srv/u", "--orders-dir", "/srv/o"]).verb
     else {
         panic!("run");
     };
-    let (layout, _) = crate::testkit::host_root_on("run-dirs-flags", Platform::MacOs);
+    let (layout, _) = crate::testkit::host_root_on("run-dirs-flags", Platform::Linux);
     assert_eq!(args.update_dir_in(&layout).as_str(), "/srv/u");
     assert_eq!(args.orders_dir_in(&layout).as_str(), "/srv/o");
 }
@@ -279,7 +268,7 @@ fn json_is_one_object_on_standard_output() {
 fn setup_is_root_only_and_says_so_as_text_or_json() {
     let args = [
         "setup",
-        "--mode=daemon",
+        "--mode=storage",
         "--frontend-url=https://f.example",
         "--token-file=/t",
     ];
@@ -485,7 +474,7 @@ fn flags_are_required_and_checked_by_the_parser() {
         &["confirm", "--id", "42"],
         &["setup"],
         &["setup", "--mode=node"],
-        &["setup", "--mode=daemon", "--min-generation=x"],
+        &["setup", "--mode=storage", "--min-generation=x"],
         &["confirm", "3-42"],
     ];
     for args in bad {
@@ -498,13 +487,13 @@ fn flags_are_required_and_checked_by_the_parser() {
 /// `--apply` and `--json` are global: they may come after the verb.
 #[test]
 fn global_flags_may_follow_the_verb() {
-    let cli = parse(&["setup", "--mode=all-in-one", "--apply", "--json"]);
+    let cli = parse(&["setup", "--mode=frontend", "--apply", "--json"]);
     assert_eq!((cli.apply, cli.json), (true, true));
 }
 
 /// A host root with release A current and its order spool in place, as the installer finds a host.
 /// The installer under test lays a host out for the platform it was built for, so the
-/// scratch host is laid out for that platform too (`/var/db/kbf-installer` on macOS).
+/// scratch host is laid out for that platform too.
 pub(super) fn seeded(name: &str) -> (Layout, PathBuf) {
     let (layout, root) = host_root_on(&format!("app-{name}"), Platform::current());
     crate::testkit::mkdirs(&root, &layout.join(&layout.orders_dir()), 0o755);

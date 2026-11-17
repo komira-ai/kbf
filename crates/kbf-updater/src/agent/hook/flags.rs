@@ -5,8 +5,7 @@
 //! kbf update-hook --record-dir DIR --channel NAME
 //!                 (--enrollment-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
 //!                 [--frontend <dns name>:<port>]
-//!                 [--operator-api http://IP:PORT --token-file FILE] [--daemon-node NODE_ID]
-//!                 [--cordon-dir DIR] [--helper-socket PATH]
+//!                 [--operator-api http://IP:PORT --token-file FILE] [--helper-socket PATH]
 //!                 [--drain-deadline-secs N] [--health-timeout-secs N] [--health-poll-secs N]
 //!                 [--retry-secs N]
 //!                 <step> [<artifact>] [--params FILE]
@@ -20,7 +19,6 @@
 //! - `--enrollment-dir` is what the agent calls `--state-dir`: the directory `kbf-updater
 //!   enroll` filled. The hook never renews the certificate.
 //! - `--retry-secs` is the `retry_after_secs` of a step that exits `75`.
-//! - `--cordon-dir` defaults to the record directory.
 //!
 //! Nothing here names the coordinator, the heartbeat or the services of an agent: the updater
 //! that runs the hook has already decided which update this is.
@@ -33,9 +31,8 @@ use super::super::flags::{
     DEFAULT_HELPER_SOCKET, NodeApi, Timing, channel_ok, collect, drain_secs, secs, tls_files,
 };
 use crate::daemon::parse_operator_url;
-use crate::inventory::valid_node_id;
 
-const FLAGS: [&str; 16] = [
+const FLAGS: [&str; 14] = [
     "--record-dir",
     "--channel",
     "--enrollment-dir",
@@ -45,8 +42,6 @@ const FLAGS: [&str; 16] = [
     "--frontend",
     "--operator-api",
     "--token-file",
-    "--daemon-node",
-    "--cordon-dir",
     "--helper-socket",
     "--drain-deadline-secs",
     "--health-timeout-secs",
@@ -80,9 +75,6 @@ pub enum FlagsError {
     /// One of `--operator-api` and `--token-file` without the other.
     #[error("--operator-api and --token-file are given together, or not at all")]
     OperatorApiAlone,
-    /// `--daemon-node` is not a node id.
-    #[error("--daemon-node must be a node id: a DNS label")]
-    DaemonNode,
     /// A number of seconds out of its range; the text names the flag and the range.
     #[error("{0}")]
     Seconds(String),
@@ -151,13 +143,6 @@ fn parse(args: &[String]) -> Result<Flags, FlagsError> {
         (None, None) => None,
         _ => return Err(FlagsError::OperatorApiAlone),
     };
-    let daemon_node = found.remove("--daemon-node");
-    if daemon_node.as_deref().is_some_and(|id| !valid_node_id(id)) {
-        return Err(FlagsError::DaemonNode);
-    }
-    let cordon_dir = found
-        .remove("--cordon-dir")
-        .map_or_else(|| record_dir.clone(), PathBuf::from);
     let helper_socket = found
         .remove("--helper-socket")
         .map_or_else(|| PathBuf::from(DEFAULT_HELPER_SOCKET), PathBuf::from);
@@ -183,8 +168,6 @@ fn parse(args: &[String]) -> Result<Flags, FlagsError> {
             files,
             frontend,
             node_api,
-            cordon_dir,
-            daemon_node,
         },
         timing,
     })

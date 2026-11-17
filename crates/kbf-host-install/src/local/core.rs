@@ -30,7 +30,7 @@ use super::backend::{Backend, Fault, Pending};
 use super::request::LocalRequest;
 use crate::host::take_lock;
 use crate::locks;
-use crate::mac::release::commit_prefix;
+use crate::release::commit_prefix;
 use crate::request::{Channel, Version};
 use crate::trust::Trust;
 

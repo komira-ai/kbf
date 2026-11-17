@@ -27,26 +27,6 @@ pub(crate) fn offer() -> Offer {
     }
 }
 
-/// The 40-digit commit of generation `generation`: the number in hex, zero padded.
-pub(crate) fn commit(generation: u64) -> String {
-    format!("{generation:040x}")
-}
-
-/// The offer of `generation`, for `commit(generation)`, with every expected fact set.
-pub(crate) fn offer_of(generation: u64) -> Offer {
-    Offer {
-        generation,
-        commit: commit(generation),
-        expected: Expected {
-            protocol: 7,
-            min_protocol: 6,
-            state_schema: 3,
-            profile: "release".to_owned(),
-        },
-        ..offer()
-    }
-}
-
 /// An empty directory for one test, under the test binary's own directory.
 pub(crate) fn scratch(name: &str) -> PathBuf {
     static CALLS: AtomicU64 = AtomicU64::new(0);

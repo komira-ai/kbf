@@ -1,6 +1,5 @@
-//! The vocabulary of the update client: what the frontend offers and orders, and what the
-//! node says back. These are plain values; the wire messages become them at the edge of
-//! the daemon (`kbf-daemon`'s `update_link`), so nothing here knows protobuf.
+//! The vocabulary of the update records: what is offered and ordered, and what the node says
+//! back. These are plain values; nothing here knows protobuf.
 
 use serde::{Deserialize, Serialize};
 
@@ -10,13 +9,14 @@ pub const MAX_COMPONENT_BYTES: u64 = 512 << 20;
 /// The most bytes one component's attestation may be.
 pub const MAX_ATTESTATION_BYTES: usize = 256 << 10;
 
-/// The components a node installs, by name. An offer naming another is refused.
+/// The components a node installs, by name. An offer naming another is refused. `kbf-daemon` is
+/// the name of a component of earlier releases, which a record written by one still names.
 pub const COMPONENT_NAMES: [&str; 2] = ["kbf", "kbf-daemon"];
 
 /// One file of a release, as the offer names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Component {
-    /// `kbf` or `kbf-daemon`.
+    /// `kbf`, or `kbf-daemon` in a record an earlier release wrote.
     pub name: String,
     /// The SHA-256 of the tarball, as 64 lowercase hex digits; also the key the
     /// frontend serves it by.
@@ -242,7 +242,7 @@ pub struct Status {
     /// Where the helper fetches releases from, when it says.
     pub release_source: ReleaseSource,
     /// Whether the node is in the update gate: it takes no lease until the update
-    /// settles. Not on the wire; it makes a change of gate wake the session.
+    /// settles. Not on the wire.
     pub gated: bool,
 }
 

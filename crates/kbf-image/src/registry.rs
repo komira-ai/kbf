@@ -110,7 +110,7 @@ impl Registry {
     }
 
     /// Also speaks plain HTTP to the registry `authority` (`host:port`). Only for a
-    /// registry on a loopback address or a test: the daemon never calls this.
+    /// registry on a loopback address or a test: production code never calls this.
     #[must_use]
     pub fn allow_plain_http(mut self, authority: &str) -> Self {
         self.http.allow_plain(authority.to_owned());

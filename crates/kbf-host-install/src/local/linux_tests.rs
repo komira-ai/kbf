@@ -356,7 +356,7 @@ impl Rig {
             host,
             allowlist: dir.join("releases.toml"),
             units: vec![
-                Unit::service("kbf-daemon.service").unwrap(),
+                Unit::service("kbf-storage.service").unwrap(),
                 Unit::service("kbf-frontend@a.service").unwrap(),
             ],
             restart_wait: Wait {
@@ -503,8 +503,8 @@ fn a_switch_puts_the_release_on_trial_and_restarts_the_units() {
     assert_eq!(
         rig.systemctl(),
         [
-            "restart -- kbf-daemon.service",
-            "is-active -- kbf-daemon.service",
+            "restart -- kbf-storage.service",
+            "is-active -- kbf-storage.service",
             "restart -- kbf-frontend@a.service",
             "is-active -- kbf-frontend@a.service"
         ]
@@ -616,7 +616,7 @@ fn a_confirm_keeps_the_release_and_a_revert_goes_back_and_restarts() {
     rig.net
         .borrow_mut()
         .restart_fails
-        .insert("kbf-daemon.service".to_owned());
+        .insert("kbf-storage.service".to_owned());
     let pending = rig.backend.pending().unwrap().unwrap();
     let fault = rig.backend.revert(&pending).unwrap_err();
     assert_eq!(fault.code, Code::RevertFailed);
@@ -651,15 +651,7 @@ fn a_trial_armed_with_no_deadline_has_none() {
         commit: CommitId::new(COMMIT).unwrap(),
         order_id: "7-1".into(),
     };
-    activate::activate(
-        &mut *exec,
-        &rig.layout,
-        &order,
-        activate::Arm::FromFirstStart { starts: 3 },
-        1,
-        &mut Vec::new(),
-    )
-    .unwrap();
+    activate::activate(&mut *exec, &rig.layout, &order, 3, &mut Vec::new()).unwrap();
     drop(exec);
     let pending = rig.backend.pending().unwrap().unwrap();
     assert_eq!(pending.deadline_unix, None);
@@ -769,7 +761,7 @@ fn a_unit_that_fails_on_b_and_not_on_a_leaves_the_host_on_a() {
     rig.net
         .borrow_mut()
         .restart_fails_once
-        .insert("kbf-daemon.service".to_owned());
+        .insert("kbf-storage.service".to_owned());
     let fault = rig.backend.switch(COMMIT, 600, 1_000).unwrap_err();
     assert_eq!(
         (fault.code, fault.refused),
@@ -814,7 +806,7 @@ fn a_release_directory_without_a_binary_file_is_not_laid_out() {
 /// the channels file, the programs of a stage, and no lease waited for.
 #[test]
 fn the_production_host_is_the_installers_layout_and_the_programs_of_a_stage() {
-    let host = super::linux::production(vec![Unit::service("kbf-daemon.service").unwrap()]);
+    let host = super::linux::production(vec![Unit::service("kbf-storage.service").unwrap()]);
     assert_eq!(
         host.allowlist,
         Path::new("/etc/kbf/host-install-releases.toml")
@@ -829,8 +821,6 @@ fn the_production_host_is_the_installers_layout_and_the_programs_of_a_stage() {
     assert_eq!(tools.curl, Path::new("/usr/bin/curl"));
     assert_eq!(tools.tarball_max, 512 * 1024 * 1024);
     assert_eq!(host.tools.download, tools.download);
-    use kbf_installer::helper::leases::LeaseSource;
-    assert_eq!(super::linux::NoLeases.live(), Ok(0));
 }
 
 #[path = "linux_image_tests.rs"]

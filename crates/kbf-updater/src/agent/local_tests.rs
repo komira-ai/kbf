@@ -461,12 +461,11 @@ fn the_helper_is_the_installer_port_of_the_health_check() {
     let events = Events::default();
     let local = FakeLocal::new(&events);
     let installer = LocalInstaller(Arc::new(local.clone()));
-    let host = host(Role::Daemon);
+    let host = host(Role::Storage);
     let report = installer.report(&host).unwrap();
     assert_eq!(report.installed, Installed::Version(VA.to_owned()));
     assert_eq!(report.running_commit.as_deref(), Some(COMMIT_A));
     assert_eq!(report.node_id.as_deref(), Some("n1"));
-    assert_eq!(report.apply, None);
 
     local.world().state.version = None;
     assert_eq!(

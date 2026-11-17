@@ -87,7 +87,7 @@ fn a_restart_with_a_pending_host_continues_at_it() {
     let roll = u.drive("roll-1").expect("drive");
     assert_eq!(roll.state, RollState::Done);
     assert!(rig.log.touching("fe").is_empty());
-    assert_eq!(rig.log.installs(), ["st1", "dm", "st2"]);
+    assert_eq!(rig.log.installs(), ["st1", "st3", "st2"]);
     assert_eq!(rig.store().load().expect("l").expect("r").resumes, 1);
 }
 
@@ -132,7 +132,7 @@ fn installing_with_the_target_already_there_is_not_installed_again() {
         &[ev("qy", "st1"), ev("hl", "st1")]
     );
     assert_eq!(roll.hosts[1].attempts, 1);
-    assert_eq!(rig.log.installs(), ["dm", "st2"]);
+    assert_eq!(rig.log.installs(), ["st3", "st2"]);
 }
 
 /// Catches a restart that trusts "installing" meant "installed", and one that never repeats an
@@ -175,7 +175,7 @@ fn a_failed_repeat_install_fails_the_roll() {
     );
     let roll = u.drive("roll-1").expect("drive");
     assert_eq!(roll.failure.expect("f").code, ErrorCode::InstallFailed);
-    assert!(rig.log.touching("dm").is_empty());
+    assert!(rig.log.touching("st3").is_empty());
 }
 
 /// Catches a restart that installs on top of a running install: "in progress" is waited out
@@ -274,7 +274,7 @@ fn no_answer_for_120_seconds_interrupts_the_roll() {
             .is_some_and(|d| d.contains("ssh: timed out"))
     );
     assert!(rig.log.installs().is_empty());
-    for later in ["dm", "st2"] {
+    for later in ["st3", "st2"] {
         assert!(rig.log.touching(later).is_empty());
     }
     assert_eq!(

@@ -76,7 +76,7 @@ impl Rig {
 
     fn bare(&self) -> Agent {
         Agent::new(
-            host(Role::Daemon),
+            host(Role::Storage),
             "stable".to_owned(),
             Timing::DEFAULT,
             self.world(),

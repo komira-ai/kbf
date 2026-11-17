@@ -5,13 +5,12 @@
 //! - [`api`]: the request, the roll as a poller sees it, the closed set of error codes;
 //! - [`version`]: the one rule for a version, shared with the host-side wrapper;
 //! - [`inventory`]: the root-owned host file, and the order a roll touches the hosts in;
-//! - [`ports`]: safe-to-stop, install and query, drain, health, a frontend member's own API
-//!   and the clock, as traits;
+//! - [`ports`]: safe-to-stop, install and query, health, a frontend member's own API and the
+//!   clock, as traits (and the drain of the agent's update);
 //! - [`ssh_installer`]: the install port over ssh to the `kbf-host-install` forced command;
 //! - [`record`]: `roll.json`, the durable record;
 //! - [`Updater`]: the state machine over all of the above. One roll at a time, the frontends
 //!   first, the first failure stops it, a restart asks the host before it installs again; a
-//!   `mac-daemon` host's install starts an apply that the roll polls until it is done; a
 //!   frontend that is a member of a pool of frontends drains itself and exits once the other
 //!   members have been ready for a while, and is then installed on and restarted, one at a
 //!   time;
@@ -24,9 +23,8 @@
 //! - [`operator`], [`reply`] and [`secret`]: the client of the frontend's loopback operator
 //!   API, and the token files it reads;
 //! - [`safe_http`]: the real safe-to-stop, a call to the operator API;
-//! - [`node_drain`]: the real drain of a daemon host's node, over the operator API;
-//! - [`health`] and [`node_health`]: the real health check of a storage or daemon host, over
-//!   the operator API; a frontend that is no pool member is refused;
+//! - [`health`] and [`node_health`]: the real health check of a storage host, over the operator
+//!   API; a frontend that is no pool member is refused;
 //! - [`frontend_http`]: the real control of a frontend member, over its own operator API;
 //! - [`daemon`]: the flags and the wiring of all of it.
 //!
@@ -48,7 +46,6 @@ pub mod http;
 pub mod identity;
 pub mod inventory;
 pub mod listener;
-pub mod node_drain;
 pub mod node_health;
 pub mod operator;
 pub mod ports;
@@ -79,9 +76,6 @@ mod identity_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod listener_tests;
 #[cfg(test)]
-mod node_drain_tests;
-#[cfg(test)]
-mod node_health_frontends_tests;
 #[cfg(test)]
 mod node_health_own_tests;
 #[cfg(test)]
@@ -95,15 +89,11 @@ mod server_tests;
 #[cfg(test)]
 mod testutil;
 #[cfg(test)]
-mod updater_cordon_tests;
-#[cfg(test)]
-mod updater_drain_tests;
-#[cfg(test)]
 mod updater_followup_tests;
 #[cfg(test)]
 mod updater_fresh_host_tests;
 #[cfg(test)]
-mod updater_mac_tests;
+mod updater_identity_tests;
 #[cfg(test)]
 mod updater_no_proxy_tests;
 #[cfg(test)]

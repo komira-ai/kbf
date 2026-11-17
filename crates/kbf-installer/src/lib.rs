@@ -7,8 +7,8 @@
 //! - [`layout`]: the paths ([`layout::Layout`], a directory tree and its
 //!   [`layout::Platform`]): each release in its own directory under
 //!   `/var/lib/kbf-installer/releases/<commit>/`, the `current` and `previous` links beside them,
-//!   the state under `/var/lib/kbf-installer/` (Linux) or `/var/db/kbf-installer/` (macOS) and
-//!   its trust files under `/usr/share/kbf/trust/`.
+//!   the state under `/var/lib/kbf-installer/` and its trust files under
+//!   `/usr/share/kbf/trust/`.
 //! - [`state`]: `state.json` (schema 2: the current, previous and staged commits, the one
 //!   waiting to be confirmed, the order floor and the rest), with `state.json.bak` as the last
 //!   good copy, read and written under an exclusive lock and replaced whole by a rename.
@@ -33,15 +33,15 @@
 //! - [`trust`] and [`settings`]: what the check believes without looking at its content
 //!   (`gh`, the trusted root, the host's settings) and the root-ownership check on it.
 //! - [`stage`]: the verify pipeline, in the order of the contract: size, digest,
-//!   attestation, shape, the binary's own report, the lease check, then the install behind a
+//!   attestation, shape, the binary's own report, then the install behind a
 //!   `VERIFIED` marker; behind the [`stage::Verifier`] trait.
 //! - [`seed`]: the release the package itself carries, its manifest, and the rules by which an
 //!   order that names it ([`helper::fetcher_seed`]) is admitted. It goes through the same
 //!   [`stage`] pipeline as a fetched release.
 //! - [`seq_floor`]: the highest `seq` a staged order may not use, kept at what the host has
 //!   confirmed; the writer of the file [`seed`] reads.
-//! - [`archive`], [`binary`] and [`darwin`]: the tarball, the kind of executable and its
-//!   `--version --json`, and on macOS the quarantine attribute and the code signature.
+//! - [`archive`] and [`binary`]: the tarball, the kind of executable and its
+//!   `--version --json`.
 //! - [`proxy_verb`]: `kbf-installer proxy`, the host of the `kbf-proxy` runtime (the one
 //!   public port of a frontend host); it shares nothing with the root helper above.
 //! - `proxy_pool`: what the proxy verb serves, a load balancer over frontends that run on
@@ -61,7 +61,6 @@ pub mod archive;
 pub mod attest;
 pub mod binary;
 pub mod cli;
-pub mod darwin;
 pub mod fetch;
 #[cfg(any(test, feature = "testkit"))]
 pub mod fixtures;

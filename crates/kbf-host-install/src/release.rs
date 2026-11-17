@@ -1,10 +1,9 @@
 //! Which release a version names. Pure: nothing is read here.
 //!
 //! A version of a build of `main` is `0.1.<seq>+g<12 hex digits of the commit>-<run>`
-//! (`xtask`'s `pkg_version`). The 12 digits pick the one tarball
-//! `kbf-<40 hex digits>-darwin-arm64.tar.gz` whose commit starts with them: among the file
-//! names of the channel's directory ([`pick_named`]), or, when the channel pins its releases,
-//! among the lines of its `SHA256SUMS` ([`pick`]).
+//! (`xtask`'s `pkg_version`). The 12 digits name the one tarball
+//! `kbf-<40 hex digits>-<platform>.tar.gz` whose commit starts with them, and the names of the
+//! release's files.
 
 /// The repository whose releases a channel takes unless it names another, and whose
 /// workflow's attestation it accepts.
@@ -94,15 +93,6 @@ pub fn is_signer_workflow(text: &str) -> bool {
 }
 
 impl Origin {
-    /// kbf's own repository, workflow and file names.
-    pub fn kbf() -> Self {
-        Self {
-            repository: REPO.to_owned(),
-            workflow: WORKFLOW.to_owned(),
-            prefix: ARTIFACT_PREFIX.to_owned(),
-        }
-    }
-
     /// An origin, if `repository` is `owner/name`, `workflow` is a `.yml` or `.yaml` file
     /// directly under `<repository>/.github/workflows/`, and `prefix` is lower-case letters,
     /// digits and `-` (at most 32, not starting with `-`).
@@ -185,9 +175,6 @@ impl Origin {
     }
 }
 
-/// The platform of a Mac's release.
-pub const PLATFORM: &str = "darwin-arm64";
-
 /// The extension of a release tarball.
 pub const TARBALL_EXTENSION: &str = "tar.gz";
 
@@ -221,22 +208,8 @@ pub fn is_commit(text: &str) -> bool {
     text.len() == COMMIT_LEN && text.bytes().all(is_hex)
 }
 
-/// The commit in a tarball's file name `kbf-<40 hex>-darwin-arm64.tar.gz`.
-pub fn commit_of_name(name: &str) -> Option<&str> {
-    commit_of_name_on(PLATFORM, name)
-}
-
-/// The commit in a tarball's file name `kbf-<40 hex>-<platform>.tar.gz`.
-pub fn commit_of_name_on<'a>(platform: &str, name: &'a str) -> Option<&'a str> {
-    commit_of_asset_on(platform, TARBALL_EXTENSION, name)
-}
-
-/// The commit in a release file's name `kbf-<40 hex>-<platform>.<extension>`.
-pub fn commit_of_asset_on<'a>(platform: &str, extension: &str, name: &'a str) -> Option<&'a str> {
-    commit_of_named_asset_on(ARTIFACT_PREFIX, platform, extension, name)
-}
-
-/// [`commit_of_asset_on`] for the files of a channel whose names start with `prefix`.
+/// The commit in a release file's name `<prefix>-<40 hex>-<platform>.<extension>`, for the files
+/// of a channel whose names start with `prefix`.
 pub fn commit_of_named_asset_on<'a>(
     prefix: &str,
     platform: &str,
@@ -273,47 +246,14 @@ pub fn listed_hash(sums: &str, name: &str) -> Result<String, PickError> {
     found.ok_or(PickError::Unknown)
 }
 
-/// The tarball of `commit`.
-pub fn tarball_name(commit: &str) -> String {
-    tarball_name_on(PLATFORM, commit)
-}
-
-/// The tarball of `commit` for `platform`.
-pub fn tarball_name_on(platform: &str, commit: &str) -> String {
-    asset_name_on(platform, TARBALL_EXTENSION, commit)
-}
-
-/// The release file `kbf-<commit>-<platform>.<extension>`.
-pub fn asset_name_on(platform: &str, extension: &str, commit: &str) -> String {
-    named_asset_on(ARTIFACT_PREFIX, platform, extension, commit)
-}
-
-/// [`asset_name_on`] for a channel whose names start with `prefix`.
+/// The release file `<prefix>-<commit>-<platform>.<extension>`.
 pub fn named_asset_on(prefix: &str, platform: &str, extension: &str, commit: &str) -> String {
     format!("{prefix}-{commit}-{platform}.{extension}")
-}
-
-/// The attestation bundle of `commit`'s tarball.
-pub fn bundle_name(commit: &str) -> String {
-    bundle_name_on(PLATFORM, commit)
-}
-
-/// The attestation bundle of `commit`'s tarball for `platform`.
-pub fn bundle_name_on(platform: &str, commit: &str) -> String {
-    bundle_of(&tarball_name_on(platform, commit))
 }
 
 /// The attestation bundle of the release file `asset`.
 pub fn bundle_of(asset: &str) -> String {
     format!("{asset}.sigstore.json")
-}
-
-/// The release a version picks out.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pick {
-    pub commit: String,
-    /// The sha256 the sums list for the tarball.
-    pub sha256: String,
 }
 
 /// Why no release was picked.
@@ -323,59 +263,4 @@ pub enum PickError {
     Malformed,
     /// No tarball of a commit that starts with the digits.
     Unknown,
-    /// Two commits start with them.
-    Ambiguous,
-}
-
-/// The tarball of the commit that starts with `prefix` in `sums`.
-///
-/// # Errors
-/// [`PickError`].
-pub fn pick(sums: &str, prefix: &str) -> Result<Pick, PickError> {
-    let mut names = std::collections::BTreeSet::new();
-    let mut found: Vec<Pick> = Vec::new();
-    if !sums.is_empty() && !sums.ends_with('\n') {
-        return Err(PickError::Malformed);
-    }
-    for line in sums.lines() {
-        let (hash, name) = line.split_once("  ").ok_or(PickError::Malformed)?;
-        let hash_ok = hash.len() == 64 && hash.bytes().all(is_hex);
-        if !hash_ok || name.is_empty() || name.contains('/') || !names.insert(name) {
-            return Err(PickError::Malformed);
-        }
-        if let Some(commit) = commit_of_name(name).filter(|commit| commit.starts_with(prefix)) {
-            found.push(Pick {
-                commit: commit.to_owned(),
-                sha256: hash.to_owned(),
-            });
-        }
-    }
-    match found.len() {
-        0 => Err(PickError::Unknown),
-        1 => Ok(found.remove(0)),
-        _ => Err(PickError::Ambiguous),
-    }
-}
-
-/// The commit that starts with `prefix` among the tarball file names `names` (a directory
-/// listing; names of anything else are ignored).
-///
-/// # Errors
-/// [`PickError::Unknown`] when none does, [`PickError::Ambiguous`] when two commits do.
-pub fn pick_named<'a>(
-    names: impl IntoIterator<Item = &'a str>,
-    prefix: &str,
-) -> Result<String, PickError> {
-    let mut found: Vec<&str> = names
-        .into_iter()
-        .filter_map(commit_of_name)
-        .filter(|commit| commit.starts_with(prefix))
-        .collect();
-    found.sort_unstable();
-    found.dedup();
-    match found.as_slice() {
-        [] => Err(PickError::Unknown),
-        [one] => Ok((*one).to_owned()),
-        _ => Err(PickError::Ambiguous),
-    }
 }

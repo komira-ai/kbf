@@ -93,7 +93,7 @@ fn the_manifest_constants_agree() {
     const { assert!(CLEANUP_SECS > 0 && crate::CLEANUP_RETRIES > 0 && crate::CUTOVER_SECS > 0) };
     assert_eq!(crate::HOOK_COMMAND, ["/usr/bin/kbf", "package-hook"]);
     assert_eq!(crate::PACKAGE, "kbf");
-    assert_eq!(crate::RUN_UNIT, "kbf-storage-and-daemon.service");
-    assert_eq!(crate::MODE, "storage-and-daemon");
+    assert_eq!(crate::RUN_UNIT, "kbf-storage.service");
+    assert_eq!(crate::MODE, "storage");
     assert_eq!(crate::STATE_DIR, "/var/lib/kbf-package-hook");
 }

@@ -10,7 +10,7 @@
 //! holds the orders that have not started, and never cuts one that has.
 //!
 //! The hold file is the helper's, at a fixed path whatever the agent's flags say:
-//! [`LINUX_PIN`] on Linux, [`MAC_PIN`] on a Mac (the packaged agent's state directory, which
+//! [`LINUX_PIN`] (the packaged agent's state directory, which
 //! is the agent's account's). Since that account owns the directory, only a regular file
 //! **owned by root and not writable by its group or by others** is a pin:
 //!
@@ -38,9 +38,6 @@ use crate::wire::{Commit, PinReport};
 
 /// The hold file on Linux: the helper writes it there (`kbf-host-install`'s `LINUX_HOLD`).
 pub const LINUX_PIN: &str = "/var/lib/kbf-updater/pin.json";
-
-/// The hold file on a Mac: the helper writes it there (`kbf-host-install`'s `MAC_HOLD`).
-pub const MAC_PIN: &str = "/var/db/kbf-updater/pin.json";
 
 /// The account a hold file must be owned by in production: root.
 pub const ROOT: u32 = 0;
@@ -115,12 +112,10 @@ impl PinFile {
         }
     }
 
-    /// The helper's hold file on the operating system `os` (as Rust names it: `macos` is a Mac,
-    /// anything else is taken for Linux), owned by root.
+    /// The helper's hold file, owned by root.
     #[must_use]
-    pub fn of_platform(os: &str) -> Self {
-        let path = if os == "macos" { MAC_PIN } else { LINUX_PIN };
-        Self::new(path, ROOT)
+    pub fn helper() -> Self {
+        Self::new(LINUX_PIN, ROOT)
     }
 
     /// What the hold file says now.

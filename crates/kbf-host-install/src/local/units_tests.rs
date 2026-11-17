@@ -19,7 +19,7 @@ fn wait() -> Wait {
 const INTERVAL: Duration = Duration::from_millis(1);
 
 fn unit() -> Unit {
-    Unit::service("kbf-daemon.service").unwrap()
+    Unit::service("kbf-storage.service").unwrap()
 }
 
 fn lines(runner: &FakeRunner) -> Vec<String> {
@@ -50,10 +50,10 @@ fn a_restarted_unit_is_looked_at_until_it_is_active() {
     assert_eq!(
         lines(&runner),
         [
-            "/usr/bin/systemctl restart -- kbf-daemon.service",
-            "/usr/bin/systemctl is-active -- kbf-daemon.service",
-            "/usr/bin/systemctl is-active -- kbf-daemon.service",
-            "/usr/bin/systemctl is-active -- kbf-daemon.service",
+            "/usr/bin/systemctl restart -- kbf-storage.service",
+            "/usr/bin/systemctl is-active -- kbf-storage.service",
+            "/usr/bin/systemctl is-active -- kbf-storage.service",
+            "/usr/bin/systemctl is-active -- kbf-storage.service",
         ]
     );
 }
@@ -65,7 +65,7 @@ fn a_restart_that_fails_or_a_unit_that_never_comes_up_is_an_error() {
     let runner = FakeRunner::new(vec![exec(5, "", "Unit not found.")]);
     let err = restart_and_wait(&runner, &unit(), wait(), &Fake::new().pace()).unwrap_err();
     assert!(
-        err.contains("kbf-daemon.service") && err.contains("Unit not found"),
+        err.contains("kbf-storage.service") && err.contains("Unit not found"),
         "{err}"
     );
     assert_eq!(

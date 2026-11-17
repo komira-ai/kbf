@@ -1,4 +1,4 @@
-//! The health of a storage or daemon host, from the frontend's loopback operator API
+//! The health of a storage host, from the frontend's loopback operator API
 //! ([`crate::operator`]; `docs/api.md`).
 //!
 //! # A frontend host
@@ -24,9 +24,7 @@
 //!
 //! A member is `active` only while its lease is current, so an `active` member is a connected
 //! one; there is no separate connected flag on a member. A restarted node registers again and
-//! its `build_commit` is the new build's, so the old process cannot pass for the new. The
-//! daemon half of a host that runs both is not judged: the inventory does not say whether
-//! there is one.
+//! its `build_commit` is the new build's, so the old process cannot pass for the new.
 //!
 //! More than one member at the address is ambiguous (safe-to-stop answers 409 for it): none
 //! is taken, so a stale `down` row beside the live one cannot pass for it, nor hide it.
@@ -48,35 +46,6 @@
 //! blob is known to be owed a copy (`under_replicated_blobs` is zero or unknown: a number
 //! that cannot be told because another member is down is not this host's to wait for). The
 //! roll waits otherwise, and fails at once for `no_storage` and `unknown_node`.
-//!
-//! # A daemon host
-//!
-//! The daemon reports no build commit to the frontend (`Hello` carries only
-//! `daemon_version`), so the commit comes from the host itself: the `running_commit` of its
-//! `kbf-host-install query`, asked over ssh through the installer the roll installs with.
-//! A daemon host is **healthy** when `GET /v1/nodes/{id}` (the node id the inventory lists
-//! for it, else the alias) says it is `connected` and its placement is `serving`, and the
-//! host's `running_commit` is the target's by the rule storage uses ([`names`]).
-//!
-//! A node the roll holds drained is judged by [`NodeHealth::check_held`]: the same, without
-//! `serving`, which it cannot be until the roll undrains it. The roll then undrains it and
-//! asks [`NodeHealth::check`], so `serving` is shown too before the host is done.
-//!
-//! A node is connected to exactly one frontend, and a host's updater reaches the frontends
-//! through the farm's load balancer, which picks one per connection and which the updater
-//! cannot steer. A frontend that does not hold the node answers from the shared store: the
-//! node, `connected: false`, or a 404. So one answer of "not connected" proves nothing, and
-//! reading one answer made the check flap with the balancer's choice. [`NodeHealth::for_updater`]
-//! therefore asks again, each time on a new connection, up to [`FRONTEND_SAMPLES`] times, and
-//! takes the first answer that says connected: the node is as healthy as the frontend that
-//! holds it says. Only when no answer says so does the check wait ("is not connected", or
-//! "has not registered"), and it fails as before when no sample could be read at all.
-//!
-//! The roll waits while the node has not registered with this frontend since it started
-//! (404), is not connected, is not serving (unless held), or the host has not reported a
-//! commit or reports another. It fails at once for a version that names no commit.
-
-use std::sync::Arc;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -84,14 +53,8 @@ use serde::de::DeserializeOwned;
 use crate::health::{commit_of, names};
 use crate::inventory::{Host, Role, valid_node_id};
 use crate::operator::{CHECK, OperatorApi, WHAT};
-use crate::ports::{Health, HealthCheck, Installer, PortError};
+use crate::ports::{Health, HealthCheck, PortError};
 use crate::version::Version;
-
-/// How many times a host's updater asks the frontends (through the load balancer, one new
-/// connection each) whether its node is connected, before it believes that none holds it. With
-/// the balancer sharing connections out in turn, two frontends are both reached by the second
-/// ask; the rest covers a balancer that picks at random (one miss in 2^8 for two frontends).
-pub const FRONTEND_SAMPLES: usize = 8;
 
 /// What the check says of a frontend host that is listed without `instance=` and `base=`.
 pub const NO_MEMBER_REFUSAL: &str =
@@ -122,17 +85,6 @@ struct Member {
     addr: String,
     state: String,
     build_commit: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DaemonNode {
-    connected: bool,
-    placement: Placement,
-}
-
-#[derive(Deserialize)]
-struct Placement {
-    state: String,
 }
 
 /// How a node stands to the storage members, in `GET /v1/nodes/{id}/storage-health`.
@@ -176,37 +128,28 @@ enum StorageView {
     Own,
 }
 
-/// Health of storage and daemon hosts, over the frontend's operator API.
+/// Health of storage hosts, over the frontend's operator API.
 pub struct NodeHealth {
     api: OperatorApi,
-    /// Asked what commit a daemon host runs.
-    installer: Arc<dyn Installer>,
     storage_view: StorageView,
-    /// How many answers about a daemon's node are read, at most, to find the one that says it
-    /// is connected (see the module docs); 1 for a client that reaches one frontend.
-    samples: usize,
 }
 
 impl NodeHealth {
-    /// A health check over a client that was made (and its files checked) already, and the
-    /// installer that tells what commit a daemon host runs.
-    pub fn with_api(api: OperatorApi, installer: Arc<dyn Installer>) -> NodeHealth {
+    /// A health check over a client that was made (and its files checked) already.
+    pub fn with_api(api: OperatorApi) -> NodeHealth {
         NodeHealth {
             api,
-            installer,
             storage_view: StorageView::Lists,
-            samples: 1,
         }
     }
 
     /// As [`NodeHealth::with_api`], for a client that is a host's updater (no token): a storage
     /// host is judged from its own view and the two storage numbers, which its certificate may
     /// read.
-    pub fn for_updater(api: OperatorApi, installer: Arc<dyn Installer>) -> NodeHealth {
+    pub fn for_updater(api: OperatorApi) -> NodeHealth {
         NodeHealth {
             storage_view: StorageView::Own,
-            samples: FRONTEND_SAMPLES,
-            ..NodeHealth::with_api(api, installer)
+            ..NodeHealth::with_api(api)
         }
     }
 
@@ -221,31 +164,6 @@ impl NodeHealth {
             }),
             404 => Ok(None),
             _ => Err(reply.failure(WHAT, CHECK)),
-        }
-    }
-
-    /// A daemon's node as the frontends say it, asking up to `samples` times for an answer
-    /// that says it is connected (the first is returned at once). Without one: the last
-    /// answer that named the node, else a 404 if every answer was one, else the last error
-    /// if no answer could be read.
-    fn daemon_node(&self, path: &str) -> Result<Option<DaemonNode>, PortError> {
-        let mut named = None;
-        let mut answered = false;
-        let mut failed = None;
-        for _ in 0..self.samples.max(1) {
-            match self.read::<DaemonNode>(path) {
-                Ok(Some(node)) if node.connected => return Ok(Some(node)),
-                Ok(Some(node)) => {
-                    named = Some(node);
-                    answered = true;
-                }
-                Ok(None) => answered = true,
-                Err(e) => failed = Some(e),
-            }
-        }
-        match failed {
-            Some(e) if !answered => Err(e),
-            _ => Ok(named),
         }
     }
 
@@ -267,7 +185,7 @@ impl NodeHealth {
         };
         if node.advertise.is_empty() {
             return Ok(Health::Abandoned(format!(
-                "{alias} advertises no storage address, so it has no storage member; list it as a daemon"
+                "{alias} advertises no storage address, so it has no storage member"
             )));
         }
         let members: Members = self.read("/v1/members")?.ok_or_else(|| {
@@ -326,36 +244,6 @@ impl NodeHealth {
         })?;
         Ok(own_health(alias, commit, own))
     }
-
-    /// `held`: the roll holds the node drained, so it is not asked to be serving.
-    fn daemon(&self, host: &Host, target: &Version, held: bool) -> Result<Health, PortError> {
-        let commit = match commit_of(target) {
-            Ok(commit) => commit,
-            Err(health) => return Ok(health),
-        };
-        let alias = &host.alias;
-        let waiting = |why: &str| Ok(Health::Waiting(format!("{alias} {why}")));
-        let node_id = host.node_id.as_deref().unwrap_or(alias);
-        let Some(node) = self.daemon_node(&format!("/v1/nodes/{node_id}"))? else {
-            return waiting("has not registered with the frontend since it started");
-        };
-        if !node.connected {
-            return waiting("is not connected");
-        }
-        if !held && node.placement.state != "serving" {
-            return Ok(Health::Waiting(format!(
-                "{alias} is {}, not serving",
-                node.placement.state
-            )));
-        }
-        match self.installer.report(host)?.running_commit {
-            Some(built) if names(&built, commit) => Ok(Health::Healthy),
-            Some(built) => Ok(Health::Waiting(format!(
-                "{alias} runs build {built}, not the target's"
-            ))),
-            None => waiting("has not reported the commit it runs"),
-        }
-    }
 }
 
 /// What a storage host's own view says of it, for the target's `commit`.
@@ -408,12 +296,11 @@ impl HealthCheck for NodeHealth {
         }
     }
 
-    /// A daemon-only host is judged as a daemon, a storage host as a storage node, and a
-    /// frontend not here (see [`MEMBER_ELSEWHERE`]).
+    /// A storage host is judged as a storage node, and a frontend not here (see
+    /// [`MEMBER_ELSEWHERE`]).
     fn check(&self, host: &Host, target: &Version) -> Result<Health, PortError> {
         match host.role {
             Role::Frontend => Ok(Health::Abandoned(MEMBER_ELSEWHERE.to_owned())),
-            Role::Daemon | Role::MacDaemon => self.daemon(host, target, false),
             Role::Storage => match self.storage_view {
                 StorageView::Lists => self.storage(host, target),
                 StorageView::Own => self.storage_own(host, target),
@@ -421,11 +308,8 @@ impl HealthCheck for NodeHealth {
         }
     }
 
-    /// As [`HealthCheck::check`], but a daemon is not asked to be serving.
+    /// As [`HealthCheck::check`]: a storage node has no drain to be held through.
     fn check_held(&self, host: &Host, target: &Version) -> Result<Health, PortError> {
-        match host.role {
-            Role::Daemon | Role::MacDaemon => self.daemon(host, target, true),
-            Role::Frontend | Role::Storage => self.check(host, target),
-        }
+        self.check(host, target)
     }
 }

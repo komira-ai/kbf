@@ -262,7 +262,7 @@ fn the_unpin_command_audits_what_it_did_on_a_linux_host() {
         audit: rig.dir.join("audit.log"),
     };
     let hold = agent_dir(&rig).join("pin.json");
-    let args: Vec<String> = format!("kbf={VB} --pin --restart-unit kbf-daemon.service")
+    let args: Vec<String> = format!("kbf={VB} --pin --restart-unit kbf-storage.service")
         .split(' ')
         .map(str::to_owned)
         .collect();

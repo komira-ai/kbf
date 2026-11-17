@@ -1,6 +1,6 @@
 //! Whether this host runs a frontend: the top-level `mode` of its `kbf.toml`
 //! (docs/design/kbf-installer.md section 4: a `frontend_update` record is accepted only on a
-//! host whose mode is `frontend` or `all-in-one`). Only that one key is read, and a file that
+//! host whose mode is `frontend`). Only that one key is read, and a file that
 //! is missing, unreadable, too big or not TOML is a host that is not a frontend, with the
 //! reason in the answer: a malformed `kbf.toml` is the node's to refuse, never a reason for
 //! the helper to stop.
@@ -12,17 +12,17 @@ use crate::layout::Layout;
 /// The most of `kbf.toml` that is read.
 const MAX_BYTES: u64 = 1 << 20;
 
-/// `Ok` when the host's `kbf.toml` says `mode = "frontend"` or `"all-in-one"`; otherwise why not.
+/// `Ok` when the host's `kbf.toml` says `mode = "frontend"`; otherwise why not.
 pub fn frontend_host(layout: &Layout) -> Result<(), String> {
     match read_mode(layout)?.as_str() {
-        "frontend" | "all-in-one" => Ok(()),
+        "frontend" => Ok(()),
         other => Err(format!("{} mode is {other:?}", layout.kbf_toml())),
     }
 }
 
 /// The systemd unit that runs this host's mode: the first unit `setup` enabled for the `mode`
 /// of its `kbf.toml`. It is how `run` learns what to restart when the service is not told
-/// (`run` with neither `--unit` nor `--launchd-label`).
+/// (`run` without `--unit`).
 pub fn mode_unit(layout: &Layout) -> Result<&'static str, String> {
     use clap::ValueEnum;
     let mode = read_mode(layout)?;
@@ -81,25 +81,20 @@ mod tests {
     use super::{first_unit, frontend_host};
     use crate::testkit::{host_root, mkdirs};
 
-    /// Catches `frontend_host` accepting a mode that is not a frontend: exactly `frontend` and
-    /// `all-in-one` are accepted, and every other mode string of kbf (`storage`,
-    /// `storage-and-daemon`, `daemon`), an unknown one and a missing mode or file is refused,
-    /// the refusal naming the mode it saw.
+    /// Catches `frontend_host` accepting a mode that is not a frontend: exactly `frontend` is
+    /// accepted, and every other mode string (`storage`, and the names of the modes that were
+    /// removed), an unknown one and a missing mode or file is refused, the refusal naming the
+    /// mode it saw.
     ///
     /// Catches: `| "storage"` added to the accepted arm of `frontend_host` fails the
     /// `storage` row; any other mode added fails its own row.
     #[test]
-    fn exactly_frontend_and_all_in_one_are_frontend_hosts() {
+    fn exactly_frontend_is_a_frontend_host() {
         // (file text, accepted, text the refusal must contain)
-        let rows: [(Option<&str>, bool, &str); 8] = [
+        let rows: [(Option<&str>, bool, &str); 7] = [
             (Some("mode = \"frontend\"\n"), true, ""),
-            (Some("mode = \"all-in-one\"\n"), true, ""),
             (Some("mode = \"storage\"\n"), false, "\"storage\""),
-            (
-                Some("mode = \"storage-and-daemon\"\n"),
-                false,
-                "\"storage-and-daemon\"",
-            ),
+            (Some("mode = \"all-in-one\"\n"), false, "\"all-in-one\""),
             (Some("mode = \"daemon\"\n"), false, "\"daemon\""),
             (Some("mode = \"bogus\"\n"), false, "\"bogus\""),
             (Some("listen = \"x\"\n"), false, "has no mode"),

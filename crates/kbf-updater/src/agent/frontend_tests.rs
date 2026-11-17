@@ -1,6 +1,6 @@
 //! The agent's calls to the frontend with the host's own certificate and no token, against a
 //! frontend played by a TLS server in the test: what it presents, what it sends (the three
-//! calls about its node and nothing else), whom it will talk to, and what the agent builds from
+//! call about its node and nothing else), whom it will talk to, and what the agent builds from
 //! the flags it is given.
 
 use std::net::SocketAddr;
@@ -11,25 +11,21 @@ use std::time::Duration;
 use kbf_testkit::dir::TestDir;
 use kbf_types::HostRole;
 
-use super::build::{NO_CREDENTIAL, node_ports};
+use super::build::{NO_CREDENTIAL, node_health};
 use super::coordinator::{Endpoint, TlsFiles};
 use super::coordinator_tests::{Plan, Seen, http, ok, serve, server_config};
 use super::flags::{Config, NodeApi, Timing};
-use super::local::{Limits, SocketLocal};
 use super::pki::{Leaf, Pki, write_files};
 use super::testing::host;
 use crate::identity::{Identity, identity_of};
 use crate::inventory::Role;
+use crate::node_health::NodeHealth;
 use crate::operator::OperatorApi;
-use crate::ports::PortErrorKind;
+use crate::ports::{Health, HealthCheck, PortError, PortErrorKind};
 use crate::version::Version;
 
 /// A storage host's own view: its member active on the commit `aaaaaaaaaaaa`, nothing owed.
 const OWN: &str = r#"{"node":"n1","half":"member","member":{"id":1,"state":"active","build_commit":"aaaaaaaaaaaa"},"storage":{"members_active":3,"under_replicated_blobs":0}}"#;
-
-const SERVING: &str = r#"{"placement":{"state":"serving"},"leases":[],"connected":true}"#;
-
-const NODE: &str = r#"{"placement":{"state":"draining"},"leases":["a","b"],"connected":true}"#;
 
 struct Rig {
     pki: Pki,
@@ -42,7 +38,7 @@ impl Rig {
     fn new(name: &str) -> Self {
         let pki = Pki::new();
         let dir = TestDir::under(std::env::temp_dir(), name);
-        let updater = pki.updater("n1", HostRole::DAEMON);
+        let updater = pki.updater("n1", HostRole::STORAGE);
         let files = write_files(&dir, &pki, &updater);
         Self {
             pki,
@@ -81,7 +77,6 @@ impl Rig {
             state_dir: None,
             cordon_dir: None,
             node_api: None,
-            daemon_node: None,
             timing: Timing::DEFAULT,
             services: Vec::new(),
         }
@@ -94,43 +89,29 @@ fn head_of(seen: &Seen) -> (Vec<String>, String) {
     (head.lines().map(str::to_owned).collect(), body.to_owned())
 }
 
-/// A daemon host's agent drains, reads and undrains its own node through the frontend with its
-/// updater certificate: the three calls, the paths of the operator API, the node id of the
-/// certificate in each, mutual TLS with that certificate, and no `Authorization` header, no
-/// proxy secret and no token anywhere in a request.
+/// The target the storage view `OWN` is healthy for.
+fn target() -> Version {
+    Version::parse("0.1.5+gaaaaaaaaaaaa-2").unwrap()
+}
+
+/// A storage host's health, read as its updater does through `api`.
+fn health_of(api: OperatorApi) -> Result<Health, PortError> {
+    NodeHealth::for_updater(api).check(&host(Role::Storage), &target())
+}
+
+/// A storage host's agent reads its own node's storage health through the frontend with its
+/// updater certificate: one call, the path of the operator API with the node id of the
+/// certificate in it, mutual TLS with that certificate, and no `Authorization` header, no proxy
+/// secret and no token anywhere in a request.
 #[test]
-fn the_agent_drains_reads_and_undrains_its_node_with_its_certificate_and_no_token() {
-    let rig = Rig::new("fe-three");
-    let (addr, server) = rig.frontend(vec![ok("{}"), ok(NODE), ok("{}")]);
-    let api = rig.api(addr);
-    let drain = super::build::drain_for(Role::Daemon, &api);
-    let h = host(Role::Daemon);
-    assert_eq!(drain.drain(&h, Some(Duration::from_secs(600))), Ok(()));
-    assert_eq!(drain.leases(&h), Ok(2));
-    assert_eq!(drain.undrain(&h), Ok(()));
+fn the_agent_reads_its_storage_health_with_its_certificate_and_no_token() {
+    let rig = Rig::new("fe-one");
+    let (addr, server) = rig.frontend(vec![ok(OWN)]);
+    assert_eq!(health_of(rig.api(addr)), Ok(Health::Healthy));
 
     let seen = server.join().unwrap();
-    let calls: Vec<(String, String)> = seen
-        .iter()
-        .map(|s| {
-            let (lines, body) = head_of(s);
-            (lines[0].clone(), body)
-        })
-        .collect();
-    assert_eq!(
-        calls,
-        [
-            (
-                "POST /v1/nodes/n1:drain HTTP/1.1".to_owned(),
-                r#"{"deadline_secs":600}"#.to_owned()
-            ),
-            ("GET /v1/nodes/n1 HTTP/1.1".to_owned(), String::new()),
-            (
-                "POST /v1/nodes/n1:uncordon HTTP/1.1".to_owned(),
-                String::new()
-            ),
-        ]
-    );
+    let calls: Vec<String> = seen.iter().map(|s| head_of(s).0[0].clone()).collect();
+    assert_eq!(calls, ["GET /v1/nodes/n1/storage-health HTTP/1.1"]);
     for one in &seen {
         let (lines, _) = head_of(one);
         assert!(lines.contains(&format!("Host: localhost:{}", addr.port())));
@@ -144,30 +125,9 @@ fn the_agent_drains_reads_and_undrains_its_node_with_its_certificate_and_no_toke
         let who = identity_of(one.client.as_deref().expect("a client certificate")).unwrap();
         assert_eq!(
             (who.node_id.to_string(), who.role),
-            ("n1".to_owned(), HostRole::DAEMON)
+            ("n1".to_owned(), HostRole::STORAGE)
         );
     }
-}
-
-/// The node's status for the health check is the same call, and a daemon that is connected and
-/// held (drained) is judged by it alone, not by anything of the operator API.
-#[test]
-fn a_daemon_hosts_health_is_read_from_its_own_node_through_the_frontend() {
-    let rig = Rig::new("fe-health");
-    let (addr, server) = rig.frontend(vec![ok(NODE)]);
-    let config = rig.config(Some(addr));
-    let local = std::sync::Arc::new(SocketLocal::new(
-        &rig.dir.join("none.sock"),
-        Limits::default(),
-    ));
-    let (_, health) = node_ports(&config, &rig.identity(), Role::Daemon, "kbf", &local).unwrap();
-    let target = Version::parse("0.1.5+gaaaaaaaaaaaa-2").unwrap();
-    // The helper is not there, so the commit cannot be read: the check fails there, after it
-    // asked the frontend for the node, and not before.
-    let result = health.check_held(&host(Role::Daemon), &target);
-    assert!(result.is_err(), "{result:?}");
-    let seen = server.join().unwrap();
-    assert_eq!(head_of(&seen[0]).0[0], "GET /v1/nodes/n1 HTTP/1.1");
 }
 
 /// What the agent builds from its flags: the token, if it was given, is the way to the frontend
@@ -176,75 +136,28 @@ fn a_daemon_hosts_health_is_read_from_its_own_node_through_the_frontend() {
 #[test]
 fn the_ports_follow_the_flags_the_agent_was_given() {
     let rig = Rig::new("fe-ports");
-    let local = std::sync::Arc::new(SocketLocal::new(
-        &rig.dir.join("none.sock"),
-        Limits::default(),
-    ));
-    let h = host(Role::Daemon);
+    let h = host(Role::Storage);
 
-    let none = rig.config(None);
-    let (drain, health) = node_ports(&none, &rig.identity(), Role::Daemon, "kbf", &local).unwrap();
-    for text in [
-        drain
-            .drain(&h, Some(Duration::from_secs(1)))
-            .unwrap_err()
-            .to_string(),
-        health.refusal(&h).unwrap(),
-    ] {
-        assert_eq!(text, NO_CREDENTIAL);
-    }
-
-    // The drain reads the node first (to tell its own cordon from an operator's), then drains.
-    let (addr, server) = rig.frontend(vec![ok(SERVING), ok("{}")]);
-    let with_frontend = rig.config(Some(addr));
-    let (drain, _) =
-        node_ports(&with_frontend, &rig.identity(), Role::Daemon, "kbf", &local).unwrap();
-    assert_eq!(drain.drain(&h, Some(Duration::from_secs(1))), Ok(()));
-    let seen = server.join().unwrap();
-    assert_eq!(head_of(&seen[0]).0[0], "GET /v1/nodes/n1 HTTP/1.1");
-    assert_eq!(head_of(&seen[1]).0[0], "POST /v1/nodes/n1:drain HTTP/1.1");
-    assert_eq!(seen.len(), 2);
-
-    // A storage host is built the same way: its drain and its health are calls to the frontend
-    // too, and it refuses nothing for want of the token.
-    let (addr, server) = rig.frontend(vec![
-        http("404 Not Found", "", "{}"),
-        http("404 Not Found", "", "{}"),
-        ok(OWN),
-    ]);
-    // Its own marks: the daemon's drain above left one for the same node.
-    let marks = rig.dir.join("storage-marks");
-    std::fs::create_dir(&marks).unwrap();
-    let mut with_frontend = rig.config(Some(addr));
-    with_frontend.cordon_dir = Some(marks);
-    let (storage_drain, storage_health) = node_ports(
-        &with_frontend,
-        &rig.identity(),
-        Role::Storage,
-        "kbf",
-        &local,
-    )
-    .unwrap();
-    let st = host(Role::Storage);
-    assert_eq!(storage_health.refusal(&st), None);
+    let health = node_health(&rig.config(None), &rig.identity()).unwrap();
+    assert_eq!(health.refusal(&h).unwrap(), NO_CREDENTIAL);
     assert_eq!(
-        storage_drain.drain(&st, Some(Duration::from_secs(1))),
-        Ok(())
+        health.check(&h, &target()).unwrap_err().to_string(),
+        NO_CREDENTIAL
     );
-    let target = Version::parse("0.1.5+gaaaaaaaaaaaa-2").unwrap();
-    assert_eq!(
-        storage_health.check_held(&st, &target),
-        Ok(crate::ports::Health::Healthy)
-    );
+
+    // With the frontend, the host's own certificate asks it for the node's storage health.
+    let (addr, server) = rig.frontend(vec![ok(OWN)]);
+    let health = node_health(&rig.config(Some(addr)), &rig.identity()).unwrap();
+    assert_eq!(health.refusal(&h), None);
+    assert_eq!(health.check(&h, &target()), Ok(Health::Healthy));
     let seen = server.join().unwrap();
-    assert_eq!(head_of(&seen[0]).0[0], "GET /v1/nodes/n1 HTTP/1.1");
-    assert_eq!(head_of(&seen[1]).0[0], "POST /v1/nodes/n1:drain HTTP/1.1");
     assert_eq!(
-        head_of(&seen[2]).0[0],
+        head_of(&seen[0]).0[0],
         "GET /v1/nodes/n1/storage-health HTTP/1.1"
     );
+    assert_eq!(seen.len(), 1);
 
-    // The token, given, wins: the drain goes to the loopback address and the frontend is never
+    // The token, given, wins: the call goes to the loopback address and the frontend is never
     // dialled (a connection of the test's own is the only one it sees).
     let (alive, watcher) = rig.frontend(vec![ok("{}")]);
     let token = rig.dir.join("token");
@@ -255,8 +168,8 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
         addr: "127.0.0.1:1".parse().unwrap(),
         token_file: token,
     });
-    let (drain, _) = node_ports(&with_token, &rig.identity(), Role::Daemon, "kbf", &local).unwrap();
-    let err = drain.drain(&h, Some(Duration::from_secs(1))).unwrap_err();
+    let health = node_health(&with_token, &rig.identity()).unwrap();
+    let err = health.check(&h, &target()).unwrap_err();
     assert_eq!(err.kind(), PortErrorKind::Unreachable);
     assert!(err.to_string().contains("the operator API"), "{err}");
     drop(std::net::TcpStream::connect(alive));
@@ -273,7 +186,6 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
 #[test]
 fn only_the_frontend_is_talked_to() {
     let rig = Rig::new("fe-who");
-    let h = host(Role::Daemon);
     let strangers = Pki::new();
     let cases = [
         serve(
@@ -290,8 +202,7 @@ fn only_the_frontend_is_talked_to() {
         ),
     ];
     for (addr, server) in cases {
-        let drain = super::build::drain_for(Role::Daemon, &rig.api(addr));
-        let err = drain.drain(&h, Some(Duration::from_secs(1))).unwrap_err();
+        let err = health_of(rig.api(addr)).unwrap_err();
         assert_eq!(err.kind(), PortErrorKind::Other, "{err}");
         assert!(err.to_string().contains("is not the frontend"), "{err}");
         assert!(server.join().unwrap()[0].request.is_empty());
@@ -299,19 +210,16 @@ fn only_the_frontend_is_talked_to() {
 }
 
 /// An agent whose files were swapped for another node's certificate does not present it (the
-/// node it drains is the one it started as), whose files cannot be used say so without a path,
-/// and a frontend that cannot be reached is unreachable.
+/// node it asks about is the one it started as), whose files cannot be used say so without a
+/// path, and a frontend that cannot be reached is unreachable.
 #[test]
 fn a_swapped_pair_a_bad_file_and_a_dead_frontend_are_refused() {
     let rig = Rig::new("fe-files");
-    let h = host(Role::Daemon);
     let (addr, server) = rig.frontend(vec![ok("{}")]);
     let api = rig.api(addr);
-    let other = rig.pki.updater("n2", HostRole::DAEMON);
+    let other = rig.pki.updater("n2", HostRole::STORAGE);
     write_files(&rig.dir, &rig.pki, &other);
-    let err = super::build::drain_for(Role::Daemon, &api)
-        .drain(&h, Some(Duration::from_secs(1)))
-        .unwrap_err();
+    let err = health_of(api.clone()).unwrap_err();
     assert_eq!(err.kind(), PortErrorKind::Other);
     assert!(
         err.to_string().contains("TLS files cannot be used"),
@@ -330,9 +238,7 @@ fn a_swapped_pair_a_bad_file_and_a_dead_frontend_are_refused() {
     let storage = rig.pki.storage_node("n1");
     std::fs::write(&rig.files.cert, storage.cert_pem()).unwrap();
     std::fs::write(&rig.files.key, storage.key_pem()).unwrap();
-    let err = super::build::drain_for(Role::Daemon, &api_for_dead(&rig))
-        .drain(&h, Some(Duration::from_secs(1)))
-        .unwrap_err();
+    let err = health_of(api_for_dead(&rig)).unwrap_err();
     assert!(
         err.to_string().contains("TLS files cannot be used"),
         "{err}"
@@ -342,9 +248,7 @@ fn a_swapped_pair_a_bad_file_and_a_dead_frontend_are_refused() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap()
     };
-    let err = super::build::drain_for(Role::Daemon, &rig.api(dead))
-        .drain(&h, Some(Duration::from_secs(1)))
-        .unwrap_err();
+    let err = health_of(rig.api(dead)).unwrap_err();
     assert_eq!(err.kind(), PortErrorKind::Unreachable);
 }
 
@@ -362,17 +266,16 @@ fn a_chunked_reply_is_read_and_a_refusal_is_a_refusal() {
         format!(
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
              5\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
-            &NODE[..5],
-            NODE.len() - 5,
-            &NODE[5..]
+            &OWN[..5],
+            OWN.len() - 5,
+            &OWN[5..]
         )
         .into_bytes(),
     );
     let (addr, server) = rig.frontend(vec![chunked, http("403 Forbidden", "", "{}")]);
-    let drain = super::build::drain_for(Role::Daemon, &rig.api(addr));
-    let h = host(Role::Daemon);
-    assert_eq!(drain.leases(&h), Ok(2));
-    let err = drain.drain(&h, Some(Duration::from_secs(1))).unwrap_err();
+    let api = rig.api(addr);
+    assert_eq!(health_of(api.clone()), Ok(Health::Healthy));
+    let err = health_of(api).unwrap_err();
     assert!(err.to_string().contains("refused the call (403)"), "{err}");
     server.join().unwrap();
 }

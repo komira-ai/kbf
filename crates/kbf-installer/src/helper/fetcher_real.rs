@@ -31,10 +31,7 @@
 //!
 //! The binary builds a [`RealFetcher`] for each fetch, with
 //! [`HostFetcher`](super::fetcher_host::HostFetcher), from `installer.toml` and the host's
-//! [`Parts`]. For an activation the cycle checks the helper's leases before it fetches, and
-//! the pipeline checks again with the fetch's own lease source (both come from
-//! [`leases::for_restart`](super::leases::for_restart) in the binary); a frontend update
-//! (setup's first release too) skips the pipeline's lease step.
+//! [`Parts`].
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -50,8 +47,7 @@ use crate::binary::Arch;
 use crate::fetch::pipe::{PipeFault, Received as Pulled};
 use crate::fetch::{self, ChildProgram, Component, Limits, Source};
 use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
-use crate::helper::leases::LeaseSource;
-use crate::layout::{Layout, Platform};
+use crate::layout::Layout;
 use crate::refusal::Refusal;
 use crate::run::Runner;
 use crate::settings::Settings;
@@ -67,8 +63,6 @@ pub struct RealFetcher {
     /// Says who owns the trust list and reads it; the host's own on a host.
     pub trust: Box<dyn Exec>,
     pub runner: Box<dyn Runner>,
-    /// Observed again at the pipeline's lease step, after the cycle's own check.
-    pub leases: Box<dyn LeaseSource>,
     /// Who owns the scratch directory and the release: root on a host.
     pub owner: Owner,
     pub child: ChildProgram,
@@ -77,13 +71,12 @@ pub struct RealFetcher {
 }
 
 /// What a [`RealFetcher`] takes from the host itself rather than from its configuration: who
-/// answers for ownership, how a tool is run, how leases are counted, who owns the scratch
+/// answers for ownership, how a tool is run, who owns the scratch
 /// directory and which program is the fetch child. A test plays each.
 pub struct Parts {
     /// Says who owns the trust list and reads it; the host's own on a host.
     pub trust: Box<dyn Exec>,
     pub runner: Box<dyn Runner>,
-    pub leases: Box<dyn LeaseSource>,
     /// Who owns the scratch directory and the release: root on a host.
     pub owner: Owner,
     pub child: ChildProgram,
@@ -107,7 +100,6 @@ impl RealFetcher {
             policy,
             trust: parts.trust,
             runner: parts.runner,
-            leases: parts.leases,
             owner: parts.owner,
             child: parts.child,
             source,
@@ -143,10 +135,9 @@ struct Bundle {
     size: u64,
 }
 
-/// The release platform of a host of `os` on `arch`; `None` for a pair no release is built for
-/// (a Mac on x86-64).
-fn host_platform(os: Platform, arch: Arch) -> Option<ReleasePlatform> {
-    ReleasePlatform::from_report(os.name(), &arch.to_string())
+/// The release platform of a host of `os` on `arch`; `None` for a pair no release is built for.
+fn host_platform(os: &str, arch: Arch) -> Option<ReleasePlatform> {
+    ReleasePlatform::from_report(os, &arch.to_string())
 }
 
 impl RealFetcher {
@@ -172,7 +163,7 @@ impl RealFetcher {
             ));
         }
         let (os, arch) = (self.host.platform(), self.settings.arch);
-        let platform = host_platform(os, arch).ok_or_else(|| {
+        let platform = host_platform(os.name(), arch).ok_or_else(|| {
             FetchError::Rejected(format!(
                 "platform: no release is built for {} on {arch}",
                 os.name()
@@ -251,7 +242,6 @@ impl RealFetcher {
             policy: self.policy,
             trust: &*self.trust,
             runner: &*self.runner,
-            leases: &*self.leases,
             owner: self.owner,
         };
         pipeline

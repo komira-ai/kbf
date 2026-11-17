@@ -376,11 +376,6 @@ fn the_child_is_this_program_as_the_fetch_user_or_a_typed_error() {
         matches!(got, Err(ProgramFault::User(UserFault::Root(_)))),
         "root is never the fetch user"
     );
-    let got = ChildProgram::of_this_program(Platform::MacOs);
-    assert!(
-        matches!(&got, Err(ProgramFault::User(UserFault::Missing(name))) if name == "_kbf-fetch"),
-        "{got:?}"
-    );
 }
 
 /// Who a child would run as, against who it may: a child that would be root, or in root's

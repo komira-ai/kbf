@@ -63,7 +63,7 @@ impl Rig {
 
     fn agent(&self) -> Agent {
         self.agent_with(
-            host(Role::Daemon),
+            host(Role::Storage),
             Arc::new(self.drain.clone()),
             Arc::new(self.health.clone()),
         )

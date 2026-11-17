@@ -2,8 +2,8 @@
 //!
 //! One action digest must never mean two sets of bytes, so an image is named only by a
 //! per-architecture manifest digest, and a tag is refused by its spelling. This is the
-//! form of the container driver's `container-image` platform property and of
-//! `kbf-daemon --image`; the deploy tool checks rendered units with the same parser.
+//! form of the `container-image` platform property of an action; the deploy tool checks
+//! rendered units with the same parser.
 
 use std::fmt;
 

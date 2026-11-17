@@ -297,7 +297,7 @@ fn names_and_profiles_are_plain() {
         }));
         assert!(err.contains("profile"), "{profile:?}: {err}");
     }
-    for ok in ["kbf-daemon", "k_b.f2", long(64).as_str()] {
+    for ok in ["kbf-extra", "k_b.f2", long(64).as_str()] {
         let record = edit(ORDER_ACTIVATE, |v| v["components"][0]["name"] = json!(ok));
         assert!(OrderRecord::parse(&record).is_ok(), "{ok}");
     }

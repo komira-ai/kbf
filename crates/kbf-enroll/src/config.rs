@@ -20,18 +20,10 @@ use serde::Deserialize;
 use toml::Spanned;
 
 /// The state directory when `dirs.state` is not set.
-pub const DEFAULT_STATE_DIR: &str = if cfg!(target_os = "macos") {
-    "/var/db/kbf"
-} else {
-    "/var/lib/kbf"
-};
+pub const DEFAULT_STATE_DIR: &str = "/var/lib/kbf";
 
 /// The token file when `enroll.token_file` is not set.
-pub const DEFAULT_TOKEN_FILE: &str = if cfg!(target_os = "macos") {
-    "/var/db/kbf/enroll.token"
-} else {
-    "/var/lib/kbf/enroll.token"
-};
+pub const DEFAULT_TOKEN_FILE: &str = "/var/lib/kbf/enroll.token";
 
 /// The longest host name: a DNS name.
 const MAX_HOST_LEN: usize = 253;
@@ -52,7 +44,6 @@ pub const KEYS: &[(&str, &[&str])] = &[
     ("node", &["id", "advertise", "zone"]),
     ("dirs", &["state"]),
     ("storage", &["hot_dir", "meta_dir"]),
-    ("daemon", &["data_dir", "reserve_cpus"]),
     ("tls", &["trust"]),
 ];
 
@@ -67,12 +58,12 @@ pub fn is_key(table: &str, key: &str) -> bool {
 /// not put a flag in it.
 #[must_use]
 pub fn is_own_table(table: &str) -> bool {
-    !table.is_empty() && !matches!(table, "daemon" | "tls") && KEYS.iter().any(|(t, _)| *t == table)
+    !table.is_empty() && table != "tls" && KEYS.iter().any(|(t, _)| *t == table)
 }
 
 /// The tables and keys of the file. In a shared file the tables of the mode's flags are
-/// let through (`other`), and in the tables `daemon` and `tls`, which flags also use, the
-/// keys that are not enrollment's.
+/// let through (`other`), and in the table `tls`, which flags also use, the keys that are not
+/// enrollment's.
 #[derive(Deserialize)]
 struct Raw {
     mode: Option<Spanned<String>>,
@@ -81,7 +72,6 @@ struct Raw {
     node: Option<RawNode>,
     dirs: Option<RawDirs>,
     storage: Option<RawStorage>,
-    daemon: Option<RawDaemon>,
     tls: Option<RawTls>,
     #[serde(flatten)]
     other: BTreeMap<String, toml::Value>,
@@ -121,14 +111,6 @@ struct RawStorage {
 }
 
 #[derive(Deserialize)]
-struct RawDaemon {
-    data_dir: Option<Spanned<String>>,
-    reserve_cpus: Option<Spanned<i64>>,
-    #[serde(flatten)]
-    other: BTreeMap<String, toml::Value>,
-}
-
-#[derive(Deserialize)]
 struct RawTls {
     trust: Option<Spanned<String>>,
     #[serde(flatten)]
@@ -140,7 +122,8 @@ struct RawTls {
 pub struct Host {
     /// The host name as the machine reports it (the short form is derived).
     pub hostname: String,
-    /// The CPU count, for the range of `daemon.reserve_cpus`.
+    /// The CPU count. Nothing here reads it since the `[daemon]` table went; callers still
+    /// fill it in.
     pub cpus: usize,
 }
 
@@ -231,8 +214,7 @@ pub enum Trust {
 /// A validated `kbf.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
-    /// `mode`: the mode this host runs (`storage`, `daemon`, `storage-and-daemon`, ...), as
-    /// the file spells it; `kbf --mode` overrides it. The names are the caller's to check:
+    /// `mode`: the mode this host runs (`storage`, ...), as the file spells it; `kbf --mode` overrides it. The names are the caller's to check:
     /// this crate does not know the modes.
     pub mode: Option<String>,
     /// `frontend.url`.
@@ -252,14 +234,9 @@ pub struct Config {
     pub hot_dir: PathBuf,
     /// `storage.meta_dir`.
     pub meta_dir: PathBuf,
-    /// `daemon.data_dir`.
-    pub data_dir: PathBuf,
-    /// `daemon.reserve_cpus`; `None` is kbf's default.
-    pub reserve_cpus: Option<u32>,
     /// `tls.trust`.
     pub trust: Trust,
     storage_table: bool,
-    daemon_table: bool,
 }
 
 /// Accumulates problems with their lines.
@@ -318,18 +295,12 @@ impl Check<'_> {
                 message: format!("unknown field `{table}`"),
             });
         }
-        let in_tables = [
-            ("daemon", raw.daemon.as_ref().map(|d| &d.other)),
-            ("tls", raw.tls.as_ref().map(|t| &t.other)),
-        ];
-        for (table, other) in in_tables {
-            for key in other.into_iter().flat_map(BTreeMap::keys) {
-                self.problems.push(Problem {
-                    key: format!("{table}.{key}"),
-                    line: None,
-                    message: format!("unknown field `{key}`"),
-                });
-            }
+        for key in raw.tls.iter().flat_map(|t| t.other.keys()) {
+            self.problems.push(Problem {
+                key: format!("tls.{key}"),
+                line: None,
+                message: format!("unknown field `{key}`"),
+            });
         }
     }
 }
@@ -508,8 +479,8 @@ impl Config {
     }
 
     /// Reads `text` as the enrollment's part of a `kbf.toml` that also holds the mode's
-    /// flags: the tables of the flags, and the keys of them in `[daemon]` and `[tls]`,
-    /// are let through here and are the flags' parser's to check. Every key of
+    /// flags: the tables of the flags, and the keys of them in `[tls]`, are let through here and
+    /// are the flags' parser's to check. Every key of
     /// [`KEYS`] is checked as in [`Config::parse`].
     ///
     /// # Errors
@@ -599,29 +570,6 @@ impl Config {
             storage.and_then(|s| s.meta_dir.as_ref()),
             &state_dir.join("meta"),
         );
-        let daemon = raw.daemon.as_ref();
-        let data_dir = dir(
-            &mut check,
-            "daemon.data_dir",
-            daemon.and_then(|d| d.data_dir.as_ref()),
-            &state_dir.join("data"),
-        );
-
-        let reserve_cpus = daemon.and_then(|d| d.reserve_cpus.as_ref()).and_then(|v| {
-            let most = host.cpus.saturating_sub(1);
-            match u32::try_from(*v.get_ref()) {
-                Ok(n) if n as usize <= most => Some(n),
-                _ => {
-                    check.fail(
-                        "daemon.reserve_cpus",
-                        Some(v.span().start),
-                        format!("must be from 0 to {most} on a host with {} CPUs", host.cpus),
-                    );
-                    None
-                }
-            }
-        });
-
         let trust_raw = raw.tls.as_ref().and_then(|t| t.trust.as_ref());
         let trust = check
             .value("tls.trust", trust_raw, |t| match t {
@@ -651,11 +599,8 @@ impl Config {
                 state_dir,
                 hot_dir,
                 meta_dir,
-                data_dir,
-                reserve_cpus,
                 trust,
                 storage_table: raw.storage.is_some(),
-                daemon_table: raw.daemon.is_some(),
             }),
             _ => Err(Problems(check.problems)),
         }
@@ -682,27 +627,21 @@ impl Config {
             zone: String::new(),
             hot_dir: state_dir.join("hot"),
             meta_dir: state_dir.join("meta"),
-            data_dir: state_dir.join("data"),
-            reserve_cpus: None,
             trust: Trust::Pin,
             storage_table: false,
-            daemon_table: false,
             state_dir,
         }
     }
 
     /// Warnings once the roles are known (they come from the token, not the file): a
-    /// `[storage]` or `[daemon]` table for a role the frontend did not grant, and an
-    /// `advertise` on a node granted no storage role.
+    /// `[storage]` table for a role the frontend did not grant, and an `advertise` on a node
+    /// granted no storage role.
     #[must_use]
     pub fn role_warnings(&self, granted: RoleSet) -> Vec<String> {
         use kbf_types::Role;
         let mut out = Vec::new();
         if self.storage_table && !granted.contains(Role::Storage) {
             out.push("[storage] is set but the frontend granted no storage role".to_owned());
-        }
-        if self.daemon_table && !granted.contains(Role::Daemon) {
-            out.push("[daemon] is set but the frontend granted no daemon role".to_owned());
         }
         if self.advertise.is_some() && !granted.contains(Role::Storage) {
             out.push("node.advertise is set but the frontend granted no storage role".to_owned());
@@ -711,9 +650,8 @@ impl Config {
     }
 
     /// The checks that read the file system, for directories that exist: no symlink in
-    /// the path (one a root-owned system alias like macOS's `/var` is not), owned by
-    /// `euid`, mode `0700`; and `storage.hot_dir` on the same file system as
-    /// `daemon.data_dir`, which share one cache.
+    /// the path (one a root-owned system alias is not), owned by
+    /// `euid`, mode `0700`.
     #[must_use]
     pub fn check_paths(&self, euid: u32) -> Vec<Problem> {
         let mut out = Vec::new();
@@ -721,7 +659,6 @@ impl Config {
             ("dirs.state", &self.state_dir),
             ("storage.hot_dir", &self.hot_dir),
             ("storage.meta_dir", &self.meta_dir),
-            ("daemon.data_dir", &self.data_dir),
         ] {
             if let Some(message) = dir_problem(path, euid) {
                 out.push(Problem {
@@ -731,24 +668,13 @@ impl Config {
                 });
             }
         }
-        if let (Ok(hot), Ok(data)) = (
-            std::fs::metadata(&self.hot_dir),
-            std::fs::metadata(&self.data_dir),
-        ) && hot.dev() != data.dev()
-        {
-            out.push(Problem {
-                key: "storage.hot_dir".to_owned(),
-                line: None,
-                message: "must be on the same file system as daemon.data_dir".to_owned(),
-            });
-        }
         out
     }
 }
 
 /// What is wrong with `path` as a node directory, if it exists. A symlink in the path is
 /// refused unless root owns it and it is not the last component: a system alias such as
-/// macOS's `/var` is not something the service user can plant.
+/// a root-owned alias is not something the service user can plant.
 fn dir_problem(path: &Path, euid: u32) -> Option<String> {
     let mut walked = PathBuf::new();
     let (mut is_dir, mut uid, mut mode) = (false, euid, 0o700);

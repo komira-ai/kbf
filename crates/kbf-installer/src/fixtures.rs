@@ -83,31 +83,19 @@ pub fn trusted_host() -> FakeExec {
     trusted_host_on(Platform::Linux)
 }
 
-/// [`trusted_host`] for a host of `platform`: its trust directory (a Mac's is the pkg's `/usr/local/kbf-installer/trust`).
+/// [`trusted_host`] for a host of `platform`.
 pub fn trusted_host_on(platform: Platform) -> FakeExec {
-    let (parents, dir, gh, root_file): (&[&str], &str, String, String) = match platform {
-        Platform::Linux => (
-            &[
-                "/usr",
-                "/usr/share",
-                "/usr/share/kbf",
-                // The seed directory is still under the installer's own (`Layout::seed_dir`).
-                "/usr/share/kbf-installer",
-            ],
-            TRUST_DIR,
-            GH_PATH.to_owned(),
-            TRUSTED_ROOT_PATH.to_owned(),
-        ),
-        Platform::MacOs => (
-            &["/usr", "/usr/local", "/usr/local/kbf-installer"],
-            "/usr/local/kbf-installer/trust",
-            "/usr/local/kbf-installer/trust/gh".to_owned(),
-            "/usr/local/kbf-installer/trust/trusted_root.jsonl".to_owned(),
-        ),
-    };
+    let Platform::Linux = platform;
+    let parents = [
+        "/usr",
+        "/usr/share",
+        "/usr/share/kbf",
+        // The seed directory is still under the installer's own (`Layout::seed_dir`).
+        "/usr/share/kbf-installer",
+    ];
     let mut exec = FakeExec::new(0);
     let root = Owner { uid: 0, gid: 0 };
-    for dir in parents.iter().copied().chain([dir]) {
+    for dir in parents.into_iter().chain([TRUST_DIR]) {
         exec.entries.insert(
             HostPath::new(dir).expect("a path"),
             Entry::Dir {
@@ -116,7 +104,7 @@ pub fn trusted_host_on(platform: Platform) -> FakeExec {
             },
         );
     }
-    for (file, mode) in [(gh.as_str(), 0o755), (root_file.as_str(), 0o644)] {
+    for (file, mode) in [(GH_PATH, 0o755), (TRUSTED_ROOT_PATH, 0o644)] {
         exec.entries.insert(
             HostPath::new(file).expect("a path"),
             Entry::File {

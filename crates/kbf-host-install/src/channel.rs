@@ -1,5 +1,5 @@
-//! The allowlist of a Mac, `/usr/local/etc/kbf/host-install.toml`: the channels an install
-//! may take a release from.
+//! The allowlist of channels an install may take a release from (`host-install.toml`, and the
+//! `host-install-releases.toml` of the local socket on Linux).
 //!
 //! ```toml
 //! [channels.stable]
@@ -22,11 +22,11 @@
 //!
 //! A channel takes its releases from exactly one place: a `dir`, or `source = "github"`.
 //!
-//! - `dir` is where the release files are put: `kbf-<commit>-darwin-arm64.tar.gz` and its
+//! - `dir` is where the release files are put: `kbf-<commit>-<platform>.tar.gz` and its
 //!   `.sigstore.json` bundle. Whoever puts them there is not trusted; they are copied
 //!   once and checked.
 //! - `source = "github"` fetches the release from the repository's GitHub releases
-//!   ([`super::fetch`]), as `nobody`; what it fetches is copied once and checked like the
+//!   ([`crate::fetch`]), as `nobody`; what it fetches is copied once and checked like the
 //!   files of a `dir`. `token_file` is optional: root's alone to write, it holds a token
 //!   for the public API that raises the rate limit of the listing; without one the listing
 //!   is unauthenticated.
@@ -57,9 +57,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::release::{ARTIFACT_PREFIX, Origin, REPO, WORKFLOW, is_signer_workflow};
 use crate::config::refusal;
 use crate::outcome::Refusal;
+use crate::release::{ARTIFACT_PREFIX, Origin, REPO, WORKFLOW, is_signer_workflow};
 use crate::request::Channel;
 use crate::trust::Trust;
 
@@ -78,7 +78,7 @@ pub enum Source {
 
 /// A channel as the allowlist names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MacChannel {
+pub struct ChannelConfig {
     pub source: Source,
     pub sums: Option<PathBuf>,
     pub source_ref: String,
@@ -147,12 +147,12 @@ struct Entry {
 
 /// The parsed allowlist.
 #[derive(Debug)]
-pub struct MacAllowlist {
+pub struct Allowlist {
     trusted_workflows: Vec<String>,
     channels: BTreeMap<String, Entry>,
 }
 
-impl MacAllowlist {
+impl Allowlist {
     /// Read and parse the allowlist at `path`.
     ///
     /// # Errors
@@ -191,7 +191,7 @@ impl MacAllowlist {
     /// [`ChannelError::Refused`] with [`Refusal::ChannelNotAllowed`], [`Refusal::ConfigUnsafe`]
     /// or [`Refusal::ConfigInvalid`]; [`ChannelError::UntrustedSigner`] for a signer workflow
     /// other than kbf's own that `trusted_workflows` does not name.
-    pub fn channel(&self, trust: &Trust, name: &Channel) -> Result<MacChannel, ChannelError> {
+    pub fn channel(&self, trust: &Trust, name: &Channel) -> Result<ChannelConfig, ChannelError> {
         let entry = self
             .channels
             .get(name.as_str())
@@ -218,7 +218,7 @@ impl MacAllowlist {
         {
             trust.check_file(token).map_err(refusal)?;
         }
-        Ok(MacChannel {
+        Ok(ChannelConfig {
             source,
             sums: entry.sums.clone(),
             source_ref: entry

@@ -158,7 +158,7 @@ fn a_pin_that_fails_halfway_is_told_and_completed_when_asked_again() {
     rig.net
         .borrow_mut()
         .restart_fails
-        .insert("kbf-daemon.service".to_owned());
+        .insert("kbf-storage.service".to_owned());
     fs::remove_dir(agent_dir(&rig)).unwrap_or(());
     fs::remove_file(&hold).unwrap();
     // The directory stays, but the hold cannot be made: something in the way aside.

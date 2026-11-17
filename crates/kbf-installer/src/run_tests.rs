@@ -148,7 +148,7 @@ fn a_program_runs_as_the_user_it_is_given_or_does_not_run() {
     assert_eq!(outcome, want[usize::from(is_root)]);
 }
 
-/// Catches the default account being wrong: Linux's `nobody` is 65534, macOS's is -2.
+/// Catches the default account being wrong: Linux's `nobody` is 65534.
 #[test]
 fn nobody_is_the_platforms_nobody() {
     use crate::layout::Platform;
@@ -157,13 +157,6 @@ fn nobody_is_the_platforms_nobody() {
         RunAs {
             uid: 65534,
             gid: 65534
-        }
-    );
-    assert_eq!(
-        nobody(Platform::MacOs),
-        RunAs {
-            uid: 4_294_967_294,
-            gid: 4_294_967_294
         }
     );
 }

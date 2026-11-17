@@ -7,9 +7,9 @@
 //! It makes a release the host keeps the one that runs, for good, without a fetch, a trial or
 //! the agent ([`super::core::activate`]). It is run by root (ssh as root, or `sudo`) from this
 //! program's fixed path, which no kbf release moves, so the swap runs nothing of the release it
-//! leaves. On Linux `--restart-unit` names the units that run the release, as `--serve` takes
-//! them (at least one); a Mac restarts the daemon's job and takes none. `--pin` writes the hold
-//! file in the agent's state directory ([`LINUX_HOLD`], [`MAC_HOLD`]) and pins the release;
+//! leaves. `--restart-unit` names the units that run the release, as `--serve` takes
+//! them (at least one). `--pin` writes the hold file in the agent's state directory
+//! ([`LINUX_HOLD`]) and pins the release;
 //! `--force-lock` takes the install lock from a holder that is gone or stuck.
 //!
 //! The answer is the socket's JSON line on stdout (`activated`, or a refusal that lists the kept
@@ -29,20 +29,12 @@ use super::core::Ab;
 use super::core::activate::How;
 use super::request::Target;
 use crate::audit::{self, Audit};
-use crate::mac::layout::MacHost;
 use crate::request::{BadCommand, Unit};
-use crate::runner::Runner;
 use crate::trust::Trust;
 
 /// The hold file on Linux: in the packaged agent's state directory.
-// Read by the Linux build only; the Mac build compiles the Linux side and has no use for it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const LINUX_HOLD: &str = "/var/lib/kbf-updater/pin.json";
-
-/// The hold file on a Mac: in the packaged agent's state directory.
-// Read by the Mac build only; the Linux build compiles the Mac side and has no use for it.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub const MAC_HOLD: &str = "/var/db/kbf-updater/pin.json";
 
 pub const USAGE: &str = "usage: kbf-host-install activate kbf=<commit|version> [--pin] \
 [--force-lock] [--restart-unit UNIT]...\n";
@@ -52,7 +44,7 @@ pub const USAGE: &str = "usage: kbf-host-install activate kbf=<commit|version> [
 pub struct Command {
     pub target: Target,
     pub how: How,
-    /// The units that run the release (Linux).
+    /// The units that run the release.
     pub units: Vec<Unit>,
 }
 
@@ -253,7 +245,6 @@ fn result_of(answer: &Answer) -> Option<String> {
 /// A Linux host: `command` on the `kbf-installer` layout that `backend` makes (after the
 /// command is checked: nothing of the host is read before), the state in `state_dir` (made
 /// private if it is not there), the hold file at `hold`.
-// Called by the Linux build only; the Mac build compiles it and its tests run it everywhere.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn on_linux<B: Backend>(
     command: &Command,
@@ -274,44 +265,6 @@ pub(super) fn on_linux<B: Backend>(
     let place = Place {
         trust,
         audit: &env.audit,
-    };
-    run(
-        &|target, how| ab.activate(target, how),
-        command,
-        &place,
-        &mut std::io::stdout(),
-        &mut std::io::stderr(),
-    )
-}
-
-/// A Mac: `command` on the kit of `host`, whose tools `runner` runs, the state in its work
-/// directory, the hold file at `hold`.
-// Called by the Mac build only; the Linux build compiles it and its tests run it everywhere.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(super) fn on_mac(
-    command: &Command,
-    host: MacHost,
-    runner: Box<dyn Runner>,
-    hold: PathBuf,
-) -> u8 {
-    if !command.units.is_empty() {
-        eprintln!("kbf-host-install: a Mac restarts the daemon's job and takes no --restart-unit");
-        return 2;
-    }
-    if crate::mac::ensure_work(&host).is_err() {
-        eprintln!("kbf-host-install: the work directory is not usable");
-        return 3;
-    }
-    let (trust, state, audit) = (
-        host.trust.clone(),
-        host.work.join("state.json"),
-        host.audit.clone(),
-    );
-    let backend = super::mac_backend::MacBackend::new(host, runner);
-    let ab = new_ab(backend, state, &trust, hold);
-    let place = Place {
-        trust: &trust,
-        audit: &audit,
     };
     run(
         &|target, how| ab.activate(target, how),
@@ -347,15 +300,5 @@ pub(super) fn production(command: &Command) -> u8 {
         &super::production::LinuxEnv::production(),
         &Trust::root(),
         PathBuf::from(LINUX_HOLD),
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn production(command: &Command) -> u8 {
-    on_mac(
-        command,
-        MacHost::production(),
-        Box::new(crate::runner::SystemRunner),
-        PathBuf::from(MAC_HOLD),
     )
 }

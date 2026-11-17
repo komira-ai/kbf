@@ -15,7 +15,7 @@
 //! - [`keys`]: the registered cold store and its keys, which a storage node fetches over its
 //!   mutual-TLS session and holds in memory only.
 //!
-//! This is a library; the start of a node mode (`kbf --mode=storage|daemon|storage-and-daemon`)
+//! This is a library; the start of a node mode (`kbf --mode=storage`)
 //! that calls it is another crate's (`docs/design/install-and-enrollment.md`, unit B4b). Time is always a
 //! parameter, so every decision is tested without a clock.
 

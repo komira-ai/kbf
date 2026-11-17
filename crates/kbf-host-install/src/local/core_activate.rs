@@ -8,7 +8,7 @@
 //! - **No trial.** There is no deadline and no revert: `previous` becomes the release left, and a
 //!   release that was on trial is on trial no more.
 //! - **Nothing of the release left runs.** This program moves the links and the service manager
-//!   restarts the units (the daemon's launchd job on a Mac) on the release named; the release
+//!   restarts the units on the release named; the release
 //!   being left is never executed by the swap.
 //! - **The install lock.** It is taken without waiting, as every install, switch and restart
 //!   takes it. A holder is refused and named ([`locks::Holder`]). `--force-lock` takes it from a
@@ -18,7 +18,7 @@
 //!   state) are taken without waiting too: a holder that does not let go is refused, not waited
 //!   for.
 //! - **A release that cannot run is not kept.** The release named must be one the backend can
-//!   start ([`Backend::has`]: its binary is there, and on a Mac root's); one that is not is
+//!   start ([`Backend::has`]: its binary is there); one that is not is
 //!   refused with the listing, before anything changes.
 //! - **The pin** (`--pin`) writes the hold file for the agent ([`Hold`], root's, 0644) and pins
 //!   the release in `retain.json`, so no prune removes it, once the links name the release (a

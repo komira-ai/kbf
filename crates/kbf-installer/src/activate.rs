@@ -33,8 +33,7 @@
 //!   reverts the swap before the release starts. A start of a release whose swap was
 //!   reverted puts the log back first.
 //! - [`expire`]: with a deadline (the window has started), a swap not confirmed in time
-//!   is reverted. On macOS nothing runs before a start, so [`Arm::FromActivation`] starts
-//!   the window at the swap and this is the only trigger.
+//!   is reverted.
 //!
 //! The window is bounded by the host ([`WINDOW_MIN_SECS`], [`WINDOW_MAX_SECS`]), not by
 //! the order: a compromised frontend cannot ask for a year.
@@ -61,17 +60,6 @@ pub struct Order {
     pub commit: CommitId,
     /// Names the order: a repeat is a no-op and the confirm must carry it.
     pub order_id: String,
-}
-
-/// When the window to confirm starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arm {
-    /// At the swap, for `window_secs` (macOS: no start hook, so a timer is the only
-    /// trigger).
-    FromActivation { window_secs: u64 },
-    /// At the first start of the new release ([`boot_check`]), after which `starts`
-    /// unconfirmed starts are allowed in all (Linux).
-    FromFirstStart { starts: u32 },
 }
 
 /// What [`activate`] did.
@@ -165,19 +153,16 @@ fn converge<E: Exec>(
     Ok(moved)
 }
 
-/// Swap the ordered release in on trial (see the module docs).
+/// Swap the ordered release in on trial (see the module docs). The window to confirm starts
+/// at the first start of the new release ([`boot_check`]), after which `starts` unconfirmed
+/// starts are allowed in all.
 pub fn activate<E: Exec>(
     exec: &mut E,
     host: &Layout,
     order: &Order,
-    arm: Arm,
-    now: u64,
+    starts: u32,
     out: &mut dyn Write,
 ) -> Result<Activated, ReleaseError> {
-    let (deadline, starts_left) = match arm {
-        Arm::FromActivation { window_secs } => (Some(now + window(window_secs)?), None),
-        Arm::FromFirstStart { starts } => (None, Some(starts)),
-    };
     let (lock, state) = open(host)?;
     if let Some(p) = &state.pending_confirm {
         if p.activation != order.order_id {
@@ -201,9 +186,9 @@ pub fn activate<E: Exec>(
             activation: order.order_id.clone(),
             commit: order.commit.clone(),
             previous: state.current.clone(),
-            deadline_wall: deadline,
+            deadline_wall: None,
             deadline_mono_s: None,
-            starts_left,
+            starts_left: Some(starts),
         }),
         ..state.clone()
     };

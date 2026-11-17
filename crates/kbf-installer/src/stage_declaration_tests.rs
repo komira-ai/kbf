@@ -318,7 +318,6 @@ fn stage_parts(rig: &Rig, owner: Owner, parts: &[(&str, Vec<u8>)]) -> Result<Sta
         policy: rig.policy,
         trust: &rig.trust,
         runner: &honest(),
-        leases: &rig.leases,
         owner,
     };
     let order = Order {
@@ -352,27 +351,27 @@ fn each_component_of_an_order_brings_its_own_declaration() {
     let both = [
         ("kbf", component("kbf", Some(b"name = \"kbf\"\n"))),
         (
-            "kbf-daemon",
-            component("kbf-daemon", Some(b"name = \"kbf-daemon\"\n")),
+            "kbf-extra",
+            component("kbf-extra", Some(b"name = \"kbf-extra\"\n")),
         ),
     ];
     let staged = stage_parts(&rig, owner(), &both).expect("staged");
-    assert_eq!(staged.components, ["kbf", "kbf-daemon"]);
+    assert_eq!(staged.components, ["kbf", "kbf-extra"]);
     let release = rig.release();
     assert_eq!(
         listing(&release),
         [
             "VERIFIED",
             "kbf",
-            "kbf-daemon",
+            "kbf-extra",
             "updater.d",
-            "updater.d/kbf-daemon.toml",
+            "updater.d/kbf-extra.toml",
             "updater.d/kbf.toml"
         ]
     );
     assert_eq!(
-        fs::read(release.join("updater.d/kbf-daemon.toml")).expect("daemon's"),
-        b"name = \"kbf-daemon\"\n"
+        fs::read(release.join("updater.d/kbf-extra.toml")).expect("the second one's"),
+        b"name = \"kbf-extra\"\n"
     );
     assert!(
         stage_parts(&rig, owner(), &both)
@@ -382,8 +381,8 @@ fn each_component_of_an_order_brings_its_own_declaration() {
     let other = [
         ("kbf", component("kbf", Some(b"name = \"kbf\"\n"))),
         (
-            "kbf-daemon",
-            component("kbf-daemon", Some(b"name = \"other\"\n")),
+            "kbf-extra",
+            component("kbf-extra", Some(b"name = \"other\"\n")),
         ),
     ];
     let err = stage_parts(&rig, owner(), &other).expect_err("the second differs");
@@ -391,7 +390,7 @@ fn each_component_of_an_order_brings_its_own_declaration() {
         err.to_string(),
         Refusal::Differs {
             path: release
-                .join("updater.d/kbf-daemon.toml")
+                .join("updater.d/kbf-extra.toml")
                 .display()
                 .to_string()
         }
@@ -401,7 +400,7 @@ fn each_component_of_an_order_brings_its_own_declaration() {
     let rig = Rig::new("declaration-pair-mixed");
     let mixed = [
         ("kbf", component("kbf", None)),
-        ("kbf-daemon", component("kbf-daemon", Some(b"d"))),
+        ("kbf-extra", component("kbf-extra", Some(b"d"))),
     ];
     stage_parts(&rig, owner(), &mixed).expect("staged");
     assert_eq!(
@@ -409,9 +408,9 @@ fn each_component_of_an_order_brings_its_own_declaration() {
         [
             "VERIFIED",
             "kbf",
-            "kbf-daemon",
+            "kbf-extra",
             "updater.d",
-            "updater.d/kbf-daemon.toml"
+            "updater.d/kbf-extra.toml"
         ]
     );
 
@@ -419,8 +418,8 @@ fn each_component_of_an_order_brings_its_own_declaration() {
     let later = [
         ("kbf", component("kbf", Some(b"name = \"kbf\"\n"))),
         (
-            "kbf-daemon",
-            tar_gz(&[file("kbf-daemon", &elf(0x3e, "d")), file("../evil", b"x")]),
+            "kbf-extra",
+            tar_gz(&[file("kbf-extra", &elf(0x3e, "d")), file("../evil", b"x")]),
         ),
     ];
     let err = stage_parts(&rig, owner(), &later).expect_err("the second is unsafe");

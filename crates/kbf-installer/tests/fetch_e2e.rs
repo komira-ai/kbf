@@ -26,7 +26,6 @@ use kbf_installer::fixtures::{
 };
 use kbf_installer::helper::fetcher::{FetchError as Refused, Fetcher, ReleaseLocator};
 use kbf_installer::helper::fetcher_real::RealFetcher;
-use kbf_installer::helper::leases::LeaseSource;
 use kbf_installer::layout::Platform;
 use kbf_installer::settings::Settings;
 use kbf_installer::stage::{Policy, Supported, Timeouts};
@@ -1742,7 +1741,7 @@ fn a_malformed_entry_of_another_platform_is_not_read() {
     let files = [
         spoiled("size", serde_json::json!("big")),
         spoiled("bundle_sha256", serde_json::json!("")),
-        spoiled("name", serde_json::json!("kbf kbf-daemon")),
+        spoiled("name", serde_json::json!("kbf kbf-extra")),
     ];
     for (n, file) in files.into_iter().enumerate() {
         let server = Https::start(&leaf, Plan::Files(vec![(json_path(), file)]));
@@ -1754,7 +1753,7 @@ fn a_malformed_entry_of_another_platform_is_not_read() {
 
     let mut other = entry("linux-arm64");
     other.bundle_sha256 = String::new();
-    other.name = "kbf\nkbf-daemon".to_owned();
+    other.name = "kbf\nkbf-extra".to_owned();
     let said = proto_of(COMMIT, &[other, entry("linux-x86_64")]);
     let grpc = Grpc::describing(&leaf, &pki.ca_pem(), Describing::Of(said));
     let rig = Rig::new("describe-frontend-other");
@@ -1935,7 +1934,7 @@ fn a_description_with_a_bad_digest_is_refused_whoever_sent_it() {
 fn a_hostile_field_cannot_become_a_second_line() {
     let (pki, server) = pki_and_server();
     let mut evil = entry("linux-x86_64");
-    evil.name = "kbf\ncomponent kbf-daemon linux-x86_64".to_owned();
+    evil.name = "kbf\ncomponent kbf-extra linux-x86_64".to_owned();
     let grpc = Grpc::describing(
         &server,
         &pki.ca_pem(),
@@ -2270,14 +2269,6 @@ fn a_frontend_describe_that_cannot_start_or_connect_fails_the_child() {
 
 // ------------------------------------------------------ the whole of it, on the real child
 
-struct NoLeases;
-
-impl LeaseSource for NoLeases {
-    fn live(&self) -> Result<usize, String> {
-        Ok(0)
-    }
-}
-
 /// A `frontend_update` that names a commit and nothing else, on a `url` source, with the real child
 /// and the real pipeline (only `gh` and the binary's own report are played): the file
 /// `releases/<commit>.json` is read, the bundle and then the tarball are fetched from
@@ -2335,7 +2326,6 @@ fn a_frontend_update_is_installed_from_a_url_source_end_to_end() {
                 Ok(ran(0, &probe, ""))
             }
         })),
-        leases: Box::new(NoLeases),
         owner: kbf_host::step::Owner {
             uid: ids.uid,
             gid: ids.gid,

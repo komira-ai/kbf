@@ -1,7 +1,7 @@
 //! Unpacking a component's tarball: the members the caller names, each a regular file.
 //!
 //! A release artifact is `kbf-<commit>-<platform>.tar.gz`. It holds the binary, named for
-//! the component (`kbf`, or on Linux `kbf-daemon`), with no directory in front of it, and
+//! the component (`kbf`), with no directory in front of it, and
 //! it may also hold the component's updater declaration, [`declaration_member`]
 //! (`updater.d/<component>.toml`). This is only ever done to a tarball the attestation
 //! already accepted, and it still checks every member, wanted or not: a member whose name

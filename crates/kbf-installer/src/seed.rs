@@ -66,7 +66,7 @@ pub struct Manifest {
     /// The number of commits behind it, which puts two builds in order; the binary declares
     /// the same number.
     pub seq: u64,
-    /// `linux-x86_64`, `linux-arm64` or `darwin-arm64`.
+    /// `linux-x86_64` or `linux-arm64`.
     pub platform: String,
     pub tarball_sha256: Sha256Hex,
     pub tarball_size: u64,

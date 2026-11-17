@@ -1,27 +1,15 @@
-//! More of the stage's tests: a host that is not x86-64 Linux, an order of two components,
-//! and the rig's own hygiene. They share `stage_tests`' rig.
+//! More of the stage's tests: a host that is not x86-64, an order of two components, and the
+//! rig's own hygiene. They share `stage_tests`' rig.
 
 use kbf_host::path::Root;
 
 use super::*;
-use crate::fixtures::macho;
 use crate::state::{Locked, State};
 
-const ARM64_MACHO: u32 = 0x0100_000c;
-
-/// The tool lines of `codesign --display` for a signature CI makes.
-const SIGNED: &str = "CodeDirectory v=20400 size=1 flags=0x10002(adhoc,runtime) hashes=1+2\n";
-
-/// A rig for a host of `platform` on `arch`, whose state directory is the platform's.
+/// A rig for a host of `platform` on `arch`.
 fn rig_on(name: &str, platform: Platform, arch: Arch) -> Rig {
     let dir = kbf_host::testkit::scratch(&format!("stage-{name}"));
-    for sub in [
-        "run",
-        "var/lib/kbf-installer",
-        "var/db/kbf-installer",
-        "var/run",
-        "usr/local/kbf-installer",
-    ] {
+    for sub in ["run", "var/lib/kbf-installer"] {
         fs::create_dir_all(dir.join(sub)).expect("seed");
     }
     let host = Layout::new(Root::new(&dir).expect("absolute"), platform);
@@ -62,44 +50,38 @@ fn fetch_all(rig: &Rig, parts: &[(&str, Vec<u8>)]) -> (Vec<Locator>, Fetched) {
     (locators, Fetched { partial, files })
 }
 
-/// Which step of the second component (`kbf-daemon`) a scripted runner fails.
+/// Which step of the second component (`kbf-extra`) a scripted runner fails.
 #[derive(Clone, Copy, PartialEq)]
 enum Fails {
     Nothing,
     Gh,
-    Quarantine,
-    Signature,
     Probe,
 }
 
 /// Every program answered as an honest host would, except that `fails` goes wrong for
-/// `kbf-daemon` alone: the first component is always fine.
+/// `kbf-extra` alone: the first component is always fine.
 fn scripted(fails: Fails) -> FakeRunner {
     FakeRunner::new(move |s| {
         let tool = s.program.file_name().expect("name").to_string_lossy();
-        let daemon = s.program.ends_with("kbf-daemon")
+        let extra = s.program.ends_with("kbf-extra")
             || s.args
                 .iter()
-                .any(|a| a.to_string_lossy().contains("kbf-daemon"));
-        let bad = |step| daemon && fails == step;
+                .any(|a| a.to_string_lossy().contains("kbf-extra"));
+        let bad = |step| extra && fails == step;
         Ok(match &*tool {
             "gh" if bad(Fails::Gh) => ran(1, "", "no matching attestation\n"),
-            "xattr" if bad(Fails::Quarantine) => ran(0, "0081;5f;Safari;\n", ""),
-            "xattr" => ran(1, "", "xattr: No such xattr: com.apple.quarantine\n"),
-            "codesign" if s.args[0] == "--display" => ran(0, "", SIGNED),
-            "codesign" if bad(Fails::Signature) => ran(1, "", "invalid signature\n"),
-            "gh" | "codesign" => ran(0, "", ""),
+            "gh" => ran(0, "", ""),
             _ if bad(Fails::Probe) => ran(3, "", ""),
             _ => ran(0, &version_json(COMMIT, "release"), ""),
         })
     })
 }
 
-/// The pair of Linux components an `all-in-one` node runs.
+/// A pair of Linux components: the stage takes any set of components the order names.
 fn linux_pair() -> [(&'static str, Vec<u8>); 2] {
     [
         ("kbf", elf(0x3e, "payload")),
-        ("kbf-daemon", elf(0x3e, "daemon")),
+        ("kbf-extra", elf(0x3e, "extra")),
     ]
 }
 
@@ -137,7 +119,7 @@ fn a_rig_takes_its_scratch_root_with_it() {
 
 /// Catches an order of several components judged by its first alone: every component is
 /// handed to `gh` (each its own tarball), unpacked and run, and one bad component, the
-/// second, ends the stage with nothing installed. The macOS set is two components.
+/// second, ends the stage with nothing installed.
 ///
 /// Catches: the attestation loop over the first component only; the unpack and
 /// probe loop over the first only.
@@ -146,21 +128,21 @@ fn every_component_of_an_order_is_attested_and_probed() {
     let rig = Rig::new("pair-honest");
     let runner = scripted(Fails::Nothing);
     let staged = activate_pair(&rig, &linux_pair(), "linux-x86_64", &runner).expect("staged");
-    assert_eq!(staged.components, ["kbf", "kbf-daemon"]);
-    assert_eq!(programs(&runner), ["gh", "gh", "kbf", "kbf-daemon"]);
+    assert_eq!(staged.components, ["kbf", "kbf-extra"]);
+    assert_eq!(programs(&runner), ["gh", "gh", "kbf", "kbf-extra"]);
     let calls = runner.calls();
-    for (call, tarball) in calls[..2].iter().zip(["kbf.tar.gz", "kbf-daemon.tar.gz"]) {
+    for (call, tarball) in calls[..2].iter().zip(["kbf.tar.gz", "kbf-extra.tar.gz"]) {
         assert!(
             call.args[2].to_string_lossy().ends_with(tarball),
             "{call:?}"
         );
     }
-    for (probe, name) in calls[2..].iter().zip(["kbf", "kbf-daemon"]) {
+    for (probe, name) in calls[2..].iter().zip(["kbf", "kbf-extra"]) {
         assert_eq!(probe.program.file_name().expect("name"), name);
         // The empty directory the stage made, not `/` or anything the binary could read.
         assert_eq!(probe.cwd.file_name().expect("cwd"), "empty");
     }
-    for name in ["kbf", "kbf-daemon", "VERIFIED"] {
+    for name in ["kbf", "kbf-extra", "VERIFIED"] {
         assert!(rig.release().join(name).exists(), "{name}");
     }
 
@@ -179,7 +161,7 @@ fn every_component_of_an_order_is_attested_and_probed() {
     let runner = scripted(Fails::Probe);
     let err = activate_pair(&rig, &linux_pair(), "linux-x86_64", &runner).expect_err("probe");
     assert_eq!(err.word(), Some("facts"), "{err}");
-    assert_eq!(programs(&runner), ["gh", "gh", "kbf", "kbf-daemon"]);
+    assert_eq!(programs(&runner), ["gh", "gh", "kbf", "kbf-extra"]);
     rig.assert_nothing_installed();
 }
 
@@ -199,65 +181,6 @@ fn an_arm64_linux_release_is_linux_arm64() {
     let err = activate_pair(&rig, &parts, "linux-x86_64", &scripted(Fails::Nothing))
         .expect_err("another platform than the order's");
     assert_eq!(err.word(), Some("facts"), "{err}");
-}
-
-fn mac_pair() -> [(&'static str, Vec<u8>); 2] {
-    [
-        ("kbf", macho(ARM64_MACHO, "payload")),
-        ("kbf-daemon", macho(ARM64_MACHO, "daemon")),
-    ]
-}
-
-/// Catches the macOS checks being skipped or applied to one component: each Mach-O is
-/// checked for the quarantine attribute and a signature before it is run, in that order,
-/// the release is `darwin-arm64`, and a quarantined or badly signed second component ends
-/// the stage before its binary runs.
-///
-/// Catches: the quarantine check dropped; the signature check dropped; either
-/// applied to the first component only.
-#[test]
-fn a_macos_release_is_checked_for_quarantine_and_signature_per_component() {
-    let rig = rig_on("mac", Platform::MacOs, Arch::Aarch64);
-    let runner = scripted(Fails::Nothing);
-    let staged = activate_pair(&rig, &mac_pair(), "darwin-arm64", &runner).expect("staged");
-    assert_eq!(staged.platform, "darwin-arm64");
-    assert_eq!(
-        programs(&runner),
-        [
-            "gh",
-            "gh",
-            "xattr",
-            "codesign",
-            "codesign",
-            "kbf",
-            "xattr",
-            "codesign",
-            "codesign",
-            "kbf-daemon"
-        ]
-    );
-    assert!(rig.release().join("kbf-daemon").exists());
-    assert!(
-        rig.release()
-            .starts_with(rig.dir.join("usr/local/kbf-installer")),
-        "macOS tree"
-    );
-
-    for (case, fails, code) in [
-        ("quarantine", Fails::Quarantine, "quarantined"),
-        ("signature", Fails::Signature, "signature-invalid"),
-    ] {
-        let rig = rig_on(&format!("mac-{case}"), Platform::MacOs, Arch::Aarch64);
-        let runner = scripted(fails);
-        let err = activate_pair(&rig, &mac_pair(), "darwin-arm64", &runner).expect_err(case);
-        assert_eq!(err.word(), Some("shape"), "{case}: {err}");
-        assert_eq!(err.code(), code, "{case}");
-        assert!(
-            !programs(&runner).contains(&"kbf-daemon".to_owned()),
-            "{case}: the second binary was not run"
-        );
-        rig.assert_nothing_installed();
-    }
 }
 
 /// Catches a stage that cannot tell whether a release is already there going on: a
@@ -426,39 +349,6 @@ fn a_stream_the_parent_hashed_differently_from_the_file_is_a_hash_refusal() {
         .expect_err("different digests");
     assert_eq!(err.word(), Some("hash"), "{err}");
     assert!(runner.calls().is_empty());
-}
-
-/// Catches the lease check holding up an order that moves no node link. A `frontend_update`
-/// is verified and installed whatever the lease source says (live leases, or a source that
-/// cannot tell: setup's first release runs on a host whose unit never ran, so there is no
-/// cgroup to read, and the frontend's streams belong to the swap and the proxy). An
-/// activation of the same release with the same source is refused as `lease` before
-/// anything is installed, so the skip is the frontend update's alone.
-///
-/// Catches: the check skipped for every kind (the activation installs); the check
-/// kept for the frontend update (the update is refused as `lease`).
-#[test]
-fn a_frontend_update_does_not_wait_for_leases_and_an_activation_does() {
-    for (name, leases) in [("cannot-tell", usize::MAX), ("live", 2)] {
-        let rig = Rig::new(&format!("lease-kind-{name}"));
-        rig.leases.set(leases);
-        let err = rig.activate(&honest()).expect_err("an activation waits");
-        assert_eq!(err.word(), Some("lease"), "{name}: {err}");
-        rig.assert_nothing_installed();
-
-        let (locator, fetched) = rig.fetch(&tarball());
-        let staged = rig
-            .verify(
-                &honest(),
-                OrderKind::FrontendUpdate,
-                &[locator],
-                None,
-                fetched,
-            )
-            .unwrap_or_else(|e| panic!("{name}: a frontend update moves no node link: {e}"));
-        assert!(!staged.already_installed, "{name}");
-        assert!(rig.release().exists(), "{name}: the release is installed");
-    }
 }
 
 /// Catches the move of the number check into `kbf-types` changing what the stage says: a number

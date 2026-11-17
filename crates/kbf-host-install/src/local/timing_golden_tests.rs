@@ -59,7 +59,7 @@ fn a_failed_revert_is_left_alone_for_30_seconds() {
 /// after 120 s, an `is-active` after 10 s, and the wait after a restart is 120 s at 500 ms.
 #[test]
 fn a_restart_is_killed_after_120_seconds_and_waited_for_another_120() {
-    let unit = Unit::service("kbf-daemon.service").unwrap();
+    let unit = Unit::service("kbf-storage.service").unwrap();
     assert_eq!(restart_unit(&unit).timeout, Some(Duration::from_secs(120)));
     assert_eq!(unit_active(&unit).timeout, Some(Duration::from_secs(10)));
     assert_eq!(
@@ -97,9 +97,9 @@ fn the_confirm_window_defaults_to_600_and_is_accepted_from_120_to_1800() {
 
 /// The shipped unit's command line, and the settings the helper reads from it: the account,
 /// a 600 s window, the package layout (the `kbf` deb ships the unit) and the one restart unit
-/// `kbf-daemon.service`.
+/// `kbf-storage.service`.
 #[test]
-fn the_shipped_unit_gives_a_600_second_window_and_the_daemon_unit() {
+fn the_shipped_unit_gives_a_600_second_window_and_the_storage_unit() {
     let exec: Vec<&str> = UNIT_FILE
         .lines()
         .filter(|l| l.starts_with("ExecStart="))
@@ -107,7 +107,7 @@ fn the_shipped_unit_gives_a_600_second_window_and_the_daemon_unit() {
     assert_eq!(
         exec,
         [
-            "ExecStart=/usr/libexec/kbf/kbf-host-install --serve --socket /run/kbf-host-install/local.sock --socket-user kbf-updater --window-secs 600 --layout deb --restart-unit kbf-daemon.service"
+            "ExecStart=/usr/libexec/kbf/kbf-host-install --serve --socket /run/kbf-host-install/local.sock --socket-user kbf-updater --window-secs 600 --layout deb --restart-unit kbf-storage.service"
         ]
     );
     let words: Vec<&str> = exec[0].split_whitespace().collect();
@@ -117,5 +117,5 @@ fn the_shipped_unit_gives_a_600_second_window_and_the_daemon_unit() {
     assert_eq!(config.window_secs, DEFAULT_WINDOW_SECS);
     assert_eq!(config.layout, super::serve::Layout::Deb);
     let units: Vec<_> = config.units.iter().map(Unit::as_str).collect();
-    assert_eq!(units, ["kbf-daemon.service"]);
+    assert_eq!(units, ["kbf-storage.service"]);
 }

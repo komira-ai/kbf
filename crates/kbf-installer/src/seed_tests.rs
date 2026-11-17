@@ -7,7 +7,6 @@ use kbf_host::path::Root;
 use serde_json::json;
 
 use super::*;
-use crate::layout::Platform;
 use crate::seed_fixture::{SEQ, Seeded, sha};
 use crate::testkit::{A, B, c};
 
@@ -215,15 +214,13 @@ fn an_order_is_admitted_for_the_seeds_commit_with_a_seq_above_the_floor() {
 }
 
 /// The package's files are in the package's directory (beside the trust directory) and the
-/// floor beside the state, per platform: `/usr/share/kbf-installer` on Linux and the
-/// installer's own tree on a Mac.
+/// floor beside the state: `/usr/share/kbf-installer`.
 ///
-/// Catches the seed under the state directory (where the service user's tree is), the Mac's
-/// paths taken from the Linux ones, and a floor that is not beside `state.json`.
+/// Catches the seed under the state directory (where the service user's tree is), and a floor
+/// that is not beside `state.json`.
 #[test]
 fn the_seed_is_beside_the_trust_directory_and_the_floor_beside_the_state() {
     let linux = Layout::linux(Root::host());
-    let mac = Layout::new(Root::host(), Platform::MacOs);
     assert_eq!(
         linux.seed_dir("0123456789ab").as_str(),
         "/usr/share/kbf-installer/seed/0123456789ab"
@@ -236,15 +233,6 @@ fn the_seed_is_beside_the_trust_directory_and_the_floor_beside_the_state() {
         linux.seq_floor().as_str(),
         "/var/lib/kbf-installer/seq_floor"
     );
-    assert_eq!(
-        mac.seed_dir("0123456789ab").as_str(),
-        "/usr/local/kbf-installer/seed/0123456789ab"
-    );
-    assert_eq!(
-        mac.seed_file("0123456789ab", MANIFEST).as_str(),
-        "/usr/local/kbf-installer/seed/0123456789ab/manifest.json"
-    );
-    assert_eq!(mac.seq_floor().as_str(), "/var/db/kbf-installer/seq_floor");
 }
 
 /// The rule on `seq` is one function, which the order and the run loop both ask: a seed is

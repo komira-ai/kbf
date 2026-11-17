@@ -410,22 +410,17 @@ fn the_production_stop_ends_the_process_after_the_bound() {
     assert!(!stop.seen.load(Ordering::SeqCst));
 }
 
-/// Catches a `proxy` that reads `/etc/kbf/installer.toml` on a Mac, where `setup` writes
-/// `/usr/local/etc/kbf/installer.toml`: with no `--config` the file is the platform's, and a
-/// flag wins.
+/// Catches a `proxy` that reads another file than the one `setup` writes: with no `--config`
+/// the file is the platform's, and a flag wins.
 #[test]
 fn proxy_reads_the_installer_toml_setup_wrote_on_the_platform() {
     assert_eq!(
         config_path(&args(None, true), Platform::Linux),
         PathBuf::from("/etc/kbf/installer.toml")
     );
-    assert_eq!(
-        config_path(&args(None, true), Platform::MacOs),
-        PathBuf::from("/usr/local/etc/kbf/installer.toml")
-    );
     let given = args(Some(PathBuf::from("/x.toml")), true);
     assert_eq!(
-        config_path(&given, Platform::MacOs),
+        config_path(&given, Platform::Linux),
         PathBuf::from("/x.toml")
     );
 }

@@ -27,10 +27,6 @@ fn every_case() -> Vec<(&'static str, Refusal)> {
         component: "kbf".into(),
         fault,
     };
-    let signature = |fault| Refusal::BadSignature {
-        component: "kbf".into(),
-        fault,
-    };
     let version = |fault| Refusal::Version {
         component: "kbf".into(),
         fault,
@@ -198,7 +194,6 @@ fn every_case() -> Vec<(&'static str, Refusal)> {
                 what: "protocol 1".into(),
             },
         ),
-        ("lease-live", Refusal::Lease("1 leases are live".into())),
         (
             "version-oversize",
             version(VersionFault::Oversize { cap: 4096 }),
@@ -210,19 +205,6 @@ fn every_case() -> Vec<(&'static str, Refusal)> {
                 found: BinaryKind::MachO(Arch::Aarch64),
                 want: BinaryKind::Elf(Arch::X86_64),
             },
-        ),
-        (
-            "quarantined",
-            Refusal::Quarantined {
-                name: "kbf.tar.gz".into(),
-            },
-        ),
-        ("signature-invalid", signature(SignatureFault::NotValid)),
-        (
-            "signature-flags",
-            signature(SignatureFault::Flags {
-                found: "adhoc".into(),
-            }),
         ),
         ("version-failed", version(VersionFault::Failed(Some(1)))),
         (
@@ -338,10 +320,7 @@ fn every_refusal_is_reported_under_the_word_of_the_contract() {
         ("facts-differ", Some("facts")),
         ("installer-too-old", Some("installer_too_old")),
         ("below-floor", Some("floor")),
-        ("lease-live", Some("lease")),
         ("wrong-platform", Some("platform")),
-        ("quarantined", Some("shape")),
-        ("signature-invalid", Some("shape")),
         ("version-failed", Some("facts")),
         ("version-unreadable", Some("facts")),
         ("version-commit", Some("commit_or_ref")),

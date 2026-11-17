@@ -3,8 +3,7 @@
 //! The wrapper prints one JSON line and exits 0 (done), 2 (refused) or 3 (failed); a
 //! `query` answers with the report on exit 0. The exit status and the shape must agree, so
 //! an answer that is plausible JSON from the wrong place (a banner, a shell that printed
-//! a line of its own) is not taken for one. A Mac's `install` answers `apply_started`, and its
-//! `query` carries one more field, `apply`. A `restart` answers `restarted` and the unit it
+//! a line of its own) is not taken for one. A `restart` answers `restarted` and the unit it
 //! restarted, which must be the one asked for. Nothing the host sent is passed on except a
 //! reason code, held to `[a-z_]`, and an installed version, held to the version alphabet:
 //! a [`PortError`] never carries free text from the other side.
@@ -13,8 +12,7 @@ use serde::Deserialize;
 
 use super::exec::Exited;
 use crate::inventory::valid_node_id;
-use crate::ports::{Apply, InstallAnswer, Installed, PortError, Report};
-use crate::version::Version;
+use crate::ports::{InstallAnswer, Installed, PortError, Report};
 
 /// The most stdout that is read, in bytes. The longest real line is under 200.
 pub const MAX_STDOUT: usize = 4096;
@@ -69,30 +67,6 @@ enum UnitState {
     NotRun,
 }
 
-/// A Mac's answer to `install`: the apply is launched and goes on by itself.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Started {
-    #[serde(rename = "result")]
-    _result: StartedResult,
-    version: String,
-    commit: String,
-    #[serde(rename = "apply")]
-    _apply: StartedApply,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum StartedResult {
-    ApplyStarted,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum StartedApply {
-    Running,
-}
-
 /// The host's answer to `restart`: the unit is restarted and active.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,8 +106,6 @@ struct QueryLine {
     running_commit: Option<String>,
     node_id: Option<String>,
     in_progress: bool,
-    // Only a Mac's line has it.
-    apply: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -175,39 +147,25 @@ fn reason_line(line: &str, code: i32) -> Result<PortError, PortError> {
     Ok(PortError::other(format!("{label}: {}", got.reason)))
 }
 
-/// The answer of `install` to the request for `version`: what the host accepted on exit 0,
-/// else the error to report. An `apply_started` for another version is a bad answer.
-pub fn install_answer(
-    code: i32,
-    stdout: &[u8],
-    version: &Version,
-) -> Result<InstallAnswer, PortError> {
+/// The answer of `install`: what the host accepted on exit 0, else the error to report.
+pub fn install_answer(code: i32, stdout: &[u8]) -> Result<InstallAnswer, PortError> {
     let line = one_line(stdout).ok_or_else(bad_answer)?;
     match code {
-        0 => match parse::<Done>(line) {
-            Ok(done) => {
-                let answer = match (&done.result, &done.unit_state) {
-                    (DoneResult::Installed, UnitState::Finished) => InstallAnswer::Installed,
-                    (DoneResult::AlreadyInstalled, UnitState::NotRun) => {
-                        InstallAnswer::AlreadyInstalled
-                    }
-                    _ => return Err(bad_answer()),
-                };
-                if installed_ok(&done.installed_version) {
-                    Ok(answer)
-                } else {
-                    Err(bad_answer())
+        0 => {
+            let done: Done = parse(line)?;
+            let answer = match (&done.result, &done.unit_state) {
+                (DoneResult::Installed, UnitState::Finished) => InstallAnswer::Installed,
+                (DoneResult::AlreadyInstalled, UnitState::NotRun) => {
+                    InstallAnswer::AlreadyInstalled
                 }
+                _ => return Err(bad_answer()),
+            };
+            if installed_ok(&done.installed_version) {
+                Ok(answer)
+            } else {
+                Err(bad_answer())
             }
-            Err(_) => {
-                let started: Started = parse(line)?;
-                if started.version == version.as_str() && commit_ok(&started.commit) {
-                    Ok(InstallAnswer::ApplyStarted)
-                } else {
-                    Err(bad_answer())
-                }
-            }
-        },
+        }
         2 | 3 => Err(reason_line(line, code)?),
         _ => Err(bad_answer()),
     }
@@ -236,24 +194,6 @@ fn commit_ok(commit: &str) -> bool {
     (1..=64).contains(&commit.len()) && commit.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// A Mac's apply state: `running`, `done`, or `failed:` and a reason of lower case letters,
-/// `_` and `:`, at most 64 bytes (the host's own bound).
-fn apply_of(text: &str) -> Option<Apply> {
-    match text {
-        "running" => Some(Apply::Running),
-        "done" => Some(Apply::Done),
-        _ => {
-            let why = text.strip_prefix("failed:")?;
-            let plain = !why.is_empty()
-                && why.len() <= 64
-                && why
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b':');
-            plain.then(|| Apply::Failed(why.to_owned()))
-        }
-    }
-}
-
 /// The answer of `query`.
 pub fn query_answer(code: i32, stdout: &[u8]) -> Result<Report, PortError> {
     let line = one_line(stdout).ok_or_else(bad_answer)?;
@@ -274,15 +214,10 @@ pub fn query_answer(code: i32, stdout: &[u8]) -> Result<Report, PortError> {
                     None => Installed::NotInstalled,
                 }
             };
-            let apply = match report.apply.as_deref() {
-                None => None,
-                Some(text) => Some(apply_of(text).ok_or_else(bad_answer)?),
-            };
             Ok(Report {
                 installed,
                 running_commit: report.running_commit,
                 node_id: report.node_id,
-                apply,
             })
         }
         2 | 3 => Err(reason_line(line, code)?),

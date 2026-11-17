@@ -1,12 +1,10 @@
 //! A storage host's health as its own updater reads it: one route, the node's own view
 //! (`GET /v1/nodes/{id}/storage-health`), against a fake operator API.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::fakes::{FakeInstaller, Log};
 use crate::inventory::{Host, Role};
 use crate::node_health::NodeHealth;
 use crate::operator::OperatorApi;
@@ -62,7 +60,7 @@ fn health(server: &FakeApi, name: &str) -> NodeHealth {
     let api = OperatorApi::new(server.addr, token)
         .expect("api")
         .with_timeout(Duration::from_millis(500));
-    NodeHealth::for_updater(api, Arc::new(FakeInstaller::new(&Log::default())))
+    NodeHealth::for_updater(api)
 }
 
 fn check(server: &FakeApi, name: &str) -> Result<Health, PortError> {
@@ -224,10 +222,7 @@ fn errors_are_of_the_right_kind_and_leak_nothing() {
         }
     }
     let token = file(&scratch("nho-dead"), "token", TOKEN, 0o600);
-    let dead = NodeHealth::for_updater(
-        OperatorApi::new(closed_port(), token).expect("api"),
-        Arc::new(FakeInstaller::new(&Log::default())),
-    );
+    let dead = NodeHealth::for_updater(OperatorApi::new(closed_port(), token).expect("api"));
     let e = dead.check(&host(Some("st1")), &target()).expect_err("dead");
     assert!(e.is_unreachable(), "{e}");
 }
@@ -246,7 +241,6 @@ fn held_is_the_same_and_the_rolls_reading_is_unchanged() {
         OperatorApi::new(server.addr, token)
             .expect("api")
             .with_timeout(Duration::from_millis(500)),
-        Arc::new(FakeInstaller::new(&Log::default())),
     );
     let _ = roll.check(&host(Some("st1")), &target());
     let sent = server.requests();

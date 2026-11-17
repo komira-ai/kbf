@@ -28,8 +28,7 @@ fn layout(root: &Path) -> Layout {
     )
 }
 
-/// A file in the state directory of this platform (`var/lib/kbf-installer` on Linux,
-/// `var/db/kbf-installer` on macOS), under `root`.
+/// A file in the state directory of this platform (`var/lib/kbf-installer`), under `root`.
 fn in_state_dir(root: &Path, name: &str) -> PathBuf {
     let layout = layout(root);
     layout.join(&layout.state_dir()).join(name)
@@ -50,11 +49,12 @@ fn status(root: &Path) -> serde_json::Value {
 }
 
 /// Catches a helper that cannot do one pass of its own: it writes a world-readable
-/// status.json and exits 0 (here as a non-root user, so with the installer's refusal); with an order it cannot
-/// carry out (no cgroup of the unit's leases exists on this root), the pass ends and the refusal is the node's to read, not a crash.
+/// status.json and exits 0 (here as a non-root user, so with the installer's refusal); with an
+/// order it cannot carry out (this root has no installer.toml for the fetch), the pass ends and
+/// the refusal is the node's to read, not a crash.
 ///
-/// Catches: `leases::NotWired` left in `build_helper` (the refusal says there is no
-/// lease source wired in, not that the unit's cgroup is missing).
+/// Catches: `fetcher::NotWired` left in `build_helper` (the refusal says there is no fetcher,
+/// not that the installer.toml is missing).
 #[test]
 fn one_pass_reports_the_host_and_a_refused_order() {
     let root = root("pass");
@@ -70,7 +70,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
     kbf_installer::testkit::mkdirs(&root, &release, 0o755);
     fs::write(release.join("kbf"), b"x").expect("binary");
 
-    let run = ["run", "--passes", "1", "--unit", "kbf-daemon.service"];
+    let run = ["run", "--passes", "1", "--unit", "kbf-storage.service"];
     let out = helper(&root, &run);
     assert!(
         out.status.success(),
@@ -94,9 +94,8 @@ fn one_pass_reports_the_host_and_a_refused_order() {
         .mode();
     assert_eq!(mode & 0o777, 0o644, "the node reads it as the service user");
 
-    // An activation: the binary reads the leases of the daemon's unit from its cgroup, and
-    // this scratch root has none, so it cannot tell and the order is refused with that
-    // reason (fail closed), and the pass ends before any fetch.
+    // An activation: the binary builds the host's fetcher, and this scratch root has no
+    // installer.toml, so the fetch is refused with that reason and the pass ends.
     let record = kbf_update::OrderRecord {
         order_id: 2,
         epoch: 1,
@@ -111,13 +110,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
             attestation: "{}".to_owned(),
         }],
         expected: Some(kbf_update::Facts {
-            // The platform of the host the binary was built for.
-            platform: if cfg!(target_os = "macos") {
-                "darwin-arm64"
-            } else {
-                "linux-x86_64"
-            }
-            .to_owned(),
+            platform: "linux-x86_64".to_owned(),
             protocol: 7,
             min_protocol: 6,
             state_schema: 3,
@@ -139,7 +132,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
     assert_eq!(status(&root)["state"], "refused");
     let why = status(&root)["refusal"].as_str().expect("text").to_owned();
     assert!(
-        why.contains("kbf-daemon.service: no such cgroup"),
+        why.contains("installer.toml is not trusted: it is missing"),
         "the order's own refusal now: {why}"
     );
 }
@@ -235,16 +228,6 @@ fn the_service_must_be_named_exactly_once() {
         helper(&root, &["run", "--passes", "1"]).status.code(),
         Some(2)
     );
-    let both = [
-        "run",
-        "--passes",
-        "1",
-        "--unit",
-        "a",
-        "--launchd-label",
-        "b",
-    ];
-    assert_eq!(helper(&root, &both).status.code(), Some(2));
     // The same for `run`: a relative root is refused before anything is read.
     let out = Command::new(BIN)
         .args(["--root", "relative", "run", "--passes", "1", "--unit", "a"])
@@ -294,15 +277,15 @@ fn boot_check_takes_kbf_and_mode_together_or_not_at_all() {
     }
     assert_eq!(helper(&root, &["boot-check"]).status.code(), Some(5));
     let kbf = format!("--kbf={}", root.join("no-such-kbf").display());
-    let bundled = ["boot-check", kbf.as_str(), "--mode=daemon"];
+    let bundled = ["boot-check", kbf.as_str(), "--mode=storage"];
     let out = helper(&root, &bundled);
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");
     assert!(err.contains("no-such-kbf"), "{err}");
 }
 
-/// Catches a loop that does not loop or does not stop: two passes with a launchd label
-/// (the label is taken, and no unit is needed) end on their own; a helper.json the helper
+/// Catches a loop that does not loop or does not stop: two passes with a unit (no unit is
+/// needed to exist) end on their own; a helper.json the helper
 /// cannot read ends the run with an exit of 1 and a message, not a guess.
 ///
 /// Catches: `passes` ignored (the run never ends; the test would hang), the
@@ -317,7 +300,7 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
             ..State::default()
         })
         .expect("state");
-    let two = ["run", "--passes", "2", "--launchd-label", "com.example.kbf"];
+    let two = ["run", "--passes", "2", "--unit", "kbf-storage.service"];
     let out = helper(&root, &two);
     assert!(
         out.status.success(),
@@ -414,10 +397,10 @@ fn the_operator_verbs_exit_by_the_contract() {
 #[test]
 fn the_shipped_binary_refuses_a_verb_that_needs_root_and_names_the_unbuilt_ones() {
     let root = root("gate");
-    let out = helper(&root, &["setup", "--mode=daemon"]);
+    let out = helper(&root, &["setup", "--mode=storage"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("setup writes /etc"));
-    let out = helper(&root, &["--json", "setup", "--mode=daemon"]);
+    let out = helper(&root, &["--json", "setup", "--mode=storage"]);
     assert_eq!(out.status.code(), Some(2));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one object");
     assert_eq!(v["error"], "needs_root");

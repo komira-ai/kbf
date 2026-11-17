@@ -1,12 +1,10 @@
-//! The health of storage and daemon hosts against a fake operator API, route by route.
+//! The health of storage hosts against a fake operator API, route by route.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::api::{ErrorCode, RollState};
-use crate::fakes::{FakeInstaller, Log};
 use crate::health::{commit_of, names};
 use crate::inventory::{Host, Member, Role};
 use crate::node_health::{MEMBER_ELSEWHERE, NO_MEMBER_REFUSAL, NodeHealth};
@@ -60,17 +58,7 @@ fn api(server: &FakeApi, name: &str) -> OperatorApi {
 }
 
 fn adapter(server: &FakeApi, name: &str) -> NodeHealth {
-    NodeHealth::with_api(
-        api(server, name),
-        Arc::new(FakeInstaller::new(&Log::default())),
-    )
-}
-
-/// An adapter whose installer says host `dm` runs `commit`.
-fn adapter_running(server: &FakeApi, name: &str, commit: Option<&str>) -> NodeHealth {
-    let installer = FakeInstaller::new(&Log::default());
-    installer.set_identity("dm", Some("dm-node"), commit);
-    NodeHealth::with_api(api(server, name), Arc::new(installer))
+    NodeHealth::with_api(api(server, name))
 }
 
 fn enrolled(id: &str, advertise: &str) -> Vec<u8> {
@@ -293,7 +281,6 @@ fn errors_are_of_the_right_kind_and_leak_nothing() {
             file(&scratch("nh-dead"), "token", TOKEN, 0o600),
         )
         .expect("api"),
-        Arc::new(FakeInstaller::new(&Log::default())),
     );
     let e = dead
         .check(&host("st1", Role::Storage), &target())
@@ -302,163 +289,19 @@ fn errors_are_of_the_right_kind_and_leak_nothing() {
 }
 
 /// Catches a version without a commit being judged: no host can be shown to run it, so a
-/// storage host and a daemon host both fail at once and nothing is asked.
+/// storage host fails at once and nothing is asked.
 #[test]
-fn a_version_without_a_commit_fails_a_storage_or_daemon_host() {
+fn a_version_without_a_commit_fails_a_storage_host() {
     let server = storage(vec![member(ADDR, "active", Some(COMMIT))]);
     let v = Version::parse("2.0-1").expect("version");
-    for (h, name) in [
-        (host("st1", Role::Storage), "nh-nocommit"),
-        (host("dm", Role::Daemon), "nh-dm-nocommit"),
-    ] {
-        let Ok(Health::Abandoned(why)) = adapter(&server, name).check(&h, &v) else {
-            panic!("expected a failure");
-        };
-        assert!(why.contains("names no commit"), "{why}");
-        let held = adapter(&server, name).check_held(&h, &v);
-        assert!(matches!(held, Ok(Health::Abandoned(_))), "{held:?}");
-    }
-    assert!(server.requests().is_empty());
-}
-
-fn node(connected: bool, placement: &str) -> Vec<u8> {
-    http(
-        200,
-        &json!({
-            "node_id": "dm-node", "connected": connected, "protocol": 1, "software": null,
-            "needs_attention": [], "placement": {"state": placement}, "leases": [],
-        })
-        .to_string(),
-    )
-}
-
-fn dm() -> Host {
-    Host {
-        node_id: Some("dm-node".to_owned()),
-        ..host("dm", Role::Daemon)
-    }
-}
-
-fn daemon_check(adapter: &NodeHealth) -> Result<Health, PortError> {
-    adapter.check(&dm(), &target())
-}
-
-fn daemon_check_held(adapter: &NodeHealth) -> Result<Health, PortError> {
-    adapter.check_held(&dm(), &target())
-}
-
-/// Catches a daemon taken for healthy when it is not on the frontend's side: not registered
-/// with this frontend (404), not connected, cordoned or draining (not serving). Each waits,
-/// with the reason; a node the roll holds drained is not asked to be serving, but is asked to
-/// be connected.
-#[test]
-fn a_daemon_waits_until_it_is_connected_and_serving() {
-    let missing = routes(vec![]);
-    let why = waiting(&daemon_check(&adapter_running(
-        &missing,
-        "nh-dm-404",
-        Some(COMMIT),
-    )));
-    assert!(
-        why.contains("has not registered with the frontend"),
-        "{why}"
-    );
-    let down = routes(vec![("/v1/nodes/dm-node", node(false, "serving"))]);
-    for check in [daemon_check, daemon_check_held] {
-        let why = waiting(&check(&adapter_running(&down, "nh-dm-down", Some(COMMIT))));
-        assert!(why.contains("dm is not connected"), "{why}");
-    }
-    for placement in ["cordoned", "draining", "drained", "drain_paused"] {
-        let server = routes(vec![("/v1/nodes/dm-node", node(true, placement))]);
-        let held = adapter_running(&server, "nh-dm-placed", Some(COMMIT));
-        let why = waiting(&daemon_check(&held));
-        assert!(
-            why.contains(&format!("dm is {placement}, not serving")),
-            "{why}"
-        );
-        assert_eq!(daemon_check_held(&held), Ok(Health::Healthy), "{placement}");
-    }
-}
-
-/// Catches a daemon called healthy on the frontend's word alone: the host's own report of the
-/// commit it runs must name the target's (by prefix), so a daemon still on the old build, one
-/// that reports no commit and one whose host cannot be asked each wait or fail, with the
-/// reason. Connected and serving with the target's commit, in 12 or 40 digits, is healthy.
-#[test]
-fn a_daemon_must_run_the_targets_commit() {
-    let server = routes(vec![("/v1/nodes/dm-node", node(true, "serving"))]);
-    for (commit, name) in [(COMMIT, "nh-dm-full"), ("0123456789ab", "nh-dm-short")] {
-        let health = adapter_running(&server, name, Some(commit));
-        assert_eq!(daemon_check(&health), Ok(Health::Healthy), "{commit}");
-        assert_eq!(daemon_check_held(&health), Ok(Health::Healthy), "{commit}");
-    }
-    let old = adapter_running(&server, "nh-dm-old", Some(OTHER));
-    for got in [daemon_check(&old), daemon_check_held(&old)] {
-        let why = waiting(&got);
-        assert!(
-            why.contains(&format!("dm runs build {OTHER}, not the target's")),
-            "{why}"
-        );
-    }
-    let silent = adapter_running(&server, "nh-dm-silent", None);
-    assert!(waiting(&daemon_check(&silent)).contains("has not reported the commit it runs"));
-    let installer = FakeInstaller::new(&Log::default());
-    installer.script_query("dm", vec![Err(PortError::unreachable("timeout"))]);
-    let health = NodeHealth::with_api(api(&server, "nh-dm-ssh"), Arc::new(installer));
-    assert!(daemon_check(&health).expect_err("ssh").is_unreachable());
-    let server = routes(vec![("/v1/nodes/dm-node", http(503, "{}"))]);
-    assert!(
-        daemon_check(&adapter_running(&server, "nh-dm-5xx", Some(COMMIT)))
-            .expect_err("5xx")
-            .is_unreachable()
-    );
-}
-
-/// Catches a Mac host judged as something else than a daemon: connected and serving with the
-/// running process's commit (the host's `running_commit`) is healthy, a Mac on another commit
-/// waits with the reason, a node that is not connected waits, and a held Mac is not asked to be
-/// serving.
-#[test]
-fn a_mac_daemon_is_judged_as_a_daemon() {
-    let mac = Host {
-        role: Role::MacDaemon,
-        ..dm()
+    let h = host("st1", Role::Storage);
+    let Ok(Health::Abandoned(why)) = adapter(&server, "nh-nocommit").check(&h, &v) else {
+        panic!("expected a failure");
     };
-    let serving = routes(vec![("/v1/nodes/dm-node", node(true, "serving"))]);
-    let health = adapter_running(&serving, "nh-mac-ok", Some(COMMIT));
-    assert_eq!(health.check(&mac, &target()), Ok(Health::Healthy));
-    assert_eq!(health.check_held(&mac, &target()), Ok(Health::Healthy));
-    let old = adapter_running(&serving, "nh-mac-old", Some(OTHER));
-    for got in [old.check(&mac, &target()), old.check_held(&mac, &target())] {
-        assert!(
-            waiting(&got).contains(&format!("dm runs build {OTHER}, not the target's")),
-            "{got:?}"
-        );
-    }
-    let cordoned = routes(vec![("/v1/nodes/dm-node", node(true, "cordoned"))]);
-    let health = adapter_running(&cordoned, "nh-mac-held", Some(COMMIT));
-    assert!(waiting(&health.check(&mac, &target())).contains("dm is cordoned, not serving"));
-    assert_eq!(health.check_held(&mac, &target()), Ok(Health::Healthy));
-    let down = routes(vec![("/v1/nodes/dm-node", node(false, "serving"))]);
-    let health = adapter_running(&down, "nh-mac-down", Some(COMMIT));
-    assert!(waiting(&health.check(&mac, &target())).contains("is not connected"));
-}
-
-/// Catches the node API's path built from anything but the node id the inventory lists (the
-/// alias when it lists none), and a daemon asked where it is not: the daemon is asked as
-/// `GET /v1/nodes/{node id}`.
-#[test]
-fn the_daemon_is_asked_by_its_node_id() {
-    let server = routes(vec![
-        ("/v1/nodes/dm-node", node(true, "serving")),
-        ("/v1/nodes/dm", node(true, "serving")),
-    ]);
-    let health = adapter_running(&server, "nh-dm-path", Some(COMMIT));
-    assert_eq!(daemon_check(&health), Ok(Health::Healthy));
-    assert!(server.requests()[0].starts_with("GET /v1/nodes/dm-node HTTP/1.1\r\n"));
-    let unlisted = host("dm", Role::Daemon);
-    assert_eq!(health.check(&unlisted, &target()), Ok(Health::Healthy));
-    assert!(server.requests()[1].starts_with("GET /v1/nodes/dm HTTP/1.1\r\n"));
+    assert!(why.contains("names no commit"), "{why}");
+    let held = adapter(&server, "nh-nocommit").check_held(&h, &v);
+    assert!(matches!(held, Ok(Health::Abandoned(_))), "{held:?}");
+    assert!(server.requests().is_empty());
 }
 
 /// Catches a version tied to the wrong commit: the 12 digits after `+g` of a package version,
@@ -536,7 +379,6 @@ fn a_frontend_host_that_is_no_member_is_refused_without_asking_the_api() {
     assert_eq!(health.refusal(&fe), Some(NO_MEMBER_REFUSAL.to_owned()));
     assert_eq!(health.refusal(&pooled), None);
     assert_eq!(health.refusal(&host("st1", Role::Storage)), None);
-    assert_eq!(health.refusal(&host("dm", Role::Daemon)), None);
     assert!(NO_MEMBER_REFUSAL.contains("instance=<name> and base=<port>"));
     assert!(server.requests().is_empty());
 }
@@ -553,7 +395,6 @@ fn a_roll_with_a_frontend_that_is_no_member_fails_at_it_and_touches_no_host_afte
     let ports = Ports {
         safe: Box::new(rig.stop.clone()),
         installer: Box::new(rig.inst.clone()),
-        drain: Box::new(rig.drain.clone()),
         health: Box::new(adapter(&server, "nh-roll-fe")),
         clock: Box::new(rig.clock.clone()),
         frontend: Box::new(rig.front.clone()),

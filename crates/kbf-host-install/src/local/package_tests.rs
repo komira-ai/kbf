@@ -387,7 +387,7 @@ impl Runner for Sim {
                 fs::write(bin.join("kbf"), b"the package's kbf").unwrap();
                 fs::set_permissions(bin.join("kbf"), fs::Permissions::from_mode(0o755)).unwrap();
                 fs::write(
-                    units.join("kbf-storage-and-daemon.service"),
+                    units.join("kbf-storage.service"),
                     "[Service]\nUser=kbf\nStateDirectory=kbf\nStateDirectoryMode=0750\n",
                 )
                 .unwrap();
@@ -551,7 +551,7 @@ impl Rig {
             host,
             allowlist: dir.join("releases.toml"),
             units: vec![
-                Unit::service("kbf-daemon.service").unwrap(),
+                Unit::service("kbf-storage.service").unwrap(),
                 Unit::service("kbf-frontend@a.service").unwrap(),
             ],
             restart_wait: Wait {
@@ -1142,7 +1142,7 @@ fn the_order_is_verify_record_previous_install_restart_confirm() {
                     "install:{v}:trial=true:prev_kept=true:old={}",
                     format == Format::Rpm
                 ),
-                "restart:kbf-daemon.service".to_owned(),
+                "restart:kbf-storage.service".to_owned(),
                 "restart:kbf-frontend@a.service".to_owned(),
             ]
         );
@@ -1284,7 +1284,7 @@ fn a_package_whose_unit_does_not_come_up_is_replaced_by_the_previous_at_once() {
                 .collect::<Vec<_>>(),
             [new_version(), a_version()]
         );
-        // daemon, frontend (fails), then both again on the previous package.
+        // storage node, frontend (fails), then both again on the previous package.
         assert_eq!(rig.restarts().len(), 4);
     });
 }
@@ -1329,7 +1329,7 @@ fn a_revert_that_cannot_restart_ends_the_trial_and_says_so() {
         rig.net
             .borrow_mut()
             .restart_fails_once
-            .insert("kbf-daemon.service".to_owned());
+            .insert("kbf-storage.service".to_owned());
         let pending = rig.backend.pending().unwrap().unwrap();
         let fault = rig.backend.revert(&pending).unwrap_err();
         assert_eq!(fault.code, Code::RevertFailed);
@@ -1552,7 +1552,7 @@ fn the_host_reports_its_node_and_its_lock() {
 #[test]
 fn the_production_host_is_the_package_layout_and_the_programs_of_a_stage() {
     let host = super::package::production(
-        vec![Unit::service("kbf-daemon.service").unwrap()],
+        vec![Unit::service("kbf-storage.service").unwrap()],
         Format::Rpm,
         Path::new("/var/lib/kbf-host-install"),
     );

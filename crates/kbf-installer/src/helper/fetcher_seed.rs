@@ -43,7 +43,6 @@ use crate::binary::Version;
 use crate::fetch;
 use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
 use crate::helper::fetcher_real::{Parts, fetch_error, refused, replaced_bytes};
-use crate::helper::leases::LeaseSource;
 use crate::layout::{GH, Layout, RELEASE_BINARY, SETTINGS, TRUSTED_ROOT};
 use crate::refusal::{Refusal, TrustFault};
 use crate::run::Runner;
@@ -61,8 +60,6 @@ pub struct SeedFetcher {
     /// a host.
     pub trust: Box<dyn Exec>,
     pub runner: Box<dyn Runner>,
-    /// Observed at the pipeline's lease step, for an activation.
-    pub leases: Box<dyn LeaseSource>,
     /// Who owns the scratch directory and the release: root on a host.
     pub owner: Owner,
     /// The first 12 hex digits of the commit this installer was built from, which name its
@@ -98,7 +95,6 @@ impl SeedFetcher {
             policy,
             trust: parts.trust,
             runner: parts.runner,
-            leases: parts.leases,
             owner: parts.owner,
             build: build.to_owned(),
         }
@@ -257,7 +253,6 @@ impl SeedFetcher {
             policy: self.policy,
             trust: &*self.trust,
             runner: &*self.runner,
-            leases: &*self.leases,
             owner: self.owner,
         }
     }

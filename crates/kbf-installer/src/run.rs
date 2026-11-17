@@ -26,18 +26,12 @@ pub struct RunAs {
 }
 
 /// The `nobody` account: what a program that reads untrusted bytes runs as unless the
-/// host's settings name another. Linux gives it 65534; on macOS it is -2, which a `uid_t`
-/// holds as 4294967294 (UNVERIFIED on the farm's Macs: a Mac's settings may name it).
+/// host's settings name another. Linux gives it 65534.
 pub const fn nobody(platform: crate::layout::Platform) -> RunAs {
-    match platform {
-        crate::layout::Platform::Linux => RunAs {
-            uid: 65534,
-            gid: 65534,
-        },
-        crate::layout::Platform::MacOs => RunAs {
-            uid: 4_294_967_294,
-            gid: 4_294_967_294,
-        },
+    let crate::layout::Platform::Linux = platform;
+    RunAs {
+        uid: 65534,
+        gid: 65534,
     }
 }
 

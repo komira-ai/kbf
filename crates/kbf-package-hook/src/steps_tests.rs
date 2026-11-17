@@ -45,8 +45,8 @@ impl Rig {
     fn params(&self, first_install: bool) -> Params {
         let mut params = Params::default();
         let text = |s: &str| Scalar::Text(s.to_owned());
-        params.insert("unit", text("kbf-storage-and-daemon.service"));
-        params.insert("mode", text("storage-and-daemon"));
+        params.insert("unit", text("kbf-storage.service"));
+        params.insert("mode", text("storage"));
         params.insert("state_dir", text(&self.state_dir().display().to_string()));
         params.insert(
             "updater.staged_release",
@@ -123,10 +123,7 @@ fn prepare_checks_the_staged_binary_then_stops_the_running_unit() {
     let calls = rig.host.calls();
     assert_eq!(
         calls[0],
-        format!(
-            "check {}/tree/usr/bin/kbf storage-and-daemon",
-            rig.staged().display()
-        )
+        format!("check {}/tree/usr/bin/kbf storage", rig.staged().display())
     );
     assert_eq!(calls[1..], ["state", "stop"]);
     let record = rig.record().expect("a record");

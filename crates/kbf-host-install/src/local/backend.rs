@@ -1,10 +1,11 @@
-//! What the platform does for an update: the one trait [`crate::local::core::Ab`] stands on.
+//! What the host does for an update: the one trait [`crate::local::core::Ab`] stands on.
 //!
 //! A Linux host keeps its releases in the layout of `kbf-installer`
 //! (`/var/lib/kbf-installer/releases/<commit>`, the links `current` and `previous`, one
-//! `state.json`); a Mac keeps them in the kit tree. The trait is the same: verify and lay out
+//! `state.json`), a host that runs the `kbf` package keeps them as that package does. The trait
+//! is the same: verify and lay out
 //! a release beside the running one, move to it on trial, keep it, or go back. What is on
-//! trial is persisted by the platform (in `state.json`, or in the Mac's `pending.json`) in the
+//! trial is persisted by the backend (in `state.json`) in the
 //! same step as the move, so a restart of this program or of the host finds it.
 
 use std::path::PathBuf;

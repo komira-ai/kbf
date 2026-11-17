@@ -2,30 +2,24 @@
 
 use super::*;
 
-/// Catches a frontend or all-in-one unit that activates releases with no database migration
-/// and no warning: `run` for the unit of either mode refuses (exit 2, one line) unless
-/// `--installer-config` is given, before it touches the host; a unit of a mode with no
-/// database (or a launchd label, which names no mode) still runs without one; and a config
-/// that cannot be read stops the service rather than starting it without the step.
+/// Catches a frontend unit that activates releases with no database migration and no warning:
+/// `run` for the unit of the frontend (the plain unit or an instance of its template) refuses
+/// (exit 2, one line) unless `--installer-config` is given, before it touches the host; a unit
+/// of a mode with no database still runs without one; and a config that cannot be read stops
+/// the service rather than starting it without the step.
 ///
-/// Catches: the unit check removed (the all-in-one unit ran its pass); the unit
-/// check matching only `kbf-frontend@` (the plain `kbf-frontend.service`, the unit setup enables on
-/// a frontend host, ran its pass without the migration);
-/// the all-in-one template (`kbf-all-in-one@1.service`) is in the test list.
+/// Catches: the unit check removed; the unit check matching only `kbf-frontend@` (the plain
+/// `kbf-frontend.service`, the unit setup enables on a frontend host, ran its pass without the
+/// migration).
 #[test]
-fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
+fn run_on_a_frontend_unit_needs_the_installer_config() {
     let (layout, root) = seeded("run-database");
-    for unit in [
-        "kbf-all-in-one.service",
-        "kbf-all-in-one@1.service",
-        "kbf-frontend@main.service",
-        "kbf-frontend.service",
-    ] {
+    for unit in ["kbf-frontend@main.service", "kbf-frontend.service"] {
         let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
         assert_eq!(exit, Exit::Usage, "{unit}: {err}");
         assert_eq!(
             err,
-            "kbf-installer: run needs --installer-config on a frontend or all-in-one host \
+            "kbf-installer: run needs --installer-config on a frontend host \
              (the database is migrated before a release is activated)\n",
             "{unit}"
         );
@@ -37,15 +31,10 @@ fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
             "{unit}: nothing was done before the refusal"
         );
     }
-    for unit in ["kbf.service", "kbf-daemon.service"] {
+    for unit in ["kbf.service", "kbf-storage.service"] {
         let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
         assert_eq!(exit, Exit::Ok, "{unit}: {err}");
     }
-    let (exit, err) = on(
-        &root,
-        &["run", "--passes", "1", "--launchd-label", "com.example.kbf"],
-    );
-    assert_eq!(exit, Exit::Ok, "a label names no mode: {err}");
     let (exit, err) = on(
         &root,
         &[
@@ -53,7 +42,7 @@ fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
             "--passes",
             "1",
             "--unit",
-            "kbf-all-in-one.service",
+            "kbf-frontend.service",
             "--installer-config",
             "/etc/kbf/missing.toml",
         ],
@@ -123,44 +112,6 @@ fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
     assert!(with(&[]).schema_step_mut().is_none(), "no flag, no step");
 }
 
-/// Catches `run` building a helper that cannot tell about leases (the stub every build had
-/// until a lease source was wired): the helper `run` builds reads the lease cgroups of the
-/// unit it restarts, below the host root's `/sys/fs/cgroup`, so a populated lease of
-/// `kbf-daemon.service` is one live lease. A unit that never ran (no cgroup), a unit of no
-/// mode and a launchd label (the Mac source, which looks under the host root for
-/// `sandbox-exec`) each cannot tell, with the reason: the activation is refused
-/// (fail closed), and `run` itself still starts for them.
-///
-/// Catches: `leases::NotWired` left in `build_helper` (the daemon's lease reads as
-/// "cannot tell"); the cgroup root taken as the real `/sys/fs/cgroup` instead of the host
-/// root's.
-#[test]
-fn run_builds_a_helper_whose_lease_source_reads_the_restarted_units_cgroup() {
-    let (_, root) = seeded("run-lease-source");
-    let lease = root.join("sys/fs/cgroup/kbf.slice/kbf-daemon.service/actions/kbf-lease-1-1");
-    fs::create_dir_all(&lease).expect("lease cgroup");
-    fs::write(lease.join("cgroup.events"), "populated 1\n").expect("events");
-    let source = |flags: &[&str]| {
-        let mut argv = vec!["--root", root.to_str().expect("text"), "run"];
-        argv.extend_from_slice(flags);
-        let Verb::Run(args) = parse(&argv).verb else {
-            panic!("a run");
-        };
-        match build_helper(root.clone(), &args) {
-            Ok(helper) => helper.leases().live(),
-            Err(f) => panic!("{}", f.why),
-        }
-    };
-    assert_eq!(source(&["--unit", "kbf-daemon.service"]), Ok(1));
-    let err = source(&["--unit", "kbf-frontend@a.service"]).expect_err("never ran");
-    assert!(err.contains("no such cgroup"), "{err}");
-    let err = source(&["--unit", "kbf.service"]).expect_err("no mode's unit");
-    assert!(err.contains("is no unit of any mode"), "{err}");
-    let err = source(&["--launchd-label", "com.example.kbf"]).expect_err("a Mac source");
-    assert!(err.contains("sandbox-exec"), "{err}");
-    assert!(!err.contains("no lease source wired"), "{err}");
-}
-
 /// Catches `run --installer-config` reading the config under a host root that is not an
 /// absolute path (the root is the sandbox flag's; a relative one is refused with its reason
 /// rather than reading from the working directory).
@@ -197,14 +148,9 @@ fn run_args(extra: &[&str]) -> RunArgs {
 fn the_fetcher_reads_the_flags_installer_toml_else_the_one_setup_writes() {
     let root = || kbf_host::Root::new("/").expect("root");
     let linux = Layout::new(root(), Platform::Linux);
-    let mac = Layout::new(root(), Platform::MacOs);
     assert_eq!(
         installer_toml_of(&run_args(&[]), &linux).as_str(),
         "/etc/kbf/installer.toml"
-    );
-    assert_eq!(
-        installer_toml_of(&run_args(&[]), &mac).as_str(),
-        "/usr/local/etc/kbf/installer.toml"
     );
     let flagged = run_args(&["--installer-config", "/srv/kbf/installer.toml"]);
     assert_eq!(
@@ -237,8 +183,7 @@ fn run_builds_its_helper_with_the_host_fetcher_not_the_unwired_one() {
     );
 }
 
-/// The Linux layout on `root`: the one the tests of the unit `run` derives from the mode pin,
-/// whatever OS runs them, because the derivation is Linux's (a Mac has no unit to derive).
+/// The layout on `root`: the one the tests of the unit `run` derives from the mode pin.
 fn linux_on(root: &Path) -> Layout {
     Layout::linux(kbf_host::path::Root::new(root).expect("absolute"))
 }
@@ -267,46 +212,34 @@ fn run_without_a_service_flag_restarts_the_unit_of_the_hosts_mode() {
         let Verb::Run(args) = parse(&argv).verb else {
             panic!("a run");
         };
-        target_on(&root, &args, Platform::Linux)
+        target_of(&root, &args)
     };
     for (mode, unit) in [
         ("frontend", "kbf-frontend.service"),
         ("storage", "kbf-storage.service"),
-        ("daemon", "kbf-daemon.service"),
-        ("storage-and-daemon", "kbf-storage-and-daemon.service"),
-        ("all-in-one", "kbf-all-in-one.service"),
     ] {
         write_kbf_toml(&linux, &format!("mode = \"{mode}\"\n"));
         let derived = service(&[])
             .unwrap_or_else(|f| panic!("{mode}: {}", f.why))
             .service;
-        assert_eq!(derived.unit.as_deref(), Some(unit), "{mode}");
-        assert_eq!(derived.launchd_label, None, "{mode}");
+        assert_eq!(derived.unit, unit, "{mode}");
     }
-    let named = service(&["--unit", "kbf-daemon.service"])
+    let named = service(&["--unit", "kbf-storage.service"])
         .expect("named")
         .service;
-    assert_eq!(named.unit.as_deref(), Some("kbf-daemon.service"));
-    write_kbf_toml(&linux, "mode = \"all-in-one\"\n");
-    let named = service(&["--unit", "kbf-daemon.service"])
+    assert_eq!(named.unit, "kbf-storage.service");
+    write_kbf_toml(&linux, "mode = \"frontend\"\n");
+    let named = service(&["--unit", "kbf-storage.service"])
         .expect("the flag wins")
         .service;
-    assert_eq!(named.unit.as_deref(), Some("kbf-daemon.service"));
-    let label = service(&["--launchd-label", "com.komira.kbf-daemon"])
-        .expect("label")
-        .service;
-    assert_eq!(label.unit, None);
-    assert_eq!(
-        label.launchd_label.as_deref(),
-        Some("com.komira.kbf-daemon")
-    );
+    assert_eq!(named.unit, "kbf-storage.service");
 }
 
 /// Catches a `run` that starts with no service it can restart: no kbf.toml, no `mode`, a
-/// mode kbf does not offer (`node`), or a Mac without a label each end it with exit 2 and the
-/// reason, before any pass.
+/// mode kbf does not offer (`node`, or one of the modes that were removed) each end it with
+/// exit 2 and the reason, before any pass.
 ///
-/// Catches: the platform check dropped; the unknown mode mapped to a default unit; a
+/// Catches: the unknown mode mapped to a default unit; a
 /// missing, unparseable, unreadable or mode-less kbf.toml mapped to a default unit.
 #[test]
 fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
@@ -315,11 +248,7 @@ fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
     let Verb::Run(args) = parse(&["run", "--passes", "1"]).verb else {
         panic!("a run");
     };
-    let refused = |root: &Path| {
-        target_on(root, &args, Platform::Linux)
-            .err()
-            .expect("refused")
-    };
+    let refused = |root: &Path| target_of(root, &args).err().expect("refused");
     let missing = refused(&root);
     assert_eq!(missing.exit, Exit::Usage);
     assert!(missing.why.contains("--unit"), "{}", missing.why);
@@ -353,44 +282,33 @@ fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
     named(&refused(&root), "no mode of kbf");
     write_kbf_toml(&linux, "mode = \"\"\n");
     named(&refused(&root), "no mode of kbf");
-    write_kbf_toml(&linux, "mode = \"daemon\"\n");
-    let mac = derived_service(&layout, Platform::MacOs)
-        .err()
-        .expect("a Mac");
-    assert_eq!(mac.exit, Exit::Usage);
-    assert!(mac.why.contains("--launchd-label"), "{}", mac.why);
-    // The whole verb, on the platform this test runs on (the `kbf.toml` is that platform's).
-    if Platform::current() == Platform::Linux {
-        write_kbf_toml(&layout, "mode = \"daemon\"\n");
-        let (exit, err) = on(&root, &["run", "--passes", "1"]);
-        assert_eq!(
-            exit,
-            Exit::Ok,
-            "a daemon host does its pass on its unit: {err}"
-        );
-        write_kbf_toml(&layout, "mode = \"all-in-one\"\n");
-        let (exit, err) = on(&root, &["run", "--passes", "1"]);
-        assert_eq!(
-            exit,
-            Exit::Failed,
-            "the database mode reads installer.toml: {err}"
-        );
-        assert!(err.contains("installer.toml"), "{err}");
-        assert!(!err.contains("needs --installer-config"), "{err}");
-    } else {
-        // A Mac derives no label from the mode, whatever its kbf.toml says: it needs the flag.
-        for mode in ["daemon", "all-in-one"] {
-            write_kbf_toml(&layout, &format!("mode = \"{mode}\"\n"));
-            let (exit, err) = on(&root, &["run", "--passes", "1"]);
-            assert_eq!(exit, Exit::Usage, "{mode}: {err}");
-            assert!(err.contains("--launchd-label"), "{mode}: {err}");
-        }
+    for removed in ["daemon", "storage-and-daemon", "all-in-one"] {
+        write_kbf_toml(&linux, &format!("mode = \"{removed}\"\n"));
+        named(&refused(&root), "no mode of kbf");
     }
+    // The whole verb: a storage host does its pass on its unit, and a frontend reads
+    // installer.toml for its database.
+    write_kbf_toml(&layout, "mode = \"storage\"\n");
+    let (exit, err) = on(&root, &["run", "--passes", "1"]);
+    assert_eq!(
+        exit,
+        Exit::Ok,
+        "a storage host does its pass on its unit: {err}"
+    );
+    write_kbf_toml(&layout, "mode = \"frontend\"\n");
+    let (exit, err) = on(&root, &["run", "--passes", "1"]);
+    assert_eq!(
+        exit,
+        Exit::Failed,
+        "the database mode reads installer.toml: {err}"
+    );
+    assert!(err.contains("installer.toml"), "{err}");
+    assert!(!err.contains("needs --installer-config"), "{err}");
 }
 
 /// Catches the derived database-mode unit reading no installer.toml (the schema step then
 /// silently absent, the very thing `run` refuses to start without): on a frontend host the
-/// target carries `/etc/kbf/installer.toml`, on a daemon host none, and a flag is kept.
+/// target carries `/etc/kbf/installer.toml`, on a storage host none, and a flag is kept.
 ///
 /// Catches: the default dropped; the default given to every mode.
 #[test]
@@ -404,19 +322,17 @@ fn a_derived_database_unit_reads_the_default_installer_toml_and_others_none() {
         let Verb::Run(args) = parse(&argv).verb else {
             panic!("a run");
         };
-        target_on(&root, &args, Platform::Linux)
+        target_of(&root, &args)
             .expect("target")
             .installer_config
             .map(|p| p.to_string())
     };
     let default = Some("/etc/kbf/installer.toml".to_owned());
     assert_eq!(config("frontend", &[]), default);
-    assert_eq!(config("all-in-one", &[]), default);
-    assert_eq!(config("daemon", &[]), None);
     assert_eq!(config("storage", &[]), None);
     let other = Some("/etc/kbf/other.toml".to_owned());
     assert_eq!(
-        config("all-in-one", &["--installer-config", "/etc/kbf/other.toml"]),
+        config("frontend", &["--installer-config", "/etc/kbf/other.toml"]),
         other
     );
 }
@@ -443,7 +359,7 @@ fn a_path_is_not_joined_to_a_relative_root() {
 fn setup_still_takes_the_flags_of_the_release_source_and_the_first_release() {
     let cli = parse(&[
         "setup",
-        "--mode=daemon",
+        "--mode=storage",
         "--release-source=bundled",
         "--release-url",
         "https://r.example/kbf",
@@ -475,7 +391,7 @@ fn setup_still_takes_the_flags_of_the_release_source_and_the_first_release() {
     assert_eq!(args.retired.frontend_ca.as_deref(), Some("/fe.pem"));
     assert_eq!(args.retired.frontend_ca_sha256.as_deref(), Some("ab"));
     assert_eq!(args.retired.given().len(), 7);
-    let plain = parse(&["setup", "--mode=daemon"]);
+    let plain = parse(&["setup", "--mode=storage"]);
     let Verb::Setup(all) = &plain.verb else {
         panic!("not the setup verb");
     };
@@ -491,7 +407,7 @@ fn setup_still_takes_the_flags_of_the_release_source_and_the_first_release() {
 fn the_retired_flags_on_the_command_line_reach_the_values_setup_runs_with() {
     let cli = parse(&[
         "setup",
-        "--mode=daemon",
+        "--mode=storage",
         "--commit",
         "0123456789abcdef0123456789abcdef01234567",
         "--release-url",

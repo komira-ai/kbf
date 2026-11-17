@@ -310,7 +310,7 @@ fn a_refused_restart_runs_nothing() {
         "restart frontend=A",
         "restart frontend=a;b",
         "restart frontend=../x",
-        "restart unit=kbf-daemon.service",
+        "restart unit=kbf-storage.service",
         "restart frontend=a1 ",
         "restart frontend=a1 now",
     ] {

@@ -28,8 +28,8 @@ use super::answer::Code;
 use super::backend::Fault;
 use super::frontend::{FetchedImage, ImageSource};
 use super::linux::{Linux, Prepared, commit_id, copy_hashing_mode, fetch_fault, read_capped};
-use crate::mac::fetch::{AssetKind, Fetcher, Limits};
-use crate::mac::release::{PickError, SUMS_NAME, bundle_of, listed_hash};
+use crate::fetch::{AssetKind, Fetcher, Limits};
+use crate::release::{PickError, SUMS_NAME, bundle_of, listed_hash};
 use crate::request::{Channel, Version};
 use crate::runner::Identity;
 
@@ -173,7 +173,7 @@ impl<E: Exec> Linux<E> {
         let mismatch = |from: &str, e: PickError| {
             let why = match e {
                 PickError::Unknown => format!("{from} does not list {name}"),
-                PickError::Malformed | PickError::Ambiguous => format!("{from} is malformed"),
+                PickError::Malformed => format!("{from} is malformed"),
             };
             Fault::refused(Code::VerifyFailed, why)
         };

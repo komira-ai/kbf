@@ -21,7 +21,6 @@ use crate::database::Database;
 use crate::exit::Exit;
 use crate::helper::cycle::{Config, Helper, HelperError};
 use crate::helper::fetcher_host::HostFetcher;
-use crate::helper::leases;
 use crate::helper::operator::{self, Operator};
 use crate::helper::restart::Restart;
 use crate::helper::serve::{FileIdentity, Flow, PASS_INTERVAL, Serve};
@@ -134,20 +133,11 @@ struct Target {
     installer_config: Option<HostPath>,
 }
 
-/// The target of `run`: the service its flags name, else (Linux) the unit of the mode in the
-/// host's `kbf.toml`, which is how the one packaged `kbf-installer.service` serves every mode.
-/// A unit found that way on a frontend or all-in-one host reads the host's `installer.toml`
-/// (`/etc/kbf`) when `--installer-config` is not given (`setup` wrote it there). A Mac derives
-/// nothing: it is a daemon-only node whose property list always names its launchd label, so
-/// `run` there needs `--launchd-label`.
+/// The target of `run`: the service its flags name, else the unit of the mode in the host's
+/// `kbf.toml`, which is how the one packaged `kbf-installer.service` serves every mode. A unit
+/// found that way on a frontend host reads the host's `installer.toml` (`/etc/kbf`) when
+/// `--installer-config` is not given (`setup` wrote it there).
 fn target_of(root: &Path, args: &RunArgs) -> Result<Target, Failure> {
-    target_on(root, args, Platform::current())
-}
-
-/// [`target_of`] for the host of `platform`, which the layout (the `kbf.toml` it reads, the
-/// `installer.toml` it defaults to) is of: the platform is a parameter so that a test can say
-/// which platform's rule it pins.
-fn target_on(root: &Path, args: &RunArgs, platform: Platform) -> Result<Target, Failure> {
     if let Some(service) = args.named_service() {
         return Ok(Target {
             service,
@@ -155,8 +145,8 @@ fn target_on(root: &Path, args: &RunArgs, platform: Platform) -> Result<Target, 
         });
     }
     let root = Root::new(root.to_path_buf()).map_err(|e| usage(e.to_string()))?;
-    let layout = Layout::new(root, platform);
-    let service = derived_service(&layout, platform)?;
+    let layout = Layout::new(root, Platform::current());
+    let service = derived_service(&layout)?;
     let default = (args.installer_config.is_none() && service.runs_database_mode())
         .then(|| layout.installer_toml());
     let installer_config = args.installer_config.clone().or(default);
@@ -174,18 +164,14 @@ fn usage(why: String) -> Failure {
 }
 
 /// The service of `layout`'s host when no flag names one.
-fn derived_service(layout: &Layout, platform: Platform) -> Result<ServiceArgs, Failure> {
-    if platform != Platform::Linux {
-        return Err(usage("run needs --launchd-label".to_owned()));
-    }
+fn derived_service(layout: &Layout) -> Result<ServiceArgs, Failure> {
     let unit = host_mode::mode_unit(layout).map_err(|why| {
         usage(format!(
             "run needs --unit (or run setup, which writes the kbf.toml that names the mode): {why}"
         ))
     })?;
     Ok(ServiceArgs {
-        unit: Some(unit.to_owned()),
-        launchd_label: None,
+        unit: unit.to_owned(),
     })
 }
 
@@ -217,7 +203,6 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
         None => None,
     };
     let (layout, exec) = host(root)?;
-    let platform = layout.platform();
     let cfg = Config {
         update_dir: args.update_dir_in(&layout),
         orders_dir: args.orders_dir_in(&layout),
@@ -226,29 +211,10 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
         starts: args.starts,
         min_activation_interval_secs: args.min_activation_interval_secs,
     };
-    // The leases are those of the unit restarted after a swap, read below the host root's
-    // cgroup mount; the helper and each fetch's pipeline get a source of their own. The
-    // fetcher reads `installer.toml` (the flag's, else the host's own) at each fetch.
-    let cgroups = HostPath::new(leases::CGROUP_ROOT).expect("CGROUP_ROOT is an absolute path");
-    let cgroup_root = layout.join(&cgroups);
-    let lease_host = leases::LeaseHost {
-        cgroup_root,
-        layout: layout.clone(),
-    };
-    let lease_source = leases::for_restart(&cfg.restart, &lease_host);
-    let restart = cfg.restart.clone();
+    // The fetcher reads `installer.toml` (the flag's, else the host's own) at each fetch.
     let installer_toml = installer_toml_of(args, &layout);
-    let fetcher = HostFetcher::on_host(layout.clone(), installer_toml, move || {
-        leases::for_restart(&restart, &lease_host)
-    });
-    let mut helper = Helper::new(
-        layout,
-        exec,
-        cfg,
-        Box::new(fetcher),
-        lease_source,
-        Box::new(HostProcs::new(platform)),
-    );
+    let fetcher = HostFetcher::on_host(layout.clone(), installer_toml);
+    let mut helper = Helper::new(layout, exec, cfg, Box::new(fetcher), Box::new(HostProcs));
     if let Some(database) = database {
         helper.set_schema_step(Box::new(database));
     }
@@ -258,14 +224,14 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
 /// The service loop of `me`, the file this program runs from, whose identity `watch` holds:
 /// once the file is replaced the loop starts the new one in this process's place.
 fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Result<(), Failure> {
-    // A frontend or all-in-one unit activates a release only after the database is migrated
+    // A frontend unit activates a release only after the database is migrated
     // for it; without the installer.toml that names the database the step would be silently
     // absent, so the service does not start.
     let target = target_of(&root, args)?;
     if target.installer_config.is_none() && target.service.runs_database_mode() {
         return Err(Failure {
             exit: Exit::Usage,
-            why: "run needs --installer-config on a frontend or all-in-one host (the \
+            why: "run needs --installer-config on a frontend host (the \
                   database is migrated before a release is activated)"
                 .to_owned(),
         });
@@ -369,11 +335,9 @@ fn operate(
     verb: impl FnOnce(&mut Operator<'_, HostExec>) -> Result<(), operator::Failure>,
 ) -> Result<(), Failure> {
     let (layout, mut exec) = host(root)?;
-    let procs = HostProcs::new(layout.platform());
-    // The host's own `installer.toml`, read when `rollback` asks; the leases are never asked.
-    let fetcher = HostFetcher::on_host(layout.clone(), layout.installer_toml(), || {
-        Box::new(leases::NotWired)
-    });
+    let procs = HostProcs;
+    // The host's own `installer.toml`, read when `rollback` asks.
+    let fetcher = HostFetcher::on_host(layout.clone(), layout.installer_toml());
     let mut err = std::io::stderr();
     verb(&mut Operator {
         host: &layout,
@@ -408,7 +372,7 @@ fn record_release(
 
 fn gc(root: PathBuf, apply: bool, keep: usize) -> Result<(), Failure> {
     let (layout, mut exec) = host(root)?;
-    let procs = HostProcs::new(layout.platform());
+    let procs = HostProcs;
     operator::gc(
         &mut exec,
         &layout,

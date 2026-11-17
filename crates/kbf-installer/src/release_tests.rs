@@ -84,12 +84,9 @@ fn gc_on(exec: &mut ScratchHost, root: &Layout, keep: usize) -> Result<String, R
     Ok(String::from_utf8(out).expect("utf-8"))
 }
 
-/// Where a link under `/usr/local/kbf` points; `None` when there is no link.
+/// Where a link under `/var/lib/kbf-installer/releases` points; `None` when there is no link.
 fn link(exec: &ScratchHost, name: &str) -> Option<String> {
-    // A Linux host's tree, else a Mac's.
-    let linux = exec.at(&format!("/var/lib/kbf-installer/releases/{name}"));
-    let mac = exec.at(&format!("/usr/local/kbf-installer/releases/{name}"));
-    let target = fs::read_link(linux).or_else(|_| fs::read_link(mac)).ok()?;
+    let target = fs::read_link(exec.at(&format!("/var/lib/kbf-installer/releases/{name}"))).ok()?;
     Some(target.display().to_string())
 }
 
@@ -328,43 +325,6 @@ fn a_copy_whose_sha256_differs_is_refused_before_the_switch() {
         let (head, tail) = (
             format!("the copy at /var/lib/kbf-installer/releases/.stage-{A}."),
             format!("/kbf has sha256 {got}; the source has {want}"),
-        );
-        let text = err.to_string();
-        assert!(text.starts_with(&head) && text.ends_with(&tail), "{text}");
-        assert_eq!(link(&exec.host, "current"), None);
-        assert_eq!(state::read_unlocked(&root).expect("read"), None);
-    }
-}
-
-/// Catches a copy checked for the first binary only: in a release of two binaries the
-/// second lands with other bytes (or not at all) and is refused the same way, before any
-/// link or state names the release.
-///
-/// Catches: the read-back loop over `source.binaries` cut to its first element.
-#[test]
-fn every_binary_of_a_release_is_read_back_not_only_the_first() {
-    let from = source("badcopy2", "kbf A", None);
-    fs::write(from.join("kbf-daemon"), "daemon A").expect("daemon");
-    for (skip, got) in [
-        (false, sha256(b"tampered")),
-        (true, "none (no file)".to_owned()),
-    ] {
-        let (host, root) = host(&format!("badcopy2-{skip}"));
-        let mut exec = BadCopy {
-            host,
-            skip,
-            hit: "/kbf-daemon",
-        };
-        let a = Install {
-            commit: c(A),
-            from: from.clone(),
-        };
-        let err = install(&mut exec, &root, me(), &a, Mode::Apply, &mut Vec::new())
-            .expect_err("a bad copy of the second binary");
-        let want = sha256(b"daemon A");
-        let (head, tail) = (
-            format!("the copy at /var/lib/kbf-installer/releases/.stage-{A}."),
-            format!("/kbf-daemon has sha256 {got}; the source has {want}"),
         );
         let text = err.to_string();
         assert!(text.starts_with(&head) && text.ends_with(&tail), "{text}");
@@ -731,27 +691,6 @@ fn errors_name_what_is_wrong() {
         exec.at("/var/lib/kbf-installer/releases").display()
     );
     assert!(err.to_string().starts_with(&want), "{err}");
-}
-
-/// A scratch Mac: the directories every macOS has above the layout (`/var/run`,
-/// `/var/db`, `/usr`) and not `/usr/local`, which a fresh one lacks.
-fn mac(name: &str) -> (ScratchHost, Layout) {
-    let exec = ScratchHost::new(&format!("deploy-release-mac-{name}"));
-    for sub in ["var/run", "var/db", "usr"] {
-        fs::create_dir_all(exec.root.join(sub)).expect("seed");
-    }
-    let layout = Layout::new(
-        Root::new(&exec.root).expect("absolute"),
-        crate::layout::Platform::MacOs,
-    );
-    (exec, layout)
-}
-
-/// A release for a Mac: `kbf` holding `binary`.
-fn mac_source(name: &str, binary: &str) -> PathBuf {
-    let dir = scratch(&format!("deploy-release-src-{name}"));
-    fs::write(dir.join("kbf"), binary).expect("binary");
-    dir
 }
 
 #[path = "release_stage_tests.rs"]

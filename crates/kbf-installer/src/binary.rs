@@ -49,7 +49,8 @@ impl fmt::Display for Arch {
 pub enum BinaryKind {
     /// A 64-bit little-endian ELF executable or shared object.
     Elf(Arch),
-    /// A 64-bit little-endian thin Mach-O.
+    /// A 64-bit little-endian thin Mach-O: no host runs it, and it is told from `Other` so
+    /// that a release built for a Mac is refused by name.
     MachO(Arch),
     /// Anything else: a script, a fat Mach-O, a 32-bit file, a truncated one.
     Other,
@@ -100,10 +101,8 @@ impl BinaryKind {
 
     /// The kind of binary a host of `platform` on `arch` runs.
     pub fn wanted(platform: Platform, arch: Arch) -> BinaryKind {
-        match platform {
-            Platform::Linux => BinaryKind::Elf(arch),
-            Platform::MacOs => BinaryKind::MachO(arch),
-        }
+        let Platform::Linux = platform;
+        BinaryKind::Elf(arch)
     }
 }
 

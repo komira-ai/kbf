@@ -11,10 +11,9 @@ use rustls::pki_types::pem::PemObject;
 
 use super::container_health::ContainerHealth;
 use super::coordinator::{Endpoint, HttpsCoordinator, TlsFiles};
-use super::cordon::OwnCordon;
 use super::enroll::frontend_url;
 use super::enrolled::{self, LOOK_EVERY, Waited, Waiting};
-use super::flags::{Config, NodeApi, ServiceConfig, ServiceDrain, ServiceHealth};
+use super::flags::{Config, NodeApi, ServiceConfig, ServiceHealth};
 use super::local::{Limits, LocalInstaller, SocketLocal};
 use super::pin::PinFile;
 use super::renew::{FrontendRenewer, Renewer};
@@ -23,15 +22,13 @@ use super::service_health::ReadyUrl;
 use super::status::{Status, host_platform};
 use crate::identity::{Identity, identity_of};
 use crate::inventory::{Host, Role};
-use crate::node_drain::NodeDrain;
 use crate::node_health::NodeHealth;
 use crate::operator::OperatorApi;
 use crate::ports::{Drain, Health, HealthCheck, Placed, PortError, SystemClock};
 use crate::version::Version;
-use crate::wire::KBF_SERVICE;
 
-/// A host whose node is never drained (a frontend host that runs no daemon): the frontend's own
-/// drain is the helper's, and there is no node to give back.
+/// The drain of every host: nothing. No kbf node runs a daemon any more, so there is no node to
+/// take out of placement and none to give back (a frontend's own drain is the helper's).
 pub struct NoDrain;
 
 impl Drain for NoDrain {
@@ -58,13 +55,13 @@ pub fn no_drain() -> Arc<dyn Drain> {
 }
 
 /// The ports of an agent that cannot reach what it needs of the frontend: it refuses every
-/// update before it fetches anything, and drains nothing. The text says why.
+/// update before it fetches anything. The text says why.
 pub struct NoCredential(pub &'static str);
 
 /// Why an agent given no way to the frontend refuses.
-pub const NO_CREDENTIAL: &str = "this agent was given neither --frontend (to drain its node with \
-     its own certificate) nor an operator API credential, so it cannot drain its node and \
-     updates nothing";
+pub const NO_CREDENTIAL: &str = "this agent was given neither --frontend (to read its node's health \
+     with its own certificate) nor an operator API credential, so it cannot judge its node's \
+     health and updates nothing";
 
 impl HealthCheck for NoCredential {
     fn refusal(&self, _host: &Host) -> Option<String> {
@@ -80,30 +77,8 @@ impl HealthCheck for NoCredential {
     }
 }
 
-impl Drain for NoCredential {
-    fn placed(&self, _host: &Host) -> Result<Placed, PortError> {
-        Err(PortError::other(self.0))
-    }
-
-    fn drain(&self, _host: &Host, _deadline: Option<Duration>) -> Result<(), PortError> {
-        Err(PortError::other(self.0))
-    }
-
-    fn leases(&self, _host: &Host) -> Result<usize, PortError> {
-        Err(PortError::other(self.0))
-    }
-
-    fn undrain(&self, _host: &Host) -> Result<(), PortError> {
-        Err(PortError::other(self.0))
-    }
-}
-
-/// The drain and the health of a host.
-type NodePorts = (Arc<dyn Drain>, Arc<dyn HealthCheck>);
-
 /// What a process needs to reach its node at the frontend: the settings of the agent (or of
-/// the update hook, which is given the same flags) that say how the drain and the health are
-/// asked.
+/// the update hook, which is given the same flags) that say how the health is asked.
 #[derive(Clone, Debug)]
 pub struct Access {
     /// This host's updater certificate, its key and the farm CA.
@@ -112,10 +87,6 @@ pub struct Access {
     pub frontend: Option<Endpoint>,
     /// The opt-in operator API and its token.
     pub node_api: Option<NodeApi>,
-    /// Where the marks of the cordons made are kept.
-    pub cordon_dir: PathBuf,
-    /// The node id of the daemon a frontend host also runs.
-    pub daemon_node: Option<String>,
 }
 
 impl Access {
@@ -125,64 +96,40 @@ impl Access {
             files: cfg.files.clone(),
             frontend: cfg.frontend.clone(),
             node_api: cfg.node_api.clone(),
-            cordon_dir: cordon_dir(cfg),
-            daemon_node: cfg.daemon_node.clone(),
         }
     }
 }
 
-/// The drain and the health of the host `identity` names, by the way the agent was given to the
-/// frontend:
+/// The health of the host `identity` names, by the way the agent was given to the frontend:
 ///
 /// - the operator token (`--operator-api`, `--token-file`), the opt-in fallback, if it was given;
-/// - else the host's own certificate on the frontend's worker listener (`--frontend`): the drain of
-///   the node, and the node's status for a daemon's health or its own storage view for a
-///   storage host's ([`NodeHealth::for_updater`]);
+/// - else the host's own certificate on the frontend's worker listener (`--frontend`): the
+///   storage host's own storage view ([`NodeHealth::for_updater`]);
 /// - else the refusals of [`NoCredential`].
-pub(super) fn node_ports(
+pub(super) fn node_health(
     cfg: &Config,
     identity: &Identity,
-    role: Role,
-    unit: &str,
-    local: &Arc<SocketLocal>,
-) -> Result<NodePorts, String> {
-    node_ports_for(&Access::of(cfg), identity, role, unit, local)
+) -> Result<Arc<dyn HealthCheck>, String> {
+    node_health_for(&Access::of(cfg), identity)
 }
 
-/// [`node_ports`], from the access alone.
-pub(super) fn node_ports_for(
+/// [`node_health`], from the access alone.
+pub(super) fn node_health_for(
     access: &Access,
     identity: &Identity,
-    role: Role,
-    unit: &str,
-    local: &Arc<SocketLocal>,
-) -> Result<NodePorts, String> {
-    let installer = || Arc::new(LocalInstaller(local.clone()));
-    // A drain that could not record its cordon would refuse every update: found out here.
-    let own = |drain: Arc<dyn Drain>| -> Result<Arc<dyn Drain>, String> {
-        let own = OwnCordon::new(drain, access.cordon_dir.clone(), unit);
-        own.check_writable()?;
-        Ok(Arc::new(own))
-    };
+) -> Result<Arc<dyn HealthCheck>, String> {
     if let Some(api) = &access.node_api {
         let api = OperatorApi::new(api.addr, api.token_file.clone())?;
-        let drain = own(drain_for(role, &api))?;
-        let health = Arc::new(NodeHealth::with_api(api, installer()));
-        return Ok((drain, health));
+        return Ok(Arc::new(NodeHealth::with_api(api)));
     }
     let Some(frontend) = &access.frontend else {
-        return Ok((
-            Arc::new(NoCredential(NO_CREDENTIAL)),
-            Arc::new(NoCredential(NO_CREDENTIAL)),
-        ));
+        return Ok(Arc::new(NoCredential(NO_CREDENTIAL)));
     };
     let api = OperatorApi::as_updater(frontend.clone(), access.files.clone(), identity.clone());
-    let drain = own(drain_for(role, &api))?;
-    let health = Arc::new(NodeHealth::for_updater(api, installer()));
-    Ok((drain, health))
+    Ok(Arc::new(NodeHealth::for_updater(api)))
 }
 
-/// Where the marks of the cordons the agent made are kept: `--cordon-dir`, else the state
+/// Where the agent keeps its deferral and halt records: `--cordon-dir`, else the state
 /// directory, else the directory of the key file (the one an operator placed the files in).
 pub(super) fn cordon_dir(cfg: &Config) -> PathBuf {
     cfg.cordon_dir
@@ -203,18 +150,6 @@ pub fn identity_of_files(files: &TlsFiles) -> Result<Identity, String> {
         .ok_or_else(|| format!("{} holds no certificate", files.cert.display()))?
         .map_err(|e| format!("{}: {e}", files.cert.display()))?;
     identity_of(leaf.as_ref()).map_err(|e| format!("{}: {e}", files.cert.display()))
-}
-
-/// The drain of a host of `role`: the frontend's cordon, drain and uncordon of its node. A
-/// storage host may run a daemon too (`storage-and-daemon`), which its restart would cut off
-/// from its leases, so it drains that if the frontend knows the node, and has nothing to drain
-/// if it does not ([`NodeDrain::if_present`]).
-pub fn drain_for(role: Role, api: &OperatorApi) -> Arc<dyn Drain> {
-    if role == Role::Storage {
-        Arc::new(NodeDrain::if_present(api.clone()))
-    } else {
-        Arc::new(NodeDrain::with_api(api.clone()))
-    }
 }
 
 /// The renewer of the certificate in the state directory, if the agent was given one
@@ -249,68 +184,37 @@ pub(super) fn unix_now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// The drain and the health of a frontend host, which the helper runs as a container
-/// (`docs/deploy/host-install.md`, "A frontend container"):
-///
-/// - the frontend itself is drained by the helper, inside the A/B, through the frontend's own
-///   operator API, so the agent drains nothing on its behalf;
-/// - the node of a daemon the host also runs is drained and given back only when the agent was
-///   told which node it is (`--daemon-node`), by the way [`node_ports`] gives the daemon of a
-///   host;
-/// - the health is what the helper says runs: its switch returned only after the container
-///   answered `/readyz` with 200 and `/healthz` named the release's commit.
-pub(super) fn frontend_ports(
-    cfg: &Config,
-    identity: &Identity,
-    local: &Arc<SocketLocal>,
-) -> Result<NodePorts, String> {
-    frontend_ports_for(&Access::of(cfg), identity, local)
-}
-
-/// [`frontend_ports`], from the access alone.
-pub(super) fn frontend_ports_for(
-    access: &Access,
-    identity: &Identity,
-    local: &Arc<SocketLocal>,
-) -> Result<NodePorts, String> {
-    let drain = match &access.daemon_node {
-        Some(_) => node_ports_for(access, identity, Role::Daemon, KBF_SERVICE, local)?.0,
-        None => no_drain(),
-    };
-    let health = Arc::new(ContainerHealth::new(Arc::new(LocalInstaller(
+/// The health of a frontend host, which the helper runs as a container
+/// (`docs/deploy/host-install.md`, "A frontend container"): what the helper says runs. Its switch
+/// returned only after the container answered `/readyz` with 200 and `/healthz` named the
+/// release's commit. The frontend itself is drained by the helper, inside the A/B, through the
+/// frontend's own operator API.
+pub(super) fn frontend_health(local: &Arc<SocketLocal>) -> Arc<dyn HealthCheck> {
+    Arc::new(ContainerHealth::new(Arc::new(LocalInstaller(
         local.clone(),
-    ))));
-    Ok((drain, health))
+    ))))
 }
 
-/// The kind of host a role names: what the agent has duties for, and nothing else.
+/// The kind of host a role names: what the agent has duties for, and nothing else. The roles
+/// `daemon` and `mac-daemon` are read (a certificate of an earlier release names one) and have
+/// no duties: no kbf daemon runs on the host.
 pub(super) fn kind_of(role: &HostRole) -> Result<Role, String> {
     match role.name() {
         "frontend" => Ok(Role::Frontend),
         "storage" => Ok(Role::Storage),
-        "daemon" => Ok(Role::Daemon),
-        "mac-daemon" => Ok(Role::MacDaemon),
         other => Err(format!(
             "{other} is a host role this agent has no duties for"
         )),
     }
 }
 
-/// The host a certificate names, as the frontend knows its node: `daemon_node` for a frontend host
-/// that also runs a daemon, else the certificate's own node id.
+/// The host a certificate names, as the frontend knows its node: the certificate's own node id.
 ///
 /// # Errors
-/// A role this updater has no duties for, or `daemon_node` for a host that is not a frontend's.
-pub(super) fn this_host(identity: &Identity, daemon_node: Option<&str>) -> Result<Host, String> {
+/// A role this updater has no duties for.
+pub(super) fn this_host(identity: &Identity) -> Result<Host, String> {
     let role = kind_of(&identity.role)?;
-    if daemon_node.is_some() && role != Role::Frontend {
-        return Err(
-            "--daemon-node is for the agent of a frontend host that also runs a \
-                    daemon: another host's node is its certificate's"
-                .to_owned(),
-        );
-    }
-    let node_id = daemon_node.map_or_else(|| identity.node_id.to_string(), str::to_owned);
+    let node_id = identity.node_id.to_string();
     Ok(Host {
         alias: node_id.clone(),
         address: "localhost".to_owned(),
@@ -325,18 +229,17 @@ pub(super) fn this_host(identity: &Identity, daemon_node: Option<&str>) -> Resul
 ///
 /// # Errors
 /// Why not: no releases for this platform, a certificate that is no updater's, files that do
-/// not make a TLS configuration, an operator API client whose token files are not usable, or
-/// `--daemon-node` given to an agent whose certificate is not a frontend's.
+/// not make a TLS configuration, or an operator API client whose token files are not usable.
 pub fn build(cfg: &Config) -> Result<Agent, String> {
     let platform = host_platform().ok_or("kbf has no release for this platform")?;
     let identity = identity_of_files(&cfg.files)?;
-    let host = this_host(&identity, cfg.daemon_node.as_deref())?;
+    let host = this_host(&identity)?;
     super::coordinator::client_config(&cfg.files).map_err(|e| e.to_string())?;
     let local = Arc::new(SocketLocal::new(&cfg.helper_socket, Limits::default()));
-    let (drain, health) = if host.role == Role::Frontend {
-        frontend_ports(cfg, &identity, &local)?
+    let health = if host.role == Role::Frontend {
+        frontend_health(&local)
     } else {
-        node_ports(cfg, &identity, host.role, KBF_SERVICE, &local)?
+        node_health(cfg, &identity)?
     };
     let renewer = renewer_for(cfg)?;
     let coordinator = Arc::new(
@@ -346,7 +249,7 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
     let world = World {
         coordinator,
         local,
-        drain,
+        drain: no_drain(),
         health,
         clock: Arc::new(SystemClock::new()),
         unix_now: Arc::new(unix_now),
@@ -357,7 +260,7 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
     let services = cfg
         .services
         .iter()
-        .map(|service| service_ports(cfg, &identity, &host, service))
+        .map(|service| service_ports(cfg, &identity, service))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Agent::new(
         host,
@@ -368,33 +271,26 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
     )
     .with_services(services)
     .with_host_updates(cordon_dir(cfg))
-    .with_pin(PinFile::of_platform(std::env::consts::OS)))
+    .with_pin(PinFile::helper()))
 }
 
-/// The ports of `service`: its own helper socket, the node's drain
-/// unless it declared none, and the node's health unless it declared a readiness URL. The
-/// frontend is needed only for what the service did not replace.
+/// The ports of `service`: its own helper socket, and the node's health unless it declared a
+/// readiness URL. The frontend is needed only for what the service did not replace.
 pub(super) fn service_ports(
     cfg: &Config,
     identity: &Identity,
-    host: &Host,
     service: &ServiceConfig,
 ) -> Result<ServicePorts, String> {
     let local = Arc::new(SocketLocal::new(&service.helper_socket, Limits::default()));
-    let node = || node_ports(cfg, identity, host.role, &service.name, &local);
-    let drain = match service.drain {
-        ServiceDrain::None => no_drain(),
-        ServiceDrain::Node => node()?.0,
-    };
     let health: Arc<dyn HealthCheck> = match &service.health {
         ServiceHealth::Ready { addr, path } => Arc::new(ReadyUrl::new(*addr, path.clone())),
-        ServiceHealth::Node => node()?.1,
+        ServiceHealth::Node => node_health(cfg, identity)?,
     };
     Ok(ServicePorts {
         name: service.name.clone(),
         channel: service.channel.clone(),
         local,
-        drain,
+        drain: no_drain(),
         health,
     })
 }

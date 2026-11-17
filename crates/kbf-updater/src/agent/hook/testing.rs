@@ -136,7 +136,7 @@ impl Rig {
     /// The world the fakes make.
     pub fn world(&self) -> HookWorld {
         HookWorld {
-            host: host(Role::Daemon),
+            host: host(Role::Storage),
             local: Arc::new(self.local.clone()),
             drain: self.drain_port.clone(),
             health: Arc::new(self.health.clone()),
@@ -224,7 +224,7 @@ impl Rig {
     /// Today's update (`agent::update`) of this rig's host to `VB`, over the same fakes: the
     /// order of calls the hook's steps must make between them.
     pub fn today(&self) -> UpdateResult {
-        let host = host(Role::Daemon);
+        let host = host(Role::Storage);
         let status = Shared::new(Status::unknown(ReleasePlatform::LinuxX86_64, version(VA)));
         let log = |_: &str| {};
         let unix_now = || NOW;

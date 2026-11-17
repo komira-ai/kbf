@@ -17,23 +17,19 @@ use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
 use super::activate_cli::LINUX_HOLD;
-#[cfg(target_os = "macos")]
-use super::activate_cli::MAC_HOLD;
 use super::activate_cli::{Asked, Place, answer, new_ab};
 use super::answer::Answer;
 use super::backend::Backend;
-use crate::mac::layout::MacHost;
-use crate::runner::Runner;
 use crate::trust::Trust;
 
 pub const USAGE: &str = "usage: kbf-host-install unpin\n";
 
-/// The program: `unpin` with the arguments after it, as root, on this platform.
+/// The program: `unpin` with the arguments after it, as root, on this host.
 pub fn main(args: &[String]) -> ExitCode {
     main_with(args, rustix::process::geteuid().as_raw(), &production)
 }
 
-/// [`main`] with the effective user and the platform's run put in by the caller.
+/// [`main`] with the effective user and the run put in by the caller.
 pub(super) fn main_with(args: &[String], euid: u32, run: &dyn Fn() -> u8) -> ExitCode {
     if let Some(arg) = args.first() {
         eprintln!("kbf-host-install: unknown argument {arg:?}\n{USAGE}");
@@ -62,7 +58,6 @@ pub(super) fn run(
 
 /// A Linux host: unpin on the `kbf-installer` layout that `backend` makes, the state in
 /// `state_dir` (made private if it is not there), the hold file at `hold`.
-// Called by the Linux build only; the Mac build compiles it and its tests run it everywhere.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn on_linux<B: Backend>(
     backend: impl FnOnce() -> B,
@@ -87,34 +82,6 @@ pub(super) fn on_linux<B: Backend>(
     )
 }
 
-/// A Mac: unpin on the kit of `host`, whose tools `runner` runs, the state in its work
-/// directory, the hold file at `hold`.
-// Called by the Mac build only; the Linux build compiles it and its tests run it everywhere.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(super) fn on_mac(host: MacHost, runner: Box<dyn Runner>, hold: PathBuf) -> u8 {
-    if crate::mac::ensure_work(&host).is_err() {
-        eprintln!("kbf-host-install: the work directory is not usable");
-        return 3;
-    }
-    let (trust, state, audit) = (
-        host.trust.clone(),
-        host.work.join("state.json"),
-        host.audit.clone(),
-    );
-    let backend = super::mac_backend::MacBackend::new(host, runner);
-    let ab = new_ab(backend, state, &trust, hold);
-    let place = Place {
-        trust: &trust,
-        audit: &audit,
-    };
-    run(
-        &|| ab.unpin(),
-        &place,
-        &mut std::io::stdout(),
-        &mut std::io::stderr(),
-    )
-}
-
 #[cfg(target_os = "linux")]
 fn production() -> u8 {
     on_linux(
@@ -122,14 +89,5 @@ fn production() -> u8 {
         &super::production::LinuxEnv::production(),
         &Trust::root(),
         PathBuf::from(LINUX_HOLD),
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn production() -> u8 {
-    on_mac(
-        MacHost::production(),
-        Box::new(crate::runner::SystemRunner),
-        PathBuf::from(MAC_HOLD),
     )
 }

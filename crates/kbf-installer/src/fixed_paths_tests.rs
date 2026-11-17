@@ -4,10 +4,10 @@
 //! Children of the release tests, which hold the scratch hosts.
 
 use super::*;
-use crate::activate::{self, Activated, Arm, Order};
+use crate::activate::{self, Activated, Order};
 
-/// The fixed files, on Linux and on a Mac: the helper (`SELF_EXE` of `kbf-host-install`
-/// and of its macOS layout) and the agent (`kbf-updater`).
+/// The fixed files: the helper (`SELF_EXE` of `kbf-host-install`) and the agent
+/// (`kbf-updater`).
 const FIXED: [&str; 4] = [
     "/usr/libexec/kbf/kbf-host-install",
     "/usr/local/libexec/kbf/kbf-host-install",
@@ -106,15 +106,15 @@ fn order(commit: &str, id: &str) -> Order {
 
 /// Catches a release operation that writes, replaces, links or removes the helper or the
 /// agent: a run of installs, a stage and an activation with its confirm, a reverted
-/// activation, a rollback and a collection that removes releases, on a Linux host and on a
-/// Mac, leaves no step that names a path under `libexec/kbf` and the four fixed files
-/// byte for byte and mode for mode as they were.
+/// activation, a rollback and a collection that removes releases leaves no step that names a
+/// path under `libexec/kbf` and the four fixed files byte for byte and mode for mode as they
+/// were.
 ///
 /// Catches: an install that copies the release's binary to the fixed helper path; a switch
 /// that links the agent; a `gc` that sweeps `libexec`.
 #[test]
 fn installing_switching_and_collecting_releases_never_touch_the_helper_or_the_agent() {
-    for (mut exec, root) in [host("fixed"), mac("fixed")] {
+    for (mut exec, root) in std::iter::once(host("fixed")) {
         let on = format!("{:?}", root.platform());
         lay_down_the_fixed_files(&exec);
         let laid = marks(&exec);
@@ -151,8 +151,7 @@ fn installing_switching_and_collecting_releases_never_touch_the_helper_or_the_ag
                 &mut exec,
                 &root,
                 &order(&id(n), order_id),
-                Arm::FromFirstStart { starts: 3 },
-                1_000,
+                3,
                 &mut Vec::new(),
             )
             .expect("activate");
@@ -178,8 +177,7 @@ fn installing_switching_and_collecting_releases_never_touch_the_helper_or_the_ag
                     &mut exec,
                     &root,
                     &order(&id(n), "o4-again"),
-                    Arm::FromFirstStart { starts: 3 },
-                    1_000,
+                    3,
                     &mut Vec::new(),
                 )
                 .expect("activate again");

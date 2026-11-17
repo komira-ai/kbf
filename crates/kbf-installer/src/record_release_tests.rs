@@ -9,12 +9,10 @@ use crate::layout::Platform;
 use crate::state::Locked;
 use crate::testkit::{A, B, c};
 
-/// Every platform a layout has. A layout is built for a platform on any OS, so the Linux
-/// build runs the Mac's paths too: a path written by hand in a test is a test that passes on
-/// one OS only.
-const PLATFORMS: [Platform; 2] = [Platform::Linux, Platform::MacOs];
+/// Every platform a layout has.
+const PLATFORMS: [Platform; 1] = [Platform::Linux];
 
-/// Run `body` once per platform, so each test proves its rule on both layouts.
+/// Run `body` once per platform, so each test proves its rule on every layout.
 fn on_each_platform(body: impl Fn(Platform)) {
     for platform in PLATFORMS {
         body(platform);

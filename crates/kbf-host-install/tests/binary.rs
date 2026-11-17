@@ -92,7 +92,7 @@ fn the_unit_variable_selects_the_unit_body() {
     }
 }
 
-/// The release pipeline signs the Mac binary and runs `--version` on it, before and after
+/// The release pipeline signs the binary and runs `--version` on it, before and after
 /// packaging; the answer is the name and the package version, whatever request the
 /// environment carries, and nothing runs.
 ///
@@ -193,7 +193,7 @@ fn approve_takes_a_service_and_a_digest_and_nothing_else() {
 /// `--migrate-to-package` is the held step that moves a hand-placed Linux host to the package
 /// and takes only its own flags: with none, or with a flag it does not know, it exits 2 with its
 /// usage and touches nothing; a unit that is not a daemon mode's is refused before the host is
-/// looked at. (A Mac has no such step and says so.)
+/// looked at.
 #[test]
 fn migrate_takes_its_own_flags_and_nothing_else() {
     for args in [

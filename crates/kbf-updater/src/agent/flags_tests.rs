@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::flags::{
-    DEFAULT_HELPER_SOCKET, NodeApi, ServiceConfig, ServiceDrain, ServiceHealth, Timing, parse_flags,
+    DEFAULT_HELPER_SOCKET, NodeApi, ServiceConfig, ServiceHealth, Timing, parse_flags,
 };
 
 fn args(words: &[&str]) -> Vec<String> {
@@ -93,8 +93,6 @@ fn the_optional_flags_are_read() {
         "/etc/kbf/updater/token",
         "--helper-socket",
         "/run/other.sock",
-        "--daemon-node",
-        "d1",
         "--heartbeat-secs",
         "20",
         "--drain-deadline-secs",
@@ -108,7 +106,6 @@ fn the_optional_flags_are_read() {
     ]))
     .unwrap();
     assert_eq!(config.helper_socket, PathBuf::from("/run/other.sock"));
-    assert_eq!(config.daemon_node.as_deref(), Some("d1"));
     let secs = Duration::from_secs;
     assert_eq!(config.timing.heartbeat, secs(20));
     assert_eq!(config.timing.drain_deadline, Some(secs(30)));
@@ -305,20 +302,17 @@ fn the_state_directory_goes_with_the_enroll_listener_and_not_with_placed_files()
     assert_eq!((placed.state_dir, placed.frontend.is_some()), (None, true));
 }
 
-/// `--daemon-node` is a node id, and is left out unless the host runs a daemon beside its
-/// frontend.
+/// `--daemon-node` is no flag of the agent any more: a unit that still gives it is refused with
+/// the flag named, rather than started with a node that is not drained.
 #[test]
-fn the_daemon_node_is_a_node_id_or_not_given() {
-    assert_eq!(parse_flags(&with(&NODE_API)).unwrap().daemon_node, None);
-    for bad in ["D1", "-d", "d_1", "", "a.b"] {
-        let err = parse_flags(&with(&["--daemon-node", bad])).unwrap_err();
-        assert!(err.contains("--daemon-node"), "{bad}: {err}");
-    }
+fn the_daemon_node_flag_is_gone() {
+    let err = parse_flags(&with(&["--daemon-node", "d1"])).unwrap_err();
+    assert_eq!(err, "unknown argument --daemon-node");
 }
 
 /// No `--service` is no services; each is read, in the order given, as `--service V` or
-/// `--service=V`: the channel is the service's name unless one is given, the drain is the node's
-/// unless `none`, the health is the node's unless there is a readiness URL (a loopback address,
+/// `--service=V`: the channel is the service's name unless one is given, `drain=` is read and
+/// changes nothing, the health is the node's unless there is a readiness URL (a loopback address,
 /// with a path or without), and the helper is the socket given.
 #[test]
 fn services_are_read_in_order_with_their_settings() {
@@ -338,14 +332,12 @@ fn services_are_read_in_order_with_their_settings() {
                 name: "db".to_owned(),
                 channel: "db".to_owned(),
                 helper_socket: PathBuf::from("/run/db.sock"),
-                drain: ServiceDrain::Node,
                 health: ServiceHealth::Node,
             },
             ServiceConfig {
                 name: "cache".to_owned(),
                 channel: "cache-stable".to_owned(),
                 helper_socket: PathBuf::from("/run/cache.sock"),
-                drain: ServiceDrain::None,
                 health: ServiceHealth::Ready {
                     addr: "127.0.0.1:8080".parse().unwrap(),
                     path: "/readyz".to_owned(),
@@ -355,7 +347,6 @@ fn services_are_read_in_order_with_their_settings() {
                 name: "plain".to_owned(),
                 channel: "plain".to_owned(),
                 helper_socket: PathBuf::from("/run/plain.sock"),
-                drain: ServiceDrain::Node,
                 health: ServiceHealth::Ready {
                     addr: "[::1]:9".parse().unwrap(),
                     path: "/".to_owned(),

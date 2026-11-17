@@ -100,7 +100,7 @@ mod tests {
     use crate::types::Component;
 
     /// Catches an offer check that refuses a good offer (every later test of a refusal
-    /// would pass for the wrong reason) and one that refuses the daemon's own component.
+    /// would pass for the wrong reason) and one that refuses the component of earlier releases that a record still names.
     #[test]
     fn a_good_offer_passes() {
         assert_eq!(offer().check(PLATFORM), Ok(()));

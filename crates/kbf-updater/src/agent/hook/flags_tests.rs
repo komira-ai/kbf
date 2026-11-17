@@ -22,8 +22,7 @@ fn kind(line: &str) -> FlagsError {
 }
 
 /// The shortest command line takes the agent's defaults: the helper socket, the 300 s health
-/// timeout, 5 s polls, a 900 s retry, no drain deadline, the marks of the cordons in the record
-/// directory; the step and what follows it are handed back.
+/// timeout, 5 s polls, a 900 s retry, no drain deadline; the step and what follows it are handed back.
 ///
 /// Catches: a default that is not today's.
 #[test]
@@ -37,12 +36,10 @@ fn the_defaults_are_the_agents() {
         flags.helper_socket,
         PathBuf::from("/run/kbf-host-install/local.sock")
     );
-    assert_eq!(flags.access.cordon_dir, PathBuf::from("/var/lib/hook"));
     assert_eq!(flags.access.files.cert, PathBuf::from("/c"));
     assert_eq!(flags.access.files.key, PathBuf::from("/k"));
     assert_eq!(flags.access.files.ca, PathBuf::from("/ca"));
     assert!(flags.access.frontend.is_none() && flags.access.node_api.is_none());
-    assert!(flags.access.daemon_node.is_none());
     let t = flags.timing;
     assert_eq!(
         (
@@ -71,16 +68,14 @@ fn the_defaults_are_the_agents() {
 fn every_flag_is_read() {
     let line = args(
         "--record-dir=/r --channel=beta --enrollment-dir /e --frontend fe.example:18001 \
-         --operator-api http://127.0.0.1:18002 --token-file /t --daemon-node d1 \
-         --cordon-dir /cordons --helper-socket /run/h.sock --drain-deadline-secs 3600 \
+         --operator-api http://127.0.0.1:18002 --token-file /t \
+         --helper-socket /run/h.sock --drain-deadline-secs 3600 \
          --health-timeout-secs 120 --health-poll-secs 2 --retry-secs 60 cutover",
     );
     let (flags, rest) = split(&line).unwrap();
     assert_eq!(rest, ["cutover"]);
     assert_eq!(flags.channel, "beta");
-    assert_eq!(flags.access.cordon_dir, PathBuf::from("/cordons"));
     assert_eq!(flags.helper_socket, PathBuf::from("/run/h.sock"));
-    assert_eq!(flags.access.daemon_node.as_deref(), Some("d1"));
     assert_eq!(flags.access.frontend.as_ref().map(|e| e.port), Some(18001));
     let api = flags.access.node_api.as_ref().unwrap();
     assert_eq!(
@@ -135,9 +130,13 @@ fn flags_that_are_wrong_are_refused_by_name() {
         ))
         .contains("--operator-api")
     );
-    assert!(
-        refusal(&format!("{BASE} --daemon-node Not_A_Label prepare")).contains("--daemon-node")
-    );
+    for gone in ["--daemon-node d1", "--cordon-dir /c"] {
+        let flag = gone.split(' ').next().unwrap();
+        assert!(
+            refusal(&format!("{BASE} {gone} prepare")).contains(flag),
+            "{gone}"
+        );
+    }
     assert!(
         refusal(&format!("{BASE} --drain-deadline-secs 0 prepare"))
             .contains("--drain-deadline-secs")
@@ -193,10 +192,6 @@ fn each_refusal_is_of_its_own_kind() {
         )),
         FlagsError::OperatorApi(_)
     ));
-    assert_eq!(
-        kind(&format!("{BASE} --daemon-node Not_A_Label prepare")),
-        FlagsError::DaemonNode
-    );
     for line in [
         format!("{BASE} --drain-deadline-secs 0 prepare"),
         format!("{BASE} --health-poll-secs 0 prepare"),

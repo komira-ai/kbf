@@ -41,7 +41,7 @@ impl Fx {
 #[test]
 fn the_node_table_names_the_id() {
     let fx = Fx::new("node-id-node");
-    let text = "mode = \"daemon\"\n[node]\nid = \"build-7\"\n[identity]\nnode-id = \"other\"\n";
+    let text = "mode = \"storage\"\n[node]\nid = \"build-7\"\n[identity]\nnode-id = \"other\"\n";
     assert_eq!(fx.id(text, Some("host\n")), Some("build-7".into()));
 }
 
@@ -61,7 +61,7 @@ fn the_identity_table_names_the_id_of_a_host_that_does_not_enroll() {
 fn the_short_host_name_is_the_default() {
     let fx = Fx::new("node-id-hostname");
     assert_eq!(
-        fx.id("mode = \"daemon\"\n", Some("Build-7.example.org\n")),
+        fx.id("mode = \"storage\"\n", Some("Build-7.example.org\n")),
         Some("build-7".into())
     );
 }

@@ -5,7 +5,7 @@ use std::path::Path;
 use kbf_installer::binary::Arch;
 
 use super::*;
-use crate::mac::fetch::AssetKind;
+use crate::fetch::AssetKind;
 use crate::runner::Exec;
 
 fn printed(code: i32, stdout: &str) -> Exec {

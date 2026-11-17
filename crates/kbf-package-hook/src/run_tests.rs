@@ -94,11 +94,11 @@ fn the_manifest_params_are_required_and_checked() {
     let state = dir.join("state");
     let file = dir.join("params.toml");
     let cases: [(&str, &str, bool); 8] = [
-        ("kbf.service", "storage-and-daemon", true),
+        ("kbf.service", "storage", true),
         ("kbf.service", "storage2", true),
-        ("-kbf.service", "storage-and-daemon", false),
-        ("kbf service", "storage-and-daemon", false),
-        ("../x.service", "storage-and-daemon", false),
+        ("-kbf.service", "storage", false),
+        ("kbf service", "storage", false),
+        ("../x.service", "storage", false),
         ("kbf.service", "--check", false),
         ("kbf.service", "Mode", false),
         ("kbf.service", "", false),

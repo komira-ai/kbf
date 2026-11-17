@@ -1,7 +1,7 @@
 //! Fetching a release from the GitHub release of the repository, for a channel whose source
 //! is `github`. Everything here runs through the pinned `gh`, as `nobody`, in a directory
 //! `nobody` owns; what it leaves there is untrusted bytes until the root process has copied
-//! them once and checked the copy ([`super::stage`]).
+//! them once and checked the copy.
 //!
 //! 1. The releases are listed with the system `curl` from the public REST endpoint
 //!    `https://api.github.com/repos/<repo>/releases` (the channel's repository), a page of 100 at a time until a page
@@ -10,7 +10,7 @@
 //!    them up, which is [`FetchError::RateLimited`]). Never only the latest: a rollback
 //!    names an old release. Every page is read, because two commits that start with the
 //!    version's 12 hex digits are an ambiguous release and only the whole listing shows it.
-//! 2. A release asset named `kbf-<40 hex>-darwin-arm64.tar.gz` (`kbf` is the channel's
+//! 2. A release asset named `kbf-<40 hex>-<platform>.tar.gz` (`kbf` is the channel's
 //!    artifact prefix) whose commit starts with the
 //!    digits picks the release. None is [`FetchError::Unknown`] (or a failure when the
 //!    listing was cut at the page limit: it was not all seen); two commits are
@@ -34,7 +34,7 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::release::{self, Origin};
+use crate::release::{self, Origin};
 use crate::runner::{Cmd, Identity, Runner, WriteCap};
 
 /// Releases asked for per page (GitHub's most).

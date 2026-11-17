@@ -26,7 +26,6 @@ fn report(installed: Installed, running: Option<&str>) -> Result<Report, PortErr
         installed,
         running_commit: running.map(str::to_owned),
         node_id: None,
-        apply: None,
     })
 }
 

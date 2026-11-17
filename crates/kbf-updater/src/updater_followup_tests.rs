@@ -208,7 +208,6 @@ fn open_over(rig: &Rig, rec: &crate::record::Record) -> Result<Updater, StoreErr
         Ports {
             safe: Box::new(rig.stop.clone()),
             installer: Box::new(rig.inst.clone()),
-            drain: Box::new(rig.drain.clone()),
             health: Box::new(rig.health.clone()),
             clock: Box::new(rig.clock.clone()),
             frontend: Box::new(rig.front.clone()),
@@ -247,20 +246,20 @@ fn a_record_whose_hosts_are_not_the_requests_plan_is_refused() {
         assert!(matches!(err, StoreError::Inconsistent(_)), "{err}");
         err.to_string()
     };
-    assert!(inconsistent(&listed(&["st1", "dm"], &["st1", "st2"])).contains("not the request's"));
-    assert!(inconsistent(&listed(&["st1", "dm"], &["st1"])).contains("not the request's"));
-    assert!(inconsistent(&listed(&["st1", "dm"], &["dm", "st1"])).contains("not the plan"));
+    assert!(inconsistent(&listed(&["st1", "st3"], &["st1", "st2"])).contains("not the request's"));
+    assert!(inconsistent(&listed(&["st1", "st3"], &["st1"])).contains("not the request's"));
+    assert!(inconsistent(&listed(&["st1", "st3"], &["st3", "st1"])).contains("not the plan"));
     assert!(inconsistent(&listed(&["st1", "fe"], &["st1", "fe"])).contains("not the plan"));
-    let moved = inconsistent(&listed(&["st1", "dm", "st2"], &["dm", "st2", "st1"]));
+    let moved = inconsistent(&listed(&["st1", "st3", "st2"], &["st3", "st2", "st1"]));
     assert!(moved.contains("not the plan"), "{moved}");
     assert!(
-        inconsistent(&listed(&["st1", "dm", "st2"], &["st2", "dm", "st1"])).contains("request's")
+        inconsistent(&listed(&["st1", "st3", "st2"], &["st2", "st3", "st1"])).contains("request's")
     );
 
     for (ask, have) in [
-        (&["st1", "dm"][..], &["st1", "dm"][..]),
+        (&["st1", "st3"][..], &["st1", "st3"][..]),
         (&["st1", "fe"], &["fe", "st1"]),
-        (&["st1", "dm", "fe"], &["fe", "st1", "dm"]),
+        (&["st1", "st3", "fe"], &["fe", "st1", "st3"]),
         (&["st1"], &["st1"]),
     ] {
         open_over(&rig, &listed(ask, have)).unwrap_or_else(|e| panic!("{ask:?}: {e}"));
@@ -380,7 +379,7 @@ fn an_unreachable_install_is_asked_about_not_failed() {
         .script_query("fe", vec![Ok(Installed::Version(TARGET.into()))]);
     let u = rig.open();
     assert_eq!(rig.roll(&u).state, RollState::Done);
-    assert_eq!(rig.log.installs(), ["fe", "st1", "dm", "st2"]);
+    assert_eq!(rig.log.installs(), ["fe", "st1", "st3", "st2"]);
 }
 
 /// Catches silence ending in `failed`: an install whose host never answers, nor to the

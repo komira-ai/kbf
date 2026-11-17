@@ -449,21 +449,16 @@ fn a_platform_must_be_complete_and_exact() {
     );
     let extra = description(vec![
         entry("kbf", "linux-x86_64"),
-        entry("kbf-daemon", "linux-x86_64"),
+        entry("kbf-extra", "linux-x86_64"),
     ]);
     assert!(
         fault_text(extra.select(&commit(), host, MAX))
-            .contains("\"kbf-daemon\" is not a component of linux-x86_64")
+            .contains("\"kbf-extra\" is not a component of linux-x86_64")
     );
     let empty = description(Vec::new());
     assert_eq!(
         fault_text(empty.select(&commit(), host, MAX)),
         "it has no kbf for linux-x86_64"
-    );
-    let mac = description(vec![entry("kbf-daemon", "darwin-arm64")]);
-    assert!(
-        fault_text(mac.select(&commit(), ReleasePlatform::DarwinArm64, MAX))
-            .contains("\"kbf-daemon\" is not a component of darwin-arm64")
     );
 }
 

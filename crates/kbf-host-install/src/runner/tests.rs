@@ -366,28 +366,6 @@ fn a_cap_works_without_a_time_limit_and_over_a_missing_directory() {
     assert!(SystemRunner.run(&missing).unwrap().success());
 }
 
-/// A drop with exact groups to uid 0 or gid 0 is refused, so the program never runs as root or
-/// in group 0 (`wheel`) through it; the drop by `Command::uid` and `gid` is not covered by this
-/// check, and no drop at all is not refused.
-#[test]
-fn an_exact_groups_drop_to_uid_or_gid_zero_is_refused() {
-    use super::{Identity, drop_ids};
-    use std::process::Command;
-    for (uid, gid) in [(0, 20), (501, 0), (0, 0)] {
-        let mut command = Command::new("/usr/bin/true");
-        let kind = drop_ids(&mut command, Some(Identity { uid, gid }), true).map_err(|e| e.kind());
-        assert_eq!(
-            kind,
-            Err(std::io::ErrorKind::PermissionDenied),
-            "{uid} {gid}"
-        );
-        assert!(drop_ids(&mut command, Some(Identity { uid, gid }), false).is_ok());
-    }
-    let mut command = Command::new("/usr/bin/true");
-    assert!(drop_ids(&mut command, None, true).is_ok());
-    assert!(drop_ids(&mut command, Some(Identity { uid: 501, gid: 20 }), true).is_ok());
-}
-
 /// The words for how a command ended, from a fixed exit.
 #[test]
 fn ended_says_the_status_or_the_signal() {

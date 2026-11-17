@@ -107,7 +107,7 @@ impl Rig {
 
     fn kbf_only(&self) -> Agent {
         Agent::new(
-            host(Role::Daemon),
+            host(Role::Storage),
             "stable".to_owned(),
             timing(),
             self.world(),
@@ -539,7 +539,7 @@ fn a_readiness_url_is_healthy_when_it_answers_2xx() {
         b"",
     ]);
     let ready = ReadyUrl::new(addr, "/readyz".to_owned());
-    let h = host(Role::Daemon);
+    let h = host(Role::Storage);
     let v = version(VB);
     assert_eq!(ready.refusal(&h), None);
     assert_eq!(ready.check(&h, &v), Ok(Health::Healthy));

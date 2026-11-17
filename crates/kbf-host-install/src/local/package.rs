@@ -1,11 +1,11 @@
-//! A Linux daemon host that runs the `kbf` package: the update is the package manager's.
+//! A Linux host that runs the `kbf` package: the update is the package manager's.
 //!
 //! The units of such a host are the packaged ones and run `/usr/bin/kbf`, so a release is not
 //! laid out beside the running one and no link moves ([`super::linux`] is for the hand-placed
 //! layout). The A/B is two installations of a package file, with the trial recorded first:
 //!
 //! - **stage** fetches the release's `.deb` or `.rpm` for the version as the unprivileged user
-//!   (the release listing, `gh release download`: [`crate::mac::fetch`]) and copies it once,
+//!   (the release listing, `gh release download`: [`crate::fetch`]) and copies it once,
 //!   as root, with its attestation bundle and the release's `SHA256SUMS`, into a directory of
 //!   its own. Nothing is believed before every check passes, offline:
 //!   1. the file's sha256 is the one `SHA256SUMS` lists for it;
@@ -53,15 +53,15 @@ use super::linux::{
 use super::package_format::{Format, Meta, PACKAGE, SumsError, sums_entry};
 use super::package_store::{Kept, Record, Store, Trial};
 use super::units::restart_and_wait;
+use crate::channel::{Allowlist, Source};
+use crate::fetch::{Fetcher, Limits};
 use crate::host::Host;
-use crate::mac::channel::{MacAllowlist, Source};
-use crate::mac::fetch::{Fetcher, Limits};
-use crate::mac::release::Origin;
-use crate::mac::release::{self, commit_prefix};
-use crate::mac::stage::read_token;
 use crate::plan::Wait;
+use crate::release::Origin;
+use crate::release::{self, commit_prefix};
 use crate::request::{Channel, Unit, Version};
 use crate::runner::{Identity, Runner};
+use crate::token::read_token;
 
 /// A Linux host that runs the `kbf` package, as the backend of an update.
 pub struct PackageHost {
@@ -187,7 +187,7 @@ impl PackageHost {
         channel: &Channel,
     ) -> Result<(Settings, Option<String>, Origin), Fault> {
         let trust = &self.host.trust;
-        let allowlist = MacAllowlist::load(trust, &self.allowlist).map_err(config_fault)?;
+        let allowlist = Allowlist::load(trust, &self.allowlist).map_err(config_fault)?;
         let entry = allowlist.channel(trust, channel).map_err(channel_fault)?;
         let Source::Github { token_file } = &entry.source else {
             return Err(Fault::refused(

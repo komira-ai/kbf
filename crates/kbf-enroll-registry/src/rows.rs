@@ -14,7 +14,8 @@ use crate::error::{Corrupt, Internal};
 pub(crate) const TOKEN_PREFIX: &str = "enroll/token/";
 pub(crate) const NODE_PREFIX: &str = "enroll/node/";
 /// A host's updater has its own row family: its node id is also the id of the host's storage
-/// or daemon node, and the two enrollments must neither supersede nor deny one another.
+/// node (or of a daemon node an earlier release enrolled), and the two enrollments must neither
+/// supersede nor deny one another.
 pub(crate) const UPDATER_PREFIX: &str = "enroll/updater/";
 pub(crate) const DENY_PREFIX: &str = "deny/";
 pub(crate) const CA_GENERATION: &str = "enroll/ca/generation";

@@ -24,7 +24,7 @@
 //!    a device, an absolute path or one with `..` (a member of another name is ignored and
 //!    logged), a decompressed size under the cap, nothing after the tar's end and nothing
 //!    after the gzip member; unpacked by root; its header is the executable this host
-//!    runs; on macOS no quarantine attribute and a valid code signature ([`crate::darwin`]).
+//!    runs.
 //! 5. **The binary names itself**: `<name> --version --json`, run as the unprivileged
 //!    user in an empty directory with an empty environment, must print at most 4 KiB of
 //!    exactly the fields a build reports, name the order's commit and carry the facts the
@@ -32,9 +32,7 @@
 //!    meet the operator's floor and be understood by this installer. An activation that
 //!    carries no expected facts is refused; a `frontend_update` may leave them out, and
 //!    then only the commit and the release profile are checked.
-//! 6. **Leases**: root observes ([`crate::helper::leases`]) that none is live. A
-//!    `frontend_update` is not held by them: it moves no node link.
-//! 7. **Install**: `VERIFIED` is written into the directory, which is renamed to
+//! 6. **Install**: `VERIFIED` is written into the directory, which is renamed to
 //!    `releases/<commit>/`, and the parent is synced. A directory already there is the
 //!    same release (the same `VERIFIED` marker and the same bytes) or a refusal; a
 //!    release is never replaced.
@@ -73,9 +71,7 @@ use crate::CommitId;
 use crate::archive::{self, DECLARATION_CAP, Member};
 use crate::attest::{GhCheck, SourceRef, Tools};
 use crate::binary::{Arch, BinaryKind, Version};
-use crate::darwin;
 use crate::helper::fetcher::InstalledRelease;
-use crate::helper::leases::LeaseSource;
 use crate::installer_toml::InstallerToml;
 use crate::layout::{Layout, Platform};
 use crate::refusal::{ArchiveFault, FactsFault, Refusal, TrustFault, VersionFault, WHAT_PROBE};
@@ -104,7 +100,7 @@ pub enum OrderKind {
     Activate,
     /// The frontend's own update: the facts may be left out (`expected` is `None`). Its
     /// order record is a locator and carries none, so only the commit and the release
-    /// profile are checked. It waits for no lease: it moves no node link.
+    /// profile are checked.
     FrontendUpdate,
 }
 
@@ -318,7 +314,7 @@ pub struct Staged {
     pub source_ref: SourceRef,
     /// What the (first) binary declared.
     pub version: Version,
-    /// `linux-x86_64`, `linux-arm64` or `darwin-arm64`, from the binary's header.
+    /// `linux-x86_64` or `linux-arm64`, from the binary's header.
     pub platform: String,
     /// The directory was already there with the same release in it.
     pub already_installed: bool,
@@ -354,7 +350,6 @@ pub struct Pipeline<'a> {
     /// Says who owns the trust list and reads it; the host's own on a host.
     pub trust: &'a dyn Exec,
     pub runner: &'a dyn Runner,
-    pub leases: &'a dyn LeaseSource,
     /// Who owns the release: root on a host (a scratch test can chown only to itself).
     pub owner: Owner,
 }
@@ -396,26 +391,6 @@ impl Verifier for Pipeline<'_> {
             version.get_or_insert(said);
         }
         let (version, platform) = version.expect("an order names a component");
-
-        // A frontend update moves no node link, and the swap and the proxy own the
-        // frontend's streams: no lease is waited for. (Setup's first release is one, and a
-        // host that has never run its unit has no cgroup to read.) Every kind is named, so
-        // a new one has to say whether it waits.
-        let waits_for_leases = match order.kind {
-            OrderKind::Activate => true,
-            OrderKind::FrontendUpdate => false,
-        };
-        if waits_for_leases {
-            match self.leases.live() {
-                Ok(0) => {}
-                Ok(n) => return Err(Refusal::Lease(format!("{n} leases are live"))),
-                Err(why) => {
-                    return Err(Refusal::Lease(format!(
-                        "cannot tell whether any is live: {why}"
-                    )));
-                }
-            }
-        }
 
         let names: Vec<String> = order.components.iter().map(|c| c.name.clone()).collect();
         let already_installed = self.install(fetched.partial, order.commit, &names)?;
@@ -682,15 +657,6 @@ impl Pipeline<'_> {
                 want,
             });
         }
-        if self.host.platform() == Platform::MacOs {
-            let timeout = self.policy.timeouts.gh;
-            if darwin::quarantined(self.runner, &binary, timeout)? {
-                return Err(Refusal::Quarantined {
-                    name: name.to_owned(),
-                });
-            }
-            darwin::check_signature(self.runner, name, &binary, timeout)?;
-        }
         let said = self.probe(&binary, name, &scratch.empty())?;
         said.check(order.commit).map_err(|fault| Refusal::Version {
             component: name.to_owned(),
@@ -905,11 +871,8 @@ impl Pipeline<'_> {
 /// checked to be the executable this host runs ([`BinaryKind::wanted`]), so the header
 /// and the host agree on it.
 fn platform_of(host: Platform, arch: Arch) -> String {
-    let os = match host {
-        Platform::Linux => "linux",
-        Platform::MacOs => "darwin",
-    };
-    format!("{os}-{arch}")
+    let Platform::Linux = host;
+    format!("linux-{arch}")
 }
 
 /// Open `path` without following a link and accept it only as a regular file owned by

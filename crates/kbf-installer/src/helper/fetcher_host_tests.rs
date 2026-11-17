@@ -16,7 +16,6 @@ use kbf_update::Source as OrderSource;
 
 use super::*;
 use crate::fixtures::{FakeRunner, SETTINGS_PATH, me, ran, trusted_host};
-use crate::helper::leases::fake::FakeLeases;
 use crate::layout::path;
 use crate::seed::SeedFacts;
 use crate::seed_fixture::{EARLIER_SEQ, SEQ, Seeded};
@@ -89,11 +88,10 @@ fn owner() -> Owner {
     }
 }
 
-fn parts(disk: &Disk, leases: &FakeLeases) -> Parts {
+fn parts(disk: &Disk) -> Parts {
     Parts {
         trust: Box::new(exec(disk)),
         runner: Box::new(FakeRunner::new(|_| Ok(ran(0, "", "")))),
-        leases: Box::new(leases.clone()),
         owner: owner(),
         child: nowhere(),
     }
@@ -103,7 +101,6 @@ fn parts(disk: &Disk, leases: &FakeLeases) -> Parts {
 struct Rig {
     fetcher: HostFetcher,
     disk: Rc<RefCell<Disk>>,
-    leases: FakeLeases,
     /// How many times the host was asked for its parts.
     asked: Rc<Cell<usize>>,
 }
@@ -112,17 +109,15 @@ impl Rig {
     fn new(name: &str) -> Rig {
         let (layout, _) = host_root(name);
         let disk = Rc::new(RefCell::new(Disk::default()));
-        let leases = FakeLeases::default();
         let asked = Rc::new(Cell::new(0));
-        let (seen, counted, held) = (Rc::clone(&disk), Rc::clone(&asked), leases.clone());
+        let (seen, counted) = (Rc::clone(&disk), Rc::clone(&asked));
         let fetcher = HostFetcher::new(layout, path(FILE), move || {
             counted.set(counted.get() + 1);
-            Ok(parts(&seen.borrow(), &held))
+            Ok(parts(&seen.borrow()))
         });
         Rig {
             fetcher,
             disk,
-            leases,
             asked,
         }
     }
@@ -232,19 +227,18 @@ fn installer_toml_is_read_at_each_fetch_so_a_file_written_later_is_used() {
 
 /// What a fetch takes from `installer.toml` and where it puts it: the `url` source with the
 /// system's roots, the component cap and timeout as limits, the cap and the `min_protocol`
-/// floor in the policy, and from the host its owner, lease source and child.
+/// floor in the policy, and from the host its owner and child.
 ///
 /// Catches a value taken from the wrong key or left at its default, a source that is not the
 /// file's, and a host part dropped or replaced on the way into the real fetcher.
 ///
 /// Catches: `Policy::of` replaced by a policy of defaults; `Limits::of` by the
-/// defaults; the source's base changed; the lease source replaced by `NotWired`.
+/// defaults; the source's base changed;
 #[test]
 fn a_fetch_is_made_from_the_file_and_the_hosts_parts() {
     let rig = Rig::new("host-fetcher-parts");
     let text = "release_source = \"url\"\nrelease_url = \"https://Mirror.example:8443/kbf/\"\nmin_protocol = 4\nfetch_timeout_s = 1234\nmax_component_bytes = 7000001\n";
     rig.write(text);
-    rig.leases.set(3);
     let real = rig.made();
     let toml = InstallerToml::parse(text).expect("parses");
     assert_eq!(
@@ -266,7 +260,6 @@ fn a_fetch_is_made_from_the_file_and_the_hosts_parts() {
     assert_eq!(real.policy.max_component_bytes, 7_000_001);
     assert_eq!(real.owner, owner());
     assert_eq!(real.child.program, nowhere().program);
-    assert_eq!(real.leases.live(), Ok(3), "the host's lease source");
     assert_eq!(real.host.platform(), Platform::Linux);
 }
 
@@ -656,11 +649,11 @@ fn the_two_forms_reach_the_real_fetchers_matching_forms() {
 }
 
 /// The parts of the host itself: the executor reads under the host's root, the owner is the
-/// ids this process runs with, and the lease source and child are the ones given.
+/// ids this process runs with, and the child is the one given.
 ///
 /// Catches an executor rooted at `/` (it would read the real host's files in a test and the
 /// wrong ones under a root flag), a fixed owner (root's, where a scratch test is not root),
-/// and a lease source or child dropped.
+/// and a child dropped.
 ///
 /// Catches: `Root::new("/")` in place of the host's root; the owner fixed at 0:0
 /// (equivalent when the tests run as root).
@@ -668,9 +661,7 @@ fn the_two_forms_reach_the_real_fetchers_matching_forms() {
 fn the_hosts_own_parts_are_rooted_at_the_host_and_owned_by_this_process() {
     let (layout, root) = host_root("host-fetcher-host-parts");
     std::fs::write(root.join("probe"), b"here").expect("a file under the root");
-    let leases = FakeLeases::default();
-    leases.set(2);
-    let parts = host_parts(&layout, Box::new(leases), nowhere());
+    let parts = host_parts(&layout, nowhere());
     let seen = parts.trust.inspect(&path("/probe")).expect("read");
     assert!(
         matches!(seen, Some(Entry::File { bytes, .. }) if bytes == b"here"),
@@ -681,7 +672,6 @@ fn the_hosts_own_parts_are_rooted_at_the_host_and_owned_by_this_process() {
         rustix::process::getegid().as_raw(),
     );
     assert_eq!(parts.owner, Owner { uid, gid });
-    assert_eq!(parts.leases.live(), Ok(2));
     assert_eq!(parts.child.program, nowhere().program);
 }
 
@@ -697,8 +687,7 @@ fn the_hosts_own_parts_are_rooted_at_the_host_and_owned_by_this_process() {
 #[test]
 fn on_a_host_the_child_is_looked_up_per_fetch_and_the_real_executor_answers() {
     let (layout, _) = host_root("host-fetcher-on-host");
-    let none = || Box::new(FakeLeases::default()) as Box<dyn LeaseSource>;
-    let without = HostFetcher::on_host_with(layout.clone(), path(FILE), none, |_| {
+    let without = HostFetcher::on_host_with(layout.clone(), path(FILE), |_| {
         Err(crate::fetch::ProgramFault::User(
             crate::fetch::user::UserFault::Missing("kbf-fetch".to_owned()),
         ))
@@ -709,25 +698,10 @@ fn on_a_host_the_child_is_looked_up_per_fetch_and_the_real_executor_answers() {
         "{got:?}"
     );
 
-    let with = HostFetcher::on_host_with(layout, path(FILE), none, |_| Ok(nowhere()));
+    let with = HostFetcher::on_host_with(layout, path(FILE), |_| Ok(nowhere()));
     let got = with.fetch(&locator());
     assert!(
         matches!(&got, Err(FetchError::Unavailable(why)) if why.ends_with("is not trusted: it is missing")),
         "no file under the scratch root: {got:?}"
-    );
-}
-
-/// `HostFetcher::on_host` is the production constructor: on a platform whose fetch user is
-/// not on this box it refuses, naming the user.
-#[cfg(target_os = "linux")]
-#[test]
-fn the_host_fetcher_of_a_host_without_the_fetch_user_names_it() {
-    let (layout, _) = host_root("host-fetcher-no-user");
-    let layout = Layout::new(layout.root().clone(), Platform::MacOs);
-    let fetcher = HostFetcher::on_host(layout, path(FILE), || Box::new(FakeLeases::default()));
-    let got = fetcher.fetch(&locator());
-    assert!(
-        matches!(&got, Err(FetchError::Unavailable(why)) if why.contains("_kbf-fetch")),
-        "{got:?}"
     );
 }

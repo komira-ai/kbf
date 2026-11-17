@@ -6,7 +6,7 @@ use crate::exec::HostExec;
 use crate::path::Root;
 use crate::testkit::{FakeExec, reply, scratch};
 
-const PASSWD: &str = "kbf:x:990:991:kbf build daemon:/var/lib/kbf:/usr/sbin/nologin\n";
+const PASSWD: &str = "kbf:x:990:991:kbf service:/var/lib/kbf:/usr/sbin/nologin\n";
 
 /// A host whose `getent` and `id -G` print `passwd` and `groups`.
 fn host(passwd: &'static str, groups: &'static str) -> FakeExec {

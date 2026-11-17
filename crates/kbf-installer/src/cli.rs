@@ -113,43 +113,24 @@ pub struct RecordReleaseArgs {
 /// The service a swap restarts, by its own flag (never from an order).
 #[derive(Args)]
 pub struct ServiceArgs {
-    /// The systemd unit to restart after a swap (Linux).
-    #[arg(
-        long,
-        conflicts_with = "launchd_label",
-        required_unless_present = "launchd_label"
-    )]
-    pub unit: Option<String>,
-    /// The launchd label to kickstart after a swap (macOS).
+    /// The systemd unit to restart after a swap.
     #[arg(long)]
-    pub launchd_label: Option<String>,
+    pub unit: String,
 }
 
 impl ServiceArgs {
     /// Whether the service this installer restarts is the unit of a mode that keeps its state
-    /// in the database (`kbf-frontend.service`, `kbf-frontend@<instance>.service`, `kbf-all-in-one.service` or its
-    /// template `kbf-all-in-one@<instance>.service`): the installer is not told the host's
-    /// mode, the unit it restarts is the one place that names it. A launchd label names no mode.
+    /// in the database (`kbf-frontend.service` or an instance of its template,
+    /// `kbf-frontend@<instance>.service`): the installer is not told the host's mode, the unit
+    /// it restarts is the one place that names it.
     pub fn runs_database_mode(&self) -> bool {
-        self.unit.as_deref().is_some_and(|u| {
-            u == "kbf-all-in-one.service"
-                || u == "kbf-frontend.service"
-                || (["kbf-frontend@", "kbf-all-in-one@"]
-                    .iter()
-                    .any(|p| u.starts_with(p))
-                    && u.ends_with(".service"))
-        })
+        let u = self.unit.as_str();
+        u == "kbf-frontend.service" || (u.starts_with("kbf-frontend@") && u.ends_with(".service"))
     }
 
-    /// How to restart the service. clap makes exactly one of the two flags present
-    /// (`required_unless_present`, `conflicts_with`), so the label is there whenever the
-    /// unit is not.
+    /// How to restart the service.
     pub fn restart(&self) -> crate::helper::restart::Restart {
-        use crate::helper::restart::Restart;
-        match &self.unit {
-            Some(unit) => Restart::Systemd(unit.clone()),
-            None => Restart::Launchd(self.launchd_label.clone().unwrap_or_default()),
-        }
+        crate::helper::restart::Restart::Systemd(self.unit.clone())
     }
 }
 
@@ -163,25 +144,21 @@ pub struct GcArgs {
 #[derive(Args)]
 pub struct RunArgs {
     /// Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it.
-    /// Default: the host's state directory (`/var/lib/kbf-installer`, `/var/db/kbf-installer` on a Mac).
+    /// Default: the host's state directory (`/var/lib/kbf-installer`).
     #[arg(long, value_parser = kbf_host::HostPath::new)]
     pub update_dir: Option<kbf_host::HostPath>,
     /// The order spool: owned by the service user, mode 0700, inside a root-owned parent.
     /// Default: `orders` in the state directory.
     #[arg(long, value_parser = kbf_host::HostPath::new)]
     pub orders_dir: Option<kbf_host::HostPath>,
-    /// The systemd unit to restart after a swap (Linux). Without it and without
-    /// `--launchd-label`, the unit of the mode in the host's kbf.toml, which is how the one
-    /// packaged kbf-installer.service serves every mode.
-    #[arg(long, conflicts_with = "launchd_label")]
-    pub unit: Option<String>,
-    /// The launchd label to kickstart after a swap (macOS).
+    /// The systemd unit to restart after a swap. Without it, the unit of the mode in the host's
+    /// kbf.toml, which is how the one packaged kbf-installer.service serves every mode.
     #[arg(long)]
-    pub launchd_label: Option<String>,
+    pub unit: Option<String>,
     /// The confirm window the boot check gives a release on trial (120 to 1800).
     #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(120..=1800))]
     pub window_secs: u64,
-    /// The starts a release on trial gets before it is reverted (Linux).
+    /// The starts a release on trial gets before it is reverted.
     #[arg(long, default_value_t = 3)]
     pub starts: u32,
     /// The fewest seconds between one activation and the next.
@@ -192,8 +169,8 @@ pub struct RunArgs {
     pub passes: Option<u64>,
     /// installer.toml, under the host root: its `database` key is the state database the
     /// installer migrates to what a release needs before that release is activated. Required
-    /// when the unit restarted after a swap is a frontend's or the all-in-one's, unless the
-    /// unit comes from kbf.toml's mode (no --unit): then the host's installer.toml (/etc/kbf, /usr/local/etc/kbf on a Mac) is the default.
+    /// when the unit restarted after a swap is a frontend's, unless the unit comes from
+    /// kbf.toml's mode (no --unit): then the host's installer.toml (/etc/kbf) is the default.
     #[arg(long, value_parser = kbf_host::HostPath::new)]
     pub installer_config: Option<kbf_host::HostPath>,
 }
@@ -213,19 +190,16 @@ impl RunArgs {
             .unwrap_or_else(|| layout.orders_dir())
     }
 
-    /// The service this `run` restarts, when the flags name it; `None` when neither does.
+    /// The service this `run` restarts, when the flags name it; `None` when they do not.
     pub fn named_service(&self) -> Option<ServiceArgs> {
-        (self.unit.is_some() || self.launchd_label.is_some()).then(|| ServiceArgs {
-            unit: self.unit.clone(),
-            launchd_label: self.launchd_label.clone(),
-        })
+        self.unit.clone().map(|unit| ServiceArgs { unit })
     }
 }
 
 #[derive(Args)]
 pub struct ProxyArgs {
-    /// The installer.toml whose `[proxy]` table configures the proxy (default: the platform's,
-    /// `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac).
+    /// The installer.toml whose `[proxy]` table configures the proxy (default:
+    /// `/etc/kbf/installer.toml`).
     #[arg(long)]
     pub config: Option<std::path::PathBuf>,
     /// Retired: no longer read, two-slot supervision was removed. Accepted and ignored, with a
@@ -273,8 +247,8 @@ pub struct BootArgs {
     /// --root), which migrates the state database, and ends as it ends. Needs --mode.
     #[arg(long, requires = "mode")]
     pub kbf: Option<std::path::PathBuf>,
-    /// The mode of the unit that runs the check: only frontend and all-in-one keep state in
-    /// the database. Needs --kbf.
+    /// The mode of the unit that runs the check: only the frontend keeps state in the
+    /// database. Needs --kbf.
     #[arg(long, value_enum, requires = "kbf")]
     pub mode: Option<Mode>,
 }

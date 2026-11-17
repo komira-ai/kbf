@@ -24,21 +24,20 @@ pub const MAX_RAW_CHARS: usize = 200;
 pub struct Entry {
     /// RFC 3339, UTC.
     pub time: String,
-    /// `install`, `restart`, `query`, `apply` (the Mac's apply job) or `prune` (what that job
-    /// removed after it, or why it could not); none when the request was not understood.
+    /// The verb of the request or the command (`install`, `restart`, `query`, the local
+    /// socket's, `activate` or `unpin`); none when the request was not understood.
     pub verb: Option<&'static str>,
     pub version: Option<String>,
     pub channel: Option<String>,
     /// The unit a `restart` named, only on the line of a restart.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
-    /// `installed`, `already_installed`, `restarted`, `apply_started`, `applied` (the end of
-    /// an apply job), `pruned` or `prune_failed` (its prune), `query`, `refused` or `failed`.
+    /// `installed`, `already_installed`, `restarted`, `query`, `refused` or `failed`, or the
+    /// outcome of a local command.
     pub outcome: &'static str,
     /// The closed reason code of a refusal or a failure.
     pub reason: Option<&'static str>,
-    /// What became of an apply job (`done`, `failed:<reason>[:<what became of the old
-    /// release>]`, the status file's line), only on the line the job appends when it ends.
+    /// What an `activate` or an `unpin` did, in words, only on the line of such a command.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
     /// The request as received, only when it was not understood.

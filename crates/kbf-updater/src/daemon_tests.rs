@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::api::{ErrorCode, Roll, RollState};
 use crate::daemon::{
     Config, Daemon, build_ports, build_ports_with_exec, drive_loop, parse_flags,
-    parse_operator_url, run_config, start, start_with, stderr_log, stderr_sink,
+    parse_operator_url, run_config, start, start_with, stderr_sink,
 };
 use crate::fakes::{Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log};
 use crate::inventory::{Host, Member, Role};
@@ -228,75 +228,20 @@ fn the_ssh_timeouts_are_optional_flags_in_seconds() {
     }
 }
 
-/// Catches a drain deadline that is not a flag, that has a default (absent must mean wait however
-/// long it takes), that is capped (a day and a year are both taken), that takes a non-number, or
-/// that may be zero (a drain that waits for nothing is no drain): the flag sets only the deadline.
+/// Catches a flag of the daemon-era roll still being read: a node's drain deadline and the two
+/// bounds of a Mac's apply are no flags any more, so an unchanged command line is refused with the
+/// flag named and the roll does not start with a setting that changes nothing.
 #[test]
-fn the_drain_deadline_is_an_optional_flag_of_at_least_a_second_with_no_cap() {
-    assert_eq!(parse(&FLAGS).expect("flags").drain_deadline, None);
-    let with = [&FLAGS[..], &["--drain-deadline-secs", "90"]].concat();
-    let cfg = parse(&with).expect("deadline");
-    assert_eq!(
-        (
-            cfg.drain_deadline.map(|d| d.as_secs()),
-            cfg.ssh_command_timeout.as_secs()
-        ),
-        (Some(90), 900)
-    );
-    for large in [86_401_u64, 31_536_000, 1_000_000_000] {
-        let text = large.to_string();
-        let with = [&FLAGS[..], &["--drain-deadline-secs", &text]].concat();
-        let cfg = parse(&with).expect("a large deadline");
-        assert_eq!(cfg.drain_deadline.map(|d| d.as_secs()), Some(large));
-    }
-    for bad in ["soon", "-1", "1.5", ""] {
-        let with = [&FLAGS[..], &["--drain-deadline-secs", bad]].concat();
+fn the_flags_of_a_daemon_hosts_drain_and_a_macs_apply_are_gone() {
+    for flag in [
+        "--drain-deadline-secs",
+        "--apply-poll-secs",
+        "--apply-deadline-secs",
+    ] {
+        let with = [&FLAGS[..], &[flag, "90"]].concat();
         assert_eq!(
-            parse(&with).expect_err(bad),
-            "--drain-deadline-secs must be a number of seconds"
-        );
-    }
-    let zero = [&FLAGS[..], &["--drain-deadline-secs", "0"]].concat();
-    assert_eq!(
-        parse(&zero).expect_err("zero"),
-        "--drain-deadline-secs must be at least 1 (leave it out to wait however long it takes)"
-    );
-}
-
-/// Catches the two bounds of a Mac's apply not being flags: both are optional, default to a
-/// 5 s poll and a 600 s deadline, take a number of seconds, and may not be zero (a poll with
-/// no interval spins; a deadline of nothing fails every apply). Each sets only itself.
-#[test]
-fn the_apply_poll_and_deadline_are_optional_flags_of_at_least_a_second() {
-    let cfg = parse(&FLAGS).expect("flags");
-    assert_eq!(
-        (cfg.apply_poll.as_secs(), cfg.apply_deadline.as_secs()),
-        (5, 600)
-    );
-    let with = [&FLAGS[..], &["--apply-poll-secs", "2"]].concat();
-    let cfg = parse(&with).expect("poll");
-    assert_eq!(
-        (cfg.apply_poll.as_secs(), cfg.apply_deadline.as_secs()),
-        (2, 600)
-    );
-    let with = [&FLAGS[..], &["--apply-deadline-secs=90"]].concat();
-    let cfg = parse(&with).expect("deadline");
-    assert_eq!(
-        (cfg.apply_poll.as_secs(), cfg.apply_deadline.as_secs()),
-        (5, 90)
-    );
-    for flag in ["--apply-poll-secs", "--apply-deadline-secs"] {
-        for bad in ["soon", "-1", "1.5", ""] {
-            let with = [&FLAGS[..], &[flag, bad]].concat();
-            assert_eq!(
-                parse(&with).expect_err(bad),
-                format!("{flag} must be a number of seconds")
-            );
-        }
-        let zero = [&FLAGS[..], &[flag, "0"]].concat();
-        assert_eq!(
-            parse(&zero).expect_err("zero"),
-            format!("{flag} must be at least 1")
+            parse(&with).expect_err(flag),
+            format!("unknown argument {flag}")
         );
     }
 }
@@ -342,36 +287,21 @@ fn the_peer_ready_and_frontend_drain_deadline_are_optional_flags_of_at_least_a_s
     }
 }
 
-/// Asserts that each of the flags below reaches the roll's timing: the drain deadline, the apply
-/// poll and deadline, the wait for the other members and the deadline of a member's drain, and
-/// that the rest of the timing is the default.
+/// Asserts that each of the flags below reaches the roll's timing: the wait for the other members
+/// and the deadline of a member's drain, and that the rest of the timing is the default.
 #[test]
 fn the_flags_set_the_timing_of_the_roll() {
     let with = [
         &FLAGS[..],
-        &[
-            "--drain-deadline-secs=7",
-            "--apply-poll-secs=3",
-            "--apply-deadline-secs=11",
-            "--peer-ready-secs=13",
-            "--frontend-drain-deadline-secs=17",
-        ],
+        &["--peer-ready-secs=13", "--frontend-drain-deadline-secs=17"],
     ]
     .concat();
     let t = crate::daemon::timing(&parse(&with).expect("flags"));
-    assert_eq!(
-        (
-            t.drain_deadline.map(|d| d.as_secs()),
-            t.apply_poll.as_secs(),
-            t.apply_deadline.as_secs()
-        ),
-        (Some(7), 3, 11)
-    );
     assert_eq!(t.peer_ready.as_secs(), 13);
     assert_eq!(t.frontend_drain.map(|d| d.as_secs()), Some(17));
     assert_eq!(t.poll, Timing::default().poll);
     let t = crate::daemon::timing(&parse(&FLAGS).expect("flags"));
-    assert_eq!((t.drain_deadline, t.frontend_drain), (None, None));
+    assert_eq!(t.frontend_drain, None);
 }
 
 /// Catches the settings of the installer reaching it unchecked: a key path that is no file, a
@@ -486,9 +416,6 @@ fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
         channel: "stable".to_owned(),
         ssh_connect_timeout: Duration::from_secs(5),
         ssh_command_timeout: Duration::from_secs(30),
-        drain_deadline: None,
-        apply_poll: Duration::from_secs(5),
-        apply_deadline: Duration::from_secs(600),
         peer_ready: Duration::from_secs(30),
         frontend_drain_deadline: None,
     }
@@ -545,10 +472,6 @@ fn quick() -> Timing {
         query_bound: Duration::from_millis(300),
         healthy_frontend: Duration::from_millis(300),
         healthy_storage: Duration::from_millis(300),
-        healthy_daemon: Duration::from_millis(300),
-        drain_deadline: Some(Duration::from_millis(300)),
-        apply_poll: Duration::from_millis(10),
-        apply_deadline: Duration::from_millis(300),
         peer_ready: Duration::from_millis(30),
         frontend_drain: Some(Duration::from_millis(300)),
     }
@@ -585,7 +508,7 @@ fn post(socket: &std::path::Path) -> (u16, Value) {
 }
 
 /// Asserts that ssh is never run for a frontend that is no pool member: with the binary's own
-/// ports, an all-hosts roll (frontend, storage, daemon) is accepted (202) and fails at the
+/// ports, an all-hosts roll (frontend and two storage hosts) is accepted (202) and fails at the
 /// frontend, before its installer, with the reason that says to list an instance and a base in
 /// the failure. The recording `Exec` is never called (the recorded calls are empty), no later
 /// host is asked about (the fake operator API sees no request at all) and the later hosts stay
@@ -599,7 +522,7 @@ fn an_all_hosts_roll_never_runs_ssh_for_a_frontend_that_is_no_member() {
     let cfg = config(
         "unbuilt",
         "fe fe.farm.example frontend KEY\nst1 st1.farm.example storage KEY\n\
-         dm1 dm1.farm.example daemon KEY\n",
+         st2 st2.farm.example storage KEY\n",
         &api,
     );
     let ssh = Arc::new(FakeSsh::default());
@@ -705,7 +628,7 @@ fn a_node_is_installed_over_ssh_with_the_configured_user_key_and_channel() {
     daemon.wait();
 }
 
-/// Catches a role that is not frontend, storage, daemon or mac-daemon being accepted: the
+/// Catches a role that is not frontend or storage being accepted: the
 /// inventory refuses the line (`mac` alone is not a role), so the updater does not start and
 /// no ssh runs.
 #[test]
@@ -719,8 +642,7 @@ fn an_unknown_role_is_refused_by_the_inventory() {
         );
         let e = start(&cfg).err().expect(role);
         assert!(
-            e.starts_with("inventory ")
-                && e.contains("is not frontend, storage, daemon or mac-daemon"),
+            e.starts_with("inventory ") && e.contains("is not frontend or storage"),
             "{e}"
         );
         assert!(!sock(&cfg).exists());
@@ -827,7 +749,6 @@ fn the_driver_loop_audits_what_it_cannot_drive_and_goes_on() {
     let ports = Ports {
         safe: Box::new(FakeSafeToStop::new(&log)),
         installer: Box::new(FakeInstaller::new(&log)),
-        drain: Box::new(crate::fakes::FakeDrain::new(&log)),
         health: Box::new(FakeHealth::new(&log)),
         clock: Box::new(FakeClock::new()),
         frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
@@ -932,5 +853,4 @@ fn the_process_entry_points() {
     assert_eq!((code, out.as_str()), (0, ""));
     assert!(!sock(&cfg).exists(), "the socket is removed on exit");
     stderr_sink()("{\"event\":\"test\"}");
-    stderr_log()("warn: test");
 }

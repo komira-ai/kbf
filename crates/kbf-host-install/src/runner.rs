@@ -12,8 +12,6 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::ids;
-
 /// The only `PATH` a child sees.
 pub const PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -62,8 +60,7 @@ pub struct Cmd {
     /// Variables the child sees besides the fixed three.
     pub env: Vec<(String, String)>,
     /// The user and group the child runs as, with no supplementary group; none for the
-    /// caller's own. A root caller is needed (see [`drop_ids`]). On macOS the command starts in
-    /// `/`, because the user may not be able to enter the caller's directory.
+    /// caller's own. A root caller is needed (see [`refuse_setuid_drop`]).
     pub run_as: Option<Identity>,
     /// Bytes written to the child's standard input, which is then closed; none for an
     /// input that is closed at once.
@@ -114,8 +111,7 @@ impl Exec {
     }
 }
 
-/// The signals that end a process, by number, on this platform. The numbers of `SIGBUS` and
-/// `SIGSYS` differ between macOS and Linux, so those are listed per platform.
+/// The signals that end a process, by number.
 const SIGNALS: &[(i32, &str)] = &[
     (1, "SIGHUP"),
     (2, "SIGINT"),
@@ -123,12 +119,7 @@ const SIGNALS: &[(i32, &str)] = &[
     (4, "SIGILL"),
     (5, "SIGTRAP"),
     (6, "SIGABRT"),
-    #[cfg(not(target_os = "macos"))]
     (7, "SIGBUS"),
-    #[cfg(target_os = "macos")]
-    (10, "SIGBUS"),
-    #[cfg(target_os = "macos")]
-    (12, "SIGSYS"),
     (8, "SIGFPE"),
     (9, "SIGKILL"),
     (11, "SIGSEGV"),
@@ -230,34 +221,6 @@ fn wait_watching(
     }
 }
 
-/// How the child gets its ids. A drop to another user is made by this process: by
-/// `Command::uid` and `gid` where the standard library's `setgroups(0)` empties the groups
-/// (Linux), and, with `exact_groups`, in the child just before it executes the program, which
-/// sets the supplementary groups to the one gid, then the gid, then the uid ([`ids::switch_to`]).
-/// The second is for macOS, where the standard library's `setgroups(0)` leaves the old
-/// effective gid (group 0, `wheel`, for root) as the child's only supplementary group.
-/// (`chroot(8)` would set the groups too, but a process that calls `chroot` and then executes
-/// a program is killed by the system on macOS, `SIGKILL` at once, even for `/` and
-/// `/usr/bin/true`.) The second refuses a target of uid 0 or gid 0 (`PermissionDenied`): it
-/// would otherwise run the program as root, or in group 0, without a drop.
-fn drop_ids(command: &mut Command, run_as: Option<Identity>, exact_groups: bool) -> io::Result<()> {
-    let Some(id) = run_as else { return Ok(()) };
-    if !exact_groups {
-        command.uid(id.uid).gid(id.gid);
-        return Ok(());
-    }
-    if id.uid == 0 || id.gid == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "a privilege drop with exact groups needs a uid and a gid that are not root's",
-        ));
-    }
-    // The child starts in `/`: the caller's directory may be one the new user cannot enter.
-    command.current_dir("/");
-    ids::switch_to(command, id);
-    Ok(())
-}
-
 /// Refuse a privilege drop made by this process when its effective uid is root and its real
 /// uid is not (a setuid-style launch): the standard library empties the supplementary groups
 /// only when the REAL uid is root, so such a drop would keep the caller's groups.
@@ -293,7 +256,9 @@ impl Runner for SystemRunner {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        drop_ids(&mut command, cmd.run_as, cfg!(target_os = "macos"))?;
+        if let Some(id) = cmd.run_as {
+            command.uid(id.uid).gid(id.gid);
+        }
         let mut child = command.spawn()?;
         // The input is written from a thread, or a child that writes before it reads
         // blocks on a full pipe while this waits for it.

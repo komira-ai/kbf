@@ -15,13 +15,10 @@
 //! the host's owners and modes; on a host it is [`kbf_host::HostExec`]. The same rule is
 //! `trusted_chain` of the dev installer this was ported from, with one addition: a
 //! directory above the path that is a link is refused, which is why the pins are not
-//! under `/etc` (a link on macOS, see [`crate::layout`]).
+//! under `/etc` (see [`crate::layout`]).
 //!
 //! The chain ends at the top-level directory (`/usr`): `/` itself has no [`HostPath`]
 //! and is not asked about.
-//!
-//! A macOS host needs `/usr/local` to be `root:wheel` 755: Homebrew on Intel leaves it
-//! writable by the admin group, and the chain is then refused, naming `/usr/local`.
 
 use kbf_host::exec::{Exec, Kind, Meta};
 use kbf_host::path::HostPath;

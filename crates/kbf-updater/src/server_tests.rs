@@ -23,7 +23,7 @@ use crate::testutil::{
 use crate::{Ports, Timing};
 
 const INVENTORY: &str = "fe fe.farm.example frontend KEY\nst1 st1.farm.example storage KEY\n\
-                         dm dm.farm.example daemon KEY dm-node\n";
+                         st2 st2.farm.example storage KEY st2-node\n";
 
 /// A scratch directory with an inventory and an empty state directory, and the config over it.
 fn prepare(name: &str, proxy_uid: u32) -> Config {
@@ -44,9 +44,6 @@ fn prepare(name: &str, proxy_uid: u32) -> Config {
         channel: "stable".to_owned(),
         ssh_connect_timeout: std::time::Duration::from_secs(5),
         ssh_command_timeout: std::time::Duration::from_secs(30),
-        drain_deadline: None,
-        apply_poll: std::time::Duration::from_secs(5),
-        apply_deadline: std::time::Duration::from_secs(600),
         peer_ready: std::time::Duration::from_secs(30),
         frontend_drain_deadline: None,
     }
@@ -90,7 +87,6 @@ impl Farm {
         let ports = Ports {
             safe: Box::new(stop.clone()),
             installer: Box::new(inst.clone()),
-            drain: Box::new(crate::fakes::FakeDrain::new(&log)),
             health: Box::new(health),
             clock: Box::new(clock),
             frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
@@ -171,8 +167,8 @@ fn a_roll_runs_end_to_end_over_the_socket() {
     let roll = farm.finished(&id);
     assert_eq!(roll.state, RollState::Done, "{roll:?}");
     let aliases: Vec<_> = roll.hosts.iter().map(|h| h.alias.as_str()).collect();
-    assert_eq!(aliases, ["fe", "st1", "dm"]);
-    assert_eq!(farm.log.installs(), ["fe", "st1", "dm"]);
+    assert_eq!(aliases, ["fe", "st1", "st2"]);
+    assert_eq!(farm.log.installs(), ["fe", "st1", "st2"]);
     // The list: the latest roll is `current`; a second roll pushes the first into `recent`.
     let list = farm.current_rolls();
     assert_eq!(
@@ -295,7 +291,7 @@ fn a_failed_roll_reads_as_failed_with_a_code() {
         (failure.alias.as_str(), failure.code),
         ("st1", ErrorCode::UnsafeToStop)
     );
-    assert_eq!(farm.log.touching("dm"), Vec::<Event>::new());
+    assert_eq!(farm.log.touching("st2"), Vec::<Event>::new());
 }
 
 /// Catches an unknown or malformed roll id answering anything but 404 `unknown_roll`, and an
@@ -508,7 +504,7 @@ fn bad_requests_get_closed_codes_and_no_inventory() {
         for secret in [
             "fe.farm",
             "st1",
-            "dm.farm",
+            "st2.farm",
             "ssh-ed25519",
             "storage",
             "frontend",
@@ -587,7 +583,6 @@ fn bare_server(name: &str) -> (Server, std::sync::mpsc::Receiver<String>, Lines)
     let ports = Ports {
         safe: Box::new(FakeSafeToStop::new(&log)),
         installer: Box::new(FakeInstaller::new(&log)),
-        drain: Box::new(crate::fakes::FakeDrain::new(&log)),
         health: Box::new(FakeHealth::new(&log)),
         clock: Box::new(FakeClock::new()),
         frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
@@ -774,7 +769,6 @@ fn a_running_roll_found_at_start_is_resumed() {
         let ports = Ports {
             safe: Box::new(FakeSafeToStop::new(&log)),
             installer: Box::new(FakeInstaller::new(&log)),
-            drain: Box::new(crate::fakes::FakeDrain::new(&log)),
             health: Box::new(FakeHealth::new(&log)),
             clock: Box::new(FakeClock::new()),
             frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
@@ -800,7 +794,7 @@ fn a_running_roll_found_at_start_is_resumed() {
         (done[0]["roll_id"].as_str(), done[0]["state"].as_str()),
         (Some("roll-1"), Some("done"))
     );
-    assert_eq!(farm.log.installs(), ["fe", "st1", "dm"]);
+    assert_eq!(farm.log.installs(), ["fe", "st1", "st2"]);
 }
 
 /// Catches start-up treating any record as a roll to resume: a record that is already

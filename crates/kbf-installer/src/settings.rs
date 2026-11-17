@@ -10,8 +10,7 @@
 //! RUN_AS_GID=65534
 //! ```
 //!
-//! Every key has a default (the table above, `nobody`; on macOS `nobody` is uid and gid
-//! 4294967294), and a host with no file uses them. A file that is there must be root's
+//! Every key has a default (the table above, `nobody`), and a host with no file uses them. A file that is there must be root's
 //! alone ([`crate::trust`]); a file that is not is refused, not ignored, since the
 //! settings it may hold decide what is believed.
 //!

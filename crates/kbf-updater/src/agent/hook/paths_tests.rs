@@ -8,12 +8,9 @@ use update_hook::{Class, Outcome, Phase, Step, Verdict};
 
 use super::record::Was;
 use super::testing::Rig;
-use crate::agent::cordon::OwnCordon;
 use crate::agent::local::{LocalError, Trial};
-use crate::agent::testing::{COMMIT_A, COMMIT_B, ServingNode, VA, VB, host, version};
-use crate::inventory::Role;
-use crate::ports::{Health, Placed, PortError};
-use crate::testutil::scratch;
+use crate::agent::testing::{COMMIT_A, COMMIT_B, ServingNode, VA, VB, version};
+use crate::ports::{Health, PortError};
 
 const LEFT_OUT: &str = "node was out of placement before the roll; left out";
 
@@ -436,77 +433,6 @@ fn the_placement_is_recorded_before_the_drain_and_read_once() {
     assert_eq!(rig.run(Step::Cutover).outcome, Outcome::Success);
     assert_eq!(rig.run(Step::Rollback).outcome, Outcome::Success);
     assert_eq!(rig.events.count("placed"), 1);
-}
-
-/// The update through the agent's own cordon marks (`OwnCordon`) on a node the frontend keeps:
-/// a node an operator had drained comes out of the update still drained and with no mark; a
-/// serving node comes out serving and with no mark; a node this updater drained on an earlier
-/// attempt and never gave back (its mark is on disk, its record gone) is given back.
-///
-/// Catches: the updater uncordoning an operator's drain; one of its own cordons kept for good.
-#[test]
-fn through_the_cordon_marks_an_operators_drain_is_kept_and_the_updaters_is_given_back() {
-    let marks = |dir: &std::path::Path| {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("cordon-")
-            })
-            .count()
-    };
-    let with_cordon = |name: &str| {
-        let mut rig = Rig::new(name);
-        let node = ServingNode::new();
-        let cordons = scratch(&format!("{name}-marks"));
-        rig.drain_port = Arc::new(OwnCordon::new(Arc::new(node.clone()), &cordons, "kbf"));
-        (rig, node, cordons)
-    };
-
-    let (rig, node, cordons) = with_cordon("hook-cordon-operator");
-    node.operator_drains();
-    assert_eq!(
-        rig.drive().verdict,
-        Verdict::Succeeded {
-            promotion_pending: false
-        }
-    );
-    assert!(!node.is_serving());
-    assert_eq!(marks(&cordons), 0);
-
-    let (rig, node, cordons) = with_cordon("hook-cordon-serving");
-    assert_eq!(
-        rig.drive().verdict,
-        Verdict::Succeeded {
-            promotion_pending: false
-        }
-    );
-    assert!(node.is_serving());
-    assert_eq!(marks(&cordons), 0);
-
-    // An earlier attempt drained the node, kept its mark, and its record is gone.
-    let (rig, node, cordons) = with_cordon("hook-cordon-earlier");
-    rig.drain_port
-        .drain(&host(Role::Daemon), None)
-        .expect("the earlier attempt's drain");
-    assert_eq!(marks(&cordons), 1);
-    assert!(!node.is_serving());
-    assert_eq!(
-        rig.drive().verdict,
-        Verdict::Succeeded {
-            promotion_pending: false
-        }
-    );
-    assert!(
-        node.is_serving(),
-        "the earlier drain was ours: it is given back"
-    );
-    assert_eq!(marks(&cordons), 0);
-    assert_eq!(rig.record().expect("a record").placement, Some(Was::In));
-    assert_eq!(rig.drain_port.placed(&host(Role::Daemon)), Ok(Placed::In));
 }
 
 // ---- cutover and verify ----

@@ -248,9 +248,6 @@ pub(crate) mod fake {
             fs::create_dir_all(&dir).expect("release dir");
             fs::write(dir.join("kbf"), b"binary").expect("binary");
             let mut report = honest(rec);
-            if self.layout.platform() == crate::layout::Platform::MacOs {
-                report.platform = "darwin-arm64".to_owned();
-            }
             if let Some(change) = *self.tamper.lock().expect("lock") {
                 change(&mut report);
             }

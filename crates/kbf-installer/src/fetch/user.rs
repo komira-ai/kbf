@@ -1,4 +1,4 @@
-//! The fetch user: `kbf-fetch` (`_kbf-fetch` on macOS), a system user with no home, no
+//! The fetch user: `kbf-fetch`, a system user with no home, no
 //! shell and no groups that owns no file (contract section 3). The package or `setup`
 //! creates it; this reads its ids.
 
@@ -11,10 +11,8 @@ use crate::run::RunAs;
 
 /// The name of the fetch user on `platform`.
 pub const fn name(platform: Platform) -> &'static str {
-    match platform {
-        Platform::Linux => FETCH_USER,
-        Platform::MacOs => "_kbf-fetch",
-    }
+    let Platform::Linux = platform;
+    FETCH_USER
 }
 
 /// Why the fetch user's ids could not be had.

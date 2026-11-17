@@ -116,8 +116,6 @@ fn refusals_are_verdicts_only_when_the_contract_has_a_word_for_them() {
         name: "kbf".to_owned(),
     };
     refusal(hash, |s| FetchError::Rejected(format!("hash: {s}")));
-    let lease = Refusal::Lease("2 leases are live".to_owned());
-    refusal(lease, |s| FetchError::Rejected(format!("lease: {s}")));
     let list = Refusal::Components("kbf was not fetched".to_owned());
     refusal(list, FetchError::Rejected);
 }
@@ -127,7 +125,7 @@ fn refusals_are_verdicts_only_when_the_contract_has_a_word_for_them() {
 /// Catches a name with a separator or a dot part (`../x`) being joined onto `dl/`.
 #[test]
 fn only_one_plain_file_name_is_a_component_name() {
-    for good in ["kbf", "kbf-daemon", "a.b"] {
+    for good in ["kbf", "kbf-extra", "a.b"] {
         assert!(is_plain_name(good), "{good}");
     }
     for bad in ["", ".", "..", "a/b", "/a", "../a", "a/", "a/.."] {
@@ -136,26 +134,17 @@ fn only_one_plain_file_name_is_a_component_name() {
 }
 
 /// The release platform of a host is its operating system and CPU as the server names them,
-/// and a Mac on x86-64 has none (no release is built for it).
+/// and a pair no release is built for (a Mac on x86-64) has none.
 ///
 /// Catches the CPU spelt as the OS spells it (`aarch64` for `arm64`), and a host given a
 /// platform no release exists for.
 #[test]
 fn a_hosts_release_platform_is_its_os_and_cpu() {
     use ReleasePlatform::{DarwinArm64, LinuxArm64, LinuxX86_64};
-    assert_eq!(
-        host_platform(Platform::Linux, Arch::X86_64),
-        Some(LinuxX86_64)
-    );
-    assert_eq!(
-        host_platform(Platform::Linux, Arch::Aarch64),
-        Some(LinuxArm64)
-    );
-    assert_eq!(
-        host_platform(Platform::MacOs, Arch::Aarch64),
-        Some(DarwinArm64)
-    );
-    assert_eq!(host_platform(Platform::MacOs, Arch::X86_64), None);
+    assert_eq!(host_platform("linux", Arch::X86_64), Some(LinuxX86_64));
+    assert_eq!(host_platform("linux", Arch::Aarch64), Some(LinuxArm64));
+    assert_eq!(host_platform("macos", Arch::Aarch64), Some(DarwinArm64));
+    assert_eq!(host_platform("macos", Arch::X86_64), None);
 }
 
 /// The disk check counts the release that is current: the sizes of its files, and nothing

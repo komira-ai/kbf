@@ -287,7 +287,7 @@ fn every_member_is_checked_and_an_unsafe_one_is_refused_by_name() {
 fn a_missing_required_member_is_refused_by_name() {
     for (why, tarball) in [
         ("declaration-alone", tar_gz(&[file(DECLARATION, b"x")])),
-        ("other-name", tar_gz(&[file("kbf-daemon", b"a")])),
+        ("other-name", tar_gz(&[file("kbf-extra", b"a")])),
         ("dir-prefix", tar_gz(&[file("bin/kbf", b"a")])),
         ("dot-slash", tar_gz(&[file("./kbf", b"a")])),
     ] {
@@ -487,10 +487,7 @@ fn a_declaration_is_never_written_through_a_link_or_into_a_missing_directory() {
 #[test]
 fn the_declaration_member_is_named_for_the_component_under_updater_d() {
     assert_eq!(declaration_member("tierstore"), "updater.d/tierstore.toml");
-    assert_eq!(
-        declaration_member("kbf-daemon"),
-        "updater.d/kbf-daemon.toml"
-    );
+    assert_eq!(declaration_member("kbf-extra"), "updater.d/kbf-extra.toml");
 }
 
 /// Gzip of `bytes` as one member.

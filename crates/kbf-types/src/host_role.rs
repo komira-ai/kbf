@@ -34,11 +34,12 @@ impl HostRole {
 
     /// A frontend: updated after every other kind, and never the last one that is up.
     pub const FRONTEND: Self = Self(Cow::Borrowed("frontend"));
-    /// A storage node, possibly with a daemon.
+    /// A storage node.
     pub const STORAGE: Self = Self(Cow::Borrowed("storage"));
-    /// A daemon-only Linux host.
+    /// A host of a worker daemon, which kbf no longer has. The name is still read (a certificate
+    /// an earlier release issued names it); no updater has duties for it.
     pub const DAEMON: Self = Self(Cow::Borrowed("daemon"));
-    /// A Mac that runs a daemon.
+    /// A Mac that ran a worker daemon, which kbf no longer has. Read like [`HostRole::DAEMON`].
     pub const MAC_DAEMON: Self = Self(Cow::Borrowed("mac-daemon"));
 
     /// The name in a certificate, a file and the status, such as `frontend` or `mac-daemon`.

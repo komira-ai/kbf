@@ -23,28 +23,29 @@ enum Way {
     Certificate,
 }
 
-/// A daemon host is told to update to B and does: the helper installs it, the node is drained
-/// at the frontend before the helper switches, the node's health is read, B is confirmed, and
-/// the node is given back; and the heartbeats say all along who is not named (no node id, no
-/// role), that an update is running, and at the end that it succeeded.
+/// A storage host is told to update to B and does: the helper installs it, switches, the node's
+/// storage health is read while B is on trial, and B is confirmed; nothing is drained or given
+/// back at the frontend, which has no node of this host to take out of placement; and the
+/// heartbeats say all along who is not named (no node id, no role), that an update is running,
+/// and at the end that it succeeded.
 #[test]
-fn a_daemon_host_updates_from_the_order_to_the_heartbeat_that_says_it_worked() {
+fn a_storage_host_updates_from_the_order_to_the_heartbeat_that_says_it_worked() {
     an_update_by(Way::Token);
 }
 
 /// The same update with no token anywhere: the agent is given `--frontend` and its certificate
 /// and nothing else, the frontend sees the node's own certificate on every call and no
-/// `Authorization` header, and the drain, the health reads and the undrain happen in the same
-/// order around the helper's switch.
+/// `Authorization` header, and the health reads happen between the helper's switch and its
+/// confirm.
 #[test]
-fn a_daemon_host_updates_with_its_certificate_alone_and_no_token() {
+fn a_storage_host_updates_with_its_certificate_alone_and_no_token() {
     an_update_by(Way::Certificate);
 }
 
 fn an_update_by(way: Way) {
     let dir = TestDir::under(std::env::temp_dir(), "agent-e2e");
     let pki = Pki::new();
-    let leaf = pki.updater("n1", HostRole::DAEMON);
+    let leaf = pki.updater("n1", HostRole::STORAGE);
     pki.write_updater_files(&dir, &leaf);
     let token = dir.join("operator-token");
     if way == Way::Token {
@@ -161,10 +162,7 @@ fn an_update_by(way: Way) {
         .iter()
         .map(String::as_str)
         .filter(|e| {
-            e.starts_with("helper:")
-                || e == &"api:drain"
-                || e == &"api:uncordon"
-                || e.starts_with("api:node")
+            e.starts_with("helper:") || e.starts_with("api:members") || e.starts_with("api:storage")
         })
         .collect();
     let position = |needle: &str| {
@@ -187,24 +185,25 @@ fn an_update_by(way: Way) {
             .any(|e| *e == format!("helper:install install kbf={VB} from stable"))
     );
     assert!(
-        position("helper:install") < position("api:drain"),
-        "{steps:?}"
-    );
-    assert!(
-        position("api:drain") < position("helper:switch"),
+        position("helper:install") < position("helper:switch"),
         "{steps:?}"
     );
     assert!(
         position("helper:switch") < position("helper:confirm"),
         "{steps:?}"
     );
+    let health = match way {
+        Way::Token => "api:members",
+        Way::Certificate => "api:storage-health",
+    };
     assert!(
-        position("helper:confirm") < position("api:uncordon"),
-        "{steps:?}"
+        steps[position("helper:switch")..position("helper:confirm")].contains(&health),
+        "the node is judged while B is on trial: {steps:?}"
     );
     assert!(
-        steps[position("helper:switch")..position("helper:confirm")].contains(&"api:node drained"),
-        "the node is judged while drained: {steps:?}"
+        !all.iter()
+            .any(|e| e.contains("drain") || e.contains("uncordon")),
+        "nothing is taken out of placement: {all:?}"
     );
 
     // What the heartbeats said.

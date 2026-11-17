@@ -89,8 +89,7 @@ pub struct StatusArgs {
     /// The directory the host's paths are under, such as a mounted image.
     #[arg(long, default_value = "/", value_parser = root)]
     root: Root,
-    /// The host's operating system, which decides where its state and lock are
-    /// (`linux` or `macos`); the one this program was built for by default.
+    /// The host's operating system, which decides where its state and lock are (`linux`).
     #[arg(long)]
     platform: Option<Platform>,
 }
@@ -125,8 +124,7 @@ pub struct ApplyArgs {
     /// The directory the host's paths are under, such as a mounted image.
     #[arg(long, default_value = "/", value_parser = root)]
     root: Root,
-    /// The host's operating system, which decides where its state and lock are
-    /// (`linux` or `macos`); the one this program was built for by default.
+    /// The host's operating system, which decides where its state and lock are (`linux`).
     #[arg(long)]
     platform: Option<Platform>,
 }
@@ -186,7 +184,7 @@ pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
         }
         Host::Gc(a) => {
             let host = a.apply.layout();
-            let procs = service::HostProcs::new(host.platform());
+            let procs = service::HostProcs;
             return gc(&procs, &host, a.keep, a.apply.mode(), out, err);
         }
     };

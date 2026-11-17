@@ -9,8 +9,7 @@
 //! Where the copy is made: at the first start of a release on trial, from `boot-check`, which
 //! the unit runs as `ExecStartPre=` after the old process has stopped and before the new one
 //! starts. That is the one point at which nothing writes the log; the helper's restart is a
-//! single `systemctl restart` and has no stop of its own to hook. (macOS has no start hook, so
-//! it keeps no copy.)
+//! single `systemctl restart` and has no stop of its own to hook.
 //!
 //! The copy lives in the directory of the release the log belongs to, the one that was
 //! running, and goes with that release when `gc` collects it:
@@ -100,8 +99,7 @@ pub enum Restored {
 }
 
 /// The metadata log's directory, as `kbf.toml` names it, under the host root; `None` for a mode
-/// that keeps none (or no `kbf.toml`). An `all-in-one` host names it in `[stores] meta-dir`; a
-/// storage node in `[storage] meta_dir`, which defaults to `meta` in `[dirs] state` (default
+/// that keeps none (or no `kbf.toml`). A storage node names it in `[storage] meta_dir`, which defaults to `meta` in `[dirs] state` (default
 /// `/var/lib/kbf`), as the node's enrollment reads it.
 pub fn dir(host: &Layout) -> Result<Option<PathBuf>, MetaLogError> {
     let table = match host_mode::read_table(host) {
@@ -119,12 +117,7 @@ pub fn dir(host: &Layout) -> Result<Option<PathBuf>, MetaLogError> {
     };
     let shown = host.kbf_toml();
     let named = match table.get("mode").and_then(toml::Value::as_str) {
-        Some("all-in-one") => get("stores", "meta-dir").ok_or_else(|| {
-            MetaLogError::Dir(format!(
-                "{shown} is an all-in-one host and has no [stores] meta-dir"
-            ))
-        })?,
-        Some("storage" | "storage-and-daemon") => get("storage", "meta_dir").unwrap_or_else(|| {
+        Some("storage") => get("storage", "meta_dir").unwrap_or_else(|| {
             let state = get("dirs", "state").unwrap_or_else(|| "/var/lib/kbf".to_owned());
             format!("{}/meta", state.trim_end_matches('/'))
         }),

@@ -358,38 +358,24 @@ fn a_stage_directory_a_killed_run_left_is_swept_by_install_stage_and_gc() {
 }
 
 /// The state directory and the install root are the package's: made when missing, never
-/// chmod-ed when there. A 0700 `/var/db/kbf-installer` (macOS) and a 0750 install root stay
-/// as they are; the ones the install makes are 0755.
+/// chmod-ed when there. A 0750 install root stays as it is; the ones the install makes are 0755.
 ///
 /// Catches an install that widens a directory the package made private.
 ///
 /// Catches: the "only when missing" test dropped (both always planned).
 #[test]
 fn an_existing_state_directory_and_install_root_keep_their_mode() {
-    let (mut exec, layout) = mac("s5-modes");
-    for (dir, mode) in [
-        ("/var/db/kbf-installer", 0o700),
-        ("/usr/local/kbf-installer", 0o750),
-    ] {
-        fs::create_dir_all(exec.at(dir)).expect("pkg dir");
-        fs::set_permissions(exec.at(dir), fs::Permissions::from_mode(mode)).expect("mode");
-    }
-    let from = mac_source("s5-modes-src", "daemon A");
-    install_on(&mut exec, &layout, A, &from, Mode::Apply).expect("install");
-    assert_eq!(mode_of(&exec, "/var/db/kbf-installer"), 0o700);
-    assert_eq!(mode_of(&exec, "/usr/local/kbf-installer"), 0o750);
-    assert_eq!(mode_of(&exec, "/usr/local/kbf-installer/releases"), 0o755);
-
-    let (mut exec, root) = host("s5-modes-linux");
+    let (mut exec, root) = host("s5-modes");
     fs::create_dir_all(exec.at("/var/lib/kbf-installer")).expect("dir");
     fs::set_permissions(
         exec.at("/var/lib/kbf-installer"),
         fs::Permissions::from_mode(0o750),
     )
     .expect("mode");
-    let from = source("s5-modes-linux-src", "kbf A", None);
+    let from = source("s5-modes-src", "kbf A", None);
     install_on(&mut exec, &root, A, &from, Mode::Apply).expect("install");
     assert_eq!(mode_of(&exec, "/var/lib/kbf-installer"), 0o750);
+    assert_eq!(mode_of(&exec, "/var/lib/kbf-installer/releases"), 0o755);
 }
 
 /// The links move `previous` first, then `current`: until `current` moves, both name whole

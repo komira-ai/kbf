@@ -99,28 +99,6 @@ fn an_honest_seed_is_installed_by_both_forms_and_the_hook_reports_its_manifest()
     assert_eq!(again, Ok(installed(&seeded)));
 }
 
-/// An activation holds the lease check and an update does not: with work running the
-/// activation is refused with the word `lease` and installs nothing, and the update of the same
-/// seed goes through (it moves no node link).
-///
-/// Catches the two kinds of order verified as one kind: an activation that ignores the leases,
-/// or an update that waits for them.
-///
-/// Catches: the activation form made an update; the update form made an activation.
-#[test]
-fn an_activation_waits_for_no_lease_and_an_update_does_not() {
-    let seeded = Seeded::scratch("seed-fetch-leases");
-    seeded.leases.set(2);
-    let fetcher = seeded.fetcher();
-    let got = fetcher.fetch_activation(&seeded.locator(), &seeded.facts());
-    assert!(
-        matches!(&got, Err(FetchError::Rejected(why)) if why.starts_with("lease: ")),
-        "{got:?}"
-    );
-    assert!(!seeded.installed());
-    assert_eq!(fetcher.fetch(&seeded.locator()), Ok(installed(&seeded)));
-}
-
 /// A flipped byte in the tarball is refused by the pipeline's digest check (the manifest still
 /// names the digest of the honest bytes), and nothing is installed or left behind.
 ///

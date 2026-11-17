@@ -21,9 +21,8 @@
 //!   so no agent socket, no `SSH_ASKPASS`, no proxy variable.
 //!
 //! The answer is read by [`answer`]: one capped JSON line out of a closed set of shapes whose
-//! exit status must agree. An install answers `installed`, `already_installed` or, from a
-//! Mac, `apply_started` for the version asked ([`InstallAnswer`]); a Mac's `query` carries
-//! one more field, `apply` (`running`, `done` or `failed:<reason>`, or null). An [`PortError`] holds one of a few fixed texts or a reason code,
+//! exit status must agree. An install answers `installed` or `already_installed`
+//! ([`InstallAnswer`]). A [`PortError`] holds one of a few fixed texts or a reason code,
 //! never ssh's or apt's own words; stderr is only classified (exit 255, ssh's own failure,
 //! is the one kind the roll tells apart: [`PortError::is_unreachable`]) and then dropped.
 //!
@@ -308,7 +307,7 @@ impl Installer for SshInstaller {
         }
         let done = self.call(host, &self.install_command(version))?;
         let (code, stdout) = answer::checked(&done)?;
-        answer::install_answer(code, stdout, version)
+        answer::install_answer(code, stdout)
     }
 
     fn report(&self, host: &Host) -> Result<Report, PortError> {

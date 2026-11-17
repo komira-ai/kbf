@@ -9,7 +9,7 @@
 //!
 //! sshd then runs it with no arguments, and the request is the one string in
 //! `SSH_ORIGINAL_COMMAND`. (The one argument it takes anywhere is `--version`, which prints
-//! the name and the package version and runs nothing; the release checks the signed Mac
+//! the name and the package version and runs nothing; the release checks the signed
 //! binary with it. `--version` beside anything else is refused with the closed line,
 //! unaudited: that is not an sshd request and changes nothing.) Exactly three requests are
 //! accepted, matched as a whole string
@@ -22,7 +22,7 @@
 //!   systemd unit an ssh drop cannot kill; the unit runs this program again, takes the install
 //!   lock and holds it for both apt steps ([`plan`], [`host`]);
 //! - `restart frontend=<name>`: restart `kbf-frontend.service` (`-`) or
-//!   `kbf-frontend@<name>.service` and wait until systemd says it is active (Linux only; no
+//!   `kbf-frontend@<name>.service` and wait until systemd says it is active (no
 //!   other unit can be named). A package install restarts nothing, so the updater asks for
 //!   this after one. It holds the install lock for as long as the process runs, so a restart
 //!   and an install do not overlap;
@@ -34,16 +34,6 @@
 //! ([`outcome`], every line with a `result`); the exit status is 0 (done), 2 (refused:
 //! nothing ran) or 3 (failed). Every invocation appends one line to the audit log
 //! ([`audit`]).
-//!
-//! # A Mac
-//!
-//! On macOS ([`mac`]) the same `install` and `query` requests are answered (a `restart` is
-//! refused: a Mac has no frontend unit). The install puts the attested release tarball into the
-//! kit layout (`/usr/local/kbf/releases/<commit>/kbf`, links `current` and `previous`) and
-//! restarts the daemon's launchd job on it. The install verb checks the release on one root-owned
-//! copy, launches a one-shot launchd job that does the swap and the restart, and returns; the
-//! result is the `apply` field of `query` (`docs/deploy/host-install.md`). The platform picks
-//! the side; both are compiled everywhere.
 //!
 //! # The local socket
 //!
@@ -68,25 +58,26 @@
 //! program the body of the install unit, and counts only when sshd set none of its own
 //! variables; see [`host::dispatch`].)
 
-// The one place that is not safe code is `ids`: the system calls of a privilege drop.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod audit;
+mod channel;
 mod config;
 mod debver;
+mod fetch;
 mod host;
-mod ids;
 mod local;
 mod locks;
-pub(crate) mod mac;
 #[cfg(target_os = "linux")]
 mod migrate;
 mod node_id;
 mod outcome;
 mod pace;
 mod plan;
+mod release;
 mod request;
 mod runner;
+mod token;
 mod trust;
 
 use std::process::ExitCode;
@@ -128,7 +119,7 @@ pub mod contract {
     /// The local socket's requests and answers (`kbf-host-install --serve`), for the agent
     /// mode of `kbf-updater`, which reads the answers and writes the requests.
     pub mod local {
-        pub use crate::local::activate_cli::{LINUX_HOLD, MAC_HOLD};
+        pub use crate::local::activate_cli::LINUX_HOLD;
         pub use crate::local::answer::{Answer, Code, LastView, PendingView, QueryView};
         pub use crate::local::core::{LISTED_BYTES, MAX_LISTED};
         pub use crate::local::frontend::config::FrontendConfig;
@@ -154,13 +145,11 @@ pub mod contract {
     }
 }
 
-/// The Mac's tool command lines and the readers of what the tools print, with the runner
-/// that runs them, for the test that runs them on a real Mac (`tests/real_mac.rs`); the runner
-/// also for the test that makes its privilege drop inside the helper's systemd units
-/// (`tests/real_linux_unit.rs`). Nothing here is for production code.
+/// The runner of the program's child processes, for the test that makes its privilege drop
+/// inside the helper's systemd units (`tests/real_linux_unit.rs`) and the one that makes it as
+/// root (`tests/real_drop.rs`). Nothing here is for production code.
 #[doc(hidden)]
-pub mod mac_tools {
-    pub use crate::mac::{fetch, release, tools};
+pub mod test_runner {
     pub use crate::runner::{Cmd, Exec, Identity, Runner, SystemRunner};
 }
 
@@ -262,10 +251,6 @@ fn main_with(args: Vec<std::ffi::OsString>) -> ExitCode {
             .collect();
         return update_rights::cli::main(&rest);
     }
-    // Both sides are compiled everywhere, so the Linux build checks the Mac code.
-    if cfg!(target_os = "macos") {
-        return ExitCode::from(mac::main_process());
-    }
     let code = host::dispatch(
         &host::Host::production(),
         &runner::SystemRunner,
@@ -354,6 +339,13 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod channel_tests;
+#[cfg(test)]
+mod fetch_tests;
+#[cfg(test)]
+mod release_tests;
 
 #[cfg(test)]
 #[path = "fixed_mark_tests.rs"]

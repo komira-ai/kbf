@@ -1,7 +1,6 @@
 //! The ports of the roll: everything the state machine asks of the outside world. The real
 //! adapters are [`crate::safe_http`] (safe-to-stop), [`crate::ssh_installer`] (install),
-//! [`crate::node_drain`] (drain), [`crate::node_health`] (health) and
-//! [`crate::frontend_http`] (a frontend member's own API). [`crate::fakes`] has one scripted
+//! [`crate::node_health`] (health) and [`crate::frontend_http`] (a frontend member's own API). [`crate::fakes`] has one scripted
 //! fake per port.
 //!
 //! The traits are synchronous: a roll is one host at a time and waits on each answer, so
@@ -137,38 +136,21 @@ pub struct Report {
     pub running_commit: Option<String>,
     /// The node id from the host's kbf configuration (`node_id` of the query), if it has one.
     pub node_id: Option<String>,
-    /// How the host's last apply stands (`apply` of a Mac's query); none on a Linux host and
-    /// on a Mac that has had no apply.
-    pub apply: Option<Apply>,
-}
-
-/// How a Mac's last apply stands: the `apply` of its `query`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Apply {
-    Running,
-    Done,
-    /// `failed:<reason>`: the reason as the host spells it (lower case letters, `_` and `:`;
-    /// the tail says what became of the old release).
-    Failed(String),
 }
 
 /// What the host said to an install that it accepted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallAnswer {
-    /// The package manager finished: the target is installed (a Linux host).
+    /// The package manager finished: the target is installed.
     Installed,
     /// The target was already installed and running; nothing ran.
     AlreadyInstalled,
-    /// The release is checked and its apply is launched, and goes on by itself (a Mac): the
-    /// host's `query` says how it ends.
-    ApplyStarted,
 }
 
 /// The host-side install (the forced-command wrapper over ssh, later).
 pub trait Installer: Send + Sync {
-    /// Install `version`. A Linux host answers when the package manager is done; a Mac
-    /// answers [`InstallAnswer::ApplyStarted`] and finishes on its own. `Err` carries one line
-    /// for a person: the wrapper's refusal or the failed install. An older version than the
+    /// Install `version`. The host answers when the package manager is done. `Err` carries one
+    /// line for a person: the wrapper's refusal or the failed install. An older version than the
     /// installed one is installed too: a rollback is an install.
     fn install(&self, host: &Host, version: &Version) -> Result<InstallAnswer, PortError>;
     /// What the host reports, without changing anything.
@@ -177,7 +159,7 @@ pub trait Installer: Send + Sync {
     fn query(&self, host: &Host) -> Result<Installed, PortError> {
         self.report(host).map(|r| r.installed)
     }
-    /// Restart the frontend unit `name` on a Linux host and return when it is active: `-` is
+    /// Restart the frontend unit `name` on the host and return when it is active: `-` is
     /// the plain frontend unit, anything else an instance name. A package install restarts
     /// no `kbf` unit, so this is asked for after one. An installer that cannot do it says so,
     /// and `Err` carries one line for a person otherwise.
@@ -202,35 +184,24 @@ impl<T: Installer + ?Sized> Installer for std::sync::Arc<T> {
     }
 }
 
-/// Whether a node was in placement (taking new leases) when a roll came to it.
+/// Whether a node was in placement (taking new leases) when an update came to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placed {
-    /// It was serving, or there is no node to ask about: the roll's drain is the only
-    /// thing keeping it out, so the roll gives it back.
+    /// It was serving, or there is no node to ask about: the update's drain is the only
+    /// thing keeping it out, so the update gives it back.
     In,
-    /// It was out already (cordoned, draining or drained by somebody else): the roll still
-    /// drains it, so that a restart cuts no lease off, but does not give it back.
+    /// It was out already (cordoned, draining or drained by somebody else): the update still
+    /// drains it, but does not give it back.
     Out,
 }
 
-/// How the frontend holds a node out of placement, as far as telling the updater's own cordon
-/// from an operator's needs: the updater's cordon is always a drain, never a plain cordon.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Seen {
-    /// In placement.
-    Serving,
-    /// Out of placement as a plain cordon (no drain): an operator's, never the updater's.
-    Cordoned,
-    /// Out of placement in a drain (draining, drained or paused at its deadline).
-    Draining,
-}
-
-/// Taking a daemon host's node out of placement at the frontend, and giving it back.
+/// The drain of a host's node, around an update (the agent's `drain` and `undrain` steps).
+/// No kbf node runs a daemon any more, so the only real drain, [`crate::agent::build::NoDrain`],
+/// has nothing to take out of placement.
 pub trait Drain: Send + Sync {
     /// Whether the node of `host` is in placement now, or was put out by this caller. A caller
     /// reads this before [`Drain::drain`] and calls [`Drain::undrain`] only for a node that was
-    /// [`Placed::In`]. A drain that can remember its own cordon (the agent's) reads a node it
-    /// cordoned earlier as [`Placed::In`]; one that cannot reads it as out.
+    /// [`Placed::In`].
     fn placed(&self, host: &Host) -> Result<Placed, PortError>;
     /// Cordon the node of `host` and ask the frontend to wait for its leases for `deadline`,
     /// or with no deadline (`None`) when the caller waits however long it takes.
@@ -239,29 +210,8 @@ pub trait Drain: Send + Sync {
     fn leases(&self, host: &Host) -> Result<usize, PortError>;
     /// Return the node of `host` to placement. This is unconditional: it is the caller's job
     /// not to call it for a node that [`Drain::placed`] said was [`Placed::Out`], because an
-    /// uncordon cannot tell the roll's cordon from an operator's.
-    /// A storage host is never drained, even one that also runs a daemon, and needs no node id.
+    /// uncordon cannot tell the update's cordon from an operator's.
     fn undrain(&self, host: &Host) -> Result<(), PortError>;
-    /// As [`Drain::placed`], but `None` when the frontend knows no node for `host` (a storage
-    /// host that runs no daemon): [`Drain::placed`] reads such a host as in placement, and a
-    /// caller that records a cordon must tell that from a node that is there. The default
-    /// has no such case.
-    fn placed_if_known(&self, host: &Host) -> Result<Option<Placed>, PortError> {
-        self.placed(host).map(Some)
-    }
-    /// As [`Drain::placed_if_known`], but telling a plain cordon from a drain. The default
-    /// reads a node that is out as draining.
-    fn seen_if_known(&self, host: &Host) -> Result<Option<Seen>, PortError> {
-        Ok(self.placed_if_known(host)?.map(|placed| match placed {
-            Placed::In => Seen::Serving,
-            Placed::Out => Seen::Draining,
-        }))
-    }
-    /// Look at the node the caller cordoned earlier, outside any update, so that a drain that
-    /// remembers its own cordon can forget one that is gone. The default does nothing.
-    fn observe(&self, _host: &Host) -> Result<(), PortError> {
-        Ok(())
-    }
 }
 
 /// What a frontend says of its own drain: `GET /v1/frontend/drain`.
@@ -406,7 +356,7 @@ mod tests {
         let host = Host {
             alias: "a".to_owned(),
             address: "h.example".to_owned(),
-            role: crate::inventory::Role::Daemon,
+            role: crate::inventory::Role::Storage,
             host_key: "ssh-ed25519 AAAA".to_owned(),
             node_id: None,
             member: None,
@@ -459,7 +409,7 @@ mod tests {
         let host = Host {
             alias: "a".to_owned(),
             address: "h.example".to_owned(),
-            role: crate::inventory::Role::Daemon,
+            role: crate::inventory::Role::Storage,
             host_key: "ssh-ed25519 AAAA".to_owned(),
             node_id: None,
             member: None,

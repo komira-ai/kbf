@@ -83,8 +83,9 @@ impl<const N: usize> From<[(&str, u32); N]> for RoleLimits {
 }
 
 impl RoleLimits {
-    /// The limits of a state that says none: one frontend and one storage host, two daemons
-    /// and two Macs at a time.
+    /// The limits of a state that says none: one frontend and one storage host at a time, and
+    /// two of each of the two roles of the retired worker daemon (still read, and still limited,
+    /// for a farm whose state names them).
     #[must_use]
     pub fn max_updating_default() -> Self {
         Self(

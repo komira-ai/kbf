@@ -26,6 +26,8 @@ pub const KEYS: &[&str] = &[
     "KBF_SERVER_MEMORY_MAX",
     "KBF_SERVER_CPU_QUOTA",
     "KBF_SERVER_TASKS_MAX",
+    // Retired, with the daemon steps of the kit that read them: accepted so that a file that
+    // still sets them loads.
     "KBF_DAEMON_NODES",
     "KBF_DRIVER",
     "KBF_DAEMON_EXTRA_ARGS",

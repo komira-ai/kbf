@@ -17,7 +17,6 @@ use crate::binary::Arch;
 use crate::fixtures::{FakeRunner, elf, file, me, ran, tar_gz, trusted_host_on};
 use crate::helper::fetcher::fake::Tamper;
 use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
-use crate::helper::leases::fake::FakeLeases;
 use crate::layout::Layout;
 use crate::settings::Settings;
 use crate::stage::{
@@ -112,7 +111,6 @@ impl PipelineFetcher {
                 Ok(ran(0, &probe, ""))
             }
         });
-        let leases = FakeLeases::default();
         let pipeline = Pipeline {
             host: &self.layout,
             settings: &settings,
@@ -129,7 +127,6 @@ impl PipelineFetcher {
             },
             trust: &trust,
             runner: &runner,
-            leases: &leases,
             owner,
         };
         let order = Order {

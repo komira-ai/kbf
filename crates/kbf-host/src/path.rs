@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// An absolute path on the host a step changes, such as `/etc/kbf/kbf-daemon.env`.
+/// An absolute path on the host a step changes, such as `/etc/kbf/kbf.env`.
 ///
 /// It starts with `/`, names at least one component and has no empty, `.` or `..`
 /// component, so joining it to a [`Root`] always lands inside that root.
@@ -107,9 +107,9 @@ mod tests {
         for (path, want) in refused {
             assert_eq!(HostPath::new(path), Err(want(path.to_owned())), "{path:?}");
         }
-        let ok = HostPath::new("/etc/kbf/kbf-daemon.env").expect("a plain absolute path");
-        assert_eq!(ok.as_str(), "/etc/kbf/kbf-daemon.env");
-        assert_eq!(ok.to_string(), "/etc/kbf/kbf-daemon.env");
+        let ok = HostPath::new("/etc/kbf/kbf.env").expect("a plain absolute path");
+        assert_eq!(ok.as_str(), "/etc/kbf/kbf.env");
+        assert_eq!(ok.to_string(), "/etc/kbf/kbf.env");
     }
 
     /// Catches a join that drops the root (`Path::join` with an absolute path replaces

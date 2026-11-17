@@ -256,8 +256,8 @@ impl ScratchHost {
     }
 }
 
-/// The scratch root goes with the host, after a failed test too: it may hold planted
-/// executables (a fake `kbf-daemon`), and the coverage run loads every executable it
+/// The scratch root goes with the host, after a failed test too: it may hold
+/// executables a test placed (a fake `kbf`), and the coverage run loads every executable it
 /// finds under the target directory as an object file.
 impl Drop for ScratchHost {
     fn drop(&mut self) {

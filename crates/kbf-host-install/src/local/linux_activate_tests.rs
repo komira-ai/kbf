@@ -166,8 +166,8 @@ fn activate_swaps_to_a_kept_release_with_the_release_source_unreachable() {
     assert_eq!(
         rig.systemctl(),
         [
-            "restart -- kbf-daemon.service",
-            "is-active -- kbf-daemon.service",
+            "restart -- kbf-storage.service",
+            "is-active -- kbf-storage.service",
             "restart -- kbf-frontend@a.service",
             "is-active -- kbf-frontend@a.service"
         ]
@@ -506,7 +506,7 @@ fn what_the_host_cannot_do_is_told_and_a_failed_restart_does_not_go_back() {
     rig.net
         .borrow_mut()
         .restart_fails
-        .insert("kbf-daemon.service".to_owned());
+        .insert("kbf-storage.service".to_owned());
     let (ab, _) = core(&rig);
     let answer = ab.activate(&target(B), PIN);
     assert_eq!(
@@ -533,7 +533,7 @@ fn what_the_host_cannot_do_is_told_and_a_failed_restart_does_not_go_back() {
     assert_eq!(
         rig.systemctl(),
         [
-            "restart -- kbf-daemon.service",
+            "restart -- kbf-storage.service",
             "restart -- kbf-frontend@a.service",
             "is-active -- kbf-frontend@a.service"
         ]
@@ -610,11 +610,14 @@ fn the_command_audits_what_it_did_on_a_linux_host() {
     assert!(!env.audit.exists());
 
     let _dead = hold_as(&rig.backend.lock_file(), &format!("{GONE}\n"));
-    let line = format!("kbf={VB} --pin --force-lock --restart-unit kbf-daemon.service");
+    let line = format!("kbf={VB} --pin --force-lock --restart-unit kbf-storage.service");
     assert_eq!(run(&line), 0);
     assert!(env.state_dir.join(LOCK_TAKES).exists());
     assert!(hold.exists());
-    assert_eq!(run("kbf=cccccccccccc --restart-unit kbf-daemon.service"), 2);
+    assert_eq!(
+        run("kbf=cccccccccccc --restart-unit kbf-storage.service"),
+        2
+    );
     let audit: Vec<serde_json::Value> = fs::read_to_string(&env.audit)
         .unwrap()
         .lines()
@@ -648,7 +651,7 @@ fn the_command_audits_what_it_did_on_a_linux_host() {
     fs::write(&blocked.state_dir, "a file").unwrap();
     fs::set_permissions(&blocked.state_dir, fs::Permissions::from_mode(0o644)).unwrap();
     let code = activate_cli::on_linux(
-        &command("kbf=cccccccccccc --restart-unit kbf-daemon.service"),
+        &command("kbf=cccccccccccc --restart-unit kbf-storage.service"),
         || Borrowed(&rig.backend),
         &blocked,
         &trust,

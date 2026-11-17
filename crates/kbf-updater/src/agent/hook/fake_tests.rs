@@ -450,7 +450,7 @@ fn a_host_that_cannot_be_written_fails_each_change() {
 }
 
 /// The fake's clock moves only when it is waited on, by exactly the wait; the host it plays is
-/// node `n1`, a daemon's.
+/// the storage node `n1`.
 ///
 /// Catches: a fake clock that reads the system's, which would make a drain deadline take real
 /// time.
@@ -461,6 +461,6 @@ fn the_fake_clock_moves_only_when_waited_on() {
     clock.sleep(Duration::from_secs(30));
     assert_eq!(clock.now(), Duration::from_secs(30));
     let host = host();
-    assert_eq!((host.alias.as_str(), host.role), ("n1", Role::Daemon));
+    assert_eq!((host.alias.as_str(), host.role), ("n1", Role::Storage));
     assert_eq!(host.node_id.as_deref(), Some("n1"));
 }

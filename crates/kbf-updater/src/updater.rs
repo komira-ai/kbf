@@ -1,26 +1,11 @@
 //! The roll state machine.
 //!
 //! One roll at a time, over the hosts of a plan: the frontend first, then one host at a time.
-//! Per host the turn is `pending`, `checking` (the node's identity, safe-to-stop and, for a
-//! daemon host, the drain; nodes only), `installing`, `waiting_healthy`, `done`. Every phase
+//! Per host the turn is `pending`, `checking` (the node's identity and safe-to-stop; nodes
+//! only), `installing`, `waiting_healthy`, `done`. Every phase
 //! change is written to `roll.json` before the work of the new phase starts, so a restart
 //! finds the host where its work began and never earlier.
 //! The first failure stops the roll and no later host is asked about, let alone touched.
-//!
-//! A drain never cuts work. A daemon host's node is waited for until it holds no lease, however
-//! long that takes; a [`Timing::drain_deadline`] the operator set only stops the waiting, with
-//! `drain_failed`, the node left drained and nothing installed. A frontend pool member's
-//! drain ([`Timing::frontend_drain`]) is the same: waited for until the member has exited,
-//! and a deadline fails the roll with the member left draining.
-//!
-//! A node is given back only if the roll drained it. The frontend's cordon carries no owner, so
-//! the drain port ([`crate::agent::cordon::OwnCordon`] in the daemon, marks in the state
-//! directory beside `roll.json`) keeps a mark for each node the roll cordons: before the drain
-//! call, and until an undrain worked. The node's placement is read before the drain (an
-//! unreadable one drains nothing) and again before the give-back; a node with the roll's mark
-//! reads as in placement, on this attempt, on a retry roll and after a restart, and one without
-//! it that is out was drained by an operator and is left out. The host is then not asked to be
-//! serving. A mark of a node seen serving is dropped.
 //!
 //! A frontend that is a member of a pool of frontends (an inventory line with `instance=` and
 //! `base=`) takes a turn of its own, in `updater_no_proxy.rs`, whatever load balancer is in
@@ -30,20 +15,6 @@
 //! `installing`, `restarting` and `waiting_healthy`; nothing is put back, because a drained
 //! frontend is a new process after the restart. The roll never takes a member out unless every
 //! other one is ready.
-//!
-//! A `mac-daemon` host takes the daemon's turn with one difference. Its `install` only starts
-//! the apply on the Mac and answers `apply_started`; the roll marks the host `waiting_healthy`
-//! and polls `query` every [`Timing::apply_poll`] until the apply is `done` with the target
-//! installed, for at most [`Timing::apply_deadline`]. `failed:<reason>` and the deadline end
-//! the roll with the node left drained and the reason named. Only then the daemon's health
-//! hold, the undrain and the full health follow. A restart finds the host in `waiting_healthy`
-//! and polls again; it installs again only from `installing`, and only if the host says no
-//! apply is running and the target is not installed. A Mac that answers `already_installed`
-//! (it runs the target) is not polled, but a restart in `waiting_healthy` cannot tell that
-//! answer from an install, so it polls: a stale `failed` status ends the resumed roll at once,
-//! and none ends it at the deadline, either way with the node left drained. A Mac that
-//! answers `installed`, or a host of another role that answers `apply_started`, fails the
-//! roll.
 //!
 //! The machine is deterministic: no clock but the [`Clock`] port, no randomness, no threads of
 //! its own. [`Updater::drive`] runs one roll to the end on the caller's thread; the other
@@ -59,7 +30,7 @@
 //! updater is poisoned: every operation answers `state_lost` until [`Updater::reload`] (or a
 //! new process) has read `roll.json` again and so knows what the disk says.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::api::{
@@ -67,11 +38,9 @@ use crate::api::{
 };
 use crate::inventory::{Host, Inventory, Role};
 use crate::ports::{
-    Apply, Clock, Drain, FrontendControl, Health, HealthCheck, InstallAnswer, Installed, Installer,
-    Placed, PortError, SafeToStop, Stop,
+    Clock, FrontendControl, Health, HealthCheck, Installed, Installer, PortError, SafeToStop, Stop,
 };
 use crate::record::{FORMAT, Record, RollStore, StoreError, roll_id};
-use crate::server::AuditSink;
 use crate::timing::Timing;
 use crate::version::Version;
 
@@ -80,22 +49,14 @@ mod frontend;
 #[path = "updater_no_proxy.rs"]
 mod no_proxy;
 
-/// The six ports of a roll.
+/// The ports of a roll.
 pub struct Ports {
     pub safe: Box<dyn SafeToStop>,
     pub installer: Box<dyn Installer>,
-    pub drain: Box<dyn Drain>,
     pub health: Box<dyn HealthCheck>,
     pub clock: Box<dyn Clock>,
     /// A frontend member's own API.
     pub frontend: Box<dyn FrontendControl>,
-}
-
-/// `halt`, with the node it leaves drained named. A store error is not changed.
-fn left_drained(host: &Host, halt: Halt) -> Halt {
-    let node = host.node_id.as_deref().unwrap_or(&host.alias);
-    let note = format!("node {node} ({}) is left drained", host.alias);
-    noted(halt, &note)
 }
 
 /// `halt`, with `note` after its detail. A store error is not changed.
@@ -165,8 +126,6 @@ pub struct Updater {
     store: RollStore,
     ports: Ports,
     timing: Timing,
-    /// Where the roll's warnings go; nowhere until [`Updater::with_log`].
-    log: AuditSink,
     state: Mutex<State>,
 }
 
@@ -214,7 +173,6 @@ impl Updater {
             store,
             ports,
             timing,
-            log: Arc::new(|_| {}),
             state: Mutex::new(State {
                 rec,
                 driving: false,
@@ -222,22 +180,6 @@ impl Updater {
                 poisoned: false,
             }),
         })
-    }
-
-    /// Send the roll's warnings (a node it leaves out, with the reason) to `log`.
-    pub fn with_log(mut self, log: AuditSink) -> Updater {
-        self.log = log;
-        self
-    }
-
-    /// Say that the roll leaves `host`'s node out, because its cordon is not the roll's.
-    fn warn_left_out(&self, host: &Host) {
-        let node = host.node_id.as_deref().unwrap_or(&host.alias);
-        (self.log)(&format!(
-            "warn: {node}: left out after the roll: its cordon is not marked as this roll's (an \
-             operator's, or placement was unknown at the drain); uncordon it by hand if it \
-             should serve"
-        ));
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
@@ -522,10 +464,6 @@ impl Updater {
     /// `installing` asks the host what happened to the install, `waiting_healthy` resumes
     /// the wait with a fresh bound, and a `failed` host is never resumed past.
     ///
-    /// A daemon host's node is drained at the end of `checking` and given back after the host
-    /// is healthy, if the roll drained it (an operator's cordon is left). From `installing` on the roll holds it, whether this process drained it or
-    /// the one before a restart did: every failure on the way names the node and leaves it
-    /// drained, for an operator to look at.
     fn step(&self, idx: usize, target: &Version) -> Result<(), Halt> {
         let rec = self.snapshot()?;
         let h = &rec.roll.hosts[idx];
@@ -552,9 +490,6 @@ impl Updater {
                 self.mark(idx, Phase::Checking, false)?;
                 self.check_identity(host)?;
                 self.check_safe(host)?;
-                if host.role.is_daemon() {
-                    self.drain(host)?;
-                }
             }
         }
         if let (Role::Frontend, Some(member)) = (host.role, &host.member) {
@@ -562,49 +497,31 @@ impl Updater {
             self.mark(idx, Phase::Done, false)?;
             return Ok(());
         }
-        let held = host.role.is_daemon();
-        self.install_and_wait(idx, host, target, phase, held)
-            .map_err(|halt| if held { left_drained(host, halt) } else { halt })?;
-        if held {
-            // A node the roll did not drain stays out, so the host is not asked to be serving.
-            let given_back = self.undrain(host)?;
-            self.wait_healthy(host, target, !given_back)?;
-        }
+        self.install_and_wait(idx, host, target, phase)?;
         self.mark(idx, Phase::Done, false)?;
         Ok(())
     }
 
     /// The install of a host (or the check of what a restart left) and the wait for it to run
-    /// the target. `held`: its node is drained, so it is not asked to be serving.
-    ///
-    /// A Mac host's install only starts its apply. The host is `waiting_healthy` from the
-    /// answer on, and that phase begins with the wait for the apply ([`Updater::wait_apply`]),
-    /// so a restart that finds it there polls again and never installs again.
+    /// the target.
     fn install_and_wait(
         &self,
         idx: usize,
         host: &Host,
         target: &Version,
         phase: Phase,
-        held: bool,
     ) -> Result<(), Halt> {
-        let mut apply = host.role == Role::MacDaemon;
         match phase {
             Phase::Pending | Phase::Checking => {
                 self.mark(idx, Phase::Installing, true)?;
                 match self.install(host, target) {
-                    Ok(answer) => {
-                        apply &= answer == InstallAnswer::ApplyStarted;
-                        self.mark(idx, Phase::WaitingHealthy, false)?;
-                    }
+                    Ok(()) => self.mark(idx, Phase::WaitingHealthy, false)?,
                     // No answer: the install may or may not have run. Ask, as after a restart.
-                    Err(InstallError::Unreachable) => {
-                        apply = self.recover_install(idx, host, target)?;
-                    }
+                    Err(InstallError::Unreachable) => self.recover_install(idx, host, target)?,
                     Err(InstallError::Halt(h)) => return Err(h),
                 }
             }
-            Phase::Installing => apply = self.recover_install(idx, host, target)?,
+            Phase::Installing => self.recover_install(idx, host, target)?,
             // The phases of a frontend member's turn are never a node's; one that is found on
             // a node is waited on like `waiting_healthy`.
             Phase::WaitingHealthy
@@ -615,28 +532,15 @@ impl Updater {
             | Phase::Restarting
             | Phase::Undraining => {}
         }
-        if apply {
-            self.wait_apply(host, target)?;
-        }
-        self.wait_healthy(host, target, held)
+        self.wait_healthy(host, target)
     }
 
-    /// The node the host's report names must be the one the inventory lists for it. A daemon
-    /// host without a node id is refused: it cannot be told from another, and a drain is
-    /// aimed by that id. A host that lists one has it checked, a daemon or not. Nothing has
-    /// been drained when this fails.
+    /// The node the host's report names must be the one the inventory lists for it, if it
+    /// lists one. A host that lists none is not asked.
     fn check_identity(&self, host: &Host) -> Result<(), Halt> {
         let fail = |why: String| Err(Halt::Fail(ErrorCode::NodeIdentity, why));
         let Some(listed) = host.node_id.as_deref() else {
-            return if host.role.is_daemon() {
-                fail(format!(
-                    "{} is listed without a node id, so its node cannot be told from another; \
-                     add the id from its kbf configuration to the inventory",
-                    host.alias
-                ))
-            } else {
-                Ok(())
-            };
+            return Ok(());
         };
         let report = self.ports.installer.report(host).map_err(|e| {
             Halt::Fail(
@@ -655,89 +559,6 @@ impl Updater {
                 host.alias
             )),
         }
-    }
-
-    /// Drain the host's node and wait until it holds no lease, however long that takes, or
-    /// until the drain deadline, if the operator set one, has passed. At the deadline nothing is
-    /// installed: the roll stops with the node left drained and its leases running, and a new
-    /// roll drains the node again and waits again. A failure leaves the node as the frontend
-    /// has it, which may be drained.
-    fn drain(&self, host: &Host) -> Result<(), Halt> {
-        let fail = |why: &str, e: PortError| {
-            left_drained(
-                host,
-                Halt::Fail(ErrorCode::DrainFailed, format!("{why}: {e}")),
-            )
-        };
-        let deadline = self.timing.drain_deadline;
-        // Read first, so that a node whose placement cannot be read is not cordoned at all:
-        // the give-back reads it again, and the drain's marks are what tell the roll's own
-        // cordon (on this attempt, on a retry, after a restart) from an operator's.
-        self.ports.drain.placed(host).map_err(|e| {
-            Halt::Fail(
-                ErrorCode::DrainFailed,
-                format!("the node's placement could not be read: {e}"),
-            )
-        })?;
-        self.ports
-            .drain
-            .drain(host, deadline)
-            .map_err(|e| fail("the drain was refused", e))?;
-        let start = self.now();
-        loop {
-            let held = self
-                .ports
-                .drain
-                .leases(host)
-                .map_err(|e| fail("the node's leases could not be read", e))?;
-            if held == 0 {
-                return Ok(());
-            }
-            if let Some(deadline) = deadline.filter(|d| self.since(start) >= *d) {
-                return Err(left_drained(
-                    host,
-                    Halt::Fail(
-                        ErrorCode::DrainFailed,
-                        format!(
-                            "{} still holds {held} leases after the drain deadline of {} s; \
-                             nothing was installed and the leases run on; start a new roll to \
-                             drain it again and wait again",
-                            host.alias,
-                            deadline.as_secs()
-                        ),
-                    ),
-                ));
-            }
-            self.ports.clock.sleep(self.timing.poll);
-        }
-    }
-
-    /// Give the host's node back, now that the host runs the target, if the roll drained it:
-    /// true when it was given back. The drain port reads a node as in placement when it is,
-    /// or when it holds the roll's own mark for it (see [`Drain::placed`]); a node it reads as
-    /// out is an operator's, and is left out.
-    fn undrain(&self, host: &Host) -> Result<bool, Halt> {
-        let fail = |why: &str, e: PortError| {
-            left_drained(
-                host,
-                Halt::Fail(ErrorCode::UndrainFailed, format!("{why}: {e}")),
-            )
-        };
-        let placed = self.ports.drain.placed(host).map_err(|e| {
-            fail(
-                "the node's placement could not be read, so it is not given back",
-                e,
-            )
-        })?;
-        if placed == Placed::Out {
-            self.warn_left_out(host);
-            return Ok(false);
-        }
-        self.ports
-            .drain
-            .undrain(host)
-            .map_err(|e| fail("the undrain failed", e))?;
-        Ok(true)
     }
 
     fn now(&self) -> Duration {
@@ -769,36 +590,15 @@ impl Updater {
         }
     }
 
-    /// One install call. A Mac host's answer is `apply_started` or `already_installed`; a
-    /// Linux host's is `installed` or `already_installed`. The other pairing is the host
-    /// being not what the inventory says, and fails the roll.
-    fn install(&self, host: &Host, target: &Version) -> Result<InstallAnswer, InstallError> {
-        let answer = match self.ports.installer.install(host, target) {
-            Ok(answer) => answer,
-            Err(e) if e.is_unreachable() => return Err(InstallError::Unreachable),
-            Err(e) => {
-                return Err(InstallError::Halt(Halt::Fail(
-                    ErrorCode::InstallFailed,
-                    e.to_string(),
-                )));
-            }
-        };
-        let mac = host.role == Role::MacDaemon;
-        let wrong = match answer {
-            InstallAnswer::Installed if mac => Some("finished the install at once"),
-            InstallAnswer::ApplyStarted if !mac => Some("started an apply"),
-            _ => None,
-        };
-        match wrong {
-            Some(did) => Err(InstallError::Halt(Halt::Fail(
+    /// One install call.
+    fn install(&self, host: &Host, target: &Version) -> Result<(), InstallError> {
+        match self.ports.installer.install(host, target) {
+            Ok(_) => Ok(()),
+            Err(e) if e.is_unreachable() => Err(InstallError::Unreachable),
+            Err(e) => Err(InstallError::Halt(Halt::Fail(
                 ErrorCode::InstallFailed,
-                format!(
-                    "{} is listed as a {} host but {did}",
-                    host.alias,
-                    if mac { "mac-daemon" } else { "non-Mac" }
-                ),
+                e.to_string(),
             ))),
-            None => Ok(answer),
         }
     }
 
@@ -806,41 +606,29 @@ impl Updater {
     /// finished; another version means it never started or did not finish, and one more
     /// install is safe (it is idempotent, and an older version is installed like any other);
     /// "in progress" waits it out; silence for [`Timing::query_bound`] interrupts the roll.
-    ///
-    /// A Mac whose apply is running has been installed on: the host is `waiting_healthy` and
-    /// the apply is waited for there. The answer is whether the apply is still to be waited
-    /// for (false after an `already_installed`).
-    fn recover_install(&self, idx: usize, host: &Host, target: &Version) -> Result<bool, Halt> {
+    fn recover_install(&self, idx: usize, host: &Host, target: &Version) -> Result<(), Halt> {
         let start = self.now();
         let mut last_answer = start;
-        let mac = host.role == Role::MacDaemon;
         loop {
             match self.ports.installer.report(host) {
-                Ok(report) if mac && report.apply == Some(Apply::Running) => {
-                    self.mark(idx, Phase::WaitingHealthy, false)?;
-                    return Ok(true);
-                }
                 Ok(report) => match report.installed {
                     Installed::Version(v) if v == target.as_str() => {
-                        self.mark(idx, Phase::WaitingHealthy, false)?;
-                        return Ok(mac);
+                        return self
+                            .mark(idx, Phase::WaitingHealthy, false)
+                            .map_err(Halt::from);
                     }
                     // Not the target: the install did not run or did not finish. One more
                     // (section 13(e): rerun once); a host that is still not there after that
                     // is for an operator.
                     Installed::Version(v) => {
-                        if let Some(apply) =
-                            self.reinstall(idx, host, target, &format!("runs {v}"))?
-                        {
-                            return Ok(apply);
+                        if self.reinstall(idx, host, target, &format!("runs {v}"))? {
+                            return Ok(());
                         }
                     }
                     // A fresh host: nothing is older than the target, so it is installed.
                     Installed::NotInstalled => {
-                        if let Some(apply) =
-                            self.reinstall(idx, host, target, "has no kbf installed")?
-                        {
-                            return Ok(apply);
+                        if self.reinstall(idx, host, target, "has no kbf installed")? {
+                            return Ok(());
                         }
                     }
                     Installed::InProgress => {
@@ -868,17 +656,16 @@ impl Updater {
         }
     }
 
-    /// One more install of a host that is not at the target, if the cap allows. `Ok(Some(_))`:
-    /// it ran and the host is `waiting_healthy`, and the value is whether a Mac's apply is
-    /// still to be waited for; `Ok(None)`: it got no answer, so the caller asks again. `state`
-    /// says what the host was found as, for the interrupt text.
+    /// One more install of a host that is not at the target, if the cap allows. `Ok(true)`:
+    /// it ran and the host is `waiting_healthy`; `Ok(false)`: it got no answer, so the caller
+    /// asks again. `state` says what the host was found as, for the interrupt text.
     fn reinstall(
         &self,
         idx: usize,
         host: &Host,
         target: &Version,
         state: &str,
-    ) -> Result<Option<bool>, Halt> {
+    ) -> Result<bool, Halt> {
         let attempts = self.snapshot()?.roll.hosts[idx].attempts;
         if attempts >= MAX_INSTALLS {
             return Err(Halt::Interrupt(format!(
@@ -889,73 +676,19 @@ impl Updater {
         }
         self.mark(idx, Phase::Installing, true)?;
         match self.install(host, target) {
-            Ok(answer) => {
+            Ok(()) => {
                 self.mark(idx, Phase::WaitingHealthy, false)?;
-                Ok(Some(
-                    host.role == Role::MacDaemon && answer == InstallAnswer::ApplyStarted,
-                ))
+                Ok(true)
             }
-            Err(InstallError::Unreachable) => Ok(None),
+            Err(InstallError::Unreachable) => Ok(false),
             Err(InstallError::Halt(h)) => Err(h),
         }
     }
 
-    /// Wait for a Mac host's apply to be `done` for the target: ask `query` every
-    /// [`Timing::apply_poll`] for [`Timing::apply_deadline`]. `failed:<reason>` ends the wait
-    /// at once and names the reason. A host that does not answer, reports no apply, reports
-    /// one still running, or is done but on another version is waited for until the deadline.
-    fn wait_apply(&self, host: &Host, target: &Version) -> Result<(), Halt> {
-        let start = self.now();
-        let bound = self.timing.apply_deadline;
-        loop {
-            let last = match self.ports.installer.report(host) {
-                Ok(report) => match (report.apply, report.installed) {
-                    (Some(Apply::Failed(why)), _) => {
-                        return Err(Halt::Fail(
-                            ErrorCode::InstallFailed,
-                            format!("the apply on {} failed: {why}", host.alias),
-                        ));
-                    }
-                    (Some(Apply::Done), Installed::Version(v)) if v == target.as_str() => {
-                        return Ok(());
-                    }
-                    (Some(Apply::Done), Installed::Version(v)) => {
-                        format!("the apply is done but {} runs {v}", host.alias)
-                    }
-                    (Some(Apply::Done), _) => {
-                        format!("the apply is done but {} reports no version", host.alias)
-                    }
-                    (Some(Apply::Running), _) => "the apply is running".to_owned(),
-                    (None, _) => format!("{} reports no apply", host.alias),
-                },
-                Err(e) => e.to_string(),
-            };
-            if self.since(start) >= bound {
-                return Err(Halt::Fail(
-                    ErrorCode::HealthTimeout,
-                    format!(
-                        "the apply on {} was not done for {} after {} s: {last}",
-                        host.alias,
-                        target.as_str(),
-                        bound.as_secs()
-                    ),
-                ));
-            }
-            self.ports.clock.sleep(self.timing.apply_poll);
-        }
-    }
-
-    /// Wait for `host` to run the target. `held`: its node is drained by the roll, which a
-    /// daemon is not asked to be serving through.
-    fn wait_healthy(&self, host: &Host, target: &Version, held: bool) -> Result<(), Halt> {
+    /// Wait for `host` to run the target.
+    fn wait_healthy(&self, host: &Host, target: &Version) -> Result<(), Halt> {
         let bound = self.timing.healthy(host.role);
-        self.wait_until(bound, || {
-            if held {
-                self.ports.health.check_held(host, target)
-            } else {
-                self.ports.health.check(host, target)
-            }
-        })
+        self.wait_until(bound, || self.ports.health.check(host, target))
     }
 
     /// Ask `check` every [`Timing::poll`] until it says healthy, for at most `bound`. A host

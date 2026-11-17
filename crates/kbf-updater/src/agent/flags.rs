@@ -5,8 +5,7 @@
 //! kbf-updater agent --coordinator <dns name>:<port> --channel NAME
 //!                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
 //!                   [--frontend <dns name>:<port>] [--enroll-frontend <dns name>:<port>]
-//!                   [--operator-api http://IP:PORT --token-file FILE] [--daemon-node NODE_ID]
-//!                   [--cordon-dir DIR]
+//!                   [--operator-api http://IP:PORT --token-file FILE] [--cordon-dir DIR]
 //!                   [--helper-socket PATH] [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]...
 //!                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
 //!                   [--health-poll-secs N] [--retry-secs N]
@@ -21,35 +20,31 @@
 //!   Nothing renews them. The certificate says which node this is and what the host runs;
 //!   neither is a flag.
 //! - `--frontend`: the frontend's worker listener, `<dns name>:<port>` (its `--worker-listen`;
-//!   the name must be one its certificate covers). The node's drain, its undrain, its status
-//!   and, for a storage host, its own storage health are four calls there, made over mutual
-//!   TLS with the updater's own certificate and no token: the frontend serves them for the node
-//!   in the certificate and for no other, and refuses everything else from an updater.
+//!   the name must be one its certificate covers). A storage host's own storage health is a call
+//!   there, made over mutual TLS with the updater's own certificate and no token: the frontend
+//!   serves it for the node in the certificate and for no other, and refuses everything else
+//!   from an updater.
 //! - `--enroll-frontend`: the frontend's enroll listener (its `--enroll-listen`), the address
 //!   `kbf-updater enroll --frontend` was given. The agent renews its certificate there, with
 //!   the key it enrolled with; the listener asks for no client certificate, so a host whose
 //!   certificate lapsed during an outage still recovers.
-//! - `--daemon-node`: for the agent of a frontend host that also runs a daemon: the daemon's
-//!   node id. The frontend's update drains that node around it (the frontend itself is drained
-//!   by the helper, inside the A/B); without the flag a frontend host's node is not drained.
-//! - `--cordon-dir`: where the agent records, one file per node and unit, that a cordon is its
-//!   own, so that a retry or a restart gives back a node it drained and leaves out one an
-//!   operator drained; the agent drops the marks of a node it reads serving (a cordon given back
-//!   by hand). Default: `--state-dir`, else the directory `--client-key` is in. It must be
-//!   writable by the agent, which checks at start and does not start otherwise.
+//! - `--cordon-dir`: where the agent keeps the records of its host updates (a deferral and a halt,
+//!   one file per unit), so that a restart keeps them. The name is from when the agent also kept
+//!   its node cordons there. Default: `--state-dir`, else the directory `--client-key` is in.
 //! - `--channel`: the release channel the helper's allowlist names; the version the
 //!   coordinator names is looked up in it by the helper, never by URL.
 //! - `--helper-socket`: the socket of `kbf-host-install --serve` (default
 //!   `/run/kbf-host-install/local.sock`).
 //! - `--operator-api`, `--token-file`: the frontend's loopback
-//!   operator API, as in the roll mode, as an **opt-in fallback** for the drain and the
+//!   operator API, as in the roll mode, as an **opt-in fallback** for the
 //!   node's health: the credential is the full operator token, which the design keeps off
 //!   hosts. Giving it to an agent is a choice of the operator, made by giving both
 //!   `--operator-api` and `--token-file`, and it is then used
 //!   instead of the updater's certificate for those calls. Without either way (no `--frontend`
 //!   and no token) the agent heartbeats and refuses every update order, before it fetches
 //!   anything. The packaged units give no token.
-//! - `--service NAME,helper-socket=PATH[,channel=C][,drain=node|none][,ready-url=URL]`, as
+//! - `--service NAME,helper-socket=PATH[,channel=C][,drain=node|none][,ready-url=URL]` (`drain=` is
+//!   read and changes nothing: there is no node to drain), as
 //!   many times as the host runs services besides `kbf`: the agent lists each in its heartbeat
 //!   and runs an order that names it with the service's own ports ([`ServiceConfig`]). Each
 //!   names its own helper, which may not be the agent's `--helper-socket`: an install request
@@ -71,17 +66,16 @@ use kbf_types::Role;
 
 use super::coordinator::{Endpoint, TlsFiles};
 use crate::daemon::parse_operator_url;
-use crate::inventory::valid_node_id;
 use crate::wire::{KBF_SERVICE, MAX_SERVICE_NAME, is_service_name};
 
 pub const USAGE: &str = "usage: kbf-updater agent --coordinator DNSNAME:PORT --channel NAME \
 (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE) [--frontend DNSNAME:PORT] \
 [--enroll-frontend DNSNAME:PORT] \
 [--operator-api http://IP:PORT --token-file FILE] \
-[--daemon-node NODE_ID] [--cordon-dir DIR] [--helper-socket PATH] [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]... [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
+[--cordon-dir DIR] [--helper-socket PATH] [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]... [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
 [--health-poll-secs N] [--retry-secs N]\n";
 
-const FLAGS: [&str; 18] = [
+const FLAGS: [&str; 17] = [
     "--coordinator",
     "--state-dir",
     "--frontend",
@@ -92,7 +86,6 @@ const FLAGS: [&str; 18] = [
     "--channel",
     "--operator-api",
     "--token-file",
-    "--daemon-node",
     "--cordon-dir",
     "--helper-socket",
     "--heartbeat-secs",
@@ -145,33 +138,21 @@ pub struct Config {
     pub files: TlsFiles,
     pub channel: String,
     pub helper_socket: PathBuf,
-    /// The frontend's worker listener: where the node's own drain, status and storage health
-    /// are asked.
+    /// The frontend's worker listener: where a storage host's own storage health is asked.
     pub frontend: Option<Endpoint>,
     /// The frontend's enroll listener: where the certificate is renewed.
     pub enroll_frontend: Option<Endpoint>,
     /// The enrollment's state directory, if the certificate is the agent's to renew.
     pub state_dir: Option<PathBuf>,
-    /// Where the agent keeps its marks of the cordons it made (`--cordon-dir`); when absent, the
+    /// Where the agent keeps its deferral and halt records (`--cordon-dir`); when absent, the
     /// state directory, else the directory of the key file.
     pub cordon_dir: Option<PathBuf>,
-    /// The frontend's operator API for the drain and the health, if the operator gave the agent
+    /// The frontend's operator API for the health, if the operator gave the agent
     /// the credential for it.
     pub node_api: Option<NodeApi>,
-    /// The node id of the daemon a frontend host also runs, if it runs one.
-    pub daemon_node: Option<String>,
     pub timing: Timing,
     /// The services the host runs besides `kbf`, in the order they were given.
     pub services: Vec<ServiceConfig>,
-}
-
-/// How a service's node is drained around its update.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ServiceDrain {
-    /// The node is drained through the frontend, as `kbf`'s is.
-    Node,
-    /// There is nothing to drain: the service is replaced in place.
-    None,
 }
 
 /// How a service's health is judged.
@@ -191,7 +172,6 @@ pub struct ServiceConfig {
     pub channel: String,
     /// The helper that installs it: its own, never the agent's `--helper-socket`.
     pub helper_socket: PathBuf,
-    pub drain: ServiceDrain,
     pub health: ServiceHealth,
 }
 
@@ -313,10 +293,6 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
             );
         }
     };
-    let daemon_node = found.remove("--daemon-node");
-    if daemon_node.as_deref().is_some_and(|id| !valid_node_id(id)) {
-        return Err("--daemon-node must be a node id: a DNS label".to_owned());
-    }
     let cordon_dir = found.remove("--cordon-dir").map(PathBuf::from);
     let helper_socket = found
         .remove("--helper-socket")
@@ -352,7 +328,6 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
         state_dir,
         cordon_dir,
         node_api,
-        daemon_node,
         timing,
         services,
     })
@@ -442,11 +417,10 @@ fn parse_service(value: &str) -> Result<ServiceConfig, String> {
             "--service {name}: helper-socket may not hold a .. component"
         ));
     }
-    let drain = match take("drain") {
-        None | Some("node") => ServiceDrain::Node,
-        Some("none") => ServiceDrain::None,
-        Some(_) => return Err(format!("--service {name}: drain is node or none")),
-    };
+    // Read for the units written when a node was drained around an update; it changes nothing.
+    if !matches!(take("drain"), None | Some("node" | "none")) {
+        return Err(format!("--service {name}: drain is node or none"));
+    }
     let health = match take("ready-url") {
         None => ServiceHealth::Node,
         Some(url) => {
@@ -462,7 +436,6 @@ fn parse_service(value: &str) -> Result<ServiceConfig, String> {
         name: name.to_owned(),
         channel,
         helper_socket,
-        drain,
         health,
     })
 }

@@ -8,11 +8,9 @@ use update_hook::{Class, Outcome, Step};
 
 use super::record::Was;
 use super::testing::{Rig, kill_at};
-use crate::agent::cordon::OwnCordon;
 use crate::agent::local::LocalError;
 use crate::agent::testing::{ServingNode, VB};
 use crate::ports::PortError;
-use crate::testutil::scratch;
 
 fn s(text: &str) -> String {
     text.to_owned()
@@ -23,12 +21,11 @@ fn deadline(rig: &mut Rig) {
     *rig.drain.leases.lock().unwrap() = [2].into();
 }
 
-/// A rig whose drain is the agent's cordon marks over a node the frontend keeps.
-fn with_cordon(name: &str) -> (Rig, ServingNode) {
+/// A rig whose drain is a node the frontend keeps.
+fn with_node(name: &str) -> (Rig, ServingNode) {
     let mut rig = Rig::new(name);
     let node = ServingNode::new();
-    let marks = scratch(&format!("{name}-marks"));
-    rig.drain_port = Arc::new(OwnCordon::new(Arc::new(node.clone()), &marks, "kbf"));
+    rig.drain_port = Arc::new(node.clone());
     (rig, node)
 }
 
@@ -71,15 +68,15 @@ fn a_node_drained_again_after_a_deadline_is_given_back_again() {
 
 /// A step killed after the placement was recorded and before the drain, and run again after an
 /// operator drained the node, reads the node again: it is the operator's, so the update drains
-/// and waits as for any node and never gives it back. Killed after the drain, the node is ours
-/// by its mark and is given back; killed with no operator in between, the same.
+/// and waits as for any node and never gives it back. Run again with no operator in between, the
+/// node is the update's and is given back.
 ///
 /// Catches: the update uncordoning a node an operator drained in the window between the
 /// recorded placement and the drain.
 #[test]
 fn a_crash_between_the_placement_and_the_drain_does_not_hand_the_node_to_the_update() {
-    for (kill, operator, serving_at_end) in [(2, true, false), (2, false, true), (3, false, true)] {
-        let (rig, node) = with_cordon("hook-window");
+    for (kill, operator, serving_at_end) in [(2, true, false), (2, false, true)] {
+        let (rig, node) = with_node("hook-window");
         let killed = catch_unwind(AssertUnwindSafe(|| {
             rig.run_gated(Step::Prepare, kill_at(kill));
         }));
@@ -104,13 +101,13 @@ fn a_crash_between_the_placement_and_the_drain_does_not_hand_the_node_to_the_upd
     }
 }
 
-/// A drain whose answer was lost (the frontend unreachable, a timeout) may have landed: the mark
-/// stays, and `rollback` gives the node back. A drain the frontend definitely refused, or that
+/// A drain whose answer was lost (the frontend unreachable, a timeout) may have landed: the record
+/// says so, and `rollback` gives the node back. A drain the frontend definitely refused, or that
 /// was never made (connection refused), clears it.
 ///
 /// Catches: a cordon forgotten because the call timed out, which nothing ever lifts.
 #[test]
-fn a_drain_that_may_have_landed_keeps_its_mark() {
+fn a_drain_that_may_have_landed_is_recorded() {
     let rig = Rig::new("hook-drain-lost");
     *rig.drain.drain_error.lock().unwrap() = Some(PortError::unreachable("timed out"));
     let ran = rig.run(Step::Prepare);
@@ -130,13 +127,13 @@ fn a_drain_that_may_have_landed_keeps_its_mark() {
     assert_eq!(rig.events.count("undrain"), 0);
 }
 
-/// A confirm whose answer was lost may have landed: `cleanup` keeps the mark, does not revert
+/// A confirm whose answer was lost may have landed: `cleanup` keeps the record, does not revert
 /// (a release that may be confirmed is not put back), exits 1 with `confirm_unknown`, and the
 /// next `cleanup` looks at the helper and confirms if it must.
 ///
 /// Catches: a release reverted, or confirmed twice, because a socket timed out.
 #[test]
-fn a_confirm_that_may_have_landed_keeps_its_mark_and_is_not_reverted() {
+fn a_confirm_that_may_have_landed_is_recorded_and_is_not_reverted() {
     let rig = Rig::new("hook-confirm-lost");
     for step in [Step::Prepare, Step::Cutover, Step::Verify] {
         assert_eq!(rig.run(step).outcome, Outcome::Success);
@@ -158,27 +155,4 @@ fn a_confirm_that_may_have_landed_keeps_its_mark_and_is_not_reverted() {
     assert_eq!(rig.run(Step::Cleanup).outcome, Outcome::Success);
     assert_eq!(rig.events.count(&format!("local:confirm {VB}")), 2);
     assert!(!rig.drain.is_drained());
-}
-
-/// A mark of an earlier update's drain is on the disk, and an operator has since cordoned the
-/// node over it: the node is the operator's, the update drains and waits as for any node, and
-/// it never gives the node back, though the mark said the cordon was the updater's.
-///
-/// Catches: a stale own-cordon mark that makes this update uncordon a node an operator holds.
-#[test]
-fn a_stale_mark_over_an_operators_cordon_does_not_make_the_node_the_updates() {
-    let (rig, node) = with_cordon("hook-stale-mark");
-    rig.drain_port
-        .drain(
-            &crate::agent::testing::host(crate::inventory::Role::Daemon),
-            None,
-        )
-        .expect("the earlier update's drain");
-    node.operator_cordons();
-    *node.undrain_error.lock().unwrap() = Some(PortError::other("called"));
-    for step in [Step::Prepare, Step::Cutover, Step::Verify, Step::Cleanup] {
-        assert_eq!(rig.run(step).outcome, Outcome::Success, "{step}");
-    }
-    assert!(!node.is_serving(), "still the operator's");
-    assert_eq!(rig.record().expect("a record").placement, Some(Was::Out));
 }

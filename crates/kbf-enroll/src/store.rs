@@ -89,9 +89,9 @@ pub struct StoredConfig {
     pub generation: u64,
     /// The roles granted.
     pub roles: Vec<String>,
-    /// The URL the daemon dials.
+    /// The URL of the frontend's worker listener, which a node dials.
     pub worker_endpoint: String,
-    /// What `--cas` is for a daemon-only node.
+    /// The frontend's CAS endpoint, kept as it came (`node.json` is read by other releases).
     pub cas_endpoint: String,
     /// The storage port.
     pub storage_port: u32,

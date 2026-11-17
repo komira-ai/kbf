@@ -25,9 +25,9 @@ pub fn host_root(name: &str) -> (Layout, PathBuf) {
     host_root_on(name, Platform::Linux)
 }
 
-/// The same for `platform`: its lock's directory (`/run`, or `/var/run` on macOS), its
-/// state directory and the releases directory. A test that runs the installer binary uses the
-/// platform it was built for, as the binary does.
+/// The same for `platform`: its lock's directory (`/run`), its state directory and the
+/// releases directory. A test that runs the installer binary uses the platform it was built for,
+/// as the binary does.
 pub fn host_root_on(name: &str, platform: Platform) -> (Layout, PathBuf) {
     let dir = kbf_host::testkit::scratch(name);
     let layout = Layout::new(Root::new(&dir).expect("absolute"), platform);

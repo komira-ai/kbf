@@ -44,7 +44,7 @@ struct Rig {
 }
 
 impl Rig {
-    /// A daemon host that runs `VA`, offered `VB`, whose node holds two leases and whose
+    /// A storage host that runs `VA`, offered `VB`, whose node holds two leases and whose
     /// operator bounded the drain at a minute.
     fn new(name: &str) -> Self {
         let events = Events::default();
@@ -91,7 +91,7 @@ impl Rig {
     /// An agent that announces nothing: the agent as it was before.
     fn plain(&self) -> Agent {
         let agent = Agent::new(
-            host(Role::Daemon),
+            host(Role::Storage),
             "stable".to_owned(),
             Self::timing(),
             self.world(),
@@ -109,7 +109,7 @@ impl Rig {
 
     fn announcing_in(&self, dir: PathBuf) -> Agent {
         let agent = Agent::new(
-            host(Role::Daemon),
+            host(Role::Storage),
             "stable".to_owned(),
             Self::timing(),
             self.world(),
@@ -642,7 +642,7 @@ fn a_retry_above_the_bound_is_reported_and_persisted_at_the_bound() {
     let rig = Rig::new("hold-clamp-new");
     rig.coordinator.advertise(&["deferred-v1"]);
     let agent = Agent::new(
-        host(Role::Daemon),
+        host(Role::Storage),
         "stable".to_owned(),
         Timing {
             retry: Duration::from_secs(2 * MAX_RETRY_SECS),

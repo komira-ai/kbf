@@ -50,7 +50,7 @@ fn a_header_says_what_kind_of_binary_a_file_is() {
     );
 }
 
-/// Catches the wanted kind mixed up: Linux runs ELF, macOS Mach-O, each for the host's CPU.
+/// Catches the wanted kind mixed up: Linux runs ELF, for the host's CPU.
 #[test]
 fn a_platform_wants_its_own_kind_for_its_cpu() {
     assert_eq!(
@@ -58,8 +58,8 @@ fn a_platform_wants_its_own_kind_for_its_cpu() {
         BinaryKind::Elf(Arch::Aarch64)
     );
     assert_eq!(
-        BinaryKind::wanted(Platform::MacOs, Arch::X86_64),
-        BinaryKind::MachO(Arch::X86_64)
+        BinaryKind::wanted(Platform::Linux, Arch::X86_64),
+        BinaryKind::Elf(Arch::X86_64)
     );
     assert_eq!(Arch::named("aarch64"), Arch::Aarch64);
     assert_eq!(Arch::named("x86_64"), Arch::X86_64);

@@ -14,8 +14,7 @@
 //!   sha256 is the source's, then points `previous` at the old current release and
 //!   `current` at the new one and writes the state. Only the files the source names are
 //!   compared: a file the release directory has beyond them is not noticed. A release
-//!   holds the binaries its source directory has: `kbf` (all a macOS release has),
-//!   `kbf-daemon` (a Linux one may add it) or both.
+//!   holds the one binary, `kbf`.
 //!   A new release is made in `releases/.stage-<commit>.<rand>/`,
 //!   its files and directories synced, then renamed to `releases/<commit>/` and the parent
 //!   synced (S19): the final name never holds a half-written release, and the state is
@@ -47,7 +46,7 @@ use kbf_host::step::{Owner, Perms};
 use sha2::{Digest, Sha256};
 
 use super::CommitId;
-use super::layout::{self, Layout, Platform};
+use super::layout::{self, Layout};
 use super::retain::{self, RetainError, RetainLock, Retained};
 use super::state::{self, Locked, State, StateError};
 
@@ -137,34 +136,19 @@ fn read_failed(path: &Path) -> impl FnOnce(io::Error) -> ReleaseError + '_ {
     }
 }
 
-/// What `install --from <dir>` copies: each of `<dir>/kbf` and `<dir>/kbf-daemon` that
-/// exists (at least one must), and each file of `<dir>/units/` (sorted by name) when that
-/// directory exists.
+/// What `install --from <dir>` copies: `<dir>/kbf`, and each file of `<dir>/units/` (sorted by
+/// name) when that directory exists.
 #[derive(Debug)]
 pub struct Source {
-    /// The binaries by name, in the order of [`layout::RELEASE_BINARIES`].
-    pub binaries: Vec<(&'static str, Vec<u8>)>,
+    /// The bytes of `kbf`.
+    pub binary: Vec<u8>,
     pub units: Vec<(String, Vec<u8>)>,
 }
 
 impl Source {
     pub fn read(from: &Path) -> Result<Source, ReleaseError> {
-        let mut binaries = Vec::new();
-        let mut missing = None;
-        for name in layout::RELEASE_BINARIES {
-            let bin = from.join(name);
-            match fs::read(&bin) {
-                Ok(bytes) => binaries.push((name, bytes)),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    missing.get_or_insert((bin, e));
-                }
-                Err(e) => return Err(read_failed(&bin)(e)),
-            }
-        }
-        // With none, the error is the first one's: the source has no `kbf`.
-        if let Some((bin, e)) = missing.filter(|_| binaries.is_empty()) {
-            return Err(read_failed(&bin)(e));
-        }
+        let bin = from.join(layout::RELEASE_BINARY);
+        let binary = fs::read(&bin).map_err(read_failed(&bin))?;
         let dir = from.join(layout::RELEASE_UNITS);
         let items = match fs::read_dir(&dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
@@ -179,7 +163,7 @@ impl Source {
             units.push((name, fs::read(&file).map_err(read_failed(&file))?));
         }
         units.sort();
-        Ok(Source { binaries, units })
+        Ok(Source { binary, units })
     }
 }
 
@@ -277,14 +261,10 @@ fn switch<E: Exec>(
         // SEAM(unit restart): no verb here restarts a service; the units are the
         // packaged files (packaging/linux/units/), which name the release directory's
         // binary. When a verb restarts them, it goes here, after the switch.
-        let restart = match host.platform() {
-            Platform::Linux => "systemctl restart <unit>",
-            Platform::MacOs => "launchctl kickstart -k system/<label>",
-        };
         let binary = layout::RELEASE_BINARY;
         let _ = writeln!(
             out,
-            "next, by hand: restart the units that run {}/{binary} ({restart}), \
+            "next, by hand: restart the units that run {}/{binary} (systemctl restart <unit>), \
              then check `kbf-deploy host status`",
             host.current(),
         );
@@ -380,35 +360,19 @@ fn copy_release<E: Exec>(
     let staged = (!existed && mode == Mode::Apply).then(|| host.stage_dir(commit, &unique()));
     let target = staged.clone().unwrap_or_else(|| final_dir.clone());
     let copy = plan_copy(exec, host, owner, commit, &target, source)?;
-    // The first binary is named in the line, as it was when a release held only `kbf`;
-    // each other one gets a line of its own.
-    let ((_, first), others) = source
-        .binaries
-        .split_first()
-        .expect("a source holds at least one binary");
     let _ = writeln!(
         out,
         "release {commit}: {final_dir} ({} bytes, sha256 {}), {} unit(s)",
-        first.len(),
-        sha256(first),
+        source.binary.len(),
+        sha256(&source.binary),
         source.units.len()
     );
-    for (name, bytes) in others {
-        let _ = writeln!(
-            out,
-            "also {name} ({} bytes, sha256 {})",
-            bytes.len(),
-            sha256(bytes)
-        );
-    }
     let copied = execute(&copy, RunAs::Root, mode, exec, &mut &mut *out)
         .map_err(ReleaseError::from)
         .and_then(|()| {
             if mode == Mode::Apply {
-                for (name, bytes) in &source.binaries {
-                    let bin = target_file(&target, name);
-                    verify(inspect(exec, &bin)?, bin, bytes)?;
-                }
+                let bin = target_file(&target, layout::RELEASE_BINARY);
+                verify(inspect(exec, &bin)?, bin, &source.binary)?;
             }
             Ok(())
         })
@@ -545,9 +509,7 @@ fn plan_copy<E: Exec>(
 ) -> Result<Plan, ReleaseError> {
     let units = child(dir, layout::RELEASE_UNITS);
     let mut files = Vec::new();
-    for (name, bytes) in &source.binaries {
-        files.push((child(dir, name), BINARY, bytes));
-    }
+    files.push((child(dir, layout::RELEASE_BINARY), BINARY, &source.binary));
     for (name, bytes) in &source.units {
         files.push((child(&units, name), UNIT, bytes));
     }
@@ -571,13 +533,8 @@ fn plan_copy<E: Exec>(
     }
     let mut planner = Planner::new(exec);
     let mut dirs = Vec::new();
-    // A fresh macOS has no `/usr/local`. An existing one is not touched: its owner and
-    // mode are the host's, and the trust check (crate::trust) refuses one others write to.
-    if let Some(usr_local) = missing_usr_local(exec, host)? {
-        dirs.push(usr_local);
-    }
     // The state directory and the install root are the package's or the host's: made only when
-    // missing, never chmod-ed (a 0700 `/var/db/kbf-installer` stays 0700). `releases/` and the
+    // missing, never chmod-ed (a 0750 `/var/lib/kbf-installer` stays 0750). `releases/` and the
     // release are this program's own.
     for d in [host.state_dir(), host.install_root()] {
         if inspect(exec, &d)?.is_none() && !dirs.contains(&d) {
@@ -595,15 +552,6 @@ fn plan_copy<E: Exec>(
         planner.file(path, perms, Some(owner), bytes.clone())?;
     }
     Ok(planner.finish())
-}
-
-/// `/usr/local` when the installer tree is under it and the host has none.
-fn missing_usr_local<E: Exec>(exec: &E, host: &Layout) -> Result<Option<HostPath>, ReleaseError> {
-    let usr_local = HostPath::new("/usr/local").expect("a path");
-    if !host.install_root().as_str().starts_with("/usr/local/") {
-        return Ok(None);
-    }
-    Ok(inspect(exec, &usr_local)?.is_none().then_some(usr_local))
 }
 
 /// The copied binary at `path` (`copied`, read back from the host after the copy and
@@ -639,18 +587,15 @@ pub fn rollback<E: Exec>(
     switch(exec, host, lock, &state, (previous, None), out)
 }
 
-/// Whether the release `commit` has a binary in its directory. Any will do: a release
-/// holds `kbf` (a macOS one holds nothing else) and, on Linux, maybe `kbf-daemon`.
+/// Whether the release `commit` has its binary, `kbf`, in its directory.
 pub(crate) fn has_binary<E: Exec>(exec: &E, host: &Layout, commit: &CommitId) -> bool {
-    layout::RELEASE_BINARIES.iter().any(|name| {
-        matches!(
-            exec.stat(&host.release_file(commit, name)),
-            Ok(Some(Meta {
-                kind: Kind::File,
-                ..
-            }))
-        )
-    })
+    matches!(
+        exec.stat(&host.release_file(commit, layout::RELEASE_BINARY)),
+        Ok(Some(Meta {
+            kind: Kind::File,
+            ..
+        }))
+    )
 }
 
 /// `host gc --keep N`: remove each release directory but the kept ones: the state's

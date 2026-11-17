@@ -50,7 +50,7 @@ use self::runtime::{Runtime, RuntimeError};
 use super::answer::Code;
 use super::backend::{Backend, Fault, Pending};
 use crate::host::Host;
-use crate::mac::release::is_commit;
+use crate::release::is_commit;
 use crate::request::{Channel, Version};
 
 /// The repository the release's image is loaded as: `kbf-frontend:<commit>`.

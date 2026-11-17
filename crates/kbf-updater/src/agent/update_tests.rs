@@ -39,7 +39,7 @@ pub(super) struct Rig {
 }
 
 impl Rig {
-    /// A daemon host that runs `VA`, whose node is serving, offered `VB`, which turns out
+    /// A storage host that runs `VA`, whose node is serving, offered `VB`, which turns out
     /// healthy.
     pub(super) fn new() -> Self {
         let events = Events::default();
@@ -61,7 +61,7 @@ impl Rig {
     }
 
     pub(super) fn run(&self, target: &str) -> UpdateResult {
-        let host = host(Role::Daemon);
+        let host = host(Role::Storage);
         let logs = Arc::clone(&self.logs);
         let log = move |line: &str| logs.lock().unwrap().push(line.to_owned());
         let now = self.now;

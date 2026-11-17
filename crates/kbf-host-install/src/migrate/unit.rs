@@ -27,7 +27,7 @@ impl HandPlaced {
     /// node's own, with the mode named by `--mode=` and by nothing else.
     ///
     /// `kbf` takes the mode as `--mode=<mode>` or, in its older spelling, as the first word
-    /// after the program (`kbf storage-and-daemon --cold-store=...`), and refuses both
+    /// after the program (`kbf storage --cold-store=...`), and refuses both
     /// together ("the mode is given twice") and the word anywhere but first ("unexpected
     /// argument"). A hand-placed unit may use the word, and the packaged unit names the mode with
     /// `--mode=`: a first word that is the mode is dropped, one that is another word is

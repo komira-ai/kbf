@@ -1,7 +1,6 @@
 //! The client against the registries kbf's images come from: Docker Hub and gcr.io, over
 //! the network, by the manifests the tests and the M2 cell pin. Run by hand (`cargo test
-//! -p kbf-image --test live -- --ignored`); the real-`crun` jobs of CI run the same
-//! fetches through the driver.
+//! -p kbf-image --test live -- --ignored`).
 
 mod support;
 

@@ -1,6 +1,6 @@
 //! Which releases a host keeps, and `retain.json`, the file that says what must stay besides the
-//! links: the rule and the file are `kbf-retain`'s (the helper's Mac build takes them without
-//! this crate), and where the file is on a host with this layout is here.
+//! links: the rule and the file are `kbf-retain`'s (other crates take them without this one),
+//! and where the file is on a host with this layout is here.
 //!
 //! A host keeps, in `releases/`, the release that runs (`current`), the one before it
 //! (`previous`), every pinned release, the coordinator's `last_good`, and the newest

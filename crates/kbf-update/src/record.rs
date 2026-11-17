@@ -544,11 +544,10 @@ mod tests {
     }
 
     /// Catches a node writing a frontend update: `for_order` refuses that verb whatever
-    /// offer it is given, no wire verb value maps to it, and the word is the contract's
-    /// `frontend_update` in a record (which the reader, not this crate's writer, takes).
+    /// offer it is given, and the word is the contract's `frontend_update` in a record (which
+    /// the reader, not this crate's writer, takes).
     ///
-    /// Catches: the guard in `for_order` removed; the wire's catch-all arm made to
-    /// map to it.
+    /// Catches: the guard in `for_order` removed.
     #[test]
     fn a_node_never_writes_a_frontend_update() {
         let o = order(COMMIT);
@@ -560,14 +559,6 @@ mod tests {
             OrderRecord::for_order(&o, Verb::FrontendUpdate, None).unwrap_err(),
             RecordError::NotForNodes
         );
-        for value in -2..=100 {
-            let mapped = Order::from(kbf_proto::update::UpdateOrder {
-                verb: value,
-                commit: COMMIT.to_owned(),
-                ..Default::default()
-            });
-            assert_ne!(mapped.verb, Some(Verb::FrontendUpdate), "wire verb {value}");
-        }
         // The word, as the reader sees it from the frontend's own writer: a confirm's
         // record (a locator) with the verb changed.
         let mut by_hand = OrderRecord::for_order(&o, Verb::Confirm, None).expect("ok");

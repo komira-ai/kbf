@@ -301,7 +301,7 @@ impl Local for SocketLocal {
 }
 
 /// The helper as the installer port of the health check: what the host runs, from `query`.
-/// The health of a daemon host asks `running_commit` of it; nothing else of the port is used.
+/// The health of a frontend container asks `running_commit` of it; nothing else of the port is used.
 pub struct LocalInstaller(pub Arc<dyn Local>);
 
 impl Installer for LocalInstaller {
@@ -327,7 +327,6 @@ impl Installer for LocalInstaller {
             installed,
             running_commit: state.commit,
             node_id: state.node_id,
-            apply: None,
         })
     }
 }

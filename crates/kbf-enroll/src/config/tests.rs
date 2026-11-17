@@ -47,8 +47,6 @@ fn the_two_required_values_make_a_config_with_every_default() {
     assert_eq!(c.state_dir, PathBuf::from(DEFAULT_STATE_DIR));
     assert_eq!(c.hot_dir, Path::new(DEFAULT_STATE_DIR).join("hot"));
     assert_eq!(c.meta_dir, Path::new(DEFAULT_STATE_DIR).join("meta"));
-    assert_eq!(c.data_dir, Path::new(DEFAULT_STATE_DIR).join("data"));
-    assert_eq!(c.reserve_cpus, None);
     assert_eq!(c.trust, Trust::Pin, "pin unless public is written down");
     assert_eq!(
         c.mode, None,
@@ -61,8 +59,8 @@ fn the_two_required_values_make_a_config_with_every_default() {
 /// letters and hyphens, and the line of a bad one is reported.
 #[test]
 fn the_mode_is_a_top_level_name() {
-    let c = ok(&format!("mode = \"storage-and-daemon\"\n{MINIMAL}"));
-    assert_eq!(c.mode.as_deref(), Some("storage-and-daemon"));
+    let c = ok(&format!("mode = \"storage\"\n{MINIMAL}"));
+    assert_eq!(c.mode.as_deref(), Some("storage"));
     let got = one(&format!("mode = \"Storage\"\n{MINIMAL}"));
     assert!(got.starts_with("mode@1: a mode is a name"), "{got}");
     let got = one(&format!("mode = \"\"\n{MINIMAL}"));
@@ -92,9 +90,6 @@ state = "/srv/kbf"
 [storage]
 hot_dir = "/srv/hot"
 meta_dir = "/srv/meta"
-[daemon]
-data_dir = "/srv/data"
-reserve_cpus = 7
 [tls]
 trust = "public"
 "#);
@@ -110,8 +105,6 @@ trust = "public"
     assert_eq!(c.state_dir, PathBuf::from("/srv/kbf"));
     assert_eq!(c.hot_dir, PathBuf::from("/srv/hot"));
     assert_eq!(c.meta_dir, PathBuf::from("/srv/meta"));
-    assert_eq!(c.data_dir, PathBuf::from("/srv/data"));
-    assert_eq!(c.reserve_cpus, Some(7));
     assert_eq!(c.trust, Trust::Public);
 }
 
@@ -119,7 +112,7 @@ trust = "public"
 fn state_dir_moves_the_defaults_of_the_directories_under_it() {
     let c = ok(&format!("{MINIMAL}[dirs]\nstate = \"/srv/kbf\"\n"));
     assert_eq!(c.hot_dir, PathBuf::from("/srv/kbf/hot"));
-    assert_eq!(c.data_dir, PathBuf::from("/srv/kbf/data"));
+    assert_eq!(c.meta_dir, PathBuf::from("/srv/kbf/meta"));
 }
 
 #[test]
@@ -314,7 +307,6 @@ fn paths_are_absolute_and_directories_have_no_dotdot() {
         ("dirs", "state"),
         ("storage", "hot_dir"),
         ("storage", "meta_dir"),
-        ("daemon", "data_dir"),
     ] {
         let got = one(&format!("{MINIMAL}[{table}]\n{key} = \"/a/../b\"\n"));
         assert_eq!(
@@ -329,29 +321,6 @@ fn paths_are_absolute_and_directories_have_no_dotdot() {
 }
 
 #[test]
-fn reserve_cpus_is_zero_to_cpus_minus_one() {
-    let cpus = |n: i64| one(&format!("{MINIMAL}[daemon]\nreserve_cpus = {n}\n"));
-    assert_eq!(
-        cpus(8),
-        "daemon.reserve_cpus@4: must be from 0 to 7 on a host with 8 CPUs"
-    );
-    assert_eq!(
-        cpus(-1),
-        "daemon.reserve_cpus@4: must be from 0 to 7 on a host with 8 CPUs"
-    );
-    assert_eq!(
-        ok(&format!("{MINIMAL}[daemon]\nreserve_cpus = 0\n")).reserve_cpus,
-        Some(0)
-    );
-    let one_cpu = Host {
-        hostname: "n".to_owned(),
-        cpus: 1,
-    };
-    let text = format!("{MINIMAL}[daemon]\nreserve_cpus = 1\n");
-    assert!(Config::parse(&text, &one_cpu).is_err());
-}
-
-#[test]
 fn a_typo_a_wrong_type_and_bad_toml_are_not_silently_ignored() {
     // Unknown key, in a known table and as a table.
     let got = one(&format!("{MINIMAL}[node]\nidd = \"a\"\n"));
@@ -362,8 +331,8 @@ fn a_typo_a_wrong_type_and_bad_toml_are_not_silently_ignored() {
         "{got}"
     );
     // Wrong type: the key is named from its line.
-    let got = one(&format!("{MINIMAL}[daemon]\nreserve_cpus = \"two\"\n"));
-    assert!(got.starts_with("reserve_cpus@4: "), "{got}");
+    let got = one(&format!("{MINIMAL}[node]\nzone = 3\n"));
+    assert!(got.starts_with("zone@4: "), "{got}");
     // Not TOML at all, and a repeated key (TOML itself refuses it).
     assert!(one("[frontend\nurl = 1").starts_with("@"));
     assert!(one(&format!("{MINIMAL}url = \"https://b.example.com\"\n")).contains("duplicate"));
@@ -394,7 +363,7 @@ fn a_problem_prints_its_line_and_key_when_it_has_them() {
 
 #[test]
 fn all_the_problems_are_reported_together() {
-    let text = "[frontend]\nurl = \"http://x\"\n[node]\nid = \"A\"\nzone = \"Z\"\n[daemon]\nreserve_cpus = 99\n";
+    let text = "[frontend]\nurl = \"http://x\"\n[node]\nid = \"A\"\nzone = \"Z\"\n";
     let all = problems(text);
     let keys: Vec<_> = all.iter().map(|p| (p.key.as_str(), p.line)).collect();
     assert_eq!(
@@ -403,31 +372,25 @@ fn all_the_problems_are_reported_together() {
             ("frontend.url", Some(2)),
             ("node.id", Some(4)),
             ("node.zone", Some(5)),
-            ("daemon.reserve_cpus", Some(7)),
         ]
     );
     let shown = Problems(all).to_string();
     assert!(shown.starts_with("line 2: frontend.url: "), "{shown}");
-    assert_eq!(shown.matches("; ").count(), 3);
+    assert_eq!(shown.matches("; ").count(), 2);
 }
 
 #[test]
 fn warnings_name_the_tables_for_roles_the_frontend_did_not_grant() {
     let c = ok(&format!(
-        "{MINIMAL}[node]\nadvertise = \"n.example.net:80\"\n[storage]\n[daemon]\n"
+        "{MINIMAL}[node]\nadvertise = \"n.example.net:80\"\n[storage]\n"
     ));
-    let both = RoleSet::new([Role::Storage, Role::Daemon]).unwrap();
-    assert!(c.role_warnings(both).is_empty());
-    let daemon = RoleSet::new([Role::Daemon]).unwrap();
-    let w = c.role_warnings(daemon);
+    let storage = RoleSet::new([Role::Storage]).unwrap();
+    assert!(c.role_warnings(storage).is_empty());
+    let updater = RoleSet::new([Role::Updater]).unwrap();
+    let w = c.role_warnings(updater);
     assert_eq!(w.len(), 2, "{w:?}");
     assert!(w[0].starts_with("[storage]") && w[1].starts_with("node.advertise"));
-    let storage = RoleSet::new([Role::Storage]).unwrap();
-    assert_eq!(
-        c.role_warnings(storage),
-        vec!["[daemon] is set but the frontend granted no daemon role"]
-    );
-    assert!(ok(MINIMAL).role_warnings(daemon).is_empty());
+    assert!(ok(MINIMAL).role_warnings(updater).is_empty());
 }
 
 // ---- the file-system checks -------------------------------------------------------
@@ -532,50 +495,14 @@ fn a_root_owned_system_alias_is_not_a_symlink_the_service_user_could_plant() {
     assert_eq!(message, "/proc/self is a symlink");
 }
 
+/// Catches a key that `kbf.toml` puts in `[tls]` and that is not enrollment's being accepted
+/// by an enrollment-only file (a typo of `trust` would start the node with the default), or
+/// reported without its table in the key, or only the first of several reported; a `[daemon]`
+/// table (an earlier release's) being taken for a table of enrollment's; and the same file
+/// read as a shared one (the flags' parser checks those keys) being refused.
 #[test]
-fn hot_and_data_dirs_must_share_a_file_system() {
-    let root = scratch("fs");
-    let euid = rustix::process::geteuid().as_raw();
-    let (hot, data) = (root.join("hot"), root.join("data"));
-    mkdir(&hot, 0o700);
-    mkdir(&data, 0o700);
-    assert!(
-        config_for(&root)
-            .check_paths(euid)
-            .iter()
-            .all(|p| p.key != "storage.hot_dir")
-    );
-    // /dev/shm is a different file system from the scratch dir on Linux; elsewhere the
-    // check is skipped, since there is no second file system to name.
-    let shm = Path::new("/dev/shm");
-    if shm.is_dir()
-        && std::fs::metadata(shm).unwrap().dev() != std::fs::metadata(&root).unwrap().dev()
-    {
-        let other = shm.join(format!("kbf-enroll-config-{}", std::process::id()));
-        mkdir(&other, 0o700);
-        let text = format!(
-            "{MINIMAL}[storage]\nhot_dir = \"{}\"\n[daemon]\ndata_dir = \"{}\"\n",
-            hot.display(),
-            other.display()
-        );
-        let got = ok(&text).check_paths(euid);
-        let _ = std::fs::remove_dir(&other);
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(
-            got[0].message,
-            "must be on the same file system as daemon.data_dir"
-        );
-    }
-}
-
-/// Catches a key that `kbf.toml` puts in `[daemon]` or `[tls]` and that is not enrollment's
-/// being accepted by an enrollment-only file (a typo of `trust` would start the node
-/// with the default), or reported without its table in the key, or only the first of
-/// several reported; and the same file read as a shared one (the flags' parser checks
-/// those keys) being refused.
-#[test]
-fn an_unknown_key_in_daemon_or_tls_is_refused_unless_the_file_is_shared() {
-    let text = format!("{MINIMAL}[daemon]\nbogus = 1\n[tls]\ntrsut = \"pin\"\n");
+fn an_unknown_key_in_tls_is_refused_unless_the_file_is_shared() {
+    let text = format!("{MINIMAL}[daemon]\ndriver = 1\n[tls]\ntrsut = \"pin\"\nbogus = 1\n");
     let got: Vec<(String, String)> = problems(&text)
         .into_iter()
         .map(|p| (p.key, p.message))
@@ -583,10 +510,8 @@ fn an_unknown_key_in_daemon_or_tls_is_refused_unless_the_file_is_shared() {
     assert_eq!(
         got,
         [
-            (
-                "daemon.bogus".to_owned(),
-                "unknown field `bogus`".to_owned()
-            ),
+            (String::new(), "unknown field `daemon`".to_owned()),
+            ("tls.bogus".to_owned(), "unknown field `bogus`".to_owned()),
             ("tls.trsut".to_owned(), "unknown field `trsut`".to_owned()),
         ]
     );
@@ -594,7 +519,7 @@ fn an_unknown_key_in_daemon_or_tls_is_refused_unless_the_file_is_shared() {
     assert_eq!(shared.trust, Trust::Pin);
 }
 
-/// Catches `is_own_table` answering for a table the flags also use (`daemon`, `tls`), for
+/// Catches `is_own_table` answering for a table the flags also use (`tls`), for
 /// the top level (the empty name) or for a name that is no table of ours: the shared
 /// file's flag check would then refuse a legitimate flag or let a stray table by.
 #[test]

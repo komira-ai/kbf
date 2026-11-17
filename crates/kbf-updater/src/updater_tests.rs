@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::api::{ErrorCode, Hosts, Phase, Roll, RollRequest, RollState};
 use crate::fakes::{
-    Event, FakeClock, FakeDrain, FakeFrontend, FakeHealth, FakeInstaller, FakeSafeToStop, Log,
-    safe, unsafe_because,
+    Event, FakeClock, FakeFrontend, FakeHealth, FakeInstaller, FakeSafeToStop, Log, safe,
+    unsafe_because,
 };
 use crate::inventory::Inventory;
 use crate::ports::{Health, PortError, Stop};
@@ -23,14 +23,14 @@ pub(crate) fn inventory() -> Inventory {
     Inventory::parse(&format!(
         "st1 st1.farm.example storage {KEY}\n\
          fe  fe.farm.example frontend {KEY}\n\
-         dm  dm.farm.example daemon {KEY} dm-node\n\
+         st3 st3.farm.example storage {KEY} st3-node\n\
          st2 st2.farm.example storage {KEY}\n"
     ))
     .expect("inventory")
 }
 
 /// The order a roll over everything touches the hosts in.
-pub(crate) const ORDER: [&str; 4] = ["fe", "st1", "dm", "st2"];
+pub(crate) const ORDER: [&str; 4] = ["fe", "st1", "st3", "st2"];
 
 pub(crate) fn request(version: &str, hosts: Hosts, key: &str) -> RollRequest {
     let body = serde_json::json!({
@@ -50,7 +50,6 @@ pub(crate) struct Rig {
     pub log: Log,
     pub stop: FakeSafeToStop,
     pub inst: FakeInstaller,
-    pub drain: FakeDrain,
     pub health: FakeHealth,
     pub clock: FakeClock,
     pub front: FakeFrontend,
@@ -70,7 +69,6 @@ impl Rig {
             dir,
             stop: FakeSafeToStop::new(&log),
             inst: FakeInstaller::new(&log),
-            drain: FakeDrain::new(&log),
             health: FakeHealth::new(&log),
             clock: FakeClock::new(),
             front: FakeFrontend::new(&log),
@@ -82,7 +80,6 @@ impl Rig {
         Ports {
             safe: Box::new(self.stop.clone()),
             installer: Box::new(self.inst.clone()),
-            drain: Box::new(self.drain.clone()),
             health: Box::new(self.health.clone()),
             clock: Box::new(self.clock.clone()),
             frontend: Box::new(self.front.clone()),
@@ -95,14 +92,6 @@ impl Rig {
 
     pub fn open(&self) -> Updater {
         self.open_with(self.store())
-    }
-
-    /// An updater over the standard inventory with `timing` in place of the defaults.
-    pub fn open_timed(&self, timing: Timing) -> Updater {
-        match Updater::open(inventory(), self.store(), self.ports(), timing) {
-            Ok(u) => u,
-            Err(e) => panic!("open: {e}"),
-        }
     }
 
     pub fn open_with(&self, store: RollStore) -> Updater {
@@ -150,17 +139,13 @@ fn failure_code(roll: &Roll) -> ErrorCode {
 }
 
 fn e(s: &str) -> Event {
-    // `ck:` check, `in:` install, `hl:` health, `qy:` query, `dr:` drain (no deadline), `ls:` read the
-    // node's leases, `ud:` undrain.
+    // `ck:` check, `in:` install, `hl:` health, `qy:` query.
     let (kind, alias) = s.split_once(':').expect("kind:alias");
     let a = alias.to_owned();
     match kind {
         "ck" => Event::Check(a),
         "in" => Event::Install(a, "2.0".to_owned()),
         "hl" => Event::Health(a),
-        "dr" => Event::Drain(a, None),
-        "ls" => Event::Leases(a),
-        "ud" => Event::Undrain(a),
         _ => Event::Query(a),
     }
 }
@@ -172,9 +157,7 @@ fn events(list: &[&str]) -> Vec<Event> {
 /// Catches an order that is not "the frontend first, then one host at a time, each fully
 /// healthy before the next is asked about": the exact call sequence of a clean roll. The
 /// frontend has no safe-to-stop; every node has one, immediately before its install, which
-/// is also the re-check after the previous host. A daemon host's node id is asked first, and
-/// its node is drained (600 s) and its leases read before the install, then undrained once the
-/// host is healthy (a held check, then a check for serving).
+/// is also the re-check after the previous host. A host that lists a node id is asked it first.
 #[test]
 fn a_clean_roll_goes_frontend_first_then_one_host_at_a_time() {
     let rig = Rig::new("clean");
@@ -191,8 +174,8 @@ fn a_clean_roll_goes_frontend_first_then_one_host_at_a_time() {
     assert_eq!(
         rig.log.events(),
         events(&[
-            "in:fe", "hl:fe", "ck:st1", "in:st1", "hl:st1", "qy:dm", "ck:dm", "dr:dm", "ls:dm",
-            "in:dm", "hl:dm", "ud:dm", "hl:dm", "ck:st2", "in:st2", "hl:st2",
+            "in:fe", "hl:fe", "ck:st1", "in:st1", "hl:st1", "qy:st3", "ck:st3", "in:st3", "hl:st3",
+            "ck:st2", "in:st2", "hl:st2",
         ])
     );
     assert_eq!(
@@ -214,18 +197,18 @@ fn a_clean_roll_goes_frontend_first_then_one_host_at_a_time() {
 fn a_listed_roll_touches_only_the_listed_hosts_frontend_first() {
     let rig = Rig::new("listed");
     let u = rig.open();
-    let hosts = Hosts::Aliases(vec!["st2".into(), "fe".into(), "dm".into()]);
+    let hosts = Hosts::Aliases(vec!["st2".into(), "fe".into(), "st3".into()]);
     let started = u.start(&request("2.0", hosts, "k")).expect("start");
     assert_eq!(
         phases(&started.roll)
             .iter()
             .map(|(a, _)| a.as_str())
             .collect::<Vec<_>>(),
-        ["fe", "st2", "dm"]
+        ["fe", "st2", "st3"]
     );
     let roll = u.drive(&started.roll.id).expect("drive");
     assert_eq!(roll.state, RollState::Done);
-    assert_eq!(rig.log.installs(), ["fe", "st2", "dm"]);
+    assert_eq!(rig.log.installs(), ["fe", "st2", "st3"]);
     assert!(rig.log.touching("st1").is_empty());
 }
 
@@ -277,13 +260,13 @@ fn unsafe_past_the_bound_fails_the_roll_and_stops_there() {
         [
             ("fe".into(), Phase::Done),
             ("st1".into(), Phase::Failed),
-            ("dm".into(), Phase::Pending),
+            ("st3".into(), Phase::Pending),
             ("st2".into(), Phase::Pending)
         ]
     );
     assert_eq!(rig.elapsed(), Timing::default().safe_bound);
     assert!(!rig.log.installs().contains(&"st1".to_owned()));
-    for later in ["dm", "st2"] {
+    for later in ["st3", "st2"] {
         assert!(rig.log.touching(later).is_empty(), "{later} was touched");
     }
 }
@@ -348,15 +331,7 @@ fn the_first_failure_stops_the_roll_and_no_later_host_is_touched() {
             }
         }
         assert_eq!(roll.hosts[at].attempts, 1);
-        let note = if *failing == "dm" {
-            "; node dm-node (dm) is left drained"
-        } else {
-            ""
-        };
-        assert_eq!(
-            roll.hosts[at].detail,
-            Some(format!("dpkg: lock held{note}"))
-        );
+        assert_eq!(roll.hosts[at].detail, Some("dpkg: lock held".to_owned()));
         assert_eq!(
             rig.log.touching(failing).last(),
             Some(&e(&format!("in:{failing}")))
@@ -364,11 +339,11 @@ fn the_first_failure_stops_the_roll_and_no_later_host_is_touched() {
     }
 }
 
-/// Catches a bound taken from the wrong role: storage nodes and the frontend wait 300 s, the
-/// daemon 780 s, each ending in `health_timeout` with the last thing the host said.
+/// Catches a bound taken from the wrong role: storage nodes and the frontend wait 300 s, each
+/// ending in `health_timeout` with the last thing the host said.
 #[test]
 fn the_health_bound_follows_the_role() {
-    for (alias, bound) in [("fe", 300), ("st1", 300), ("dm", 780)] {
+    for (alias, bound) in [("fe", 300), ("st1", 300)] {
         let rig = Rig::new(&format!("bound-{alias}"));
         rig.health.script(
             alias,
@@ -611,7 +586,7 @@ fn an_abort_during_a_roll_takes_effect_between_hosts() {
         [
             ("fe".into(), Phase::Done),
             ("st1".into(), Phase::Pending),
-            ("dm".into(), Phase::Pending),
+            ("st3".into(), Phase::Pending),
             ("st2".into(), Phase::Pending)
         ]
     );

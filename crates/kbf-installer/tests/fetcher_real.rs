@@ -21,7 +21,6 @@ use kbf_installer::helper::fetcher::{
     FetchError, Fetcher, InstalledRelease, NotWired, ReleaseLocator,
 };
 use kbf_installer::helper::fetcher_real::RealFetcher;
-use kbf_installer::helper::leases::LeaseSource;
 use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::settings::Settings;
 use kbf_installer::stage::{Policy, Supported, Timeouts};
@@ -109,15 +108,6 @@ fn described_as(commit: &str, components: Vec<Described>) -> String {
         components,
     })
     .render()
-}
-
-/// A host on which no lease is live.
-struct NoLeases;
-
-impl LeaseSource for NoLeases {
-    fn live(&self) -> Result<usize, String> {
-        Ok(0)
-    }
 }
 
 /// How the programs the pipeline runs answer.
@@ -232,7 +222,6 @@ impl Rig {
             },
             trust: Box::new(trusted_host_on(self.host.platform())),
             runner: Box::new(answers.runner()),
-            leases: Box::new(NoLeases),
             owner: Owner {
                 uid: ids.uid,
                 gid: ids.gid,
@@ -385,7 +374,7 @@ fn a_child_that_cannot_start_leaves_nothing() {
 /// Catches a fetcher that installs what the child brought without the pipeline's checks.
 ///
 /// Catches: `Pipeline::verify` skipped (the partial renamed into `releases/` and the order's
-/// own facts reported as installed): this test, the facts test and the lease test go red.
+/// own facts reported as installed): this test and the facts test go red.
 #[test]
 fn a_release_the_attestation_does_not_accept_is_refused_and_not_installed() {
     let rig = Rig::new("attest");
@@ -733,23 +722,6 @@ fn a_source_that_cannot_be_asked_is_an_outage_and_makes_nothing() {
     assert!(!rig.work().exists(), "nothing was made");
 }
 
-/// A host no release is built for (a Mac on x86-64) is told so before the source is asked.
-///
-/// Catches a request for a platform that does not exist (the source would answer with a
-/// different complaint, or the host would install another platform's binary).
-#[test]
-fn a_host_no_release_is_built_for_is_refused_before_anything_is_asked() {
-    let rig = Rig::on("update-mac-x86", Platform::MacOs);
-    let fetcher = rig.fetcher(None, Answers::honest());
-    assert_eq!(
-        fetcher.fetch(&rec(Vec::new())),
-        Err(FetchError::Rejected(
-            "platform: no release is built for macos on x86_64".to_owned()
-        ))
-    );
-    assert!(!rig.work().exists(), "nothing was made");
-}
-
 /// An activation that names no component is refused (the cycle never sends one, but the
 /// fetcher does not rely on that, and it does not ask the source: an activation's components
 /// come from its offer).
@@ -832,29 +804,6 @@ fn a_component_named_by_a_path_is_refused_before_a_file_is_made() {
     assert_eq!(rig.work_left(), Vec::<String>::new(), "no scratch");
     assert!(!rig.dir.join("evil.tar.gz").exists());
     assert!(!rig.work().join("evil.tar.gz").exists());
-}
-
-/// The pipeline asks the lease source again, after the download: a source that cannot tell
-/// (`leases::NotWired`, or a cgroup that cannot be read) refuses with `lease`, nothing is
-/// installed and the directory is gone.
-///
-/// Catches the lease step skipped on the real path (a host with work running would be swapped).
-///
-/// Catches: `Pipeline::verify` skipped (red: the release is installed).
-#[test]
-fn a_lease_source_that_cannot_tell_refuses_after_the_download() {
-    let rig = Rig::new("leases");
-    let bytes = tarball();
-    let ops = rig.serving(&bytes);
-    let mut fetcher = rig.fetcher(Some(&ops), Answers::honest());
-    fetcher.leases = Box::new(kbf_installer::helper::leases::NotWired);
-    let got = fetcher.fetch_activation(&rec(vec![locator("kbf", &bytes)]), &facts());
-    match got {
-        Err(FetchError::Rejected(why)) => assert!(why.starts_with("lease: "), "{why}"),
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(rig.work_left(), Vec::<String>::new(), "no scratch");
-    assert!(!rig.release().exists(), "nothing installed");
 }
 
 /// A scratch directory left by a crashed stage is refused, not reused and not removed: it is

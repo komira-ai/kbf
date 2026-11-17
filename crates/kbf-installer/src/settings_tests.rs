@@ -49,8 +49,6 @@ fn a_host_with_no_settings_file_gets_the_defaults() {
         }
     );
     assert_eq!((linux.arch, linux.timeout), (Arch::current(), TOOL_TIMEOUT));
-    let mac = Settings::load(&trusted_host(), &host(Platform::MacOs)).expect("defaults");
-    assert_eq!(mac.run_as.uid, 4_294_967_294);
 }
 
 /// Catches each key of the file being ignored or misread, and the ones left out keeping

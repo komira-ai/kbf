@@ -17,8 +17,7 @@
 //!   ([`Settings::narrowed_to`]). The file is held to the trust files' rule: root's alone.
 //! - `installer.conf` ([`Settings::load`]), for the refs a release may be attested for and the
 //!   unprivileged user `gh` and the probe run as.
-//! - the host ([`Parts`]): the executor that answers for ownership, the runner, the lease
-//!   source, the owner of the scratch directory and the fetch child's program.
+//! - the host ([`Parts`]): the executor that answers for ownership, the runner, the owner of the scratch directory and the fetch child's program.
 //!
 //! Any of them that cannot be had makes the fetch `Unavailable` with the reason, so the cycle
 //! refuses the order (`fetch`) and goes on, and `setup` says why it stopped.
@@ -43,7 +42,6 @@ use crate::fetch::{ChildProgram, Limits, ProgramFault, Source};
 use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
 use crate::helper::fetcher_real::{Parts, RealFetcher};
 use crate::helper::fetcher_seed::SeedFetcher;
-use crate::helper::leases::LeaseSource;
 use crate::helper::trusted_toml::{ReadError, read_trusted};
 use crate::installer_toml::{InstallerToml, Source as Configured};
 use crate::layout::{Layout, Platform};
@@ -95,14 +93,9 @@ impl HostFetcher {
     }
 
     /// The fetcher of the host `host` itself: the real executor and runner, the owner of this
-    /// process, the fetch child that is this program run as the fetch user, and the lease
-    /// source `leases` makes.
-    pub fn on_host(
-        host: Layout,
-        installer_toml: HostPath,
-        leases: impl Fn() -> Box<dyn LeaseSource> + 'static,
-    ) -> HostFetcher {
-        HostFetcher::on_host_with(host, installer_toml, leases, ChildProgram::of_this_program)
+    /// process, and the fetch child that is this program run as the fetch user.
+    pub fn on_host(host: Layout, installer_toml: HostPath) -> HostFetcher {
+        HostFetcher::on_host_with(host, installer_toml, ChildProgram::of_this_program)
     }
 
     /// [`HostFetcher::on_host`] with the fetch child's program made by `child` (a test cannot
@@ -110,13 +103,12 @@ impl HostFetcher {
     fn on_host_with(
         host: Layout,
         installer_toml: HostPath,
-        leases: impl Fn() -> Box<dyn LeaseSource> + 'static,
         child: fn(Platform) -> Result<ChildProgram, ProgramFault>,
     ) -> HostFetcher {
         let own = host.clone();
         HostFetcher::new(host, installer_toml, move || {
             let child = child(own.platform()).map_err(|e| e.to_string())?;
-            Ok(host_parts(&own, leases(), child))
+            Ok(host_parts(&own, child))
         })
     }
 
@@ -251,14 +243,13 @@ impl From<NotBuilt> for FetchError {
     }
 }
 
-/// The parts of the host `host` itself, with the fetch child `child` and the lease source
-/// `leases`: the real executor under the host's root, the real runner, and this process's
-/// effective ids as the owner of what a fetch makes (root on a host).
-pub fn host_parts(host: &Layout, leases: Box<dyn LeaseSource>, child: ChildProgram) -> Parts {
+/// The parts of the host `host` itself, with the fetch child `child`: the real executor under
+/// the host's root, the real runner, and this process's effective ids as the owner of what a
+/// fetch makes (root on a host).
+pub fn host_parts(host: &Layout, child: ChildProgram) -> Parts {
     Parts {
         trust: Box::new(HostExec::new(host.root().clone())),
         runner: Box::new(SystemRunner),
-        leases,
         owner: Owner {
             uid: rustix::process::geteuid().as_raw(),
             gid: rustix::process::getegid().as_raw(),

@@ -384,10 +384,6 @@ impl Agent {
                     slot.status.update(|s| s.health = wire::Health::Unhealthy);
                 }
             }
-            // A cordon an operator gave back by hand: the drain forgets its mark.
-            if let Err(e) = slot.drain.observe(&self.host) {
-                self.log(&slot.say(&format!("the node's cordon could not be looked at: {e}")));
-            }
         }
     }
 

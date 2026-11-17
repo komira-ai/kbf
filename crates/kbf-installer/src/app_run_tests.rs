@@ -152,7 +152,7 @@ fn a_bundled_boot_check_runs_the_kbf_it_names_and_never_reads_the_state() {
     assert_eq!(exit, Exit::NeedsOperator, "{err}");
 
     let flag = format!("--kbf={}", root.join("no-such-kbf").display());
-    for mode in ["--mode=daemon", "--mode=frontend"] {
+    for mode in ["--mode=storage", "--mode=frontend"] {
         let (exit, err) = on(&root, &["boot-check", flag.as_str(), mode]);
         assert_eq!(exit, Exit::Failed, "{mode}: {err}");
         assert!(err.contains("cannot run"), "{mode}: {err}");
@@ -161,7 +161,7 @@ fn a_bundled_boot_check_runs_the_kbf_it_names_and_never_reads_the_state() {
 }
 
 /// Asserts that a bundled host's boot check runs `<kbf> boot-check --mode=<mode>` once, for
-/// each of the five modes, with the host's `installer.toml` under the root named by
+/// each of the modes, with the host's `installer.toml` under the root named by
 /// `--installer-config`, as the caller with an empty environment in `/` and for at most 120 s,
 /// and passes when it exits 0. A relative root is refused before anything is run.
 #[test]
@@ -169,13 +169,7 @@ fn the_bundled_boot_check_runs_kbf_boot_check_for_the_mode_and_passes_when_it_do
     let (layout, root) = seeded("boot-bundled-args");
     let installer_toml = layout.join(&layout.installer_toml());
     let config = format!("--installer-config={}", installer_toml.display());
-    let modes = [
-        (Mode::Frontend, "frontend"),
-        (Mode::Storage, "storage"),
-        (Mode::Daemon, "daemon"),
-        (Mode::StorageAndDaemon, "storage-and-daemon"),
-        (Mode::AllInOne, "all-in-one"),
-    ];
+    let modes = [(Mode::Frontend, "frontend"), (Mode::Storage, "storage")];
     for (mode, name) in modes {
         let runner = FakeRunner::new(|_| Ok(ran(0, "", "kbf boot-check: skipped\n")));
         let kbf = Path::new("/usr/bin/kbf");
@@ -193,7 +187,7 @@ fn the_bundled_boot_check_runs_kbf_boot_check_for_the_mode_and_passes_when_it_do
     }
     let runner = FakeRunner::new(|_| Ok(ran(0, "", "")));
     let kbf = Path::new("/usr/bin/kbf");
-    let refused = bundled_boot_check("relative".into(), &runner, kbf, Mode::Daemon);
+    let refused = bundled_boot_check("relative".into(), &runner, kbf, Mode::Storage);
     assert_eq!(refused.unwrap_err().exit, Exit::Failed);
     assert!(runner.calls().is_empty());
 }
@@ -252,16 +246,18 @@ fn the_bundled_flags_of_boot_check_come_together_or_not_at_all() {
     let node = refused(&["--kbf", "/usr/bin/kbf", "--mode", "node"]);
     assert_eq!(node, Some(ErrorKind::InvalidValue));
     assert_eq!(refused(&[]), None);
-    let both = refused(&["--kbf", "/usr/bin/kbf", "--mode", "all-in-one"]);
+    let removed = refused(&["--kbf", "/usr/bin/kbf", "--mode", "all-in-one"]);
+    assert_eq!(removed, Some(ErrorKind::InvalidValue));
+    let both = refused(&["--kbf", "/usr/bin/kbf", "--mode", "frontend"]);
     assert_eq!(both, None);
 
-    let cli = parse(&["boot-check", "--kbf=/usr/bin/kbf", "--mode=all-in-one"]);
+    let cli = parse(&["boot-check", "--kbf=/usr/bin/kbf", "--mode=frontend"]);
     let Verb::BootCheck(args) = cli.verb else {
         panic!("boot-check");
     };
     assert_eq!(
         args.bundled(),
-        Some((Path::new("/usr/bin/kbf"), Mode::AllInOne))
+        Some((Path::new("/usr/bin/kbf"), Mode::Frontend))
     );
     let Verb::BootCheck(args) = parse(&["boot-check"]).verb else {
         panic!("boot-check");

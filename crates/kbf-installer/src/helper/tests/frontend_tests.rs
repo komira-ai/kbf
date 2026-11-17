@@ -552,8 +552,8 @@ fn a_state_lock_that_cannot_be_opened_is_a_refusal_of_each_of_the_three_orders()
 
 /// Catches a host taking the proxy's `frontend_update` on its flag, a guess or a different
 /// key: whether the order is accepted is the top-level `mode` of the host's `kbf.toml` and
-/// nothing else (design section 4). `frontend` and `all-in-one` stage the release, on Linux
-/// and on macOS (where the file is elsewhere); `daemon`, no file, a file that is not TOML, a
+/// nothing else (design section 4). `frontend` stages the release; `daemon` and `all-in-one`
+/// (modes that were removed), no file, a file that is not TOML, a
 /// `mode` that is not a string, a `mode` only inside a table and no `mode` are refused as
 /// `denied` with the reason in `status.json`, the pass goes on, no floor moves and nothing is
 /// staged.
@@ -563,15 +563,11 @@ fn a_state_lock_that_cannot_be_opened_is_a_refusal_of_each_of_the_three_orders()
 #[test]
 fn a_frontend_update_is_taken_by_the_mode_in_the_hosts_kbf_toml() {
     let accepted = [
-        (Platform::Linux, "mode = \"frontend\"\n"),
-        (
-            Platform::Linux,
-            "mode = \"all-in-one\"\n[listener]\nlisten = \"x\"\n",
-        ),
-        (Platform::MacOs, "mode = \"frontend\"\n"),
+        "mode = \"frontend\"\n",
+        "mode = \"frontend\"\n[listener]\nlisten = \"x\"\n",
     ];
-    for (index, (platform, text)) in accepted.into_iter().enumerate() {
-        let mut rig = Rig::on(&format!("mode-ok-{index}"), platform);
+    for (index, text) in accepted.into_iter().enumerate() {
+        let mut rig = Rig::new(&format!("mode-ok-{index}"));
         write_kbf_toml(&rig.layout, text);
         rig.order(1, Verb::FrontendUpdate, B);
         rig.cycle(T0);
@@ -582,8 +578,9 @@ fn a_frontend_update_is_taken_by_the_mode_in_the_hosts_kbf_toml() {
             rig.refusal()
         );
     }
-    let refused: [(Option<&str>, &str); 6] = [
+    let refused: [(Option<&str>, &str); 7] = [
         (Some("mode = \"daemon\"\n"), "\"daemon\""),
+        (Some("mode = \"all-in-one\"\n"), "\"all-in-one\""),
         (None, "is not there"),
         (Some("mode = [unclosed\n"), "is not TOML"),
         (Some("mode = 3\n"), "has no mode"),

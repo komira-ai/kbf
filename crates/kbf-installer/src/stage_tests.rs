@@ -9,7 +9,6 @@ use kbf_host::testkit::FakeExec;
 use super::*;
 use crate::fixtures::{COMMIT, FakeRunner, OTHER, elf, file, me, ran, tar_gz, trusted_host_on};
 use crate::fixtures::{Item, version_json};
-use crate::helper::leases::fake::FakeLeases;
 use crate::run::{Ran, SystemRunner};
 use crate::testkit::host_root;
 
@@ -99,7 +98,6 @@ struct Rig {
     settings: Settings,
     trust: FakeExec,
     policy: Policy,
-    leases: FakeLeases,
 }
 
 impl Rig {
@@ -119,7 +117,6 @@ impl Rig {
             settings,
             trust,
             policy: policy(),
-            leases: FakeLeases::default(),
         }
     }
 
@@ -163,7 +160,6 @@ impl Rig {
             policy: self.policy,
             trust: &self.trust,
             runner,
-            leases: &self.leases,
             owner: owner(),
         };
         let order = Order {
@@ -407,7 +403,6 @@ fn a_download_that_is_not_the_parents_plain_file_is_refused() {
             policy: rig.policy,
             trust: &rig.trust,
             runner: &runner,
-            leases: &rig.leases,
             owner: Owner {
                 uid: if case == "owner" {
                     owner().uid + 1
@@ -712,32 +707,6 @@ fn a_release_below_the_floor_or_beyond_the_installer_is_refused() {
     }
 }
 
-/// Catches a lease check that is missing, late or read from the wrong place: a live lease,
-/// and a source that cannot tell, each refuse as `lease` after the binary was verified and
-/// before the release directory exists.
-///
-/// Catches: the check dropped; the check after the rename.
-#[test]
-fn a_live_lease_refuses_before_the_release_is_installed() {
-    let rig = Rig::new("lease");
-    rig.leases.set(2);
-    let runner = honest();
-    let err = rig.activate(&runner).expect_err("busy");
-    assert_eq!(err.word(), Some("lease"), "{err}");
-    assert!(err.to_string().contains("2 leases are live"));
-    assert_eq!(programs(&runner), ["gh", "kbf"], "it was verified first");
-    rig.assert_nothing_installed();
-
-    rig.leases.set(usize::MAX);
-    let err = rig.activate(&honest()).expect_err("cannot tell");
-    assert_eq!(err.word(), Some("lease"));
-    assert!(err.to_string().contains("cannot tell"));
-    rig.assert_nothing_installed();
-
-    rig.leases.set(0);
-    rig.activate(&honest()).expect("idle");
-}
-
 /// Catches the marker being written after the rename: with the marker's name taken by a
 /// directory in the partial tree, writing it fails, and then no release directory may
 /// exist (a `releases/<commit>/` is only ever made whole, with its marker).
@@ -823,7 +792,7 @@ fn the_files_fetched_must_be_the_components_ordered() {
     let rig = Rig::new("components");
     let (locator, mut fetched) = rig.fetch(&tarball());
     let extra = Received {
-        name: "kbf-daemon".to_owned(),
+        name: "kbf-extra".to_owned(),
         ..fetched.files[0].clone()
     };
     fetched.files.push(extra);

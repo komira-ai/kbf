@@ -1,9 +1,8 @@
 //! A small HTTP/1.1 client for a registry: one connection per request over TCP or
 //! rustls, redirects followed without credentials, every wait bounded.
 //!
-//! Written over hyper's connection API rather than a client crate: the daemon links
-//! this, and a daemon must not link a standalone HTTP client (the layering test in
-//! `kbf-integration-test`); hyper is already in its closure through tonic.
+//! Written over hyper's connection API rather than a client crate: no standalone HTTP client
+//! is linked, and hyper is already in the closure through tonic.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;

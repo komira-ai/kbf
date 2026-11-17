@@ -134,7 +134,7 @@ impl Seen {
     fn maker(&self, beat: Sender<()>) -> impl FnOnce(&Config) -> Result<Agent, String> + use<'_> {
         move |cfg: &Config| {
             let identity = identity_of_files(&cfg.files)?;
-            let host = this_host(&identity, None)?;
+            let host = this_host(&identity)?;
             self.made.lock().unwrap().push(identity);
             let events = Events::default();
             Ok(Agent::new(
@@ -212,7 +212,7 @@ impl Enrolling {
             .issue_updater(
                 &UpdaterCert {
                     node_id: &node_id,
-                    host_role: &HostRole::DAEMON,
+                    host_role: &HostRole::STORAGE,
                     key: &public,
                 },
                 now(),
@@ -317,13 +317,13 @@ fn once_the_host_is_enrolled_the_waiting_agent_heartbeats() {
         let dir = TestDir::under(std::env::temp_dir(), "enrolled-start");
         let pki = Pki::new();
         if enrolled_before {
-            enrolled_in(&dir, &pki, HostRole::DAEMON);
+            enrolled_in(&dir, &pki, HostRole::STORAGE);
         }
         let state = dir.join("state");
         let seen = Seen::default();
         let nap = |_: &Stop| {
             seen.naps.fetch_add(1, Ordering::SeqCst);
-            enrolled_in(&dir, &pki, HostRole::DAEMON);
+            enrolled_in(&dir, &pki, HostRole::STORAGE);
         };
         let (code, text) = run_until_a_heartbeat(&seen, &state, &nap);
         assert_eq!((code, text.as_str()), (0, ""), "{enrolled_before}");
@@ -598,7 +598,7 @@ fn a_stop_before_the_first_look_ends_the_wait_after_one_look() {
     assert_eq!(naps.load(Ordering::SeqCst), 1);
 
     let pki = Pki::new();
-    let state = enrolled_in(&dir, &pki, HostRole::DAEMON);
+    let state = enrolled_in(&dir, &pki, HostRole::STORAGE);
     let nap = |_: &Stop| panic!("an enrolled host never naps");
     let quiet = |_: &str| panic!("an enrolled host is not said to be unenrolled");
     let waited = wait(

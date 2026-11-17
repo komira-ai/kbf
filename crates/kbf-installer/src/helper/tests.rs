@@ -1,6 +1,6 @@
 //! The helper's passes on a scratch host: the real installer verbs over a real file tree,
-//! with the fetch played by a fake that installs a directory (or fails as told), the lease
-//! source set by the test, and the service restart recorded as a step. Orders are the
+//! with the fetch played by a fake that installs a directory (or fails as told), and the service
+//! restart recorded as a step. Orders are the
 //! records `kbf-update` writes into the spool.
 
 use std::fs;
@@ -20,8 +20,6 @@ use crate::testkit::{A, B, C, c};
 use crate::helper::cycle::{Config, Helper};
 use crate::helper::fetcher::fake::FakeFetcher;
 use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, NotWired, ReleaseLocator};
-use crate::helper::leases::fake::FakeLeases;
-use crate::helper::mac_leases::tests::{MacHost, reply_pids};
 use crate::helper::memory::{Event, Memory};
 use crate::helper::order::{Order, Verb as OrderVerb};
 use crate::helper::restart::Restart;
@@ -37,7 +35,6 @@ struct Rig {
     root: PathBuf,
     layout: Layout,
     fetcher: FakeFetcher,
-    leases: FakeLeases,
     /// The restarts the start-up made (the links were missing and were made).
     base: usize,
     /// The unit the helper restarts.
@@ -75,9 +72,9 @@ fn record(
             Vec::new()
         },
         expected: activate.then(|| Facts {
-            platform: match platform {
-                Platform::Linux => "linux-x86_64".to_owned(),
-                Platform::MacOs => "darwin-arm64".to_owned(),
+            platform: {
+                let Platform::Linux = platform;
+                "linux-x86_64".to_owned()
             },
             protocol: 7,
             min_protocol: 6,
@@ -89,13 +86,13 @@ fn record(
 }
 
 impl Rig {
-    /// A host running release A, with release B not installed, an empty spool, no lease and
-    /// the service restart recorded.
+    /// A host running release A, with release B not installed, an empty spool and the service
+    /// restart recorded.
     fn new(name: &str) -> Rig {
         Rig::on(name, Platform::Linux)
     }
 
-    /// The same host on `platform`: macOS keeps its state and lock elsewhere.
+    /// The same host on `platform`.
     fn on(name: &str, platform: Platform) -> Rig {
         Rig::build(name, platform, 0, false)
     }
@@ -184,13 +181,11 @@ impl Rig {
             min_activation_interval_secs: min_interval,
         };
         let fetcher = FakeFetcher::new(&layout);
-        let leases = FakeLeases::default();
         let mut helper = Helper::new(
             layout.clone(),
             host,
             cfg,
             Box::new(fetcher.clone()),
-            Box::new(leases.clone()),
             Box::new(service.clone()),
         );
         helper.recover().expect("recover");
@@ -199,7 +194,6 @@ impl Rig {
             root,
             layout,
             fetcher,
-            leases,
             base: 0,
             unit: unit.to_owned(),
             platform,
@@ -459,15 +453,14 @@ fn a_fetched_release_that_declares_other_facts_is_refused_before_the_flip() {
     }
 }
 
-/// Catches the checks before the fetch being skipped: an activation while a trial is
-/// pending, while a lease is live (read from the installer's own source), while the lease
-/// source cannot answer is not even fetched. The one pending trial is another order's, so a
-/// second timer is never started.
+/// Catches the check before the fetch being skipped: an activation while a trial is pending is
+/// not even fetched. The one pending trial is another order's, so a second timer is never
+/// started.
 ///
-/// Catches: the pending check dropped (the second activation reaches the installer's
-/// own refusal after a wasted fetch); the live count compared with `> 1`.
+/// Catches: the pending check dropped (the second activation reaches the installer's own
+/// refusal after a wasted fetch).
 #[test]
-fn an_activation_is_refused_before_the_fetch_during_a_trial_or_with_leases_live() {
+fn an_activation_is_refused_before_the_fetch_during_a_trial() {
     let mut rig = Rig::new("pending");
     rig.order(5, Verb::Activate, B);
     rig.cycle(T0);
@@ -479,116 +472,15 @@ fn an_activation_is_refused_before_the_fetch_during_a_trial_or_with_leases_live(
     assert_eq!(rig.current(), Some(c(B)));
     assert!(rig.refusal().contains("on trial"), "{}", rig.refusal());
     assert_eq!(rig.restarts(), 1);
-
-    let mut rig = Rig::new("leases");
-    rig.leases.set(1);
-    rig.order(5, Verb::Activate, B);
-    rig.cycle(T0);
-    assert_eq!(rig.fetcher.count(), 0);
-    assert_eq!(rig.current(), Some(c(A)));
-    assert!(
-        rig.refusal().contains("1 leases are live"),
-        "{}",
-        rig.refusal()
-    );
-    // A confirm or revert takes no lease check.
-    rig.leases.set(4);
-    rig.order(6, Verb::Revert, A);
-    rig.cycle(T0 + 3);
-    assert!(!rig.refusal().contains("leases"), "{}", rig.refusal());
 }
 
-/// A macOS helper whose lease source is the real Mac source over a scripted host: the
-/// source's own `setup` plays the host (processes, directories), the rig the helper's.
-fn mac_rig(name: &str, setup: impl FnOnce(&mut MacHost)) -> Rig {
-    let mut rig = Rig::on(name, Platform::MacOs);
-    let mut host = MacHost::new(name);
-    setup(&mut host);
-    rig.helper.set_leases(Box::new(host.source()));
-    rig
-}
-
-/// Catches the Mac source not wired into the cycle: with a keeper running on the Mac an
-/// activation is refused with the live count, before any fetch, and the release stays; with
-/// the host idle the same order is fetched and swapped; a Mac that cannot tell (no
-/// `sandbox-exec`) refuses with the reason; and when only a stale directory remains with no
-/// daemon running the activation goes through and the pass logs which directory it let by.
-///
-/// Catches: the keepers ignored; the `sandbox-exec` check dropped; the lease note not logged
-/// by the cycle; the note naming no directory.
-#[test]
-fn a_mac_activation_follows_the_mac_lease_source() {
-    let mut rig = mac_rig("mac-keeper", |h| h.keepers(reply_pids("412\n")));
-    rig.order(5, Verb::Activate, B);
-    rig.cycle(T0);
-    assert_eq!(rig.fetcher.count(), 0);
-    assert_eq!(rig.current(), Some(c(A)));
-    assert!(
-        rig.refusal().contains("1 leases are live"),
-        "{}",
-        rig.refusal()
-    );
-
-    let mut rig = mac_rig("mac-idle", |_| {});
-    rig.order(5, Verb::Activate, B);
-    rig.cycle(T0);
-    assert_eq!(rig.current(), Some(c(B)));
-    assert_eq!(rig.restarts(), 1);
-
-    let mut rig = mac_rig("mac-blind", |h| h.without_sandbox());
-    rig.order(5, Verb::Activate, B);
-    rig.cycle(T0);
-    assert_eq!(rig.fetcher.count(), 0);
-    assert!(
-        rig.refusal()
-            .contains("cannot tell whether leases are live: ")
-            && rig.refusal().contains("sandbox-exec"),
-        "{}",
-        rig.refusal()
-    );
-
-    let mut rig = mac_rig("mac-stale", |h| {
-        h.no_daemon();
-        h.dir("lease-3-7");
-    });
-    rig.order(5, Verb::Activate, B);
-    rig.cycle(T0);
-    assert_eq!(rig.current(), Some(c(B)));
-    let mut log = Vec::new();
-    rig.helper.drain_log(&mut log);
-    let log = String::from_utf8(log).expect("text");
-    assert!(
-        log.contains(
-            "leases: /Volumes/kbf/data/leases/lease-3-7 remains and no kbf daemon is running"
-        ),
-        "{log}"
-    );
-}
-
-/// Catches an unreadable lease source being read as "none": the installer refuses, and
-/// fetches nothing.
-///
-/// Catches: the error arm treated as zero leases (the activation goes through).
-#[test]
-fn a_lease_source_that_cannot_answer_refuses_the_activation() {
-    let mut rig = Rig::new("leases-unknown");
-    rig.leases.set(usize::MAX);
-    rig.order(5, Verb::Activate, B);
-    rig.cycle(T0);
-    assert_eq!(rig.fetcher.count(), 0);
-    assert_eq!(rig.current(), Some(c(A)));
-    assert!(rig.refusal().contains("cannot tell"), "{}", rig.refusal());
-}
-
-/// Catches a node `activate` taken when the unit the helper restarts is a frontend's. A
-/// frontend holds no leases, so a running one reads as idle and the lease check lets the
-/// order through; the swap would then restart the frontend, which moves by `frontend_update`
-/// (the proxy owns its streams). The order is refused before any fetch, with no live lease
-/// and no restart, for the template's instance and for the plain unit; the same order for the
-/// daemon's unit, with the same idle lease source, is taken.
+/// Catches a node `activate` taken when the unit the helper restarts is a frontend's. The swap
+/// would restart the frontend, which moves by `frontend_update` (the proxy owns its streams).
+/// The order is refused before any fetch, with no restart, for the template's instance and for
+/// the plain unit; the same order for the storage node's unit is taken.
 ///
 /// Catches: the check removed (both frontend units swap); the check refusing every
-/// unit (the daemon's order is refused).
+/// unit (the storage node's order is refused).
 #[test]
 fn an_activation_is_refused_when_the_restarted_unit_is_a_frontends() {
     for unit in ["kbf-frontend@a.service", "kbf-frontend.service"] {
@@ -607,7 +499,7 @@ fn an_activation_is_refused_when_the_restarted_unit_is_a_frontends() {
         );
         assert_eq!(seen, (0, Some(c(A)), 0, why), "{unit}");
     }
-    let mut rig = Rig::restarting("daemon-unit", "kbf-daemon.service");
+    let mut rig = Rig::restarting("storage-unit", "kbf-storage.service");
     rig.order(5, Verb::Activate, B);
     rig.cycle(T0);
     let seen = (rig.fetcher.count(), rig.current(), rig.restarts());

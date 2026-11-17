@@ -1,4 +1,4 @@
-//! `kbf-host-install --migrate-to-package`: move a Linux daemon host from the hand-placed
+//! `kbf-host-install --migrate-to-package`: move a Linux storage host from the hand-placed
 //! layout (`/var/lib/kbf-installer/releases/<commit>`, a unit in `/etc/systemd/system` that
 //! runs `releases/current/kbf` with the node's flags) to the `kbf` package, once, by an
 //! operator, as root.
@@ -16,9 +16,8 @@
 //! update installs it ([`PackageHost::check_copies`]), and is the commit the host runs. A deb is
 //! then unpacked in the checks' own directory and its `kbf` is run on the flags the drop-in
 //! gives it, `--help` last, so that it reads them and starts nothing; the directories the node's
-//! flags name (the data, metadata and local cold-store directories) are recorded with their mode
-//! and owner, and a data directory the container runtime cannot reach (some directory down to it
-//! closed to others) is refused. The plan prints what it found as `checked:` lines.
+//! flags name (the metadata and local cold-store directories) are recorded with their mode
+//! and owner. The plan prints what it found as `checked:` lines.
 //!
 //! The steps, in order:
 //!
@@ -31,7 +30,7 @@
 //!    named in [`unit::HandPlaced`], the packaged unit's `kbf.toml` condition lifted (the
 //!    flags are the node's configuration) and its `StateDirectory=` cleared (systemd would set
 //!    `/var/lib/kbf` to 0750 at every start; the node's directories are the node's). The mode
-//!    is named by `--mode=` alone: the older first word (`kbf storage-and-daemon ...`) is dropped
+//!    is named by `--mode=` alone: the older first word (`kbf storage ...`) is dropped
 //!    ([`unit::HandPlaced::flags`]);
 //! 3. the hand-placed unit is renamed `<unit>.hand-placed`, so the packaged one takes its
 //!    place, and systemd rereads its files;
@@ -61,17 +60,17 @@ use crate::local::backend::Fault;
 use crate::local::package::{Copies, PackageHost};
 use crate::local::package_format::Format;
 use crate::local::units::restart_and_wait;
-use crate::mac::release::{self, commit_prefix};
 use crate::pace::Pace;
 use crate::plan::{self, SYSTEMCTL, Wait};
+use crate::release::{self, commit_prefix};
 use crate::request::{Channel, Unit};
 use crate::runner::{Cmd, Identity, Runner};
 
 pub const USAGE: &str = "usage: kbf-host-install --migrate-to-package --layout deb|rpm \
 --channel NAME --unit UNIT --dir DIR [--apply]\n";
 
-/// The units of the modes a daemon host runs. (A frontend is not migrated here.)
-const MODES: [&str; 4] = ["daemon", "storage", "storage-and-daemon", "all-in-one"];
+/// The units of the modes a host migrated here runs. (A frontend is not migrated here.)
+const MODES: [&str; 1] = ["storage"];
 
 /// The name of the drop-in.
 const DROP_IN: &str = "10-node-flags.conf";
@@ -81,13 +80,6 @@ const ASIDE: &str = ".hand-placed";
 
 /// The packaged binary.
 const KBF: &str = "/usr/bin/kbf";
-
-/// The modes whose process runs containers, and so keeps a data directory the container
-/// runtime has to reach.
-const RUNS_CONTAINERS: [&str; 3] = ["daemon", "storage-and-daemon", "all-in-one"];
-
-/// Where a daemon keeps its data without `--data-dir`.
-const DEFAULT_DATA_DIR: &str = "/var/lib/kbf";
 
 /// How long the hand-placed unit, put back, must stay active before it is called running: a
 /// unit that crashes at once and is restarted (`Restart=on-failure`, `RestartSec=5`) is active
@@ -323,20 +315,11 @@ fn flag_value<'a>(flags: &'a [String], name: &str) -> Option<&'a str> {
     found
 }
 
-/// The directory a daemon of `mode` keeps its data in: `--data-dir`, or the default. None for a
-/// mode that runs no containers.
-fn data_dir(flags: &[String], mode: &str) -> Option<PathBuf> {
-    RUNS_CONTAINERS
-        .contains(&mode)
-        .then(|| PathBuf::from(flag_value(flags, "--data-dir").unwrap_or(DEFAULT_DATA_DIR)))
-}
-
-/// The directories the node's flags name for its data: the data directory, the metadata
-/// directory and a cold store on a local disk. The node's, not the package's.
-fn node_dirs(flags: &[String], mode: &str) -> Vec<PathBuf> {
+/// The directories the node's flags name for its data: the metadata directory and a cold store
+/// on a local disk. The node's, not the package's.
+fn node_dirs(flags: &[String]) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let named = [
-        data_dir(flags, mode),
         flag_value(flags, "--meta-dir").map(PathBuf::from),
         flag_value(flags, "--cold-store")
             .and_then(|url| url.strip_prefix("file://"))
@@ -422,7 +405,7 @@ struct Planned {
 fn plan_of(config: &Config, host: &PackageHost, place: &Place) -> Result<Planned, Refused> {
     let layout = &host.layout;
     let releases = layout.join(&layout.releases());
-    // 1. The unit is the unit of a daemon mode.
+    // 1. The unit is the unit of a mode this host runs.
     let mode = config
         .unit
         .as_str()
@@ -431,7 +414,7 @@ fn plan_of(config: &Config, host: &PackageHost, place: &Place) -> Result<Planned
         .filter(|mode| MODES.contains(mode))
         .ok_or_else(|| {
             Refused(format!(
-                "{} is not the unit of a daemon mode ({})",
+                "{} is not the unit of a mode that is migrated ({})",
                 config.unit.as_str(),
                 MODES.join(", ")
             ))
@@ -461,7 +444,7 @@ fn plan_of(config: &Config, host: &PackageHost, place: &Place) -> Result<Planned
     // The flags as the packaged unit gives them (the mode word of the old spelling is gone).
     let flags = old.flags(mode, config.unit.as_str()).map_err(Refused)?;
     let text_of_drop_in = drop_in(&old, mode, config.unit.as_str()).map_err(Refused)?;
-    let dirs = record_dirs(place, &flags, mode)?;
+    let dirs = record_dirs(place, &flags)?;
     let drop_in_dir = place
         .systemd_dir
         .join(format!("{}.d", config.unit.as_str()));
@@ -539,12 +522,11 @@ fn plan_of(config: &Config, host: &PackageHost, place: &Place) -> Result<Planned
     })
 }
 
-/// The node's directories as they are now, and a refusal when the container runtime cannot
-/// reach the data directory: it needs every directory from `/` down to it searchable by others,
-/// and the migration keeps the modes it finds and chooses none.
-fn record_dirs(place: &Place, flags: &[String], mode: &str) -> Result<Vec<Dir>, Refused> {
+/// The node's directories as they are now; the migration keeps the modes it finds and chooses
+/// none.
+fn record_dirs(place: &Place, flags: &[String]) -> Result<Vec<Dir>, Refused> {
     let mut dirs = Vec::new();
-    for shown in node_dirs(flags, mode) {
+    for shown in node_dirs(flags) {
         let path = under(&place.root, &shown);
         match fs::metadata(&path) {
             Ok(meta) if meta.is_dir() => dirs.push(Dir {
@@ -557,25 +539,6 @@ fn record_dirs(place: &Place, flags: &[String], mode: &str) -> Result<Vec<Dir>, 
             Ok(_) => return refused(format!("{} is not a directory", shown.display())),
             // Not there (or not to be looked into): nothing of the node's to keep.
             Err(_) => {}
-        }
-    }
-    if let Some(data) = data_dir(flags, mode) {
-        let start = under(&place.root, &data);
-        for ancestor in start.ancestors().take_while(|a| *a != place.root) {
-            if let Ok(meta) = fs::metadata(ancestor)
-                && meta.mode() & 0o001 == 0
-            {
-                let shown =
-                    Path::new("/").join(ancestor.strip_prefix(&place.root).unwrap_or(ancestor));
-                return refused(format!(
-                    "{} is not searchable by others (mode {:04o}): the container runtime of a {mode} \
-                     node reaches {} through it. Run chmod o+x {}; the move keeps the modes it finds",
-                    shown.display(),
-                    meta.mode() & 0o7777,
-                    data.display(),
-                    shown.display()
-                ));
-            }
         }
     }
     Ok(dirs)
@@ -870,7 +833,7 @@ fn put_back(
     if !matches!(&reloaded, Ok(exec) if exec.success()) {
         problems.push("systemctl daemon-reload did not work".to_owned());
     }
-    // Before the restart: the hand-placed unit's container runtime needs the modes it had.
+    // Before the restart: the hand-placed unit needs the modes it had.
     if let Err(why) = restore_all(dirs) {
         problems.push(format!("putting the directories back: {why}"));
     }

@@ -44,9 +44,8 @@ impl ReleasePlatform {
     }
 
     /// The tarballs a host of this platform needs for a release: `kbf` on every platform
-    /// (`docs/design/pull-updates.md` section 5). A Mac runs `kbf --mode=daemon` from its
-    /// release, and no darwin `kbf-daemon` is built (`docs/artifacts.md`). The release store
-    /// calls a platform complete when it holds each of these with its attestation.
+    /// (`docs/design/pull-updates.md` section 5). The release store calls a platform complete
+    /// when it holds each of these with its attestation.
     #[must_use]
     pub const fn components(self) -> &'static [&'static str] {
         match self {
@@ -121,9 +120,9 @@ mod tests {
         }
     }
 
-    /// Catches: a host asked for a tarball it does not run (the Mac was asked for a
-    /// `kbf-daemon` that is not built for darwin, so no Mac release was ever complete or
-    /// taken), and a platform with no component at all. The cross-crate pins are
+    /// Catches: a host asked for a tarball it does not run (a platform asked for a second
+    /// component that is not built for it, so no release was ever complete or taken), and a
+    /// platform with no component at all. The cross-crate pins are
     /// `kbf-installer` (`the_components_of_each_platform_are_the_binary_its_host_runs`,
     /// `an_order_naming_the_components_the_store_needs_passes_the_name_check`) and `kbf-it`
     /// (`every_component_a_platform_needs_is_in_its_release_set`).

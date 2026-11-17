@@ -138,7 +138,6 @@ fn a_record_expires_by_roots_first_seen_time_not_the_files() {
     // A record root first sees at T1 and is still in the spool 1801 s later (here: the
     // installer was held, so it was seen but not taken) is expired.
     let mut rig = Rig::new("expiry-stale");
-    rig.leases.set(0);
     rig.put(&rig.rec(5, 1, 1, Verb::Activate, B));
     let memory_path = rig.root.join("var/lib/kbf-installer/helper.json");
     // Root has seen it at T0 - 1801 already (as a persisted first-seen time).
@@ -307,34 +306,6 @@ fn the_restart_is_one_fixed_command() {
             ]
         )
     );
-    assert_eq!(
-        program(Restart::Launchd("com.komira.kbf-daemon".to_owned())),
-        (
-            "/bin/launchctl".to_owned(),
-            vec![
-                "kickstart".to_owned(),
-                "-k".to_owned(),
-                "system/com.komira.kbf-daemon".to_owned()
-            ]
-        )
-    );
-}
-
-/// Catches a confirm window the order chooses: on macOS the window starts at the swap and
-/// the helper clamps the order's `window_s` to its own 120..=1800 seconds.
-///
-/// Catches: the clamp dropped; the bounds swapped.
-#[test]
-fn the_window_an_order_asks_for_is_clamped_on_macos() {
-    for (asked, kept) in [(5_u32, 120_u64), (600, 600), (99_999, 1800)] {
-        let mut rig = Rig::on(&format!("window-{asked}"), Platform::MacOs);
-        let mut r = rig.rec(5, 1, 1, Verb::Activate, B);
-        r.window_s = asked;
-        rig.put(&r);
-        rig.cycle(T0 + 3);
-        let pending = rig.state().pending_confirm.expect("on trial");
-        assert_eq!(pending.deadline_wall, Some(T0 + 3 + kept), "asked {asked}");
-    }
 }
 
 /// Catches orders taken in the order the directory lists them: three orders in one pass
