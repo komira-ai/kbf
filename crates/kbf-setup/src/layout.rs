@@ -109,11 +109,6 @@ impl Platform {
         Platform::Linux
     }
 
-    /// The user database this platform has: `getent`.
-    pub fn user_db(self) -> kbf_host::user::UserDb {
-        kbf_host::user::UserDb::Getent
-    }
-
     /// `linux`, as the command line spells it.
     pub fn name(self) -> &'static str {
         "linux"

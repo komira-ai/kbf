@@ -287,6 +287,15 @@ fn wants_keys(stored: &StoredConfig) -> bool {
         && stored.roles.iter().any(|r| r == Role::Storage.name())
 }
 
+/// What a node is told when its frontend asks for object-store keys to be fetched, which this
+/// build does not do: only a node with a storage role is told.
+fn keys_warning(stored: &StoredConfig) -> Option<&'static str> {
+    wants_keys(stored).then_some(
+        "the frontend asks for object-store keys to be fetched; this build does not, and the \
+         object-store client uses the credentials of this process",
+    )
+}
+
 /// How long a start waits before its `attempt`th retry (0 is the first): 5 seconds,
 /// doubling, at most 5 minutes. A frontend that is down for a minute is found again at
 /// once; one down for an hour is asked every 5 minutes, not in a loop.
@@ -440,12 +449,9 @@ pub fn run_with(
     crate::check_settings(want.mode, &args.config).map_err(Failure::Settings)?;
     let outcome = enroll_with_retry(&loaded, want, env)?;
     let node = outcome.node;
-    if wants_keys(&node.config) {
-        eprintln!(
-            "kbf: warning: the frontend asks for object-store keys to be fetched; this \
-             build does not, and the object-store client uses the credentials of this process"
-        );
-    }
+    keys_warning(&node.config)
+        .into_iter()
+        .for_each(|warning| eprintln!("kbf: warning: {warning}"));
     let argv = plan(&loaded.config, &node, &loaded.store, want)?;
     let invocation = parse_planned(argv, &args.config).map_err(Failure::Mode)?;
 

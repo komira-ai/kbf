@@ -64,7 +64,7 @@ mod tests {
             "xY9".repeat(60),
             "z_".repeat(60)
         );
-        assert!(long.len() > 255 && long.len() <= 1024, "{}", long.len());
+        assert!((256..=1024).contains(&long.len()), "{}", long.len());
         assert_eq!(read("token-long", &format!("{long}\n")), Ok(long));
         assert_eq!(
             read("token-max", &"a".repeat(MAX_TOKEN_BYTES)).map(|t| t.len()),

@@ -135,6 +135,24 @@ fn a_few_seeds_of_each_tier_fault_meet_it_and_keep_every_property() {
     );
 }
 
+/// Catches a local read failed by a disk fault being answered as a lost blob: on seeds whose
+/// disk fault (an I/O error, not a full disk) fails a read of a staged block, the run keeps
+/// every property (a read the fault failed is served by the store, or is unavailable for now,
+/// never missing) and at least one such read was met.
+#[test]
+fn a_local_read_failed_by_a_disk_fault_is_not_a_lost_blob() {
+    let met: u64 = [9, 27, 33]
+        .into_iter()
+        .map(|seed| {
+            swept(Kind::TierDiskFull, seed..seed + 1)
+                .each()
+                .map(|r| r.tier.read_errors)
+                .sum::<u64>()
+        })
+        .sum();
+    assert!(met > 0, "no disk fault failed a local read");
+}
+
 /// Catches a tier crash point that never fires, or a restart after it that breaks a
 /// property: random points over a few seeds, and every pinned point under a kill.
 #[test]

@@ -8,8 +8,6 @@
 //! - An order becomes a small [`OrderRecord`] ([`record`]) in the [order spool](spool): its
 //!   components and expected facts are carried by the record, and the installer reads it with
 //!   [`OrderRecord::parse`].
-//! - [`Status`] says where the node stands, from its own state and the installer's status
-//!   file ([`helper`]).
 //!
 //! The writer that fed these from a worker daemon's session with the frontend is gone with the
 //! daemon; the formats stay, because a release on the other side of an update reads and writes
@@ -26,7 +24,6 @@
 
 #[cfg(test)]
 mod fixtures;
-pub mod helper;
 mod offer;
 pub mod record;
 pub mod spool;
@@ -37,6 +34,6 @@ pub use record::{
     Facts, Locator, MAX_AGE_SECS, MAX_RECORD_BYTES, MAX_RECORDS, OrderRecord, RecordError,
 };
 pub use types::{
-    Available, COMPONENT_NAMES, Component, Expected, MAX_ATTESTATION_BYTES, MAX_COMPONENT_BYTES,
-    Offer, Order, ReleaseSource, Source, Staged, State, Status, Verb,
+    COMPONENT_NAMES, Component, Expected, MAX_ATTESTATION_BYTES, MAX_COMPONENT_BYTES, Offer, Order,
+    Source, Verb,
 };

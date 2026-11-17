@@ -335,6 +335,42 @@ fn only_a_storage_node_asked_for_keys_is_told_they_are_not_fetched() {
     assert!(!with(&["storage"], 0));
 }
 
+/// Catches the keys warning missing or worded differently for a storage node asked for keys,
+/// and a warning for any other node.
+#[test]
+fn the_keys_warning_is_for_a_storage_node_asked_for_keys_alone() {
+    let mut stored = sent(&["storage"]);
+    stored.credential_mode = 1;
+    assert_eq!(
+        keys_warning(&stored),
+        Some(
+            "the frontend asks for object-store keys to be fetched; this build does not, and the \
+             object-store client uses the credentials of this process"
+        )
+    );
+    stored.credential_mode = 2;
+    assert_eq!(keys_warning(&stored), None);
+}
+
+/// Catches a reload interval of 0 (the frontend sent none) passed to the mode as a flag: the
+/// mode then keeps its own default.
+#[test]
+fn a_storage_node_told_no_reload_interval_passes_none() {
+    let c = case("sent-no-reload");
+    let config = config(&c.root, "[storage]\n");
+    let mut stored = sent(&["storage"]);
+    stored.tls_reload_interval_s = 0;
+    let node = enrolled(&["storage"], stored);
+    let argv = plan(&config, &node, &c.store, want(names::STORAGE)).expect("a plan");
+    assert!(
+        strings(&argv)
+            .iter()
+            .all(|a| !a.starts_with("--tls-reload-interval-secs")),
+        "{:?}",
+        strings(&argv)
+    );
+}
+
 /// Catches a loop that spins (a wait of nothing, or of a time already past) or that sleeps
 /// longer than its cap (a clock that jumped, a machine that slept).
 #[test]

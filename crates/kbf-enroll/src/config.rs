@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
-use kbf_types::{NodeId, RoleSet};
+use kbf_types::NodeId;
 use serde::Deserialize;
 use toml::Spanned;
 
@@ -251,7 +251,6 @@ pub struct Config {
     pub meta_dir: PathBuf,
     /// `tls.trust`.
     pub trust: Trust,
-    storage_table: bool,
 }
 
 /// Accumulates problems with their lines.
@@ -623,7 +622,6 @@ impl Config {
                 hot_dir,
                 meta_dir,
                 trust,
-                storage_table: raw.storage.is_some(),
             }),
             _ => Err(Problems(check.problems)),
         }
@@ -651,25 +649,8 @@ impl Config {
             hot_dir: state_dir.join("hot"),
             meta_dir: state_dir.join("meta"),
             trust: Trust::Pin,
-            storage_table: false,
             state_dir,
         }
-    }
-
-    /// Warnings once the roles are known (they come from the token, not the file): a
-    /// `[storage]` table for a role the frontend did not grant, and an `advertise` on a node
-    /// granted no storage role.
-    #[must_use]
-    pub fn role_warnings(&self, granted: RoleSet) -> Vec<String> {
-        use kbf_types::Role;
-        let mut out = Vec::new();
-        if self.storage_table && !granted.contains(Role::Storage) {
-            out.push("[storage] is set but the frontend granted no storage role".to_owned());
-        }
-        if self.advertise.is_some() && !granted.contains(Role::Storage) {
-            out.push("node.advertise is set but the frontend granted no storage role".to_owned());
-        }
-        out
     }
 
     /// The checks that read the file system, for directories that exist: no symlink in

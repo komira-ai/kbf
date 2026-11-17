@@ -119,47 +119,6 @@ impl Source {
     }
 }
 
-/// The release the host's package carries, once its installer has found it whole (its digests
-/// and its build attestation) and newer than any release the host has confirmed: the release
-/// an operator can order by its commit with [`Source::Staged`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Available {
-    /// The commit: 40 lowercase hex digits.
-    pub commit: String,
-    /// The number of commits behind it, which puts two builds of one branch in order.
-    pub seq: u64,
-}
-
-/// Where the host's installer fetches the releases it is ordered to install from. An order that
-/// fetches cannot be carried out by a host that fetches nothing, so the frontend asks.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ReleaseSource {
-    /// The installer does not say: it predates the report, or could not read its settings.
-    #[default]
-    Unreported,
-    /// An https file server.
-    Url,
-    /// The frontend's release store.
-    Frontend,
-    /// Nothing: the release is the one the host's package carries.
-    Bundled,
-}
-
-impl ReleaseSource {
-    /// The source the word in `status.json` names. A word this build does not know is
-    /// [`ReleaseSource::Unreported`]: the installer is the gate on what it fetches, and this is
-    /// only what the frontend is told.
-    #[must_use]
-    pub fn from_word(word: &str) -> Self {
-        match word {
-            "url" => Self::Url,
-            "frontend" => Self::Frontend,
-            "bundled" => Self::Bundled,
-            _ => Self::Unreported,
-        }
-    }
-}
-
 /// The frontend's order that this node change now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Order {
@@ -180,91 +139,6 @@ pub struct Order {
     /// not know: the client refuses that order. (Unlike `verb`, an unset message is
     /// `Some(Source::Fetch)`.)
     pub source: Option<Source>,
-}
-
-/// Where the node stands, as the frontend is told.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum State {
-    /// Nothing ordered.
-    Idle,
-    /// The installer is pulling the release of an order.
-    Fetching,
-    /// The installer holds the offered release verified, not yet switched to.
-    Staged,
-    /// The helper switched to a release and awaits its confirmation.
-    ActivatedUnconfirmed,
-    /// The helper switched and the release is confirmed.
-    Confirmed,
-    /// The helper went back to the previous release.
-    Reverted,
-    /// An offer or an order was refused, or the helper's status cannot be read; the
-    /// reason is in [`Status::refusal`].
-    Refused,
-    /// This node updates by hand: no update directory, or no helper has reported.
-    Manual,
-}
-
-/// The facts of a staged release the frontend plans by.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Staged {
-    /// The wire protocol of the staged build.
-    pub protocol: u32,
-    /// The oldest protocol it still speaks.
-    pub min_protocol: u32,
-    /// The state schema it reads.
-    pub state_schema: u32,
-}
-
-/// What the node reports after every change and after each Welcome.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Status {
-    /// The commit this process was built from (its own word, not the helper's).
-    pub running_commit: String,
-    /// The release the helper says is installed.
-    pub installed_commit: Option<String>,
-    /// The release the helper says is staged.
-    pub staged_commit: Option<String>,
-    /// Where the node stands.
-    pub state: State,
-    /// Why the node is [`State::Refused`]; empty otherwise.
-    pub refusal: String,
-    /// The newest order this node accepted; 0 before any.
-    pub acked_order_id: u64,
-    /// The newest offer generation this node has acted on or refused; 0 before any.
-    pub offered_generation: u64,
-    /// Whether a helper has reported through the status file.
-    pub helper_present: bool,
-    /// The staged release's protocol facts, when the helper reported them.
-    pub staged: Option<Staged>,
-    /// The release the host's package carries, when the helper says it is whole and newer than
-    /// what the host has confirmed.
-    pub available: Option<Available>,
-    /// Where the helper fetches releases from, when it says.
-    pub release_source: ReleaseSource,
-    /// Whether the node is in the update gate: it takes no lease until the update
-    /// settles. Not on the wire.
-    pub gated: bool,
-}
-
-impl Status {
-    /// The status of a node with no update directory: it updates by hand.
-    #[must_use]
-    pub fn manual(running_commit: &str) -> Self {
-        Self {
-            running_commit: running_commit.to_owned(),
-            installed_commit: None,
-            staged_commit: None,
-            state: State::Manual,
-            refusal: String::new(),
-            acked_order_id: 0,
-            offered_generation: 0,
-            helper_present: false,
-            staged: None,
-            available: None,
-            release_source: ReleaseSource::Unreported,
-            gated: false,
-        }
-    }
 }
 
 /// Whether `text` is exactly `len` lowercase hexadecimal digits.

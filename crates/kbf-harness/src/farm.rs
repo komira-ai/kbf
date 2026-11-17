@@ -51,16 +51,13 @@ pub struct Farm {
     members: Vec<Member>,
     /// The frontend's REAPI listener.
     reapi: String,
-    /// What a client dials: the frontend's REAPI port.
-    client_port: u16,
     api: u16,
     ca: Vec<u8>,
     storage_nodes: usize,
     /// How long [`Farm::try_wait`] and [`Farm::stop_all`] wait before giving up.
     hang: Duration,
-    /// The block of ports the farm's processes bind, held while the farm lives, and the
-    /// ports of it that the processes were told.
-    claim: Option<(Claim, Ports)>,
+    /// The block of ports the farm's processes bind, held while the farm lives.
+    _claim: Option<Claim>,
     /// A scratch directory the farm removes when it drops. The last field: fields drop in
     /// order, so every process (each [`Proc`] kills and reaps its group as it drops) is
     /// gone before the directory they write into.
@@ -138,12 +135,11 @@ impl Farm {
             logs: logs.to_owned(),
             members: Vec::new(),
             reapi: String::new(),
-            client_port: front.0,
             api: wiring.api,
             ca: Vec::new(),
             storage_nodes: nodes,
             hang: HANG,
-            claim: Some((claim, ports.clone())),
+            _claim: Some(claim),
             scratch: None,
         };
         // The frontend: its unit as packaged, a state directory made.
@@ -214,12 +210,11 @@ impl Farm {
             logs: logs.to_owned(),
             members: Vec::new(),
             reapi: String::new(),
-            client_port: 0,
             api: 0,
             ca: Vec::new(),
             storage_nodes: 0,
             hang: HANG,
-            claim: None,
+            _claim: None,
             scratch: None,
         };
         for (role, spec) in specs {
@@ -512,14 +507,6 @@ impl Farm {
         text
     }
 
-    /// The ports the processes were told and the block they were taken from (a farm of
-    /// [`Farm::start`]; none for a supervised one).
-    #[must_use]
-    pub fn ports(&self) -> Option<(&Ports, std::ops::Range<u16>)> {
-        let (claim, ports) = self.claim.as_ref()?;
-        Some((ports, claim.base()..claim.base() + crate::ports::BLOCK))
-    }
-
     /// `POST path` with the JSON `body` to the frontend's operator API, as an operator with
     /// the farm's token does: the status code and the body, or `None` while nothing answers.
     #[must_use]
@@ -550,23 +537,10 @@ impl Farm {
         crate::procs::log_hits(&self.logs, needle)
     }
 
-    /// The frontend's operator API port (on loopback).
-    #[must_use]
-    pub fn api_port(&self) -> u16 {
-        self.api
-    }
-
     /// The frontend's REAPI address as it printed it, for a client of the frontend itself.
     #[must_use]
     pub fn reapi(&self) -> &str {
         &self.reapi
-    }
-
-    /// The port a build client dials (`localhost:<port>`, under the farm CA): the
-    /// frontend's REAPI port.
-    #[must_use]
-    pub fn client_port(&self) -> u16 {
-        self.client_port
     }
 
     /// The farm CA's certificate, PEM.

@@ -82,13 +82,21 @@ fn only_a_taken_or_a_refused_result_is_acknowledged() {
 /// Catches a `Result` the scheduler gave no answer to taken as what it is not. The current
 /// lease's is not acknowledged, so the worker sends it again (a refusal would lose it),
 /// unless the farm is fenced, which refuses every `Result` as stale. A held finish waits
-/// for the store, a copy of an answered one is dropped, and any other refusal stands.
+/// for the store, a copy of an answered one is dropped, and any other refusal stands. The
+/// current lease's is logged as an error that says the worker sends it again.
 #[test]
 fn a_result_given_no_answer_is_taken_by_what_its_lease_stands_for() {
+    let log = crate::test_log::capture();
     let (operation, lease) = (kbf_types::OperationId(1), kbf_types::LeaseId::new(1, 1));
     let worker = WorkerId::new("node-a");
     let taken = |standing, fenced| not_answered(standing, fenced, operation, lease, &worker);
     assert_eq!(taken(Ok(()), false), Taken::Unanswered);
+    let told = log.text();
+    assert!(
+        told.contains("took no answer from the result of the operation's current lease")
+            && told.contains("the worker sends it again"),
+        "{told}"
+    );
     assert_eq!(taken(Ok(()), true), Taken::Refused(Reason::Stale));
     assert_eq!(taken(Err(Verdict::Held), false), Taken::Held);
     assert_eq!(

@@ -3,8 +3,6 @@
 
 use std::os::unix::fs::{PermissionsExt, symlink};
 
-use kbf_types::{Role, RoleSet};
-
 use super::*;
 
 fn host() -> Host {
@@ -400,20 +398,6 @@ fn all_the_problems_are_reported_together() {
     assert_eq!(shown.matches("; ").count(), 2);
 }
 
-#[test]
-fn warnings_name_the_tables_for_roles_the_frontend_did_not_grant() {
-    let c = ok(&format!(
-        "{MINIMAL}[node]\nadvertise = \"n.example.net:80\"\n[storage]\n"
-    ));
-    let storage = RoleSet::new([Role::Storage]).unwrap();
-    assert!(c.role_warnings(storage).is_empty());
-    let updater = RoleSet::new([Role::Updater]).unwrap();
-    let w = c.role_warnings(updater);
-    assert_eq!(w.len(), 2, "{w:?}");
-    assert!(w[0].starts_with("[storage]") && w[1].starts_with("node.advertise"));
-    assert!(ok(MINIMAL).role_warnings(updater).is_empty());
-}
-
 // ---- the file-system checks -------------------------------------------------------
 
 fn config_for(state: &Path) -> Config {
@@ -581,10 +565,5 @@ fn an_updaters_config_is_the_four_values_and_the_defaults() {
     assert_eq!(
         (&config.mode, &config.advertise, config.zone.as_str()),
         (&None, &None, "")
-    );
-    assert!(
-        config
-            .role_warnings(RoleSet::new([kbf_types::Role::Updater]).unwrap())
-            .is_empty()
     );
 }

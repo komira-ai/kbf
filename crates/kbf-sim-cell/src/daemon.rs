@@ -377,4 +377,43 @@ mod tests {
         d.apply(message(30_001, start(1, 1)));
         assert!(runs(&d).is_empty(), "a reported lease ran again");
     }
+
+    /// Catches a daemon that runs a lease it has already reported once the server has
+    /// acknowledged the result (nothing then holds the lease but its record of having
+    /// reported it), and one that takes a `Start` after its contact is lost.
+    #[test]
+    fn a_start_is_not_taken_for_a_lease_reported_and_acknowledged_or_after_contact_is_lost() {
+        let mut d = FakeDaemon::new(
+            NodeId::from("server"),
+            "d-1".to_owned(),
+            Resources::new(1_000, 1),
+        );
+        d.apply(input(0, Event::Start));
+        d.apply(message(1, welcome(1)));
+        d.apply(message(2, start(1, 1)));
+        d.apply(input(30_000, Event::Timer { tag: T_POLL }));
+        assert!(d.reported().contains(&LeaseId::new(1, 1)));
+        d.apply(message(
+            30_001,
+            Msg::ResultAck {
+                lease: LeaseId::new(1, 1),
+                accepted: true,
+            },
+        ));
+        d.apply(message(30_002, start(1, 1)));
+        assert!(runs(&d).is_empty(), "an acknowledged lease ran again");
+
+        // On a daemon whose Hello was confirmed at 0 ms, contact is lost from 40 s on.
+        let mut d = FakeDaemon::new(
+            NodeId::from("server"),
+            "d-2".to_owned(),
+            Resources::new(1_000, 1),
+        );
+        d.apply(input(0, Event::Start));
+        d.apply(message(1, welcome(1)));
+        d.apply(message(39_999, start(1, 2)));
+        assert_eq!(runs(&d), [LeaseId::new(1, 2)]);
+        d.apply(message(40_000, start(1, 3)));
+        assert_eq!(runs(&d), [LeaseId::new(1, 2)], "taken with contact lost");
+    }
 }

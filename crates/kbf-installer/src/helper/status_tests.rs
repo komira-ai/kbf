@@ -1,15 +1,11 @@
-//! `status.json` as the helper writes it: the golden bytes of the writer, and the node's reader
+//! `status.json` as the helper writes it: the golden bytes of the writer, and the strict reader
 //! reading them. What each test proves is named on it, with the defect it catches.
-
-use std::fs;
-
-use kbf_update::Staged;
-use kbf_update::helper::{Helper, HelperState, Report};
 
 use super::*;
 use crate::golden::STATUS;
 use crate::helper::memory::StagedFacts;
 use crate::seed::Available;
+use crate::status_v2::{Phase, StatusV2};
 use crate::testkit::{A, B, C, c};
 
 /// The host the golden file describes: running A, B staged and refused, C before A, a package
@@ -58,40 +54,32 @@ fn the_golden_status_is_what_the_writer_writes() {
     assert_eq!(written, STATUS);
 }
 
-/// The node's reader reads what the writer writes, whole: the commits, the state word, the
-/// refusal, the order acknowledged, the staged facts, and the two keys this change adds, the
-/// seed that is available and the source the host fetches from.
+/// The strict reader reads what the writer writes, whole: the commits, the state word, the
+/// refusal, the order acknowledged, the staged facts, the seed that is available and the source
+/// the host fetches from.
 ///
-/// Catches a writer and a reader that disagree on a key (the node would then report nothing of
-/// the package to the frontend, silently), which the golden file alone cannot see.
-///
-/// Catches: the reader's `available` or `release_source` field renamed; the writer's
-/// key renamed.
+/// Catches a writer and a reader that disagree on a key, which the golden file alone cannot see.
 #[test]
-fn the_node_reads_what_the_writer_writes() {
+fn the_strict_reader_reads_what_the_writer_writes() {
     let (state, memory) = described();
-    let dir = kbf_host::testkit::scratch("status-node");
-    let path = dir.join("status.json");
-    fs::write(&path, render(&state, &memory)).expect("written");
-    let want = Report {
-        installed: Some(A.to_owned()),
-        previous: Some(C.to_owned()),
-        staged: Some(B.to_owned()),
-        state: HelperState::Refused,
-        refusal: "attestation: no valid attestation for kbf at commit 0123456789ab".to_owned(),
-        acked_order_id: 41,
-        staged_facts: Some(Staged {
-            protocol: 12,
-            min_protocol: 11,
-            state_schema: 4,
-        }),
-        available: Some(kbf_update::Available {
-            commit: B.to_owned(),
-            seq: 812,
-        }),
-        release_source: kbf_update::ReleaseSource::Bundled,
-    };
-    assert_eq!(kbf_update::helper::read(&path), Helper::Reported(want));
+    let read = StatusV2::parse(&render(&state, &memory)).expect("parses");
+    assert_eq!(read.installed_commit.as_ref().map(|c| c.as_str()), Some(A));
+    assert_eq!(read.previous_commit.as_ref().map(|c| c.as_str()), Some(C));
+    assert_eq!(read.staged_commit.as_ref().map(|c| c.as_str()), Some(B));
+    assert_eq!(read.state, Phase::Refused);
+    assert_eq!(
+        read.refusal,
+        "attestation: no valid attestation for kbf at commit 0123456789ab"
+    );
+    assert_eq!(read.acked_order_id, 41);
+    let staged = read.staged.expect("staged facts");
+    assert_eq!(
+        (staged.protocol, staged.min_protocol, staged.state_schema),
+        (12, 11, 4)
+    );
+    let available = read.available.expect("seed");
+    assert_eq!((available.commit.as_str(), available.seq), (B, 812));
+    assert_eq!(read.release_source.as_deref(), Some("bundled"));
 }
 
 /// A status of a host with no seed to announce and no source it could read carries neither key,
@@ -112,7 +100,7 @@ fn a_status_with_no_seed_and_no_source_carries_neither_key() {
 }
 
 /// Asserts that the id of the order a refusal answers is told while there is one, that the strict
-/// reader reads it, and that the node's reader ignores the key and still reports the status. A
+/// reader reads it. A
 /// status whose refusal is no order's has no such key.
 #[test]
 fn the_order_a_refusal_answers_is_told_and_read_by_the_strict_reader_and_the_node() {
@@ -124,11 +112,6 @@ fn the_order_a_refusal_answers_is_told_and_read_by_the_strict_reader_and_the_nod
     assert_eq!(json["refused_order_id"], 41);
     let strict = StatusV2::parse(&bytes).expect("parses");
     assert_eq!(strict.refused_order_id, Some(41));
-    let dir = kbf_host::testkit::scratch("status-refused-id");
-    let path = dir.join("status.json");
-    fs::write(&path, &bytes).expect("written");
-    let node = kbf_update::helper::read(&path);
-    assert!(matches!(node, Helper::Reported(_)), "{node:?}");
 
     let (state, memory) = described();
     let bytes = render(&state, &memory);

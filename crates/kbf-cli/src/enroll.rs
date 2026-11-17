@@ -36,7 +36,7 @@ use kbf_enroll::pin::{Anchor, system_roots};
 use kbf_enroll::store::{Node as Enrolled, Store, StoreError};
 use kbf_enroll::token::{self, TokenFileError};
 use kbf_proto::kbf::enroll::v1::NodeFacts;
-use kbf_types::{CaPin, Role, RoleSet, RoleSetError};
+use kbf_types::{CaPin, Role, RoleSet};
 
 use crate::names;
 
@@ -172,9 +172,6 @@ pub enum Failure {
          `kbf --mode={0} <flags>`"
     )]
     FlagsOnly(String),
-    /// A set of roles that cannot be (none, or one twice).
-    #[error("roles: {0}")]
-    Roles(#[from] RoleSetError),
     /// What the frontend granted cannot be run here, or is not complete.
     #[error("{0}")]
     Plan(String),
@@ -352,9 +349,6 @@ pub fn ensure_enrolled(loaded: &Loaded, want: Want, env: &Env) -> Result<Outcome
         };
         Ok::<_, Failure>(enroll(&frontend, &loaded.store, &attempt).await?)
     })?;
-    for warning in config.role_warnings(RoleSet::new(node.roles())?) {
-        eprintln!("kbf: warning: {warning}");
-    }
     Ok(Outcome { node, fresh: true })
 }
 

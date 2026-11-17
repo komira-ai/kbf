@@ -35,3 +35,17 @@ fn a_binary_that_was_not_built_says_how_to_build_it() {
     let dir = crate::scratch("stand-in-missing");
     let _ = sibling_of(&dir.join("debug/deps/x"), "not-there");
 }
+
+#[test]
+fn a_built_binary_is_found_beside_the_running_test_binary() {
+    // Catches: a lookup that does not start from the running test binary: the stand-in this
+    // package builds is found in the profile directory above the test binary's own.
+    let found = sibling_bin("kbf-harness-watcher");
+    assert!(found.is_file(), "{}", found.display());
+    assert_eq!(
+        found.file_name().and_then(|n| n.to_str()),
+        Some("kbf-harness-watcher")
+    );
+    let exe = std::env::current_exe().expect("the test binary");
+    assert!(exe.starts_with(found.parent().expect("a directory")));
+}

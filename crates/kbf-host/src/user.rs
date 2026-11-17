@@ -39,24 +39,10 @@ pub enum UserError {
     Output { cmd: String, out: String },
 }
 
-/// Which tool reads the host's user database: `getent passwd`, the only one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UserDb {
-    /// `getent passwd`.
-    Getent,
-}
-
-/// `name` as this host's user database has it: see [`lookup_on`].
+/// `name` as this host's user database has it: the uid, gid and home from `getent passwd`, the
+/// groups from `id -G`. `None` when there is no such user (`getent` exits 2).
 pub fn lookup<E: Exec>(exec: &E, name: &str) -> Result<Option<RunUser>, UserError> {
-    lookup_on(exec, name, UserDb::Getent)
-}
-
-/// `name` as `db` has it: the uid, gid and home from `getent passwd`, the groups from
-/// `id -G`. `None` when there is no such user (`getent` exits 2).
-pub fn lookup_on<E: Exec>(exec: &E, name: &str, db: UserDb) -> Result<Option<RunUser>, UserError> {
-    let record = match db {
-        UserDb::Getent => getent(exec, name)?,
-    };
+    let record = getent(exec, name)?;
     let Some((uid, gid, home)) = record else {
         return Ok(None);
     };

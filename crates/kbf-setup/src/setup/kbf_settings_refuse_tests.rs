@@ -42,7 +42,7 @@ fn base(mode: Mode) -> KbfFlags {
 /// untouched (exit 2).
 #[test]
 fn every_invalid_setting_is_refused_by_flag_and_without_its_value() {
-    let cases: [(Mode, &str, Mutate, &str); 16] = [
+    let cases: [(Mode, &str, Mutate, &str); 18] = [
         (
             Mode::Frontend,
             "listen",
@@ -90,6 +90,18 @@ fn every_invalid_setting_is_refused_by_flag_and_without_its_value() {
             "worker-client-ca",
             |k, v| k.worker_client_ca = some(v),
             "/etc/kbf/../SECRET.pem",
+        ),
+        (
+            Mode::Frontend,
+            "worker-tls-cert",
+            |k, v| k.worker_tls_cert = some(v),
+            "/etc/kbf/\"SECRET\".pem",
+        ),
+        (
+            Mode::Frontend,
+            "worker-tls-cert",
+            |k, v| k.worker_tls_cert = some(v),
+            "/etc/kbf/SECRET\\.pem",
         ),
         (
             Mode::Frontend,

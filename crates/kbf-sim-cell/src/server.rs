@@ -309,13 +309,6 @@ impl Server {
         std::mem::take(&mut self.out)
     }
 
-    /// Whether the server's process is running (its log open, or stopped and
-    /// answering reads).
-    #[must_use]
-    pub fn is_up(&self) -> bool {
-        self.up.is_some()
-    }
-
     /// The applied metadata state, while the server is up.
     #[must_use]
     pub fn meta(&self) -> Option<MetaState> {

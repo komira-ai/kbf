@@ -148,6 +148,11 @@ pub(super) fn state_fault(e: impl std::fmt::Display) -> Fault {
     Fault::failed(Code::StateUnavailable, e.to_string())
 }
 
+/// A switch that could not be made: the installer's refusal, or the state it keeps.
+fn switch_failed(e: impl std::fmt::Display) -> Fault {
+    Fault::failed(Code::SwitchFailed, e.to_string())
+}
+
 /// The scratch directory `<work>/<prefix>.fetch` (and its `home`) that the unprivileged user
 /// `who` fetches into, made new and owned by it; `work` is made, readable by all, if it is not
 /// there.
@@ -238,16 +243,16 @@ impl<E: Exec> Linux<E> {
     /// (Unix seconds), whatever the number of starts of the release. The installer's own
     /// activation starts the window at the release's first start; the update of this socket
     /// owns its revert and counts from its own swap.
-    fn arm(&self, deadline: u64) -> Result<(), state::StateError> {
-        let lock = state::Locked::acquire(&self.layout)?;
-        let Some(mut now) = lock.read()? else {
+    pub(super) fn arm(&self, deadline: u64) -> Result<(), Fault> {
+        let lock = state::Locked::acquire(&self.layout).map_err(switch_failed)?;
+        let Some(mut now) = lock.read().map_err(switch_failed)? else {
             return Ok(());
         };
         if let Some(pending) = now.pending_confirm.as_mut() {
             pending.deadline_wall = Some(deadline);
             pending.starts_left = None;
         }
-        lock.write(&now)
+        lock.write(&now).map_err(switch_failed)
     }
 
     fn restart_units(&self) -> Result<(), String> {
@@ -592,11 +597,8 @@ impl<E: Exec> Backend for Linux<E> {
             TRIAL_STARTS,
             &mut out,
         );
-        match swapped.map_err(|e| Fault::failed(Code::SwitchFailed, e.to_string()))? {
-            Activated::Swapped | Activated::Repeat => {
-                self.arm(now + window_secs)
-                    .map_err(|e| Fault::failed(Code::SwitchFailed, e.to_string()))?;
-            }
+        match swapped.map_err(switch_failed)? {
+            Activated::Swapped | Activated::Repeat => self.arm(now + window_secs)?,
             Activated::AlreadyCurrent => {
                 return Err(Fault::refused(
                     Code::NotStaged,

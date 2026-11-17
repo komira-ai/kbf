@@ -570,6 +570,55 @@ fn the_installers_refusals_are_the_switchs_failures() {
     assert!(rig.systemctl().is_empty());
 }
 
+/// The window of a swap on trial is armed at the swap: its deadline is the one given and the
+/// count of starts is dropped, so the update of this socket owns the revert. With nothing on
+/// trial, or no state at all, arming changes nothing and fails nothing.
+///
+/// Catches: a trial left on the installer's start count, whose deadline never counts from the
+/// swap; an arm that writes a state for a host with none, or invents a trial.
+#[test]
+fn arming_sets_the_deadline_of_a_trial_and_leaves_a_host_without_one_alone() {
+    let rig = Rig::new("arm");
+    rig.stage().unwrap();
+    assert_eq!(rig.backend.switch(COMMIT, 600, 1_000).unwrap(), 1_600);
+    let pending = rig.state().pending_confirm.unwrap();
+    assert_eq!(
+        (pending.deadline_wall, pending.starts_left),
+        (Some(1_600), None)
+    );
+    rig.backend.arm(2_000).unwrap();
+    let pending = rig.state().pending_confirm.unwrap();
+    assert_eq!(pending.deadline_wall, Some(2_000));
+
+    let calm = Rig::new("arm-calm");
+    calm.backend.arm(2_000).unwrap();
+    assert!(calm.state().pending_confirm.is_none());
+    assert_eq!(calm.state().current.unwrap().to_string(), A);
+
+    // A state that is gone from a host that was provisioned is a failed switch, not a guess.
+    let lost = Rig::new("arm-lost");
+    for file in [lost.layout.state_file(), lost.layout.state_backup()] {
+        let _ = fs::remove_file(lost.layout.join(&file));
+    }
+    let fault = lost.backend.arm(2_000).unwrap_err();
+    assert_eq!(fault.code, Code::SwitchFailed, "{fault:?}");
+    assert!(fault.detail.contains("unusable"), "{fault:?}");
+
+    // A host never provisioned (no state, no link) has nothing to arm.
+    let bare = Rig::new("arm-bare");
+    for file in [bare.layout.state_file(), bare.layout.state_backup()] {
+        let _ = fs::remove_file(bare.layout.join(&file));
+    }
+    for entry in fs::read_dir(bare.releases()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_symlink() {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    bare.backend.arm(2_000).unwrap();
+    assert!(state::read_unlocked(&bare.layout).unwrap().is_none());
+}
+
 /// A confirm clears the marker and keeps the release; a revert puts the links and the state back
 /// on the release that ran and restarts the units on it, needing nothing of the release on trial;
 /// a revert when the units will not start says so, with the host back.

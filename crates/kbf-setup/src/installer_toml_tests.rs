@@ -498,6 +498,35 @@ fn the_proxy_table_is_rendered_and_read_back_with_every_key() {
     assert_eq!(InstallerToml::parse(&back.render()).expect("again"), back);
 }
 
+/// Catches a `[proxy]` table that serves its certificates by name losing them on a rewrite: a
+/// table with `[[proxy.server_cert]]` entries and no `server_cert_file`/`server_key_file` pair
+/// keeps its entries (names, files and the default mark), its `listen` and `admin_listen`
+/// addresses, renders back byte for byte, and `proxy_listen` reads the address it gives.
+#[test]
+fn a_proxy_table_with_certificates_by_name_and_addresses_survives_a_rewrite() {
+    let text = PROXY_HOST
+        .replace("operator_token_file", "listen = \"127.0.0.1:8443\"\noperator_token_file")
+        .replace("server_cert_file = \"/etc/kbf/reapi.pem\"\n", "")
+        .replace("server_key_file = \"/etc/kbf/reapi.key\"\n", "")
+        .replace(
+            "ui = true\n",
+            "ui = true\nadmin_listen = \"127.0.0.1:9443\"\n\n[[proxy.server_cert]]\n\
+             names = [\"a.example\", \"b.example\"]\ncert_file = \"/etc/kbf/a.pem\"\n\
+             key_file = \"/etc/kbf/a.key\"\ndefault = true\n\n[[proxy.server_cert]]\n\
+             names = [\"c.example\"]\ncert_file = \"/etc/kbf/c.pem\"\nkey_file = \"/etc/kbf/c.key\"\n",
+        );
+    let parsed = InstallerToml::parse(&text).expect("parses");
+    let proxy = parsed.proxy.as_ref().expect("a table");
+    assert_eq!(proxy.server_cert.len(), 2);
+    assert!(proxy.server_cert[0].default && !proxy.server_cert[1].default);
+    assert_eq!(
+        parsed.proxy_listen(),
+        Some("127.0.0.1:8443".parse().expect("addr"))
+    );
+    assert!(parsed.has_proxy_table());
+    assert_eq!(parsed.render(), text);
+}
+
 /// Catches `remote_operator_file` lost on a rewrite: `setup` parses `installer.toml` and renders
 /// it again, so a key that is read and not rendered switches the CI credential off silently on
 /// the next run. The key parses, survives `render`, and a table without it renders without it.
