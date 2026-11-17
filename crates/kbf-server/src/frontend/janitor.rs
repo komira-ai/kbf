@@ -1,9 +1,9 @@
 //! The janitor of `cas/b/`: the flags `--task-janitor-key-file` and its companions, and the
 //! [`Janitor`] they open, which sweeps the task packs nothing recorded.
 //!
-//! A task writes its packs (`cas/b/<lease>/<nonce>-<k>`) and large objects (`...-L<i>`) through
-//! presigned writes, or commits them into a put directory (`cas/b/<lease>/<nonce>/pack`,
-//! `.../pack<k>`, `.../L<i>`). A pack the ingest records stays where it lies and the index holds it. What
+//! A task commits its packs and large objects into a put directory (`cas/b/<lease>/<nonce>/pack`,
+//! `.../pack<k>`, `.../L<i>`); the packs (`cas/b/<lease>/<nonce>-<k>`) and large objects
+//! (`...-L<i>`) that earlier releases wrote through presigned writes are swept the same way. A pack the ingest records stays where it lies and the index holds it. What
 //! no one holds is an orphan: a run that was refused or failed after its write, the keys of a
 //! key set the task did not use, and a large object the ingest has copied into the CAS. The
 //! janitor deletes those, and nothing else.
@@ -12,7 +12,7 @@
 //!
 //! 1. says its age (`kbf_pack::task_key_age`: the minute it was minted in, from a `-<k>` or
 //!    `-L<i>` name, or the nonce of a put directory) and is older than `--task-janitor-grace-secs`, which is at least the 4 hours
-//!    a presigned write is good for and an hour more for the ingest, so a key is never deleted
+//!    the keys of a put directory are good for and an hour more for the ingest, so a key is never deleted
 //!    while a task can still write it or the ingest still read it (the flag's default is 6
 //!    hours);
 //! 2. is not under verification: every key of the key set an ingest is working on is held in the

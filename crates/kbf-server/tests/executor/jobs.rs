@@ -7,11 +7,11 @@ use tonic::Code;
 use crate::rig::{HOST, Rig, cancels, submits};
 
 /// Catches an executor that does not use the job service the way its design says: over actions
-/// that run, a whole-machine action, a submit whose answer is lost, a caller that cancels and a
+/// that run, a whole-machine action refused, a submit whose answer is lost, a caller that cancels and a
 /// job that did not end well, every call it makes is one of `SubmitJob`, `GetJob`, `CancelJob`,
 /// `GetResult` and `GetLogs`, and each of them is made (so the check is not about an empty
-/// list). The lost answer makes one job, sent twice; the whole-machine action is one job too,
-/// through the same calls; and the cancel is made for the one job of the cancelled operation.
+/// list). The lost answer makes one job, sent twice; the whole-machine action makes none; and the
+/// cancel is made for the one job of the cancelled operation.
 #[tokio::test]
 async fn the_traffic_with_the_job_service_is_the_five_calls_of_its_design() {
     let rig = Rig::start(&[HOST], |_| {}).await;
@@ -25,24 +25,27 @@ async fn the_traffic_with_the_job_service_is_the_five_calls_of_its_design() {
     }
     assert_eq!(rig.ingest.keys_read().len(), 2);
 
-    // A whole-machine action is one job, of the whole host, submitted and read as any other.
+    // A whole-machine action cannot commit into a put directory: it is refused as the caller's,
+    // and no job is submitted for it.
     let mut whole = rig.submit_whole(3);
-    let job = rig.first_job(3).await;
-    assert!(
-        job.spec
-            .needs
-            .as_ref()
-            .is_some_and(|needs| needs.whole_host)
-    );
-    rig.host_finishes(job.id(), HOST, 0);
-    assert!(matches!(whole.done().await, Finished::Ran(_)));
-    assert_eq!(rig.jobs_of(3).len(), 1);
+    match whole.done().await {
+        Finished::Failed(status) => {
+            assert_eq!(Code::from_i32(status.code), Code::InvalidArgument);
+            assert!(
+                status.message.contains("whole_machine"),
+                "{}",
+                status.message
+            );
+        }
+        other => panic!("not refused: {other:?}"),
+    }
+    assert!(rig.jobs_of(3).is_empty());
 
     // A submit whose answer is lost makes one job, which is sent again under its id.
     rig.fake.inject_on("SubmitJob", Fault::LoseAnswer);
     let mut lost = rig.submit(4);
     let job = rig.first_job(4).await;
-    rig.counter_reaches("kbf_executor_jobs_submitted_total", 4)
+    rig.counter_reaches("kbf_executor_jobs_submitted_total", 3)
         .await;
     assert_eq!(rig.jobs_of(4).len(), 1, "one job, whatever was sent");
     let sent: Vec<_> = submits(&rig.fake.calls())

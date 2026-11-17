@@ -20,7 +20,7 @@ use tokio::sync::oneshot;
 use super::base_tree::tests::bundle_dir;
 use super::pack_tests::{flags_over, index, pack_flags, scrape};
 use super::{FrontendFlags, FrontendHandle, Prepared, boxed};
-use crate::executor::{PrepareError, PreparedRun, RunPrepare, RunSource};
+use crate::executor::{MintedDir, PrepareError, PreparedPutDir, RunPrepare, RunSource};
 use crate::test_dir::scratch_dir;
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
@@ -30,13 +30,23 @@ pub(super) struct Idle;
 
 #[tonic::async_trait]
 impl RunPrepare for Idle {
-    async fn prepare_run(
+    async fn prepare_put_dir(
         &self,
         _: &str,
         _: &kbf_types::Digest,
         _: std::time::SystemTime,
         _: std::time::Duration,
-    ) -> Result<PreparedRun, PrepareError> {
+    ) -> Result<PreparedPutDir, PrepareError> {
+        Err(PrepareError::Unavailable("not prepared here".to_owned()))
+    }
+
+    async fn mint_put_dir(
+        &self,
+        _: &str,
+        _: &kbf_types::Digest,
+        _: std::time::SystemTime,
+        _: std::time::Duration,
+    ) -> Result<MintedDir, PrepareError> {
         Err(PrepareError::Unavailable("not prepared here".to_owned()))
     }
 }
@@ -276,12 +286,7 @@ async fn a_frontend_with_js_agent_serves_submits_no_job_unasked_and_leaves_none(
     let s3 = FakeS3::start().await;
     let dir = scratch_dir("executor-js");
     let fake = job_server(&["host-1"]).await;
-    let flags = flags(
-        dir.path(),
-        &s3,
-        &fake,
-        &["--executor=js-agent", "--executor-insecure-argv-secrets"],
-    );
+    let flags = flags(dir.path(), &s3, &fake, &["--executor=js-agent"]);
     let (handle, stop) = started(&flags, Some(source())).expect("starts");
     let api = handle.api.expect("the operator API");
     assert!(
@@ -322,12 +327,7 @@ async fn a_put_dir_frontend_starts_over_its_own_put_dir_preparation() {
     let s3 = FakeS3::start().await;
     let dir = scratch_dir("executor-put-dir-only");
     let fake = job_server(&["host-1"]).await;
-    let mut list = flag_list(
-        dir.path(),
-        &s3,
-        &fake,
-        &["--executor=js-agent", "--executor-insecure-argv-secrets"],
-    );
+    let mut list = flag_list(dir.path(), &s3, &fake, &["--executor=js-agent"]);
     list.retain(|flag| !flag.starts_with("--job-"));
     let flags = flags_over(Some("--storage=http://127.0.0.1:1"), &list);
     assert!(flags.put_dir.is_some() && flags.job_read.is_none());
@@ -349,7 +349,7 @@ async fn a_frontend_that_cannot_build_its_executor_does_not_start() {
     let s3 = FakeS3::start().await;
     let dir = scratch_dir("executor-refused");
     let fake = job_server(&["host-1"]).await;
-    let js = ["--executor=js-agent", "--executor-insecure-argv-secrets"];
+    let js = ["--executor=js-agent"];
 
     let good = flags(dir.path(), &s3, &fake, &js);
     let mut no_task = good.clone();
@@ -397,12 +397,7 @@ async fn a_js_agent_frontend_publishes_the_base_tree_and_records_it_before_it_se
     let s3 = FakeS3::start().await;
     let dir = scratch_dir("executor-base-tree");
     let fake = job_server(&["host-1"]).await;
-    let flags = flags(
-        dir.path(),
-        &s3,
-        &fake,
-        &["--executor=js-agent", "--executor-insecure-argv-secrets"],
-    );
+    let flags = flags(dir.path(), &s3, &fake, &["--executor=js-agent"]);
     let bundled = bundle_dir(
         &dir.path().join("base-tree"),
         crate::BUILD_COMMIT_FULL,
@@ -454,11 +449,7 @@ async fn a_missing_bundle_for_the_configured_arch_fails_the_start_naming_the_fla
         dir.path(),
         &s3,
         &fake,
-        &[
-            "--executor=js-agent",
-            "--executor-insecure-argv-secrets",
-            "--executor-arch=arm64",
-        ],
+        &["--executor=js-agent", "--executor-arch=arm64"],
     );
     let (store, state) = state_store();
     let (handle, _stop) = started_over(&flags, Some(source()), Some(state)).expect("starts");
@@ -483,7 +474,7 @@ async fn a_publish_that_fails_fails_the_start() {
     let s3 = FakeS3::start().await;
     let dir = scratch_dir("executor-base-tree-store");
     let fake = job_server(&["host-1"]).await;
-    let js = ["--executor=js-agent", "--executor-insecure-argv-secrets"];
+    let js = ["--executor=js-agent"];
     let flags = flags(dir.path(), &s3, &fake, &js);
     let bundled = bundle_dir(
         &dir.path().join("base-tree"),

@@ -3,20 +3,19 @@
 
 use std::time::Duration;
 
-use js_proto::v1::{Constraints, ExecMode, Isolation, NetworkLevel};
+use js_proto::v1::{Constraints, ExecMode, Isolation};
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::executor::mac::{MacPool, MacPoolError};
-use crate::executor::out::TaskOut;
-use crate::executor::task::Delivery;
+use crate::executor::out::PutDirRoots;
 
 /// The default of [`Config::failed_stderr_log_bytes`]: enough for the line a tool dies with.
 pub const FAILED_STDERR_LOG_BYTES: usize = 512;
 
-/// The longest a presigned url may be asked to stay good. The store refuses more, and the
-/// executor does not ask: [`Config::presign_ceiling`] stays under it, and the longest job's
+/// The longest the keys of a put directory may be asked to stay good. The store refuses more,
+/// and the executor does not ask: [`Config::key_ceiling`] stays under it, and the longest job's
 /// wall limit under that.
-pub const PRESIGN_LIMIT: Duration = Duration::from_secs(4 * 3600);
+pub const KEY_LIMIT: Duration = Duration::from_secs(4 * 3600);
 
 /// The default of [`Config::live`]: how long the liveness row of a process outlives its last
 /// renewal, and so how soon after a process ends another takes up its unfinished operations.
@@ -26,38 +25,9 @@ pub const LIVE: Duration = Duration::from_secs(20);
 /// by name from memory.
 pub const FINISHED_RETENTION: Duration = Duration::from_secs(600);
 
-/// The network a job of the executor is given on its host (`--executor-network`): the
-/// job's `network` level, which the job service passes to the host's agent. A job that asks
-/// for none is given none, so every job names one.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Network {
-    /// No route out: the task can reach neither the read listener nor the store, so every
-    /// action fails. For a farm whose agents give jobs no network yet.
-    None,
-    /// The endpoints the host's agent allows, and nothing else: the read listener and the
-    /// store, when the agent is set up for them. The default.
-    #[default]
-    AllowList,
-    /// Any address but those the agent always denies. Only with
-    /// [`Config::allow_open_network`].
-    Open,
-}
-
-impl Network {
-    /// The job's `network` level: never unspecified, which the service reads as none.
-    #[must_use]
-    pub fn level(self) -> NetworkLevel {
-        match self {
-            Self::None => NetworkLevel::None,
-            Self::AllowList => NetworkLevel::AllowList,
-            Self::Open => NetworkLevel::Open,
-        }
-    }
-}
-
 /// What a put-directory job's root is read from (`--executor-input-tree`,
 /// docs/design/actions-as-jobs.md, 4.7).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum InputTree {
     /// The action tree written as tierstore tree manifests, the job's layer the host directory
     /// `<mp>/trees/<digest>` that tierstore's file system serves. The default.
@@ -92,8 +62,8 @@ pub struct Config {
     /// The timeout of an action that names none: at most [`Config::max_run`].
     pub default_timeout: Duration,
     /// The most bytes of a failed job's standard error the frontend writes to its log, at WARN,
-    /// with the grants of the job redacted: the end of the stream. `0` writes none; the
-    /// whole attached output stays with the result either way.
+    /// the end of the stream. `0` writes none; the whole attached output stays with the result
+    /// either way.
     pub failed_stderr_log_bytes: usize,
     /// How often the job of an operation is read back, and a submit whose answer was lost is
     /// sent again.
@@ -103,28 +73,9 @@ pub struct Config {
     /// 30 s a call.
     pub call_timeout: Duration,
     /// How long the inputs of one run (its action, its input tree published into the store,
-    /// its keys) may take to prepare; a preparation past it is a run that ended for a reason
-    /// of the farm's.
+    /// its put directory) may take to prepare; a preparation past it is a run that ended for a
+    /// reason of the farm's.
     pub prepare_limit: Duration,
-    /// How the secrets reach the task.
-    pub delivery: Delivery,
-    /// Whether the operator has said the secrets may travel as arguments, where the action
-    /// can read them (`/proc/1/cmdline`) and the engine's inspect shows them. False by
-    /// default, and [`Config::validate`] refuses a config that leaves it so unless the
-    /// delivery is [`Delivery::Files`].
-    pub insecure_argv_secrets: bool,
-    /// Where the task tool works in the container, if not in the tool's own default: the
-    /// kbf image must have a writable directory there.
-    pub work_dir: Option<String>,
-    /// Whether the task may `PUT` over plain http.
-    pub allow_plain_http_put: bool,
-    /// Whether the task may read its inputs through a read grant served over plain http, and
-    /// the executor may submit a job whose grant url is `http://` (the bearer token then
-    /// crosses the job network in clear).
-    pub allow_plain_http_grant: bool,
-    /// Whether the task is told to read its inputs where `GET /locate` says they are kept
-    /// (`--locate`), and from the listener when that read fails.
-    pub locate: bool,
     /// The most bytes of a pack the frontend takes.
     pub max_pack_bytes: u64,
     /// The most bytes of one blob in a pack.
@@ -136,20 +87,14 @@ pub struct Config {
     /// The bytes of a one-pass object's tail each record may account for
     /// (`--task-object-bytes-per-entry`).
     pub object_bytes_per_entry: u64,
-    /// The longest a pack url may stay good: the store's presign ceiling.
-    pub presign_ceiling: Duration,
-    /// The network every job is given (`--executor-network`).
-    pub network: Network,
-    /// Whether the operator has said a job may have an open network
-    /// (`--executor-allow-open-network`). [`Config::validate`] refuses
-    /// [`Network::Open`] without it, and it without [`Network::Open`].
-    pub allow_open_network: bool,
-    /// Where a task's outputs go (`--task-out-mode`, `--task-out-root`). A job of a put
-    /// directory has no network, whatever [`Config::network`] says.
-    pub task_out: TaskOut,
+    /// The longest a put directory's keys may be good for.
+    pub key_ceiling: Duration,
+    /// The host directories of the put directory of every run (`--task-out-root`). `None`, the
+    /// default, refuses every Linux and Mac run as the caller's: a run has nowhere to commit.
+    /// A job has no network.
+    pub task_out: Option<PutDirRoots>,
     /// What a Linux put-directory job's root is read from ([`InputTree`];
-    /// `--executor-input-tree`): [`Config::validate`] refuses [`InputTree::Provider`] without
-    /// a put directory.
+    /// `--executor-input-tree`).
     pub input_tree: InputTree,
     /// How long the liveness row of this process lives after a renewal, on the store's clock
     /// (`--executor-live-secs`). It is renewed every quarter of it; once it has expired,
@@ -170,9 +115,9 @@ pub enum ConfigError {
     /// A name that cannot be a label value.
     #[error("the frontend id must be 1 to 63 of letters, digits, '-', '_' and '.'")]
     Frontend,
-    /// A job whose pack url the store would not sign.
-    #[error("the longest job's wall limit exceeds the presign ceiling")]
-    Presign,
+    /// A job whose put directory's keys would not stay good for its wall limit.
+    #[error("the longest job's wall limit exceeds the key ceiling")]
+    KeyCeiling,
     /// A default timeout of zero or over the longest run.
     #[error("the default timeout must be above zero and no more than the longest run")]
     Timeout,
@@ -181,32 +126,9 @@ pub enum ConfigError {
         "the poll interval, the call timeout, the preparation limit and the liveness time must be above zero"
     )]
     Bounds,
-    /// Secrets as arguments, which the operator has not allowed.
-    #[error("the secrets travel as arguments: set insecure_argv_secrets to say so")]
-    InsecureArgv,
-    /// Secrets as files, and the opt-in for secrets as arguments: a contradiction.
-    #[error("the secrets travel as files: insecure_argv_secrets must not be set")]
-    InsecureWithFiles,
-    /// A presign ceiling or a job longer than a url may be good for.
-    #[error("the presign ceiling and the longest job's wall limit must be at most 4 hours")]
-    PresignLimit,
-    /// An open network for the jobs, which the operator has not allowed.
-    #[error(
-        "--executor-network open lets every job reach any address: give \
-         --executor-allow-open-network as well to say so"
-    )]
-    OpenNetwork,
-    /// The opt-in for an open network, with another network: it would open the network on a
-    /// later change of one flag.
-    #[error("--executor-allow-open-network is only for --executor-network open: drop it")]
-    OpenNetworkUnused,
-    /// Tierstore's mount provider with presigned task outputs: only a put-directory job reads
-    /// its root from a tree.
-    #[error(
-        "--executor-input-tree provider needs --task-out-mode put-dir: only a put-directory \
-         job reads its root from a tree"
-    )]
-    ProviderPresigned,
+    /// A key ceiling or a job longer than a put directory's keys may be good for.
+    #[error("the key ceiling and the longest job's wall limit must be at most 4 hours")]
+    KeyLimit,
     /// The pool of Macs is not one.
     #[error("{0}")]
     Mac(#[from] MacPoolError),
@@ -227,21 +149,13 @@ impl Config {
             poll: Duration::from_millis(250),
             call_timeout: Duration::from_secs(5),
             prepare_limit: Duration::from_secs(300),
-            delivery: Delivery::InsecureArgv,
-            insecure_argv_secrets: false,
-            work_dir: None,
-            allow_plain_http_put: false,
-            allow_plain_http_grant: false,
-            locate: false,
             max_pack_bytes: 128 << 20,
             max_blob_bytes: 64 << 20,
             max_object_entries: 1 << 20,
             max_object_manifest_bytes: 4 << 20,
             object_bytes_per_entry: 1024,
-            presign_ceiling: PRESIGN_LIMIT,
-            network: Network::AllowList,
-            allow_open_network: false,
-            task_out: TaskOut::Presigned,
+            key_ceiling: KEY_LIMIT,
+            task_out: None,
             input_tree: InputTree::Manifests,
             live: LIVE,
             finished_retention: FINISHED_RETENTION,
@@ -264,36 +178,13 @@ impl Config {
                 !self.default_timeout.is_zero() && self.default_timeout <= self.max_run,
                 ConfigError::Timeout,
             ),
-            (self.presign_ceiling >= longest, ConfigError::Presign),
-            (
-                self.presign_ceiling <= PRESIGN_LIMIT,
-                ConfigError::PresignLimit,
-            ),
+            (self.key_ceiling >= longest, ConfigError::KeyCeiling),
+            (self.key_ceiling <= KEY_LIMIT, ConfigError::KeyLimit),
             (
                 [self.poll, self.call_timeout, self.prepare_limit, self.live]
                     .iter()
                     .all(|bound| !bound.is_zero()),
                 ConfigError::Bounds,
-            ),
-            (
-                self.delivery == Delivery::Files || self.insecure_argv_secrets,
-                ConfigError::InsecureArgv,
-            ),
-            (
-                self.delivery != Delivery::Files || !self.insecure_argv_secrets,
-                ConfigError::InsecureWithFiles,
-            ),
-            (
-                self.network != Network::Open || self.allow_open_network,
-                ConfigError::OpenNetwork,
-            ),
-            (
-                self.network == Network::Open || !self.allow_open_network,
-                ConfigError::OpenNetworkUnused,
-            ),
-            (
-                self.input_tree == InputTree::Manifests || self.task_out != TaskOut::Presigned,
-                ConfigError::ProviderPresigned,
             ),
         ];
         let first = checks

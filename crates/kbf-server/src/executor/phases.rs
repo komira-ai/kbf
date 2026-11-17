@@ -18,8 +18,8 @@
 //!
 //! The phases:
 //!
-//! - `prepare`: the Execute to its job being ready (the CAS read, the key, the url and the
-//!   grant);
+//! - `prepare`: the Execute to its job being ready (the CAS read, the put directory and the
+//!   action tree);
 //! - `start`: ready to the job service answering the submit with the job (including each submit that
 //!   was not answered and was sent again);
 //! - `queue`: accepted to first read back as running (queued, placed and starting);

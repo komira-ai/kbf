@@ -11,8 +11,8 @@ use tonic::Code;
 
 use super::*;
 use crate::executor::rows::{OpRow, op_key};
-use crate::executor::tests::{Rig, Setup, digest_of};
-use crate::executor::{OperationId, PutDirRoots, TaskOut, stored_name};
+use crate::executor::tests::{Rig, digest_of};
+use crate::executor::{OperationId, stored_name};
 
 fn ran(exit_code: i32) -> Finished {
     Finished::Ran(Box::new(ActionResult {
@@ -61,13 +61,15 @@ async fn an_operation_keeps_its_row_from_before_its_submit_until_it_finishes() {
         .op(caller.operation())
         .expect("read")
         .expect("the row is there");
+    let key = row.key.clone().expect("a put directory");
+    assert!(key.starts_with("cas/b/"), "{key}");
     assert_eq!(
         row,
         OpRow {
             owner: "p-main".to_owned(),
             attempt: 0,
             job: job.clone(),
-            key: None,
+            key: Some(key),
             whole_machine: false,
             ..row_of(1, "")
         }
@@ -81,18 +83,10 @@ async fn an_operation_keeps_its_row_from_before_its_submit_until_it_finishes() {
     );
 }
 
-/// A put-directory run's row names its put directory, which another process finishes it from;
-/// a whole-machine run's row says so.
+/// A run's row names its put directory, which another process finishes it from.
 #[tokio::test(start_paused = true)]
-async fn the_row_of_a_put_directory_run_names_its_directory() {
-    let rig = Rig::build(
-        Setup {
-            store: true,
-            record: false,
-        },
-        |cfg| cfg.task_out = TaskOut::PutDir(PutDirRoots::new("/mnt/ts/put").expect("roots")),
-    )
-    .await;
+async fn the_row_of_a_run_names_its_put_directory() {
+    let rig = Rig::stored().await;
     let caller = rig.submit(1);
     let job = rig.submitted(&caller, 0).await;
     let row = rig

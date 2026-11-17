@@ -14,8 +14,8 @@
 //!
 //! An operation taken up from the state store ([`Start::Attached`]) begins where its row says:
 //! its job is read back as if this process had submitted it, and finished from its put
-//! directory. A job that writes to a presigned url cannot be finished by any process but the one
-//! that holds the url, so it is cancelled and the operation run again as its next attempt.
+//! directory. A row that names no put directory has no pack to read, so its job is cancelled and
+//! the operation run again as its next attempt.
 //!
 //! When the state store shows another process runs the operation now (a write of its row is
 //! refused), this process stops running it, and its callers follow the answer that process
@@ -36,9 +36,8 @@ use tonic::Code;
 use super::Inner;
 use super::api::{answered, not_found, note};
 use super::metrics::{IngestEnd, RunEnd};
-use super::out::TaskOut;
 use super::outcome::{RESUBMITS, Settled, Verdict, forgotten, judge, refused};
-use super::output::{Grants, Output, Tail};
+use super::output::{Output, Tail};
 use super::phases::{Mark, Phase, Timeline};
 use super::record;
 use super::rows::{Look, OpRow, Rows, RowsError};
@@ -88,10 +87,8 @@ pub(crate) enum Start {
 struct Submitted {
     /// Its id.
     job: String,
-    /// The key its pack is written under.
+    /// The put directory its pack is committed into.
     key: PackKey,
-    /// What it was handed that its output must never show.
-    grants: Grants,
 }
 
 /// How one run ended.
@@ -256,7 +253,6 @@ async fn fresh(
         cfg: &inner.cfg,
         inputs: &inner.deps.inputs,
         ingest: &inner.deps.ingest,
-        presign: &inner.deps.presign,
     };
     let booking = Booking::of(op.whole_machine);
     let prepared = tokio::select! {
@@ -281,8 +277,7 @@ async fn fresh(
         size: op.key.action.size_bytes,
         attempt: run.attempt,
         job: job.clone(),
-        key: matches!(inner.cfg.task_out, TaskOut::PutDir(_))
-            .then(|| prepared.key.as_str().to_owned()),
+        key: Some(prepared.key.as_str().to_owned()),
         whole_machine: op.whole_machine,
     };
     let id = op.id;
@@ -325,7 +320,6 @@ async fn fresh(
     let submitted = Submitted {
         job,
         key: prepared.key,
-        grants: prepared.grants,
     };
     watch_job(inner, op, run, &submitted, cancel, timeline).await
 }
@@ -341,14 +335,13 @@ async fn resume(
 ) -> Ended {
     let Some(key) = row.key else {
         withdraw(inner, &row.job).await;
-        let why = "the frontend that held the job's write url is gone";
+        let why = "the operation's row names no put directory to read the job's pack from";
         return Ended::Again(Settled::Lost(why), None);
     };
     tracing::info!(operation = %op.id, %run, job = %row.job, "taken up from the state store");
     let submitted = Submitted {
         job: row.job,
         key: PackKey::new(key),
-        grants: Grants::default(),
     };
     watch_job(inner, op, run, &submitted, cancel, timeline).await
 }
@@ -377,7 +370,7 @@ async fn watch_job(
     timeline: &mut Timeline,
 ) -> Ended {
     let metrics = &inner.deps.metrics;
-    let (job, grants) = (submitted.job.as_str(), &submitted.grants);
+    let job = submitted.job.as_str();
     let (mut running, mut silence) = (false, false);
     let (read, result) = loop {
         tokio::select! {
@@ -421,7 +414,7 @@ async fn watch_job(
         match inner.api().get_result(job).await {
             Ok(result) => break (read, result),
             Err(error) if not_found(&error) => {
-                let output = output(inner, run, job, None, grants).await;
+                let output = output(inner, run, job, None).await;
                 return Ended::Again(forgotten(), Some(output));
             }
             // Asked again at the next poll.
@@ -433,7 +426,7 @@ async fn watch_job(
     timeline.stamp(Mark::Ended, Instant::now(), metrics);
     match judge(&read, &result) {
         Verdict::Settled(settled) => {
-            let output = output(inner, run, job, Some(&result), grants).await;
+            let output = output(inner, run, job, Some(&result)).await;
             Ended::Again(settled, Some(output))
         }
         Verdict::Ingest => {
@@ -474,21 +467,15 @@ async fn ingest(inner: &Inner, run: RunId, action: &ActionKey, key: &PackKey) ->
 }
 
 /// The output of `job`, which did not end well: the tails of its `result` if they hold any,
-/// else one `GetLogs`; redacted of `grants` and cut to the cap. The lengths are logged, and the
-/// end of the standard error, redacted, as a second line at WARN.
-async fn output(
-    inner: &Inner,
-    run: RunId,
-    job: &str,
-    result: Option<&JobResult>,
-    grants: &Grants,
-) -> Output {
+/// else one `GetLogs`; cut to the cap. The lengths are logged, and the end of the standard
+/// error as a second line at WARN.
+async fn output(inner: &Inner, run: RunId, job: &str, result: Option<&JobResult>) -> Output {
     let tail = match result.and_then(Tail::of_result) {
         Some(tail) => Ok(tail),
         None => inner.api().logs_tail(job).await,
     };
     let output = match tail {
-        Ok(tail) => Output::of(&tail, grants),
+        Ok(tail) => Output::of(&tail),
         Err(error) => Output::unread(&error),
     };
     tracing::info!(

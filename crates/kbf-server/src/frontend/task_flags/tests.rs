@@ -109,6 +109,7 @@ fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
     assert_eq!(set.max_object_entries, 1 << 20);
     assert_eq!(set.max_object_manifest_bytes, 4 << 20);
     assert_eq!(set.object_bytes_per_entry, 1024);
+    assert_eq!(set.directory_cache, None, "Directories stay in memory");
 
     let set = put_dir(&[
         "--task-url-slack-secs=0",
@@ -118,6 +119,8 @@ fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
         "--task-max-object-entries=7",
         "--task-max-object-manifest-bytes=8",
         "--task-object-bytes-per-entry=9",
+        "--task-directory-cache-dir=/var/cache/kbf/directories",
+        "--task-directory-cache-bytes=4096",
     ]);
     assert_eq!(set.url_slack, Duration::ZERO);
     assert_eq!(set.put_retry, Duration::ZERO);
@@ -126,6 +129,31 @@ fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
     assert_eq!(set.max_object_entries, 7);
     assert_eq!(set.max_object_manifest_bytes, 8);
     assert_eq!(set.object_bytes_per_entry, 9);
+    assert_eq!(
+        set.directory_cache,
+        Some((PathBuf::from("/var/cache/kbf/directories"), 4096))
+    );
+}
+
+/// Asserts that the two flags of the cache of Directories come together, so that it is never
+/// half configured: each alone is refused as a missing argument, and a size of 0 is refused.
+#[test]
+fn the_directory_cache_flags_need_each_other_and_a_size() {
+    let missing = ErrorKind::MissingRequiredArgument;
+    for alone in [
+        "--task-directory-cache-dir=/var/cache/kbf/directories",
+        "--task-directory-cache-bytes=4096",
+    ] {
+        let mut given = PUT_DIR_ONLY.to_vec();
+        given.push(alone);
+        assert_eq!(refused(&given), missing, "{alone}");
+    }
+    let mut given = PUT_DIR_ONLY.to_vec();
+    given.extend([
+        "--task-directory-cache-dir=/var/cache/kbf/directories",
+        "--task-directory-cache-bytes=0",
+    ]);
+    assert_eq!(refused(&given), ErrorKind::ValueValidation);
 }
 
 /// Asserts the bounds of the numeric flags: the slack is 0 to 14400 seconds, and the budgets and
@@ -279,6 +307,7 @@ fn put_dir_flags(dir: &Path) -> PutDirFlags {
         max_object_manifest_bytes: 4 << 20,
         object_bytes_per_entry: 1024,
         max_bytes: ClosureLimits::DEFAULT.max_bytes,
+        directory_cache: None,
     }
 }
 
@@ -330,8 +359,8 @@ async fn the_put_dir_flags_open_a_preparer_of_put_dirs() {
 
 /// Asserts that the preparation of put directories, as the executor asks for it
 /// ([`crate::executor::RunPrepare`]), gives the directory and the closure the mint of the secret
-/// verifies, refuses a run of presigned writes, and refuses a lease that is no build id as the
-/// caller's.
+/// verifies, mints the directory alone, and refuses a lease that is no build id as the caller's in
+/// both.
 #[tokio::test]
 async fn the_put_dir_preparation_makes_directories() {
     use crate::executor::{PrepareError, RunPrepare};
@@ -350,20 +379,23 @@ async fn the_put_dir_preparation_makes_directories() {
         run.dir
     );
     assert_eq!(run.not_after, 1_790_000_040 + 60 + DEFAULT_URL_SLACK_SECS);
-    let Err(refused) = RunPrepare::prepare_run(&prep, LEASE, &action, now, wall).await else {
-        panic!("a run of writes is refused");
-    };
-    assert_eq!(
-        refused,
-        PrepareError::Refused(
-            "this preparation makes no presigned write: runs commit into put directories"
-                .to_owned()
-        )
-    );
     let bad = RunPrepare::prepare_put_dir(&prep, "a.b", &action, now, wall)
         .await
         .expect_err("refused");
     assert!(matches!(bad, PrepareError::Refused(_)), "{bad:?}");
+    let minted = RunPrepare::mint_put_dir(&prep, LEASE, &action, now, wall)
+        .await
+        .expect("minted");
+    assert!(
+        minted.dir.starts_with(&format!("cas/b/{LEASE}/")),
+        "{}",
+        minted.dir
+    );
+    assert_eq!(minted.not_after, run.not_after);
+    let bad_mint = RunPrepare::mint_put_dir(&prep, "a.b", &action, now, wall)
+        .await
+        .expect_err("refused");
+    assert!(matches!(bad_mint, PrepareError::Refused(_)), "{bad_mint:?}");
     let source = crate::executor::RunSource::of_put_dir(&Arc::new(prep));
     assert!(
         source
@@ -377,5 +409,123 @@ async fn the_put_dir_preparation_makes_directories() {
                 &action
             )
             .is_ok()
+    );
+}
+
+/// Asserts that a cache directory the flags name opens with the preparer, and that one that
+/// cannot be opened (a path under a regular file) fails the start, naming the flag and the path
+/// and not the secret.
+#[tokio::test]
+async fn the_directory_cache_dir_is_opened_with_the_preparer_and_a_bad_one_fails_the_start() {
+    let dir = scratch_dir("task-directory-cache");
+    let (backend, _) = farm().await;
+    let mut set = put_dir_flags(dir.path());
+    let cache = dir.path().join("directories");
+    set.directory_cache = Some((cache, 1 << 20));
+    set.open(backend.clone()).expect("opens");
+
+    let plain = file(dir.path(), "plain", "not a directory", 0o600);
+    let under = plain.join("directories");
+    set.directory_cache = Some((under.clone(), 1 << 20));
+    let error = set.open(backend).expect_err("refused");
+    assert!(
+        matches!(error, TaskFlagError::Directories { .. }),
+        "{error}"
+    );
+    let said = error.to_string();
+    assert!(
+        said.starts_with(&format!("--task-directory-cache-dir {}: ", under.display())),
+        "{said}"
+    );
+    assert!(!said.contains(SECRET), "{said}");
+}
+
+/// A store holding an Action whose input root is one Directory of one file, and the digests of
+/// the Action and of that Directory.
+async fn farm_with_a_tree() -> (Backend, kbf_types::Digest, kbf_types::Digest) {
+    let store: Arc<dyn Storage> = Arc::new(CacheStorage::new(
+        Arc::new(Cache::memory()),
+        SegmentsConfig::DEFAULT,
+    ));
+    let put = |message: Vec<u8>| {
+        let store = Arc::clone(&store);
+        async move { store.put(Bytes::from(message)).await.expect("stored") }
+    };
+    let command = reapi::Command {
+        arguments: vec!["true".to_owned()],
+        ..reapi::Command::default()
+    };
+    let command = put(command.encode_to_vec()).await;
+    let file = put(b"an input".to_vec()).await;
+    let root = reapi::Directory {
+        files: vec![reapi::FileNode {
+            name: "input".to_owned(),
+            digest: Some(kbf_front::digest_to_proto(&file)),
+            ..reapi::FileNode::default()
+        }],
+        ..reapi::Directory::default()
+    };
+    let root = put(root.encode_to_vec()).await;
+    let action = reapi::Action {
+        command_digest: Some(kbf_front::digest_to_proto(&command)),
+        input_root_digest: Some(kbf_front::digest_to_proto(&root)),
+        ..reapi::Action::default()
+    };
+    let action = put(action.encode_to_vec()).await;
+    (Backend::remote(store), action, root)
+}
+
+/// Asserts that the two cache flags, given on the command line, reach the preparation: a run
+/// prepared through the flags as parsed keeps its input root's Directory in the directory
+/// `--task-directory-cache-dir` names, and parsed flags naming a directory that cannot be made
+/// (a path under a regular file) fail the start naming that flag.
+#[tokio::test]
+async fn the_parsed_cache_flags_keep_the_directories_of_a_run_on_the_disk() {
+    use crate::executor::RunPrepare;
+
+    let dir = scratch_dir("task-directory-cache-parsed");
+    let secret = file(dir.path(), "task.secret", &format!("{SECRET}\n"), 0o600);
+    let cache = dir.path().join("directories");
+    let given = |cache: &Path| {
+        let args = [
+            format!("--task-secret-file={}", secret.display()),
+            "--task-out-root=/mnt/ts/put".to_owned(),
+            format!("--task-directory-cache-dir={}", cache.display()),
+            "--task-directory-cache-bytes=1048576".to_owned(),
+        ];
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        parsed(&args)
+            .expect("parses")
+            .put_dir
+            .expect("put-dir flags")
+    };
+    let flags = given(&cache);
+    assert_eq!(flags.directory_cache, Some((cache.clone(), 1 << 20)));
+    let (backend, action, root) = farm_with_a_tree().await;
+    let prep = flags.open(backend.clone()).expect("opened");
+    let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
+    let run = RunPrepare::prepare_put_dir(&prep, LEASE, &action, now, Duration::from_secs(60))
+        .await
+        .expect("prepared");
+    assert_eq!(run.kept.directory_count(), 1);
+    let kept: Vec<String> = std::fs::read_dir(&cache)
+        .expect("the cache directory")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(kept, [format!("{}-{}", root.hash_hex(), root.size_bytes)]);
+
+    let plain = file(dir.path(), "plain", "not a directory", 0o600);
+    let error = given(&plain.join("directories"))
+        .open(backend)
+        .expect_err("refused");
+    assert!(
+        error.to_string().starts_with("--task-directory-cache-dir "),
+        "{error}"
     );
 }

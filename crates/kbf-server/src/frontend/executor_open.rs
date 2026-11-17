@@ -21,7 +21,7 @@ pub(super) struct ExecutorParts {
 /// The executor `--executor js-agent` describes, with the metrics it counts into; none when
 /// `--executor` is left out, which builds nothing and contacts no job service. The seams are
 /// the frontend's own: the ingest of the packs, the CAS `backend` over the same packs, and the
-/// `source` of the keys, writes and grants. The rows of the operations are kept in `store`, the
+/// `source` of the put directories. The rows of the operations are kept in `store`, the
 /// frontend's state store, if it has one; the operations' events go to `recorder`, and a
 /// finished operation is answered by name from memory for `--finished-retention-secs`.
 ///

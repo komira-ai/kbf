@@ -1,7 +1,8 @@
 //! The seams of a frontend whose tasks commit into put directories (`--task-out-mode put-dir`):
 //! the directory and the action tree a run gets, and the ingest of what it committed.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use kbf_front::action_tree::{BaseFacts, BaseTree};
 use kbf_front::prepare_run::{ClosureLimits, collect_closure_keeping};
@@ -10,36 +11,61 @@ use tierstore::TreeDigest;
 use super::*;
 
 /// A preparation that makes put directories with the real mint and the real closure over the
-/// rig's CAS, or refuses as told.
-struct DirPrep {
+/// rig's CAS, or refuses as told, and counts what it was asked for.
+pub(super) struct DirPrep {
     backend: OnceLock<Backend>,
     refuse: Option<PrepareError>,
     /// How long past now the directory's keys are good.
     good_for: u64,
+    /// How long past now the keys of a directory minted alone are good.
+    minted_good_for: AtomicU64,
+    /// What a directory minted alone is refused with, while it is set.
+    refuse_mints: Mutex<Option<PrepareError>>,
+    /// How many runs were prepared with their closure.
+    prepared: AtomicUsize,
+    /// How many directories were minted alone.
+    minted: AtomicUsize,
 }
 
 impl DirPrep {
-    fn new(refuse: Option<PrepareError>, good_for: u64) -> Arc<Self> {
+    pub(super) fn new(refuse: Option<PrepareError>, good_for: u64) -> Arc<Self> {
         Arc::new(Self {
             backend: OnceLock::new(),
             refuse,
             good_for,
+            minted_good_for: AtomicU64::new(good_for),
+            refuse_mints: Mutex::new(None),
+            prepared: AtomicUsize::new(0),
+            minted: AtomicUsize::new(0),
         })
+    }
+
+    /// The runs prepared with their closure so far.
+    pub(super) fn prepared(&self) -> usize {
+        self.prepared.load(Ordering::SeqCst)
+    }
+
+    /// The directories minted alone so far.
+    pub(super) fn minted(&self) -> usize {
+        self.minted.load(Ordering::SeqCst)
+    }
+
+    /// From now on, a directory minted alone has keys good `secs` past now.
+    pub(super) fn mints_good_for(&self, secs: u64) {
+        self.minted_good_for.store(secs, Ordering::SeqCst);
+    }
+
+    /// From now on, a directory minted alone is refused with `why`, or minted again for `None`.
+    pub(super) fn refuses_mints(&self, why: Option<PrepareError>) {
+        *self
+            .refuse_mints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = why;
     }
 }
 
 #[tonic::async_trait]
 impl RunPrepare for DirPrep {
-    async fn prepare_run(
-        &self,
-        _: &str,
-        _: &kbf_types::Digest,
-        _: SystemTime,
-        _: Duration,
-    ) -> Result<PreparedRun, PrepareError> {
-        Err(PrepareError::Refused("only put directories".to_owned()))
-    }
-
     async fn prepare_put_dir(
         &self,
         lease: &str,
@@ -47,6 +73,7 @@ impl RunPrepare for DirPrep {
         now: SystemTime,
         _: Duration,
     ) -> Result<PreparedPutDir, PrepareError> {
+        self.prepared.fetch_add(1, Ordering::SeqCst);
         if let Some(refused) = &self.refuse {
             return Err(refused.clone());
         }
@@ -61,6 +88,30 @@ impl RunPrepare for DirPrep {
             not_after: NOW + self.good_for,
         })
     }
+
+    async fn mint_put_dir(
+        &self,
+        lease: &str,
+        action: &kbf_types::Digest,
+        now: SystemTime,
+        _: Duration,
+    ) -> Result<MintedDir, PrepareError> {
+        self.minted.fetch_add(1, Ordering::SeqCst);
+        let refused = self
+            .refuse_mints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(refused) = refused {
+            return Err(refused);
+        }
+        let mint = PackKeyMint::new(SECRET).expect("a mint");
+        let dir = mint.mint_put_dir(lease, action, now).expect("a dir");
+        Ok(MintedDir {
+            dir: dir.dir().to_owned(),
+            not_after: NOW + self.minted_good_for.load(Ordering::SeqCst),
+        })
+    }
 }
 
 /// The root manifest of the base tree: one symlink.
@@ -68,7 +119,7 @@ const BASE_ROOT: &[u8] =
     br#"{"v":1,"children":[{"name":"bin","kind":"symlink","target":"usr/bin"}]}"#;
 
 /// A base tree of one symlink.
-fn base() -> BaseTree {
+pub(super) fn base() -> BaseTree {
     BaseTree::new(
         BASE_ROOT,
         BaseFacts {
@@ -81,7 +132,7 @@ fn base() -> BaseTree {
 
 /// [`base`] with every entry below its root listed, as a tree list needs it: the root is
 /// the only manifest, since it holds no directory.
-fn listed_base() -> BaseTree {
+pub(super) fn listed_base() -> BaseTree {
     base()
         .listed(|digest| match *digest == TreeDigest::of(BASE_ROOT) {
             true => Ok(BASE_ROOT.to_vec()),
@@ -91,29 +142,29 @@ fn listed_base() -> BaseTree {
 }
 
 /// A rig in put-directory mode over `prepare`; the base tree published when `published`.
-fn rig_with(prepare: Arc<DirPrep>, published: bool) -> Rig {
+pub(super) fn rig_with(prepare: Arc<DirPrep>, published: bool) -> Rig {
     rig_over(prepare, published.then(base))
 }
 
 /// A rig in put-directory mode over `prepare` with `base` published, when there is one.
-fn rig_over(prepare: Arc<DirPrep>, base: Option<BaseTree>) -> Rig {
+pub(super) fn rig_over(prepare: Arc<DirPrep>, base: Option<BaseTree>) -> Rig {
     let slot = Arc::new(OnceLock::new());
     if let Some(base) = base {
         slot.set(base).expect("set once");
     }
     let dirs = Arc::clone(&prepare);
-    Rig::over(Prepared::new(), prepare, move |packs, backend| {
+    Rig::over(prepare, move |packs, backend| {
         dirs.backend.set(backend.clone()).expect("set once");
-        Some(PutDirParts::new(packs, backend, slot))
+        PutDirParts::new(packs, backend, slot)
     })
 }
 
-fn rig() -> Rig {
+pub(super) fn rig() -> Rig {
     rig_with(DirPrep::new(None, 7_200), true)
 }
 
 /// An Action whose input root holds one file named `name` and whose Command declares `out`.
-async fn action_with_input(rig: &Rig, name: &str) -> Digest {
+pub(super) async fn action_with_input(rig: &Rig, name: &str) -> Digest {
     let file = rig.store(&reapi::Command::default()).await;
     let root = rig
         .store(&Directory {
@@ -132,13 +183,12 @@ async fn action_with_input(rig: &Rig, name: &str) -> Digest {
     .await
 }
 
-const WALL: Duration = Duration::from_secs(3_600);
+pub(super) const WALL: Duration = Duration::from_secs(3_600);
 
-/// Asserts that a run gets its put directory (verified by the mint for its action), that the
-/// action tree is written to the store and its digest handed out once, and that no write and
-/// no grant was prepared for it.
+/// Asserts that a run gets its put directory (verified by the mint for its action), and that the
+/// action tree is written to the store and its digest handed out once.
 #[tokio::test]
-async fn a_run_gets_its_dir_and_its_tree_once_and_no_write_or_grant() {
+async fn a_run_gets_its_dir_and_its_tree_once() {
     let rig = rig();
     let action = action_with_input(&rig, "input").await;
     let key = rig
@@ -161,14 +211,6 @@ async fn a_run_gets_its_dir_and_its_tree_once_and_no_write_or_grant() {
     assert!(rig.store.len(&manifest).await.expect("asked").is_some());
     assert!(matches!(
         rig.front.tree(lease()).await,
-        Err(InputsError::Unavailable(_))
-    ));
-    assert!(matches!(
-        rig.front.put_url(&key, WALL, 1).await,
-        Err(PresignError::Refused(_))
-    ));
-    assert!(matches!(
-        rig.front.read_grant(lease(), &action, WALL).await,
         Err(InputsError::Unavailable(_))
     ));
 }
@@ -214,8 +256,7 @@ async fn a_tree_that_cannot_be_written_is_refused_or_unavailable() {
 }
 
 /// Asserts that the preparation's refusals keep whose they are, that a directory whose keys
-/// end before the run's wall is refused, and that a preparation that makes no put directory
-/// refuses every run.
+/// end before the run's wall is refused.
 #[tokio::test]
 async fn a_preparation_that_cannot_give_a_dir_refuses_the_run() {
     for (refuse, unavailable) in [
@@ -242,23 +283,6 @@ async fn a_preparation_that_cannot_give_a_dir_refuses_the_run() {
         .mint(lease(), &action, WALL, InputTree::Manifests)
         .await;
     assert!(matches!(got, Err(MintError::Refused(_))), "{got:?}");
-
-    let presigned_only = Rig::over(Prepared::new(), Prepared::new(), |packs, backend| {
-        let published = Arc::new(OnceLock::new());
-        published.set(base()).expect("set once");
-        Some(PutDirParts::new(packs, backend, published))
-    });
-    let action = action_with_input(&presigned_only, "input").await;
-    let got = presigned_only
-        .front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
-        .await;
-    assert_eq!(
-        got,
-        Err(MintError::Refused(
-            "this preparation makes no put directory".to_owned()
-        ))
-    );
 }
 
 /// Asserts that a pack committed as `pack` in the run's directory is ingested into the action's
@@ -274,7 +298,7 @@ async fn a_pack_committed_in_the_dir_becomes_the_result() {
         .await
         .expect("a dir");
     let pack = write_pack(&manifest_of("7-3", &action), &[]).expect("a pack");
-    put_pack(&rig, &PackKey::new(format!("{key}/pack")), pack).await;
+    put_pack(&rig, &key, pack).await;
 
     let done = rig.front.ingest(lease(), &key, &action, &limits()).await;
     assert!(
@@ -311,6 +335,50 @@ async fn a_pack_committed_in_the_dir_becomes_the_result() {
             "{bad}: {got:?}"
         );
     }
+}
+
+/// Asserts that the ingest reads through the frontend's packs: the pack of a run whose output
+/// directory's tree and file are in the pack alone, committed in the minted directory, is
+/// ingested into a result with that output directory, and cached. Catches an ingest handed a
+/// backend that cannot read the packs, which would leave every run with an output directory
+/// unavailable and retried for ever.
+#[tokio::test]
+async fn a_tree_that_only_the_pack_holds_is_read_through_the_same_packs() {
+    let rig = rig();
+    let action = action_with_input(&rig, "input").await;
+    let key = rig
+        .front
+        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .await
+        .expect("a dir");
+    let file = b"a file inside the output directory".to_vec();
+    let file_digest = VerifiedBlob::hashed(Bytes::from(file.clone())).digest();
+    let tree = reapi::Tree {
+        root: Some(Directory {
+            files: vec![FileNode {
+                name: "f".to_owned(),
+                digest: Some(wire(&file_digest)),
+                ..FileNode::default()
+            }],
+            ..Directory::default()
+        }),
+        ..reapi::Tree::default()
+    };
+    let tree = prost::Message::encode_to_vec(&tree);
+    let mut manifest = manifest_of("7-3", &action);
+    manifest.output_directories = vec![kbf_pack::OutputDirectory {
+        path: "out".to_owned(),
+        tree: VerifiedBlob::hashed(Bytes::from(tree.clone())).digest(),
+    }];
+    let pack = write_pack(&manifest, &[&tree, &file]).expect("a pack");
+    put_pack(&rig, &key, pack).await;
+
+    let done = rig.front.ingest(lease(), &key, &action, &limits()).await;
+    let Ingested::Ran { result, cached } = done else {
+        panic!("not ingested: {done:?}");
+    };
+    assert_eq!(result.output_directories.len(), 1);
+    assert!(cached, "the result was not cached");
 }
 
 /// Asserts that a run minted with `InputTree::Provider` over a listed base tree parks a key

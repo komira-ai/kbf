@@ -1,9 +1,8 @@
-//! Where a task's outputs go ([`TaskOut`], `--task-out-mode`): presigned writes to the tier
-//! store's proxy, or a put directory on the job's host (docs/design/jobs-on-jobscheduler-and-tierstore.md,
-//! sections 2 and 3).
+//! Where a task's outputs go: a put directory on the job's host (docs/design/jobs-on-jobscheduler-and-tierstore.md,
+//! sections 2 and 3), under the roots [`PutDirRoots`] holds (`--task-out-root`).
 //!
-//! In a put directory the task commits its objects as files, and the node's tier store makes
-//! each an object of the store when its rename returns. The job is then submitted with:
+//! The task commits its objects into it as files, and the node's tier store makes each an
+//! object of the store when its rename returns. The job is submitted with:
 //!
 //! - **One layer**, the read-only action tree: the job's root, with `work` (`/work`), `.kbf`
 //!   (`/.kbf`) and the base tree's `/.kbf-tools/kbf-task` ([`TASK_IN_TREE`]), the program the
@@ -34,18 +33,6 @@ pub const TASK_IN_TREE: &str = "/.kbf-tools/kbf-task";
 /// a put directory adds at most 176 to the root (`/cas/b/`, a build id of 128 and `/` and a
 /// nonce of 40), an action tree 71 to the trees beside it.
 pub const MAX_ROOT_BYTES: usize = 4096 - 176;
-
-/// Where a task's outputs go.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum TaskOut {
-    /// A presigned `PUT` of each object to the tier store's proxy, and a read grant for the
-    /// inputs: the job reaches both over its network.
-    #[default]
-    Presigned,
-    /// A put directory on the job's host, under these roots, and the inputs in a read-only
-    /// tree: the job has no network.
-    PutDir(PutDirRoots),
-}
 
 /// Why `--task-out-root` is not one.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

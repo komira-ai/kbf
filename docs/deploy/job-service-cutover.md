@@ -29,11 +29,14 @@ The switch sets exactly these keys and leaves every other line of the file as it
 
 The rest of what `js-agent` needs must be in the file already, and the switch does not write
 it: `executor-frontend-id`, `executor-base-image`, `executor-kbf-image`, `executor-base-tree`
-(the directory of the release's base tree bundles, below), the secret delivery
-(`executor-secret-delivery = "files"`, or `executor-insecure-argv-secrets = true` for the
-default `argv`), the packs (`--pack-store-endpoint`), the task runs and the job-facing read
-listener. `plan` names the `[executor]` keys that are missing, and `apply` checks the whole
-new file with `kbf --check` before it puts it in place.
+(the directory of the release's base tree bundles, below), the packs (`--pack-store-endpoint`)
+and the task runs (`--task-secret-file`, `--task-out-root`). The keys of the executor's presigned
+path (`executor-secret-delivery`, `executor-insecure-argv-secrets`, `executor-work-dir`,
+`executor-allow-plain-http-put`, `executor-allow-plain-http-grant`, `executor-locate`,
+`executor-network` and `executor-allow-open-network`) were removed, and a frontend refuses to
+start with one, naming this release: they must not be in the file. `plan` names the `[executor]`
+keys that are missing, and each of those removed keys the file still holds, to delete; `apply`
+checks the whole new file with `kbf --check` before it puts it in place.
 
 **A flag on the frontend's command line overrides its key.** The switch changes `kbf.toml`
 only. If the unit or a drop-in of it (`systemctl cat <unit>`) passes an `--executor*` flag,
@@ -126,57 +129,33 @@ executor republishes its release's tree, finding most objects held.
 
 ## The farm agents' egress
 
-The executor submits every job with the network level `--executor-network` names, by default
-`allow-list`: a task PUTs its packs to the tier store's proxy and reads its inputs from the
-frontend's job-facing read listener, and nothing else. A farm agent runs such a job only if its own
-ceiling is `allow-list` (`--egress allow-list`, on a Linux agent, which runs crun), and the job reaches only the
-endpoints its `--egress-allow` lines name. An agent with the default ceiling, `none`, is never
-given kbf's jobs. kbf asks for `open` only when the frontend is given `--executor-network open`
-with `--executor-allow-open-network`. An agent that cannot check the limits of its job network
-refuses the start (`egress-unchecked`), and the farm runs the action again.
-
-Those lines are made from the frontend's own `kbf.toml`, so that they name the places the frontend
-gives its tasks:
+The executor submits every job with the network level `none`: a put-dir job commits its object
+into its put directory and reads its inputs from its mounted tree, and has no route out. The
+level is not a setting: `--executor-network` and `--executor-allow-open-network` were removed with
+the executor's presigned path. The rest of this section is for the agent-egress verb below, which
+renders the `allow-list` ceiling a farm agent's flags file holds for those jobs.
 
 ```text
 kbf-deploy job-service agent-egress --config /etc/kbf/kbf.toml
 ```
 
-It reads the file and prints the lines; it changes nothing. For a frontend whose `[task-runs]`
-says `task-put-endpoint = "http://192.0.2.10:9000"` and
-`task-read-url = "https://192.0.2.20:8444"`:
+It reads the frontend's `kbf.toml` and prints the lines; it changes nothing. A put-dir job
+reaches no address, so the lines name no destination:
 
 ```text
-# The egress of kbf's tasks, from /etc/kbf/kbf.toml. Put these lines in /etc/js-agent/flags on
-# every agent of the farm (the Linux js-agent, which runs crun): a job of kbf's reaches these and
-# nothing else.
+# The egress of kbf's jobs, from /etc/kbf/kbf.toml. Put these lines in /etc/js-agent/flags on
+# every agent of the farm (the Linux js-agent, which runs crun): a put-dir job has no
+# destination, so no allow line follows.
 --egress=allow-list
-# task-put-endpoint = http://192.0.2.10:9000
---egress-allow=192.0.2.10:9000
-# task-read-url = https://192.0.2.20:8444
---egress-allow=192.0.2.20:8444
 ```
 
-A task reads no store directly, with `executor-locate` or without it (the frontend hands out no store
-read grants: tierstore v0.3.29 removed them), so a `job-store-url` left in the file adds no line. An endpoint named by two keys is printed once. Put the lines in
-the flags file of every farm agent (the jobscheduler's
+Put the lines in the flags file of every farm agent (the jobscheduler's
 [farm node runbook](https://github.com/komira-ai/jobscheduler/blob/main/docs/runbooks/farm-node-enroll.md)
 gives the file's rules). The agent reads the file when it starts, so restart it as that runbook
-says. When the frontend's
-`task-put-endpoint` or `task-read-url` changes, render the lines again and replace
-them on every agent.
+says.
 
-**Refused** (exit 2, nothing printed; the message names the file and the key):
-
-- `task-put-endpoint` or `task-read-url` is not in the file: the task would have nowhere to
-  write its packs or read its inputs;
-- a url whose host is not an IPv4 address: a job's network has no DNS, and the agent allows
-  IPv4 endpoints only. Give the frontend IP addresses (with certificates that name them);
-- an IPv6 address, a port that is not 1 to 65535, or a scheme other than `http` or `https`;
-- a loopback, unspecified, link-local (the cloud metadata range), multicast or broadcast address,
-  which no job reaches through the host;
-- a file that cannot be read, is not TOML, has a key of the wrong type, or has a key in two
-  tables.
+**Refused** (exit 2, nothing printed; the message names the file): a file that cannot be read or
+is not TOML.
 
 ## kbf's client token
 
@@ -315,7 +294,6 @@ kept from the file (the executor needs them):
   executor-base-image = "registry.example/kbf-base@sha256:bbbb...bbbb"
   executor-kbf-image = "registry.example/kbf@sha256:aaaa...aaaa"
   executor-base-tree = "/opt/kbf/base-tree"
-  executor-secret-delivery = "files"
 to switch: kbf-deploy job-service apply with these flags and the restart's (a dry run without --apply)
 ```
 

@@ -20,7 +20,7 @@ use kbf_types::{ActionKey, Digest, DigestFunction, OperationId};
 use tokio::sync::watch;
 
 use super::*;
-use crate::executor::task::{RunId, Secret, build_id};
+use crate::executor::task::{RunId, build_id};
 
 pub(crate) const IMAGE: &str =
     "registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -29,10 +29,9 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// What the executor reads of an action, and the grant of its task.
+/// What the executor reads of an action, and the tree of its run.
 pub(crate) struct FakeInputs {
     pub facts: Mutex<Result<ActionFacts, InputsError>>,
-    pub grant: Mutex<Result<ReadGrant, InputsError>>,
     pub tree: Mutex<Result<String, InputsError>>,
     /// While set, the read of an action never answers (a CAS that hangs).
     pub hang: AtomicBool,
@@ -54,10 +53,6 @@ impl FakeInputs {
                 timeout: Some(Duration::from_secs(60)),
                 system: System::Linux,
                 size_class: SizeClass::of_action(&shape),
-            })),
-            grant: Mutex::new(Ok(ReadGrant {
-                url: "https://grant.test:9400".to_owned(),
-                token: Secret::new("read-token-0001"),
             })),
             tree: Mutex::new(Ok("ef".repeat(32))),
             hang: AtomicBool::new(false),
@@ -81,39 +76,8 @@ impl Inputs for FakeInputs {
         locked(&self.facts).clone()
     }
 
-    async fn read_grant(
-        &self,
-        _run: RunId,
-        _action: &kbf_proto::reapi::Digest,
-        _expires: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        locked(&self.grant).clone()
-    }
-
     async fn tree(&self, _run: RunId) -> Result<String, InputsError> {
         locked(&self.tree).clone()
-    }
-}
-
-/// A store that signs a url for any key.
-pub(crate) struct FakePresign {
-    pub fail: Mutex<Option<PresignError>>,
-}
-
-#[tonic::async_trait]
-impl Presign for FakePresign {
-    async fn put_url(
-        &self,
-        key: &PackKey,
-        _expires: Duration,
-        _max_bytes: u64,
-    ) -> Result<Secret, PresignError> {
-        if let Some(error) = locked(&self.fail).clone() {
-            return Err(error);
-        }
-        Ok(Secret::new(format!(
-            "https://store.test/{key}?sig=s3cr3t-signature"
-        )))
     }
 }
 
@@ -416,7 +380,6 @@ pub(crate) struct Rig {
     pub exec: Executor,
     pub cfg: Config,
     pub inputs: Arc<FakeInputs>,
-    pub presign: Arc<FakePresign>,
     pub ingest: Arc<FakeIngest>,
     pub metrics: Arc<Metrics>,
     pub recorder: Recorder,
@@ -469,7 +432,7 @@ impl Rig {
         );
         let mut cfg = Config::new("front-1");
         cfg.instance = "p-main".to_owned();
-        cfg.insecure_argv_secrets = true;
+        cfg.task_out = Some(PutDirRoots::new("/mnt/ts/put").expect("roots"));
         adjust(&mut cfg);
         let clock = Arc::new(ManualClock::default());
         let store = setup
@@ -483,9 +446,6 @@ impl Rig {
             Recorder::off()
         };
         let inputs = Arc::new(FakeInputs::new());
-        let presign = Arc::new(FakePresign {
-            fail: Mutex::new(None),
-        });
         let ingest = Arc::new(FakeIngest {
             script: Mutex::new(VecDeque::new()),
             mint_fails: Mutex::new(VecDeque::new()),
@@ -499,7 +459,6 @@ impl Rig {
                 Deps {
                     client: fake.client().expect("a client"),
                     ingest: ingest.clone(),
-                    presign: presign.clone(),
                     inputs: inputs.clone(),
                     metrics: Arc::clone(&metrics),
                     store: store.clone().map(|s| s as Arc<dyn Store>),
@@ -510,7 +469,6 @@ impl Rig {
             fake,
             cfg,
             inputs,
-            presign,
             ingest,
             metrics,
             recorder,
@@ -527,7 +485,6 @@ impl Rig {
         Deps {
             client: self.fake.client().expect("a client"),
             ingest: self.ingest.clone(),
-            presign: self.presign.clone(),
             inputs: self.inputs.clone(),
             metrics: Arc::clone(&self.metrics),
             store: self.store.clone().map(|s| s as Arc<dyn Store>),

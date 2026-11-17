@@ -11,8 +11,8 @@ use super::{Booking, FRONTEND_LABEL, INSTANCE_LABEL, Preparer, Settled, job_id, 
 use crate::executor::mac::mac_argv;
 use crate::executor::traits::InputsError;
 use crate::executor::{
-    ActionFacts, DEFAULT_MAC_OS_VERSION, Inputs, MAC_OUT_TARGET, MacPool, PutDirRoots, ReadGrant,
-    RunId, System, TREE_TARGET, TaskOut,
+    ActionFacts, DEFAULT_MAC_OS_VERSION, Inputs, MAC_OUT_TARGET, MacPool, PutDirRoots, RunId,
+    System, TREE_TARGET,
 };
 
 const TREE: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -47,17 +47,6 @@ impl Inputs for Mac {
             },
             size_class: built_class(),
         })
-    }
-
-    async fn read_grant(
-        &self,
-        _: RunId,
-        _: &Digest,
-        _: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Err(InputsError::Invalid(
-            "a Mac run asks for no grant".to_owned(),
-        ))
     }
 
     async fn tree(&self, run: RunId) -> Result<String, InputsError> {
@@ -105,9 +94,9 @@ impl Default for Case {
 /// Prepares the job of [`RUN`] for `case`, under the Linux put root `/mnt/ts/put`.
 async fn prepared(case: Case) -> Result<super::Prepared, Settled> {
     let mut harness = Harness::new();
-    if case.put_dir {
-        harness.cfg.task_out = TaskOut::PutDir(PutDirRoots::new("/mnt/ts/put").expect("roots"));
-    }
+    harness.cfg.task_out = case
+        .put_dir
+        .then(|| PutDirRoots::new("/mnt/ts/put").expect("roots"));
     harness.cfg.mac = case.mac;
     let inputs: Arc<dyn Inputs> = Arc::new(Mac {
         os_version: case.os_version,

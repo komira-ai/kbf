@@ -149,7 +149,8 @@ impl TreeWriter {
             })
             .collect();
         let blobs: Vec<Digest> = blobs.into_iter().collect();
-        let (places, unlocated) = place::locate(&*self.source, &blobs).await?;
+        let now = (self.clock)();
+        let (places, unlocated) = self.locate(&blobs, now).await?;
         for entry in &mut entries[listed.len()..] {
             if let Kind::File {
                 sha256, size, span, ..
@@ -160,7 +161,7 @@ impl TreeWriter {
             }
         }
         let (key, bytes) = encode(&entries)?;
-        place::write_whole(&*self.source, &*self.store, &self.retry, unlocated).await?;
+        self.write_whole(unlocated, now).await?;
         place::write_object(&*self.store, &self.retry, &key, Bytes::from(bytes)).await?;
         Ok(Listing {
             key: key.to_string(),

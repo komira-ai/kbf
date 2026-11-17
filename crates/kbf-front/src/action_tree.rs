@@ -36,6 +36,13 @@
 //! clock and no longer than its subdirectories' entries; [`TreeWriter::forget`] drops an input
 //! root's entries.
 //!
+//! **The place memo** ([`places`]) maps a blob's digest to where it was found (a pack span, or
+//! the whole object `cas/l/<sha256>`), so that a tree naming blobs an earlier tree named asks
+//! neither the pack index nor `cas/l/` for them. It holds at most [`PLACE_ENTRIES`] entries, the
+//! oldest dropped first, each good for [`MEMO_TTL`] on the writer's clock. A blob found by the
+//! lookups is remembered when they answer; a blob written to `cas/l/` is remembered as whole only
+//! after its write succeeded. [`TreeWriter::forget`] drops the place memo whole.
+//!
 //! **The tree list** ([`listing`], [`TreeWriter::write_listing`]) is the same action tree as one
 //! object, tierstore's tree list: every entry at its path, the base tree's included
 //! ([`BaseTree::listed`]), a file with bytes naming its pack span or whole object and its SHA-256, stored
@@ -51,6 +58,7 @@ mod encode;
 mod listing;
 mod memo;
 mod place;
+mod places;
 mod retry;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -64,11 +72,13 @@ use tierstore::{MAX_DEPTH, MAX_ENTRIES, TreeDigest, TreeError};
 pub use self::base::{BaseFacts, BaseTree, BaseTreeError, RESERVED_NAMES};
 pub use self::listing::Listing;
 pub use self::place::{HEADS_IN_FLIGHT, LOCATE_CHUNK, LOOKUP_DEADLINE};
+pub use self::places::PLACE_ENTRIES;
 pub use self::retry::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, PutRetry, Sleeper};
 
 use self::encode::{Child, Manifest};
 use self::memo::{Measure, Memo, Remembered};
 use self::place::Place;
+use self::places::Places;
 use crate::job_read::BlobSource;
 use crate::large_backfill::LargeStore;
 use crate::prepare_run::{KeptClosure, KeptDirectory};
@@ -242,13 +252,16 @@ impl ActionTree {
     }
 }
 
-/// The manifest writer. Shared by every preparation: the memo is the only state it holds.
+/// The manifest writer. Shared by every preparation: the manifest memo and the place memo are
+/// the only state it holds.
 pub struct TreeWriter {
     source: Arc<dyn BlobSource>,
     store: Arc<dyn LargeStore>,
     clock: Clock,
     retry: PutRetry,
     memo: Mutex<Memo>,
+    /// Where blobs were found ([`places`]).
+    places: Mutex<Places>,
     /// The most entries a tree list holds ([`MAX_ENTRIES`] unless a test lowers it).
     list_entries: u64,
 }
@@ -283,8 +296,17 @@ impl TreeWriter {
             clock,
             retry: PutRetry::default(),
             memo: Mutex::new(Memo::new(entries)),
+            places: Mutex::new(Places::new(PLACE_ENTRIES)),
             list_entries: MAX_ENTRIES,
         }
+    }
+
+    /// This writer, its place memo holding at most `entries` (a test scales it down);
+    /// [`PLACE_ENTRIES`] by default.
+    #[must_use]
+    pub fn with_place_entries(mut self, entries: usize) -> Self {
+        self.places = Mutex::new(Places::new(entries));
+        self
     }
 
     /// This writer, refusing a tree list of more than `entries` entries
@@ -338,7 +360,7 @@ impl TreeWriter {
             .filter(|digest| digest.size_bytes > 0)
             .collect();
         let blobs: Vec<Digest> = blobs.into_iter().collect();
-        let (places, unlocated) = place::locate(&*self.source, &blobs).await?;
+        let (places, unlocated) = self.locate(&blobs, now).await?;
         let mut manifests: BTreeMap<Digest, Digest> = plan
             .hits
             .iter()
@@ -363,7 +385,7 @@ impl TreeWriter {
         children.push(encode::dir("work", &manifests[kept.root()]));
         children.push(encode::dir(".kbf", &kbf.digest));
         let root = top(children)?;
-        place::write_whole(&*self.source, &*self.store, &self.retry, unlocated).await?;
+        self.write_whole(unlocated, now).await?;
         let store = &*self.store;
         // Collected, as `place`'s asks are, so the future can be proved `Send`.
         let writes: Vec<_> = built
@@ -450,8 +472,48 @@ impl TreeWriter {
     /// reaches from it through its subdirectories (expired ones included), so that its next tree
     /// is built from the pack index as it is then. An entry the memo already dropped at its
     /// bound is not walked through; its subdirectories were remembered before it and went first.
+    ///
+    /// The place memo does not say which tree a blob was found for, so it is dropped whole: the
+    /// next tree asks the pack index and `cas/l/` for every blob again.
     pub fn forget(&self, root: &Digest) {
         self.lock().forget(root);
+        self.remembered().clear();
+    }
+
+    /// The places of `blobs` (none of them empty), those remembered at `now` answered from the
+    /// place memo and the rest from [`place::locate`], and those of them that are nowhere yet,
+    /// which are placed [`Place::Whole`] and must be written before a manifest names them. What
+    /// the lookups found is remembered, except the blobs that are nowhere: they are remembered
+    /// once [`TreeWriter::write_whole`] has written them.
+    async fn locate(
+        &self,
+        blobs: &[Digest],
+        now: SystemTime,
+    ) -> Result<(BTreeMap<Digest, Place>, Vec<Digest>), NoTree> {
+        let (mut places, unknown) = self.remembered().split(blobs, now);
+        let (found, unlocated) = place::locate(&*self.source, &unknown).await?;
+        let nowhere: BTreeSet<&Digest> = unlocated.iter().collect();
+        let located = found
+            .iter()
+            .filter(|(digest, _)| !nowhere.contains(digest))
+            .map(|(digest, place)| (*digest, place.clone()));
+        self.remembered().remember(located, now);
+        places.extend(found);
+        Ok((places, unlocated))
+    }
+
+    /// Writes the `unlocated` blobs to `cas/l/` ([`place::write_whole`]), and remembers them
+    /// whole once every write has succeeded: a write that failed is asked about again.
+    async fn write_whole(&self, unlocated: Vec<Digest>, now: SystemTime) -> Result<(), NoTree> {
+        let written = unlocated.clone();
+        place::write_whole(&*self.source, &*self.store, &self.retry, unlocated).await?;
+        let whole = written.into_iter().map(|digest| (digest, Place::Whole));
+        self.remembered().remember(whole, now);
+        Ok(())
+    }
+
+    fn remembered(&self) -> MutexGuard<'_, Places> {
+        self.places.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn lock(&self) -> MutexGuard<'_, Memo> {

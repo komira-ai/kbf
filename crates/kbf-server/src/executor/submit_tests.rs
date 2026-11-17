@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use js_proto::v1::{JobFile, JobResult, JobState, JobTimes, Needs, NetworkLevel, ResultReason};
+use js_proto::v1::{JobResult, JobState, JobTimes, Needs, NetworkLevel, ResultReason};
 use kbf_proto::reapi::Digest;
 use kbf_types::OperationId;
 use ring::digest::{SHA256, digest};
@@ -12,10 +12,10 @@ use super::{
 };
 use crate::executor::outcome::{Verdict, judge};
 use crate::executor::size_class::SizeClass;
-use crate::executor::traits::{InputsError, PresignError};
+use crate::executor::traits::InputsError;
 use crate::executor::{
-    ActionFacts, Config, Delivery, Ingest, Ingested, InputTree, Inputs, MintError, PackKey,
-    Presign, ReadGrant, RunId, Secret, UntrustedLimits, build_id,
+    ActionFacts, Config, Ingest, Ingested, InputTree, Inputs, MintError, PackKey, PutDirRoots,
+    RunId, UntrustedLimits, build_id,
 };
 
 /// The class of a build of `root//pkg:t`: `root.pkg.t.build`.
@@ -45,13 +45,6 @@ impl Ingest for Easy {
 }
 
 #[tonic::async_trait]
-impl Presign for Easy {
-    async fn put_url(&self, key: &PackKey, _: Duration, _: u64) -> Result<Secret, PresignError> {
-        Ok(Secret::new(format!("https://store.test/{key}")))
-    }
-}
-
-#[tonic::async_trait]
 impl Inputs for Easy {
     async fn action(&self, _: &Digest) -> Result<ActionFacts, InputsError> {
         Ok(ActionFacts {
@@ -62,39 +55,29 @@ impl Inputs for Easy {
         })
     }
 
-    async fn read_grant(
-        &self,
-        _: RunId,
-        _: &Digest,
-        _: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Ok(ReadGrant {
-            url: "https://grant.test:9400".to_owned(),
-            token: Secret::new("token"),
-        })
+    async fn tree(&self, _: RunId) -> Result<String, InputsError> {
+        Ok("ab".repeat(32))
     }
 }
 
-/// What the preparation of a run reads: a config and the three seams, which answer at once.
+/// What the preparation of a run reads: a config and the two seams, which answer at once.
 /// A test replaces the seam it is about.
 pub(super) struct Harness {
     pub(super) cfg: Config,
     pub(super) inputs: Arc<dyn Inputs>,
     pub(super) ingest: Arc<dyn Ingest>,
-    pub(super) presign: Arc<dyn Presign>,
 }
 
 impl Harness {
     pub(super) fn new() -> Self {
         let cfg = Config {
-            insecure_argv_secrets: true,
+            task_out: Some(PutDirRoots::new("/mnt/ts/put").expect("roots")),
             ..Config::new("front")
         };
         Self {
             cfg,
             inputs: Arc::new(Easy),
             ingest: Arc::new(Easy),
-            presign: Arc::new(Easy),
         }
     }
 
@@ -103,7 +86,6 @@ impl Harness {
             cfg: &self.cfg,
             inputs: &self.inputs,
             ingest: &self.ingest,
-            presign: &self.presign,
         }
     }
 }
@@ -197,15 +179,6 @@ fn what_could_not_be_read_is_classed_by_whose_fault_it_is() {
         Settled::from(InputsError::Unavailable("down".to_owned())),
         Settled::Infra("down".to_owned())
     );
-    for error in [
-        PresignError::Refused("ceiling".to_owned()),
-        PresignError::Unavailable("ceiling".to_owned()),
-    ] {
-        let Settled::Infra(why) = Settled::from(error) else {
-            panic!("not infra");
-        };
-        assert!(why.contains("ceiling"), "{why}");
-    }
     assert_eq!(require(true, || unreachable!()), Ok(()));
     assert_eq!(
         require(false, || "no".to_owned()),
@@ -236,16 +209,8 @@ impl Inputs for Timed {
         })
     }
 
-    async fn read_grant(
-        &self,
-        _: RunId,
-        _: &Digest,
-        _: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Ok(ReadGrant {
-            url: "https://grant.test:9400".to_owned(),
-            token: Secret::new("the-token"),
-        })
+    async fn tree(&self, _: RunId) -> Result<String, InputsError> {
+        Ok("cd".repeat(32))
     }
 }
 
@@ -354,9 +319,8 @@ fn arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 /// Catches a job asking for the wrong thing of the service: it names no CPU, no memory and no
 /// disk, so the service sizes it from its class's history; it runs on a Linux container host
-/// of the configured architecture, with the allow-listed network, the image's own entrypoint,
-/// and labels naming the frontend, the process and the action's size class; and its id is the
-/// run's.
+/// of the configured architecture, with no network, and labels naming the frontend, the process
+/// and the action's size class; and its id is the run's.
 #[tokio::test(start_paused = true)]
 async fn prepare_builds_the_job_the_service_is_asked_for() {
     let harness = Harness::new();
@@ -364,11 +328,6 @@ async fn prepare_builds_the_job_the_service_is_asked_for() {
     let built = prepared(&harness, None, BOOKING).await.expect("prepared");
     let spec = &built.spec;
     assert_eq!(spec.job_id, job_id(&cfg.frontend, RUN));
-    assert_eq!(
-        spec.image,
-        format!("registry.test/app@sha256:{}", "ab".repeat(32))
-    );
-    assert_eq!(spec.command, "");
     assert!(spec.env.is_empty());
     assert_eq!(
         spec.needs,
@@ -376,7 +335,7 @@ async fn prepare_builds_the_job_the_service_is_asked_for() {
         "no CPU, memory, disk or GPU, and not the whole host"
     );
     assert_eq!(spec.constraints.as_ref(), Some(&cfg.constraints()));
-    assert_eq!(spec.network(), NetworkLevel::AllowList);
+    assert_eq!(spec.network(), NetworkLevel::None);
     assert!(spec.ports.is_empty());
     assert_eq!(spec.labels.len(), 3);
     assert_eq!(
@@ -403,171 +362,23 @@ fn an_action_books_the_whole_host_only_for_a_whole_machine() {
     assert_eq!(Booking::of(false), Booking::Share);
 }
 
-/// Catches a whole-host job the service would refuse, or one that differs from a shared job
-/// in more than its needs and its class: it needs the whole host and nothing else (no CPU,
-/// memory, disk or GPU, which the service refuses beside `whole_host`) and carries no size
-/// class (it is never sized, and its runs would teach the class a whole host's use); its id,
-/// image, command, environment, constraints, wall limit, network, ports, priority and other
-/// labels are those of the same run's shared job, and its arguments name the same run and
-/// action (the pack url in them is minted again for each prepare).
-#[tokio::test(start_paused = true)]
-async fn a_whole_host_job_needs_the_whole_host_alone() {
-    let harness = Harness::new();
-    let whole = prepared(&harness, None, Booking::WholeHost)
-        .await
-        .expect("prepared");
-    let shared = prepared(&harness, None, BOOKING).await.expect("prepared");
+/// Catches a whole-host need the service would refuse, or one that is sized: it needs the whole
+/// host and nothing else (no CPU, memory, disk or GPU, which the service refuses beside
+/// `whole_host`) and carries no size class (it is never sized, and its runs would teach the
+/// class a whole host's use), where a share needs nothing named and carries its class.
+#[test]
+fn a_whole_host_needs_the_whole_host_alone_and_is_never_sized() {
+    let class = built_class();
     assert_eq!(
-        whole.spec.needs,
-        Some(Needs {
+        Booking::WholeHost.needs(),
+        Needs {
             whole_host: true,
             ..Needs::default()
-        })
+        }
     );
-    assert_eq!(shared.spec.needs, Some(Needs::default()));
-    assert_eq!(whole.spec.labels.get("size-class"), None);
-    assert!(shared.spec.labels.contains_key("size-class"));
-    let without_needs = |spec: &js_proto::v1::JobSpec| js_proto::v1::JobSpec {
-        needs: None,
-        labels: spec
-            .labels
-            .iter()
-            .filter(|(key, _)| *key != "size-class")
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-        // The grant and the pack url are made again for each prepare.
-        args: Vec::new(),
-        files: Vec::new(),
-        ..spec.clone()
-    };
-    assert_eq!(without_needs(&whole.spec), without_needs(&shared.spec));
-    assert_eq!(arg(&whole.spec.args, "--lease"), Some("7-8"));
-    assert_eq!(
-        arg(&whole.spec.args, "--action"),
-        arg(&shared.spec.args, "--action")
-    );
-}
-
-/// Catches the secrets travelling the way the operator did not choose: under `Files` the
-/// presigned url and the read token are the contents of the job's two files and no argument
-/// holds either; under `InsecureArgv` the arguments hold them and the job has no files.
-#[tokio::test(start_paused = true)]
-async fn the_secrets_travel_as_the_delivery_says() {
-    let mut harness = Harness::new();
-    harness.cfg.delivery = Delivery::Files;
-    harness.cfg.insecure_argv_secrets = false;
-    let files = prepared(&harness, Some(Timed(None)), BOOKING)
-        .await
-        .expect("prepared");
-    let url = format!("https://store.test/{}", files.key);
-    assert_eq!(
-        files.spec.files,
-        vec![
-            JobFile {
-                name: "pack-url".to_owned(),
-                contents: url.clone(),
-            },
-            JobFile {
-                name: "grant-token".to_owned(),
-                contents: "the-token".to_owned(),
-            },
-        ]
-    );
-    for arg in &files.spec.args {
-        assert!(
-            arg != "the-token" && !arg.contains("store.test"),
-            "an argument holds a secret: {arg}"
-        );
-    }
-    assert!(arg(&files.spec.args, "--pack-url-file").is_some());
-    assert!(arg(&files.spec.args, "--grant-token-file").is_some());
-
-    harness.cfg.delivery = Delivery::InsecureArgv;
-    harness.cfg.insecure_argv_secrets = true;
-    let argv = prepared(&harness, Some(Timed(None)), BOOKING)
-        .await
-        .expect("prepared");
-    assert!(argv.spec.files.is_empty());
-    assert_eq!(arg(&argv.spec.args, "--pack-url"), Some(url.as_str()));
-    assert_eq!(arg(&argv.spec.args, "--grant-token"), Some("the-token"));
-    assert!(
-        argv.spec
-            .args
-            .iter()
-            .any(|a| a == "--insecure-argv-secrets")
-    );
-}
-
-/// A presign that signs a plain-http url.
-struct PlainPut;
-
-#[tonic::async_trait]
-impl Presign for PlainPut {
-    async fn put_url(&self, key: &PackKey, _: Duration, _: u64) -> Result<Secret, PresignError> {
-        Ok(Secret::new(format!("http://store.test/{key}")))
-    }
-}
-
-/// Inputs of the good action whose read grant is served at `url`.
-struct GrantAt(&'static str);
-
-#[tonic::async_trait]
-impl Inputs for GrantAt {
-    async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
-        Easy.action(action).await
-    }
-
-    async fn read_grant(
-        &self,
-        _: RunId,
-        _: &Digest,
-        _: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Ok(ReadGrant {
-            url: self.0.to_owned(),
-            token: Secret::new("the-token"),
-        })
-    }
-}
-
-/// Catches a write permission or a bearer token sent in clear without the operator's word: a
-/// presigned url that is not https is refused as infrastructure unless
-/// `allow_plain_http_put`, and a read grant that is not https unless `allow_plain_http_grant`;
-/// each is taken once allowed, and the refusal names which of the two it is.
-#[tokio::test(start_paused = true)]
-async fn a_url_that_would_cross_the_network_in_clear_needs_the_operators_word() {
-    let mut harness = Harness::new();
-    harness.presign = Arc::new(PlainPut);
-    let Err(refused) = prepared(&harness, None, BOOKING).await else {
-        panic!("a plain-http pack url was taken");
-    };
-    assert_eq!(
-        refused,
-        Settled::Infra("the pack url is not https".to_owned())
-    );
-    harness.cfg.allow_plain_http_put = true;
-    prepared(&harness, None, BOOKING).await.expect("allowed");
-
-    let mut harness = Harness::new();
-    harness.inputs = Arc::new(GrantAt("http://grant.test:9400"));
-    let Err(refused) = prepared(&harness, None, BOOKING).await else {
-        panic!("a plain-http read grant was taken");
-    };
-    assert_eq!(
-        refused,
-        Settled::Infra("the read grant is not served over https".to_owned())
-    );
-    harness.cfg.allow_plain_http_grant = true;
-    let built = prepare(&harness.preparer(), RUN, &action(), BOOKING)
-        .await
-        .expect("allowed");
-    assert!(
-        built
-            .spec
-            .args
-            .iter()
-            .any(|a| a == "http://grant.test:9400")
-    );
+    assert_eq!(Booking::WholeHost.class(&class), None);
+    assert_eq!(BOOKING.needs(), Needs::default());
+    assert_eq!(BOOKING.class(&class), Some(&class));
 }
 
 /// An ingest whose mint fails as told.
@@ -594,7 +405,7 @@ impl Ingest for NoMint {
 /// the frontend will not issue is the caller's to fix, one it could not issue is
 /// infrastructure, and both messages say what failed.
 #[tokio::test(start_paused = true)]
-async fn a_key_that_could_not_be_minted_is_classed_by_whose_fault_it_is() {
+async fn a_put_directory_that_could_not_be_minted_is_classed_by_whose_fault_it_is() {
     let mut harness = Harness::new();
     harness.ingest = Arc::new(NoMint(MintError::Refused("too deep".to_owned())));
     let Err(refused) = prepared(&harness, None, BOOKING).await else {
@@ -602,82 +413,33 @@ async fn a_key_that_could_not_be_minted_is_classed_by_whose_fault_it_is() {
     };
     assert_eq!(
         refused,
-        Settled::Invalid("no key for the pack: too deep".to_owned())
+        Settled::Invalid("no put directory: too deep".to_owned())
     );
     harness.ingest = Arc::new(NoMint(MintError::Unavailable("down".to_owned())));
     let Err(refused) = prepared(&harness, None, BOOKING).await else {
         panic!("prepared with no key");
     };
-    assert_eq!(
-        refused,
-        Settled::Infra("no key for the pack: down".to_owned())
-    );
+    assert_eq!(refused, Settled::Infra("no put directory: down".to_owned()));
 }
 
-/// Inputs that fail the step they are told to, and are good in the others.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Fails {
-    Action,
-    Grant,
-}
-
-struct Broken(Fails);
+/// Inputs whose action cannot be read.
+struct Broken;
 
 #[tonic::async_trait]
 impl Inputs for Broken {
-    async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
-        match self.0 {
-            Fails::Action => Err(InputsError::Invalid("no such action".to_owned())),
-            Fails::Grant => Easy.action(action).await,
-        }
-    }
-
-    async fn read_grant(
-        &self,
-        _: RunId,
-        _: &Digest,
-        _: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Err(InputsError::Unavailable("no token".to_owned()))
+    async fn action(&self, _: &Digest) -> Result<ActionFacts, InputsError> {
+        Err(InputsError::Invalid("no such action".to_owned()))
     }
 }
 
-/// A presign the store refuses.
-struct NoUrl;
-
-#[tonic::async_trait]
-impl Presign for NoUrl {
-    async fn put_url(&self, _: &PackKey, _: Duration, _: u64) -> Result<Secret, PresignError> {
-        Err(PresignError::Refused("over the ceiling".to_owned()))
-    }
-}
-
-/// Catches a failure of a step of the preparation being lost or classed wrong, each step
-/// by its own message: the action that cannot be read is the caller's, a url the store will
-/// not sign and a grant that cannot be made are infrastructure, and nothing is prepared.
+/// Catches a failure to read the action being lost or classed wrong: the action that cannot
+/// be read is the caller's, and nothing is prepared.
 #[tokio::test(start_paused = true)]
-async fn a_step_of_the_preparation_that_fails_settles_the_run_by_its_class() {
+async fn an_action_that_cannot_be_read_settles_the_run_as_the_callers() {
     let mut harness = Harness::new();
-    harness.inputs = Arc::new(Broken(Fails::Action));
+    harness.inputs = Arc::new(Broken);
     let Err(refused) = prepare(&harness.preparer(), RUN, &action(), BOOKING).await else {
         panic!("prepared an action that cannot be read");
     };
     assert_eq!(refused, Settled::Invalid("no such action".to_owned()));
-
-    let mut harness = Harness::new();
-    harness.presign = Arc::new(NoUrl);
-    let Err(refused) = prepare(&harness.preparer(), RUN, &action(), BOOKING).await else {
-        panic!("prepared with no url");
-    };
-    assert_eq!(
-        refused,
-        Settled::Infra("no url for the pack: over the ceiling".to_owned())
-    );
-
-    let mut harness = Harness::new();
-    harness.inputs = Arc::new(Broken(Fails::Grant));
-    let Err(refused) = prepare(&harness.preparer(), RUN, &action(), BOOKING).await else {
-        panic!("prepared with no grant");
-    };
-    assert_eq!(refused, Settled::Infra("no token".to_owned()));
 }

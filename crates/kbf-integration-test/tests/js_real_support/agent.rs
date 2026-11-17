@@ -143,6 +143,10 @@ pub struct Node {
     /// The stand-ins' directory (`js_stand_in::Place`).
     pub stand_in: PathBuf,
     pub state_root: PathBuf,
+    /// The directory the agent's `--mount-root put=` (`put`, read-write) and
+    /// `--mount-root-ro trees=` (`trees`, read-only) name beside each other, as a put-directory
+    /// job's host-path mount and layer are admitted only beneath such roots.
+    pub mount_point: PathBuf,
     pub scratch_root: PathBuf,
     pub run_files: PathBuf,
     pub join: PathBuf,
@@ -220,6 +224,9 @@ impl Node {
         std::fs::set_permissions(&calls, std::fs::Permissions::from_mode(0o666)).expect("chmod");
 
         let state_root = mkdir(&test.path().join("state"), 0o700);
+        let mount_point = mkdir(&test.path().join("mount-point"), 0o755);
+        mkdir(&mount_point.join("put"), 0o755);
+        mkdir(&mount_point.join("trees"), 0o755);
         let join = test.path().join("join");
         std::fs::write(&join, JOIN).expect("the join token");
         std::fs::set_permissions(&join, std::fs::Permissions::from_mode(0o600)).expect("chmod");
@@ -245,6 +252,7 @@ impl Node {
             bin,
             stand_in,
             state_root,
+            mount_point,
             scratch_root,
             run_files,
             join,
@@ -423,6 +431,14 @@ impl RealAgent {
             ("--job-user", node.user.name.clone()),
             ("--crun-bin", path(&node.bin.join("crun"))),
             ("--state-root", path(&node.state_root)),
+            (
+                "--mount-root",
+                format!("put={}", node.mount_point.join("put").display()),
+            ),
+            (
+                "--mount-root-ro",
+                format!("trees={}", node.mount_point.join("trees").display()),
+            ),
             ("--scratch-root", path(&node.scratch_root)),
             ("--run-files-root", path(&node.run_files)),
             ("--stop-grace", "0".to_owned()),

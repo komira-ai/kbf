@@ -98,8 +98,8 @@ action again. With no pack flags the nodes check the entry alone, as before.
 `--pack-bytes` (default 32 MiB) is the length at which a pack is closed, `--pack-writer`
 (default `frontend`) names the frontend in its pack keys, `--pack-store-region` (default
 `us-east-1`) is the signing region, and `--pack-cache-dir` with `--pack-cache-bytes` keeps
-the blobs read from packs on a local disk. A build's job writes its pack through a presigned
-write and the frontend records it after re-hashing it; no other caller commits a pack. `--pack-commit-sample` is retired: accepted, ignored
+the blobs read from packs on a local disk. A build's job commits its pack into its put directory
+and the frontend records it after re-hashing it; no other caller commits a pack. `--pack-commit-sample` is retired: accepted, ignored
 and warned about at start, for one release. At start the frontend checks that the store
 refuses to replace an object, and does not serve if it does not. `GET /metrics` gains the
 `kbf_pack_*` families. Left out, no object store is built or contacted and the frontend
@@ -164,11 +164,15 @@ on the frontend's jobs, hashed into every job id; every frontend of one farm tha
 `--state-store` gives the same one), the packs (`--pack-store-endpoint`, through which the
 pack a task writes is read, hashed and turned into the action's result) and nothing else for the
 output: a put-dir job (the only mode, `--task-out-mode put-dir`) carries no url, no grant and no secret, and its pack is a file
-of its put directory, which the frontend ingests. The executor's presigned path (a write url, a read token, `--executor-secret-delivery`
-`argv` or `files`) is still in the code and no flag selects it: `--executor-secret-delivery`, `--executor-insecure-argv-secrets`,
-`--executor-work-dir`, `--executor-allow-plain-http-put`, `--executor-allow-plain-http-grant` and `--executor-locate` are still
-read and checked at start (so a `kbf.toml` that sets them keeps starting) and change nothing a put-dir job is given. They are
-deleted, with that path and the test rigs built on it, in the change that follows the removal of the presigned task-out mode. The executor no longer speaks to a lease server: the
+of its put directory, which the frontend ingests. The executor's presigned path (a write url, a read token, the secret delivery
+`argv` or `files`) was deleted, and so were the flags only it read: `--executor-secret-delivery`,
+`--executor-insecure-argv-secrets`, `--executor-work-dir`, `--executor-allow-plain-http-put`,
+`--executor-allow-plain-http-grant`, `--executor-locate`, `--executor-network` and
+`--executor-allow-open-network`. A put-dir job is given no secret and no network, whatever they said. Each is still
+declared, hidden from `--help`, and refuses any value at start, naming this release and telling you to delete the flag, so a
+frontend started with one (or a `kbf.toml` whose `[executor]` table still has the key, as the template
+of the releases before wrote `executor-secret-delivery`, `executor-insecure-argv-secrets`, `executor-locate`, `executor-network`
+and `executor-allow-open-network` as live lines) does not start until the line is removed: change the file before the binary. The executor no longer speaks to a lease server: the
 flags `--executor-lease-url`, `--executor-lease-token-file`, `--executor-lease-ca-file`,
 `--executor-lease-ttl-secs` and `--executor-class` are gone, and a frontend started with one (or
 a `kbf.toml` that names one) fails at start naming it. `--executor-output-disk-bytes`, the scratch
@@ -264,19 +268,13 @@ Execute to the job service's answer to its submit) and `execute` (the Execute to
 answered). A frontend with no executor has none of them. The remaining settings are
 `--executor-run-margin-secs` (300; what a job's wall limit
 adds to the action's timeout), `--executor-failed-stderr-log-bytes` (512, at most 8192, 0 for
-none: the end of a failed job's standard error, with the job's secrets redacted, is one WARN line
+none: the end of a failed job's standard error is one WARN line
 of the frontend's log, `the end of the standard error of a job that did not end well`; the whole
 output goes with the result as before), `--executor-max-run-secs` and `--executor-default-timeout-secs`
 (3000), `--executor-call-timeout-secs` (5), `--executor-poll-ms` (250, from 100 to 10000: how often each operation's job is read back from the job service), `--executor-prepare-limit-secs` (300: how long a run's input
-tree may take to publish), `--executor-work-dir`, `--executor-allow-plain-http-put`, `--executor-allow-plain-http-grant` and `--executor-locate`
-(read and checked at start, with no effect on a put-dir job: they belong to the presigned path that a following change deletes), and `--executor-network` (the network every job is given on its host: `allow-list`,
-the default, the endpoints the host's agent is set up to allow and nothing else, so each agent must
-allow the read listener and the pack store before the switch; `none`, no route out, with which
-every action fails; `open`, any address but those the agent always denies, refused at start unless
-`--executor-allow-open-network` is also given, and that flag is refused with any other level). A
-start the agent refuses because it cannot check the limits of a job's network (`egress-unchecked`)
-is an infrastructure failure, and the action runs again. An open
-network without its opt-in is refused at start, exit status 2. A server that has more than
+tree may take to publish). A job is given no network, whatever a `kbf.toml` of the releases before
+said with `--executor-network`. A setting that breaks a rule the executor's safety rests on is
+refused at start, exit status 2. A server that has more than
 65 536 open operations refuses the next Execute `UNAVAILABLE`: the one bound kbf keeps.
 
 **The kbf base tree: `--executor-base-tree <DIR>`.** Needed with `--executor js-agent`: the
@@ -375,7 +373,7 @@ the run, the action and the minute). The directory's keys are good for the run's
 no image: its root is the one read-only layer `<mp>/trees/<digest>`, it runs
 `/.kbf-tools/kbf-task --tree --stage-and-commit --out-dir /out`, the directory
 `<mp>/put/cas/b/<operation>-<attempt>/<nonce>` is mounted read-write and `no_exec` at `/out`, and it has no
-network, no file and no secret, whatever `--executor-network` says. The host's agent must list
+network, no file and no secret. The host's agent must list
 `<mp>/put` as a `--mount-root` (read-write) and `<mp>/trees` as a mount root. The task commits one
 object, `pack` (the one-pass object, `--task-out-format one-pass`, the only value); the ingest
 reads its trailer and manifest, refuses an output path the Command does not declare, streams each
@@ -386,6 +384,34 @@ task of an earlier release committed. The secret file holds one secret of at lea
 owned by the server's user and readable by it alone; the mint is made from it, and the job-facing
 listener (if one is served) must verify grants with the same secret. No secret is a flag. Left
 out, no secret file is read and the frontend serves exactly as before.
+
+**What a prepare reads, and the caches that spare it** (the `[task-runs]` table). Preparing a run
+walks the input root of its action, decoding each `Directory` message, then writes the action tree
+and mints the put directory. Four caches, all keyed by digest or by the action, make a repeated prepare
+do no store call:
+
+- *The directory cache* holds the decoded `Directory` messages by digest. It is always on in memory
+  (256 MiB). With `--task-directory-cache-dir DIR` and `--task-directory-cache-bytes BYTES` (each
+  needs the other; BYTES at least 1) it also keeps them on disk, one file each, at most BYTES of
+  them, the least recently used removed first. Every read from the disk is checked against the
+  digest, so nothing in the directory is trusted, and a restart reads from the disk what the memory
+  lost. One process per directory: nothing else may write there. A directory that cannot be opened
+  fails the start, naming `--task-directory-cache-dir` and the path.
+- *The place memo* of the tree writer remembers where the bytes of a blob already are (a span of a
+  pack, or a whole object), so that a repeated write finds them without asking the pack index or
+  the store. An entry is good for 10 minutes, and a blob the writer wrote whole is remembered at
+  once.
+- *The tree cache* of the executor's front remembers, for an action and the form of its input tree
+  (manifests or tree list), the tree that was written: a hit skips the closure walk, the lookups and
+  every write, and only the put directory is minted. An entry is good for 10 minutes, and the cache
+  holds a bounded number of entries.
+- *The action facts cache* remembers what the action says of its image, platform and timeout, by the
+  action's digest. It never expires, since an action's digest names its bytes, and holds a bounded
+  number of entries.
+
+A prepare that hits all of them reads nothing from the store and writes nothing. All four are
+memory held by the process (the disk half of the first aside) and lose nothing a restart cannot
+fetch again.
 
 **Where a task's outputs go** (`--task-out-mode`, `put-dir`, the only value and the default; the
 `[task-runs]` table). The `presigned` mode of the releases before, a presigned write of each pack
@@ -423,7 +449,7 @@ its write, the unused keys of a key set, and a large object the ingest has alrea
 CAS leave keys nothing refers to. With `--task-janitor-key-file` the leader (the server that holds
 its roles: the `leader` flag of `/readyz`) lists `cas/b/` every `--task-janitor-interval-secs` (default 900) and deletes
 a key that is older than `--task-janitor-grace-secs` (default 21600, which is also the least: the
-18000 seconds at which an ingest refuses a key, the 4 hours a presigned write is good for and an
+18000 seconds at which an ingest refuses a key, the 4 hours the keys of a put directory are good for and an
 hour for the ingest, and an hour more as a margin between frontends), is not one an ingest is verifying
 right now, and is not recorded in the pack index (asked again for that key just before the
 delete; a pack the ingest recorded stays where it lies and is never deleted). The age is the
@@ -461,11 +487,11 @@ written to the object store: [pack-adopt.md](pack-adopt.md) gives the order to r
 **The job-facing read listener** (off by default; the `[job-read]` table of `kbf.toml`). It is
 the frontend's own read listener, not an executor mode: the jobscheduler's job service, which
 serves under a `--job-listen` of its own, is another process, and the switch of
-an executor onto it is in [job-service-cutover.md](job-service-cutover.md). A task
-that runs an action on a worker fetches the action's input files from the frontend, with a read
-grant (a token the frontend gives the run, valid until its expiry, for one Action: it reads that
-Action, its Command and its input tree, and no other blob). The task is untrusted code that holds
-no client certificate, so the REAPI listener is not open to it; `--job-listen <addr>` opens
+an executor onto it is in [job-service-cutover.md](job-service-cutover.md). No executor job
+reads from it: a job of the executor reads its mounted tree and writes its put directory. It
+serves whatever holds a read grant (a token valid until its expiry, for one Action: it reads that
+Action, its Command and its input tree, and no other blob). Such a reader is untrusted code that
+holds no client certificate, so the REAPI listener is not open to it; `--job-listen <addr>` opens
 another, over HTTPS (or plain HTTP, below), that serves `GET /<hex>/<size>` and `POST /batch` (below) with
 `Authorization: Bearer <read grant>` and nothing else (any other path is 404, any other method
 405). It needs the secret and a transport (a certificate and key, or `--job-plain-http`), and takes
@@ -511,7 +537,7 @@ two more flags that have defaults:
   tierstore v0.3.29 removed the store read grants they configured. A start that gives one, as a
   flag or as its `kbf.toml` key, is refused at once, exit status 2, with a line that names the
   flag and that release; delete it. A `GET /locate` answer has no header line and no `g`, and a
-  task reads every blob from this listener.
+  reader gets every blob from this listener.
 - The tee that copies a large blob to tierstore while it is streamed buffers up to 32 MiB for each
   live put (64 MiB in all at the default concurrency of two). That buffer is outside
   `--job-read-budget-bytes`, which counts what a read and its reply hold.

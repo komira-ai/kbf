@@ -1,8 +1,6 @@
 use js_proto::v1::{Layer, Mount, MountMode, MountPropagation, ProviderSource, layer, mount};
 
-use super::{
-    MAX_ROOT_BYTES, OUT_TARGET, PROVIDER, PutDirRoots, RootError, TaskOut, provider_layer,
-};
+use super::{MAX_ROOT_BYTES, OUT_TARGET, PROVIDER, PutDirRoots, RootError, provider_layer};
 
 /// Asserts that the trees are the directory beside the put root, under one mount point or `/`.
 #[test]
@@ -12,7 +10,6 @@ fn the_trees_are_beside_the_put_root() {
     assert_eq!(roots.trees(), "/mnt/tierstore/trees");
     let top = PutDirRoots::new("/put").expect("roots");
     assert_eq!(top.trees(), "/trees");
-    assert_eq!(TaskOut::default(), TaskOut::Presigned);
 }
 
 /// Asserts that a root that is not an absolute path in normal form below `/`, or is too long,

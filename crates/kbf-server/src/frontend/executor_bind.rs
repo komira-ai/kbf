@@ -17,7 +17,7 @@ use kbf_front::prepare_run::MAX_EXPIRY;
 use super::executor_flags::JsAgentFlags;
 use super::pack_flags::PackFlags;
 use super::task_flags::PutDirFlags;
-use crate::executor::{Config, TaskOut};
+use crate::executor::Config;
 
 /// The settings `--executor js-agent` rests on, as the flags beside it give them.
 pub(super) struct Beside<'a> {
@@ -49,7 +49,7 @@ pub(super) fn check(js: &mut JsAgentFlags, beside: &Beside<'_>) -> Result<(), St
     })?;
     js.put_retry = put_dir.put_retry;
     let config = &mut js.config;
-    config.task_out = TaskOut::PutDir(put_dir.roots.clone());
+    config.task_out = Some(put_dir.roots.clone());
     config.max_object_entries = put_dir.max_object_entries;
     config.max_object_manifest_bytes = put_dir.max_object_manifest_bytes;
     config.object_bytes_per_entry = put_dir.object_bytes_per_entry;
@@ -61,9 +61,9 @@ pub(super) fn check(js: &mut JsAgentFlags, beside: &Beside<'_>) -> Result<(), St
 /// ([`Config::validate`]).
 fn fit_wall(config: &mut Config, slack: Duration) -> Result<(), String> {
     let refuse = |why: &str| format!("--executor js-agent: {why}");
-    config.presign_ceiling = MAX_EXPIRY.saturating_sub(slack);
+    config.key_ceiling = MAX_EXPIRY.saturating_sub(slack);
     let longest = config.max_run + config.run_margin;
-    if longest > config.presign_ceiling {
+    if longest > config.key_ceiling {
         return Err(refuse(&format!(
             "--executor-max-run-secs plus --executor-run-margin-secs ({} s) must be at most \
              14400 s less --task-url-slack-secs ({} s), the longest the keys of a put directory \

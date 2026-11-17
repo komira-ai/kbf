@@ -12,8 +12,7 @@ use crate::executor::out::provider_layer;
 use crate::executor::traits::InputsError;
 use crate::executor::{
     ActionFacts, DEFAULT_MAC_OS_VERSION, Ingest, Ingested, InputTree, Inputs, MacPool, MintError,
-    OUT_TARGET, PackKey, PutDirRoots, ReadGrant, RunId, System, TASK_IN_TREE, TaskOut,
-    UntrustedLimits, build_id,
+    OUT_TARGET, PackKey, PutDirRoots, RunId, System, TASK_IN_TREE, UntrustedLimits, build_id,
 };
 
 const TREE: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -32,8 +31,7 @@ fn action() -> Digest {
     }
 }
 
-/// Inputs whose run wrote the action tree `tree`, and that never issue a grant; a Mac action
-/// when `mac`.
+/// Inputs whose run wrote the action tree `tree`; a Mac action when `mac`.
 struct Treed {
     tree: &'static str,
     mac: bool,
@@ -100,17 +98,6 @@ impl Inputs for Treed {
         })
     }
 
-    async fn read_grant(
-        &self,
-        _: RunId,
-        _: &Digest,
-        _: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Err(InputsError::Invalid(
-            "a put-directory run asks for no grant".to_owned(),
-        ))
-    }
-
     async fn tree(&self, _: RunId) -> Result<String, InputsError> {
         Ok(self.tree.to_owned())
     }
@@ -144,9 +131,7 @@ impl Case {
 async fn prepared_as(case: Case) -> (Result<super::Prepared, Settled>, Vec<InputTree>) {
     let mut harness = Harness::new();
     let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
-    if case.put_dir {
-        harness.cfg.task_out = TaskOut::PutDir(roots);
-    }
+    harness.cfg.task_out = case.put_dir.then_some(roots);
     harness.cfg.input_tree = case.tree;
     if case.macs {
         harness.cfg.mac = Some(MacPool {
@@ -230,11 +215,24 @@ async fn a_whole_machine_action_cannot_commit_into_a_put_dir() {
     );
 }
 
+/// Inputs of a Linux action that wrote no tree for the run: the default of the seam.
+struct NoTree;
+
+#[tonic::async_trait]
+impl Inputs for NoTree {
+    async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
+        Treed::linux().action(action).await
+    }
+}
+
 /// Asserts that inputs that wrote no tree for the run (the default of the seam) settle the run
 /// as infrastructure, and nothing is submitted.
 #[tokio::test(start_paused = true)]
 async fn a_run_with_no_tree_is_infrastructure() {
-    let refused = prepared(None, SHARE).await.err().expect("refused");
+    let refused = prepared(Some(Arc::new(NoTree)), SHARE)
+        .await
+        .err()
+        .expect("refused");
     assert_eq!(
         refused,
         Settled::Infra("no input tree was written for 7-8".to_owned())
@@ -279,19 +277,23 @@ async fn a_provider_job_has_the_tree_lists_provider_as_its_one_layer_and_nothing
     assert_eq!(bare(&listed), bare(&manifests));
 }
 
-/// Asserts that a presigned job (no put directory) asks the mint for `InputTree::Manifests`
-/// even when the config says provider, because it writes no tree. Catches: a presigned run
-/// made to write a tree list nobody reads.
+/// Asserts that an executor given no roots refuses a Linux run as the caller's, naming
+/// `--task-out-root`, before a key is minted: no put directory has anywhere to be mounted from.
+/// Catches: a run minted and submitted with no host directory to commit into.
 #[tokio::test(start_paused = true)]
-async fn a_presigned_job_asks_for_manifests_whatever_the_config_says() {
+async fn a_linux_run_with_no_task_out_root_is_refused_naming_the_flag() {
     let (job, asked) = prepared_as(Case {
-        tree: InputTree::Provider,
         put_dir: false,
-        ..Case::new(None, SHARE)
+        ..Case::new(Some(Arc::new(Treed::linux())), SHARE)
     })
     .await;
-    job.expect("prepared");
-    assert_eq!(asked, [InputTree::Manifests]);
+    assert_eq!(
+        job.err(),
+        Some(Settled::Invalid(
+            "a Linux action commits into a put directory: give --task-out-root".to_owned()
+        ))
+    );
+    assert!(asked.is_empty(), "{asked:?}");
 }
 
 /// Asserts that a Mac job asks the mint for `InputTree::Manifests` when the config says

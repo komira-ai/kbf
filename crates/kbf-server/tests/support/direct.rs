@@ -1,4 +1,4 @@
-//! The executor side of the harness: a fake job service, fakes of the three seams the executor
+//! The executor side of the harness: a fake job service, fakes of the two seams the executor
 //! reads the rest of the server through, and the helpers that drive a job. `support/mod.rs`
 //! documents how a test uses them.
 
@@ -15,8 +15,7 @@ use kbf_job_client::fake::{FakeJobServer, Fault, Machine};
 use kbf_proto::reapi::{ActionResult, Digest, OutputFile};
 use kbf_server::executor::{
     ActionFacts, Config, Deps, Executor, Ingest, Ingested, InputTree, Inputs, InputsError, Metrics,
-    MintError, PackKey, Presign, PresignError, ReadGrant, RunId, Secret, SizeClass, System,
-    UntrustedLimits, build_id,
+    MintError, PackKey, PutDirRoots, RunId, SizeClass, System, UntrustedLimits, build_id,
 };
 use prost::Message;
 use tokio::time::{sleep, timeout};
@@ -165,7 +164,7 @@ impl Direct {
         finished_retention: Duration,
     ) -> Executor {
         let mut cfg = Config::new("front-1");
-        cfg.insecure_argv_secrets = true;
+        cfg.task_out = Some(PutDirRoots::new("/mnt/ts/put").expect("roots"));
         cfg.poll = Duration::from_millis(20);
         cfg.finished_retention = finished_retention;
         let seams = Arc::new(Seams {
@@ -175,7 +174,6 @@ impl Direct {
         let deps = Deps {
             client: self.fake.client().expect("a job client"),
             ingest: seams.clone(),
-            presign: seams.clone(),
             inputs: seams,
             metrics: Arc::clone(&self.metrics),
             store,
@@ -338,7 +336,7 @@ impl Direct {
     }
 }
 
-/// The executor's three seams, over the server's cache.
+/// The executor's two seams, over the server's cache.
 struct Seams {
     direct: Direct,
     cache: Arc<Cache<GateLog, SharedStore>>,
@@ -365,28 +363,8 @@ impl Inputs for Seams {
         })
     }
 
-    async fn read_grant(
-        &self,
-        _run: RunId,
-        _action: &Digest,
-        _expires: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Ok(ReadGrant {
-            url: "https://grant.test:9400".to_owned(),
-            token: Secret::new("read-token-0001"),
-        })
-    }
-}
-
-#[tonic::async_trait]
-impl Presign for Seams {
-    async fn put_url(
-        &self,
-        key: &PackKey,
-        _expires: Duration,
-        _max_bytes: u64,
-    ) -> Result<Secret, PresignError> {
-        Ok(Secret::new(format!("https://store.test/{key}?sig=s3cr3t")))
+    async fn tree(&self, _run: RunId) -> Result<String, InputsError> {
+        Ok("ab".repeat(32))
     }
 }
 

@@ -27,7 +27,7 @@ use super::{FrontendFlags, FrontendHandle, Prepared, boxed, command, parse};
 use crate::health::Readiness;
 use crate::test_dir::scratch_dir;
 
-const JS_AGENT: &[&str] = &["--executor=js-agent", "--executor-insecure-argv-secrets"];
+const JS_AGENT: &[&str] = &["--executor=js-agent"];
 
 /// The error of parsing the command line `argv`, as text.
 fn refused(argv: Vec<String>) -> String {

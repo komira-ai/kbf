@@ -122,11 +122,11 @@ async fn a_finished_operation_is_answered_by_name_by_another_frontend_until_the_
 }
 
 /// Asserts that a frontend started after another is gone takes up the operation the first left
-/// unfinished, and a client that reattaches by name gets the result. The first frontend held the
-/// job's presigned write url, which no other process has, so the job it was running is
-/// cancelled and the operation runs again as the next attempt; that attempt ends and the new
-/// frontend reads its result and answers the client. The old frontend's liveness row has expired
-/// on the store's clock, and its operation row names it as the owner.
+/// unfinished, and a client that reattaches by name gets the result. The row names the put
+/// directory the job commits into, so the new frontend reads the job the first one submitted
+/// and, when it ends, its pack from that directory, and answers the client: one job, no second
+/// attempt. The old frontend's liveness row has expired on the store's clock, and its operation
+/// row names it as the owner.
 #[tokio::test]
 async fn a_restarted_frontend_takes_up_the_unfinished_operation_and_the_client_reattaches() {
     let state = FakeState::new();
@@ -147,16 +147,13 @@ async fn a_restarted_frontend_takes_up_the_unfinished_operation_and_the_client_r
     let mut reattached = wait(&after, &name)
         .await
         .expect("the new frontend knows it");
-    let second = after.direct.job(&job.action, 1).await;
-    after.direct.run_job(&second);
-    assert!(after.direct.fake.finish(&second, 0));
+    assert!(after.direct.fake.finish(&first, 0));
 
     let result = response(&done(&mut reattached).await)
         .result
         .expect("a result");
     assert_eq!(result.output_files[0].path, "out");
-    assert_ne!(first, second, "the next attempt is a new job");
-    assert_eq!(after.direct.jobs_of(&job.action).len(), 2);
+    assert_eq!(after.direct.jobs_of(&job.action).len(), 1, "no second job");
     assert!(state.keys("exec/op/").is_empty(), "the operation finished");
     assert_eq!(state.keys("done/").len(), 1);
 }

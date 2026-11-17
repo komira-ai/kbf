@@ -6,8 +6,7 @@
 //! `--job-grant-secret-file`, and then no other listener changes. A farm on its own network
 //! may serve it in plain HTTP instead (`--job-plain-http`, in place of the certificate and
 //! the key): the same routes, bounds and grants, with nothing encrypted, so a read grant
-//! crosses the network in clear; the executor's `--task-read-url` must then be `http://`
-//! and the TLS that follows is the TLS mode's alone. The jobs hold no client
+//! crosses the network in clear; the TLS that follows is the TLS mode's alone. The jobs hold no client
 //! certificate (they are untrusted code), so the TLS is the server's alone, from the farm CA
 //! the task is given (`kbf-task --root-der`), and no client is asked for a certificate.
 //! The task dials an IP address, so the certificate must name the addresses it dials as IP
@@ -180,9 +179,7 @@ pub(super) fn args() -> [Arg; 12] {
                 "Serves `--job-listen` in plain HTTP, with no TLS, in place of `--job-tls-cert` \
                  and `--job-tls-key` (given with either it is refused): the same routes and the \
                  same grants, each request still needs a valid read grant, but the grant and \
-                 the blobs cross the network unencrypted. For a farm on its own network; the \
-                 executor's `--task-read-url` must then be `http://` with \
-                 `--executor-allow-plain-http-grant`, and the other way round. Needs \
+                 the blobs cross the network unencrypted. For a farm on its own network. Needs \
                  `--job-listen` and `--job-grant-secret-file`",
             ),
         Arg::new(GRANT_SECRET)

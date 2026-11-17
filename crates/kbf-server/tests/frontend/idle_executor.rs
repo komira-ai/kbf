@@ -12,8 +12,7 @@ use kbf_job_client::fake::{FakeJobServer, Machine};
 use kbf_proto::reapi::Digest;
 use kbf_server::executor::{
     ActionFacts, Config, Deps, Executor, Ingest, Ingested, InputTree, Inputs, InputsError, Metrics,
-    MintError, PackKey, Presign, PresignError, ReadGrant, RunId, Secret, SizeClass, System,
-    UntrustedLimits,
+    MintError, PackKey, PutDirRoots, RunId, SizeClass, System, UntrustedLimits,
 };
 use std::sync::Arc;
 
@@ -21,7 +20,7 @@ use std::sync::Arc;
 const IMAGE: &str =
     "registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// The three seams of the executor, answering what an action that is never run needs.
+/// The two seams of the executor, answering what an action that is never run needs.
 struct Idle;
 
 #[tonic::async_trait]
@@ -37,28 +36,8 @@ impl Inputs for Idle {
         })
     }
 
-    async fn read_grant(
-        &self,
-        _run: RunId,
-        _action: &Digest,
-        _expires: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Ok(ReadGrant {
-            url: "https://grant.test:9400".to_owned(),
-            token: Secret::new("read-token-0001"),
-        })
-    }
-}
-
-#[tonic::async_trait]
-impl Presign for Idle {
-    async fn put_url(
-        &self,
-        key: &PackKey,
-        _expires: Duration,
-        _max_bytes: u64,
-    ) -> Result<Secret, PresignError> {
-        Ok(Secret::new(format!("https://store.test/{key}?sig=s3cr3t")))
+    async fn tree(&self, _run: RunId) -> Result<String, InputsError> {
+        Ok("ab".repeat(32))
     }
 }
 
@@ -113,13 +92,12 @@ pub async fn idle_executor() -> (Executor, Arc<FakeJobServer>) {
     fake.add_host("host-1", machine());
     let fake = Arc::new(fake);
     let mut cfg = Config::new("front-1");
-    cfg.insecure_argv_secrets = true;
+    cfg.task_out = Some(PutDirRoots::new("/mnt/ts/put").expect("roots"));
     cfg.poll = Duration::from_millis(20);
     let seams = Arc::new(Idle);
     let deps = Deps {
         client: fake.client().expect("a job client"),
         ingest: seams.clone(),
-        presign: seams.clone(),
         inputs: seams,
         metrics: Arc::new(Metrics::default()),
         store: None,

@@ -1,4 +1,4 @@
-//! One pack key ingested twice, by two frontends over the same stores: what a dead or stalled
+//! One put directory ingested twice, by two frontends over the same stores: what a dead or stalled
 //! frontend and the adopter that takes its job leave behind (`docs/design/n-frontends.md`, 4.4).
 
 use kbf_pack::OutputFile;
@@ -12,15 +12,6 @@ enum Order {
     AThenB,
     BThenA,
     Together,
-}
-
-/// How the run's pack was issued.
-#[derive(Clone, Copy, Debug)]
-enum Mode {
-    /// A put directory (`--task-out-mode put-dir`, the mode shared ownership needs).
-    PutDir,
-    /// One presigned key.
-    Presigned,
 }
 
 /// The stores two frontends share: the packs' object store, the pack index, and the CAS and
@@ -56,7 +47,7 @@ impl Plane {
 
     /// A frontend named `name` over these stores: its own packs and backend, the same index,
     /// object store, CAS and mint secret, as a second process of the group would hold.
-    fn frontend(&self, name: &str, mode: Mode) -> Front {
+    fn frontend(&self, name: &str) -> Front {
         let index: Arc<dyn PackIndex> = self.index.clone();
         let keys = PackKeys::new(WriterKind::Frontend, name, "boot1").expect("keys");
         let at = UNIX_EPOCH + Duration::from_secs(NOW);
@@ -73,20 +64,13 @@ impl Plane {
             SegmentsConfig::DEFAULT,
         ));
         let backend = Backend::remote_over(node, Some(packs.clone()));
-        let put_dir = match mode {
-            Mode::PutDir => Some(PutDirParts::new(
-                &packs,
-                &backend,
-                Arc::new(OnceLock::new()),
-            )),
-            Mode::Presigned => None,
-        };
+        let put_dir = PutDirParts::new(&packs, &backend, Arc::new(OnceLock::new()));
         Front::with_clock(
             FrontParts {
                 packs,
                 backend,
                 mint: PackKeyMint::new(SECRET).expect("a mint"),
-                prepare: Prepared::new(),
+                prepare: Arc::new(Unprepared),
                 base_image: ImageRef::parse(IMAGE).expect("an image"),
                 kbf_image: ImageRef::parse(&format!("docker://{KBF_IMAGE}")).expect("an image"),
                 put_dir,
@@ -116,25 +100,14 @@ impl Plane {
         wire(&self.store(&action).await)
     }
 
-    /// The key the run commits under for `action`, after writing its pack: a pack whose
-    /// manifest names the output `out`, and whose one record is that file's bytes.
-    async fn run(&self, mode: Mode, action: &Digest) -> PackKey {
+    /// The put directory the run commits into for `action`, after writing its pack: a pack
+    /// whose manifest names the output `out`, and whose one record is that file's bytes.
+    async fn run(&self, action: &Digest) -> PackKey {
         let digest = cas_digest(action).expect("a digest");
         let mint = PackKeyMint::new(SECRET).expect("a mint");
-        let (key, object) = match mode {
-            Mode::PutDir => {
-                let dir = mint.mint_put_dir("7-3", &digest, clock()).expect("a dir");
-                let dir = dir.dir().to_owned();
-                let object = format!("{dir}/pack");
-                (PackKey::new(dir), object)
-            }
-            Mode::Presigned => {
-                let key = mint
-                    .mint("7-3", &digest, clock(), Slot::Pack(0))
-                    .expect("a key");
-                (PackKey::new(key.key()), key.key().to_owned())
-            }
-        };
+        let dir = mint.mint_put_dir("7-3", &digest, clock()).expect("a dir");
+        let dir = dir.dir().to_owned();
+        let object = format!("{dir}/pack");
         let mut manifest = manifest_of("7-3", action);
         manifest.output_files = vec![OutputFile {
             path: "out".to_owned(),
@@ -145,7 +118,7 @@ impl Plane {
         let object = ObjectKey::new(object).expect("an object key");
         let put = self.store.put_new(&object, Bytes::from(pack), None);
         put.await.expect("written");
-        key
+        PackKey::new(dir)
     }
 
     /// What the stores hold of the run of `action` whose output is [`OUTPUT`].
@@ -177,11 +150,11 @@ fn ran(done: Ingested) -> (reapi::ActionResult, bool) {
 }
 
 /// What the stores hold after one ingest of the run, for comparison with two.
-async fn once(mode: Mode) -> Held {
+async fn once() -> Held {
     let plane = Plane::new();
-    let front = plane.frontend("fe1", mode);
+    let front = plane.frontend("fe1");
     let action = plane.action().await;
-    let key = plane.run(mode, &action).await;
+    let key = plane.run(&action).await;
     ran(front.ingest(lease(), &key, &action, &limits()).await);
     plane.held(&action).await
 }
@@ -196,17 +169,17 @@ async fn ingest_of(
     ran(front.ingest(lease(), key, action, caps).await)
 }
 
-/// Asserts, for one mode and order, that both ingests return `Ran` with equal results, that the
+/// Asserts, for one order, that both ingests return `Ran` with equal results, that the
 /// action cache holds one entry for the action and it is the result, and that the index holds
 /// the rows one ingest leaves (and, run in sequence, that the second changes none).
-async fn leaves_one_result(mode: Mode, order: Order) {
+async fn leaves_one_result(order: Order) {
     let plane = Plane::new();
-    let (a, b) = (plane.frontend("fe1", mode), plane.frontend("fe2", mode));
+    let (a, b) = (plane.frontend("fe1"), plane.frontend("fe2"));
     let action = plane.action().await;
-    let key = plane.run(mode, &action).await;
+    let key = plane.run(&action).await;
     let caps = limits();
     let ingest = |front| ingest_of(front, &key, &action, &caps);
-    let which = format!("{mode:?} {order:?}");
+    let which = format!("{order:?}");
     let (first, second, between) = match order {
         Order::AThenB | Order::BThenA => {
             let (early, late) = if matches!(order, Order::AThenB) {
@@ -232,11 +205,7 @@ async fn leaves_one_result(mode: Mode, order: Order) {
     let at = after.located.as_ref().expect("the output is indexed");
     assert!(at.pack_key.starts_with("cas/b/7-3/"), "{which}: {at:?}");
     assert!(after.pack.is_some(), "{which}: the pack has no row");
-    assert_eq!(
-        after,
-        once(mode).await,
-        "{which}: more than one ingest holds"
-    );
+    assert_eq!(after, once().await, "{which}: more than one ingest holds");
     if let Some(between) = between {
         assert_eq!(between, after, "{which}: the second ingest changed a row");
     }
@@ -248,14 +217,14 @@ async fn leaves_one_result(mode: Mode, order: Order) {
 /// entry equal to the result, and both return `Ran` with equal results.
 #[tokio::test]
 async fn a_put_dir_ingested_by_a_then_b_leaves_one_result() {
-    leaves_one_result(Mode::PutDir, Order::AThenB).await;
+    leaves_one_result(Order::AThenB).await;
 }
 
 /// Catches the same repeat in the other order: B first (the adopter of a job whose first
 /// frontend is slow), then A, as the zombie window of the fence allows.
 #[tokio::test]
 async fn a_put_dir_ingested_by_b_then_a_leaves_one_result() {
-    leaves_one_result(Mode::PutDir, Order::BThenA).await;
+    leaves_one_result(Order::BThenA).await;
 }
 
 /// Catches two ingests of one put directory that overlap (the stalled frontend wakes while the
@@ -263,25 +232,7 @@ async fn a_put_dir_ingested_by_b_then_a_leaves_one_result() {
 /// ingest leaves.
 #[tokio::test]
 async fn a_put_dir_ingested_by_both_at_once_leaves_one_result() {
-    leaves_one_result(Mode::PutDir, Order::Together).await;
-}
-
-/// Catches the presigned key (single ownership's mode) not being repeatable, in order A, B.
-#[tokio::test]
-async fn a_presigned_key_ingested_by_a_then_b_leaves_one_result() {
-    leaves_one_result(Mode::Presigned, Order::AThenB).await;
-}
-
-/// Catches the presigned key not being repeatable, in order B, A.
-#[tokio::test]
-async fn a_presigned_key_ingested_by_b_then_a_leaves_one_result() {
-    leaves_one_result(Mode::Presigned, Order::BThenA).await;
-}
-
-/// Catches two overlapping ingests of one presigned key leaving a second set of rows.
-#[tokio::test]
-async fn a_presigned_key_ingested_by_both_at_once_leaves_one_result() {
-    leaves_one_result(Mode::Presigned, Order::Together).await;
+    leaves_one_result(Order::Together).await;
 }
 
 /// Catches two ingests running on separate threads (real interleaving of the object store,
@@ -291,10 +242,10 @@ async fn a_presigned_key_ingested_by_both_at_once_leaves_one_result() {
 async fn two_threads_ingesting_one_put_dir_leave_one_result() {
     let plane = Plane::new();
     let action = plane.action().await;
-    let key = plane.run(Mode::PutDir, &action).await;
+    let key = plane.run(&action).await;
     let mut tasks = Vec::new();
     for name in ["fe1", "fe2"] {
-        let front = plane.frontend(name, Mode::PutDir);
+        let front = plane.frontend(name);
         let (key, action) = (key.clone(), action.clone());
         tasks.push(tokio::spawn(async move {
             ran(front.ingest(lease(), &key, &action, &limits()).await)
@@ -304,5 +255,5 @@ async fn two_threads_ingesting_one_put_dir_leave_one_result() {
     let second = tasks.remove(0).await.expect("joined");
     assert_eq!(first, second);
     assert!(first.1);
-    assert_eq!(plane.held(&action).await, once(Mode::PutDir).await);
+    assert_eq!(plane.held(&action).await, once().await);
 }

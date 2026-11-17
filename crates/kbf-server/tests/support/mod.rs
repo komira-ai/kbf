@@ -7,7 +7,7 @@
 //! `Listeners::executor` is a [`kbf_server::executor::Executor`] over
 //! [`kbf_job_client::fake::FakeJobServer`] (one Linux x86-64 host, [`HOST`]), and fakes of the
 //! seams the executor reads the rest of the server through: the inputs (an image, the action's
-//! timeout, a read grant), the presigned `PUT`, and the ingest. The ingest stands for the task
+//! timeout, its tree) and the ingest. The ingest stands for the task
 //! tool's pack: it answers with the [`Ran`] the test scripted for the action (nothing scripted:
 //! exit 0, no outputs), stores its blobs in the cell's CAS and, for an exit of 0, writes the
 //! result to the cell's action cache, as the frontend's ingest does. `cell.direct` holds the job

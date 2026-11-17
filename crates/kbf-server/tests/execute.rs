@@ -511,28 +511,33 @@ async fn an_execute_with_a_missing_input_is_refused_naming_the_blob_and_runs_no_
     assert_eq!(cell.direct.submitted_jobs(), 0);
 }
 
-/// Asserts that the platform's `kbf-lease` reaches the job: an action that asks for a whole
-/// machine is submitted as a job that needs the whole host, and one that does not is not.
+/// Asserts that the platform's `kbf-lease` is read: an action that asks for a whole machine
+/// cannot commit into a put directory (the job service gives a whole-host job no mount), so it
+/// is answered INVALID_ARGUMENT, naming the lease, with no job made; one that does not is
+/// submitted as a job that does not need the whole host.
 #[tokio::test]
-async fn a_whole_machine_action_is_submitted_as_a_job_that_needs_the_whole_host() {
+async fn a_whole_machine_action_is_refused_and_one_that_is_not_needs_no_whole_host() {
     let cell = Cell::start().await;
     let whole = Job::new("whole", &[("kbf-lease", "whole_machine")]);
     let shared = Job::new("shared", &[]);
     cell.upload(&whole.blobs()).await;
     cell.upload(&shared.blobs()).await;
-    let _whole_ops = cell.execute(&whole.action).await;
+    let mut whole_ops = cell.execute(&whole.action).await;
     let _shared_ops = cell.execute(&shared.action).await;
 
-    let needs = |id: String| {
-        cell.direct
-            .fake
-            .submitted(&id)
-            .expect("a submitted job")
-            .needs
-            .map(|needs| needs.whole_host)
-    };
-    let whole_job = cell.direct.job(&whole.action, 0).await;
+    let answer = response(&done(&mut whole_ops).await);
+    let status = answer.status.expect("a status");
+    assert_eq!(status.code, Code::InvalidArgument as i32, "{status:?}");
+    assert!(status.message.contains("whole_machine"), "{status:?}");
+    assert!(cell.direct.jobs_of(&whole.action).is_empty());
+
     let shared_job = cell.direct.job(&shared.action, 0).await;
-    assert_eq!(needs(whole_job), Some(true));
-    assert!(!needs(shared_job).unwrap_or(false));
+    let needs = cell
+        .direct
+        .fake
+        .submitted(&shared_job)
+        .expect("a submitted job")
+        .needs
+        .map(|needs| needs.whole_host);
+    assert!(!needs.unwrap_or(false));
 }

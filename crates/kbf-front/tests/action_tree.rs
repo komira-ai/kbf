@@ -42,6 +42,8 @@ mod limits;
 mod listing;
 #[path = "action_tree/memo.rs"]
 mod memo;
+#[path = "action_tree/places.rs"]
+mod places;
 #[path = "action_tree/retry.rs"]
 mod retry;
 #[path = "action_tree/store.rs"]

@@ -46,13 +46,23 @@
 //! listener's URL and key, so a frontend whose runs all commit into put directories is set up
 //! without them.
 //!
+//! **A put directory alone.** [`PutDirPrep::mint_put_dir`] makes the same checks as
+//! [`PutDirPrep::prepare_put_dir`] and mints the directory without collecting a closure
+//! ([`MintedPutDir`]), for a run whose input tree is already written.
+//! [`PutDirPrep::with_directories`] has the closure walk read its `Directory` messages through a
+//! [`DirectoryCache`], keyed by digest, so a tree walked before is not read from the store again.
+//! The cache serves the closure walk of the put-directory preparation only; [`RunPrep`] reads no
+//! cache.
+//!
 //! **Secrets.** The key of the mint, the key of the grants and the signing key of the write
 //! are values the caller loads from files named by flags (`kbf-server`'s `task_flags`); no
 //! type here prints one, and the URL and the token are redacted from [`RunInputs`]'s `Debug`.
 
 mod closure;
+mod directories;
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_pack::{MAX_LARGE, MAX_PACKS, MAX_RECORD_BYTES, TaskKeyError, check_build};
@@ -60,11 +70,12 @@ use kbf_types::Digest;
 use tierstore::server::presign::PresignError;
 use tierstore::server::{PresignRequest, presign_put};
 
-pub(crate) use self::closure::KeptDirectory;
 pub use self::closure::{
     ClosureError, ClosureLimits, InputClosure, KeptClosure, collect_closure,
     collect_closure_keeping,
 };
+pub(crate) use self::closure::{KeptDirectory, keeping_through};
+pub use self::directories::{DIRECTORY_MEMORY_BYTES, DirectoryCache};
 pub use tierstore::server::AccessKey;
 
 use crate::backend::Backend;
@@ -620,6 +631,7 @@ impl RunPrep {
             &self.mint,
             self.limits,
             self.slack,
+            None,
             &RunAt {
                 lease,
                 action,
@@ -642,6 +654,16 @@ pub struct PutDirPrep {
     mint: PackKeyMint,
     slack: Duration,
     limits: ClosureLimits,
+    directories: Option<Arc<DirectoryCache>>,
+}
+
+/// What [`PutDirPrep::mint_put_dir`] gives: the put directory of a run, with no closure.
+#[derive(Debug)]
+pub struct MintedPutDir {
+    /// The put directory the task commits its objects into: the run's keys.
+    pub dir: IssuedPutDir,
+    /// The Unix second after which the directory's keys are not good for the run.
+    pub not_after: u64,
 }
 
 impl PutDirPrep {
@@ -662,7 +684,15 @@ impl PutDirPrep {
             mint,
             slack,
             limits,
+            directories: None,
         }
+    }
+
+    /// This preparer, its closure walk reading each `Directory` through `cache` first.
+    #[must_use]
+    pub fn with_directories(mut self, cache: Arc<DirectoryCache>) -> Self {
+        self.directories = Some(cache);
+        self
     }
 
     /// The mint that signs this preparer's directories: the one [`crate::ingest_put_dir`] must
@@ -689,6 +719,7 @@ impl PutDirPrep {
             &self.mint,
             self.limits,
             self.slack,
+            self.directories.as_deref(),
             &RunAt {
                 lease,
                 action,
@@ -697,6 +728,24 @@ impl PutDirPrep {
             },
         )
         .await
+    }
+
+    /// The put directory of the run alone: the checks of [`PutDirPrep::prepare_put_dir`] (the
+    /// lease, the expiry, the clock, the mint) and no closure, so nothing is read from the store.
+    ///
+    /// # Errors
+    /// [`PrepareError`]: the lease is not a build id, the wall and slack are over
+    /// [`MAX_EXPIRY`], `now` is before the epoch, or the directory cannot be minted.
+    pub async fn mint_put_dir(
+        &self,
+        lease: &str,
+        action: &Digest,
+        now: SystemTime,
+        wall: Duration,
+    ) -> Result<MintedPutDir, PrepareError> {
+        let not_after = not_after(lease, now, wall, self.slack)?;
+        let dir = self.mint.mint_put_dir(lease, action, now)?;
+        Ok(MintedPutDir { dir, not_after })
     }
 }
 
@@ -708,25 +757,37 @@ struct RunAt<'a> {
     wall: Duration,
 }
 
+/// The Unix second a put directory minted for `lease` at `now` stops being good for the run: its
+/// start, `wall` and `slack`, after the checks every put directory has.
+fn not_after(
+    lease: &str,
+    now: SystemTime,
+    wall: Duration,
+    slack: Duration,
+) -> Result<u64, PrepareError> {
+    check_build(lease)?;
+    let expires_secs = expiry_secs(wall, slack)?;
+    let since = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| PrepareError::Clock)?;
+    Ok(since.as_secs().saturating_add(expires_secs))
+}
+
 async fn put_dir_run(
     backend: &Backend,
     mint: &PackKeyMint,
     limits: ClosureLimits,
     slack: Duration,
+    directories: Option<&DirectoryCache>,
     run: &RunAt<'_>,
 ) -> Result<PutDirRun, PrepareError> {
-    check_build(run.lease)?;
-    let expires_secs = expiry_secs(run.wall, slack)?;
-    let since = run
-        .now
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| PrepareError::Clock)?;
-    let kept = collect_closure_keeping(backend, run.action, limits).await?;
+    let not_after = not_after(run.lease, run.now, run.wall, slack)?;
+    let kept = keeping_through(backend, run.action, limits, directories).await?;
     let dir = mint.mint_put_dir(run.lease, run.action, run.now)?;
     Ok(PutDirRun {
         dir,
         kept,
-        not_after: since.as_secs().saturating_add(expires_secs),
+        not_after,
     })
 }
 

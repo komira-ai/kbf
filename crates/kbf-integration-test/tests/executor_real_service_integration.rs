@@ -6,8 +6,8 @@
 //! tells the test when it starts, with what arguments, and when it ends, and does what the test
 //! planned for its action: exit with a code, or hold until it is stopped.
 //!
-//! What the executor reads from the outside (the action's facts and read grant, the presigned
-//! `PUT`, the pack's ingest) is faked here as in `kbf-server/tests/executor/rig.rs`: the
+//! What the executor reads from the outside (the action's facts and tree, the put directory's
+//! mint, the pack's ingest) is faked here as in `kbf-server/tests/executor/rig.rs`: the
 //! subject is what the executor and the job service say to each other, and what the service and
 //! the agent make of it. A fake job server can drift from the real one; these tests run the
 //! real one.
@@ -26,6 +26,9 @@
 //! - `a_lost_answer_to_a_submit_makes_one_job`: the answer to the submit is lost after the
 //!   service made the job; the executor submits again under the same id, and the service holds
 //!   one job.
+//! - `a_whole_machine_action_is_refused_and_no_job_is_made`: a whole-machine action cannot
+//!   commit into a put directory (the service gives a whole-host job no mount), so the executor
+//!   answers it as the caller's and makes no job.
 //!
 //! One test runs everywhere, as a pull request's tests do:
 //! `the_stand_in_answers_as_the_program_it_is_linked_as`, the built stand-in under the names
@@ -38,6 +41,7 @@
 mod js_real_support;
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt as _;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -47,8 +51,8 @@ use kbf_job_client::Client;
 use kbf_proto::reapi::Digest;
 use kbf_server::executor::{
     ActionFacts, Config, Deps, Executor, Ingest, Ingested, InputTree, Inputs, InputsError, Metrics,
-    MintError, PackKey, Presign, PresignError, ReadGrant, RunId, Secret, SizeClass,
-    UntrustedLimits, build_id, job_id, parse_stored_name,
+    MintError, OUT_TARGET, PackKey, PutDirRoots, RunId, SizeClass, TASK_IN_TREE, UntrustedLimits,
+    build_id, job_id, parse_stored_name,
 };
 use kbf_types::ActionKey;
 use tokio::sync::watch;
@@ -58,6 +62,9 @@ use js_real_support::drop_answer::DropFirstAnswer;
 use js_real_support::{RealJobServer, TOKEN};
 
 const FRONTEND: &str = "front-1";
+
+/// The action tree every run is told to read its root from: 64 hex digits.
+const TREE: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 /// The digest of the action of `tag`: hash `[tag; 32]`, size `tag`.
 fn digest_of(tag: u8) -> kbf_types::Digest {
@@ -79,8 +86,8 @@ fn hash_of(tag: u8) -> String {
     format!("{tag:02x}").repeat(32)
 }
 
-/// What the executor reads of an action: the node's image, and a timeout per action (60 s
-/// unless the test set one).
+/// What the executor reads of an action: the node's image, a timeout per action (60 s unless
+/// the test set one), and the one tree every run reads its root from.
 #[derive(Default)]
 struct FakeInputs {
     timeouts: Mutex<BTreeMap<String, Duration>>,
@@ -99,31 +106,8 @@ impl Inputs for FakeInputs {
         })
     }
 
-    async fn read_grant(
-        &self,
-        _run: RunId,
-        _action: &Digest,
-        _expires: Duration,
-    ) -> Result<ReadGrant, InputsError> {
-        Ok(ReadGrant {
-            url: "https://grant.test:9400".to_owned(),
-            token: Secret::new("read-token-0001"),
-        })
-    }
-}
-
-/// A store that signs a url for any key.
-struct FakePresign;
-
-#[tonic::async_trait]
-impl Presign for FakePresign {
-    async fn put_url(
-        &self,
-        key: &PackKey,
-        _expires: Duration,
-        _max_bytes: u64,
-    ) -> Result<Secret, PresignError> {
-        Ok(Secret::new(format!("https://store.test/{key}?sig=s3cr3t")))
+    async fn tree(&self, _run: RunId) -> Result<String, InputsError> {
+        Ok(TREE.to_owned())
     }
 }
 
@@ -131,6 +115,18 @@ impl Presign for FakePresign {
 #[derive(Default)]
 struct FakeIngest {
     ingested: Mutex<Vec<RunId>>,
+    /// The put root of the node: a run's put directory is made under it when it is minted, as
+    /// the job's mount source must exist when the agent starts the job.
+    put: std::path::PathBuf,
+}
+
+impl FakeIngest {
+    fn under(put: std::path::PathBuf) -> Self {
+        Self {
+            ingested: Mutex::default(),
+            put,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -142,7 +138,12 @@ impl Ingest for FakeIngest {
         _wall: Duration,
         _tree: InputTree,
     ) -> Result<PackKey, MintError> {
-        Ok(PackKey::new(format!("cas/b/{}/0-0", build_id(run))))
+        let key = PackKey::new(format!("cas/b/{}/0-0", build_id(run)));
+        let dir = self.put.join(key.as_str());
+        std::fs::create_dir_all(&dir).expect("the put directory");
+        // The job's user writes into it.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        Ok(key)
     }
 
     async fn ingest(
@@ -220,11 +221,15 @@ impl Rig {
         let agent = RealAgent::start(&node, &server).await;
         let api = server.client();
         let mut cfg = Config::new(FRONTEND);
-        cfg.insecure_argv_secrets = true;
+        // The put directories are under the node's own mount point, a root of its agent.
+        let put = node.mount_point.join("put");
+        cfg.task_out = Some(PutDirRoots::new(&put.display().to_string()).expect("roots"));
+        // The action tree every run's layer names: a directory under the agent's trees root.
+        std::fs::create_dir_all(node.mount_point.join("trees").join(TREE)).expect("the tree");
         // The job's wall limit is the action's timeout: no margin is added.
         cfg.run_margin = Duration::ZERO;
         let inputs = Arc::new(FakeInputs::default());
-        let ingest = Arc::new(FakeIngest::default());
+        let ingest = Arc::new(FakeIngest::under(put));
         let metrics = Arc::new(Metrics::default());
         let exec = Rig::executor(&cfg, server.client(), &inputs, &ingest, &metrics);
         Rig {
@@ -250,7 +255,6 @@ impl Rig {
         let deps = Deps {
             client,
             ingest: ingest.clone(),
-            presign: Arc::new(FakePresign),
             inputs: inputs.clone(),
             metrics: Arc::clone(metrics),
             store: None,
@@ -261,12 +265,21 @@ impl Rig {
 
     /// Hands the action of `tag` to the executor, as the REAPI front hands an Execute.
     fn submit(&self, tag: u8) -> Caller {
+        self.submit_as(tag, false)
+    }
+
+    /// Hands the action of `tag`, which asks for the whole machine, to the executor.
+    fn submit_whole(&self, tag: u8) -> Caller {
+        self.submit_as(tag, true)
+    }
+
+    fn submit_as(&self, tag: u8, whole_machine: bool) -> Caller {
         let submission = Submission {
             key: ActionKey {
                 instance: "main".to_owned(),
                 action: digest_of(tag),
             },
-            whole_machine: false,
+            whole_machine,
             call: None,
             described: Described {
                 arguments: vec!["/bin/run".to_owned()],
@@ -398,12 +411,11 @@ fn after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 /// Asserts the whole way of an action that succeeds: the executor submits it as a job of the
 /// real service under the id made from the frontend and the operation's first run, the service
-/// places it on the agent, the agent starts its container from the node's image with the task
-/// tool's arguments (the action, the run, the grant), the container exits 0, the service
-/// records the job succeeded with exit code 0, the executor reads that, ingests the pack once
-/// and answers the operation with the action's result. Catches a job the real service refuses,
-/// never places or ends otherwise than the fake does, and an executor that reads a real ending
-/// as another.
+/// places it on the agent, the agent starts its container with the task tool's arguments (the
+/// tree, the action, the run), the container exits 0, the service records the job succeeded
+/// with exit code 0, the executor reads that, ingests the pack once and answers the operation
+/// with the action's result. Catches a job the real service refuses, never places or ends
+/// otherwise than the fake does, and an executor that reads a real ending as another.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs root, systemd and the pinned js-lease-server and js-agent: beta.yml's js-real-service job fetches them and runs these with cargo xtask sudo-test"]
 async fn a_job_that_exits_0_is_the_actions_result() {
@@ -417,9 +429,9 @@ async fn a_job_that_exits_0_is_the_actions_result() {
         after(&args, "--action"),
         Some(format!("{}/1", hash_of(1)).as_str())
     );
-    assert_eq!(after(&args, "--grant-url"), Some("https://grant.test:9400"));
-    // The agent's init, then the image's entrypoint and the job's arguments.
-    assert_eq!(after(&args, "--"), Some("/bin/task"), "{args:?}");
+    // The agent's init, then the program of the base tree and the job's arguments.
+    assert_eq!(after(&args, "--"), Some(TASK_IN_TREE), "{args:?}");
+    assert!(args.iter().any(|arg| arg == "--tree"), "{args:?}");
     assert_eq!(after(&args, "--lease"), Some(build_id(run).as_str()));
     // The container ends by itself.
     assert_eq!(rig.node.next().await, Event::Ended { name });
@@ -443,7 +455,10 @@ async fn a_job_that_exits_0_is_the_actions_result() {
     assert_eq!(*rig.ingest.ingested.lock().expect("ingested"), [run]);
     assert_eq!(rig.counter("kbf_executor_jobs_submitted_total"), 1);
     let spec = job.spec.clone().expect("the job's spec");
-    assert_eq!(spec.image, image());
+    assert_eq!(spec.image, "");
+    assert_eq!(spec.command, TASK_IN_TREE);
+    assert_eq!((spec.layers.len(), spec.mounts.len()), (1, 1));
+    assert_eq!(spec.mounts[0].target, OUT_TARGET);
     assert_eq!(spec.wall_limit_seconds, Some(60));
 }
 
@@ -563,6 +578,28 @@ async fn a_lost_answer_to_a_submit_makes_one_job() {
     assert_eq!(rig.ingest.ingested.lock().expect("ingested").len(), 1);
 }
 
+/// Asserts that a whole-machine action is refused as the caller's and makes no job: it cannot
+/// commit into a put directory, the real service gives a whole-host job no mount, so the
+/// executor answers the action `INVALID_ARGUMENT` before it submits anything. Catches an
+/// executor that sends the real service a whole-host job with a mount.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root, systemd and the pinned js-lease-server and js-agent: beta.yml's js-real-service job fetches them and runs these with cargo xtask sudo-test"]
+async fn a_whole_machine_action_is_refused_and_no_job_is_made() {
+    let rig = Rig::start("xrs-whole").await;
+    let whole = rig.submit_whole(5);
+    match whole.done().await {
+        Finished::Failed(status) => assert_eq!(
+            tonic::Code::from_i32(status.code),
+            tonic::Code::InvalidArgument,
+            "{}",
+            rig.logs()
+        ),
+        other => panic!("not refused: {other:?}\n{}", rig.logs()),
+    }
+    let jobs = rig.jobs_of(5).await;
+    assert!(jobs.is_empty(), "{jobs:?}");
+    assert_eq!(rig.counter("kbf_executor_jobs_submitted_total"), 0);
+}
 /// Asserts that the built stand-in answers as the program the name it is run by says, with the
 /// place beside it: as `crun --version` it names a release the agent takes, as `ip -j link
 /// show` it lists no link, both recorded in `stand-in/calls`, and under a name it does not know

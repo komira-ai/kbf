@@ -28,8 +28,8 @@
 //! An `exec/op/` value is one version byte ([`VERSION`]) and a JSON object. A reader ignores the
 //! fields it does not name, so a later release adds a field and this one still reads the row. A
 //! row whose version byte this build does not know was written by a later release: a scan skips
-//! it and counts it ([`Rows::unknown_rows`]). A row never holds a presigned url, a read token or
-//! a file or environment value of a job.
+//! it and counts it ([`Rows::unknown_rows`]). A row never holds a file or environment value of
+//! a job.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -117,9 +117,9 @@ pub struct OpRow {
     pub attempt: u32,
     /// The id of that attempt's job.
     pub job: String,
-    /// The put directory the job commits into, `cas/b/<build>/<nonce>`; `None` for a job that
-    /// writes to a presigned url, which only the process holding the url can finish: one that
-    /// takes the operation up runs it again.
+    /// The put directory the job commits into, `cas/b/<build>/<nonce>`, always written. A row
+    /// with none is read as one whose pack cannot be found: the process that takes the
+    /// operation up runs it again.
     #[serde(default)]
     pub key: Option<String>,
     /// The action's platform asks for a whole machine.

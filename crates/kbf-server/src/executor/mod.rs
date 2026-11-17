@@ -28,7 +28,7 @@
 //! one takes up the old one's jobs. Nothing is cancelled when a frontend ends.
 //!
 //! The frontend builds one only for `--executor js-agent` (`frontend/executor_flags.rs`), over
-//! [`Front`], which implements the three seams ([`Ingest`], [`Presign`], [`Inputs`]) with the
+//! [`Front`], which implements the two seams ([`Ingest`], [`Inputs`]) with the
 //! frontend's own packs, CAS, key mint and run preparation. A frontend with no executor answers
 //! every Execute that is not a cache hit `FAILED_PRECONDITION`.
 
@@ -36,6 +36,7 @@ mod api;
 mod config;
 mod driver;
 mod front;
+mod front_cache;
 mod mac;
 mod metrics;
 mod ops;
@@ -66,24 +67,22 @@ use ops::{Joined, Ops};
 use rows::Rows;
 use run::{Op, Start};
 
-pub use config::{Config, ConfigError, FINISHED_RETENTION, InputTree, LIVE, Network};
+pub use config::{Config, ConfigError, FINISHED_RETENTION, InputTree, LIVE};
 pub use driver::Running;
 pub use front::{
-    Front, FrontParts, PrepareError, PreparedPutDir, PreparedRun, PutDirParts, RunPrepare,
-    RunSource,
+    Front, FrontParts, MintedDir, PrepareError, PreparedPutDir, PutDirParts, RunPrepare, RunSource,
 };
 pub use mac::{
     DEFAULT_MAC_OS_VERSION, MAC_OS, MAC_OUT_TARGET, MacPool, MacPoolError, System, TREE_TARGET,
 };
 pub use metrics::Metrics;
-pub use out::{MAX_ROOT_BYTES, OUT_TARGET, PutDirRoots, RootError, TASK_IN_TREE, TaskOut};
+pub use out::{MAX_ROOT_BYTES, OUT_TARGET, PutDirRoots, RootError, TASK_IN_TREE};
 pub use outcome::OUT_OF_MEMORY_REASON;
 pub use size_class::SizeClass;
 pub use submit::job_id;
-pub use task::{Delivery, PackKey, RunId, Secret, TaskArgs, build_id};
+pub use task::{PackKey, RunId, build_id};
 pub use traits::{
-    ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
-    ReadGrant, RejectReason, UntrustedLimits,
+    ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, RejectReason, UntrustedLimits,
 };
 
 /// The most operations the executor holds open at once: a guard on the memory they hold (a
@@ -119,9 +118,7 @@ pub struct Deps {
     pub client: Client,
     /// The frontend's read of a task's pack.
     pub ingest: Arc<dyn Ingest>,
-    /// The store's presigned `PUT`.
-    pub presign: Arc<dyn Presign>,
-    /// The CAS read of an action, and the read grant.
+    /// The CAS read of an action, and the action tree of a run.
     pub inputs: Arc<dyn Inputs>,
     /// What the executor counts.
     pub metrics: Arc<Metrics>,

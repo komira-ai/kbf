@@ -141,13 +141,10 @@ impl Executor {
             format!("--executor-job-url={}", self.fake.origin()),
             format!("--executor-job-token-file={}", job_token.display()),
             format!("--executor-frontend-id={name}"),
-            "--executor-insecure-argv-secrets".to_owned(),
             format!("--executor-base-image={BASE_IMAGE}"),
             format!("--executor-kbf-image={KBF_IMAGE}"),
             format!("--executor-base-tree={}", dir.join("base-tree").display()),
             "--executor-base-tree-url=".to_owned(),
-            "--executor-allow-plain-http-put".to_owned(),
-            "--executor-work-dir=/scratch".to_owned(),
         ]
     }
 

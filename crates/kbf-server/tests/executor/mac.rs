@@ -6,7 +6,6 @@ use kbf_front::Finished;
 use kbf_job_client::fake::Machine;
 use kbf_server::executor::{
     ActionFacts, DEFAULT_MAC_OS_VERSION, MAC_OUT_TARGET, MacPool, PutDirRoots, System, TREE_TARGET,
-    TaskOut,
 };
 use tonic::Code;
 
@@ -20,7 +19,7 @@ const BUNDLE: &str =
 async fn rig(macs: bool) -> Rig {
     let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
     let rig = Rig::start(&[HOST], |cfg| {
-        cfg.task_out = TaskOut::PutDir(roots);
+        cfg.task_out = Some(roots);
         cfg.mac = macs.then(|| MacPool {
             bundle: BUNDLE.to_owned(),
             os_version: DEFAULT_MAC_OS_VERSION,

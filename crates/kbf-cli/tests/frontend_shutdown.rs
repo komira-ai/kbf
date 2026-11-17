@@ -342,13 +342,10 @@ impl Rig {
             format!("--executor-job-url={}", fake.origin()),
             format!("--executor-job-token-file={job_token}"),
             "--executor-frontend-id=front-1".to_owned(),
-            "--executor-insecure-argv-secrets".to_owned(),
             format!("--executor-base-image={BASE_IMAGE}"),
             format!("--executor-kbf-image={KBF_IMAGE}"),
             format!("--executor-base-tree={}", dir.join("base-tree").display()),
             "--executor-base-tree-url=".to_owned(),
-            "--executor-allow-plain-http-put".to_owned(),
-            "--executor-work-dir=/scratch".to_owned(),
         ];
         args.extend(more.iter().map(|m| (*m).to_owned()));
         let mut frontend = Proc::start(&dir, &args);

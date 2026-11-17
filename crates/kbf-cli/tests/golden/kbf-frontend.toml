@@ -39,14 +39,17 @@ enroll-rate-per-minute = 60
 # frontend-name = []
 
 [executor]
-# Where the frontend runs the actions it is asked to execute: `js-agent`, the only value, runs each Execute as a job of the job scheduler's job service, in the kbf image (`--executor-kbf-image`, built from `--executor-base-image`), whose task tool runs the action inside it; it needs the job service's flags (`--executor-job-url`, `--executor-job-token-file`, and `--executor-job-ca-file` for https), `--executor-frontend-id`, the release's base tree bundles (`--executor-base-tree`), the packs (`--pack-store-endpoint`) and the secret delivery (`--executor-secret-delivery`, with `--executor-insecure-argv-secrets` for its default `argv`). Left out, no executor is built and no job service is contacted, whatever the other `--executor-*` flags say; `--executor-insecure-argv-secrets` is then ignored
+# Where the frontend runs the actions it is asked to execute: `js-agent`, the only value, runs each Execute as a job of the job scheduler's job service, in the kbf image (`--executor-kbf-image`, built from `--executor-base-image`), whose task tool runs the action inside it; it needs the job service's flags (`--executor-job-url`, `--executor-job-token-file`, and `--executor-job-ca-file` for https), `--executor-frontend-id`, the release's base tree bundles (`--executor-base-tree`), the packs (`--pack-store-endpoint`) and the put directories of the runs (`--task-secret-file`, `--task-out-root`). Left out, no executor is built and no job service is contacted, whatever the other `--executor-*` flags say
 # executor = "KIND"
-# Says jobs may be given an open network: what `--executor-network open` needs, and refused with any other `--executor-network`. Off by default. Used only with `--executor js-agent`
-executor-allow-open-network = false
-# Lets the task read its inputs through a read grant served over `http://`: an `http://` `--task-read-url` is accepted, and the task tool is given `--allow-plain-http-grant`. The read token then crosses the job network in clear, so this is for a farm on its own network. Off by default, and an `http://` read url is refused without it. Used only with `--executor js-agent`
-executor-allow-plain-http-grant = false
-# Lets the task write its pack to an `http://` url, until the store serves TLS. The reads stay https unless `--executor-allow-plain-http-grant` says otherwise. Used only with `--executor js-agent`
-executor-allow-plain-http-put = false
+# Removed with the executor's presigned path. Any value is refused at start
+# (not in --help)
+# executor-allow-open-network = "VALUE"
+# Removed with the executor's presigned path. Any value is refused at start
+# (not in --help)
+# executor-allow-plain-http-grant = "VALUE"
+# Removed with the executor's presigned path. Any value is refused at start
+# (not in --help)
+# executor-allow-plain-http-put = "VALUE"
 # The CPU architecture of the Linux hosts. Every job of a Linux action asks for a host of `os=linux`, this `arch` and containers (the Macs' are `arm64`). Used only with `--executor js-agent`
 executor-arch = "x86_64"
 # The base environment the Command of an action sees, pinned by digest as `<repository>@sha256:<64 hex digits>` (a leading `docker://` is optional). It is the one image an action's `container-image` platform property may name: an action that names another is refused as invalid, one that names none gets this. A tag is refused. Needed with `--executor js-agent`
@@ -63,7 +66,7 @@ executor-base-tree-url = "https://api.github.com/repos/komira-ai/kbf/releases"
 executor-call-timeout-secs = 5
 # The timeout, in seconds, of an action that names none: at most `--executor-max-run-secs`. Used only with `--executor js-agent`
 executor-default-timeout-secs = 3000
-# The most bytes of a failed job's standard error the frontend writes to its log, at WARN, with the job's secrets redacted: the end of the stream. 0 writes none. The whole output (up to 8 KiB with standard output) goes with the result either way. Used only with `--executor js-agent`
+# The most bytes of a failed job's standard error the frontend writes to its log, at WARN: the end of the stream. 0 writes none. The whole output (up to 8 KiB with standard output) goes with the result either way. Used only with `--executor js-agent`
 executor-failed-stderr-log-bytes = 512
 # The name every frontend of the farm gives: the value of the `kbf-frontend` label of every job, hashed into the job ids. 1 to 63 of letters, digits, `-`, `_` and `.`. It is the same for every frontend of one farm, not unique to each. Used only with `--executor js-agent`
 # executor-frontend-id = "ID"
@@ -81,8 +84,9 @@ executor-failed-stderr-log-bytes = 512
 # executor-hosts = "WORKERS"
 # What a Linux put-directory job's root is read from. `manifests`, the default: the action tree's manifests, the job's layer `<mp>/trees/<digest>`. `provider`: one tree list of the tree, the job's layer tierstore's mount provider, which fetches the tree's files while the job's sandbox is made. `provider` needs `--task-out-mode put-dir`. A Mac job's root is always `manifests`. Used only with `--executor js-agent`
 executor-input-tree = "manifests"
-# Says the secrets of a task (the presigned write url, the read token) may travel as arguments of the job, where the action can read them from `/proc` and the engine's inspect shows them. It is what the default `--executor-secret-delivery argv` needs, and `--executor-secret-delivery files` refuses it. Off by default
-executor-insecure-argv-secrets = false
+# Removed with the executor's presigned path. Any value is refused at start
+# (not in --help)
+# executor-insecure-argv-secrets = "VALUE"
 # The CA certificate (PEM) the job service's certificate chains to: the only trust anchor, no system roots are consulted. Needed for an `https` job service and refused for an `http` one. Used only with `--executor js-agent`
 # executor-job-ca-file = "PATH"
 # A file with the bearer token of the job service, readable by its owner alone (mode 0600 or 0400). The secret is never a flag: a command line is world-readable. Used only with `--executor js-agent`
@@ -93,8 +97,9 @@ executor-insecure-argv-secrets = false
 # executor-kbf-image = "IMAGE"
 # How long the liveness row of this process lives in the state store after its last renewal, on the store's clock, in seconds. Once it has expired, another frontend of the store takes up this process's unfinished operations. Read only with `--state-store`. Used only with `--executor js-agent`
 executor-live-secs = 20
-# Has the task tool ask the read listener where each input is kept (`GET /locate`). The answer names no store and no grant (tierstore v0.3.29 removed the store read grants), so the task still reads every input through the listener, as without the flag; every byte is checked against its digest. Off by default. Used only with `--executor js-agent`, and refused without it
-executor-locate = false
+# Removed with the executor's presigned path. Any value is refused at start
+# (not in --help)
+# executor-locate = "VALUE"
 # Retired: no longer read, every Execute is a job of the job service
 # (not in --help)
 # executor-mac-hosts = "WORKERS"
@@ -106,8 +111,9 @@ executor-mac-os-version = 26
 # executor-mac-task-out-root = "PATH"
 # The longest action timeout the executor runs, in seconds; an action that asks for more is refused. Used only with `--executor js-agent`
 executor-max-run-secs = 3000
-# The network every job is given on its host. `allow-list`, the default, is the endpoints the host's agent is set up to allow and nothing else: the task reaches the read listener and the pack store only once each agent allows them, and a host whose agent cannot check those limits refuses the job (`egress-unchecked`). `none` is no route out: every action fails, as the task can reach neither. `open` is any address but those the agent always denies, and needs `--executor-allow-open-network`. Used only with `--executor js-agent`
-executor-network = "allow-list"
+# Removed with the executor's presigned path. Any value is refused at start
+# (not in --help)
+# executor-network = "VALUE"
 # Retired: no longer read, every Execute is a job of the job service
 # (not in --help)
 # executor-ownership = "MODE"
@@ -120,10 +126,12 @@ executor-poll-ms = 250
 executor-prepare-limit-secs = 300
 # What a job's wall limit adds to the action's timeout, in seconds: the fetch of the inputs and the upload of the pack. An action that fetches or uploads for longer than this ends at the wall limit and is answered to the caller as a timeout. Used only with `--executor js-agent`
 executor-run-margin-secs = 300
-# How the secrets of a task (the presigned write url, the read token) reach it. `argv`, the default, passes them as arguments of the job and needs `--executor-insecure-argv-secrets`. `files` passes each as a file of the job, which its host writes read-only at `/run/js-files`: no argument holds a secret, and `--executor-insecure-argv-secrets` is refused with it; a host whose agent cannot write files refuses to start the job. `files` is refused without `--executor js-agent`, which builds the command line
-executor-secret-delivery = "argv"
-# Where the task tool works in the container, if not in its own default: the kbf image must have a writable directory there. Used only with `--executor js-agent`
-# executor-work-dir = "DIR"
+# Removed with the executor's presigned path. Any value is refused at start
+# (not in --help)
+# executor-secret-delivery = "VALUE"
+# Removed with the executor's presigned path. Any value is refused at start
+# (not in --help)
+# executor-work-dir = "VALUE"
 
 [handover]
 # Retired: no longer read, the handover was removed. Accepted and ignored for one release
@@ -177,7 +185,7 @@ invocation-memory = 268435456
 # job-listen = "ADDR"
 # The most bytes of one blob the listener serves, at least 1: a blob of more is refused 413 `too_large` before anything is read. A blob of more than 67108864 bytes is streamed from the store through SHA-256 and never held whole; one whose bytes are not its digest's ends its response early, and is counted. Needs `--job-listen`
 job-max-blob-bytes = 536870912
-# Serves `--job-listen` in plain HTTP, with no TLS, in place of `--job-tls-cert` and `--job-tls-key` (given with either it is refused): the same routes and the same grants, each request still needs a valid read grant, but the grant and the blobs cross the network unencrypted. For a farm on its own network; the executor's `--task-read-url` must then be `http://` with `--executor-allow-plain-http-grant`, and the other way round. Needs `--job-listen` and `--job-grant-secret-file`
+# Serves `--job-listen` in plain HTTP, with no TLS, in place of `--job-tls-cert` and `--job-tls-key` (given with either it is refused): the same routes and the same grants, each request still needs a valid read grant, but the grant and the blobs cross the network unencrypted. For a farm on its own network. Needs `--job-listen` and `--job-grant-secret-file`
 job-plain-http = false
 # The bytes of blob reads this listener has open at once, at least 1: a read takes its blob's size (a streamed blob a bounded window of it, and the scope walk's reads their own sizes) and a request over the budget waits for room, it never fails; a blob larger than the whole budget is read alone. Needs `--job-listen`
 job-read-budget-bytes = 1073741824
@@ -356,6 +364,10 @@ member-ttl-secs = 15
 task-closure-max-bytes = 34359738368
 # The most distinct digests (directories and files) the input tree of a run may have: a run whose tree has more is refused, never run on a part of its inputs. Used only with `--task-secret-file`
 task-closure-max-digests = 500000
+# The most bytes of Directories `--task-directory-cache-dir` holds. Needs `--task-directory-cache-dir`. Used only with `--task-secret-file`
+# task-directory-cache-bytes = "BYTES"
+# A directory this process owns where the input Directories the closure walk decodes are kept on disk, one file each by digest, checked by SHA-256 on every read, so that a restart or a Directory pushed out of memory is read from the disk and not from the store. At most `--task-directory-cache-bytes` of them are kept, the least recently used removed first. One process per directory: nothing else may write there. Needs `--task-directory-cache-bytes`. Left out, the Directories are kept in memory only (256 MiB). Used only with `--task-secret-file`
+# task-directory-cache-dir = "DIR"
 # Log and count the keys the janitor would delete, and delete none. Used only with `--task-janitor-key-file`
 task-janitor-dry-run = false
 # How old a key must be, in seconds, before the janitor may delete it, by the minute its name says it was minted in. At least 21600 (the 18000 seconds at which an ingest refuses a key, and an hour more as a margin for hosts with different clocks and for an old leader still ingesting) and at most 604800. Used only with `--task-janitor-key-file`

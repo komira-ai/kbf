@@ -144,10 +144,11 @@ async fn an_operation_of_a_gone_process_is_taken_up_and_finished_from_its_put_di
     running.stop().await;
 }
 
-/// Catches a presigned operation of a gone process finished by another: only the process that
-/// held the url can, so its job is cancelled and the operation runs again as its next attempt.
+/// Catches an operation of a gone process whose row names no put directory finished by another:
+/// there is no pack to read, so its job is cancelled and the operation runs again as its next
+/// attempt.
 #[tokio::test(start_paused = true)]
-async fn a_presigned_operation_of_a_gone_process_is_cancelled_and_run_again() {
+async fn an_operation_with_no_put_directory_of_a_gone_process_is_cancelled_and_run_again() {
     let rig = Rig::stored().await;
     let old = gone_job(&rig, 60, 0);
     rig.rows("gone")

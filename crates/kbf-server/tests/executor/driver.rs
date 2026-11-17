@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use kbf_front::{Dispatch as _, Finished, Stage};
-use kbf_server::executor::{PutDirRoots, Running, TaskOut};
+use kbf_server::executor::{Running, parse_stored_name};
 
 use crate::rig::{HOST, PROMPT, Rig, Shared, cancels};
 
@@ -94,12 +94,7 @@ async fn left_by_a_process_that_is_gone(rig: &Rig, shared: &Shared, tag: u8) -> 
 #[tokio::test]
 async fn a_driver_takes_up_the_put_dir_operation_of_a_process_that_is_gone() {
     let shared = Shared::new();
-    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
-    let rig = Rig::over(&[HOST], Some(shared.handle()), |cfg| {
-        cfg.live = LIVE;
-        cfg.task_out = TaskOut::PutDir(roots);
-    })
-    .await;
+    let rig = Rig::over(&[HOST], Some(shared.handle()), |cfg| cfg.live = LIVE).await;
     let name = left_by_a_process_that_is_gone(&rig, &shared, 1).await;
     let job = rig.first_job(1).await;
     rig.host_runs(job.id(), HOST);
@@ -128,15 +123,24 @@ async fn a_driver_takes_up_the_put_dir_operation_of_a_process_that_is_gone() {
     running.stop().await;
 }
 
-/// Catches an operation taken up with a write url nobody can vouch for: the row of an operation
-/// whose pack url died with its process holds no key, so the driver that takes it up cancels
-/// the old job (its pack could not be read) and runs the operation again as its next attempt, a
-/// new job of a new id, which answers the caller.
+/// Catches an operation taken up with a pack nobody can find: the row of an operation that
+/// holds no put directory leaves no pack to read, so the driver that takes it up cancels the
+/// old job and runs the operation again as its next attempt, a new job of a new id, which
+/// answers the caller.
 #[tokio::test]
-async fn a_driver_runs_the_presigned_operation_of_a_process_that_is_gone_again() {
+async fn a_driver_runs_the_operation_of_a_gone_process_whose_row_names_no_directory_again() {
     let shared = Shared::new();
     let rig = Rig::over(&[HOST], Some(shared.handle()), |cfg| cfg.live = LIVE).await;
     let name = left_by_a_process_that_is_gone(&rig, &shared, 1).await;
+    let operation = parse_stored_name(&name).expect("an operation name");
+    let left = shared
+        .rows("reader")
+        .op(operation)
+        .expect("read")
+        .expect("a row");
+    let owner = shared.rows(&left.owner);
+    let keyless = kbf_server::executor::rows::OpRow { key: None, ..left };
+    owner.put_op(operation, &keyless).expect("rewritten");
     let first = rig.first_job(1).await;
     rig.host_runs(first.id(), HOST);
 
