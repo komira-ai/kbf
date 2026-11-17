@@ -194,9 +194,10 @@ not made by this server.
 
 ## `GET /v1/nodes/{id}`
 
-One node: every field of its entry in `GET /v1/nodes`, three more, a `load` when its worker
-has sent readings, and an `input_cache` when it has sent input cache counts, a read open like the
-list:
+One node: every field of its entry in `GET /v1/nodes`, and four more (`capacity`, `free`, `leases`
+and `owner`), a read open like the list. The fields `load` and `input_cache` of earlier releases
+are never written now: nothing reports the readings they showed, and a reader that finds
+neither must read that as no reading:
 
 ```json
 { "node_id": "linux-1", "connected": true, "protocol": 1, "software": null,
@@ -214,78 +215,6 @@ list:
 | `free` | `capacity` less `booked` on each axis, never below zero |
 | `leases` | the leases it holds, as `term.seq`, in lease order |
 | `owner` | who placed the node out of placement: `operator` or `updater:<unit>`. Present while the node is cordoned, draining or drained, left out while it serves. A cordon with no recorded owner is `operator`, and so is one whose recorded owner cannot be read. No writer records an owner yet, so every cordon reads `operator` |
-
-### Node load
-
-`load` is what the node's worker reports of the CPU and memory its actions use, from the
-`node_load` of its heartbeats. The server also hands each accepted reading to the scheduler, which
-places by it only under `--placement-load on`. It is left out when the server has accepted no
-reading of the node (a worker that takes none, a failed read, a node another frontend
-holds), and it is in memory: a server restart forgets it. The field is shipped and documented
-here; no worker of this release reports a load, so it is absent on every node today.
-
-```json
-"load": { "measured_cpu_millicores": 2500, "memory_working_set_bytes": 1000,
-          "memory_active_file_bytes": 200, "admission_working_set_bytes": 1000,
-          "covered": ["117399224320012061.40"], "actions_cpu_limited": false,
-          "cpu_throttled_usec": 7, "cpu_pressure_some_total_usec": 12345,
-          "lists": { "clocks": 12, "minutes": 40,
-                     "dropped": { "invalid": 0, "duplicate": 0, "over_cap": 0 },
-                     "refused_minutes": 0 },
-          "stale": false }
-```
-
-| Field | Meaning |
-|---|---|
-| `measured_cpu_millicores` | the CPU the node's actions used, in thousandths of a CPU: the larger of the last two windows between accepted readings, each the cgroup's CPU time over the worker's clock time. `null` before two windows are known, and when `stale` |
-| `memory_working_set_bytes` | the actions cgroup's `memory.current` less its inactive file pages, at the last accepted reading |
-| `memory_active_file_bytes` | the cgroup's active file pages at the last accepted reading |
-| `admission_working_set_bytes` | `memory_working_set_bytes` less the active file pages beyond a quarter of the node's `capacity` memory, never below zero: active page cache the kernel has not yet marked reclaimable must not make an idle node look full |
-| `covered` | the leases, as `term.seq`, that ran for the whole window before the last reading |
-| `actions_cpu_limited` | whether the actions cgroup has a CPU quota |
-| `cpu_throttled_usec`, `cpu_pressure_some_total_usec` | cumulative CPU throttled time and CPU pressure (`some` total), in microseconds; telemetry. Left out when the worker could not read them |
-| `lists` | what the `lease_clocks` and `minutes` lists of the node's readings have come to since its worker process began (a restarted worker counts again from 0), so that a dropped record, or an empty feed, can be seen: `clocks` and `minutes` are the records kept, summed over the accepted readings; `dropped` counts the records left out of the two lists and of `covered`, by reason (`invalid`: a lease missing, a minute above 63, a working set above 2^45 bytes, a mean above its peak, a start after the reading; `duplicate`: a repeat of an earlier kept record; `over_cap`: a record past the cap of its list, 96 for the clocks and `covered`, 64 for the minutes); `refused_minutes` counts the minutes carried by readings that were not accepted |
-| `stale` | no reading was accepted for three windows (a window being the time between the last two accepted readings) |
-
-A reading is accepted only if its `seq` is above the last accepted one of the same worker process;
-a restarted worker starts again, and its first reading is the new baseline. A reading is dropped
-(it counts as absent, and the last accepted one stays the baseline) when its clock or CPU counter
-went back or its clock did not move, when its CPU since the last accepted reading is more than
-four cores per hardware thread of the node's `capacity`, or when its working set is more than four
-times the node's memory. A lease's busiest window is not here: it is the usage record's
-`peak_window_millicores`. The reading's `lease_clocks` and `minutes` lists
-([worker-protocol.md](design/worker-protocol.md#heartbeat-and-heartbeatack)) are vetted and counted
-(`lists`) and handed to the scheduler with the reading; their records are not shown, and the server
-keeps no series of them. `covered` is cut to 96 leases, each once, before it is kept. A heartbeat is
-never refused, nor its acknowledgement changed, for what its load carries.
-
-### Input cache counts
-
-`input_cache` is what the node's input cache has done, from the `input_cache` of its heartbeats
-(`Heartbeat.input_cache`, [worker-protocol.md](design/worker-protocol.md)). It is left out when the
-node has sent none (a worker whose cache is off, one with no cache, one built before the
-field, a node another frontend holds): absent is not zero. It is in memory: a server restart
-forgets it until the next heartbeat. The field is shipped and documented here; no worker of this
-release reports input cache counts, so it is absent on every node today. The counts are cumulative since the worker process started,
-so a restarted worker counts again from 0 (a Prometheus counter handles the reset; nothing here
-keeps them across it).
-
-```json
-"input_cache": { "fills": 120, "fill_bytes": 734003200, "hits": 480, "hit_bytes": 3145728000,
-                 "evictions": 3, "evicted_bytes": 41943040,
-                 "trees": { "builds": 1, "hits": 9, "evictions": 0 } }
-```
-
-| Field | Meaning |
-|---|---|
-| `fills`, `fill_bytes` | entries written into the cache from the content store, and their bytes. An entry copied from its executable or plain sibling, or adopted from disk, is not a fill |
-| `hits`, `hit_bytes` | entries a lease found in the cache and used, and their bytes. The lease that filled an entry does not count it; a lease that waited for another's fill does |
-| `evictions`, `evicted_bytes` | entries removed to keep the byte budget or the free-space floor, and their bytes. An entry removed because it failed its check is not one |
-| `trees` | the shared tree store's own counts: `builds` (trees built from cache entries), `hits` (acquires that found the tree built) and `evictions`. Left out when the node has no tree store |
-
-The unit is the cache entry (one blob by digest and executable bit), not the file name a lease
-places it under: two names of one blob in a lease are one entry, and the per-lease `inputs:` log
-line counts names.
 
 `{id}` is the node id as `POST /v1/nodes/{node}:cordon` takes it, percent-encoded as one
 path segment. `404` with `{"error": "no_node"}` for a node that has not registered since
@@ -1726,8 +1655,8 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_upload_waits_total` | counter | uploads that found `--pack-inflight-bytes` spent and waited their turn: a burst slowed down, none failed. Rising steadily means the bound is below what clients send |
 | `kbf_pack_upload_refusals_total` | counter | uploads refused RESOURCE_EXHAUSTED because their blobs alone are over `--pack-inflight-bytes` |
 | `kbf_pack_upload_idle_timeouts_total` | counter | ByteStream uploads ended DEADLINE_EXCEEDED because, after their resource name had arrived, no byte of their body arrived for `--pack-upload-idle-timeout`; nothing was stored and their bytes were given back |
-| `kbf_pack_commits_total` | counter | packs recorded in the pack index, whether a caller stored one (`kbf.worker.v1.PackIndex/CommitPack`) or a build wrote it through a presigned write (also counted in `kbf_pack_untrusted_commits_total`) (a retry of a commit already recorded is not counted again) |
-| `kbf_pack_commit_rejects_total` | counter | commits of a pack refused with nothing recorded, from a `CommitPack` caller or, for a build's pack, any refusal counted in `kbf_pack_untrusted_commit_rejects_total`. For a `CommitPack` caller: the writer was not the caller, the name or the list of blobs was not one a caller of the `daemon` role may commit, the pack was not in the store, a sampled blob was not its digest (`--pack-commit-sample`; alert on any), or the pack was recorded before with other contents. A store or an index that failed is UNAVAILABLE to the caller and is not counted |
+| `kbf_pack_commits_total` | counter | packs a build wrote through a presigned write that the frontend recorded in the pack index (also counted in `kbf_pack_untrusted_commits_total`; a retry of a commit already recorded is not counted again). No other caller commits a pack |
+| `kbf_pack_commit_rejects_total` | counter | commits of a build's pack refused with nothing recorded: any refusal counted in `kbf_pack_untrusted_commit_rejects_total`, or the pack was recorded before with other contents. A store or an index that failed is UNAVAILABLE to the caller and is not counted. `--pack-commit-sample` is retired: accepted, ignored and warned about at start |
 | `kbf_pack_untrusted_commits_total` | counter | packs a build wrote through a presigned write that the frontend read, hashed to the last byte and recorded in the pack index (a replay of a commit already recorded is not counted again) |
 | `kbf_pack_untrusted_commit_rejects_total` | counter | commits of such a pack refused with nothing recorded, labelled `reason`: `forbidden` (the key was not the one issued), `shape` (the manifest cannot be a pack's: a cap, an order, a gap, an overlap or a record of no bytes), `footer` (the footer is not the manifest), `mismatch` (a record is not its digest or CRC), `missing` (the pack is not in the store as long as said) or `conflict` (the key was recorded with other contents). A store or an index that failed is not counted. Each refusal also moves `kbf_pack_commit_rejects_total` |
 | `kbf_pack_ingests_total` | counter | runs of a task that `ingest` (presigned writes) or `ingest_put_dir` (a put directory) turned into an action result: the action ran (any exit code), whether or not the result was written to the action cache |
@@ -1778,26 +1707,9 @@ under `--job-plain-http`, where the listener has no TLS files.
 | `kbf_job_read_bytes_total` | counter | blob bytes served to jobs |
 | `kbf_job_read_seconds{op}` | histogram | seconds from a job's blob read (`op="get"`, `GET /<hex>/<size>`) or batch (`op="batch"`) to its answer, in fixed buckets from 1 ms to 60 s: one observation per answered request, refusals included; `/locate`, a refused method and a path that names no blob are not in it. A blob too large to read whole is answered when its stream starts, not when its last byte is sent |
 
-**Input cache counts.** A frontend exports what each worker says its input cache did, from the
-`input_cache` of its heartbeats ([`GET /v1/nodes/{id}`](#input-cache-counts) shows the same), as the
-counters of the worker's process, one sample per node. They start again from 0 when the worker
-restarts, as a counter may. A node that sent none (its cache is off, or its worker predates the
-field) has no sample, and with no node sending any the families are absent; a node whose next
-heartbeat carries none loses its samples. A node whose stream has closed keeps the counts of its
-last heartbeat until the frontend restarts. The unit is the cache entry, not the file name.
-
-| Family | Type | What it measures |
-|---|---|---|
-| `kbf_node_input_cache_fills_total{node}`, `kbf_node_input_cache_fill_bytes_total{node}` | counter | entries the node's worker wrote into its input cache from the content store (cold fills), and their bytes |
-| `kbf_node_input_cache_hits_total{node}`, `kbf_node_input_cache_hit_bytes_total{node}` | counter | entries a lease found in the cache and used, and their bytes |
-| `kbf_node_input_cache_evictions_total{node}`, `kbf_node_input_cache_evicted_bytes_total{node}` | counter | entries evicted for the byte budget or the free-space floor, and their bytes |
-| `kbf_node_input_cache_tree_builds_total{node}`, `kbf_node_input_cache_tree_hits_total{node}`, `kbf_node_input_cache_tree_evictions_total{node}` | counter | the shared tree store's builds, acquires that found the tree built, and evictions; samples only for nodes that have a tree store |
-
-**Measured load.** A frontend with a farm hands the scheduler each node load reading it accepts
-([Node load](#node-load)), in every `--placement-load` mode, and exports what the scheduler has
-counted of them and of placement by load, and each node's load as its view shows it, so that
-placement by measured load can be watched before and after `--placement-load on`. The same families
-are written by the farm's scheduler core.
+**Measured load.** A frontend with a farm exports what its scheduler has counted of node load
+readings and of placement by load. No node reports a reading in this release, so the readings
+counters stay at 0. The same families are written by the farm's scheduler core.
 
 The scheduler's counters are written on every scrape of a frontend with a farm, 0 included, and
 count since the frontend started (a restart starts them again from 0):
@@ -1805,7 +1717,7 @@ count since the frontend started (a restart starts them again from 0):
 | Family | Type | What it measures |
 |---|---|---|
 | `kbf_sched_load_readings_accepted_total` | counter | readings the scheduler accepted |
-| `kbf_sched_load_readings_dropped_total` | counter | readings the scheduler dropped: out of order, a counter or the clock going back, or implausible (more than four times the node's cores or memory). A reading the server itself refuses (a repeat, an older one) is not handed to the scheduler: it counts only in `kbf_node_load_refused_minutes_total` of its node, by the minutes it carried |
+| `kbf_sched_load_readings_dropped_total` | counter | readings the scheduler dropped: out of order, a counter or the clock going back, or implausible (more than four times the node's cores or memory). |
 | `kbf_sched_load_floor_windows_total`, `kbf_sched_load_floor_binds_total` | counter | accepted readings that gave a window, and of those the windows in which the floor from the covered leases' predictions was above the measurement |
 | `kbf_sched_load_misfit_cpu_minutes_total`, `kbf_sched_load_misfit_memory_minutes_total` | counter | lease-minutes whose mean cores were over twice the charge (and 250 millicores over it), and whose working set was above the curve's remaining maximum |
 | `kbf_sched_load_demotions_cpu_total`, `kbf_sched_load_demotions_memory_total` | counter | times the shape guard charged a key's CPU, or memory, flat for its next runs |
@@ -1816,30 +1728,6 @@ count since the frontend started (a restart starts them again from 0):
 | `kbf_sched_load_score_evaluations_total`, `kbf_sched_load_scored_total` | counter | slot-resource evaluations of the placement score, and placements the score chose among two or more nodes |
 | `kbf_sched_load_chose_slack_total`, `kbf_sched_load_chose_distrusted_total`, `kbf_sched_load_chose_concentrated_total`, `kbf_sched_load_chose_by_tie_break_total` | counter | of the scored placements: on a node predicted above its capacity; on a distrusted node; on a node concentrated on the lease's key; decided by the last tie-break |
 | `kbf_sched_load_fallback_cpu_limited_nodes` | gauge | live nodes charged by prediction because their newest reading says the actions cgroup has a CPU limit, while `--placement-load` is on: not a running total, and above 0 means a node whose cgroup limit and pool do not match |
-
-Each node that has a load in its view ([Node load](#node-load); `GET /v1/nodes/{id}`) has one
-sample of each of these, labelled `node` (the node id) as the pack families are: at most one series
-per node the frontend has accepted a reading of. A node with no accepted reading has none. A node
-whose stream has closed keeps its samples, going stale, until the frontend restarts (as `load` is
-kept in the node view and the pack counts are kept); with no node having a load no family is
-written. A value the view leaves out has no sample and is never written as 0, and a family that no
-node has a sample of is not written at all.
-
-| Family | Type | Labels | What it measures, and when it has no sample |
-|---|---|---|---|
-| `kbf_node_load_measured_cpu_millicores` | gauge | `node` | `measured_cpu_millicores`: the CPU the node's actions used, in thousandths of a CPU, the larger of the last two windows. No sample with fewer than two windows, and when `stale` |
-| `kbf_node_load_memory_working_set_bytes` | gauge | `node` | `memory_working_set_bytes` at the last accepted reading |
-| `kbf_node_load_memory_active_file_bytes` | gauge | `node` | `memory_active_file_bytes` at the last accepted reading |
-| `kbf_node_load_admission_working_set_bytes` | gauge | `node` | `admission_working_set_bytes`: the working set less the active file pages beyond a quarter of the node's memory |
-| `kbf_node_load_stale` | gauge | `node` | 1 when no reading was accepted for three windows, else 0 |
-| `kbf_node_load_actions_cpu_limited` | gauge | `node` | 1 when the actions cgroup has a CPU quota, else 0 |
-| `kbf_node_load_cpu_throttled_seconds_total`, `kbf_node_load_cpu_pressure_some_seconds_total` | counter | `node` | `cpu_throttled_usec` and `cpu_pressure_some_total_usec` in seconds (the view's microseconds over a million, written with six decimals): the cumulative CPU throttled time and CPU pressure (`some` total) of the actions cgroup. They pass through the worker's cgroup counters, so they can fall if the cgroup is recreated within a session, which Prometheus reads as a counter reset. No sample when the worker could not read them |
-| `kbf_node_load_clocks_total`, `kbf_node_load_minutes_total` | counter | `node` | `lists.clocks` and `lists.minutes`: the clock and minute records kept, summed over the accepted readings of the worker's process |
-| `kbf_node_load_refused_minutes_total` | counter | `node` | `lists.refused_minutes`: the minutes carried by readings that were not accepted |
-| `kbf_node_load_dropped_total` | counter | `node`, `reason` | `lists.dropped`, one series per reason: `invalid`, `duplicate`, `over_cap` (always all three for a node that has a load) |
-
-The counters of a node are those of its worker's process: they start again from 0 when it restarts.
-The `covered` list of the view is not exported.
 
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and

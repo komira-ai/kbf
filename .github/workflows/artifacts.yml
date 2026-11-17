@@ -4,8 +4,8 @@
 # kbf-signer and kbf-task (a static musl build, which runs in
 # any Linux image) for linux-x86_64 and linux-arm64,
 # and kbf and kbf-deploy for darwin-arm64 (each
-# signed ad hoc with the hardened runtime; no kbf runs on a Mac, and a Mac action runs as a js-agent
-# job), and the signed darwin-arm64 kbf-task as
+# signed ad hoc with the hardened runtime: operator tools, since no kbf node runs on a Mac and a
+# Mac action runs as a js-agent job), and the signed darwin-arm64 kbf-task as
 # `kbf-task-bundle-<commit>-darwin-arm64.tar.gz`, a jobscheduler bundle in an OCI image layout (docs/artifacts.md). Each comes as a
 # tarball with a CycloneDX SBOM; one SHA256SUMS covers a commit's files. The kbf of each
 # platform also comes with `kbf-<commit>-<platform>.version.json`, the exact bytes its

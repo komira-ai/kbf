@@ -394,7 +394,7 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   when the runtime has an input cache open. A runtime without one, and a daemon built before the
   field, send none (absent is not zero), and a server built before it skips the field. The server
   keeps the newest of each node for `GET /metrics` (`kbf_node_input_cache_*`) and
-  `GET /v1/nodes/{id}` ([api.md](../api.md#input-cache-counts)); a restarted daemon counts again
+  `GET /v1/nodes/{id}` (a section of api.md deleted with the counts); a restarted daemon counts again
   from 0.
 - `node_load` (optional): one reading of the node's `actions/` cgroup (`NodeLoad`). `seq` counts up
   by one from 1 for each reading within a daemon process; `mono_usec` is the daemon's monotonic
@@ -408,7 +408,7 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   runtime takes readings (the container runtime does); a reading that fails leaves it out (logged
   once per failing file), and a daemon or runtime without readings, or one built before the field,
   sends none. A server built before the field skips it. The server accepts and shows readings under
-  the rule of [api.md](../api.md#node-load) and hands each accepted reading to the scheduler, as
+  the rule api.md gave before the reading was deleted and hands each accepted reading to the scheduler, as
   described below.
 
   Two lists of a reading say when each lease started and what each used, minute by minute:
@@ -458,7 +458,7 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   nothing.
 
   The server vets the lists of each reading it accepts and counts what it dropped, by reason, in
-  the node view ([api.md](../api.md#node-load): `lists`). It counts the minutes of a reading it
+  the node view (`lists`, deleted from api.md with the reading). It counts the minutes of a reading it
   refuses under the accept rule as refused, and uses them for nothing. It hands the accepted
   reading, with the lists that passed the vet, to the scheduler (`Event::Heartbeat.load`) on the
   same heartbeat, under every `--placement-load` mode: the scheduler keeps the readings whether or
