@@ -1,4 +1,3 @@
-// `ProviderSource` lands with the jobscheduler pin bump: fields `provider` and `ref`.
 use js_proto::v1::{Layer, Mount, MountMode, MountPropagation, ProviderSource, layer, mount};
 
 use super::{

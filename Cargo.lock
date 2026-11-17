@@ -2368,6 +2368,7 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror",
+ "tierstore",
  "time",
  "tokio",
  "tokio-rustls",
