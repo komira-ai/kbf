@@ -109,3 +109,66 @@ async fn keeping_names_the_same_fault_first() {
     assert_eq!(plain, Err(ClosureError::TooManyDigests { limit: 2 }));
     assert_eq!(kept.map(|k| k.closure().clone()), plain);
 }
+
+/// Catches: a subdirectory left unkept because a file of the tree has its digest. The empty
+/// file and the empty Directory are both the empty blob, so a Directory that lists an empty
+/// file and an empty subdirectory names one digest twice; so does a file whose bytes are a
+/// Directory message. Each case has the file reached first: beside the subdirectory in one
+/// Directory (files are walked before subdirectories), and a level above it.
+#[tokio::test]
+async fn a_subdirectory_whose_digest_a_file_has_is_kept() {
+    let rig = Rig::new().await;
+    let empty = kbf_segments::sha256(&[]);
+    let leaf = rig.farm.packed("leaf", "cas/f/w/p0", 0).await;
+    let message = directory(vec![file("leaf", &leaf, false)], vec![], vec![]);
+    let inner = rig.store(&message).await;
+    // The same bytes as a file, packed, so the tree can name them as a file.
+    rig.farm.span(inner, "cas/f/w/p0", 4);
+    let beside = rig
+        .store(&directory(
+            vec![file("e", &empty, false)],
+            vec![subdir("d", &empty)],
+            vec![],
+        ))
+        .await;
+    let below = rig
+        .store(&directory(vec![], vec![subdir("d", &empty)], vec![]))
+        .await;
+    let above = rig
+        .store(&directory(
+            vec![file("e", &empty, false)],
+            vec![subdir("s", &below)],
+            vec![],
+        ))
+        .await;
+    let message_too = rig
+        .store(&directory(
+            vec![file("m", &inner, false)],
+            vec![subdir("d", &inner)],
+            vec![],
+        ))
+        .await;
+    for (root, directories, what) in [
+        (beside, 2, "the root and the empty Directory"),
+        (above, 3, "the root, s and the empty Directory"),
+        (
+            message_too,
+            2,
+            "the root and d, whose bytes are also the file m",
+        ),
+    ] {
+        let action = rig.action(&root).await;
+        let kept = collect_closure_keeping(&rig.farm.backend, &action, ClosureLimits::DEFAULT)
+            .await
+            .expect("a closure");
+        let plain = collect_closure(&rig.farm.backend, &action, ClosureLimits::DEFAULT)
+            .await
+            .expect("a closure");
+        assert_eq!(kept.closure(), &plain, "{what}");
+        assert_eq!(kept.directory_count(), directories, "{what}");
+        rig.writer
+            .write(&kept, &rig.base.tree)
+            .await
+            .unwrap_or_else(|no| panic!("a tree of {what}: {no}"));
+    }
+}
