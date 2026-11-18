@@ -37,9 +37,23 @@ async fn lose(rig: &Rig, digest: &Digest) -> String {
     at.pack_key
 }
 
-/// The reads of a lost blob after which the index forgot its pack, so far.
+/// The reads of a lost blob after which the index forgot its pack, so far, as the metrics page
+/// renders them: the family is a counter, its one sample is the counter's value.
 fn forgotten(rig: &Rig) -> u64 {
-    rig.stored.packs().metrics().lost_forgotten.get()
+    const NAME: &str = "kbf_pack_read_lost_forgotten_total";
+    let mut text = String::new();
+    kbf_front::Packs::render_metrics_of(Some(rig.stored.packs()), &mut text);
+    assert!(
+        text.contains(&format!("\n# TYPE {NAME} counter\n")),
+        "{text}"
+    );
+    let samples: Vec<&str> = (text.lines())
+        .filter_map(|line| line.strip_prefix(NAME)?.strip_prefix(' '))
+        .collect();
+    assert_eq!(samples.len(), 1, "{text}");
+    let rendered: u64 = samples[0].parse().expect("a count");
+    assert_eq!(rendered, rig.stored.packs().metrics().lost_forgotten.get());
+    rendered
 }
 
 /// The result a client gets for `action`, or its status code.
