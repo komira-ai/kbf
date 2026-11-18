@@ -11,8 +11,9 @@
 //! - a symlink: `{"name","kind":"symlink","target"}`.
 //!
 //! What tierstore's reader refuses is refused here first, by name and path: a name that is
-//! empty, `.`, `..`, or holds a `/` or a NUL ([`TreeError::Name`]); a manifest over [`MAX_MANIFEST_BYTES`]; more than [`MAX_ENTRIES`] entries below the root; an
-//! entry deeper than [`MAX_DEPTH`].
+//! empty, `.`, `..`, or holds a `/` or a NUL ([`TreeError::Name`]); a manifest over
+//! [`MAX_MANIFEST_BYTES`]; more than [`MAX_ENTRIES`] entries below the root; an entry deeper
+//! than [`MAX_DEPTH`].
 
 use std::collections::{BTreeMap, BTreeSet};
 

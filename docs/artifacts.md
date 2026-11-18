@@ -709,8 +709,8 @@ it, in the `linux-*` jobs after the task image is an asset, from that same image
 2. The base layers are applied in order onto one tree. A regular file of size 0 named `.wh.<name>` removes `<name>` from the
    layers below, and one named `.wh..wh..opq` removes everything the lower layers put in its directory, before what its own layer
    adds, whatever the order of the tar. Any other entry named `.wh.<...>` (a directory, a symlink, a file with bytes, the
-  bare `.wh.`) is not a whiteout and stays in the tree under its name, which tierstore takes like any other. A later entry replaces an earlier one at the same path (a directory over a
-   directory keeps what it holds). A hard link becomes a separate file with the bytes and the mode of its target.
+   bare `.wh.`) is not a whiteout and stays in the tree under its name, which tierstore takes like any other. A later
+   entry replaces an earlier one at the same path (a directory over a directory keeps what it holds). A hard link becomes a separate file with the bytes and the mode of its target.
 3. The packages of `crates/xtask/src/base_tree/removed.rs` are left out, each as `dpkg --purge` would remove it with no
    maintainer script run, from the base's own dpkg database: every path of its file list (a directory only once it is
    empty and no kept package lists it), its control files, its stanza of `/var/lib/dpkg/status` and its diversions, an
