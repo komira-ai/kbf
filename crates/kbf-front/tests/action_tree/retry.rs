@@ -1,6 +1,7 @@
 //! The retry of a create-only write to `cas/l/`: a connection that turns out to be dead is
 //! tried once more, a 503 is waited out within the configured total, a 503 `SlowDown`
-//! (back-pressure) is waited out past it, and nothing else is repeated. The waits are recorded by a fake [`Sleeper`], never taken.
+//! (back-pressure) is waited out past it, nothing else is repeated, and the waits are counted
+//! with the packs' when the retry is told to. The waits are recorded by a fake [`Sleeper`], never taken.
 
 use kbf_front::action_tree::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, Sleeper};
 
@@ -151,7 +152,8 @@ async fn a_503_is_waited_out_with_doubling_waits() {
 }
 
 /// Catches: a 503 retried for longer than the total: the waits stop at the total (the last one
-/// cut short to end there), and the write fails with the store's answer exactly.
+/// cut short to end there), and the write fails with the store's answer exactly, saying how many
+/// times it was made and how long it waited.
 #[tokio::test]
 async fn a_503_past_the_total_fails_with_the_stores_answer() {
     let (rig, sleeps) = rig(Duration::from_secs(5)).await;
@@ -162,7 +164,9 @@ async fn a_503_past_the_total_fails_with_the_stores_answer() {
         failed,
         NoTree::Put {
             key: key.clone(),
-            why: "store answered 503 ServiceUnavailable: retry later".to_owned()
+            why: "store answered 503 ServiceUnavailable: retry later (still so after 5 attempts \
+                  and 5.0 s of waits)"
+                .to_owned()
         }
     );
     assert_eq!(failed.why(), "store");
@@ -324,4 +328,31 @@ async fn a_slow_down_is_waited_out_with_a_zero_total() {
     let tree = rig.write(&root).await.expect("a tree");
     rig.farm.flatten(&tree).expect("every manifest is stored");
     assert_eq!(sleeps.waits(), [FIRST_WAIT, FIRST_WAIT * 2]);
+}
+
+/// Catches a tree's waits for the store that the scrape never shows: with the retry counted in
+/// the packs' waits, a blob answered 503 three times records its three waits there, as writes,
+/// adding up to the waits taken, and none as reads.
+#[tokio::test]
+async fn a_tree_s_waits_are_counted_with_the_packs() {
+    let sleeps = Arc::new(Sleeps::default());
+    let waits = Arc::new(kbf_front::store_wait::StoreWaits::default());
+    let retry = PutRetry::with_sleeper(DEFAULT_TOTAL, Arc::clone(&sleeps) as Arc<dyn Sleeper>)
+        .counted_in(Arc::clone(&waits));
+    let rig = Rig::with_memo_retry(None, Some(retry)).await;
+    let (root, key, _) = unlocated(&rig).await;
+    script(
+        &rig,
+        &key,
+        vec![unavailable(), unavailable(), unavailable()],
+    );
+
+    rig.write(&root).await.expect("a tree");
+
+    let put = waits.waits(kbf_front::store_metrics::Op::Put);
+    assert_eq!(put.count(), 3);
+    assert_eq!(put.sum(), 3_500_000_000);
+    assert_eq!(sleeps.waits().len(), 3);
+    assert_eq!(waits.waits(kbf_front::store_metrics::Op::Get).count(), 0);
+    assert_eq!(waits.exhausted(kbf_front::store_metrics::Op::Put), 0);
 }

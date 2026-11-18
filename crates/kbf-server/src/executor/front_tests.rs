@@ -80,12 +80,42 @@ struct Flaky {
     fail_reads: AtomicBool,
     /// How many objects were put.
     puts: AtomicUsize,
+    /// The end of a failover on the runtime's clock: until then every call is answered 503.
+    failover: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// How many calls a failover answered 503.
+    refused: AtomicUsize,
     /// While set, each write waits for a permit of [`Flaky::released`] before it is made.
     hold_puts: AtomicBool,
     /// The writes [`Flaky::hold_puts`] lets through.
     released: tokio::sync::Semaphore,
     /// While set, each write fails.
     fail_puts: AtomicBool,
+}
+
+impl Flaky {
+    /// From now until `window` has passed on the runtime's clock, every call (a write, a read, a
+    /// length, a delete, a listing) is answered 503 `ServiceUnavailable`, as a store answers
+    /// while it fails over its metadata.
+    fn fail_over_for(&self, window: Duration) {
+        let until = tokio::time::Instant::now() + window;
+        *self.failover.lock().expect("not poisoned") = Some(until);
+    }
+
+    /// The 503 of a failover that has not ended yet, counted.
+    fn failing_over(&self) -> Result<(), ObjectStoreError> {
+        let until = *self.failover.lock().expect("not poisoned");
+        match until {
+            Some(until) if tokio::time::Instant::now() < until => {
+                self.refused.fetch_add(1, Ordering::SeqCst);
+                Err(ObjectStoreError::Service {
+                    status: 503,
+                    code: "ServiceUnavailable".to_owned(),
+                    message: "failing over".to_owned(),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 impl ObjectStore for Flaky {
@@ -109,6 +139,7 @@ impl ObjectStore for Flaky {
             return Err(ObjectStoreError::Unsupported("writes, for this test"));
         }
         self.puts.fetch_add(1, Ordering::SeqCst);
+        self.failing_over()?;
         self.inner.put_new(key, body, retain_until).await
     }
 
@@ -117,6 +148,7 @@ impl ObjectStore for Flaky {
         key: &ObjectKey,
         range: ByteRange,
     ) -> Result<Bytes, ObjectStoreError> {
+        self.failing_over()?;
         if self.fail_reads.load(Ordering::SeqCst) {
             return Err(ObjectStoreError::Unsupported("reads, for this test"));
         }
@@ -124,6 +156,7 @@ impl ObjectStore for Flaky {
     }
 
     async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
+        self.failing_over()?;
         if self.fail_reads.load(Ordering::SeqCst) {
             return Err(ObjectStoreError::Unsupported("reads, for this test"));
         }
@@ -131,6 +164,7 @@ impl ObjectStore for Flaky {
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
+        self.failing_over()?;
         self.inner.delete(key).await
     }
 
@@ -140,6 +174,7 @@ impl ObjectStore for Flaky {
         after: Option<&ListToken>,
         page: PageSize,
     ) -> Result<ListPage, ObjectStoreError> {
+        self.failing_over()?;
         self.inner.list(prefix, after, page).await
     }
 }
@@ -149,6 +184,8 @@ impl ObjectStore for Flaky {
 struct Rig {
     front: Front,
     store: Arc<Flaky>,
+    /// The waits of the packs' calls to the store.
+    waits: Arc<kbf_front::store_wait::StoreWaits>,
     cache: Arc<Cache<MemoryMetaLog, MemoryStore>>,
     mint: PackKeyMint,
     /// The pack index's clock, which dates the packs it records.
@@ -185,6 +222,8 @@ impl Rig {
             }),
             fail_reads: AtomicBool::new(false),
             puts: AtomicUsize::new(0),
+            failover: std::sync::Mutex::new(None),
+            refused: AtomicUsize::new(0),
             hold_puts: AtomicBool::new(false),
             released: tokio::sync::Semaphore::new(0),
             fail_puts: AtomicBool::new(false),
@@ -203,6 +242,7 @@ impl Rig {
         ));
         let backend = Backend::remote_over(wrap(node), Some(packs.clone()));
         let put_dir = put_dir(&packs, &backend);
+        let waits = packs.store_waits();
         let front = Front::with_clock(
             FrontParts {
                 packs,
@@ -218,6 +258,7 @@ impl Rig {
         Self {
             front,
             store,
+            waits,
             cache,
             mint: PackKeyMint::new(SECRET).expect("a mint"),
             index_clock,
@@ -737,6 +778,9 @@ mod put_dir;
 
 #[path = "front_cache_tests.rs"]
 mod cache;
+
+#[path = "front_failover_tests.rs"]
+mod failover;
 
 #[path = "front_twice_tests.rs"]
 mod twice;

@@ -46,17 +46,19 @@ fn fires(armed: &AtomicU32) -> bool {
     armed.try_update(SeqCst, SeqCst, down).is_ok()
 }
 
+/// A failure of the store: a 500, which no caller waits out (a 503 is waited out, for up to
+/// `kbf_front::store_wait::STORE_WAIT`).
 fn injected() -> ObjectStoreError {
-    injected_with(503)
+    injected_with(500)
 }
 
-/// A failure of the store that is not its back-pressure: a 503 that is not `SlowDown`, which no
-/// writer waits out, or the status asked for.
+/// A failure of the store of `status`: a 500, a 503 that is not `SlowDown` (what a store
+/// answers while it fails over its metadata) or a 507 (full).
 fn injected_with(status: u32) -> ObjectStoreError {
-    let code = if status == 507 {
-        "InsufficientStorage"
-    } else {
-        "ServiceUnavailable"
+    let code = match status {
+        503 => "ServiceUnavailable",
+        507 => "InsufficientStorage",
+        _ => "InternalError",
     };
     ObjectStoreError::Service {
         status: u16::try_from(status).expect("a status"),
@@ -116,6 +118,9 @@ pub struct Spy {
     on_delete: Mutex<Option<Hook>>,
     held_when_asked: Mutex<Vec<bool>>,
     slow_downs: AtomicU32,
+    /// The end of a failover on the runtime's clock: until then every call is answered 503.
+    failover: Mutex<Option<tokio::time::Instant>>,
+    failover_refusals: AtomicU32,
     gate: Semaphore,
     inside: watch::Sender<usize>,
     most_inside: AtomicUsize,
@@ -161,7 +166,7 @@ impl Spy {
             overstated: Mutex::new(Vec::new()),
             hidden: Mutex::new(Vec::new()),
             failing_len: Mutex::new(Vec::new()),
-            put_status: AtomicU32::new(503),
+            put_status: AtomicU32::new(500),
             stall_streams: AtomicBool::new(false),
             puts: AtomicU32::new(0),
             stream_puts: AtomicU32::new(0),
@@ -172,6 +177,8 @@ impl Spy {
             on_delete: Mutex::new(None),
             held_when_asked: Mutex::new(Vec::new()),
             slow_downs: AtomicU32::new(0),
+            failover: Mutex::new(None),
+            failover_refusals: AtomicU32::new(0),
             gate: Semaphore::new(Semaphore::MAX_PERMITS),
             inside: watch::Sender::new(0),
             most_inside: AtomicUsize::new(0),
@@ -181,6 +188,31 @@ impl Spy {
     /// The next `n` writes (whole or streamed) are answered 503 `SlowDown`.
     pub fn slow_down_puts(&self, n: u32) {
         self.slow_downs.store(n, SeqCst);
+    }
+
+    /// From now until `window` has passed on the runtime's clock, every call of the store (a
+    /// write, a ranged read, a length, a presence check, a delete, a listing) is answered 503
+    /// `ServiceUnavailable`, as a store answers while it fails over its metadata.
+    pub fn fail_over_for(&self, window: Duration) {
+        let until = tokio::time::Instant::now() + window;
+        *self.failover.lock().unwrap_or_else(PoisonError::into_inner) = Some(until);
+    }
+
+    /// The calls a failover answered 503.
+    pub fn failover_refusals(&self) -> u32 {
+        self.failover_refusals.load(SeqCst)
+    }
+
+    /// The 503 of a failover that has not ended yet, counted.
+    fn failing_over(&self) -> Result<(), ObjectStoreError> {
+        let until = *self.failover.lock().unwrap_or_else(PoisonError::into_inner);
+        match until {
+            Some(until) if tokio::time::Instant::now() < until => {
+                self.failover_refusals.fetch_add(1, SeqCst);
+                Err(injected_with(503))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// From now on every write waits inside the store until [`Spy::let_puts`] lets it on.
@@ -320,7 +352,7 @@ impl Spy {
     }
 
     /// The next `n` writes fail with the HTTP `status` (503 and 507 are the answers of a store
-    /// that is slow and one that is full).
+    /// that is failing over and one that is full; any other status is a 500).
     pub fn reject_puts_with(&self, n: u32, status: u32) {
         self.put_status.store(status, SeqCst);
         self.reject_puts.store(n, SeqCst);
@@ -397,6 +429,7 @@ impl ObjectStore for Spy {
         retain_until: Option<SystemTime>,
     ) -> Result<(), ObjectStoreError> {
         self.puts.fetch_add(1, SeqCst);
+        self.failing_over()?;
         let (_inside, entered) = self.enter().await;
         entered?;
         if fires(&self.reject_puts) {
@@ -413,6 +446,7 @@ impl ObjectStore for Spy {
     ) -> Result<(), ObjectStoreError> {
         self.puts.fetch_add(1, SeqCst);
         self.stream_puts.fetch_add(1, SeqCst);
+        self.failing_over()?;
         let (_inside, entered) = self.enter().await;
         entered?;
         if fires(&self.reject_puts) {
@@ -447,6 +481,7 @@ impl ObjectStore for Spy {
             .unwrap_or_else(PoisonError::into_inner)
             .push(asked);
         let number = self.reads.fetch_add(1, SeqCst);
+        self.failing_over()?;
         if fires(&self.reject_reads) || number == self.fail_read_at.load(SeqCst) {
             return Err(injected());
         }
@@ -460,10 +495,12 @@ impl ObjectStore for Spy {
     }
 
     async fn may_hold(&self, key: &ObjectKey) -> Result<bool, ObjectStoreError> {
+        self.failing_over()?;
         self.inner.may_hold(key).await
     }
 
     async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
+        self.failing_over()?;
         let hook = self
             .on_len
             .lock()
@@ -533,6 +570,7 @@ impl ObjectStore for Spy {
         if let Some(hook) = hook {
             hook(key.to_string()).await;
         }
+        self.failing_over()?;
         self.inner.delete(key).await
     }
 
@@ -542,6 +580,7 @@ impl ObjectStore for Spy {
         after: Option<&ListToken>,
         max_keys: PageSize,
     ) -> Result<ListPage, ObjectStoreError> {
+        self.failing_over()?;
         self.inner.list(prefix, after, max_keys).await
     }
 }

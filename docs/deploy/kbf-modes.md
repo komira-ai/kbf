@@ -127,21 +127,39 @@ accepted and ignored without `--pack-store-endpoint`.
 Every write to the pack store shares one bound, `--pack-store-writes` (default 64, from 1 to
 4096): the packs of client uploads, the large blobs past them, and the blobs and manifests of
 action trees (a manifest takes its `--task-manifest-writes` slot first). A write past it waits
-at the frontend for one to end, so a burst queues here and not at the store. A store that
-answers 503 `SlowDown` (tierstore taking as many uploads as it can) is back-pressure: a pack is
-written again after waits from 0.5 s doubling to 8 s, holding its slot, for as long as the store
-answers it. The writes of an action tree are streamed, so the bound does not repeat them: they
-wait out `SlowDown` as they did, past `--task-put-retry-secs`, in their own retry, which sits
-above the bound, so each attempt takes a slot and gives it back when it ends, and no slot is
-held while the retry waits. A streamed write holds its slot for its whole body: a client's
-upload of a blob over 64 MiB keeps one for as long as it takes to send (one that stops sending
-is ended by `--pack-upload-idle-timeout`), so as many slow large uploads as there are slots hold
-the other writers back until one ends.
-A client upload is bounded by the `grpc-timeout` it sent: when that passes first, the call ends
-`DEADLINE_EXCEEDED` (a moment early, a tenth of the timeout and at most a second, so that the
-answer reaches the client before the transport cancels the call), never `UNAVAILABLE`; a call
-without a `grpc-timeout` waits for the store. A streamed upload of a client blob over 64 MiB
-cannot be sent twice, so a `SlowDown` fails it `UNAVAILABLE`, as before.
+at the frontend for one to end, so a burst queues here and not at the store. A streamed write
+holds its slot for its whole body: a client's upload of a blob over 64 MiB keeps one for as long
+as it takes to send (one that stops sending is ended by `--pack-upload-idle-timeout`), so as many
+slow large uploads as there are slots hold the other writers back until one ends.
+
+Every call of the frontend to the pack store (a client's upload or read, an action's preparation
+and ingest, base publication, the janitor's listings and deletes) waits out a store that answers
+503, such as a store failing over its metadata (up to about 30 s). The call is made
+again after jittered waits that double from about 0.5 s to 8 s (each between half and all of
+its nominal length, so that the calls a failover stopped together do not come back together),
+until the waits add up to 60 s; a 503 after that is the call's answer, its message saying how
+long it waited. The store is then taken as down: until it answers a call with anything but a
+503, every 503 is its call's answer at once, so a store down for good costs 60 s once, not once
+for each call a write, a preparation or a sweep makes. The store's `Retry-After` is not read: the store client gives the frontend no
+header of an error answer. A 503 `SlowDown` (tierstore taking as many uploads as it can) of a
+write whose body is in hand is back-pressure: it is waited out, holding the write's slot, for as
+long as the store answers it, and those waits do not count toward the 60 s. The writes of an
+action tree are streamed, so they repeat in their own retry, which reads the blob again: a 503
+within `--task-put-retry-secs` (default 60), a `SlowDown` past it; that retry sits above the
+bound, so no slot is held while it waits. The waits are counted in
+`kbf_pack_store_wait_seconds` and the calls that ran out of them in
+`kbf_pack_store_waits_exhausted_total` ([api.md](../api.md)). An action's run whose preparation
+or ingest waits does not fail and spends no attempt; one whose store is still answering 503
+after the waits is the farm's failure, run again as any other.
+A client call is bounded by the `grpc-timeout` it sent: when that passes first, an upload, a
+`BatchReadBlobs`, or a ByteStream `Read` before its first bytes ends `DEADLINE_EXCEEDED` (a
+moment early, a tenth of the timeout and at most a second, so that the answer reaches the
+client before the transport cancels the call), never `UNAVAILABLE`; a call without a
+`grpc-timeout` waits for the store, and one whose store is still answering 503 after the waits
+ends `UNAVAILABLE`, which a client repeats. A streamed upload of a client blob over 64 MiB
+cannot be sent twice, so a 503 while it is being sent fails it `UNAVAILABLE`; such an upload
+first asks the store whether it holds the blob, and that question waits out a failover, so an
+upload sent again during one waits before it sends its bytes.
 
 Where the frontend runs the actions it is asked to execute is `--executor` (the `[executor]` table of
 `kbf.toml`). `js-agent`, the only value, runs every Execute that the action cache does not answer as one job of the job
@@ -662,7 +680,8 @@ What it does itself, with those three:
 - **Readiness.** `GET /readyz` and `grpc.health.v1` fail when the state store does not answer a
   read and when the job service does not answer a read of a job (`executor` in the failing
   list). Nothing probes the object store or any storage node: an object store that is down is
-  found by the call that needs it, which fails UNAVAILABLE.
+  found by the call that needs it, which waits out its 503s for up to 60 s (above) and then
+  fails UNAVAILABLE.
 - **Not served:** GetTree, SplitBlob, SpliceBlob and the chunk-mapping calls.
 
 The flags of such a frontend are the `[scheduler]` and `[executor]` keys of its `kbf.toml`, the

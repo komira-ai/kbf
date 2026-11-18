@@ -680,7 +680,7 @@ impl JsAgentFlags {
     #[must_use]
     pub fn front(&self, packs: Packs, backend: Backend, source: RunSource) -> Front {
         let put_dir = PutDirParts::new(&packs, &backend, Arc::clone(&self.published))
-            .with_put_retry(PutRetry::new(self.put_retry))
+            .with_put_retry(PutRetry::new(self.put_retry).counted_in(packs.store_waits()))
             .with_write_slots(self.manifest_writes)
             .with_republish(Arc::clone(&self.republish));
         Front::new(FrontParts {

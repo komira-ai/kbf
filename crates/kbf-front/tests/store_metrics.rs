@@ -21,6 +21,7 @@ use kbf_pack_index::PackIndex;
 
 const COLD_ZERO: &str = include_str!("golden/cold_store_metrics_zero.txt");
 const PACKS_ZERO: &str = include_str!("golden/pack_store_metrics_zero.txt");
+const WAITS_ZERO: &str = include_str!("golden/pack_store_waits_zero.txt");
 
 /// The injected stopwatch, in nanoseconds.
 #[derive(Clone, Default)]
@@ -469,7 +470,8 @@ async fn the_cache_renders_the_handle_it_is_given() {
 }
 
 /// Catches: packs that render no store families, or a handle other than the one they were
-/// given: zero lines before any request, and the store's counts once it has served one.
+/// given: zero lines before any request (the store's four families, then its waits for 503s),
+/// and the store's counts once it has served one.
 #[tokio::test]
 async fn packs_render_the_pack_store_families() {
     let create_only = Capabilities {
@@ -489,7 +491,7 @@ async fn packs_render_the_pack_store_families() {
         .with_store_metrics(Arc::clone(&metrics));
     let mut out = String::new();
     packs.render_metrics(&mut out);
-    assert!(out.contains(PACKS_ZERO), "{out}");
+    assert!(out.contains(&format!("{PACKS_ZERO}{WAITS_ZERO}")), "{out}");
     store
         .put_new(&key("p"), Bytes::from_static(b"12"), None)
         .await

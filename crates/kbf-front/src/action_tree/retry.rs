@@ -9,15 +9,18 @@
 //!   store had closed, "connection closed before message completed", "Broken pipe"): once, at
 //!   once, on the connection the client makes next. A second failure is the failure.
 //! - **A 503** ([`ObjectStoreError::Service`] with status 503: the store is not taking writes
-//!   for a while, typically 10 to 40 s while it registers): after a wait that starts at
-//!   [`FIRST_WAIT`] and doubles up to [`LONGEST_WAIT`], until the waits add up to
-//!   [`PutRetry::total`] (`--task-put-retry-secs`, [`DEFAULT_TOTAL`] by default); the wait that
-//!   would pass the total is cut to end there, and when the waits have added up to it, the 503
-//!   is the failure. A total of zero never retries a 503.
+//!   for a while, typically 10 to 40 s while it registers or fails over its metadata): after a
+//!   wait that starts at about [`FIRST_WAIT`] and doubles up to [`LONGEST_WAIT`], each jittered
+//!   to between half and all of it, until the waits add up to [`PutRetry::total`]
+//!   (`--task-put-retry-secs`, [`DEFAULT_TOTAL`] by default); the wait that would pass the total
+//!   is cut to end there, and when the waits have added up to it, the 503 is the failure, its
+//!   message saying how long the write waited. A total of zero never retries a 503. The waits
+//!   are those of the frontend's other calls to the store ([`Backoff`]), and are counted with
+//!   them once the retry is [`PutRetry::counted_in`] the packs' waits.
 //! - **A 503 `SlowDown`** (the store is taking as many uploads as it can: back-pressure, not a
-//!   fault): with the same doubling waits, for as long as the store answers it; its waits do
-//!   not count toward the total. What ends it is the caller: a preparation that runs out of its
-//!   limit drops the write, and with it the retry.
+//!   fault): with the same waits, for as long as the store answers it; its waits do not count
+//!   toward the total. What ends it is the caller: a preparation that runs out of its limit
+//!   drops the write, and with it the retry.
 //!
 //! Every other answer (a 403, a 500, a body that failed its digest check) is reported on the
 //! first attempt. A write whose body is read from a source is made again by reading the source
@@ -31,6 +34,8 @@ use futures::future::BoxFuture;
 use kbf_objstore::{ObjectKey, ObjectStoreError};
 
 use super::NoTree;
+use crate::store_metrics::Op;
+use crate::store_wait::{Backoff, Next, StoreWaits, no_jitter, spread};
 
 /// The default of `--task-put-retry-secs`: how long the waits before the retries of one write
 /// of a tree may add up to.
@@ -65,27 +70,39 @@ pub(crate) fn tokio_sleeper() -> Arc<dyn Sleeper> {
 /// How a tree's writes are repeated. Cheap to clone.
 #[derive(Clone)]
 pub struct PutRetry {
-    total: Duration,
-    sleeper: Arc<dyn Sleeper>,
+    backoff: Backoff,
 }
 
 impl PutRetry {
-    /// A retry whose waits for 503s add up to at most `total`, waiting on the tokio timer.
+    /// A retry whose waits for 503s add up to at most `total`, waiting on the tokio timer,
+    /// jittered, and counted nowhere until [`PutRetry::counted_in`].
     #[must_use]
     pub fn new(total: Duration) -> Self {
-        Self::with_sleeper(total, Arc::new(TokioSleeper))
+        let backoff = Backoff::with(total, tokio_sleeper(), spread(), Arc::default());
+        Self { backoff }
     }
 
-    /// [`PutRetry::new`] waiting with `sleeper` (a test records the waits instead).
+    /// [`PutRetry::new`] waiting with `sleeper` and not jittered (a test records the nominal
+    /// waits instead).
     #[must_use]
     pub fn with_sleeper(total: Duration, sleeper: Arc<dyn Sleeper>) -> Self {
-        Self { total, sleeper }
+        let backoff = Backoff::with(total, sleeper, no_jitter(), Arc::default());
+        Self { backoff }
+    }
+
+    /// This retry, its waits counted in `waits` (the packs' [`Packs::store_waits`](crate::Packs::store_waits)),
+    /// as writes.
+    #[must_use]
+    pub fn counted_in(self, waits: Arc<StoreWaits>) -> Self {
+        Self {
+            backoff: self.backoff.counted_in(waits),
+        }
     }
 
     /// The most the waits before the retries of one write add up to.
     #[must_use]
     pub const fn total(&self) -> Duration {
-        self.total
+        self.backoff.total()
     }
 }
 
@@ -107,11 +124,6 @@ pub(super) enum Failed<E = NoTree> {
 /// Whether `error` is the store's back-pressure: a 503 `SlowDown`.
 pub(crate) fn is_slow_down(error: &ObjectStoreError) -> bool {
     matches!(error, ObjectStoreError::Service { status: 503, code, .. } if code == "SlowDown")
-}
-
-/// Whether `error` is a 503 of the store.
-fn is_unavailable(error: &ObjectStoreError) -> bool {
-    matches!(error, ObjectStoreError::Service { status: 503, .. })
 }
 
 /// Runs `attempt` (one create-only write of `key`), and again after a connection-level failure
@@ -150,31 +162,23 @@ where
     Fut: Future<Output = Result<(), Failed<E>>>,
 {
     let mut reconnected = false;
-    let mut waited = Duration::ZERO;
-    let mut next = FIRST_WAIT;
+    let mut waits = retry.backoff.call(Op::Put);
     loop {
         let error = match attempt().await {
-            Ok(()) => return Ok(()),
+            Ok(()) | Err(Failed::Store(ObjectStoreError::AlreadyExists(_))) => {
+                waits.answered();
+                return Ok(());
+            }
             Err(Failed::Other(failure)) => return Err(Failed::Other(failure)),
-            Err(Failed::Store(ObjectStoreError::AlreadyExists(_))) => return Ok(()),
             Err(Failed::Store(error)) => error,
         };
         if matches!(error, ObjectStoreError::Transport(_)) && !reconnected {
             reconnected = true;
             continue;
         }
-        if is_slow_down(&error) {
-            retry.sleeper.sleep(next).await;
-            next = (next * 2).min(LONGEST_WAIT);
+        if waits.after(&error, true).await == Next::Again {
             continue;
         }
-        if is_unavailable(&error) && waited < retry.total {
-            let wait = next.min(retry.total - waited);
-            retry.sleeper.sleep(wait).await;
-            waited += wait;
-            next = (next * 2).min(LONGEST_WAIT);
-            continue;
-        }
-        return Err(Failed::Store(error));
+        return Err(Failed::Store(waits.exhausted(error)));
     }
 }

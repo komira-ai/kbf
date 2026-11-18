@@ -385,7 +385,10 @@ impl RawByteStream {
             return answered.map_err(|unanswered| unanswered.status);
         }
         if let Some(packs) = &self.packs {
-            let answered = packed::read_stream(packs, &name, &resource.digest, &request).await?;
+            // Within the call's deadline: a read waits out a store that answers 503.
+            let read = packed::read_stream(packs, &name, &resource.digest, &request);
+            let answered =
+                deadline::within_read(deadline::of_headers(&parts.headers), read).await?;
             if let Some(response) = answered {
                 return Ok(response);
             }

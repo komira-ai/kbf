@@ -92,6 +92,7 @@ mod routed;
 mod segments;
 mod storage;
 pub mod store_metrics;
+pub mod store_wait;
 mod store_writes;
 mod wire;
 
