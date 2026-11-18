@@ -49,8 +49,9 @@ pub(super) fn executor_of(
         "--executor js-agent: this frontend was started without the preparation of task runs \
          (the key mint and the put directory of each run): give --task-secret-file",
     )?;
-    let front = js.front(packs.clone(), backend.clone(), source);
     let metrics = Arc::new(ExecutorMetrics::default());
+    let front =
+        (js.front(packs.clone(), backend.clone(), source)).with_metrics(Arc::clone(&metrics));
     let executor = js.build(
         Arc::new(front),
         Arc::clone(&metrics),

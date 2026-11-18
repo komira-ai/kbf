@@ -17,6 +17,11 @@
 //!   bytes (content-addressed), so the walk is the same with rows or without. When the rows
 //!   cannot be read the level is read from the blobs, and a record that fails is logged and
 //!   the walk goes on: the rows make a walk faster and never decide its answer.
+//! - **Writes after the walk.** The bodies read from blobs, over every level, are recorded as
+//!   rows once, and kept on the disk half of the cache, by tasks of their own that start when
+//!   the walk ends (with its answer or with its error) and that the walk does not wait for
+//!   ([`DetachedWrites`] bounds them; a write that finds no permit is skipped). A later walk
+//!   finds the rows and the disk entries once those tasks have ended.
 //! - **Complete or an error.** A blob that is not held is [`ClosureError::Missing`], never a
 //!   smaller closure: a run whose inputs cannot all be read is not started.
 //! - **Bounded.** The tree is cut off as soon as it holds more digests, or more bytes of
@@ -30,6 +35,8 @@
 //!   one of the Directory read first in level order (the reads of a level are issued
 //!   together and answered in order), so the same store gives the same answer.
 //!
+//! [`PrepareTook`] says how long a walk's three parts took, by the clock of `tokio::time`.
+//!
 //! [`collect_closure_keeping`] makes the same walk and keeps every `Directory` it read, its
 //! digests parsed, for the action tree's manifest writer ([`crate::action_tree`]): the walk the
 //! frontend makes before every submit stays the only walk. What it keeps is bounded by the same
@@ -42,6 +49,8 @@
 //! complete that the store cannot serve.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::stream;
@@ -50,11 +59,13 @@ use kbf_proto::reapi;
 use kbf_storage::StorageError;
 use kbf_types::Digest;
 use prost::Message as _;
+use tokio::time::Instant;
 
 use crate::backend::Backend;
 use crate::cache::is_empty_blob;
 use crate::grants::Scope;
 use crate::prepare_run::DirectoryCache;
+use crate::prepare_run::detached::DetachedWrites;
 use crate::wire;
 
 /// The most Directory blobs of one level read at once.
@@ -124,6 +135,20 @@ pub enum ClosureError {
         /// The limit.
         limit: u64,
     },
+}
+
+/// How long the parts of one closure walk took, measured with `tokio::time::Instant`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrepareTook {
+    /// From the start to the Action, read from the store and decoded, with the Command and the
+    /// input root named.
+    pub action: Duration,
+    /// All levels of the `Directory` walk, from the first read of the input root to the end of the
+    /// last level: the cache, the rows, the blob reads and the parse of every `Directory`.
+    pub walk: Duration,
+    /// The presence check of the Command and every file of the tree (`FindMissing`, in calls of
+    /// at most a batch), from its start until the last answer is in.
+    pub held: Duration,
 }
 
 /// What a task reads to run one Action.
@@ -352,8 +377,27 @@ pub async fn collect_closure(
     action: &Digest,
     limits: ClosureLimits,
 ) -> Result<InputClosure, ClosureError> {
-    let (closure, _, _) = collect(backend, action, limits, false, None).await?;
-    Ok(closure)
+    collect_closure_detaching(backend, action, limits, &DetachedWrites::shared()).await
+}
+
+/// [`collect_closure`], whose writes after the walk are bounded by `writes`.
+///
+/// # Errors
+/// As [`collect_closure`].
+pub async fn collect_closure_detaching(
+    backend: &Backend,
+    action: &Digest,
+    limits: ClosureLimits,
+    writes: &DetachedWrites,
+) -> Result<InputClosure, ClosureError> {
+    let walk = Walk {
+        backend,
+        limits,
+        keep: false,
+        cache: None,
+        writes,
+    };
+    Ok(collect(&walk, action).await?.closure)
 }
 
 /// [`collect_closure`], keeping every `Directory` of the input root it reads.
@@ -365,10 +409,12 @@ pub async fn collect_closure_keeping(
     action: &Digest,
     limits: ClosureLimits,
 ) -> Result<KeptClosure, ClosureError> {
-    keeping_through(backend, action, limits, None).await
+    let kept = keeping_through(backend, action, limits, None, &DetachedWrites::shared()).await;
+    Ok(kept?.0)
 }
 
-/// [`collect_closure_keeping`], reading each `Directory` through `cache` when there is one.
+/// [`collect_closure_keeping`], reading each `Directory` through `cache` when there is one, its
+/// writes after the walk bounded by `writes`, and how long its parts took.
 ///
 /// # Errors
 /// As [`collect_closure`].
@@ -376,24 +422,104 @@ pub(crate) async fn keeping_through(
     backend: &Backend,
     action: &Digest,
     limits: ClosureLimits,
-    cache: Option<&DirectoryCache>,
-) -> Result<KeptClosure, ClosureError> {
-    let (closure, root, directories) = collect(backend, action, limits, true, cache).await?;
-    Ok(KeptClosure {
+    cache: Option<&Arc<DirectoryCache>>,
+    writes: &DetachedWrites,
+) -> Result<(KeptClosure, PrepareTook), ClosureError> {
+    let walk = Walk {
+        backend,
+        limits,
+        keep: true,
+        cache,
+        writes,
+    };
+    let Collected {
         closure,
         root,
         directories,
-    })
+        took,
+    } = collect(&walk, action).await?;
+    let kept = KeptClosure {
+        closure,
+        root,
+        directories,
+    };
+    Ok((kept, took))
 }
 
-/// The closure of `action`, its input root, and, when `keep` is set, every `Directory` of it.
-async fn collect(
-    backend: &Backend,
-    action: &Digest,
+/// What one walk reads through and writes with.
+struct Walk<'a> {
+    backend: &'a Backend,
     limits: ClosureLimits,
+    /// Whether every `Directory` is kept.
     keep: bool,
-    cache: Option<&DirectoryCache>,
-) -> Result<(InputClosure, Digest, BTreeMap<Digest, KeptDirectory>), ClosureError> {
+    cache: Option<&'a Arc<DirectoryCache>>,
+    writes: &'a DetachedWrites,
+}
+
+/// What a walk found.
+struct Collected {
+    closure: InputClosure,
+    root: Digest,
+    /// Every `Directory` of the tree, when the walk keeps them; else none.
+    directories: BTreeMap<Digest, KeptDirectory>,
+    took: PrepareTook,
+}
+
+/// The `Directory` bodies of a walk that are written after it: the rows to record, and the blobs
+/// for the disk half of the cache.
+#[derive(Default)]
+struct Fresh {
+    /// The bodies read from blobs, to be recorded as rows.
+    rows: Vec<(Digest, Bytes)>,
+    /// The bodies with no malformed digest, to be kept on disk.
+    disk: Vec<(Digest, Bytes)>,
+}
+
+impl Fresh {
+    /// Starts the writes of what the walk read, each as a task of its own holding a permit of
+    /// `walk.writes`, and returns without waiting for them. A failed record is logged.
+    fn flush(self, walk: &Walk<'_>) {
+        if !self.rows.is_empty()
+            && let Some(permit) = walk.writes.take()
+        {
+            let backend = walk.backend.clone();
+            let rows = self.rows;
+            drop(tokio::spawn(async move {
+                if let Err(error) = backend.record_directories(rows).await {
+                    tracing::warn!(%error, "the Directories read could not be recorded as rows");
+                }
+                drop(permit);
+            }));
+        }
+        if let Some(cache) = walk.cache {
+            cache.store_detached(self.disk, walk.writes);
+        }
+    }
+}
+
+/// The closure of `walk`'s Action, its input root, and, when it keeps them, every `Directory`
+/// of it; the writes of what was read are started whether the walk ends with an answer or an
+/// error.
+async fn collect(walk: &Walk<'_>, action: &Digest) -> Result<Collected, ClosureError> {
+    let mut fresh = Fresh::default();
+    let collected = walk_tree(walk, action, &mut fresh).await;
+    fresh.flush(walk);
+    collected
+}
+
+async fn walk_tree(
+    walk: &Walk<'_>,
+    action: &Digest,
+    fresh: &mut Fresh,
+) -> Result<Collected, ClosureError> {
+    let Walk {
+        backend,
+        limits,
+        keep,
+        cache,
+        ..
+    } = *walk;
+    let started = Instant::now();
     let blob = read(backend, "the Action", action).await?;
     let decoded = reapi::Action::decode(blob).map_err(|e| invalid("the Action", action, &e))?;
     let named = |what, digest: Option<&reapi::Digest>| {
@@ -407,6 +533,7 @@ async fn collect(
         "the Action's input root",
         decoded.input_root_digest.as_ref(),
     )?;
+    let action_took = started.elapsed();
     let mut seen = Seen {
         limits,
         digests: BTreeSet::new(),
@@ -420,8 +547,9 @@ async fn collect(
     let mut kept = BTreeMap::new();
     let mut files = Vec::new();
     let mut level = vec![root];
+    let walking = Instant::now();
     while !level.is_empty() {
-        let directories = read_level(backend, cache, level).await?;
+        let directories = read_level(backend, cache, level, fresh).await?;
         level = Vec::new();
         for (parent, parsed) in directories {
             let Parsed {
@@ -457,14 +585,27 @@ async fn collect(
             }
         }
     }
+    let walk_took = walking.elapsed();
+    let checking = Instant::now();
     require_held(backend, &command, files).await?;
+    let held = checking.elapsed();
     let closure = InputClosure {
         action: *action,
         command,
         inputs: seen.digests,
         bytes: seen.bytes,
     };
-    Ok((closure, root, kept))
+    let took = PrepareTook {
+        action: action_took,
+        walk: walk_took,
+        held,
+    };
+    Ok(Collected {
+        closure,
+        root,
+        directories: kept,
+        took,
+    })
 }
 
 /// The digest a Directory `parent` names for `what`.
@@ -485,13 +626,14 @@ fn invalid(what: &'static str, digest: &Digest, why: &impl std::fmt::Display) ->
 }
 
 /// The Directories of one level, in order, parsed: from `cache` when it holds them, else from
-/// their rows where the pack index has them, else from their blobs, which are then recorded as
-/// rows. Only what the cache does not hold is asked of the rows, and nothing is asked when it
-/// holds the whole level.
+/// their rows where the pack index has them, else from their blobs, which are handed to `fresh`
+/// to be recorded as rows. Only what the cache does not hold is asked of the rows, and nothing is
+/// asked when it holds the whole level.
 async fn read_level(
     backend: &Backend,
-    cache: Option<&DirectoryCache>,
+    cache: Option<&Arc<DirectoryCache>>,
     level: Vec<Digest>,
+    fresh: &mut Fresh,
 ) -> Result<Vec<(Digest, Parsed)>, ClosureError> {
     // The empty Directory is never cached: it is left to `directory`, as without a cache.
     // Owned digests: a closure over a borrowed one makes the future's `Send` unprovable where
@@ -500,7 +642,7 @@ async fn read_level(
         .map(|digest| async move {
             match is_empty_blob(&digest) {
                 true => None,
-                false => remembered(cache, &digest).await,
+                false => remembered(cache.map(Arc::as_ref), &digest).await,
             }
         })
         .buffered(DIRECTORIES_IN_FLIGHT)
@@ -520,24 +662,27 @@ async fn read_level(
             }
         },
     };
-    let read: Vec<(Digest, Parsed, Option<Bytes>)> = stream::iter(misses.into_iter().zip(rows))
-        .map(|(digest, row)| directory(backend, cache, digest, row))
+    let read: Vec<Fetched> = stream::iter(misses.into_iter().zip(rows))
+        .map(|(digest, row)| directory(backend, digest, row))
         .buffered(DIRECTORIES_IN_FLIGHT)
         .try_collect()
         .await?;
-    let fresh: Vec<(Digest, Bytes)> = read
-        .iter()
-        .filter_map(|(digest, _, blob)| Some((*digest, blob.clone()?)))
-        .collect();
-    if !fresh.is_empty()
-        && let Err(error) = backend.record_directories(fresh).await
-    {
-        tracing::warn!(%error, "the Directories read could not be recorded as rows");
+    for fetched in &read {
+        let Some(body) = &fetched.body else {
+            continue;
+        };
+        if fetched.from_blob {
+            fresh.rows.push((fetched.digest, body.clone()));
+        }
+        // A Directory with a malformed digest is never stored: the walk fails on it.
+        if cache.is_some() && fetched.parsed.fault.is_none() {
+            fresh.disk.push((fetched.digest, body.clone()));
+        }
     }
     // The digests of a level are distinct: each was queued once.
     let mut read: BTreeMap<Digest, Parsed> = read
         .into_iter()
-        .map(|(digest, parsed, _)| (digest, parsed))
+        .map(|fetched| (fetched.digest, fetched.parsed))
         .collect();
     let whole = |kept| Parsed { kept, fault: None };
     Ok((level.into_iter().zip(held))
@@ -548,32 +693,44 @@ async fn read_level(
         .collect())
 }
 
+/// A Directory read for a walk.
+struct Fetched {
+    digest: Digest,
+    parsed: Parsed,
+    /// Its bytes; none for the empty Directory, which has nothing to read, keep or record.
+    body: Option<Bytes>,
+    /// Whether the bytes came from the blob and not from a row.
+    from_blob: bool,
+}
+
 /// The Directory `digest` parsed, from `row` (its bytes from the Directory rows) when there is
-/// one, else from its blob, which is handed back to be recorded; a Directory with no malformed
-/// digest is kept on the disk half of `cache`. The empty blob is the empty Directory, with
-/// nothing to read, keep or record.
+/// one, else from its blob. The bytes are handed back to be recorded and kept on disk.
 async fn directory(
     backend: &Backend,
-    cache: Option<&DirectoryCache>,
     digest: Digest,
     row: Option<Bytes>,
-) -> Result<(Digest, Parsed, Option<Bytes>), ClosureError> {
+) -> Result<Fetched, ClosureError> {
     if is_empty_blob(&digest) {
         let kept = KeptDirectory::default();
-        return Ok((digest, Parsed { kept, fault: None }, None));
+        let parsed = Parsed { kept, fault: None };
+        return Ok(Fetched {
+            digest,
+            parsed,
+            body: None,
+            from_blob: false,
+        });
     }
-    let (bytes, fresh) = match row {
+    let (bytes, from_blob) = match row {
         Some(body) => (body, false),
         None => (read(backend, "a Directory", &digest).await?, true),
     };
     let parsed = KeptDirectory::parse(&digest, bytes.clone())?;
-    // A Directory with a malformed digest is never stored: the walk fails on it.
-    if let Some(cache) = cache
-        && parsed.fault.is_none()
-    {
-        cache.store(&digest, &bytes).await;
-    }
-    Ok((digest, parsed, fresh.then_some(bytes)))
+    Ok(Fetched {
+        digest,
+        parsed,
+        body: Some(bytes),
+        from_blob,
+    })
 }
 
 /// The Directory `digest` as `cache` holds it: in memory, or as a blob on its disk that decodes

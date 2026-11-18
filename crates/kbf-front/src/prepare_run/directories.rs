@@ -16,7 +16,8 @@
 //!   every read; a file that is not the blob is dropped and the `Directory` is read from the
 //!   store again. A failure to write a blob is not an error of the walk: the `Directory` stays
 //!   in memory and the walk goes on. The cache does blocking file I/O, so each call runs on the
-//!   blocking pool.
+//!   blocking pool. The blobs a walk read are written by one task after the walk, which the
+//!   preparation does not wait for ([`DetachedWrites`]).
 //! - **Never the empty `Directory`.** The empty blob is the empty `Directory` and costs no
 //!   read; it is not stored.
 
@@ -31,6 +32,7 @@ use kbf_pack_index::BlobDigest;
 use kbf_types::Digest;
 
 use super::closure::KeptDirectory;
+use super::detached::DetachedWrites;
 
 /// The memory bound the frontend uses: 256 MiB.
 pub const DIRECTORY_MEMORY_BYTES: u64 = 256 << 20;
@@ -151,15 +153,31 @@ impl DirectoryCache {
             .flatten()
     }
 
-    /// Keeps the `Directory` blob `blob` under `digest` on the disk half, if there is one. A
-    /// blob it cannot write is left out; the walk does not depend on it.
-    pub(crate) async fn store(&self, digest: &Digest, blob: &Bytes) {
+    /// Keeps the `Directory` blobs `blobs` on the disk half, if there is one, from a task of the
+    /// blocking pool that the caller does not wait for. The task holds a permit of `writes`; with
+    /// none free the blobs are left out (and counted by it). A blob the disk cannot write is left
+    /// out too; the walk does not depend on any of them.
+    pub(crate) fn store_detached(
+        self: &Arc<Self>,
+        blobs: Vec<(Digest, Bytes)>,
+        writes: &DetachedWrites,
+    ) {
         let Some(disk) = self.disk.as_ref().map(Arc::clone) else {
             return;
         };
-        let key = to_index(digest);
-        let blob = blob.clone();
-        let _ = tokio::task::spawn_blocking(move || disk.put(&key, &blob)).await;
+        if blobs.is_empty() {
+            return;
+        }
+        let Some(permit) = writes.take() else {
+            return;
+        };
+        // The handle is dropped: the task runs to its end on its own.
+        drop(tokio::task::spawn_blocking(move || {
+            for (digest, blob) in &blobs {
+                let _ = disk.put(&to_index(digest), blob);
+            }
+            drop(permit);
+        }));
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {

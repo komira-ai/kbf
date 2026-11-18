@@ -54,11 +54,18 @@
 //! The cache serves the closure walk of the put-directory preparation only; [`RunPrep`] reads no
 //! cache.
 //!
+//! **Writes the run does not wait for.** The closure walk records the `Directory` bodies it read
+//! from blobs as rows of the pack index and keeps them on the cache's disk half, in tasks that
+//! start when the walk ends and that the preparation returns without ([`DetachedWrites`] bounds
+//! them; a write with no permit free is skipped and counted). [`PutDirRun::took`] says how long
+//! the Action read, the `Directory` walk and the presence check took ([`PrepareTook`]).
+//!
 //! **Secrets.** The key of the mint, the key of the grants and the signing key of the write
 //! are values the caller loads from files named by flags (`kbf-server`'s `task_flags`); no
 //! type here prints one, and the URL and the token are redacted from [`RunInputs`]'s `Debug`.
 
 mod closure;
+mod detached;
 mod directories;
 
 use std::fmt;
@@ -70,11 +77,13 @@ use kbf_types::Digest;
 use tierstore::server::presign::PresignError;
 use tierstore::server::{PresignRequest, presign_put};
 
+pub use self::closure::PrepareTook;
 pub use self::closure::{
     ClosureError, ClosureLimits, InputClosure, KeptClosure, collect_closure,
-    collect_closure_keeping,
+    collect_closure_detaching, collect_closure_keeping,
 };
 pub(crate) use self::closure::{KeptDirectory, keeping_through};
+pub use self::detached::{DETACHED_WRITES, DetachedWrites};
 pub use self::directories::{DIRECTORY_MEMORY_BYTES, DirectoryCache};
 pub use tierstore::server::AccessKey;
 
@@ -609,6 +618,8 @@ pub struct PutDirRun {
     /// The Unix second after which the directory's keys are not good for the run: its start,
     /// its wall and the slack.
     pub not_after: u64,
+    /// How long the closure walk's parts took ([`PrepareTook`]).
+    pub took: PrepareTook,
 }
 
 impl RunPrep {
@@ -632,6 +643,7 @@ impl RunPrep {
             self.limits,
             self.slack,
             None,
+            &DetachedWrites::shared(),
             &RunAt {
                 lease,
                 action,
@@ -655,6 +667,7 @@ pub struct PutDirPrep {
     slack: Duration,
     limits: ClosureLimits,
     directories: Option<Arc<DirectoryCache>>,
+    writes: DetachedWrites,
 }
 
 /// What [`PutDirPrep::mint_put_dir`] gives: the put directory of a run, with no closure.
@@ -685,6 +698,7 @@ impl PutDirPrep {
             slack,
             limits,
             directories: None,
+            writes: DetachedWrites::shared(),
         }
     }
 
@@ -693,6 +707,21 @@ impl PutDirPrep {
     pub fn with_directories(mut self, cache: Arc<DirectoryCache>) -> Self {
         self.directories = Some(cache);
         self
+    }
+
+    /// This preparer, the writes its closure walks leave running after they return (rows, disk
+    /// entries) bounded by `writes` instead of the bound every preparer shares.
+    #[must_use]
+    pub fn with_detached_writes(mut self, writes: DetachedWrites) -> Self {
+        self.writes = writes;
+        self
+    }
+
+    /// The bound on this preparer's writes after a walk: how many it skipped
+    /// ([`DetachedWrites::skipped`]), and a wait for the running ones ([`DetachedWrites::settled`]).
+    #[must_use]
+    pub const fn detached_writes(&self) -> &DetachedWrites {
+        &self.writes
     }
 
     /// The mint that signs this preparer's directories: the one [`crate::ingest_put_dir`] must
@@ -719,7 +748,8 @@ impl PutDirPrep {
             &self.mint,
             self.limits,
             self.slack,
-            self.directories.as_deref(),
+            self.directories.as_ref(),
+            &self.writes,
             &RunAt {
                 lease,
                 action,
@@ -778,16 +808,18 @@ async fn put_dir_run(
     mint: &PackKeyMint,
     limits: ClosureLimits,
     slack: Duration,
-    directories: Option<&DirectoryCache>,
+    directories: Option<&Arc<DirectoryCache>>,
+    writes: &DetachedWrites,
     run: &RunAt<'_>,
 ) -> Result<PutDirRun, PrepareError> {
     let not_after = not_after(run.lease, run.now, run.wall, slack)?;
-    let kept = keeping_through(backend, run.action, limits, directories).await?;
+    let (kept, took) = keeping_through(backend, run.action, limits, directories, writes).await?;
     let dir = mint.mint_put_dir(run.lease, run.action, run.now)?;
     Ok(PutDirRun {
         dir,
         kept,
         not_after,
+        took,
     })
 }
 

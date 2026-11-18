@@ -88,6 +88,15 @@ pub(crate) struct FakeIngest {
     pub minted: AtomicU64,
     /// Every pack read: the run and the key.
     pub ingested: Mutex<Vec<(RunId, String)>>,
+    /// The answers the next waits for a tree's writes give, in order; then the tree is stored.
+    pub stored_script: Mutex<VecDeque<MintError>>,
+    /// While set, a wait for a tree's writes holds until [`FakeIngest::release`] is notified
+    /// (the tree's writes still going on).
+    pub hold_stored: AtomicBool,
+    /// Ends the waits that [`FakeIngest::hold_stored`] holds.
+    pub release: tokio::sync::Notify,
+    /// Every wait for a tree's writes, by run, in the order asked.
+    pub stored_asked: Mutex<Vec<RunId>>,
 }
 
 impl FakeIngest {
@@ -116,6 +125,14 @@ impl Ingest for FakeIngest {
         }
         let n = self.minted.fetch_add(1, Ordering::SeqCst);
         Ok(PackKey::new(format!("cas/b/{}/{n:032x}", build_id(run))))
+    }
+
+    async fn stored(&self, run: RunId) -> Result<(), MintError> {
+        locked(&self.stored_asked).push(run);
+        if self.hold_stored.load(Ordering::SeqCst) {
+            self.release.notified().await;
+        }
+        locked(&self.stored_script).pop_front().map_or(Ok(()), Err)
     }
 
     async fn ingest(
@@ -149,6 +166,10 @@ pub(crate) struct Faulty {
     /// Run once, just before the first read of a key under the prefix: another process's
     /// write landing between two reads of a caller.
     pub before_read: Mutex<Option<(String, BeforeRead)>>,
+    /// How many reads of one key were made.
+    pub reads: AtomicU64,
+    /// How many batches of writes were made.
+    pub batches: AtomicU64,
 }
 
 /// What [`Faulty::before_read`] runs.
@@ -166,6 +187,8 @@ impl Faulty {
             fail_write: AtomicU64::new(0),
             race: Mutex::new(None),
             before_read: Mutex::new(None),
+            reads: AtomicU64::new(0),
+            batches: AtomicU64::new(0),
         }
     }
 
@@ -198,6 +221,7 @@ impl Faulty {
 
 impl Store for Faulty {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        self.batches.fetch_add(1, Ordering::SeqCst);
         assert!(!self.writes_panic.load(Ordering::SeqCst), "the store broke");
         if self.writes_fail.load(Ordering::SeqCst) {
             return Err(StoreError::Failed("the write failed".to_owned()));
@@ -224,6 +248,7 @@ impl Store for Faulty {
     }
 
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         self.read_fault()?;
         let armed = {
             let mut hook = locked(&self.before_read);
@@ -451,6 +476,10 @@ impl Rig {
             mint_fails: Mutex::new(VecDeque::new()),
             minted: AtomicU64::new(0),
             ingested: Mutex::new(Vec::new()),
+            stored_script: Mutex::new(VecDeque::new()),
+            hold_stored: AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+            stored_asked: Mutex::new(Vec::new()),
         });
         let metrics = Arc::new(Metrics::default());
         let mut rig = Self {

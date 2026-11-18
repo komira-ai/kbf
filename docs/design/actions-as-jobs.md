@@ -294,12 +294,15 @@ the passed-through port is out of its reach. `tierstore fs` fetches blobs over t
 
 ### 4.1 From an input root to an action tree
 
-The frontend writes the manifests, in the executor's `prepare`, before it submits [proposed, D5].
+The frontend builds the manifests, in the executor's `prepare`, and names the tree before it submits; the manifests
+are written while the job is submitted, since the tree's name is a digest of what it holds and the job's host reads
+it only once the job is placed. A first attempt waits for the writes after its submit and cancels its job when they
+fail; a later attempt waits for them before it submits [proposed, D5].
 
 **The `Directory` messages.** A manifest per `Directory` needs each one's names, kinds, executable bits, symlink
 targets and child digests. `collect_closure` already reads every `Directory` of the input root before every submit and
 drops each after taking its digests [code]; with trees on, it keeps them for the writer, at most
-`--task-closure-max-digests` (500,000 by default), released when the job is submitted. The walk the frontend makes
+`--task-closure-max-digests` (500,000 by default), released when the tree's writes end. The walk the frontend makes
 today stays the only walk; what is added is building, hashing and storing the manifests, measured in section 10.
 
 **Where each blob is.** A file entry names its blob and, unless the blob is a whole object `cas/l/<sha256>`, a

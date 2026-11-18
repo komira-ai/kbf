@@ -10,6 +10,7 @@ use super::{
     Booking, FRONTEND_LABEL, INSTANCE_LABEL, Preparer, Settled, job_id, pinned, prepare, require,
     wall_seconds,
 };
+use crate::executor::metrics::Metrics;
 use crate::executor::outcome::{Verdict, judge};
 use crate::executor::size_class::SizeClass;
 use crate::executor::traits::InputsError;
@@ -66,6 +67,7 @@ pub(super) struct Harness {
     pub(super) cfg: Config,
     pub(super) inputs: Arc<dyn Inputs>,
     pub(super) ingest: Arc<dyn Ingest>,
+    pub(super) metrics: Metrics,
 }
 
 impl Harness {
@@ -78,11 +80,13 @@ impl Harness {
             cfg,
             inputs: Arc::new(Easy),
             ingest: Arc::new(Easy),
+            metrics: Metrics::default(),
         }
     }
 
     pub(super) fn preparer(&self) -> Preparer<'_> {
         Preparer {
+            metrics: &self.metrics,
             cfg: &self.cfg,
             inputs: &self.inputs,
             ingest: &self.ingest,
@@ -234,6 +238,7 @@ async fn prepared(
         None => Arc::clone(&harness.inputs),
     };
     let ctx = Preparer {
+        metrics: &Metrics::default(),
         inputs: &inputs,
         ..harness.preparer()
     };

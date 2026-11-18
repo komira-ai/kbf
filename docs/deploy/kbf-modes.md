@@ -357,7 +357,8 @@ procedure, the canary and the refusals are in [job-service-cutover.md](job-servi
 
 Per-action overhead of the executor is read from two places. The
 executor's own phases are the histogram `kbf_executor_phase_seconds{phase=...}` on `GET /metrics`:
-`prepare` (the Execute to its job being ready), `start` (ready to the job service
+`prepare` (the Execute to its job being ready: its action read, its put directory minted and
+its action tree named, the tree's writes going on beside the submit), `start` (ready to the job service
 answering the submit with the job), `queue` (accepted to first read back as running), `task` (first
 read back as running to read back as ended), `run` (accepted to read back as ended, whether or not
 it was seen running), `ingest` (read back as ended to the read of the pack done), `submit` (the Execute to the job service's answer to its submit) and `execute` (the Execute to its callers answered). They are
@@ -365,7 +366,11 @@ stamped by the executor on its own clock, once per poll of each job, and the job
 job's state from its host's agent, which trails the host by one or two beats: `queue`, `task` and
 `run` are good to a pass plus a heartbeat or two, not to the instant the host started or ended the
 job, and a job that starts and ends between two reads has a `run` and no `queue` or `task`. A phase that was not observed
-is absent, never zero. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
+is absent, never zero. The buckets start at 1 ms. Where `prepare` and `start` go is the histogram
+`kbf_executor_step_seconds{step=...}`, each step timed around its one wait: `facts`, `put_dir` (with the closure's
+`action`, `walk` and `held`), `tree` (to the action tree's name), `row`, `rpc` (each `SubmitJob` call), `backoff`
+(the wait before a submit is sent again) and `tree_wait` (a run waiting for its tree's writes: a first attempt after
+its submit, a later attempt before it). [api.md](../api.md) lists them. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
 in the result's execution metadata as the `input_fetch`, `execution` and `output_upload` start and
 completed times, marked as a task's claim, and the run record and the read API say so with
 `phase_times: "task_claim"` (a run recorded by an earlier release is `measured`, and so is a record written before the
@@ -649,9 +654,11 @@ What it does itself, with those three:
   A cache that is empty at the start is a valid cache; nothing is imported from storage nodes.
 - **Directory rows.** The walk of an action's input tree before its job is submitted reads each
   level of Directories from the `directory` table of the state store (installer migration 4) with
-  one query, and reads only the Directories without a row from their packs, recording them as
-  rows; see `docs/design/metadata-in-postgres.md`. A database at migration 3 starts and every
-  walk reads the blobs, logging a warning for each failed read and record of the rows.
+  one query, and reads only the Directories without a row from their packs; the walk's
+  Directories read from packs are recorded as rows once it ends, by a task the preparation does
+  not wait for; see `docs/design/metadata-in-postgres.md`. A database at migration 3 starts and
+  every walk reads the blobs, logging a warning for each failed read, and for a failed record
+  of the walk's rows.
 - **Readiness.** `GET /readyz` and `grpc.health.v1` fail when the state store does not answer a
   read and when the job service does not answer a read of a job (`executor` in the failing
   list). Nothing probes the object store or any storage node: an object store that is down is

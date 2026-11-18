@@ -5,8 +5,11 @@
 //! be read or written, or whose index keeps none, answers as a walk of the blobs does.
 
 use bytes::Bytes;
-use kbf_front::PackSettings;
-use kbf_front::prepare_run::{ClosureError, ClosureLimits, InputClosure, collect_closure};
+use kbf_front::prepare_run::{
+    ClosureError, ClosureLimits, DetachedWrites, InputClosure, PutDirPrep,
+    collect_closure_detaching,
+};
+use kbf_front::{PackKeyMint, PackSettings};
 use kbf_pack_index::directory::{MAX_DIRECTORY_BYTES, NewDirectory};
 use kbf_pack_index::{MAX_BATCH, PackIndex as _};
 use kbf_proto::reapi::{self, Directory, DirectoryNode, FileNode};
@@ -90,8 +93,13 @@ async fn uploaded_tree(rig: &Rig) -> Tree {
     }
 }
 
+/// The closure of `action`, once the writes the walk left running have ended.
 async fn walk(rig: &Rig, action: &Digest) -> Result<InputClosure, ClosureError> {
-    collect_closure(&rig.backend, action, ClosureLimits::DEFAULT).await
+    let writes = DetachedWrites::new(8);
+    let closure =
+        collect_closure_detaching(&rig.backend, action, ClosureLimits::DEFAULT, &writes).await;
+    writes.settled().await;
+    closure
 }
 
 /// The Directory rows the index holds for `digests`, in order.
@@ -176,14 +184,14 @@ async fn rows_that_cannot_be_read_leave_the_walk_to_the_blobs() {
     );
 }
 
-/// Asserts that a record that fails leaves the walk its answer and writes no row; the next
-/// walk records the Directories.
+/// Asserts that a record that fails (the one record of a walk) leaves the walk its answer and
+/// writes no row; the next walk records the Directories.
 #[tokio::test]
 async fn a_record_that_fails_leaves_the_walk_its_answer() {
     let rig = Rig::new().await;
     let tree = uploaded_tree(&rig).await;
 
-    rig.index.fail_record_directories(2);
+    rig.index.fail_record_directories(1);
     let first = walk(&rig, &tree.action).await.expect("walked");
     let after_failure = rows(&rig, &[tree.root.0, tree.sub.0]);
     let second = walk(&rig, &tree.action).await.expect("walked again");
@@ -306,4 +314,120 @@ async fn a_directory_over_the_row_bound_is_read_from_its_blob_and_not_recorded()
         rows(&rig, &[root.0, long.0]),
         vec![Some(root.1.to_vec()), None]
     );
+}
+
+const LEASE: &str = "00000000000000010000000000000002";
+
+/// A preparer of put-directory runs over the rig's store, its writes after the walk bounded by
+/// `writes`.
+fn preparer(rig: &Rig, writes: &DetachedWrites) -> PutDirPrep {
+    PutDirPrep::new(
+        rig.backend.clone(),
+        PackKeyMint::new(b"0123456789abcdef0123456789abcdef").expect("a mint"),
+        std::time::Duration::from_secs(600),
+        ClosureLimits::DEFAULT,
+    )
+    .with_detached_writes(writes.clone())
+}
+
+/// Prepares the put-directory run of `action`: its kept closure's Directory count.
+async fn prepared_directories(prep: &PutDirPrep, action: &Digest) -> usize {
+    let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_040);
+    let wall = std::time::Duration::from_secs(7_200);
+    let run = prep.prepare_put_dir(LEASE, action, now, wall).await;
+    run.expect("prepared").kept.directory_count()
+}
+
+/// Asserts that a preparation returns, with the whole closure, while the record of the rows is
+/// still waiting inside the index (it had been started, and no row is there yet), and that once
+/// the record is let go and has ended the rows of the Directories read are there.
+#[tokio::test]
+async fn a_preparation_returns_while_the_rows_are_still_being_written() {
+    let rig = Rig::new().await;
+    let tree = uploaded_tree(&rig).await;
+    let writes = DetachedWrites::new(8);
+    let prep = preparer(&rig, &writes);
+    rig.index.hold_record_directories();
+
+    let kept = prepared_directories(&prep, &tree.action).await;
+    rig.index.record_directories_entered().await;
+    let while_held = rows(&rig, &[tree.root.0, tree.sub.0]);
+    rig.index.release_record_directories();
+    writes.settled().await;
+
+    assert_eq!(kept, 3, "the root, `sub` and the empty Directory");
+    assert_eq!(while_held, vec![None, None]);
+    assert_eq!(
+        rows(&rig, &[tree.root.0, tree.sub.0]),
+        vec![Some(tree.root.1.to_vec()), Some(tree.sub.1.to_vec())]
+    );
+    assert_eq!(writes.skipped(), 0);
+}
+
+/// Asserts that a record that fails after the preparation returned changes nothing the run was
+/// given: the same closure, no row written, and the next preparation records the rows.
+#[tokio::test]
+async fn a_failed_row_write_does_not_fail_the_preparation() {
+    let rig = Rig::new().await;
+    let tree = uploaded_tree(&rig).await;
+    let writes = DetachedWrites::new(8);
+    let prep = preparer(&rig, &writes);
+
+    rig.index.fail_record_directories(1);
+    let first = prepared_directories(&prep, &tree.action).await;
+    writes.settled().await;
+    let after_failure = rows(&rig, &[tree.root.0, tree.sub.0]);
+    let second = prepared_directories(&prep, &tree.action).await;
+    writes.settled().await;
+
+    assert_eq!((first, second), (3, 3));
+    assert_eq!(after_failure, vec![None, None]);
+    assert_eq!(
+        rows(&rig, &[tree.root.0, tree.sub.0]),
+        vec![Some(tree.root.1.to_vec()), Some(tree.sub.1.to_vec())]
+    );
+}
+
+/// Asserts the bound: with its only permit taken by a record that is waiting, a second
+/// preparation of the tree still succeeds, skips its own record and counts the skip; when the
+/// first record ends, its rows are the only ones written.
+#[tokio::test]
+async fn a_write_with_no_permit_free_is_skipped_and_counted() {
+    let rig = Rig::new().await;
+    let tree = uploaded_tree(&rig).await;
+    let writes = DetachedWrites::new(1);
+    let prep = preparer(&rig, &writes);
+    rig.index.hold_record_directories();
+
+    let first = prepared_directories(&prep, &tree.action).await;
+    rig.index.record_directories_entered().await;
+    let skipped_before = writes.skipped();
+    let second = prepared_directories(&prep, &tree.action).await;
+    let skipped_after = writes.skipped();
+    rig.index.release_record_directories();
+    writes.settled().await;
+
+    assert_eq!((first, second), (3, 3));
+    assert_eq!((skipped_before, skipped_after), (0, 1));
+    assert_eq!(
+        rows(&rig, &[tree.root.0, tree.sub.0]),
+        vec![Some(tree.root.1.to_vec()), Some(tree.sub.1.to_vec())]
+    );
+}
+
+/// Asserts that a bound of no permits skips every write, counted once per preparation, and the
+/// preparation still gives its closure.
+#[tokio::test]
+async fn a_bound_of_no_writes_skips_them_all() {
+    let rig = Rig::new().await;
+    let tree = uploaded_tree(&rig).await;
+    let writes = DetachedWrites::new(0);
+    let prep = preparer(&rig, &writes);
+
+    let kept = prepared_directories(&prep, &tree.action).await;
+    writes.settled().await;
+
+    assert_eq!(kept, 3);
+    assert_eq!(writes.skipped(), 1);
+    assert_eq!(rows(&rig, &[tree.root.0, tree.sub.0]), vec![None, None]);
 }

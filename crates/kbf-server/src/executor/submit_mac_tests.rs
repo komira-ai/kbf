@@ -9,6 +9,7 @@ use kbf_proto::reapi::Digest;
 use super::tests::{Harness, RUN, built_class};
 use super::{Booking, FRONTEND_LABEL, INSTANCE_LABEL, Preparer, Settled, job_id, prepare};
 use crate::executor::mac::mac_argv;
+use crate::executor::metrics::Metrics;
 use crate::executor::traits::InputsError;
 use crate::executor::{
     ActionFacts, DEFAULT_MAC_OS_VERSION, Inputs, MAC_OUT_TARGET, MacPool, PutDirRoots, RunId,
@@ -104,6 +105,7 @@ async fn prepared(case: Case) -> Result<super::Prepared, Settled> {
         linux: case.linux,
     });
     let ctx = Preparer {
+        metrics: &Metrics::default(),
         inputs: &inputs,
         ..harness.preparer()
     };

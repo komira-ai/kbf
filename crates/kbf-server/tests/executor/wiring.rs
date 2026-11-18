@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use js_proto::v1::{NetworkLevel, mount};
 use kbf_front::action_tree::{BaseFacts, BaseTree};
-use kbf_front::prepare_run::{ClosureLimits, collect_closure_keeping};
+use kbf_front::prepare_run::{ClosureLimits, PrepareTook, collect_closure_keeping};
 use kbf_front::{
     Backend, Cache, CacheStorage, Described, Dispatch as _, Finished, PackKeyMint, PackSettings,
     Packs, Recorder, SegmentsConfig, Stage, Submission, VerifiedBlob,
@@ -88,6 +88,7 @@ impl RunPrepare for Preparing {
             dir,
             kept,
             not_after,
+            took: PrepareTook::default(),
         })
     }
 

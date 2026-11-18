@@ -74,12 +74,18 @@ impl RunPrepare for Unprepared {
     }
 }
 
-/// An object store whose reads can be made to fail.
+/// An object store whose reads can be made to fail, and whose writes held or failed.
 struct Flaky {
     inner: MemoryStore,
     fail_reads: AtomicBool,
     /// How many objects were put.
     puts: AtomicUsize,
+    /// While set, each write waits for a permit of [`Flaky::released`] before it is made.
+    hold_puts: AtomicBool,
+    /// The writes [`Flaky::hold_puts`] lets through.
+    released: tokio::sync::Semaphore,
+    /// While set, each write fails.
+    fail_puts: AtomicBool,
 }
 
 impl ObjectStore for Flaky {
@@ -93,6 +99,15 @@ impl ObjectStore for Flaky {
         body: Bytes,
         retain_until: Option<SystemTime>,
     ) -> Result<(), ObjectStoreError> {
+        if self.hold_puts.load(Ordering::SeqCst) {
+            let permit = self.released.acquire().await;
+            permit
+                .map_err(|_| ObjectStoreError::Unsupported("writes, for this test"))?
+                .forget();
+        }
+        if self.fail_puts.load(Ordering::SeqCst) {
+            return Err(ObjectStoreError::Unsupported("writes, for this test"));
+        }
         self.puts.fetch_add(1, Ordering::SeqCst);
         self.inner.put_new(key, body, retain_until).await
     }
@@ -168,6 +183,9 @@ impl Rig {
             }),
             fail_reads: AtomicBool::new(false),
             puts: AtomicUsize::new(0),
+            hold_puts: AtomicBool::new(false),
+            released: tokio::sync::Semaphore::new(0),
+            fail_puts: AtomicBool::new(false),
         });
         let index: Arc<dyn PackIndex> =
             Arc::new(MemoryPackIndex::new(Arc::new(ManualClock::default())));
@@ -711,6 +729,9 @@ mod cache;
 
 #[path = "front_twice_tests.rs"]
 mod twice;
+
+#[path = "front_stored_tests.rs"]
+mod stored;
 fn props(pairs: &[(&str, &str)]) -> Platform {
     let property = |(name, value): &(&str, &str)| Property {
         name: (*name).to_owned(),

@@ -3,9 +3,11 @@
 //!
 //! - **A put directory** ([`FrontParts::put_dir`]): a run commits its objects into a directory
 //!   the frontend mints for it. The preparation ([`RunPrepare`]) mints the run's put directory
-//!   and collects its closure ([`RunPrepare::prepare_put_dir`]), and [`Ingest::mint`] writes the
-//!   action tree over the published base tree ([`TreeWriter`]) and parks its digest, which
-//!   [`Inputs::tree`] hands out once. The run it is given is the executor run's build id
+//!   and collects its closure ([`RunPrepare::prepare_put_dir`]), and [`Ingest::mint`] names the
+//!   action tree over the published base tree ([`TreeWriter::write_named`]) and parks its name,
+//!   which [`Inputs::tree`] hands out once. The tree's writes go on, on a task of their own, after
+//!   the mint answers: [`Ingest::stored`] waits for them, once for a run, and answers their
+//!   failure as the mint would have. The run it is given is the executor run's build id
 //!   ([`build_id`]), the same string the task tool is told with `--lease`. The ingest is
 //!   [`kbf_front::ingest_put_dir_with`] of the directory, over the frontend's [`Packs`] and a
 //!   [`Backend`] built over the same packs (the Action it reads to check the outputs may be a
@@ -26,11 +28,14 @@
 //!   action and a form ([`InputTree`]): the tree's name, good for
 //!   [`kbf_front::action_tree::MEMO_TTL`] on the frontend's clock, since a tree names the pack
 //!   spans and whole objects its files are held in, and the writer's own memo keeps a place for
-//!   no longer than that. A hit skips the
+//!   no longer than that. A tree is remembered once every write of it succeeded, never when it
+//!   is only named. A hit skips the
 //!   closure, the lookup of the places and every write; only the run's put directory is minted
 //!   ([`RunPrepare::mint_put_dir`]). The facts remembered are those of an action's digest, which
 //!   never expire: the Action, the Command and the platform they name are named by their
 //!   digests, so what they say cannot change. Only a read that succeeded is remembered.
+//! - **The steps of a mint are timed** into the executor's `kbf_executor_step_seconds`
+//!   ([`Front::with_metrics`]): the put directory, the closure's parts and the tree's name.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -38,18 +43,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_front::action_tree::{BaseTree, MEMO_TTL, PutRetry, TreeWriter};
 use kbf_front::prepare_run::{
-    KeptClosure, PrepareError as RunPrepError, PrepareFault, PutDirPrep, PutDirRun,
+    KeptClosure, PrepareError as RunPrepError, PrepareFault, PrepareTook, PutDirPrep, PutDirRun,
 };
 use kbf_front::{Backend, Described, IssuedPutDir, PackKeyMint, Packs};
 use kbf_proto::reapi::{self, Action, Command, Digest};
 use kbf_types::{DigestFunction, ImageRef};
 use std::sync::Arc;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::action_usage::Shape;
 use crate::executor::config::InputTree;
 use crate::executor::front_cache::Bounded;
 use crate::executor::mac::System;
+use crate::executor::metrics::Metrics;
 use crate::executor::size_class::SizeClass;
+use crate::executor::steps::Step;
 use crate::executor::task::{PackKey, RunId, build_id};
 use crate::executor::traits::{
     ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, RejectReason, UntrustedLimits,
@@ -113,6 +123,8 @@ pub struct PreparedPutDir {
     pub kept: KeptClosure,
     /// The Unix second the directory's keys stop being good for the run at.
     pub not_after: u64,
+    /// How long the parts of the closure's collection took.
+    pub took: PrepareTook,
 }
 
 /// What the frontend's run preparation gives a run whose action tree is cached
@@ -172,6 +184,7 @@ fn prepared_put_dir(run: PutDirRun) -> PreparedPutDir {
         dir: run.dir.dir().to_owned(),
         kept: run.kept,
         not_after: run.not_after,
+        took: run.took,
     }
 }
 
@@ -269,16 +282,37 @@ struct Parked {
     not_after: u64,
 }
 
+/// The writes of a run's action tree, between [`Ingest::mint`] and [`Ingest::stored`]: the task
+/// that writes the tree, which ends with the writes' answer.
+struct Pending {
+    writes: JoinHandle<Result<(), MintError>>,
+    /// When the directory's keys stop being good: the entry is dropped after, and the writes
+    /// go on with no one waiting for them.
+    not_after: u64,
+}
+
 /// The executor's seams over the frontend.
 pub struct Front {
-    parts: FrontParts,
+    packs: Packs,
+    backend: Backend,
+    mint: PackKeyMint,
+    prepare: Arc<dyn RunPrepare>,
+    base_image: ImageRef,
+    kbf_image: ImageRef,
+    /// The writer of the action trees, shared with the tasks that write them.
+    writer: Arc<TreeWriter>,
+    /// The kbf base tree every action tree is written over.
+    base: Arc<OnceLock<BaseTree>>,
     now: fn() -> SystemTime,
     parked: Mutex<BTreeMap<RunId, Parked>>,
-    /// The name of the action tree written for an action in a form, and when it stops being
+    pending: Mutex<BTreeMap<RunId, Pending>>,
+    /// The name of the action tree stored for an action in a form, and when it stops being
     /// good.
-    trees: Mutex<Trees>,
+    trees: Arc<Mutex<Trees>>,
     /// The facts of an action, by the digest of its Action.
     facts: Mutex<Bounded<(String, i64), ActionFacts>>,
+    /// Where the steps of a preparation are timed ([`Step`]).
+    metrics: Arc<Metrics>,
 }
 
 type Trees = Bounded<(kbf_types::Digest, InputTree), (String, SystemTime)>;
@@ -293,25 +327,46 @@ impl Front {
     /// As [`Front::new`], reading the time from `now`.
     #[must_use]
     pub fn with_clock(parts: FrontParts, now: fn() -> SystemTime) -> Self {
-        // The ingest judges the age of a key by the clock the keys are minted by.
-        let parts = FrontParts {
-            packs: parts.packs.with_clock(Arc::new(now)),
-            ..parts
-        };
+        let FrontParts {
+            packs,
+            backend,
+            mint,
+            prepare,
+            base_image,
+            kbf_image,
+            put_dir: PutDirParts { writer, base },
+        } = parts;
         Self {
-            parts,
+            // The ingest judges the age of a key by the clock the keys are minted by.
+            packs: packs.with_clock(Arc::new(now)),
+            backend,
+            mint,
+            prepare,
+            base_image,
+            kbf_image,
+            writer: Arc::new(writer),
+            base,
             now,
             parked: Mutex::new(BTreeMap::new()),
-            trees: Mutex::new(Bounded::new(TREE_ENTRIES)),
+            pending: Mutex::new(BTreeMap::new()),
+            trees: Arc::new(Mutex::new(Bounded::new(TREE_ENTRIES))),
             facts: Mutex::new(Bounded::new(FACTS_ENTRIES)),
+            metrics: Arc::new(Metrics::default()),
         }
+    }
+
+    /// These seams timing the steps of each preparation into `metrics`: the executor's own, so
+    /// that `GET /metrics` shows them beside the steps the executor times.
+    #[must_use]
+    pub fn with_metrics(self, metrics: Arc<Metrics>) -> Self {
+        Self { metrics, ..self }
     }
 
     /// These seams remembering at most `trees` action trees and `facts` actions' facts.
     #[cfg(test)]
     fn with_bounds(self, trees: usize, facts: usize) -> Self {
         Self {
-            trees: Mutex::new(Bounded::new(trees)),
+            trees: Arc::new(Mutex::new(Bounded::new(trees))),
             facts: Mutex::new(Bounded::new(facts)),
             ..self
         }
@@ -321,8 +376,12 @@ impl Front {
         self.parked.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn pending(&self) -> MutexGuard<'_, BTreeMap<RunId, Pending>> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn trees(&self) -> MutexGuard<'_, Trees> {
-        self.trees.lock().unwrap_or_else(PoisonError::into_inner)
+        lock_trees(&self.trees)
     }
 
     fn facts(&self) -> MutexGuard<'_, Bounded<(String, i64), ActionFacts>> {
@@ -340,19 +399,6 @@ impl Front {
         (now < expires).then_some(tree)
     }
 
-    /// Remembers `tree` as the action tree of `action` in `form`, written at `now`.
-    fn remember_tree(
-        &self,
-        action: &kbf_types::Digest,
-        form: InputTree,
-        now: SystemTime,
-        tree: &str,
-    ) {
-        let expires = now.checked_add(MEMO_TTL).unwrap_or(now);
-        self.trees()
-            .put((*action, form), (tree.to_owned(), expires));
-    }
-
     /// The message `digest` is, read from the CAS.
     async fn read<T: prost::Message + Default>(
         &self,
@@ -360,7 +406,7 @@ impl Front {
         digest: &kbf_types::Digest,
     ) -> Result<T, InputsError> {
         let bytes =
-            self.parts.backend.read_blob(digest).await.map_err(|e| {
+            self.backend.read_blob(digest).await.map_err(|e| {
                 InputsError::Unavailable(format!("the {what} could not be read: {e}"))
             })?;
         T::decode(bytes)
@@ -395,6 +441,14 @@ impl Ingest for Front {
         self.mint_put_dir(run, &action, (now, wall), tree).await
     }
 
+    async fn stored(&self, run: RunId) -> Result<(), MintError> {
+        let pending = self.pending().remove(&run);
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        pending.writes.await.unwrap_or_else(|_| Err(broke()))
+    }
+
     async fn ingest(
         &self,
         run: RunId,
@@ -419,8 +473,8 @@ impl Ingest for Front {
             object_bytes_per_entry: limits.object_bytes_per_entry,
             ..kbf_front::UntrustedLimits::default()
         };
-        let (packs, backend, mint) = (&self.parts.packs, &self.parts.backend, &self.parts.mint);
-        let writer = Some(&self.parts.put_dir.writer);
+        let (packs, backend, mint) = (&self.packs, &self.backend, &self.mint);
+        let writer = Some(&*self.writer);
         let ingest = kbf_front::ingest_put_dir_with;
         let build = build_id(run);
         let done = ingest(packs, backend, mint, &build, &dir, &action, &limits, writer).await;
@@ -450,10 +504,11 @@ fn lasts(not_after: u64, now: SystemTime, wall: Duration) -> Result<(), MintErro
 }
 
 impl Front {
-    /// [`Ingest::mint`]: the put directory of the run, and the action tree written over the base
-    /// tree as `form` says (its manifests, or its tree list) and parked for [`Inputs::tree`].
-    /// An action tree remembered for the action in this form is not written again: only the
-    /// directory is minted.
+    /// [`Ingest::mint`]: the put directory of the run, and the action tree over the base tree as
+    /// `form` says (its manifests, or its tree list), named and parked for [`Inputs::tree`]; the
+    /// tree's writes go on after the mint answers, parked for [`Ingest::stored`]. An action tree
+    /// remembered for the action in this form is not written again: only the directory is
+    /// minted.
     async fn mint_put_dir(
         &self,
         run: RunId,
@@ -461,54 +516,126 @@ impl Front {
         (now, wall): (SystemTime, Duration),
         form: InputTree,
     ) -> Result<PackKey, MintError> {
-        let put_dir = &self.parts.put_dir;
         // Before anything is read or minted: without the base no tree can be written.
-        let Some(base) = put_dir.base.get() else {
+        if self.base.get().is_none() {
             return Err(MintError::Unavailable(
                 "the kbf base tree is not published: no action tree can be written".to_owned(),
             ));
-        };
+        }
         let build = build_id(run);
-        let prepare = &self.parts.prepare;
-        let (dir, not_after, tree) = match self.remembered_tree(action, form, now) {
+        let prepare = &self.prepare;
+        let started = Instant::now();
+        let (dir, not_after, tree, writes) = match self.remembered_tree(action, form, now) {
             Some(tree) => {
                 let minted = prepare.mint_put_dir(&build, action, now, wall).await;
+                self.metrics.step_took(Step::PutDir, started.elapsed());
                 let minted = minted.map_err(MintError::from)?;
                 lasts(minted.not_after, now, wall)?;
-                (minted.dir, minted.not_after, tree)
+                (minted.dir, minted.not_after, tree, None)
             }
             None => {
                 let prepared = prepare.prepare_put_dir(&build, action, now, wall).await;
+                self.metrics.step_took(Step::PutDir, started.elapsed());
                 let prepared = prepared.map_err(MintError::from)?;
+                let took = &prepared.took;
+                for (step, took) in [
+                    (Step::Action, took.action),
+                    (Step::Walk, took.walk),
+                    (Step::Held, took.held),
+                ] {
+                    self.metrics.step_took(step, took);
+                }
                 lasts(prepared.not_after, now, wall)?;
-                let tree = write_tree(put_dir, base, &prepared.kept, form).await?;
-                self.remember_tree(action, form, now, &tree);
-                (prepared.dir, prepared.not_after, tree)
+                let (tree, writes) = self.write_tree(prepared.kept, *action, form, now).await?;
+                (prepared.dir, prepared.not_after, tree, Some(writes))
             }
         };
+        let live = |held: u64| held >= seconds(now);
         let mut parked = self.parked();
-        parked.retain(|_, run| run.not_after >= seconds(now));
+        parked.retain(|_, run| live(run.not_after));
         parked.insert(run, Parked { tree, not_after });
+        drop(parked);
+        let mut pending = self.pending();
+        pending.retain(|_, run| live(run.not_after));
+        if let Some(writes) = writes {
+            pending.insert(run, Pending { writes, not_after });
+        }
         Ok(PackKey::new(dir))
+    }
+
+    /// The action tree of `kept`, the closure of `action`, written over the base tree as `form`
+    /// says at `now`: its name (its root manifest's digest in hex, or its tree list's key), as
+    /// soon as the writer has it, and the task that writes it. The task remembers the tree for
+    /// the action once every write of it succeeded, never before. A tree the writer refuses, or
+    /// whose lookups fail, has no name: the answer is the writer's.
+    async fn write_tree(
+        &self,
+        kept: KeptClosure,
+        action: kbf_types::Digest,
+        form: InputTree,
+        now: SystemTime,
+    ) -> Result<(String, JoinHandle<Result<(), MintError>>), MintError> {
+        let started = Instant::now();
+        let (writer, base, trees) = (
+            Arc::clone(&self.writer),
+            Arc::clone(&self.base),
+            Arc::clone(&self.trees),
+        );
+        let (named, name) = oneshot::channel::<String>();
+        let writes = tokio::spawn(async move {
+            let tree = write_named(&writer, &base, &kept, form, named).await?;
+            let expires = now.checked_add(MEMO_TTL).unwrap_or(now);
+            lock_trees(&trees).put((action, form), (tree, expires));
+            Ok(())
+        });
+        let Ok(tree) = name.await else {
+            // The task ended before it named the tree: its answer is why.
+            return Err(match writes.await {
+                Ok(Err(why)) => why,
+                Ok(Ok(())) | Err(_) => broke(),
+            });
+        };
+        self.metrics.step_took(Step::Tree, started.elapsed());
+        Ok((tree, writes))
     }
 }
 
-/// The action tree of `kept` written over `base` as `form` says: its root manifest's digest in
-/// hex, or its tree list's key.
-async fn write_tree(
-    put_dir: &PutDirParts,
-    base: &BaseTree,
+/// The trees remembered behind `trees`' lock.
+fn lock_trees(trees: &Mutex<Trees>) -> MutexGuard<'_, Trees> {
+    trees.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The answer for a task writing an action tree that ended with no answer of its own.
+fn broke() -> MintError {
+    MintError::Unavailable("the task writing the action tree ended without an answer".to_owned())
+}
+
+/// Writes the action tree of `kept` over the base tree `base` holds as `form` says, and sends
+/// its name (its root manifest's digest in hex, or its tree list's key) to `named` as soon as
+/// the writer has it, before any write. Returns the name once every write succeeded.
+async fn write_named(
+    writer: &TreeWriter,
+    base: &OnceLock<BaseTree>,
     kept: &KeptClosure,
     form: InputTree,
+    named: oneshot::Sender<String>,
 ) -> Result<String, MintError> {
-    let writer = &put_dir.writer;
+    // The mint checked the base before it collected the closure, and a base once set stays.
+    let Some(base) = base.get() else {
+        return Err(broke());
+    };
+    let name = |tree: String| {
+        let _ = named.send(tree);
+    };
     let tree = match form {
-        InputTree::Manifests => {
-            (writer.write(kept, base).await).map(|tree| tree.digest().to_string())
-        }
-        InputTree::Provider => {
-            (writer.write_listing(kept, base).await).map(|listing| listing.key().to_owned())
-        }
+        InputTree::Manifests => (writer
+            .write_named(kept, base, |tree| name(tree.digest().to_string()))
+            .await)
+            .map(|tree| tree.digest().to_string()),
+        InputTree::Provider => (writer
+            .write_listing_named(kept, base, |listing| name(listing.key().to_owned()))
+            .await)
+            .map(|listing| listing.key().to_owned()),
     };
     tree.map_err(|no| {
         let why = format!("no action tree: {no}");
@@ -570,14 +697,14 @@ impl Front {
         let command = cas_digest(command).map_err(InputsError::Invalid)?;
         let command: Command = self.read("command", &command).await?;
         let platform = platform_of(&action, &command);
-        check_base(platform, &self.parts.base_image, &self.parts.kbf_image)?;
+        check_base(platform, &self.base_image, &self.kbf_image)?;
         let timeout = timeout_of(&action)?;
         let system = System::of(platform).map_err(InputsError::Invalid)?;
         // The target and kind of the action, read from its argv and output paths.
         let described = Described::of(command);
         let shape = Shape::of(&described.arguments, &described.outputs);
         Ok(ActionFacts {
-            image: self.parts.kbf_image.to_string(),
+            image: self.kbf_image.to_string(),
             timeout,
             system,
             size_class: SizeClass::of_action(&shape),

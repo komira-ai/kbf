@@ -3,7 +3,7 @@
 Status: **DESIGN, for the owner's review (2026-11-15), revised after review round 1 (section 13). Nothing is built; this pull request adds this file and one pointer line.**
 
 **Superseded** by jobscheduler's mount providers (komira-ai/jobscheduler#896): the frontend no longer calls the
-host's tierstore after reading the job. It writes the action tree as one tierstore tree list before it submits, and
+host's tierstore after reading the job. It names the action tree, one tierstore tree list, before it submits and writes it beside the submit, and
 the job's layer names tierstore's mount provider, which the host's agent asks for the tree as soon as the job is
 assigned. What kbf builds is [actions-as-jobs.md](actions-as-jobs.md), 4.7; the rest of this file is kept as the
 record of the problem (sections 2 and 3).

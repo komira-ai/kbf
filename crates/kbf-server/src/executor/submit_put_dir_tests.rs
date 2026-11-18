@@ -8,6 +8,7 @@ use kbf_proto::reapi::Digest;
 
 use super::tests::{Harness, RUN, built_class};
 use super::{Booking, FRONTEND_LABEL, INSTANCE_LABEL, Preparer, Settled, job_id, prepare};
+use crate::executor::metrics::Metrics;
 use crate::executor::out::provider_layer;
 use crate::executor::traits::InputsError;
 use crate::executor::{
@@ -144,6 +145,7 @@ async fn prepared_as(case: Case) -> (Result<super::Prepared, Settled>, Vec<Input
     let inputs = case.inputs.unwrap_or_else(|| Arc::clone(&harness.inputs));
     let ingest_dyn: Arc<dyn Ingest> = Arc::clone(&ingest) as Arc<dyn Ingest>;
     let ctx = Preparer {
+        metrics: &Metrics::default(),
         inputs: &inputs,
         ingest: &ingest_dyn,
         ..harness.preparer()

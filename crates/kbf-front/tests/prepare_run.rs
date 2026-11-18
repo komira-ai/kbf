@@ -37,6 +37,8 @@ mod put_dir;
 mod put_dir_only;
 #[path = "prepare_run/start.rs"]
 mod start;
+#[path = "prepare_run/took.rs"]
+mod took;
 
 const LEASE: &str = "00000000000000010000000000000002";
 const MINT_SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";

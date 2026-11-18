@@ -58,8 +58,10 @@
 //! (`--executor-input-tree provider`).
 //!
 //! The executor's runs that commit into a put directory call it (`--task-out-mode put-dir`),
-//! each run's action tree written over the published base tree before the job is submitted, as
-//! manifests or as a tree list.
+//! each run's action tree written over the published base tree, as manifests or as a tree list.
+//! A tree's name is a digest of what it holds, known before anything is written:
+//! [`TreeWriter::write_named`] and [`TreeWriter::write_listing_named`] hand it out then, so the
+//! executor submits the job while the tree's writes go on.
 
 mod base;
 mod encode;
@@ -363,6 +365,27 @@ impl TreeWriter {
     /// manifests written before a failure stay: each is content-bound, and nothing names them
     /// until a tree is returned.
     pub async fn write(&self, kept: &KeptClosure, base: &BaseTree) -> Result<ActionTree, NoTree> {
+        self.write_named(kept, base, |_| ()).await
+    }
+
+    /// As [`TreeWriter::write`], and calls `named` with the tree's name as soon as it is known:
+    /// after the blobs are located and every manifest is built and checked, before the first
+    /// blob or manifest is written. A tree that is refused, or whose lookups fail, is never
+    /// named. A name handed to `named` is not yet a stored tree: the writes that follow it may
+    /// still fail, and only the tree this returns is in the store. The writes keep their order,
+    /// blobs first and the root last, so a reader that finds the root finds every manifest and
+    /// blob below it.
+    ///
+    /// # Errors
+    /// As [`TreeWriter::write`], except that a write that fails after `named` ran leaves the
+    /// name handed out for a tree that is not in the store; the blobs and manifests written
+    /// before it stay.
+    pub async fn write_named(
+        &self,
+        kept: &KeptClosure,
+        base: &BaseTree,
+        named: impl FnOnce(&ActionTree) + Send,
+    ) -> Result<ActionTree, NoTree> {
         reserved_input(kept)?;
         let now = (self.clock)();
         let plan = self.plan(kept, now)?;
@@ -417,6 +440,8 @@ impl TreeWriter {
         children.push(encode::dir(INPUT_ROOT, &manifests[kept.root()]));
         children.push(encode::dir(".kbf", &kbf.digest));
         let root = top(children)?;
+        let tree = ActionTree { digest: root.tree };
+        named(&tree);
         self.write_whole(unlocated, now).await?;
         self.store_built(&plan, &built, &measures, &manifests)
             .await?;
@@ -427,7 +452,7 @@ impl TreeWriter {
         flights
             .write(&self.store, &self.retry, root.digest, root.bytes)
             .await?;
-        Ok(ActionTree { digest: root.tree })
+        Ok(tree)
     }
 
     /// Publishes the tierstore manifests of an output directory a task wrote, from the facts of

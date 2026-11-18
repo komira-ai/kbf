@@ -91,10 +91,12 @@ level **[built here]**:
 2. reads only the Directories without a row from their packs (`Backend::read_blob`: index lookup, ranged GET, SHA-256
    check), 16 at a time;
 3. records those as rows (`Backend::record_directories`), so the next walk of the same tree, on any frontend over the
-   same database, reads none of them from the object store.
+   same database, reads none of them from the object store. The rows of the whole walk are recorded once, after it
+   ends, by a task the preparation does not wait for; the record is skipped, and counted, when the bound on such
+   tasks (`DETACHED_WRITES`) has no room, and the next walk then reads those Directories from their packs again.
 
 The rows never decide the answer. A failed read of the rows is logged and the level is read from the blobs; a failed
-record is logged and the walk goes on; an index that keeps no rows answers every digest as having none. A row whose
+record is logged; an index that keeps no rows answers every digest as having none. A row whose
 bytes do not decode is refused as its blob would be (`tests/stored/directories.rs`).
 
 The order today is rows, then blobs (with the packs' optional on-disk `ReadCache` beneath the blob read). A local
