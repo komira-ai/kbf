@@ -7,15 +7,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kbf_auth::Authorizers;
-use kbf_front::{Backend, PackSettings, Stored};
+use kbf_front::{Backend, PackSettings, Packs, Stored};
 use kbf_pack::{PackKeys, WriterKind};
 use kbf_pack_index::action::{ActionEntry, ActionPut, ActionStore};
 use kbf_pack_index::directory::NewDirectory;
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_pack_index::{
-    BlobDigest, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
+    BlobDigest, Forgot, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
 };
-use kbf_state::ManualClock;
+use kbf_state::{Clock as _, ManualClock};
 use kbf_types::Digest;
 use tonic::transport::Channel;
 
@@ -48,9 +48,10 @@ pub struct Index {
 }
 
 impl Index {
-    pub fn new() -> Self {
+    /// An index that reads the time from `clock`.
+    pub fn new(clock: Arc<ManualClock>) -> Self {
         Self {
-            inner: MemoryPackIndex::new(Arc::new(ManualClock::default())),
+            inner: MemoryPackIndex::new(clock),
             fail_record: AtomicU32::new(0),
             fail_find: AtomicU32::new(0),
             fail_locate: AtomicU32::new(0),
@@ -180,11 +181,11 @@ impl PackIndex for Index {
         self.inner.drop_location(digest, pack_key)
     }
 
-    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
+    fn forget_pack(&self, pack_key: &str, min_age: Duration) -> Result<Forgot, PackIndexError> {
         if fires(&self.fail_forget) {
             return Err(PackIndexError::NotMigrated);
         }
-        self.inner.forget_pack(pack_key)
+        self.inner.forget_pack(pack_key, min_age)
     }
 
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {
@@ -256,10 +257,11 @@ pub fn index_form(digest: &Digest) -> BlobDigest {
 /// The most a blob may be and still be packed in these tests: a blob of more is a large one.
 pub const SMALL: u64 = 1024;
 
-/// A frontend with no storage node.
+/// A frontend with no storage node. The index and the packs read one manual clock.
 pub struct Rig {
     pub store: Arc<Spy>,
     pub index: Arc<Index>,
+    pub clock: Arc<ManualClock>,
     pub stored: Arc<Stored>,
     pub backend: Backend,
     /// The frontend, as a client sees it.
@@ -284,20 +286,31 @@ impl Rig {
     /// Packs as `settings` say, over `store`, every call authorized by `authorizers`.
     pub async fn over(store: Spy, settings: PackSettings, authorizers: Authorizers) -> Self {
         let store = Arc::new(store);
-        let index = Arc::new(Index::new());
+        let clock = Arc::new(ManualClock::default());
+        let index = Arc::new(Index::new(Arc::clone(&clock)));
         let keys = PackKeys::new(WriterKind::Frontend, "fe1", "boot1").expect("keys");
         let actions: Arc<dyn ActionStore> = index.clone();
-        let stored = Stored::new(Arc::clone(&store), actions, keys, settings).expect("stored");
-        let stored = Arc::new(stored);
+        let packs = Packs::new(Arc::clone(&store), index.clone(), keys, settings).expect("packs");
+        let read = Arc::clone(&clock);
+        let packs = packs.with_clock(Arc::new(move || {
+            std::time::SystemTime::UNIX_EPOCH + read.now().as_duration()
+        }));
+        let stored = Arc::new(Stored::over(packs, actions));
         let front = harness::serve(stored.routes(&Arc::new(authorizers))).await;
         let backend = Backend::stored(Arc::clone(&stored));
         Self {
             store,
             index,
+            clock,
             stored,
             backend,
             front,
         }
+    }
+
+    /// Moves the clock of the index and the packs on by `by`.
+    pub fn wait(&self, by: Duration) {
+        self.clock.advance(by);
     }
 }
 

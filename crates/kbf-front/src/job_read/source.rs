@@ -58,9 +58,10 @@ pub trait BlobSource: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
-    /// Forgets the pack `key` in the pack index if the store does not have it whole up to `end`
-    /// bytes, after asking the store for its length; whether it was forgotten. The default has
-    /// no packs, so it forgets nothing.
+    /// Asks the store for the length of the pack `key`, and when it does not have it whole up to
+    /// `end` bytes, takes that for an absence of it, which the packs' loss guard has the pack
+    /// index forget once a second look some time after the first confirms it; whether the pack
+    /// was forgotten. The default has no packs, so it forgets nothing.
     fn forget_lost<'a>(
         &'a self,
         key: &'a str,

@@ -19,7 +19,8 @@ pub(super) const TOOK: PrepareTook = PrepareTook {
 };
 
 /// A preparation that makes put directories with the real mint and the real closure over the
-/// rig's CAS, or refuses as told, and counts what it was asked for.
+/// rig's CAS, its failures answered as the frontend's preparation answers them, or refuses as
+/// told, and counts what it was asked for.
 pub(super) struct DirPrep {
     backend: OnceLock<Backend>,
     refuse: Option<PrepareError>,
@@ -92,7 +93,8 @@ impl RunPrepare for DirPrep {
         }
         let backend = self.backend.get().expect("the rig set the backend");
         let kept = collect_closure_keeping(backend, action, ClosureLimits::DEFAULT).await;
-        let kept = kept.map_err(|e| PrepareError::Unavailable(e.to_string()))?;
+        // As the frontend's preparation answers: a blob missing is the client's to upload again.
+        let kept = kept.map_err(|e| prepare_error(RunPrepError::Closure(e)))?;
         let mint = PackKeyMint::new(SECRET).expect("a mint");
         let dir = mint.mint_put_dir(lease, action, now).expect("a dir");
         Ok(PreparedPutDir {

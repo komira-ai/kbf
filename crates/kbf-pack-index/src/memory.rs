@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::conformance::PackBackend;
 use crate::directory::NewDirectory;
 use crate::{
-    BlobDigest, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
+    BlobDigest, Forgot, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
     check_batch, count, micros, micros_of,
 };
 use kbf_state::{Clock, ManualClock};
@@ -228,13 +228,22 @@ impl PackIndex for MemoryPackIndex {
         Ok(true)
     }
 
-    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
+    fn forget_pack(&self, pack_key: &str, min_age: Duration) -> Result<Forgot, PackIndexError> {
+        let cutoff = micros_of(self.clock.now()).saturating_sub(micros(min_age));
         let mut guard = self.lock();
         let state = &mut *guard;
+        let Some(pack) = state.packs.get(pack_key) else {
+            return Ok(Forgot::NotRecorded);
+        };
+        if pack.info.created_us > cutoff {
+            return Ok(Forgot::Young);
+        }
         let before = state.blobs.len();
         state.blobs.retain(|_, row| row.pack != pack_key);
         state.packs.remove(pack_key);
-        Ok(before - state.blobs.len())
+        Ok(Forgot::Forgotten {
+            rows: before - state.blobs.len(),
+        })
     }
 
     fn directories(&self, digests: &[BlobDigest]) -> Result<Vec<Option<Vec<u8>>>, PackIndexError> {

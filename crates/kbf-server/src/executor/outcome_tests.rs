@@ -11,6 +11,7 @@ use prost::Message;
 use tonic::Code;
 
 use super::{OUT_OF_MEMORY_REASON, RESUBMITS, Settled, Verdict, forgotten, judge, refused};
+use crate::executor::LostObject;
 
 /// What a test's log holds, as text.
 #[derive(Clone, Default)]
@@ -675,7 +676,7 @@ fn a_start_that_failed_on_a_lost_object_is_infra_whatever_its_code() {
         let Verdict::StoreLost { object, settled } = verdict else {
             panic!("{code:?}: not a lost object: {verdict:?}");
         };
-        assert_eq!(object, lost_sha(), "{code:?}");
+        assert_eq!(object, LostObject::Manifest(lost_sha()), "{code:?}");
         assert!(settled.retried(), "{code:?}");
         let status = settled.status();
         assert_eq!(status.code, Code::Unavailable as i32, "{code:?}");
@@ -726,6 +727,99 @@ fn only_a_whole_sha256_right_before_upstream_404_names_a_lost_object() {
     ] {
         assert_eq!(found(&detail), None, "{detail}");
     }
+}
+
+/// Catches a missing source of a job's tree (tierstore's `404 source missing: <key>`) judged by
+/// the start's code alone: whatever the code, it is `infra` (run again) with the key named for
+/// the frontend, the fixed phrase for the callers, and a manifest's SHA-256 in the same detail
+/// taking precedence.
+#[test]
+fn a_start_that_failed_on_a_missing_source_is_infra_naming_its_key() {
+    let key = "cas/f/fe1/boot1/00000000000000a3";
+    let detail = format!("tree create failed: 404 source missing: {key} (path /bin/cc)");
+    for code in [
+        StartFailureCode::InputUnavailable,
+        StartFailureCode::Unspecified,
+    ] {
+        let verdict = judge(
+            &job(JobState::FailedToStart, code, &detail),
+            &JobResult::default(),
+        );
+        let Verdict::StoreLost { object, settled } = verdict else {
+            panic!("{code:?}: not a lost object: {verdict:?}");
+        };
+        assert_eq!(object, LostObject::Source(key.to_owned()), "{code:?}");
+        assert!(settled.retried(), "{code:?}");
+        assert_eq!(
+            settled.status().message,
+            "the job failed to start: the store does not have an object of its tree"
+        );
+    }
+    let both = format!("source missing: {key}; cannot fetch manifest {LOST_HEX}: upstream 404");
+    assert_eq!(
+        super::lost_of(&both),
+        Some(LostObject::Manifest(lost_sha()))
+    );
+}
+
+/// Catches a detail read for more than a missing source's key, or for a key that is none of
+/// kbf's: only the run of key characters right after `source missing: ` counts, when it starts
+/// `cas/`, names something under it and is at most 1024 bytes; it ends at the first other
+/// character; a first mention that does not qualify is passed over for a later one; and anything
+/// else is no source.
+#[test]
+fn only_a_cas_key_right_after_source_missing_names_a_missing_source() {
+    use super::source_missing;
+    let key = "cas/b/build-1/n0nce_x.y";
+    assert_eq!(
+        source_missing(&format!("source missing: {key}")),
+        Some(key.to_owned())
+    );
+    assert_eq!(
+        source_missing(&format!("404 source missing: {key} at /bin/cc")),
+        Some(key.to_owned())
+    );
+    assert_eq!(
+        source_missing(&format!("source missing: {key}?sig=MARKER")),
+        Some(key.to_owned())
+    );
+    assert_eq!(
+        source_missing(&format!("source missing: /tmp/x; source missing: {key}")),
+        Some(key.to_owned())
+    );
+    let longest = format!("cas/{}", "a".repeat(1020));
+    assert_eq!(
+        source_missing(&format!("source missing: {longest}")),
+        Some(longest.clone())
+    );
+    for detail in [
+        String::new(),
+        "source missing".to_owned(),
+        "source missing: ".to_owned(),
+        "source missing: cas/".to_owned(),
+        "source missing: cas".to_owned(),
+        "source missing: other/b/x".to_owned(),
+        "source missing:cas/b/x".to_owned(),
+        "Source missing: cas/b/x".to_owned(),
+        format!("source missing: {longest}a"),
+        "source missing: é/cas/b/x".to_owned(),
+        "upstream 404".to_owned(),
+    ] {
+        assert_eq!(source_missing(&detail), None, "{detail}");
+    }
+}
+
+/// Catches a host's detail text reaching the log through a missing source: the log holds the
+/// key and the detail's length, never the rest of the detail.
+#[test]
+fn a_missing_source_reaches_the_log_as_its_key_only() {
+    let detail = "--pack-url https://store/key?sig=MARKER-SECRET source missing: cas/b/k1/n1";
+    let log = Log::default();
+    let verdict = log.capture(|| judge(&refused_to_start(detail), &JobResult::default()));
+    assert!(matches!(verdict, Verdict::StoreLost { .. }), "{verdict:?}");
+    let text = log.text();
+    assert!(text.contains("cas/b/k1/n1"), "{text}");
+    assert!(!text.contains("MARKER-SECRET"), "{text}");
 }
 
 /// Catches a host's detail text reaching the log or the answer through a lost object: the log

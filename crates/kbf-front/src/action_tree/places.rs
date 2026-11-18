@@ -83,6 +83,20 @@ impl Places {
         }
     }
 
+    /// Drops every entry that places a blob in the pack `key`. Returns how many it dropped.
+    pub(super) fn forget_pack(&mut self, key: &str) -> usize {
+        let before = self.entries.len();
+        let order = &mut self.order;
+        self.entries.retain(|_, (place, _, at)| {
+            let named = matches!(place, Place::Packed { key: pack, .. } if pack == key);
+            if named {
+                order.remove(at);
+            }
+            !named
+        });
+        before - self.entries.len()
+    }
+
     /// Drops every entry.
     pub(super) fn clear(&mut self) {
         self.entries.clear();

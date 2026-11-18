@@ -74,6 +74,44 @@ async fn a_lost_manifest_drops_its_memo_entry_and_those_above_it() {
     );
 }
 
+/// Catches: a pack a job found absent whose memo entries are still hits (the manifest that names a
+/// span of it, and the one above), or whose places are still remembered, so the next tree names
+/// it again without asking the index; or other entries or places dropped with them. A pack no
+/// memo names drops nothing and says so.
+#[tokio::test]
+async fn an_absent_pack_drops_the_memo_entries_and_places_that_name_it() {
+    let rig = Rig::new().await;
+    let gone = rig.farm.packed("gone!", "cas/f/w/p0", 0).await;
+    let kept = rig.farm.packed("kept!", "cas/f/w/p1", 0).await;
+    let sub = rig
+        .store(&directory(
+            vec![file("a", &gone, false), file("b", &kept, false)],
+            vec![],
+            vec![],
+        ))
+        .await;
+    let root = holding(&rig, "r", &sub).await;
+    let other = link_root(&rig, "other").await;
+    rig.write(&root).await.expect("a tree");
+    rig.write(&other).await.expect("a tree");
+
+    assert!(!rig.writer.lost_pack("cas/f/w/none"), "no entry names it");
+    assert!(rig.writer.lost_pack("cas/f/w/p0"));
+    assert!(!rig.writer.lost_pack("cas/f/w/p0"), "dropped already");
+    rig.farm.clear_records();
+    rig.write(&root).await.expect("a tree");
+    rig.write(&other).await.expect("a tree");
+
+    let asked = rig.farm.asked();
+    assert!(asked.contains(&gone), "its blob is looked up again");
+    assert!(!asked.contains(&kept), "a place in another pack is kept");
+    assert_eq!(
+        rig.farm.puts_of(&link_manifest("other")),
+        0,
+        "another root's entry is kept"
+    );
+}
+
 /// Catches: a checked write that takes a memo hit or a remembered place, or names a pack it did
 /// not ask the store after: every manifest is written again, every blob looked up, and every pack
 /// the tree names asked after once, with the end of the furthest blob in it.

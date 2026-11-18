@@ -10,12 +10,15 @@ use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
-use kbf_pack::{Blob, PackKeys, Packed, Packer, PackerConfig, Reader, ReaderConfig, WriterKind};
+use kbf_pack::{
+    Blob, LossClock, LossGuard, LossRules, PackKeys, Packed, Packer, PackerConfig, Reader,
+    ReaderConfig, WriterKind,
+};
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_pack_index::{
-    BlobDigest, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
+    BlobDigest, Forgot, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
 };
-use kbf_state::ManualClock;
+use kbf_state::{Clock as _, ManualClock};
 
 /// Counts an armed failure down; true while one is left.
 fn fires(armed: &AtomicU32) -> bool {
@@ -31,6 +34,11 @@ fn injected() -> ObjectStoreError {
         code: "SlowDown".to_owned(),
         message: "injected".to_owned(),
     }
+}
+
+/// A request that did not complete: the connection was reset, or the request timed out.
+fn cut(kind: std::io::ErrorKind) -> ObjectStoreError {
+    ObjectStoreError::Transport(Arc::new(std::io::Error::from(kind)))
 }
 
 fn note<T>(log: &Mutex<Vec<T>>, entry: T) {
@@ -60,6 +68,9 @@ pub struct FaultyStore {
     garble_gets: AtomicU32,
     lose_gets: AtomicU32,
     fail_lens: AtomicU32,
+    reset_gets: AtomicU32,
+    time_out_lens: AtomicU32,
+    lose_lens: AtomicU32,
     vanishing: Mutex<Option<String>>,
     ranges: Mutex<Vec<(String, u64, u64)>>,
     lens: Mutex<Vec<String>>,
@@ -94,6 +105,9 @@ impl FaultyStore {
             garble_gets: AtomicU32::new(0),
             lose_gets: AtomicU32::new(0),
             fail_lens: AtomicU32::new(0),
+            reset_gets: AtomicU32::new(0),
+            time_out_lens: AtomicU32::new(0),
+            lose_lens: AtomicU32::new(0),
             vanishing: Mutex::new(None),
             ranges: Mutex::new(Vec::new()),
             lens: Mutex::new(Vec::new()),
@@ -115,6 +129,22 @@ impl FaultyStore {
     /// The next `n` questions of an object's length fail.
     pub fn fail_lens(&self, n: u32) {
         self.fail_lens.store(n, Ordering::SeqCst);
+    }
+
+    /// The next `n` reads have their connection reset.
+    pub fn reset_gets(&self, n: u32) {
+        self.reset_gets.store(n, Ordering::SeqCst);
+    }
+
+    /// The next `n` questions of an object's length time out.
+    pub fn time_out_lens(&self, n: u32) {
+        self.time_out_lens.store(n, Ordering::SeqCst);
+    }
+
+    /// The next `n` questions of an object's length answer that it is not there, whatever the
+    /// store holds: a replica that is down answers for one that holds it.
+    pub fn lose_lens(&self, n: u32) {
+        self.lose_lens.store(n, Ordering::SeqCst);
     }
 
     /// The key of every object whose length was asked, in order.
@@ -246,6 +276,9 @@ impl ObjectStore for FaultyStore {
         if !passes && fires(&self.fail_gets) {
             return Err(injected());
         }
+        if fires(&self.reset_gets) {
+            return Err(cut(std::io::ErrorKind::ConnectionReset));
+        }
         let doomed = self
             .vanishing
             .lock()
@@ -276,6 +309,12 @@ impl ObjectStore for FaultyStore {
         note(&self.lens, key.to_string());
         if fires(&self.fail_lens) {
             return Err(injected());
+        }
+        if fires(&self.time_out_lens) {
+            return Err(cut(std::io::ErrorKind::TimedOut));
+        }
+        if fires(&self.lose_lens) {
+            return Ok(None);
         }
         self.inner.len(key).await
     }
@@ -331,9 +370,9 @@ pub struct FlakyIndex {
 }
 
 impl FlakyIndex {
-    pub fn over(store: Arc<FaultyStore>) -> Self {
+    pub fn over(store: Arc<FaultyStore>, clock: Arc<ManualClock>) -> Self {
         Self {
-            inner: MemoryPackIndex::new(Arc::new(ManualClock::default())),
+            inner: MemoryPackIndex::new(clock),
             store,
             fail_record: AtomicU32::new(0),
             refuse_record: AtomicU32::new(0),
@@ -483,18 +522,20 @@ impl PackIndex for FlakyIndex {
         self.inner.drop_location(digest, pack_key)
     }
 
-    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
+    fn forget_pack(&self, pack_key: &str, min_age: Duration) -> Result<Forgot, PackIndexError> {
         if fires(&self.fail_forget) {
             return Err(PackIndexError::NotMigrated);
         }
-        self.inner.forget_pack(pack_key)
+        self.inner.forget_pack(pack_key, min_age)
     }
 }
 
-/// A store and an index, and the packers and readers over them.
+/// A store and an index, and the packers and readers over them; the index's clock is the clock
+/// of the readers' loss guards too.
 pub struct Rig {
     pub store: Arc<FaultyStore>,
     pub index: Arc<FlakyIndex>,
+    pub clock: Arc<ManualClock>,
 }
 
 impl Default for Rig {
@@ -506,8 +547,24 @@ impl Default for Rig {
 impl Rig {
     pub fn new() -> Self {
         let store = Arc::new(FaultyStore::empty());
-        let index = Arc::new(FlakyIndex::over(Arc::clone(&store)));
-        Self { store, index }
+        let clock = Arc::new(ManualClock::default());
+        let index = Arc::new(FlakyIndex::over(Arc::clone(&store), Arc::clone(&clock)));
+        Self {
+            store,
+            index,
+            clock,
+        }
+    }
+
+    /// Moves the clock of the index and the loss guards on by `by`.
+    pub fn wait(&self, by: Duration) {
+        self.clock.advance(by);
+    }
+
+    /// The clock of the index as a loss guard reads it.
+    pub fn loss_clock(&self) -> LossClock {
+        let clock = Arc::clone(&self.clock);
+        Arc::new(move || SystemTime::UNIX_EPOCH + clock.now().as_duration())
     }
 
     pub fn packer(&self, config: PackerConfig) -> Packer<FaultyStore> {
@@ -522,7 +579,8 @@ impl Rig {
         config: ReaderConfig,
     ) -> Reader<FaultyStore> {
         let index: Arc<dyn PackIndex> = self.index.clone();
-        Reader::new(Arc::clone(&self.store), index, cache, config)
+        let loss = LossGuard::new(LossRules::default(), self.loss_clock());
+        Reader::new(Arc::clone(&self.store), index, cache, config).with_loss_guard(Arc::new(loss))
     }
 }
 

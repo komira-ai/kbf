@@ -67,7 +67,9 @@ async fn a_lost_object_of_an_actions_tree_has_its_next_tree_written_checked_once
     mint_tree(&rig, &action).await.expect("remembered");
     assert_eq!((prepare.prepared(), prepare.minted()), (1, 1));
 
-    rig.front.lost(&action, &sha(&tree)).await;
+    rig.front
+        .lost(&action, &LostObject::Manifest(sha(&tree)))
+        .await;
     let again = mint_tree(&rig, &action).await.expect("written again");
     let after = mint_tree(&rig, &action).await.expect("remembered again");
 
@@ -77,20 +79,15 @@ async fn a_lost_object_of_an_actions_tree_has_its_next_tree_written_checked_once
     assert_eq!(runs.load(Ordering::SeqCst), 0, "not the base's");
 }
 
-/// Asserts that a checked tree over a pack the store lost answers the run's inputs missing,
-/// naming the blob, and has the pack index forget it (FindMissingBlobs then reports it), and that
-/// the action stays checked until a checked tree is written: once the blob is uploaded again, the
-/// next mint writes its tree and the one after uses it.
-#[tokio::test]
-async fn a_checked_tree_over_a_lost_pack_answers_its_blob_missing_until_it_is_uploaded() {
-    let rig = super::put_dir::rig();
-    let bytes = Bytes::from_static(b"an input held in a pack");
+/// The action, the blob, the key of the pack it is in, and the input root.
+type OverPacked = (Digest, kbf_types::Digest, String, kbf_types::Digest);
+
+/// An action whose input root holds one file, `bytes`, packed by the frontend's packs.
+async fn action_over_packed(rig: &Rig, bytes: &'static [u8]) -> OverPacked {
+    let bytes = Bytes::from_static(bytes);
     let blob = kbf_segments::sha256(&bytes);
     let packs = rig.front.packs.clone();
-    packs
-        .put(vec![(blob, bytes.clone())])
-        .await
-        .expect("packed");
+    packs.put(vec![(blob, bytes)]).await.expect("packed");
     let root = rig
         .store(&Directory {
             files: vec![FileNode {
@@ -104,28 +101,137 @@ async fn a_checked_tree_over_a_lost_pack_answers_its_blob_missing_until_it_is_up
     let action = rig
         .action(|a| a.input_root_digest = Some(wire(&root)), |_| {})
         .await;
-    let tree = mint_tree(&rig, &action).await.expect("a tree");
     let pack = packs
         .locate_stored(&blob)
         .await
         .expect("asked")
         .expect("packed");
-    let key = ObjectKey::new(&pack.pack_key).expect("a key");
-    rig.store.inner.delete(&key).await.expect("lost");
+    (action, blob, pack.pack_key, root)
+}
 
-    rig.front.lost(&action, &sha(&tree)).await;
+/// Moves the test's clock on by `by`.
+fn wait(by: Duration) {
+    CLOCK.with(|c| c.set(c.get() + by.as_secs()));
+}
+
+/// Asserts that a checked tree over a pack the store lost forgets nothing on the first look at
+/// it (the store may answer "not found" for a while for an object it holds): the tree is written
+/// naming the pack. A checked tree [`kbf_pack::CONFIRM_AFTER`] later, the pack still absent,
+/// answers the run's inputs missing, naming the blob, and has the pack index forget the pack
+/// (FindMissingBlobs then reports the blob); the action stays checked until a checked tree is
+/// written: once the blob is uploaded again, the next mint writes its tree and the one after uses
+/// it.
+#[tokio::test]
+async fn a_checked_tree_over_a_lost_pack_answers_its_blob_missing_once_the_loss_is_confirmed() {
+    let rig = super::put_dir::rig();
+    let (action, blob, pack, _) = action_over_packed(&rig, b"an input held in a pack").await;
+    let packs = rig.front.packs.clone();
+    let tree = mint_tree(&rig, &action).await.expect("a tree");
+    let key = ObjectKey::new(&pack).expect("a key");
+    rig.store.inner.delete(&key).await.expect("lost");
+    rig.index_clock.advance(kbf_pack::MIN_AGE);
+
+    rig.front
+        .lost(&action, &LostObject::Manifest(sha(&tree)))
+        .await;
+    let first = mint_tree(&rig, &action).await;
+    let kept = packs.missing(&[blob]).await.expect("asked");
+    wait(kbf_pack::CONFIRM_AFTER);
+    rig.front
+        .lost(&action, &LostObject::Manifest(sha(&tree)))
+        .await;
     let missing = mint_tree(&rig, &action).await;
 
+    assert_eq!(first, Ok(tree.clone()), "one absence forgets nothing");
+    assert!(kept.is_empty(), "{kept:?}");
     assert_eq!(missing, Err(MintError::Missing(vec![blob])));
     assert_eq!(packs.missing(&[blob]).await.expect("asked"), [blob]);
     packs
-        .put(vec![(blob, bytes)])
+        .put(vec![(blob, Bytes::from_static(b"an input held in a pack"))])
         .await
         .expect("uploaded again");
     let written = mint_tree(&rig, &action).await.expect("written");
     assert_ne!(written, tree, "the tree names the new pack");
     let remembered = mint_tree(&rig, &action).await.expect("remembered");
     assert_eq!(remembered, written);
+}
+
+/// Asserts the loop a job's missing source takes (tierstore's `404 source missing: <key>`): the
+/// first report drops the action's remembered tree and the memos' entries that name the pack,
+/// and notes the absence, so the next mint writes the tree checked and, the pack not yet
+/// confirmed lost, names it again (and the memos remember it again); a report
+/// [`kbf_pack::CONFIRM_AFTER`] later confirms the absence, forgets the pack and drops the memos'
+/// entries of it before the retry, so the retry's mint answers the input missing. Once the
+/// client uploads the blob again (into a new pack), a second action over the same input, written
+/// from the memos, builds its input's manifest again over the new pack: no memo hands out the old
+/// one.
+#[tokio::test]
+async fn a_missing_source_drops_the_memos_and_the_retry_does_not_reuse_its_pack() {
+    let bytes: &'static [u8] = b"an input whose pack goes";
+    let rig = super::put_dir::rig();
+    let (action, blob, pack, root) = action_over_packed(&rig, bytes).await;
+    let tree = mint_tree(&rig, &action).await.expect("a tree");
+    rig.store
+        .inner
+        .delete(&ObjectKey::new(&pack).expect("a key"))
+        .await
+        .expect("lost");
+    rig.index_clock.advance(kbf_pack::MIN_AGE);
+    let source = LostObject::Source(pack.clone());
+
+    rig.front.lost(&action, &source).await;
+    let not_yet = mint_tree(&rig, &action).await;
+    wait(kbf_pack::CONFIRM_AFTER);
+    rig.front.lost(&action, &source).await;
+    let retry = mint_tree(&rig, &action).await;
+    let packs = rig.front.packs.clone();
+    let reported = packs.missing(&[blob]).await.expect("asked");
+    packs
+        .put(vec![(blob, Bytes::from_static(bytes))])
+        .await
+        .expect("uploaded again");
+    let other = rig
+        .action(
+            |a| a.input_root_digest = Some(wire(&root)),
+            |c| c.arguments = vec!["another".to_owned()],
+        )
+        .await;
+    let again = packs
+        .locate_stored(&blob)
+        .await
+        .expect("asked")
+        .expect("packed");
+    let named_before = manifests_naming(&rig, &again.pack_key).await;
+    let shared = mint_tree(&rig, &other).await.expect("a tree");
+    let named_after = manifests_naming(&rig, &again.pack_key).await;
+
+    assert_eq!(not_yet, Ok(tree.clone()), "a first absence forgets nothing");
+    assert_eq!(retry, Err(MintError::Missing(vec![blob])));
+    assert_eq!(reported, [blob]);
+    assert_ne!(again.pack_key, pack);
+    assert_ne!(shared, tree);
+    assert_eq!(named_before, 0);
+    assert_eq!(
+        named_after, 1,
+        "the input's manifest was built again over the new pack, not taken from a memo"
+    );
+}
+
+/// How many manifests under `cas/l/` in the rig's store name a span of the pack `key`.
+async fn manifests_naming(rig: &Rig, key: &str) -> usize {
+    let needle = format!("\"key\":\"{key}\"");
+    let prefix = KeyPrefix::new("cas/l/").expect("a prefix");
+    let page = rig.store.inner.list(&prefix, None, PageSize::MAX).await;
+    let mut naming = 0;
+    for object in page.expect("listed").objects {
+        let Some(range) = ByteRange::new(0, object.size) else {
+            continue;
+        };
+        let bytes = rig.store.inner.get_range(&object.key, range).await;
+        let text = String::from_utf8_lossy(&bytes.expect("read")).into_owned();
+        naming += usize::from(text.contains(&needle));
+    }
+    naming
 }
 
 /// Asserts that an object neither the writer's memos nor the action's tree name is taken for the
@@ -156,7 +262,7 @@ async fn a_lost_object_of_the_base_has_it_published_again_one_at_a_time() {
     let (rig, _) = rig_republishing(republish);
     let action = action_with_input(&rig, "input").await;
     mint_tree(&rig, &action).await.expect("a tree");
-    let unknown = [9_u8; 32];
+    let unknown = LostObject::Manifest([9_u8; 32]);
 
     let first = rig.front.lost(&action, &unknown);
     let second = async {
@@ -188,7 +294,9 @@ async fn a_lost_object_with_no_publish_again_still_checks_the_next_tree() {
     let action = action_with_input(&rig, "input").await;
     mint_tree(&rig, &action).await.expect("a tree");
 
-    rig.front.lost(&action, &[9; 32]).await;
+    rig.front
+        .lost(&action, &LostObject::Manifest([9; 32]))
+        .await;
     mint_tree(&rig, &action).await.expect("written again");
 
     assert!(
@@ -217,7 +325,9 @@ async fn a_lost_tree_list_has_the_next_list_written_checked_once() {
     let key = mint().await;
     let hex = key.strip_prefix("cas/l/").expect("a cas/l/ key");
 
-    rig.front.lost(&action, &sha(hex)).await;
+    rig.front
+        .lost(&action, &LostObject::Manifest(sha(hex)))
+        .await;
     let again = mint().await;
     let after = mint().await;
 
@@ -237,7 +347,9 @@ async fn a_lost_object_of_an_action_that_is_no_digest_changes_nothing() {
         size_bytes: -1,
     };
 
-    rig.front.lost(&bad, &sha(&tree)).await;
+    rig.front
+        .lost(&bad, &LostObject::Manifest(sha(&tree)))
+        .await;
     mint_tree(&rig, &action).await.expect("remembered");
 
     assert_eq!((prepare.prepared(), prepare.minted()), (1, 1));

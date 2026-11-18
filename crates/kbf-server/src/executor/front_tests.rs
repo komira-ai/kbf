@@ -151,6 +151,8 @@ struct Rig {
     store: Arc<Flaky>,
     cache: Arc<Cache<MemoryMetaLog, MemoryStore>>,
     mint: PackKeyMint,
+    /// The pack index's clock, which dates the packs it records.
+    index_clock: Arc<ManualClock>,
 }
 
 impl Rig {
@@ -187,11 +189,13 @@ impl Rig {
             released: tokio::sync::Semaphore::new(0),
             fail_puts: AtomicBool::new(false),
         });
-        let index: Arc<dyn PackIndex> =
-            Arc::new(MemoryPackIndex::new(Arc::new(ManualClock::default())));
+        let index_clock = Arc::new(ManualClock::default());
+        let index: Arc<dyn PackIndex> = Arc::new(MemoryPackIndex::new(index_clock.clone()));
         let keys = PackKeys::new(WriterKind::Frontend, "fe1", "boot1").expect("keys");
         let packs =
             Packs::new(Arc::clone(&store), index, keys, PackSettings::default()).expect("packs");
+        // The packs' loss guard times the absences of a pack by the test's clock.
+        let packs = packs.with_clock(Arc::new(clock));
         let cache = Arc::new(Cache::memory());
         let node = Arc::new(CacheStorage::new(
             Arc::clone(&cache),
@@ -216,6 +220,7 @@ impl Rig {
             store,
             cache,
             mint: PackKeyMint::new(SECRET).expect("a mint"),
+            index_clock,
         }
     }
 

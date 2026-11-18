@@ -13,8 +13,8 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use kbf_objstore::{BodyStream, ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_pack::{
-    Blob, FRONTEND_PACK_BYTES, Fetch, PackError, PackKeys, Packed, Packer, PackerConfig, ReadCache,
-    ReadError, Reader, ReaderConfig, check_create_only,
+    Blob, FRONTEND_PACK_BYTES, Fetch, Loss, LossGuard, PackError, PackKeys, Packed, Packer,
+    PackerConfig, ReadCache, ReadError, Reader, ReaderConfig, check_create_only,
 };
 use kbf_pack_index::{BlobDigest, Location, MAX_BATCH, PackIndex, PackIndexError};
 use kbf_types::{Digest, DigestFunction};
@@ -180,6 +180,9 @@ pub struct Packs {
     store_metrics: Arc<crate::store_metrics::StoreMetrics>,
     pub(super) verifying: Arc<VerifyingKeys>,
     clock: Clock,
+    /// When a pack a read found absent is taken for lost: shared by the reader of the blobs,
+    /// the reads of large blobs, an action tree's check and a job's report of an absent object.
+    pub(super) loss: Arc<LossGuard>,
     /// The writer the packs are recorded under, which a large object is recorded under too.
     pub(super) writer: String,
     /// [`PackSettings::store_writes`].
@@ -215,12 +218,14 @@ impl Packs {
         let writer = keys.writer();
         let store = Arc::new(StoreWrites::new(store, settings.store_writes));
         let packer = Packer::new(store.clone(), index.clone(), keys.clone(), config)?;
+        let loss = Arc::<LossGuard>::default();
         let reader = Reader::new(
             Arc::clone(&store),
             Arc::clone(&index),
             settings.cache,
             ReaderConfig::default(),
-        );
+        )
+        .with_loss_guard(Arc::clone(&loss));
         let over = Over {
             store,
             keys,
@@ -238,6 +243,7 @@ impl Packs {
             store_metrics: Arc::new(crate::store_metrics::StoreMetrics::packs()),
             verifying: Arc::default(),
             clock: Arc::new(SystemTime::now),
+            loss,
             writer,
             store_writes: settings.store_writes,
         })
@@ -253,9 +259,12 @@ impl Packs {
         self
     }
 
-    /// These packs judging the age of a task key by `clock` (the wall clock unless told).
+    /// These packs judging the age of a task key by `clock` (the wall clock unless told); and the
+    /// packs' [`LossGuard`], which every clone of these packs shares, timing the absences of a
+    /// pack by it from then on.
     #[must_use]
     pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.loss.set_clock(Arc::clone(&clock));
         self.clock = clock;
         self
     }
@@ -403,30 +412,35 @@ impl Packs {
         self.store.len(&key).await.map_err(|e| failed(&e))
     }
 
-    /// Forgets the pack `key` in the index if the store does not have it, or has it shorter than
-    /// `end` bytes: a reader of `key` was told the object is not there. The store is asked for
-    /// the object's length first, so a read that raced the object's write, or a caller that
-    /// named an object that is there, forgets nothing. Returns whether the pack was forgotten.
+    /// A reader of the pack `key` was told the store does not have it, or has it shorter than
+    /// `end` bytes (an `end` of 0: only a missing object counts): the absence goes to the
+    /// packs' [`LossGuard`], which has the index forget the whole pack only once a second look
+    /// (the object's length, asked here when its time comes) confirms it some time after the
+    /// first, and the pack is old enough. Returns what it came to; a forget is counted in
+    /// [`PackMetrics::lost_forgotten`].
+    pub async fn absent(&self, key: &str, end: u64) -> Loss {
+        let look = || self.object_len(key);
+        let loss = self.loss.absent(&self.index, key, end, look).await;
+        self.metrics.lost_forgotten.add(u64::from(loss.forgotten()));
+        loss
+    }
+
+    /// Asks the store for the length of the pack `key` (a HEAD), and when it does not have it,
+    /// or has it shorter than `end` bytes, takes that for an absence ([`Packs::absent`]), the
+    /// length asked serving as the second look when its time has come. Returns whether the
+    /// index forgot the pack. An action tree's check of the packs it names calls it.
     ///
     /// # Errors
-    /// UNAVAILABLE when `key` is not an object key, or the store or the index fails.
+    /// UNAVAILABLE when `key` is not an object key, or the store does not answer the length.
     pub(crate) async fn forget_lost(&self, key: &str, end: u64) -> Result<bool, Status> {
         let length = self.object_len(key).await?;
-        if length.is_some_and(|length| length >= end) {
-            tracing::warn!(key, "an object a reader found lost is held whole: kept");
+        if let Some(whole) = length.filter(|length| *length >= end) {
+            self.loss.held(key, whole);
             return Ok(false);
         }
-        let index = Arc::clone(&self.index);
-        let pack = key.to_owned();
-        let rows = offload(move || index.forget_pack(&pack)).await;
-        let rows = rows.map_err(|e| Status::unavailable(format!("pack index: {e}")))?;
-        tracing::warn!(
-            key,
-            rows,
-            ?length,
-            "the store does not have an object the index named: the index forgot it, and its blobs are missing until uploaded again"
-        );
-        Ok(true)
+        let look = || std::future::ready(Ok::<_, Status>(length));
+        let loss = self.loss.absent(&self.index, key, end, look).await;
+        Ok(loss.forgotten())
     }
 
     /// Writes `blobs` into packs and records them. They are in the pack index, and the packs
@@ -582,8 +596,9 @@ impl Packs {
                 Ok(None)
             }
             Fetch::Lost { forgotten } => {
-                // When the reader forgot the pack, the index no longer has a row for the
-                // digest: FindMissingBlobs lists it, so a client uploads it again.
+                // When the reader's guard confirmed the loss and the index forgot the pack, the
+                // index no longer has a row for the digest: FindMissingBlobs lists it, so a
+                // client uploads it again.
                 self.metrics.lost.add(1);
                 self.metrics.lost_forgotten.add(u64::from(forgotten));
                 tracing::warn!(

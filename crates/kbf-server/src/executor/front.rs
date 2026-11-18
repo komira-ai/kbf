@@ -38,11 +38,15 @@
 //!   ([`Front::with_metrics`]): the put directory, the closure's parts and the tree's name.
 //! - **An object the store lost** ([`Ingest::lost`]): a job that did not start because the store
 //!   does not have an object of its tree. The store is general-purpose, and its objects can
-//!   vanish while the frontend's state names them. The action's remembered trees are dropped,
-//!   the writer's memos drop what they say of the object ([`TreeWriter::lost_manifest`]), and the
-//!   action's next tree is written checked against the store ([`TreeWriter::write_checked`]): a
-//!   pack the store lost is forgotten by the pack index, and the run is answered with its blobs
-//!   missing ([`MintError::Missing`]), which the client uploads again. An object neither memo nor
+//!   vanish while the frontend's state names them, and a store can answer "not found" for a while
+//!   for an object it holds. Before the next attempt, the action's remembered trees are dropped,
+//!   the writer's memos drop what they say of the object ([`TreeWriter::lost_manifest`] for a
+//!   manifest, [`TreeWriter::lost_pack`] for a pack a span is read from), the absence of a pack is
+//!   told to the packs ([`Packs::absent`], which has the pack index forget it only once a second
+//!   look some time after the first confirms it), and the action's next tree is written checked
+//!   against the store ([`TreeWriter::write_checked`]): a pack forgotten has the run answered with
+//!   its blobs missing ([`MintError::Missing`]), which the client uploads again, and a pack not
+//!   yet confirmed lost is named again. An object neither memo nor
 //!   the action's tree names is taken for one of the kbf base tree's, whose objects the frontend
 //!   publishes again ([`PutDirParts::with_republish`]), one publish at a time.
 
@@ -75,7 +79,8 @@ use crate::executor::size_class::SizeClass;
 use crate::executor::steps::Step;
 use crate::executor::task::{PackKey, RunId, build_id};
 use crate::executor::traits::{
-    ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, RejectReason, UntrustedLimits,
+    ActionFacts, Ingest, Ingested, Inputs, InputsError, LostObject, MintError, RejectReason,
+    UntrustedLimits,
 };
 
 /// The most action trees [`Front`] remembers.
@@ -581,19 +586,29 @@ impl Ingest for Front {
         }
     }
 
-    async fn lost(&self, action: &Digest, object: &[u8; 32]) {
+    async fn lost(&self, action: &Digest, object: &LostObject) {
         let Ok(action) = cas_digest(action) else {
             return;
         };
-        let hex = super::outcome::hex(object);
+        let named_as = match object {
+            LostObject::Manifest(sha) => super::outcome::hex(sha),
+            LostObject::Source(key) => key.clone(),
+        };
         let mut own = false;
         for form in [InputTree::Manifests, InputTree::Provider] {
             let tree = self.trees().remove(&(action, form));
-            own |= tree.is_some_and(|(tree, _)| tree.ends_with(&hex));
+            own |= tree.is_some_and(|(tree, _)| tree.ends_with(&named_as));
         }
         self.checked().put(action, ());
-        let named = self.writer.lost_manifest(object);
-        tracing::warn!(%action, object = %hex, named, own, "the store lost an object of an action's tree: its next tree is written checked");
+        // The memos first, so the next attempt's tree names nothing they said of the object.
+        let (named, loss) = match object {
+            LostObject::Manifest(sha) => (self.writer.lost_manifest(sha), None),
+            LostObject::Source(key) => {
+                let named = self.writer.lost_pack(key);
+                (named, Some(self.packs.absent(key, 0).await))
+            }
+        };
+        tracing::warn!(%action, object = %named_as, named, own, ?loss, "the store answered an object of an action's tree absent: its next tree is written checked");
         if !named && !own {
             self.republish_base().await;
         }

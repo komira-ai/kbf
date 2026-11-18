@@ -85,7 +85,8 @@ pub use size_class::SizeClass;
 pub use submit::job_id;
 pub use task::{PackKey, RunId, build_id};
 pub use traits::{
-    ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, RejectReason, UntrustedLimits,
+    ActionFacts, Ingest, Ingested, Inputs, InputsError, LostObject, MintError, RejectReason,
+    UntrustedLimits,
 };
 
 /// The most operations the executor holds open at once: a guard on the memory they hold (a

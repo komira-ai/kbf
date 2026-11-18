@@ -32,7 +32,7 @@ use kbf_state::postgres::{Conn, ExtensionPool, Loan, PostgresConfig, store_error
 
 use crate::directory::NewDirectory;
 use crate::{
-    BlobDigest, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
+    BlobDigest, Forgot, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
     check_batch, count, micros, micros_of,
 };
 
@@ -145,14 +145,17 @@ const DROP: &str = concat!(
     "SELECT count(*) FROM d"
 );
 
-/// `$1` pack key: deletes every blob row that points into the pack and the pack's row, and
-/// answers how many blob rows it deleted. The pack row is locked first, as [`DROP`] and a record
-/// of the key lock it, so a forget and a record of the key take turns.
+/// `$1` pack key, `$2` the time, `$3` the least age: deletes every blob row that points into the
+/// pack and the pack's row when the pack was recorded at least the age before the time, and
+/// answers whether the key is recorded, whether it was old enough, and how many blob rows it
+/// deleted. The pack row is locked first, as [`DROP`] and a record of the key lock it, so a
+/// forget and a record of the key take turns, and the age is that of the row locked.
 const FORGET: &str = concat!(
-    "WITH p AS (SELECT pack_id FROM pack WHERE key = $1 FOR UPDATE), ",
-    "d AS (DELETE FROM blob b USING p WHERE b.pack_id = p.pack_id RETURNING 1), ",
-    "k AS (DELETE FROM pack USING p WHERE pack.pack_id = p.pack_id RETURNING 1) ",
-    "SELECT count(*) FROM d"
+    "WITH p AS (SELECT pack_id, created_us FROM pack WHERE key = $1 FOR UPDATE), ",
+    "o AS (SELECT pack_id FROM p WHERE created_us <= $2::bigint - $3::bigint), ",
+    "d AS (DELETE FROM blob b USING o WHERE b.pack_id = o.pack_id RETURNING 1), ",
+    "k AS (DELETE FROM pack USING o WHERE pack.pack_id = o.pack_id RETURNING 1) ",
+    "SELECT (SELECT count(*) FROM p), (SELECT count(*) FROM o), (SELECT count(*) FROM d)"
 );
 
 /// A failed client call as the index reports it.
@@ -451,11 +454,20 @@ impl PackIndex for PostgresPackIndex {
         Ok(removed > 0)
     }
 
-    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
+    fn forget_pack(&self, pack_key: &str, min_age: Duration) -> Result<Forgot, PackIndexError> {
         let mut session = self.session()?;
-        let removed = session.conn().query_one(FORGET, &[&pack_key]);
-        let removed: i64 = removed.map_err(failed)?.get(0);
-        Ok(usize::try_from(removed).unwrap_or(usize::MAX))
+        let now = self.now(session.conn())?;
+        let min_age = micros(min_age);
+        let args: [&(dyn ToSql + Sync); 3] = [&pack_key, &now, &min_age];
+        let row = session.conn().query_one(FORGET, &args).map_err(failed)?;
+        let (recorded, old, removed): (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
+        Ok(match (recorded, old) {
+            (0, _) => Forgot::NotRecorded,
+            (_, 0) => Forgot::Young,
+            _ => Forgot::Forgotten {
+                rows: usize::try_from(removed).unwrap_or(usize::MAX),
+            },
+        })
     }
 
     fn directories(&self, digests: &[BlobDigest]) -> Result<Vec<Option<Vec<u8>>>, PackIndexError> {

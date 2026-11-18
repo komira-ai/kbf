@@ -151,13 +151,26 @@ pub trait Ingest: Send + Sync {
         limits: &UntrustedLimits,
     ) -> Ingested;
 
-    /// A job of `action` did not start because the store does not have the object `object` (its
-    /// SHA-256) of its tree: what the frontend's state says of that object is dropped, and the
-    /// next [`Ingest::mint`] of `action` writes its tree checked against the store. Called before
-    /// the operation's next attempt is prepared. The default keeps no such state.
-    async fn lost(&self, action: &Digest, object: &[u8; 32]) {
+    /// A job of `action` did not start because the store answered that it does not have
+    /// `object`, an object of its tree: what the frontend's memos say of that object is dropped,
+    /// the absence is told to the frontend's packs (which forget a pack only once the absence is
+    /// confirmed), and the next [`Ingest::mint`] of `action` writes its tree checked against the
+    /// store. Called before the operation's next attempt is prepared. The default keeps no such
+    /// state.
+    async fn lost(&self, action: &Digest, object: &LostObject) {
         let _ = (action, object);
     }
+}
+
+/// An object of a job's tree the store answered it does not have, as the job's start failure
+/// names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LostObject {
+    /// A manifest of the tree, by its SHA-256: `cannot fetch manifest <sha256>: upstream 404`.
+    Manifest([u8; 32]),
+    /// The object a span of the tree is read from (a pack, or a large blob's object), by its
+    /// key: `source missing: <key>`.
+    Source(String),
 }
 
 /// What the executor reads of an action before it runs one.

@@ -39,9 +39,10 @@
 //!   the bytes came from; a row that points at another pack is kept. A dropped blob has no
 //!   row until a pack that holds it is recorded: the first location wins again.
 //! - **A pack can be forgotten.** A reader the object store told that a pack is gone (or
-//!   shorter than its rows say) asks the index to forget it: every row that points into it and
-//!   the pack's own row go, so its blobs are missing until a pack that holds them is recorded,
-//!   and the same key recorded again is a new pack.
+//!   shorter than its rows say), twice and some time apart, asks the index to forget it: every
+//!   row that points into it and the pack's own row go, in one transaction, so its blobs are
+//!   missing until a pack that holds them is recorded, and the same key recorded again is a new
+//!   pack. A pack recorded less than the age the caller names before is kept whole.
 //! - **Reads are queries.** [`PackIndex::locate`], [`PackIndex::find_missing`],
 //!   [`PackIndex::dead_packs`] and [`PackIndex::unreferenced_keys`] write nothing, and
 //!   [`PackIndex::touch`] writes `last_touch_us` and nothing else. Blob rows are inserted by
@@ -143,6 +144,20 @@ pub struct PackInfo {
     pub blob_count: u32,
     /// How many of them the index pointed at this pack when it was recorded.
     pub live_blobs: u32,
+}
+
+/// What [`PackIndex::forget_pack`] came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forgot {
+    /// The pack and every blob row that pointed into it are gone; `rows` is how many blob rows.
+    Forgotten {
+        /// The blob rows removed.
+        rows: usize,
+    },
+    /// The pack was recorded less than the age asked ago: nothing was removed.
+    Young,
+    /// No pack is recorded under the key: nothing was removed.
+    NotRecorded,
 }
 
 /// Why a call of the index failed.
@@ -277,15 +292,20 @@ pub trait PackIndex: Send + Sync {
         Err(PackIndexError::Unsupported)
     }
 
-    /// Forgets the pack recorded under `pack_key`: removes every blob row that points into it
-    /// and the pack's own row, in one transaction. Returns how many blob rows it removed; a key
-    /// nobody recorded removes nothing and answers 0.
+    /// Forgets the pack recorded under `pack_key` if it was recorded at least `min_age` ago by
+    /// the index's clock: removes every blob row that points into it and the pack's own row, in
+    /// one transaction. The age is read in that transaction, so a pack recorded again under the
+    /// key a moment before is young and kept ([`Forgot::Young`]); a key nobody recorded removes
+    /// nothing ([`Forgot::NotRecorded`]).
     ///
-    /// A caller calls it when the object store answers that the object under `pack_key` is not
-    /// there. Afterwards [`PackIndex::find_missing`] lists the pack's blobs, so a client uploads
-    /// them again, and a pack recorded under the same key again is a new pack whose blobs get
-    /// rows ([`PackIndex::record_pack`] answers `created: true`), where a pack row kept with no
-    /// rows would answer `created: false` and make none.
+    /// A caller calls it once the object store has answered, twice and some time apart, that
+    /// the object under `pack_key` is not there. Afterwards [`PackIndex::find_missing`] lists
+    /// the pack's blobs, so a client uploads them again, and a pack recorded under the same key
+    /// again is a new pack whose blobs get rows ([`PackIndex::record_pack`] answers
+    /// `created: true`), where a pack row kept with no rows would answer `created: false` and
+    /// make none. A blob whose row is in the pack and whose bytes are in another pack too (the
+    /// first location wins, so that pack has no row for it) is missing as well, and is packed
+    /// again when a client uploads it.
     ///
     /// The default answers [`PackIndexError::Unsupported`], as [`PackIndex::drop_location`]
     /// does.
@@ -293,8 +313,8 @@ pub trait PackIndex: Send + Sync {
     /// # Errors
     /// [`PackIndexError::Unsupported`] or [`PackIndexError::Refused`] from an index that does
     /// not take or allow the call; [`PackIndexError::Store`] when the store fails.
-    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
-        let _ = pack_key;
+    fn forget_pack(&self, pack_key: &str, min_age: Duration) -> Result<Forgot, PackIndexError> {
+        let _ = (pack_key, min_age);
         Err(PackIndexError::Unsupported)
     }
 

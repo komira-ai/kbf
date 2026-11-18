@@ -6,11 +6,14 @@
 //! range. Every blob is hashed before it is handed out, and a blob whose bytes are not its
 //! digest is refused ([`Fetch::Damaged`]), never returned and never cached, and its location
 //! is dropped from the index ([`PackIndex::drop_location`]). A pack the store does not have, or
-//! has shorter than the index says, is asked for its length once, and when that confirms it the
-//! index forgets the pack ([`PackIndex::forget_pack`], [`Fetch::Lost`]): the store is a
-//! general-purpose one, whose objects can vanish, and a row that names a vanished object would
-//! keep telling clients the blob is held. Blobs served are noted, and the index is told in
-//! batches ([`Reader::flush_touches`]) so that retention sees them as in use.
+//! has shorter than the index says, is [`Fetch::Lost`], and its absence goes to the reader's
+//! [`LossGuard`], which has the index forget the whole pack ([`PackIndex::forget_pack`]) only
+//! once a second look, some time after the first absence, confirms it, and the pack is old
+//! enough (see [`crate::lost`]): the store is a general-purpose one, whose objects can vanish,
+//! and a row that names a vanished object would keep telling clients the blob is held, while a
+//! store that answers "not found" for a while (a volume server restarting) has lost nothing.
+//! A read that gets a pack's bytes clears its noted absence. Blobs served are noted, and the
+//! index is told in batches ([`Reader::flush_touches`]) so that retention sees them as in use.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -25,6 +28,7 @@ use crate::blocking::offload;
 use crate::cache::ReadCache;
 use crate::digest::verifies;
 use crate::error::ReadError;
+use crate::lost::LossGuard;
 
 /// The most unwanted bytes read between two blobs of a pack to make them one request: 64 KiB.
 pub const DEFAULT_GAP: u64 = 64 << 10;
@@ -40,15 +44,15 @@ pub enum Fetch {
     /// The index has no row for the digest.
     Missing,
     /// The index has a row, and the store does not have the bytes it points at: the pack is
-    /// gone or shorter than the row says. The reader then asked the store for the pack's length
-    /// and, when the pack is gone or ends before the blob does, forgot the pack in the index
-    /// ([`PackIndex::forget_pack`]): the next read of the digest finds no row
-    /// ([`Fetch::Missing`]), and the index lists it as missing, so a client uploads it again.
+    /// gone or shorter than the row says. The reader's [`LossGuard`] was told, and when it
+    /// confirmed the absence the index forgot the pack ([`PackIndex::forget_pack`]): the next
+    /// read of the digest finds no row ([`Fetch::Missing`]), and the index lists it as missing,
+    /// so a client uploads it again.
     Lost {
-        /// Whether the index forgot the pack. `false` when the length asked shows the pack
-        /// whole after all (a read that raced its write), when the length could not be asked,
-        /// or when the index refused or failed the forget (each logged): the row stays, and the
-        /// next read finds the loss again.
+        /// Whether the index forgot the pack. `false` when the guard did not confirm the
+        /// absence yet (the first absence, one too soon after it, a pack too young, a second
+        /// look that found the pack whole or got no answer) or the index refused or failed the
+        /// forget (each logged): the row stays.
         forgotten: bool,
     },
     /// The store gave bytes that are not the digest. They are not returned. The reader
@@ -106,12 +110,15 @@ pub struct Reader<S: ObjectStore> {
     index: Arc<dyn PackIndex>,
     cache: Option<Arc<ReadCache>>,
     config: ReaderConfig,
+    /// When an absent pack is taken for lost.
+    loss: Arc<LossGuard>,
     /// The blobs served that the index has not been told of.
     pending: Mutex<BTreeSet<BlobDigest>>,
 }
 
 impl<S: ObjectStore> Reader<S> {
-    /// A reader over `store` and `index`, with `cache` (when there is one) in front.
+    /// A reader over `store` and `index`, with `cache` (when there is one) in front, and a
+    /// [`LossGuard`] of its own with the default rules.
     #[must_use]
     pub fn new(
         store: Arc<S>,
@@ -128,8 +135,17 @@ impl<S: ObjectStore> Reader<S> {
             index,
             cache,
             config,
+            loss: Arc::default(),
             pending: Mutex::default(),
         }
+    }
+
+    /// This reader telling `loss` of the packs it finds absent, and of those it reads: a
+    /// frontend's packs share one guard among every path that reads them.
+    #[must_use]
+    pub fn with_loss_guard(mut self, loss: Arc<LossGuard>) -> Self {
+        self.loss = loss;
+        self
     }
 
     /// Reads `digests`; the answer has one [`Fetch`] for each, in the order given. A digest
@@ -152,8 +168,14 @@ impl<S: ObjectStore> Reader<S> {
         let mut fresh = Vec::new();
         let mut damaged = Vec::new();
         let mut lost = LostPacks::new();
+        // For each pack read, the end of the furthest bytes the store gave of it.
+        let mut read: BTreeMap<ObjectKey, u64> = BTreeMap::new();
         for (span, got) in self.fetch_all(spans).await {
             let bytes = got?;
+            if let Some(whole) = &bytes {
+                let through = read.entry(span.pack.clone()).or_default();
+                *through = (*through).max(span.start.saturating_add(whole.len() as u64));
+            }
             for (digest, offset) in span.members {
                 let fetch = match &bytes {
                     None => LOST,
@@ -170,6 +192,9 @@ impl<S: ObjectStore> Reader<S> {
                 }
                 found.insert(digest, fetch);
             }
+        }
+        for (pack, through) in read.iter().filter(|(pack, _)| !lost.contains_key(*pack)) {
+            self.loss.held(&pack.to_string(), *through);
         }
         self.drop_damaged(damaged, &mut found, &mut fresh, &mut lost)
             .await;
@@ -346,35 +371,17 @@ impl<S: ObjectStore> Reader<S> {
         }
     }
 
-    /// Asks the store for the length of each pack in `lost`, and has the index forget each one
-    /// the store does not have or has shorter than its furthest blob asked; the blobs of a
-    /// forgotten pack are [`Fetch::Lost`] with `forgotten` in `found`. A pack the store has
-    /// whole after all, a length the store does not give, and a forget the index refuses or
-    /// fails are logged and keep the rows.
+    /// Tells the guard of each pack in `lost`, which asks the store for its length when it is
+    /// time for a second look ([`LossGuard::absent`]); the blobs of a pack the index forgot are
+    /// [`Fetch::Lost`] with `forgotten` in `found`.
     async fn forget_lost(&self, lost: LostPacks, found: &mut BTreeMap<BlobDigest, Fetch>) {
         for (pack, (end, blobs)) in lost {
-            let length = match self.store.len(&pack).await {
-                Ok(length) => length,
-                Err(error) => {
-                    tracing::warn!(%error, %pack, "a read found a pack lost and its length could not be asked: the index keeps it");
-                    continue;
-                }
-            };
-            if length.is_some_and(|length| length >= end) {
-                tracing::warn!(%pack, "a read found a pack lost that the store holds whole: the index keeps it");
-                continue;
-            }
-            let index = Arc::clone(&self.index);
             let key = pack.to_string();
-            match offload(move || index.forget_pack(&key)).await {
-                Ok(rows) => {
-                    tracing::warn!(%pack, rows, ?length, "the store does not have a pack the index named: the index forgot it, and its blobs are missing until uploaded again");
-                    for digest in blobs {
-                        found.insert(digest, Fetch::Lost { forgotten: true });
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, %pack, "could not forget a lost pack in the pack index");
+            let look = || self.store.len(&pack);
+            let loss = self.loss.absent(&self.index, &key, end, look).await;
+            if loss.forgotten() {
+                for digest in blobs {
+                    found.insert(digest, Fetch::Lost { forgotten: true });
                 }
             }
         }

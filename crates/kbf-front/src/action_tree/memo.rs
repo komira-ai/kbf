@@ -13,8 +13,11 @@
 //! - **Forgotten by a lost manifest**: [`Memo::forget_manifest`] drops every entry that names a
 //!   manifest the store no longer has, and every entry above one (a parent's manifest names its
 //!   child's), so that the next tree that holds them writes them again; and the whole memo is
-//!   dropped once a pack is found lost ([`Memo::clear`]), since no entry says which packs its
-//!   manifest names.
+//!   dropped once an action tree's check finds a pack lost ([`Memo::clear`]).
+//! - **Forgotten by an absent pack**: [`Memo::forget_pack`] drops every entry whose manifest
+//!   names a span of a pack the store answered absent for (each entry says which packs its own
+//!   manifest names), and every entry above one, so that the next tree that holds them looks
+//!   its blobs up again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -43,6 +46,8 @@ pub(super) struct Remembered {
     pub(super) measure: Measure,
     /// The `Directory` digests of its subdirectories.
     pub(super) children: Vec<Digest>,
+    /// The keys of the packs its own manifest names a span of (its files'), each once.
+    pub(super) packs: Vec<String>,
 }
 
 /// The memo. Not shared: the writer holds it under a lock.
@@ -102,8 +107,21 @@ impl Memo {
     /// Drops every entry whose manifest's SHA-256 is `manifest`, and every entry that reaches
     /// one through its subdirectories, expired ones included. Returns how many it dropped.
     pub(super) fn forget_manifest(&mut self, manifest: &[u8; 32]) -> usize {
+        self.forget_above(|remembered| remembered.manifest.hash == *manifest)
+    }
+
+    /// Drops every entry whose manifest names a span of the pack `key`, and every entry that
+    /// reaches one through its subdirectories, expired ones included. Returns how many it
+    /// dropped.
+    pub(super) fn forget_pack(&mut self, key: &str) -> usize {
+        self.forget_above(|remembered| remembered.packs.iter().any(|pack| pack == key))
+    }
+
+    /// Drops every entry `named` holds for, and every entry that reaches one through its
+    /// subdirectories. Returns how many it dropped.
+    fn forget_above(&mut self, named: impl Fn(&Remembered) -> bool) -> usize {
         let mut gone: BTreeSet<Digest> = (self.entries.iter())
-            .filter(|(_, (remembered, _))| remembered.manifest.hash == *manifest)
+            .filter(|(_, (remembered, _))| named(remembered))
             .map(|(digest, _)| *digest)
             .collect();
         // Each pass adds the parents of what is gone; a pass that adds none ends it.

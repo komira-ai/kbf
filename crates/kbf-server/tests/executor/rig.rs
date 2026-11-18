@@ -24,8 +24,9 @@ use kbf_job_client::fake::{Call, FakeJobServer, Fault, Machine};
 use kbf_proto::reapi::{ActionResult, Digest};
 use kbf_server::executor::rows::Rows;
 use kbf_server::executor::{
-    ActionFacts, Config, Deps, Executor, Ingest, Ingested, InputTree, Inputs, InputsError, Metrics,
-    MintError, PackKey, PutDirRoots, RunId, SizeClass, System, UntrustedLimits, build_id,
+    ActionFacts, Config, Deps, Executor, Ingest, Ingested, InputTree, Inputs, InputsError,
+    LostObject, Metrics, MintError, PackKey, PutDirRoots, RunId, SizeClass, System,
+    UntrustedLimits, build_id,
 };
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
@@ -112,7 +113,10 @@ pub struct FakeIngest {
     /// The wall each mint was asked to keep its directory good for, in order.
     pub walls: Mutex<Vec<Duration>>,
     /// Each object the store lost that a job named, with the action whose job named it.
-    pub lost: Mutex<Vec<(Digest, [u8; 32])>>,
+    pub lost: Mutex<Vec<(Digest, LostObject)>>,
+    /// The mints and the reports of lost objects, in the order they were called: `"mint"` or
+    /// `"lost"`.
+    pub calls_in_order: Mutex<Vec<&'static str>>,
 }
 
 impl FakeIngest {
@@ -127,6 +131,7 @@ impl FakeIngest {
             forms: Mutex::new(Vec::new()),
             walls: Mutex::new(Vec::new()),
             lost: Mutex::new(Vec::new()),
+            calls_in_order: Mutex::new(Vec::new()),
         }
     }
 
@@ -155,6 +160,7 @@ impl Ingest for FakeIngest {
         wall: Duration,
         tree: InputTree,
     ) -> Result<PackKey, MintError> {
+        locked(&self.calls_in_order).push("mint");
         locked(&self.forms).push(tree);
         locked(&self.walls).push(wall);
         match locked(&self.mint_fails).pop_front() {
@@ -183,8 +189,9 @@ impl Ingest for FakeIngest {
             .unwrap_or_else(|| Self::ran(0))
     }
 
-    async fn lost(&self, action: &Digest, object: &[u8; 32]) {
-        locked(&self.lost).push((action.clone(), *object));
+    async fn lost(&self, action: &Digest, object: &LostObject) {
+        locked(&self.calls_in_order).push("lost");
+        locked(&self.lost).push((action.clone(), object.clone()));
     }
 }
 

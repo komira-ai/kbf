@@ -6,11 +6,12 @@
 //! swapped for an empty one, a bucket emptied). A job that read a lost manifest says so, and its
 //! next tree is checked: every pack the tree names is asked for its length once, at most
 //! [`HEADS_IN_FLIGHT`] at once, and a pack the store does not have, or has shorter than a blob
-//! in it ends, is forgotten by the pack index ([`BlobSource::forget_lost`]). Its blobs are then
-//! missing, which FindMissingBlobs answers too, so the client uploads them again; the tree is
-//! refused naming them ([`NoTree::Lost`]), and both memos are dropped whole: the place memo may
-//! place other blobs in the packs forgotten, and a remembered manifest may name them as a
-//! file's source, which neither memo can be asked about.
+//! in it ends, is an absence of it ([`BlobSource::forget_lost`]), which the pack index forgets
+//! once a second look some time after the first confirms it (a first absence keeps the pack, and
+//! the tree names it). The blobs of a pack forgotten are then missing, which FindMissingBlobs
+//! answers too, so the client uploads them again; the tree is refused naming them
+//! ([`NoTree::Lost`]), and both memos are dropped whole: the place memo may place other blobs in
+//! the packs forgotten, and a remembered manifest may name them as a file's source.
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -8,7 +8,7 @@
 
 use js_proto::v1::{ResultReason, StartFailureCode};
 use kbf_front::Finished;
-use kbf_server::executor::{Ingested, MintError, RejectReason};
+use kbf_server::executor::{Ingested, LostObject, MintError, RejectReason};
 use tonic::Code;
 
 use crate::rig::{FakeIngest, HOST, Rig};
@@ -242,11 +242,20 @@ async fn a_job_that_did_not_start_for_a_lost_object_tells_the_frontend_and_runs_
     assert!(rig.fake.refuse_start(first.id(), &detail));
     let second = rig.until_jobs(1, 2).await.remove(1);
     let told = rig.ingest.lost.lock().expect("lock").clone();
+    let order = rig.ingest.calls_in_order.lock().expect("lock").clone();
     rig.host_finishes(second.id(), HOST, 0);
 
     assert_eq!(exit_code(&caller.done().await), 0);
+    assert_eq!(
+        order,
+        ["mint", "lost", "mint"],
+        "told before the second mint"
+    );
     assert_eq!(told.len(), 1, "{told:?}");
-    let hex: String = told[0].1.iter().map(|b| format!("{b:02x}")).collect();
+    let LostObject::Manifest(sha) = &told[0].1 else {
+        panic!("not a manifest: {told:?}");
+    };
+    let hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(hex, LOST);
     assert_eq!(
         rig.ingest.forms.lock().expect("lock").len(),
@@ -256,6 +265,34 @@ async fn a_job_that_did_not_start_for_a_lost_object_tells_the_frontend_and_runs_
     let row = "kbf_executor_runs_total{outcome=\"infra\"} 1\n";
     let counted = rig.counted();
     assert!(counted.contains(row), "{row} in {counted}");
+}
+
+/// Catches a job that did not start because the store answered a source of its tree absent
+/// (tierstore's `404 source missing: <key>`) being run again with the frontend told nothing: the
+/// frontend is told the key and the action once, before the next attempt is minted, and the next
+/// job's OK is the caller's answer.
+#[tokio::test]
+async fn a_job_that_did_not_start_for_a_missing_source_tells_the_frontend_its_key() {
+    let rig = Rig::start(&[HOST], |_| {}).await;
+    let mut caller = rig.submit(1);
+    let first = rig.first_job(1).await;
+    let key = "cas/f/fe1/boot1/0000000000000003";
+    let detail = format!("tree create failed: 404 source missing: {key} (path /bin/cc)");
+
+    assert!(rig.fake.refuse_start(first.id(), &detail));
+    let second = rig.until_jobs(1, 2).await.remove(1);
+    let told = rig.ingest.lost.lock().expect("lock").clone();
+    let order = rig.ingest.calls_in_order.lock().expect("lock").clone();
+    rig.host_finishes(second.id(), HOST, 0);
+
+    assert_eq!(exit_code(&caller.done().await), 0);
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0].1, LostObject::Source(key.to_owned()));
+    assert_eq!(
+        order,
+        ["mint", "lost", "mint"],
+        "told before the second mint"
+    );
 }
 
 /// Catches inputs the store lost (found when the next attempt's tree is written) answered as

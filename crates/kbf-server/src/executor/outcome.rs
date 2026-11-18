@@ -38,7 +38,7 @@
 //! | failed to start exclusive-not-ready | `infra` | `UNAVAILABLE`: rerun |
 //! | failed to start input-unavailable | `infra` | `UNAVAILABLE`: a host path the job named could not be read on its host, rerun |
 //! | failed to start host-unsafe | `infra` | `UNAVAILABLE`: rerun |
-//! | failed to start, any code, its detail naming an object of its tree the store answered 404 for | `infra` | `UNAVAILABLE`: the frontend drops what its state says of the object, and the next attempt's tree is checked against the store, rerun |
+//! | failed to start, any code, its detail naming an object of its tree the store answered 404 for | `infra` | `UNAVAILABLE`: the frontend drops what its memos say of the object and tells its packs of the absence, and the next attempt's tree is checked against the store, rerun |
 //! | failed to start egress-unchecked | `infra` | `UNAVAILABLE`: the host's agent could not check the limits of the job's network, rerun |
 //! | failed to start, any other code or detail | `infra` | `UNAVAILABLE`: rerun |
 //! | in a state this server does not know | `infra` | `UNAVAILABLE`: rerun |
@@ -60,12 +60,17 @@
 //! **A lost object.** The detail of a start that failed on any code is also read for one thing
 //! more: 64 lower-case hex digits right before `: upstream 404`, which is how tierstore says the
 //! store has no object of a SHA-256 the job's tree names (`cannot fetch manifest <sha256>:
-//! upstream 404`) ([`lost_object`]). The store is a general-purpose one, and its objects can
-//! vanish while the frontend's state still names them. Only those digits are taken, and logged;
-//! the callers get a fixed phrase. The run is `infra` ([`Verdict::StoreLost`]): before the next
-//! attempt the frontend drops what its state says of the object, and writes that attempt's tree
-//! checked against the store, so a pack the store lost is forgotten and its blobs reported
-//! missing ([`Settled::Missing`]), which the client uploads again.
+//! upstream 404`) ([`lost_object`]); or else an object key under `cas/` right after
+//! `source missing: `, which is how tierstore says the store has no object a span of the tree is
+//! read from (`404 source missing: <key>`) ([`source_missing`]). The store is a general-purpose
+//! one, and its objects can vanish while the frontend's state still names them; and a store can
+//! answer "not found" for a while for an object it holds. Only those digits or that key are
+//! taken, and logged; the callers get a fixed phrase. The run is `infra`
+//! ([`Verdict::StoreLost`]): before the next attempt the frontend drops what its memos say of
+//! the object, tells its packs of the absence (a pack is forgotten only once a second look, some
+//! time after the first absence, confirms it), and writes that attempt's tree checked against
+//! the store, so a pack forgotten has its blobs reported missing ([`Settled::Missing`]), which
+//! the client uploads again.
 //!
 //! What a job that did not end well wrote goes with the status as a detail, cut to a cap
 //! ([`output`](super::output)); the code and the message above are unchanged by it.
@@ -79,6 +84,8 @@ use kbf_job_client::Error;
 use kbf_proto::google::rpc::{self, ErrorInfo};
 use prost::Message;
 use tonic::Code;
+
+use super::traits::LostObject;
 
 /// How many times an operation is submitted again after a run that ended for a reason of the
 /// farm's (`infra`, `lost`, `out-of-memory`): each is a new attempt, a new job and a new key.
@@ -94,11 +101,11 @@ pub(super) enum Verdict {
     Ingest,
     /// The job did not produce a result.
     Settled(Settled),
-    /// The job did not start because the store does not have an object of its tree, `object`
-    /// (its SHA-256): the frontend's state is told before the run ends as `settled`.
+    /// The job did not start because the store does not have an object of its tree, `object`:
+    /// the frontend's state is told before the run ends as `settled`.
     StoreLost {
-        /// The SHA-256 the store answered 404 for.
-        object: [u8; 32],
+        /// The object the store answered 404 for.
+        object: LostObject,
         /// How the run ends: `infra`.
         settled: Settled,
     },
@@ -165,6 +172,42 @@ pub(super) fn lost_object(detail: &str) -> Option<[u8; 32]> {
         }
     }
     None
+}
+
+/// What tierstore writes right before the key of an object a span of a tree is read from, when
+/// the store does not have it.
+const SOURCE_MISSING: &str = "source missing: ";
+
+/// The longest object key a store takes, in bytes.
+const MAX_KEY_BYTES: usize = 1024;
+
+/// The key of the object a start failure's `detail` says is a missing source of the job's tree:
+/// the run of key characters (ASCII letters and digits, `/`, `.`, `_`, `-`) right after
+/// [`SOURCE_MISSING`], when it starts `cas/`, names something under it, and is at most
+/// [`MAX_KEY_BYTES`] long (the first such), or `None`. Nothing else of the detail is read.
+pub(super) fn source_missing(detail: &str) -> Option<String> {
+    let is_key = |c: char| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-');
+    let mut rest = detail;
+    while let Some(found) = rest.find(SOURCE_MISSING) {
+        rest = &rest[found + SOURCE_MISSING.len()..];
+        let end = rest.find(|c: char| !is_key(c)).unwrap_or(rest.len());
+        let key = &rest[..end];
+        let named = key
+            .strip_prefix("cas/")
+            .is_some_and(|under| !under.is_empty());
+        if named && key.len() <= MAX_KEY_BYTES {
+            return Some(key.to_owned());
+        }
+    }
+    None
+}
+
+/// The object a start failure's `detail` says the store does not have: a manifest
+/// ([`lost_object`]) first, else a source ([`source_missing`]).
+pub(super) fn lost_of(detail: &str) -> Option<LostObject> {
+    lost_object(detail)
+        .map(LostObject::Manifest)
+        .or_else(|| source_missing(detail).map(LostObject::Source))
 }
 
 /// The 32 bytes `hex` (64 bytes, as its one caller cuts it) spells, when every byte is a
@@ -250,10 +293,13 @@ fn promote(job: &Job, result: &JobResult) -> Verdict {
 
 /// The verdict on a job that did not start.
 fn failed_to_start(job: &Job) -> Verdict {
-    if let Some(object) = lost_object(&job.start_failure_detail) {
+    if let Some(object) = lost_of(&job.start_failure_detail) {
         let detail_bytes = job.start_failure_detail.len();
-        let object_hex = hex(&object);
-        tracing::warn!(job = %job.id, detail_bytes, object = %object_hex, "the job failed to start: the store does not have an object of its tree");
+        let object_named = match &object {
+            LostObject::Manifest(sha) => hex(sha),
+            LostObject::Source(key) => key.clone(),
+        };
+        tracing::warn!(job = %job.id, detail_bytes, object = %object_named, "the job failed to start: the store does not have an object of its tree");
         let why = "the job failed to start: the store does not have an object of its tree";
         return Verdict::StoreLost {
             object,

@@ -52,12 +52,15 @@
 //! **A lost object** is one the frontend's state names and the store does not have: the store is
 //! general-purpose, and its objects can vanish. A job whose tree named a manifest the store lost
 //! says so, and [`TreeWriter::lost_manifest`] drops the memo's entries that name it and every
-//! entry above them, and the place memo whole. The next tree of that action is written with
-//! [`TreeWriter::write_checked`] (or [`TreeWriter::write_listing_checked`]): no memo hit, no
-//! remembered place, and every pack it names asked after in the store ([`check`]); a pack the
-//! store lacks is forgotten by the pack index, both memos are dropped whole, and the tree is
-//! refused naming its blobs ([`NoTree::Lost`], `why` `missing`), which are then missing for
-//! FindMissingBlobs too.
+//! entry above them, and the place memo whole; a job whose tree named a span of a pack the store
+//! answered absent says so, and [`TreeWriter::lost_pack`] drops the memo's entries whose
+//! manifests name a span of that pack, every entry above them, and the places in it. The next tree
+//! of that action is written with [`TreeWriter::write_checked`] (or
+//! [`TreeWriter::write_listing_checked`]): no memo hit, no remembered place, and every pack it
+//! names asked after in the store ([`check`]); a pack the store lacks is an absence, which the
+//! packs' loss guard confirms only with a second look some time after the first, and once the
+//! pack index forgets it both memos are dropped whole and the tree is refused naming its blobs
+//! ([`NoTree::Lost`], `why` `missing`), which are then missing for FindMissingBlobs too.
 //!
 //! **The tree list** ([`listing`], [`TreeWriter::write_listing`]) is the same action tree as one
 //! object, tierstore's tree list in its version 2, the `TSTREE` layout ([`tstree`]): every entry
@@ -450,6 +453,16 @@ impl TreeWriter {
         self.write_as(kept, base, Trust::Store, named).await
     }
 
+    /// Drops what the memos say of the pack `key`, which the store answered a job absent for:
+    /// every memo entry whose manifest names a span of it and every entry above one, and every
+    /// place in it the place memo holds; the next tree that holds those blobs looks them up in
+    /// the pack index again. Returns whether either memo named the pack.
+    pub fn lost_pack(&self, key: &str) -> bool {
+        let entries = self.lock().forget_pack(key);
+        let places = self.remembered().forget_pack(key);
+        entries + places > 0
+    }
+
     /// Drops what the memos say of a manifest the store lost (`manifest`, its SHA-256): every
     /// memo entry that names it and every entry above one, and the place memo whole, since
     /// the store that lost one object may have lost the packs the memo places blobs in. Returns
@@ -524,7 +537,7 @@ impl TreeWriter {
         let tree = ActionTree { digest: root.tree };
         named(&tree);
         self.write_whole(unlocated, now).await?;
-        self.store_built(&plan, &built, &measures, &manifests)
+        self.store_built(&plan, &built, &measures, &manifests, &places)
             .await?;
         let flights = &self.flights;
         flights
@@ -586,7 +599,7 @@ impl TreeWriter {
             manifests.insert(*digest, manifest.digest);
             built.push(manifest);
         }
-        self.store_built(&plan, &built, &measures, &manifests)
+        self.store_built(&plan, &built, &measures, &manifests, &places)
             .await?;
         Ok(manifests[root])
     }
@@ -722,6 +735,7 @@ impl TreeWriter {
         built: &[Manifest],
         measures: &BTreeMap<Digest, Measure>,
         manifests: &BTreeMap<Digest, Digest>,
+        places: &BTreeMap<Digest, Place>,
     ) -> Result<(), NoTree> {
         // Collected, as `place`'s asks are, so the future can be proved `Send`.
         let writes: Vec<_> = built
@@ -738,12 +752,19 @@ impl TreeWriter {
         while let Some((answer, (digest, directory))) = stored.next().await {
             answer?;
             let children = directory.directories.iter().map(|(_, child)| *child);
+            let packs: BTreeSet<&String> = (directory.files.iter())
+                .filter_map(|(_, file, _)| match places.get(file) {
+                    Some(Place::Packed { key, .. }) => Some(key),
+                    _ => None,
+                })
+                .collect();
             self.lock().put(
                 *digest,
                 Remembered {
                     manifest: manifests[digest],
                     measure: measures[digest],
                     children: children.collect(),
+                    packs: packs.into_iter().cloned().collect(),
                 },
             );
         }

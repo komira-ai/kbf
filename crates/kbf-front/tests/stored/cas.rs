@@ -306,7 +306,7 @@ async fn stored_over_open_packs_shares_their_pack_keys() {
     use crate::support::Spy;
 
     let store = Arc::new(Spy::new());
-    let index = Arc::new(Index::new());
+    let index = Arc::new(Index::new(Arc::default()));
     let keys = PackKeys::new(WriterKind::Frontend, "fe1", "boot1").expect("keys");
     let settings = PackSettings {
         max_blob_bytes: SMALL,

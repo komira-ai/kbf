@@ -22,7 +22,7 @@ use kbf_objstore::{
 use kbf_pack::{PackKeys, WriterKind};
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_pack_index::{
-    BlobDigest, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
+    BlobDigest, Forgot, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
 };
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::{
@@ -665,8 +665,8 @@ impl PackIndex for Index {
         self.inner.drop_location(digest, pack_key)
     }
 
-    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
-        self.inner.forget_pack(pack_key)
+    fn forget_pack(&self, pack_key: &str, min_age: Duration) -> Result<Forgot, PackIndexError> {
+        self.inner.forget_pack(pack_key, min_age)
     }
 
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {
