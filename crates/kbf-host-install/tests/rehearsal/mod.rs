@@ -11,6 +11,14 @@
 //! `--restart-unit` pointed at the one `kbf` unit here (an operator edits that line the same
 //! way); and that `kbf` unit, a storage node that runs `releases/current/kbf`.
 //!
+//! The installer first, as on a real host: when N+1 declares a `protocol`, `min_protocol` or
+//! `state_schema` above N's, which is what N's installer understands (both read the same
+//! numbers of their build), N's installer refuses N+1 (`installer_too_old`), and an operator
+//! puts the newer installer on the host before the update (`docs/deploy/host-install.md`). The
+//! rehearsal does the same: N+1's `kbf-host-install` replaces N's at `/usr/libexec/kbf` before
+//! the helper starts ([`installer_for`]). Otherwise the helper stays N's, so a release N's
+//! helper cannot take for any other reason still fails here.
+//!
 //! Every command's output and the units' journal go to `target/update-rehearsal` (the
 //! workflow uploads it). The workflow leaves its read-only token in
 //! `/var/tmp/kbf-update-rehearsal.token`; the channel's `token_file` is a root-owned copy.
@@ -309,6 +317,40 @@ pub fn install_file(text: &str, path: &str, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// Whose `kbf-host-install` the host runs when it is asked for N+1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Installer {
+    /// Release N's, the one the host was laid out with.
+    Previous,
+    /// Release N+1's, put on the host first: N+1 declares a number N's installer does not
+    /// understand.
+    Next,
+}
+
+/// The numbers of `kbf --version --json` an installer must understand to stage a release, in
+/// the order its refusal names them (`kbf_installer::stage::supported`).
+pub const UNDERSTOOD: [&str; 3] = ["protocol", "min_protocol", "state_schema"];
+
+/// Whose installer the host needs for N+1, from the version facts of N (`from`) and N+1
+/// (`to`): N+1's when any of the [`UNDERSTOOD`] numbers N+1 declares is above N's, since an
+/// installer understands the numbers its own build's `kbf` declares and no more; N's
+/// otherwise, a lower number included. A fact that is not a number stops the rehearsal.
+pub fn installer_for(from: &Value, to: &Value) -> Installer {
+    let number = |facts: &Value, which: &str, key: &str| {
+        facts[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{which}'s `{key}` is not a number: {facts}"))
+    };
+    let raised = UNDERSTOOD
+        .iter()
+        .any(|key| number(to, "N+1", key) > number(from, "N", key));
+    if raised {
+        Installer::Next
+    } else {
+        Installer::Previous
+    }
+}
+
 /// One release of the rehearsal.
 pub struct Release {
     pub tag: String,
@@ -327,6 +369,17 @@ pub struct Rehearsal {
     /// N+1's version as a host reports it: `<semver>+g<12 hex digits of the commit>`, from
     /// N+1's version facts.
     pub version: String,
+    /// Whose `kbf-host-install` the host runs for the update.
+    pub installer: Installer,
+}
+
+/// A release's version facts (`kbf --version --json` of its Linux x86_64 `kbf`), downloaded
+/// into its directory.
+fn facts_of(token: &str, tag: &str, dir: &Path, commit: &str) -> Value {
+    let name = format!("kbf-{commit}-linux-x86_64.version.json");
+    download(token, tag, dir, std::slice::from_ref(&name));
+    let text = fs::read_to_string(dir.join(&name)).unwrap();
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tag}: {name}: {e}"))
 }
 
 /// The two releases, from the token the workflow left and the listing of the releases.
@@ -356,22 +409,28 @@ pub fn plan() -> Rehearsal {
     fs::create_dir_all(&work).unwrap();
     fs::set_permissions(&work, fs::Permissions::from_mode(0o755)).unwrap();
 
-    // The commits, from each release's SHA256SUMS; N+1's version, from its version facts.
+    // The commits, from each release's SHA256SUMS; N+1's version and whose installer the
+    // host needs, from their version facts.
     let (old_dir, new_dir) = (work.join(&from), work.join(&to));
     download(&token, &from, &old_dir, &[]);
     let old = commit_of(&fs::read_to_string(old_dir.join("SHA256SUMS")).unwrap());
     download(&token, &to, &new_dir, &[]);
     let new = commit_of(&fs::read_to_string(new_dir.join("SHA256SUMS")).unwrap());
     assert_ne!(old, new, "{from} and {to} are the same commit");
-    let facts_name = format!("kbf-{new}-linux-x86_64.version.json");
-    download(&token, &to, &new_dir, std::slice::from_ref(&facts_name));
-    let facts: Value =
-        serde_json::from_str(&fs::read_to_string(new_dir.join(&facts_name)).unwrap()).unwrap();
+    let old_facts = facts_of(&token, &from, &old_dir, &old);
+    let facts = facts_of(&token, &to, &new_dir, &new);
     let version = format!(
         "{}+g{}",
         facts["version"].as_str().expect("a version"),
         &new[..12]
     );
+    let installer = installer_for(&old_facts, &facts);
+    if installer == Installer::Next {
+        println!(
+            "{to} declares a number {from}'s installer does not understand: \
+             the host gets {to}'s kbf-host-install first"
+        );
+    }
     Rehearsal {
         token,
         from: Release {
@@ -386,6 +445,7 @@ pub fn plan() -> Rehearsal {
         },
         work,
         version,
+        installer,
     }
 }
 
@@ -409,7 +469,9 @@ pub fn kbf_unit(account: &str, flags: &str) -> String {
 }
 
 /// Release N's files: its `kbf`, `kbf-host-install`, `kbf-deploy` and package, downloaded
-/// and unpacked under its directory: `release/`, `helper/`, `deploy/` and `deb/`.
+/// and unpacked under its directory: `release/`, `helper/`, `deploy/` and `deb/`; and, when
+/// the host needs N+1's installer ([`Installer::Next`]), N+1's `kbf-host-install`, unpacked
+/// under N+1's directory's `helper/`.
 pub fn fetch_old_release(r: &Rehearsal) {
     let (old, dir) = (&r.from.commit, &r.from.dir);
     let names = ["kbf", "kbf-host-install", "kbf-deploy"]
@@ -438,10 +500,35 @@ pub fn fetch_old_release(r: &Rehearsal) {
             .arg(dir.join(&deb))
             .arg(dir.join("deb")),
     );
+    if r.installer == Installer::Next {
+        let (new, dir) = (&r.to.commit, &r.to.dir);
+        let name = format!("kbf-host-install-{new}-linux-x86_64.tar.gz");
+        download(&r.token, &r.to.tag, dir, std::slice::from_ref(&name));
+        let into = dir.join("helper");
+        fs::create_dir_all(&into).unwrap();
+        run(
+            "untar_next_helper",
+            Command::new("tar")
+                .arg("-xzf")
+                .arg(dir.join(&name))
+                .arg("-C")
+                .arg(&into),
+        );
+    }
+}
+
+/// The directory whose `kbf-host-install` the host runs: N's, or N+1's when it needs N+1's
+/// installer.
+fn installer_dir(r: &Rehearsal) -> PathBuf {
+    match r.installer {
+        Installer::Previous => r.from.dir.join("helper"),
+        Installer::Next => r.to.dir.join("helper"),
+    }
 }
 
 /// Lays the host out from release N: the trust files and accounts of N's package, the
-/// updater's account, N's `kbf` through its own `kbf-deploy`, N's helper, the channel, and the
+/// updater's account, N's `kbf` through its own `kbf-deploy`, N's helper (then N+1's in its
+/// place, installer first, when the host needs it: [`Installer::Next`]), the channel, and the
 /// units (`kbf_unit` for the `kbf` unit, the packaged helper unit pointed at it). Nothing is
 /// started. Returns the checkout's `packaging/host-agent/linux`.
 pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
@@ -496,14 +583,26 @@ pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
             .arg(dir.join("helper/kbf-host-install"))
             .arg(HELPER),
     );
+    // The installer first: N+1's helper over N's, before the helper starts, as an operator
+    // puts the newer installer on a host before an update its own installer refuses.
+    let installer = installer_dir(r).join("kbf-host-install");
+    if r.installer == Installer::Next {
+        run(
+            "helper_binary_next",
+            Command::new("install")
+                .args(["-D", "-o", "root", "-g", "root", "-m", "0755"])
+                .arg(&installer)
+                .arg(HELPER),
+        );
+    }
     fs::create_dir_all("/etc/kbf").unwrap();
-    // The channel as the farm's nodes name theirs, with a token file when release N's helper
+    // The channel as the farm's nodes name theirs, with a token file when the host's helper
     // takes GitHub's Actions token: a hosted runner's address shares GitHub's anonymous quota
     // with other jobs, so the helper lists the releases under the run's own read-only token.
     // The helper reads a token file that is root's alone, so the workflow's file (the runner
     // user's) is copied to one root owns, and removed when the rehearsal ends.
     let _ = fs::remove_file(CHANNEL_TOKEN);
-    let channel = if takes_actions_token(&dir.join("helper/kbf-host-install")) {
+    let channel = if takes_actions_token(&installer) {
         let token = fs::read_to_string(TOKEN_FILE).unwrap_or_else(|e| panic!("{TOKEN_FILE}: {e}"));
         {
             use std::io::Write as _;
@@ -520,7 +619,10 @@ pub fn lay_out(r: &Rehearsal, kbf_unit: &str) -> PathBuf {
     } else {
         // Only the first release after the helper learned the token can be here: its
         // predecessor's helper refuses a token of this length (`config_invalid`).
-        eprintln!("release {old}'s helper takes no Actions token: its channel names none");
+        eprintln!(
+            "the host's helper ({}) takes no Actions token: its channel names none",
+            installer.display()
+        );
         format!("[channels.{CHANNEL}]\nsource = \"github\"\n")
     };
     install_file(&channel, CHANNELS, 0o644);
@@ -614,6 +716,112 @@ mod tests {
                 .collect()
         };
         assert_eq!(others(&placed), others(&packaged));
+    }
+
+    /// Version facts in the form a release publishes them (`kbf --version --json`): protocol
+    /// 1, min_protocol 1, state_schema 3.
+    const BEFORE: &str = r#"{"admin_protocol":1,"commit":"aaaaaaaaaaaa","commit_full":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta_log":5,"min_protocol":1,"profile":"release","protocol":1,"relay":1,"seq":7629,"state_schema":3,"version":"0.1.0"}"#;
+
+    /// [`BEFORE`] with `key` set to `value`.
+    fn with(key: &str, value: Value) -> Value {
+        let mut facts: Value = serde_json::from_str(BEFORE).unwrap();
+        facts[key] = value;
+        facts
+    }
+
+    /// The case of a release that adds a state schema: N declares `state_schema` 3, N+1
+    /// declares 4, as N's installer refuses ("the release needs a newer installer:
+    /// state_schema 4; this installer understands up to 3"). The host gets N+1's installer,
+    /// from N+1's own directory.
+    ///
+    /// Catches the rehearsal staging N+1 with N's installer whatever N+1 declares.
+    #[test]
+    fn a_release_one_state_schema_above_gets_its_own_installer_first() {
+        let from: Value = serde_json::from_str(BEFORE).unwrap();
+        let to = with("state_schema", 4.into());
+        assert_eq!(installer_for(&from, &to), Installer::Next);
+        let r = Rehearsal {
+            token: String::new(),
+            from: Release {
+                tag: "v0.0.1".to_owned(),
+                commit: "a".repeat(40),
+                dir: PathBuf::from("work/v0.0.1"),
+            },
+            to: Release {
+                tag: "v0.0.2".to_owned(),
+                commit: "b".repeat(40),
+                dir: PathBuf::from("work/v0.0.2"),
+            },
+            work: PathBuf::from("work"),
+            version: String::new(),
+            installer: installer_for(&from, &to),
+        };
+        assert_eq!(installer_dir(&r), Path::new("work/v0.0.2/helper"));
+        let r = Rehearsal {
+            installer: Installer::Previous,
+            ..r
+        };
+        assert_eq!(installer_dir(&r), Path::new("work/v0.0.1/helper"));
+    }
+
+    /// Each number the installer checks, raised by one alone, needs N+1's installer; the same
+    /// numbers, a lower state schema (N's installer understands it), and a change in the facts
+    /// the installer does not check (the version, `seq`, `meta_log`, `admin_protocol`,
+    /// `relay`) keep N's, so the rehearsal still proves N's helper takes N+1.
+    ///
+    /// Catches a number left out of the rule (a raised protocol staged with N's installer) and
+    /// a rule that swaps the installer for any difference at all.
+    #[test]
+    fn only_a_raised_installer_number_swaps_the_installer() {
+        let from: Value = serde_json::from_str(BEFORE).unwrap();
+        for key in UNDERSTOOD {
+            let raised = from[key].as_u64().unwrap() + 1;
+            assert_eq!(
+                installer_for(&from, &with(key, raised.into())),
+                Installer::Next,
+                "{key} raised"
+            );
+        }
+        assert_eq!(installer_for(&from, &from), Installer::Previous);
+        assert_eq!(
+            installer_for(&from, &with("state_schema", 2.into())),
+            Installer::Previous
+        );
+        for (key, value) in [
+            ("version", Value::from("0.2.0")),
+            ("seq", 9999.into()),
+            ("meta_log", 6.into()),
+            ("admin_protocol", 2.into()),
+            ("relay", 2.into()),
+        ] {
+            assert_eq!(
+                installer_for(&from, &with(key, value)),
+                Installer::Previous,
+                "{key} changed"
+            );
+        }
+    }
+
+    /// Facts that lack a number the rule reads stop the rehearsal, naming the release and the
+    /// key, rather than guessing whose installer to run.
+    ///
+    /// Catches a missing `state_schema` read as 0, which would keep N's installer.
+    #[test]
+    #[should_panic(expected = "N+1's `state_schema` is not a number")]
+    fn facts_without_a_number_stop_the_rehearsal() {
+        let from: Value = serde_json::from_str(BEFORE).unwrap();
+        let mut to = from.clone();
+        to.as_object_mut().unwrap().remove("state_schema");
+        installer_for(&from, &to);
+    }
+
+    /// The same, for N's facts.
+    #[test]
+    #[should_panic(expected = "N's `protocol` is not a number")]
+    fn previous_facts_without_a_number_stop_the_rehearsal() {
+        let from = with("protocol", Value::from("1"));
+        let to: Value = serde_json::from_str(BEFORE).unwrap();
+        installer_for(&from, &to);
     }
 
     /// Catches a rate-limited helper reported as a bare "deploy_farm failed", and a journal

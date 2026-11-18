@@ -23,7 +23,8 @@
 //!   for placed certificates), the
 //!   simplest of the supported ways: enrolling needs a token and the frontend's enroll listener
 //!   for a result that is the same files;
-//! - release N's helper and `kbf` on the host, as in the first rehearsal;
+//! - release N's `kbf` and helper on the host, as in the first rehearsal (N+1's helper when N+1
+//!   needs a newer installer: the installer first);
 //! - release N's `kbf --mode=storage`, as the farm's storage nodes run it, under a unit as the
 //!   account the storage rehearsal uses;
 //! - a real frontend of release N (`kbf --mode=frontend`, a SQLite state store, the farm CA, the

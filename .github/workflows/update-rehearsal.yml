@@ -10,7 +10,9 @@
 # `rehearse-agent` (crates/kbf-host-install/tests/update_rehearsal_agent.rs): through the whole
 # control loop the farm uses. The coordinator is this checkout's, `cargo xtask deploy-farm` is
 # given the version `cargo xtask release farm-version` prints, and the agent, the helper, the
-# frontend and the host's `kbf` are the release before the newest. A pull request that changes
+# frontend and the host's `kbf` are the release before the newest. In both, when the newest
+# release declares a protocol or state schema the previous installer does not understand, its
+# own kbf-host-install is put on the host first, as an operator would. A pull request that changes
 # the coordinator, the agent's wire, the deploy verb or the OIDC verifier is rehearsed with them.
 #
 # `rehearse-tierstore` (crates/kbf-host-install/tests/update_rehearsal_tierstore.rs): tierstore as

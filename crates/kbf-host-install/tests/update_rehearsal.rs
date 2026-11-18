@@ -11,13 +11,17 @@
 //! updater's account from this checkout's `packaging/host-agent/linux`, the unit's
 //! `--restart-unit` pointed at the one `kbf` unit here (an operator edits that line the same
 //! way); and that `kbf` unit, a storage node on a `file://` cold store that runs
-//! `releases/current/kbf`.
+//! `releases/current/kbf`. When N+1 declares a `protocol`, `min_protocol` or `state_schema`
+//! above N's, which N's installer would refuse as too old, N+1's `kbf-host-install` replaces
+//! N's before the helper starts: the installer first, then the release, as an operator updates
+//! such a host (`rehearsal::installer_for`).
 //!
-//! What it proves: the helper of N, confined by the shipped unit, fetches and verifies N+1,
+//! What it proves: the host's helper (N's, or N+1's when N+1 needs a newer installer), confined
+//! by the shipped unit, fetches and verifies N+1,
 //! switches to it, restarts the unit onto N+1's binary, and confirms it. What it catches: any
 //! of those steps failing, among them a unit that leaves the helper unable to drop to the
 //! account it fetches as (`User=root` did that: every fetch failed with `Operation not
-//! permitted`), a release N+1 whose files the helper of N refuses, and a switch that does not
+//! permitted`), a release N+1 whose files the host's helper refuses, and a switch that does not
 //! leave the unit running N+1. Not covered here: the agent, the coordinator and a frontend's
 //! drain and health check.
 //!

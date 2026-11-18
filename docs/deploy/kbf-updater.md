@@ -672,7 +672,11 @@ The job starts only after `rehearse` and `rehearse-agent` pass, on hosted runner
 `kbf-deploy host install`, its `kbf-host-install`, its package's trust files and accounts, this
 release's helper unit) is updated to this release by the real helper through its local socket, as
 the agent asks for it (`install`, `switch`, `confirm`), with the release fetched from GitHub by
-the helper itself (`crates/kbf-host-install/tests/update_rehearsal.rs`). In `rehearse-agent` the
+the helper itself (`crates/kbf-host-install/tests/update_rehearsal.rs`). When this release
+declares a `protocol`, `min_protocol` or `state_schema` above the release before it, which that
+release's installer refuses as too old, the host gets this release's `kbf-host-install` before the
+update, in both rehearsals: the installer first, then the release, as an operator updates such a
+host. In `rehearse-agent` the
 same host is updated through the control loop of this page: this commit's coordinator, with a
 throwaway farm CA and an allow-list as above; `cargo xtask deploy-farm`, given the version that
 `cargo xtask release farm-version` prints, as the next step is; the release before this one's
