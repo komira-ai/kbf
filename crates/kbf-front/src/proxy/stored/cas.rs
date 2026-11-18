@@ -118,6 +118,7 @@ impl ContentAddressableStorage for StoredCas {
         request: Request<BatchReadBlobsRequest>,
     ) -> Result<Response<BatchReadBlobsResponse>, Status> {
         let caller = kbf_auth::metadata(&request);
+        let deadline = deadline::of_metadata(request.metadata());
         let request = request.into_inner();
         let call = cas_call!("BatchReadBlobs");
         let authorizer = &self.authorizers.cas_get;
@@ -133,7 +134,9 @@ impl ContentAddressableStorage for StoredCas {
                 "batch asks for {total} bytes; at most {MAX_BATCH_TOTAL_BYTES} are allowed"
             )));
         }
-        let served = packed::read_many(self.stored.packs(), &request.digests).await;
+        // Within the call's deadline: a read waits out a store that answers 503.
+        let read = async { Ok(packed::read_many(self.stored.packs(), &request.digests).await) };
+        let served = deadline::within_read(deadline, read).await?;
         let responses = stream::iter(request.digests)
             .map(|asked| {
                 let read = match wire::digest(Some(&asked)) {

@@ -178,11 +178,12 @@ pub(super) fn args() -> [Arg; 11] {
                  them, and the blobs and manifests of action trees. A write past it waits at \
                  the frontend for one to end, so a burst queues here and not at the store. A \
                  pack the store answers 503 SlowDown (it is taking as many uploads as it can) \
-                 is written again after waits from 0.5 s doubling to 8 s, holding its slot, for \
-                 as long as the store answers it: the client sees the time it takes, and an \
-                 upload whose grpc-timeout passes first is ended DEADLINE_EXCEEDED. A streamed \
-                 upload of a client blob over 64 MiB cannot be sent twice, so a SlowDown fails \
-                 it. Used only with `--pack-store-endpoint`",
+                 is written again after jittered waits that double from about 0.5 s to 8 s, \
+                 holding its slot, for as long as the store answers it; any other 503, to any \
+                 call of the store, is waited out the same way for at most 60 s. The client \
+                 sees the time it takes, and a call whose grpc-timeout passes first is ended \
+                 DEADLINE_EXCEEDED. A streamed upload of a client blob over 64 MiB cannot be \
+                 sent twice, so a 503 fails it. Used only with `--pack-store-endpoint`",
             ),
         Arg::new(WRITER)
             .long("pack-writer")

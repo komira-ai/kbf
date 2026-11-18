@@ -18,19 +18,16 @@
 //!   keeps sending slowly keeps it. As many such uploads as there are slots leave none for the
 //!   other writers until one ends. Streamed writes are not given a share of their own, because
 //!   the action trees' blobs and manifests are streamed writes too, and would share it.
-//! - **`SlowDown`.** tierstore answers a 503 `SlowDown` when it is taking as many uploads as it
-//!   can: back-pressure, not a fault. A write whose body is in hand ([`ObjectStore::put_new`]) is
-//!   made again after a wait that starts at [`FIRST_WAIT`] and doubles up to [`LONGEST_WAIT`], for
-//!   as long as the store answers it. What ends it is the caller: a client upload whose
-//!   deadline passes drops the write, and with it the wait and the slot; a writer of the
-//!   frontend's own (an action tree's preparation, base publication) ends it by its own limit,
-//!   or waits for the store. A streamed write
-//!   ([`ObjectStore::put_stream`]) reads a body that cannot be read twice, so its `SlowDown` is
-//!   its caller's answer, as every other answer of the store is.
+//! - **The store's 503s.** Under the slots, every call waits out a store that answers 503
+//!   ([`Waiting`], as [`crate::store_wait`] says): a whole write waits holding its slot, its
+//!   `SlowDown` for as long as the store answers it and any other 503 for at most
+//!   [`STORE_WAIT`](crate::store_wait::STORE_WAIT); a read, a length, a delete or a listing waits
+//!   holding none. A streamed write ([`ObjectStore::put_stream`]) reads a body that cannot be
+//!   read twice, so it is made once, and the store's answer is its caller's.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use kbf_objstore::{
@@ -39,36 +36,26 @@ use kbf_objstore::{
 };
 use tokio::sync::Semaphore;
 
-use crate::action_tree::{FIRST_WAIT, LONGEST_WAIT, Sleeper, is_slow_down, tokio_sleeper};
+use crate::store_wait::{Backoff, Waiting};
 
 /// The default of `--pack-store-writes`: the most writes a frontend has at its pack store at once.
 pub const STORE_WRITES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(63);
 
-/// An object store whose writes share a fixed number of slots and wait out `SlowDown`.
+/// An object store whose writes share a fixed number of slots and whose calls wait out its 503s.
 pub(crate) struct StoreWrites<S> {
-    inner: Arc<S>,
+    inner: Waiting<S>,
     slots: Semaphore,
-    sleeper: Arc<dyn Sleeper>,
 }
 
 impl<S: ObjectStore> StoreWrites<S> {
-    /// `inner`, with at most `slots` writes at it at once, waiting on the tokio timer.
-    pub(crate) fn new(inner: Arc<S>, slots: NonZeroUsize) -> Self {
-        Self::with_sleeper(inner, slots, tokio_sleeper())
-    }
-
-    /// [`StoreWrites::new`] waiting with `sleeper` (a test records the waits instead).
-    pub(crate) fn with_sleeper(
-        inner: Arc<S>,
-        slots: NonZeroUsize,
-        sleeper: Arc<dyn Sleeper>,
-    ) -> Self {
+    /// `inner`, with at most `slots` writes at it at once, each call waiting out its 503s as
+    /// `backoff` says.
+    pub(crate) fn new(inner: Arc<S>, slots: NonZeroUsize, backoff: Backoff) -> Self {
         // A semaphore holds at most `Semaphore::MAX_PERMITS`; `--pack-store-writes` is far below.
         let slots = Semaphore::new(slots.get().min(Semaphore::MAX_PERMITS));
         Self {
-            inner,
+            inner: Waiting::new(inner, backoff),
             slots,
-            sleeper,
         }
     }
 }
@@ -87,17 +74,7 @@ impl<S: ObjectStore> ObjectStore for StoreWrites<S> {
         // Held until the write ends, its waits included. The semaphore is never closed, so this
         // is always a permit.
         let _slot = self.slots.acquire().await;
-        let mut wait = FIRST_WAIT;
-        loop {
-            match self.inner.put_new(key, body.clone(), retain_until).await {
-                Err(error) if is_slow_down(&error) => {
-                    tracing::debug!(%key, ?wait, "the store answered SlowDown; waiting");
-                    self.sleeper.sleep(wait).await;
-                    wait = next_wait(wait);
-                }
-                answer => return answer,
-            }
-        }
+        self.inner.put_new(key, body, retain_until).await
     }
 
     async fn put_stream(
@@ -139,11 +116,6 @@ impl<S: ObjectStore> ObjectStore for StoreWrites<S> {
     ) -> Result<ListPage, ObjectStoreError> {
         self.inner.list(prefix, after, max_keys).await
     }
-}
-
-/// The wait after `wait`: twice as long, at most [`LONGEST_WAIT`].
-fn next_wait(wait: Duration) -> Duration {
-    wait.saturating_mul(2).min(LONGEST_WAIT)
 }
 
 #[cfg(test)]

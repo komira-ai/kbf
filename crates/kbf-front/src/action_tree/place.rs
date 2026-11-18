@@ -10,7 +10,10 @@
 //!   `cas/l/<sha256>` with a create-only PUT ([`write_whole`]); then it is whole.
 //!
 //! The lookups (the index asks and the HEADs) answer within [`LOOKUP_DEADLINE`] together, or the
-//! tree is not made. A write streams the blob through a SHA-256 check and holds its last chunk
+//! tree is not made. A HEAD waits out a store that answers 503 for up to
+//! [`STORE_WAIT`](crate::store_wait::STORE_WAIT) ([`crate::store_wait`]), so the deadline is
+//! that wait and 30 s more: a store that fails over while a tree is looked up delays the tree,
+//! and does not end it. A write streams the blob through a SHA-256 check and holds its last chunk
 //! back until the whole has hashed to the digest, so a store never receives all of a blob whose
 //! bytes are wrong: the body ends in an error instead, and the store keeps nothing.
 
@@ -30,6 +33,7 @@ use super::NoTree;
 use super::retry::{Failed, PutRetry, repeating, retrying};
 use crate::job_read::BlobSource;
 use crate::large_backfill::{LargeStore, large_key};
+use crate::store_wait::STORE_WAIT;
 
 /// The most digests one ask of the pack index names.
 pub const LOCATE_CHUNK: usize = 4096;
@@ -44,7 +48,9 @@ pub const HEADS_IN_FLIGHT: usize = 16;
 pub(super) const WRITES_IN_FLIGHT: usize = 16;
 
 /// How long the lookups of one tree may take together: the index asks and the presence checks.
-pub const LOOKUP_DEADLINE: Duration = Duration::from_secs(30);
+/// It is longer than the most a presence check waits for a store that answers 503
+/// ([`STORE_WAIT`]), by 30 s.
+pub const LOOKUP_DEADLINE: Duration = STORE_WAIT.saturating_add(Duration::from_secs(30));
 
 /// Where a blob's bytes are, as a manifest names them.
 #[derive(Clone, Debug, PartialEq, Eq)]

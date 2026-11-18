@@ -194,6 +194,7 @@ impl ContentAddressableStorage for ProxyCas {
         request: Request<BatchReadBlobsRequest>,
     ) -> Result<Response<BatchReadBlobsResponse>, Status> {
         let caller = kbf_auth::metadata(&request);
+        let deadline = deadline::of_metadata(request.metadata());
         let request = request.into_inner();
         let authorizer = &self.authorizers.cas_get;
         let call = cas_call!("BatchReadBlobs");
@@ -210,10 +211,14 @@ impl ContentAddressableStorage for ProxyCas {
                 "batch asks for {total} bytes; at most {MAX_BATCH_TOTAL_BYTES} are allowed"
             )));
         }
-        // With packs the batch is read from them together; what they do not serve is asked of
-        // the nodes below, item by item.
+        // With packs the batch is read from them together, within the call's deadline (a read
+        // waits out a store that answers 503); what they do not serve is asked of the nodes
+        // below, item by item.
         let served = match &self.packs {
-            Some(packs) => packed::read_many(packs, &request.digests).await,
+            Some(packs) => {
+                let read = async { Ok(packed::read_many(packs, &request.digests).await) };
+                deadline::within_read(deadline, read).await?
+            }
             None => packed::Served::new(),
         };
         let served = &served;

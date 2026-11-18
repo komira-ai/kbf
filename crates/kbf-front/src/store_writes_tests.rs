@@ -1,7 +1,8 @@
 //! [`StoreWrites`]: the writes share the slots, a `SlowDown` of a write whose body is in hand is
-//! waited out holding the slot, and nothing else is repeated or bounded. The waits are recorded
-//! by a fake [`Sleeper`] (or held by one until a test lets them end), never taken, and every
-//! bound is checked by counting the calls the store saw.
+//! waited out holding the slot, and a streamed write is made once. (The waits for a store's
+//! other 503s are tested with [`Waiting`](crate::store_wait::Waiting), in `store_wait_tests`.)
+//! The waits are recorded by a fake [`Sleeper`] (or held by one until a test lets them end),
+//! never taken, and every bound is checked by counting the calls the store saw.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -13,6 +14,9 @@ use kbf_objstore::MemoryStore;
 use tokio::sync::{Semaphore, watch};
 
 use super::*;
+use crate::action_tree::{FIRST_WAIT, Sleeper};
+use crate::store_wait::{STORE_WAIT, no_jitter};
+use std::time::Duration;
 
 /// A memory store whose writes answer the errors scripted for them first, wait at a gate the
 /// test opens, and count how many are inside at once.
@@ -227,11 +231,8 @@ fn body(bytes: &'static [u8]) -> BodyStream {
 /// `slots` over `fake`, waiting with `sleeps`.
 fn over(fake: &Arc<Fake>, n: usize, sleeps: &Arc<Sleeps>) -> Arc<StoreWrites<Fake>> {
     let sleeper = Arc::clone(sleeps) as Arc<dyn Sleeper>;
-    Arc::new(StoreWrites::with_sleeper(
-        Arc::clone(fake),
-        slots(n),
-        sleeper,
-    ))
+    let backoff = Backoff::with(STORE_WAIT, sleeper, no_jitter(), Arc::default());
+    Arc::new(StoreWrites::new(Arc::clone(fake), slots(n), backoff))
 }
 
 /// Catches a `SlowDown` that fails a write, or one waited out on a schedule other than the
@@ -258,14 +259,13 @@ async fn a_slow_down_is_waited_out_with_doubling_waits() {
     assert_eq!(held.expect("read"), Bytes::from_static(b"abc"));
 }
 
-/// Catches a writer that repeats or swallows an answer other than `SlowDown`: a plain 503, a
-/// 500, a 403, a dead connection and a refusal to replace an object are each the write's
-/// answer on its first attempt, with no wait.
+/// Catches a writer that repeats or swallows an answer other than a 503: a 500, a 403, a dead
+/// connection and a refusal to replace an object are each the write's answer on its first
+/// attempt, with no wait.
 #[tokio::test]
 async fn every_other_answer_is_the_write_s_at_once() {
     let dead = || ObjectStoreError::Transport(Arc::new(std::io::Error::other("broken pipe")));
     let answers = [
-        service(503, "ServiceUnavailable"),
         service(500, "InternalError"),
         service(403, "AccessDenied"),
         dead(),
@@ -440,14 +440,6 @@ async fn reads_take_no_slot() {
 
     fake.gate.add_permits(1);
     stuck.await.expect("ran").expect("stored");
-}
-
-/// Catches a wait that grows past the longest, or overflows: doubling stops at [`LONGEST_WAIT`].
-#[test]
-fn the_wait_doubles_up_to_the_longest() {
-    assert_eq!(next_wait(FIRST_WAIT), FIRST_WAIT * 2);
-    assert_eq!(next_wait(LONGEST_WAIT), LONGEST_WAIT);
-    assert_eq!(next_wait(Duration::MAX), LONGEST_WAIT);
 }
 
 /// Catches a default bound that is not the flag's documented 64.

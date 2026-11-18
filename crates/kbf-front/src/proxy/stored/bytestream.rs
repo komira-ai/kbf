@@ -80,6 +80,7 @@ impl ByteStream for StoredByteStream {
         request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
         let caller = kbf_auth::metadata(&request);
+        let deadline = deadline::of_metadata(request.metadata());
         let request = request.into_inner();
         let resource = plain(Method::Read, &request.resource_name)?;
         let authorizer = &*self.authorizers.cas_get;
@@ -101,8 +102,10 @@ impl ByteStream for StoredByteStream {
             n => digest.size_bytes.min(offset.saturating_add(n)),
         };
         let packs = self.stored.packs();
+        // The first bytes come within the call's deadline: a read waits out a store that
+        // answers 503.
         let windows: Windows = if digest.size_bytes <= packs.max_blob_bytes() {
-            match packs.read(&digest).await? {
+            match deadline::within_read(deadline, packs.read(&digest)).await? {
                 Some(blob) => {
                     let wanted = blob.slice(offset as usize..end as usize);
                     stream::once(futures::future::ready(Ok(wanted))).boxed()
@@ -110,7 +113,7 @@ impl ByteStream for StoredByteStream {
                 None => return Err(not_held(&digest)),
             }
         } else {
-            match packs.read_large(&digest, offset, end).await? {
+            match deadline::within_read(deadline, packs.read_large(&digest, offset, end)).await? {
                 Some(windows) => windows,
                 None => return Err(not_held(&digest)),
             }

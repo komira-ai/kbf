@@ -99,3 +99,28 @@ async fn work_in_time_is_its_own_answer() {
     let refused = within(at, async { Err::<(), _>(Status::invalid_argument("no")) }).await;
     assert_eq!(refused.expect_err("its own").code(), Code::InvalidArgument);
 }
+
+/// Catches a read past its deadline that is not ended, or is ended saying a write's words: a read
+/// that never ends, given a deadline, is ended DEADLINE_EXCEEDED saying the store did not give
+/// its blobs, and one that ends in time, or has no deadline, is answered as it ended.
+#[tokio::test(start_paused = true)]
+async fn a_read_past_its_deadline_is_deadline_exceeded() {
+    let at = Instant::now() + Duration::from_secs(9);
+
+    let ended = within_read(Some(at), pending::<Result<(), Status>>()).await;
+
+    let status = ended.expect_err("ended");
+    assert_eq!(status.code(), Code::DeadlineExceeded);
+    assert_eq!(
+        status.message(),
+        "the call's deadline (grpc-timeout) passed before the store gave its blobs"
+    );
+    let at = Some(Instant::now() + Duration::from_secs(9));
+    assert_eq!(within_read(at, async { Ok(5) }).await.expect("in time"), 5);
+    assert_eq!(
+        within_read(None, async { Ok(6) })
+            .await
+            .expect("no deadline"),
+        6
+    );
+}

@@ -2,10 +2,13 @@
 //! margin, from when the handler began.
 //!
 //! A write to the store waits out the store's `SlowDown` and waits for one of the frontend's
-//! store-write slots (`crate::store_writes`), for as long as it takes. What bounds that is the
-//! client: an upload whose deadline passes is ended DEADLINE_EXCEEDED, which drops its write,
-//! its wait and its slot, so back-pressure is latency for the client and never UNAVAILABLE.
-//! A call without a `grpc-timeout` has no deadline and waits for the store.
+//! store-write slots (`crate::store_writes`), for as long as it takes, and a read or a write
+//! waits out the store's other 503s for up to `crate::store_wait::STORE_WAIT`. What bounds that
+//! first is the client: a call whose deadline passes is ended DEADLINE_EXCEEDED, which drops
+//! its request to the store, its wait and its slot, so a store that is busy or failing over is
+//! latency for the client and never UNAVAILABLE. A call without a `grpc-timeout` has no
+//! deadline and waits for the store. Uploads are bounded with [`within`], and reads (a
+//! `BatchReadBlobs`, and a ByteStream `Read` until its first bytes) with [`within_read`].
 //!
 //! The handler ends the call before the client's own deadline, by [`margin`]: the server's
 //! transport ends a call whose `grpc-timeout` has passed as CANCELLED, and the handler's
@@ -83,16 +86,38 @@ pub(crate) async fn within<T>(
     deadline: Option<Instant>,
     work: impl Future<Output = Result<T, Status>>,
 ) -> Result<T, Status> {
+    ended(deadline, "took its blobs", work).await
+}
+
+/// [`within`] for a read: the answer of `work`, or DEADLINE_EXCEEDED when `deadline` passes
+/// before the store gave the blobs.
+///
+/// # Errors
+/// DEADLINE_EXCEEDED, or the error of `work`.
+pub(crate) async fn within_read<T>(
+    deadline: Option<Instant>,
+    work: impl Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    ended(deadline, "gave its blobs", work).await
+}
+
+/// The answer of `work`, or DEADLINE_EXCEEDED when `deadline` passes first, saying that it
+/// passed before the store `did`.
+async fn ended<T>(
+    deadline: Option<Instant>,
+    did: &str,
+    work: impl Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
     let Some(at) = deadline else {
         return work.await;
     };
     match tokio::time::timeout_at(at, work).await {
         Ok(answer) => answer,
         Err(_) => {
-            tracing::warn!("an upload's deadline passed before the store took its blobs: ended");
-            Err(Status::deadline_exceeded(
-                "the call's deadline (grpc-timeout) passed before the store took its blobs",
-            ))
+            tracing::warn!("a call's deadline passed before the store {did}: ended");
+            Err(Status::deadline_exceeded(format!(
+                "the call's deadline (grpc-timeout) passed before the store {did}"
+            )))
         }
     }
 }

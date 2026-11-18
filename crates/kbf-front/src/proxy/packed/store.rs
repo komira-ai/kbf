@@ -25,6 +25,7 @@ use super::room::{Budget, DEFAULT_INFLIGHT_BYTES, Room};
 use super::verifying::VerifyingKeys;
 use crate::cache::is_empty_blob;
 use crate::large_backfill::LargeStore;
+use crate::store_wait::{Backoff, STORE_WAIT, StoreWaits};
 use crate::store_writes::{STORE_WRITES, StoreWrites};
 
 /// The largest blob a frontend puts in a pack or serves from one by default: 64 MiB, the
@@ -178,6 +179,8 @@ pub struct Packs {
     pub(super) metrics: Arc<PackMetrics>,
     /// What the packs' object store has been asked ([`Packs::with_store_metrics`]).
     store_metrics: Arc<crate::store_metrics::StoreMetrics>,
+    /// The waits of every call to the store for its 503s ([`crate::store_wait`]).
+    waits: Arc<StoreWaits>,
     pub(super) verifying: Arc<VerifyingKeys>,
     clock: Clock,
     /// The writer the packs are recorded under, which a large object is recorded under too.
@@ -213,7 +216,9 @@ impl Packs {
             ..PackerConfig::default()
         };
         let writer = keys.writer();
-        let store = Arc::new(StoreWrites::new(store, settings.store_writes));
+        let waits = Arc::<StoreWaits>::default();
+        let backoff = Backoff::new(STORE_WAIT, Arc::clone(&waits));
+        let store = Arc::new(StoreWrites::new(store, settings.store_writes, backoff));
         let packer = Packer::new(store.clone(), index.clone(), keys.clone(), config)?;
         let reader = Reader::new(
             Arc::clone(&store),
@@ -236,6 +241,7 @@ impl Packs {
             budget: Budget::new(settings.inflight_bytes, Arc::clone(&metrics)),
             metrics,
             store_metrics: Arc::new(crate::store_metrics::StoreMetrics::packs()),
+            waits,
             verifying: Arc::default(),
             clock: Arc::new(SystemTime::now),
             writer,
@@ -319,6 +325,15 @@ impl Packs {
     pub fn render_metrics(&self, out: &mut String) {
         self.metrics.render(out);
         self.store_metrics.render(out);
+        self.waits.render(out);
+    }
+
+    /// The waits of these packs' calls to their store for its 503s. Another caller of the same
+    /// store (an action tree's writes, the janitor) records its own waits here too, so that the
+    /// scrape counts every wait for the store once.
+    #[must_use]
+    pub fn store_waits(&self) -> Arc<StoreWaits> {
+        Arc::clone(&self.waits)
     }
 
     /// Appends the pack families of `packs`, if a frontend has them, to `out`; without packs
