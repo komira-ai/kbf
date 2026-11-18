@@ -706,10 +706,24 @@ the channel's pinned `sums` list, if it has some), and `gh attestation verify` a
 offline for the full commit on the channel's branch, from `artifacts.yml` on a hosted runner. Only
 then is the image loaded (`docker image load`), and its id recorded in `frontend.json` (root's,
 0600, in `/var/lib/kbf-host-install`). Containers are made from that id, never from a tag. A
-release that fails the check changes nothing: nothing is loaded and nothing is stopped.
+release that fails the check changes nothing: nothing is loaded and nothing is stopped. A release
+that is loaded but refuses the container's configuration (step 0 of the switch below, for example
+one that no longer has a flag `kbf.toml` still holds) is refused by the switch and changes nothing
+either.
 
 **switch**, in this order:
 
+0. before anything else, the new release checks the configuration the container would be made
+   with: a throwaway container (`docker run --rm [--network] [--user] [--group-add]...
+   [--volume]... <new image id> <command>... --check`, with no name, restart policy or published
+   port, so it cannot collide with the running one) runs the release's own `kbf --check`, which
+   reads the flags and the files, runs the start's checks and prints each problem without
+   starting anything or binding a port. Exit 0 goes on. Any other end (2 refused, 75 not ready, a
+   signal) refuses the switch (`config_invalid`) with the release and what the check printed, for
+   example a `kbf.toml` that still holds a flag the release removed; **nothing is changed**: the
+   old container serves as before, its restart policy is untouched, no marker is written. Fix the
+   file and ask again. If docker itself cannot run the check the switch fails with
+   `runtime_failed`, also with nothing changed;
 1. it refuses (`peer_not_ready`) if any of `peers` does not answer `/readyz` with 200, before
    anything is written. This program can see only its own host and these peers; without `peers`
    the coordinator's order (one frontend at a time, never the last ready one) is the guard;

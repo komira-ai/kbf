@@ -95,6 +95,32 @@ impl RunSpec {
         args.extend(self.command.iter().cloned());
         args
     }
+
+    /// The arguments of `docker` that run the release's own configuration check once: a
+    /// throwaway container (`--rm`) with the network, user, groups and mounts of the real one
+    /// and the same command followed by `--check`, and no name, restart policy or published
+    /// port, so it cannot collide with the container that runs.
+    pub fn check_args(&self, image: &str) -> Vec<String> {
+        let mut args = vec!["run".to_owned(), "--rm".to_owned()];
+        for (flag, value) in [("--network", &self.network), ("--user", &self.user)] {
+            if let Some(value) = value {
+                args.push(flag.to_owned());
+                args.push(value.clone());
+            }
+        }
+        for gid in &self.group_add {
+            args.push("--group-add".to_owned());
+            args.push(gid.to_string());
+        }
+        for value in &self.mounts {
+            args.push("--volume".to_owned());
+            args.push(value.clone());
+        }
+        args.push(image.to_owned());
+        args.extend(self.command.iter().cloned());
+        args.push("--check".to_owned());
+        args
+    }
 }
 
 /// The file, checked.

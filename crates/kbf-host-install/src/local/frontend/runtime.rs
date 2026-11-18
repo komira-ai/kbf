@@ -32,6 +32,17 @@ pub struct Container {
 #[error("{0}")]
 pub struct RuntimeError(pub String);
 
+/// How a release's own configuration check ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked {
+    /// Whether it exited with status 0.
+    pub passed: bool,
+    /// How it ended, in words (`exit status 2`).
+    pub ended: String,
+    /// What it printed, on one line, cleaned and cut.
+    pub output: String,
+}
+
 /// What the update needs of the container runtime.
 pub trait Runtime {
     /// Load the image file.
@@ -88,6 +99,13 @@ pub trait Runtime {
     /// # Errors
     /// The runtime could not make or start it.
     fn run(&self, spec: &RunSpec, image_id: &str) -> Result<(), RuntimeError>;
+
+    /// Run the configuration check of the image `image_id` once, in a throwaway container made
+    /// as `spec` says (see [`RunSpec::check_args`]).
+    ///
+    /// # Errors
+    /// The runtime could not run it at all. A check that ran and said no is a [`Checked`].
+    fn check(&self, spec: &RunSpec, image_id: &str) -> Result<Checked, RuntimeError>;
 }
 
 /// The directory `docker` is told is its configuration: not there, so nothing is read from it.
@@ -95,6 +113,16 @@ const NO_CONFIG: &str = "/nonexistent/docker";
 
 /// How long a `docker` call may take besides the load of an image.
 const CALL: Duration = Duration::from_secs(120);
+
+/// How long the configuration check of a release may take: it reads files and certificates and
+/// waits for no network.
+const CHECK: Duration = Duration::from_secs(60);
+
+/// What `docker run` exits with when docker itself, not the command, failed.
+const DOCKER_FAILED: i32 = 125;
+
+/// The most of a check's output that is kept.
+const CHECK_OUTPUT_MAX: usize = 1000;
 
 /// How long the load of an image may take.
 const LOAD: Duration = Duration::from_secs(900);
@@ -148,6 +176,23 @@ impl Docker {
         }
         Err(failure(cmd, &exec))
     }
+}
+
+/// What a check printed (standard error, then standard output) as one line: the lines apart by
+/// ` / `, a control character a `?`, cut at [`CHECK_OUTPUT_MAX`].
+fn one_line(exec: &Exec) -> String {
+    let text = format!("{}\n{}", exec.stderr_text(), exec.stdout_text());
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines
+        .join(" / ")
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .take(CHECK_OUTPUT_MAX)
+        .collect()
 }
 
 fn failure(cmd: &Cmd, exec: &Exec) -> RuntimeError {
@@ -249,5 +294,20 @@ impl Runtime for Docker {
         let args = spec.run_args(image_id);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         self.ok(&self.cmd(&args, CALL)).map(drop)
+    }
+
+    fn check(&self, spec: &RunSpec, image_id: &str) -> Result<Checked, RuntimeError> {
+        let args = spec.check_args(image_id);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let cmd = self.cmd(&args, CHECK);
+        let exec = self.run_cmd(&cmd)?;
+        if exec.code == Some(DOCKER_FAILED) {
+            return Err(failure(&cmd, &exec));
+        }
+        Ok(Checked {
+            passed: exec.success(),
+            ended: exec.ended(),
+            output: one_line(&exec),
+        })
     }
 }

@@ -482,6 +482,22 @@ impl<S: ImageSource, R: Runtime, P: Probe> Backend for Frontend<S, R, P> {
             .container(&config.run.name)
             .map_err(runtime_fault)?
             .ok_or_else(|| Fault::refused(Code::NoCurrent, "there is no container of that name"))?;
+        // The new release's own check of the configuration it would be started with, before
+        // a peer is asked, anything is drained or anything is written: a configuration it
+        // refuses (a flag it no longer has) leaves the old container serving as it was.
+        let checked = self
+            .runtime
+            .check(&config.run, &image)
+            .map_err(runtime_fault)?;
+        if !checked.passed {
+            return Err(Fault::refused(
+                Code::ConfigInvalid,
+                format!(
+                    "release {commit} refuses this container's configuration (its check ended with {}): {}",
+                    checked.ended, checked.output
+                ),
+            ));
+        }
         if let Some(peer) = config
             .peers
             .iter()
@@ -612,6 +628,8 @@ pub fn production(
     }
 }
 
+#[cfg(test)]
+mod check_tests;
 #[cfg(test)]
 mod config_tests;
 #[cfg(test)]

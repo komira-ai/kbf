@@ -208,3 +208,127 @@ fn a_docker_that_cannot_be_started_is_an_error() {
     let (d, _) = docker(vec![Err(io::Error::other("no such file"))]);
     assert_eq!(err(d.exec("f", &[])), "docker exec: no such file");
 }
+
+fn check_spec() -> super::config::RunSpec {
+    FrontendConfig::parse(
+        "[frontend]\nname = \"f\"\nrestart = \"unless-stopped\"\nnetwork = \"bridge\"\nuser = \"65532:65532\"\ngroup_add = [\"990\", \"991\"]\nports = [\"127.0.0.1:8982:8982\"]\nmounts = [\"/etc/kbf:/etc/kbf:ro\", \"/var/lib/kbf:/var/lib/kbf\"]\ncommand = [\"--config\", \"/etc/kbf/kbf.toml\"]\napi = \"127.0.0.1:1\"\ndrain_token_file = \"/t\"\n",
+    )
+    .unwrap()
+    .run
+}
+
+/// The check is a throwaway container with the real one's network, user, groups and mounts and
+/// its command followed by `--check`; it has no name, restart policy or published port, and the
+/// call is bounded in time.
+#[test]
+fn the_check_is_a_throwaway_container_with_the_configuration_and_check_flag() {
+    let (d, seen) = docker(vec![done(0, "kbf frontend: ok\n", "")]);
+    let checked = d.check(&check_spec(), "sha256:new").unwrap();
+    assert!(checked.passed);
+    assert_eq!(checked.ended, "exit status 0");
+    assert_eq!(
+        args(&seen),
+        [
+            "run",
+            "--rm",
+            "--network",
+            "bridge",
+            "--user",
+            "65532:65532",
+            "--group-add",
+            "990",
+            "--group-add",
+            "991",
+            "--volume",
+            "/etc/kbf:/etc/kbf:ro",
+            "--volume",
+            "/var/lib/kbf:/var/lib/kbf",
+            "sha256:new",
+            "--config",
+            "/etc/kbf/kbf.toml",
+            "--check",
+        ]
+    );
+    assert_eq!(seen.borrow()[0].timeout, Some(Duration::from_secs(60)));
+}
+
+/// A configuration with none of the optional parts gives the shortest line: the image and
+/// `--check`.
+#[test]
+fn a_check_with_no_options_is_the_image_and_the_check_flag() {
+    let spec = FrontendConfig::parse(
+        "[frontend]\nname = \"f\"\nrestart = \"always\"\napi = \"127.0.0.1:1\"\ndrain_token_file = \"/t\"\n",
+    )
+    .unwrap()
+    .run;
+    assert_eq!(
+        spec.check_args("sha256:x"),
+        ["run", "--rm", "sha256:x", "--check"]
+    );
+}
+
+/// A check that exits non-zero is an answer, not a runtime error: status 2 (refused) and 75
+/// (not ready) carry what the program printed, standard error first, on one line with control
+/// characters replaced; a signal says which.
+#[test]
+fn a_check_that_says_no_is_an_answer_with_its_output() {
+    let (d, _) = docker(vec![done(
+        2,
+        "out line\n",
+        "kbf: --history-objects was removed\n\n  fix kbf.toml\x1b\n",
+    )]);
+    let checked = d.check(&check_spec(), "sha256:new").unwrap();
+    assert!(!checked.passed);
+    assert_eq!(checked.ended, "exit status 2");
+    assert_eq!(
+        checked.output,
+        "kbf: --history-objects was removed / fix kbf.toml? / out line"
+    );
+
+    let (d, _) = docker(vec![done(75, "", "certificate not yet valid\n")]);
+    let checked = d.check(&check_spec(), "sha256:new").unwrap();
+    assert_eq!(
+        (checked.passed, checked.ended.as_str()),
+        (false, "exit status 75")
+    );
+
+    let (d, _) = docker(vec![Ok(Exec {
+        code: None,
+        signal: Some(9),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    })]);
+    let checked = d.check(&check_spec(), "sha256:new").unwrap();
+    assert!(!checked.passed);
+    assert_eq!(checked.ended, "signal 9 (SIGKILL)");
+    assert_eq!(checked.output, "");
+}
+
+/// The output of a check is cut at 1000 characters.
+#[test]
+fn the_output_of_a_check_is_cut() {
+    let (d, _) = docker(vec![done(2, "", &"y".repeat(5000))]);
+    let checked = d.check(&check_spec(), "sha256:new").unwrap();
+    assert_eq!(checked.output, "y".repeat(1000));
+}
+
+/// Docker's own failure (exit 125) and a docker that cannot be started are runtime errors, not
+/// an answer of the release.
+#[test]
+fn docker_failing_to_run_the_check_is_a_runtime_error() {
+    let (d, _) = docker(vec![done(
+        125,
+        "",
+        "docker: Error response from daemon: no such image\n",
+    )]);
+    let why = err(d.check(&check_spec(), "sha256:new"));
+    assert_eq!(
+        why,
+        "docker run: exit status Some(125): docker: Error response from daemon: no such image"
+    );
+    let (d, _) = docker(vec![Err(io::Error::other("timed out"))]);
+    assert_eq!(
+        err(d.check(&check_spec(), "sha256:new")),
+        "docker run: timed out"
+    );
+}

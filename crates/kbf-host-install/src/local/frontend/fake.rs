@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use super::config::RunSpec;
 use super::probe::{Probe, Reply};
-use super::runtime::{Container, Runtime, RuntimeError};
+use super::runtime::{Checked, Container, Runtime, RuntimeError};
 use super::{FetchedImage, ImageSource, Pace};
 use crate::local::backend::Fault;
 use crate::request::{Channel, Version};
@@ -64,6 +64,12 @@ pub(super) struct Inner {
     pub(super) lies_about_commit: Option<String>,
     /// Every `run` that was asked, as docker's arguments.
     pub(super) runs: Vec<Vec<String>>,
+    /// Every configuration check that was asked: the image id and how many events there were
+    /// when it ran (a check is not an event, so the lists of steps stay as they were).
+    pub(super) checks: Vec<(String, usize)>,
+    /// What the check of an image says when it does not pass: exit status and output. The
+    /// call `check` in `fail` is docker failing to run it.
+    pub(super) check_says: BTreeMap<String, (i32, String)>,
     /// The container's name and operator API when they are not the default ones.
     pub(super) serving: Option<(String, SocketAddr)>,
 }
@@ -135,6 +141,19 @@ impl World {
 
     pub(super) fn elapsed(&self) -> Duration {
         self.0.borrow().now
+    }
+
+    /// The check of the image `id` ends with status `code` and prints `output`.
+    pub(super) fn check_fails(&self, id: &str, code: i32, output: &str) {
+        self.0
+            .borrow_mut()
+            .check_says
+            .insert(id.to_owned(), (code, output.to_owned()));
+    }
+
+    /// The checks that were asked: the image id and how many events came before it.
+    pub(super) fn checks(&self) -> Vec<(String, usize)> {
+        self.0.borrow().checks.clone()
     }
 
     /// The runs, as docker's arguments.
@@ -272,6 +291,25 @@ impl Runtime for World {
             draining: false,
         });
         Ok(())
+    }
+
+    fn check(&self, _spec: &RunSpec, image_id: &str) -> Result<Checked, RuntimeError> {
+        let mut inner = self.0.borrow_mut();
+        let before = inner.events.len();
+        inner.checks.push((image_id.to_owned(), before));
+        failure(&inner, "check")?;
+        Ok(match inner.check_says.get(image_id) {
+            Some((code, output)) => Checked {
+                passed: false,
+                ended: format!("exit status {code}"),
+                output: output.clone(),
+            },
+            None => Checked {
+                passed: true,
+                ended: "exit status 0".to_owned(),
+                output: String::new(),
+            },
+        })
     }
 }
 
