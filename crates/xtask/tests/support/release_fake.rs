@@ -150,8 +150,10 @@ pub fn bundle_json(sha: &str, flags: &str) -> String {
     format!("{b}\n")
 }
 
-pub fn refs_path(page: u32) -> String {
-    format!("repos/{REPO}/git/matching-refs/tags/v?per_page=100&page={page}")
+/// GitHub's `git/matching-refs` answers every matching ref at once and ignores `page=`:
+/// the path has no paging.
+pub fn refs_path() -> String {
+    format!("repos/{REPO}/git/matching-refs/tags/v")
 }
 
 /// GitHub's list of the release tags `tags`.
@@ -160,7 +162,7 @@ pub fn refs(tags: &[&str]) -> (String, Value) {
         .iter()
         .map(|t| json!({ "ref": format!("refs/tags/{t}") }))
         .collect();
-    (refs_path(1), Value::Array(list))
+    (refs_path(), Value::Array(list))
 }
 
 /// GitHub's compare of the tag (or commit) `base` against the commit `sha`.

@@ -354,6 +354,38 @@ fn the_binary_does_not_cancel_a_run_that_is_over_or_still_going() {
 }
 
 #[test]
+fn a_job_list_that_repeats_its_full_page_is_a_miss_and_never_read_without_end() {
+    // Catches: a job list whose page 2 is page 1 again (GitHub ignoring `page=`) read
+    // page after page without end inside one poll.
+    let root = scratch("repeat");
+    let full: Vec<(String, String, Value)> = (0..100)
+        .map(|i| (format!("j{i}"), "completed".to_owned(), json!("success")))
+        .collect();
+    let full: Vec<(&str, &str, Value)> = full
+        .iter()
+        .map(|(n, s, c)| (n.as_str(), s.as_str(), c.clone()))
+        .collect();
+    answers(
+        &root,
+        &[
+            (jobs_path(REPO, RUN, 1), page(&full)),
+            (jobs_path(REPO, RUN, 2), page(&full)),
+        ],
+    );
+    let (code, out, err) = xtask(&root, &MAX_MISSES.to_string());
+    assert_eq!((code, calls(&root).as_str()), (Some(0), ""), "{err}");
+    assert_eq!(
+        out,
+        format!(
+            "notice: the jobs could not be read {MAX_MISSES} times in a row (gh api \
+             repos/{REPO}/actions/runs/{RUN}/jobs: page 2 is page 1 again: the endpoint does \
+             not page with `page=`, so the list has no end to read to); the run goes on \
+             without fail-fast\n"
+        )
+    );
+}
+
+#[test]
 fn the_binary_exits_zero_when_the_api_answers_nothing_it_can_use() {
     // Catches: an unreadable job list (the run not found, an answer without jobs, a `gh` that
     // is gone) turning the watcher, and so the pipeline, red.

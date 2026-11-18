@@ -36,8 +36,10 @@ fn fx(name: &str) -> Fx {
     Fx { root, _own: own }
 }
 
+/// GitHub's `git/matching-refs` answers every matching ref at once and ignores `page=`:
+/// the path has no paging.
 fn refs_path() -> String {
-    format!("repos/{REPO}/git/matching-refs/tags/v?per_page=100&page=1")
+    format!("repos/{REPO}/git/matching-refs/tags/v")
 }
 
 fn ref_path(tag: &str) -> String {
@@ -188,6 +190,25 @@ fn the_first_release_is_tagged_when_no_release_tag_exists() {
     let (code, out, err) = fx.tag("v0.0.1");
     assert_eq!(code, Some(0), "{err}");
     assert!(out.contains("created=true"), "{out}");
+}
+
+#[test]
+fn a_hundred_release_tags_in_one_answer_are_read_with_one_call() {
+    // Catches: the tags read page by page from an endpoint that ignores `page=`: with 100
+    // tags each page is full and the same, and the read never ends.
+    let fx = fx("hundred");
+    let tags: Vec<String> = (1..=100).map(|n| format!("v0.0.{n}")).collect();
+    let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+    fx.github(&tags, &[("v0.0.100", SHA, "ahead")]);
+    let (code, out, err) = fx.tag("v0.0.101");
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out, "tag=v0.0.101\ncreated=true\n");
+    let asked = fx.gh_args();
+    let refs: Vec<&str> = asked
+        .lines()
+        .filter(|l| l.contains("matching-refs"))
+        .collect();
+    assert_eq!(refs, [format!("api {}", refs_path())], "{asked}");
 }
 
 #[test]

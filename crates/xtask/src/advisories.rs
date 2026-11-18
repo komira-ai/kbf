@@ -53,6 +53,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
+use crate::pages::{PER_PAGE, Pages};
 use crate::{Error, build_commit, git_stdout};
 
 /// The title of the one issue the advisories are kept in.
@@ -75,9 +76,6 @@ pub const DENY_ARGS: [&str; 10] = [
     "check",
     "advisories",
 ];
-
-/// Issues GitHub lists per page (its maximum).
-const PAGE: usize = 100;
 
 /// The arguments of `advisories`.
 #[derive(clap::Args)]
@@ -319,8 +317,10 @@ fn write(tools: &mut impl Tools, call: Call) -> Result<Value, Error> {
 /// The number of the open issue titled [`TITLE`], if there is one. A pull request is not
 /// one, though GitHub lists them with the issues.
 fn open_issue(tools: &mut impl Tools, repo: &str) -> Result<Option<u64>, Error> {
-    for page in 1.. {
-        let path = format!("repos/{repo}/issues?state=open&per_page={PAGE}&page={page}");
+    let mut pages = Pages::new(format!("repos/{repo}/issues?state=open"));
+    loop {
+        let page = pages.number();
+        let path = format!("repos/{repo}/issues?state=open&per_page={PER_PAGE}&page={page}");
         let reply = tools
             .github(&Call::get(path.clone()))?
             .ok_or_else(|| Error::Failed(format!("gh api {path}: not found")))?;
@@ -336,11 +336,10 @@ fn open_issue(tools: &mut impl Tools, repo: &str) -> Result<Option<u64>, Error> 
                 .map(Some)
                 .ok_or_else(|| Error::Failed(format!("gh api {path}: an issue with no number")));
         }
-        if items.len() < PAGE {
-            break;
+        if !pages.more(items)? {
+            return Ok(None);
         }
     }
-    Ok(None)
 }
 
 /// The advisories in what `cargo deny` printed, sorted and without repeats.

@@ -159,6 +159,7 @@ pub mod installer_tarball;
 pub mod js_pin;
 pub mod merge_profiles;
 pub mod package;
+pub mod pages;
 pub mod pipeline_rerun;
 pub mod pipeline_watch;
 pub mod pkg_asset;

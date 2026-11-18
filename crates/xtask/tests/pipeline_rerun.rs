@@ -429,6 +429,36 @@ fn the_binary_reads_every_page_of_jobs_and_reruns_for_a_failure_on_a_later_page(
 }
 
 #[test]
+fn the_binary_fails_and_reruns_nothing_when_the_job_list_repeats_its_full_page() {
+    // Catches: a job list whose page 2 is page 1 again (GitHub ignoring `page=`) read
+    // page after page without end.
+    let root = scratch("repeat");
+    let full: Vec<Value> = (0..100)
+        .map(|i| {
+            json!({"name": format!("j{i}"), "status": "completed", "conclusion": "success",
+            "html_url": "https://x"})
+        })
+        .collect();
+    let answers = json!({
+        run_path(REPO, RUN): {"run_attempt": 1, "conclusion": "failure",
+            "head_branch": "main", "event": "push"},
+        jobs_path(REPO, RUN, 1): {"total_count": 100, "jobs": full},
+        jobs_path(REPO, RUN, 2): {"total_count": 100, "jobs": full},
+    });
+    std::fs::write(root.join("gh/gh-api.json"), answers.to_string()).expect("gh-api.json");
+    let (code, _, err) = xtask(&root, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(
+        err.trim_end(),
+        format!(
+            "xtask: gh api repos/{REPO}/actions/runs/{RUN}/jobs: page 2 is page 1 again: the \
+             endpoint does not page with `page=`, so the list has no end to read to"
+        )
+    );
+    assert_eq!(calls(&root), "");
+}
+
+#[test]
 fn the_binary_fails_when_the_jobs_of_the_run_cannot_be_read() {
     // Catches: a run that is listed but whose jobs are not (404) read as "no job failed", so a
     // rerun that was wanted silently never happens.

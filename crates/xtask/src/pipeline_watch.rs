@@ -23,9 +23,7 @@ use clap::Args as ClapArgs;
 use serde_json::Value;
 
 use crate::Error;
-
-/// Jobs GitHub lists on one page, the most it allows.
-const PAGE: usize = 100;
+use crate::pages::{PER_PAGE, Pages};
 
 /// Reads of the job list that may fail one after the other before the watch gives up.
 pub const MAX_MISSES: u32 = 10;
@@ -74,7 +72,7 @@ pub enum Verdict {
 
 /// The path of one page of the run's jobs (the latest attempt of each).
 pub fn jobs_path(repo: &str, run_id: u64, page: usize) -> String {
-    format!("repos/{repo}/actions/runs/{run_id}/jobs?per_page={PAGE}&filter=latest&page={page}")
+    format!("repos/{repo}/actions/runs/{run_id}/jobs?per_page={PER_PAGE}&filter=latest&page={page}")
 }
 
 /// The path that cancels the run.
@@ -169,18 +167,18 @@ pub fn watch(
 /// Every job of the run, page after page.
 fn all_jobs(gh: &Path, repo: &str, run_id: u64) -> Result<Vec<Job>, Error> {
     let mut jobs = Vec::new();
-    for page in 1.. {
-        let path = jobs_path(repo, run_id, page);
+    let mut pages = Pages::new(format!("repos/{repo}/actions/runs/{run_id}/jobs"));
+    loop {
+        let path = jobs_path(repo, run_id, pages.number());
         let answer = crate::release::api(gh, &path)?
             .ok_or_else(|| Error::Failed(format!("gh api {path}: not found")))?;
         let these = jobs_of(&answer)?;
-        let full = these.len() == PAGE;
+        let more = pages.more(&these)?;
         jobs.extend(these);
-        if !full {
-            break;
+        if !more {
+            return Ok(jobs);
         }
     }
-    Ok(jobs)
 }
 
 /// Cancels the run. A run that is already over or already cancelling (HTTP 409) is not an

@@ -301,16 +301,16 @@ fn tags_that_are_not_ancestors_leave_no_previous_release() {
 }
 
 #[test]
-fn tags_are_read_page_after_page() {
-    // Catches: only the first 100 tags read, which hides the highest on page 2 (the highest
-    // of page 1 is an ancestor too, but it has no release: it would fail, not pass).
+fn tags_are_read_in_one_call_however_many_there_are() {
+    // Catches: the tags read page by page from an endpoint that ignores `page=` (at 100
+    // tags or more the read never ends), and the 101st tag missed (the highest of the
+    // first 100 is an ancestor too, but it has no release: it would fail, not pass).
     let f = fx("pages");
-    let page1: Vec<Value> = (1..=100)
+    let tags: Vec<Value> = (1..=101)
         .map(|n| json!({ "ref": format!("refs/tags/v0.0.{n}") }))
         .collect();
     let mut all = vec![
-        (refs_path(1), Value::Array(page1)),
-        (refs_path(2), json!([{ "ref": "refs/tags/v0.0.101" }])),
+        (refs_path(), Value::Array(tags)),
         compare("v0.0.101", "ahead"),
         compare("v0.0.100", "ahead"),
     ];
@@ -321,8 +321,11 @@ fn tags_are_read_page_after_page() {
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(value(&out, "previous-tag"), "v0.0.101");
     let asked = f.gh_args();
-    assert_eq!(asked.matches("matching-refs").count(), 2, "{asked}");
-    assert!(!asked.contains("page=3"), "{asked}");
+    let refs: Vec<&str> = asked
+        .lines()
+        .filter(|l| l.contains("matching-refs"))
+        .collect();
+    assert_eq!(refs, [format!("api {}", refs_path())], "{asked}");
 }
 
 #[test]

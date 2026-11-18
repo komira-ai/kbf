@@ -269,6 +269,23 @@ fn the_open_issue_is_found_on_a_later_page_and_a_pull_request_is_not_one() {
     assert_eq!(out, ["no advisories: closed issue #150"]);
 }
 
+// Catches: an issue list whose page 2 is page 1 again (GitHub ignoring `page=`) read
+// page after page without end.
+#[test]
+fn an_issue_list_that_repeats_its_full_page_is_a_failure() {
+    let first: Vec<Value> = (1..=100).map(|n| issue(n, "Other")).collect();
+    let mut f = fake(run_of(0, &[]), first.clone());
+    f.gets.insert(
+        "repos/komira-ai/kbf/issues?state=open&per_page=100&page=2".to_owned(),
+        Some(Value::Array(first)),
+    );
+    assert_eq!(
+        failure(sync(&mut f, REPO, COMMIT)),
+        "gh api repos/komira-ai/kbf/issues?state=open: page 2 is page 1 again: the endpoint \
+         does not page with `page=`, so the list has no end to read to"
+    );
+}
+
 // Catches: a missing repository or a reply that is not a list read as "no issue", which
 // would open a duplicate or close nothing.
 #[test]

@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use super::api;
 use crate::Error;
+use crate::pages::{PER_PAGE, Pages};
 
 /// The `MAJOR.MINOR` a `VERSION` file holds: a release's version without its patch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -70,28 +71,41 @@ impl std::fmt::Display for Version {
     }
 }
 
-/// Every entry of a GitHub list at `path`, page after page (100 a page) until a page
-/// is short. A list that is not there is an error, not an empty list: a guard that
-/// reads "no tags" from a failed call would let anything through.
-fn listed(gh: &Path, path: &str) -> Result<Vec<Value>, Error> {
-    let mut all = Vec::new();
-    for page in 1.. {
-        let got = api(gh, &format!("{path}?per_page=100&page={page}"))?;
-        let Some(Value::Array(got)) = got else {
-            return Err(Error::Failed(format!("gh api {path}: no list of entries")));
-        };
-        let last = got.len() < 100;
-        all.extend(got);
-        if last {
-            break;
-        }
+/// The entries of the GitHub list `got` from `gh api <path>`. A list that is not there is
+/// an error, not an empty list: a guard that reads "no tags" from a failed call would let
+/// anything through.
+fn entries(got: Option<Value>, path: &str) -> Result<Vec<Value>, Error> {
+    match got {
+        Some(Value::Array(got)) => Ok(got),
+        _ => Err(Error::Failed(format!("gh api {path}: no list of entries"))),
     }
-    Ok(all)
 }
 
-/// The versions of the release tags of `repo` (its `v*` refs).
+/// Every entry of a GitHub list at `path`, page after page (100 a page) until a page is
+/// short; [`Pages`] ends it with an error on a repeated page or at its cap.
+fn listed(gh: &Path, path: &str) -> Result<Vec<Value>, Error> {
+    let mut all = Vec::new();
+    let mut pages = Pages::new(path);
+    loop {
+        let got = api(
+            gh,
+            &format!("{path}?per_page={PER_PAGE}&page={}", pages.number()),
+        )?;
+        let got = entries(got, path)?;
+        let more = pages.more(&got)?;
+        all.extend(got);
+        if !more {
+            return Ok(all);
+        }
+    }
+}
+
+/// The versions of the release tags of `repo` (its `v*` refs). GitHub's
+/// `git/matching-refs` does not page: it ignores `per_page` and `page` and answers every
+/// matching ref, with no `Link` header, so it is read with one call.
 pub fn tag_versions(gh: &Path, repo: &str) -> Result<Vec<Version>, Error> {
-    let refs = listed(gh, &format!("repos/{repo}/git/matching-refs/tags/v"))?;
+    let path = format!("repos/{repo}/git/matching-refs/tags/v");
+    let refs = entries(api(gh, &path)?, &path)?;
     Ok(refs
         .iter()
         .filter_map(|r| Version::parse_tag(r["ref"].as_str()?.strip_prefix("refs/tags/")?))

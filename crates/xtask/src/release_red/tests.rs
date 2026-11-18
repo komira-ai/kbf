@@ -311,7 +311,7 @@ fn red_with_an_open_issue_comments_the_same_lines() {
 fn the_issue_is_found_past_pull_requests_other_titles_and_page_one() {
     let mut f = fake();
     f.jobs(&[("a", "completed", "success")]);
-    let mut page: Vec<Value> = (0..PAGE)
+    let mut page: Vec<Value> = (0..PER_PAGE)
         .map(|n| json!({ "number": 1000 + n, "title": "something else" }))
         .collect();
     page[0] = json!({ "number": 3, "title": "RELEASE-RED: kbf x", "pull_request": {} });
@@ -325,6 +325,47 @@ fn the_issue_is_found_past_pull_requests_other_titles_and_page_one() {
         sync(&mut f, REPO, 77).expect("sync"),
         ["green: closed issue #8"]
     );
+}
+
+// Catches: an issue list whose page 2 is page 1 again (GitHub ignoring `page=`) read
+// without end.
+#[test]
+fn an_issue_list_that_repeats_its_full_page_fails_the_sync() {
+    let mut f = fake();
+    f.jobs(&[("a", "completed", "success")]);
+    let page: Vec<Value> = (0..PER_PAGE)
+        .map(|n| json!({ "number": 1000 + n, "title": "something else" }))
+        .collect();
+    f.set(ISSUES, Value::Array(page.clone()));
+    f.set(ISSUES2, Value::Array(page));
+    let err = sync(&mut f, REPO, 77).expect_err("a repeated page");
+    assert_eq!(
+        err.to_string(),
+        "gh api repos/komira-ai/kbf/issues?state=open&labels=main-red: page 2 is page 1 \
+         again: the endpoint does not page with `page=`, so the list has no end to read to"
+    );
+    assert!(f.writes().is_empty());
+}
+
+// Catches: a job list whose page 2 is page 1 again (GitHub ignoring `page=`) read
+// without end.
+#[test]
+fn a_job_list_that_repeats_its_full_page_fails_the_sync() {
+    let mut f = fake();
+    let names: Vec<String> = (0..PER_PAGE).map(|n| format!("job{n}")).collect();
+    let page: Vec<(&str, &str, &str)> = names
+        .iter()
+        .map(|n| (n.as_str(), "completed", "success"))
+        .collect();
+    f.jobs(&page);
+    f.set(JOBS2, jobs_json(&page));
+    let err = sync(&mut f, REPO, 77).expect_err("a repeated page");
+    assert_eq!(
+        err.to_string(),
+        "gh api repos/komira-ai/kbf/actions/runs/77/jobs: page 2 is page 1 again: the \
+         endpoint does not page with `page=`, so the list has no end to read to"
+    );
+    assert!(f.writes().is_empty());
 }
 
 // Catches: a pull request titled like the issue standing for it.
@@ -347,7 +388,7 @@ fn a_pull_request_with_the_title_is_not_the_issue() {
 #[test]
 fn jobs_are_read_from_every_page() {
     let mut f = fake();
-    let page: Vec<(String, &str, &str)> = (0..PAGE)
+    let page: Vec<(String, &str, &str)> = (0..PER_PAGE)
         .map(|n| (format!("job{n}"), "completed", "success"))
         .collect();
     let page: Vec<(&str, &str, &str)> = page.iter().map(|(n, s, c)| (n.as_str(), *s, *c)).collect();
