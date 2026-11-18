@@ -76,11 +76,13 @@ show the working set is in the hundreds of thousands of objects, not billions.
 ### 2.3 Garbage collection
 
 Nothing deletes a recorded pack today: `PackIndex::dead_packs` has no caller outside tests; the objects deleted are the
-key of a failed PUT attempt (`Packer::discard`) and orphans under `cas/b/` (the janitor) **[code]**. When pack collection is built **[proposed]**, it deletes `blob` rows untouched for the grace
-period, then the objects of packs no row points at (`dead_packs`), and deletes the `directory` row of a digest in the
-same transaction as that digest's `blob` row. A `directory` row whose blob was collected is still a correct answer for
-its digest, so the order of the two deletes is not a correctness question, only one of size. Until then `directory`
-rows, like packs, are never deleted.
+key of a failed PUT attempt (`Packer::discard`) and orphans under `cas/b/` (the janitor) **[code]**; rows are removed
+only by `drop_location` and by heal (`forget_pack`, for an object the store lost). Pack collection is designed in
+[pack-index-over-the-store.md](pack-index-over-the-store.md) **[proposed]**, which supersedes the sketch that stood
+here: a leader-only collector retires a pack whose `blob` rows all went unused for the retention, deleting its `blob`
+rows, their `directory` rows and its `pack` row in one transaction that re-checks recent touches, and deletes the
+object only after a grace. Until it is built, no `directory` row is deleted, and a recorded pack's rows go only by
+`drop_location` and heal; its object is never deleted.
 
 ## 3. Reads: the walk before a job is submitted
 
@@ -122,7 +124,8 @@ points at an object that is not stored. One logical step, two systems, ordered s
   its object stays under the old key, which no row names;
 - the PUT succeeds and the record fails: the record is retried for the same key; when every attempt fails the upload
   answers UNAVAILABLE and the stored pack is an object no row points at;
-- objects no row points at stay until pack collection is built (section 2.3, **[proposed]**).
+- objects no row points at stay: the collector of section 2.3 deletes only objects it retired, and the janitor only
+  orphans under `cas/b/` **[code]**.
 
 **Directory rows** are written by the walk (section 3), not at upload: an uploaded blob does not say whether it is a
 Directory, and decoding every upload as one would record rows for blobs that are not Directories.
