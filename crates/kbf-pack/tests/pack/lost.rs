@@ -3,14 +3,14 @@
 //! store that fails to answer (a 503, a reset connection, a timeout) is never a look at all.
 //! Time is the rig's manual clock, which the index and the loss guard read.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use kbf_objstore::ObjectStore;
 use kbf_pack::{
-    CONFIRM_AFTER, CONFIRM_WITHIN, FORGET_INTERVAL, Fetch, Loss, LossGuard, LossRules, MAX_NOTED,
-    MIN_AGE, PackerConfig, ReadError, ReaderConfig,
+    CONFIRM_AFTER, CONFIRM_WITHIN, FORGET_INTERVAL, Fetch, Loss, LossClock, LossGuard, LossRules,
+    MAX_NOTED, MIN_AGE, PackerConfig, ReadError, ReaderConfig,
 };
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_pack_index::{BlobDigest, NewPack, PackBlob, PackIndex};
@@ -571,19 +571,15 @@ async fn a_young_pack_or_a_failed_forget_keeps_the_note() {
 #[tokio::test]
 async fn a_clock_that_went_back_confirms_nothing() {
     let clock = Arc::new(ManualClock::default());
-    let at = Arc::new(Mutex::new(CONFIRM_WITHIN));
-    let read = Arc::clone(&at);
-    let guard = LossGuard::new(
-        LossRules::default(),
-        Arc::new(move || SystemTime::UNIX_EPOCH + *read.lock().unwrap()),
-    );
+    let at = |time: Duration| -> LossClock { Arc::new(move || SystemTime::UNIX_EPOCH + time) };
+    let guard = LossGuard::new(LossRules::default(), at(CONFIRM_WITHIN));
     let index = index_with(&clock, KEY);
     let looks = AtomicU32::new(0);
 
     let first = guard
         .absent(&index, KEY, 10, looking(&looks, Ok(None)))
         .await;
-    *at.lock().unwrap() -= CONFIRM_AFTER;
+    guard.set_clock(at(CONFIRM_WITHIN - CONFIRM_AFTER));
     let back = guard
         .absent(&index, KEY, 10, looking(&looks, Ok(None)))
         .await;

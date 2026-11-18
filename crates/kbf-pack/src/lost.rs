@@ -212,12 +212,9 @@ impl LossGuard {
     /// cut).
     pub fn held(&self, key: &str, through: u64) {
         let mut state = self.state();
-        let covered = state.noted.get(key).is_some_and(|note| through >= note.end);
-        if covered && state.noted.remove(key).is_some() {
-            tracing::info!(
-                pack = key,
-                "a pack noted as absent was read: no longer noted"
-            );
+        if state.noted.get(key).is_some_and(|note| through >= note.end) {
+            state.noted.remove(key);
+            tracing::info!(pack = key, "an absent pack was read: no longer noted");
         }
     }
 
@@ -241,11 +238,7 @@ impl LossGuard {
         let now = self.now();
         if let Some(waits) = self.wait(key, end, now) {
             match &waits {
-                Loss::Noted => tracing::info!(
-                    pack = key,
-                    "the store answered a pack absent: noted, and looked at again after {:?}",
-                    self.rules.confirm_after
-                ),
+                Loss::Noted => tracing::info!(pack = key, "absent: noted for a later second look"),
                 _ => tracing::debug!(pack = key, ?waits, "a pack absent again: kept"),
             }
             return waits;
@@ -260,10 +253,7 @@ impl LossGuard {
         };
         if length.is_some_and(|length| length >= end) {
             self.state().noted.remove(key);
-            tracing::warn!(
-                pack = key,
-                "the second look at an absent pack found it whole: kept"
-            );
+            tracing::warn!(pack = key, "the second look found the pack whole: kept");
             return Loss::Held;
         }
         let forget = Arc::clone(index);
@@ -284,12 +274,9 @@ impl LossGuard {
             Err(error) => Loss::IndexFailed(error.to_string()),
         };
         match &loss {
-            Loss::Forgotten { rows } => tracing::warn!(
-                pack = key,
-                rows,
-                ?length,
-                "the store does not have a pack the index named, twice and some time apart: the index forgot it, and its blobs are missing until uploaded again"
-            ),
+            Loss::Forgotten { rows } => {
+                tracing::warn!(pack = key, rows, ?length, "a lost pack: forgotten");
+            }
             other => {
                 tracing::warn!(pack = key, ?length, loss = ?other, "a pack confirmed absent was not forgotten")
             }
