@@ -783,10 +783,24 @@ mod tests {
             );
         }
         assert_eq!(installer_for(&from, &from), Installer::Previous);
-        assert_eq!(
-            installer_for(&from, &with("state_schema", 2.into())),
-            Installer::Previous
-        );
+        // A lower number, of each the installer checks, against N's facts with every number at 2.
+        let mut high = from.clone();
+        for key in UNDERSTOOD {
+            high[key] = 2.into();
+        }
+        for key in UNDERSTOOD {
+            let mut lower = high.clone();
+            lower[key] = 1.into();
+            assert_eq!(
+                installer_for(&high, &lower),
+                Installer::Previous,
+                "{key} lower"
+            );
+        }
+        // One number raised and another lowered: the raised one decides.
+        let mut mixed = with("protocol", 2.into());
+        mixed["state_schema"] = 2.into();
+        assert_eq!(installer_for(&from, &mixed), Installer::Next);
         for (key, value) in [
             ("version", Value::from("0.2.0")),
             ("seq", 9999.into()),
