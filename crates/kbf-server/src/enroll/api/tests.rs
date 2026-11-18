@@ -812,3 +812,42 @@ async fn a_panicking_call_is_a_server_error() {
     assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(!body.contains("panicked"), "{body}");
 }
+
+// Catches a node revoke that leaves the membership map to the sweeper's next beat: with the
+// members attached, the deny rows the revoke wrote are read back at once.
+#[tokio::test]
+async fn a_node_revoke_refreshes_the_members_at_once() {
+    let store = fake();
+    let members = Arc::new(crate::members::Members::new(
+        store.clone(),
+        crate::members::MembershipConfig {
+            ttl: std::time::Duration::from_secs(600),
+            dwell: std::time::Duration::from_secs(600),
+            replication: 1,
+        },
+    ));
+    let api = api(
+        store.clone(),
+        Arc::new(Counting(AtomicU8::new(0))),
+        Ok(ca_pin()),
+    )
+    .with_members(Some(Arc::clone(&members)));
+    let state = state_with(Some(ApiToken::for_tests(BEARER)), Some(api));
+    let created = make(&state, r#"{"roles":["daemon"],"max_uses":5}"#).await;
+    enroll(&*store, &created, "n1").expect("enroll");
+    assert!(
+        members.denied_snapshot().is_none(),
+        "nothing read before the revoke"
+    );
+    let (code, done): (_, NodeRevoked) =
+        json(ok(&state, &Route::RevokeNode("n1".into())).await).await;
+    assert_eq!(code, StatusCode::OK);
+    let (denied, _) = members
+        .denied_snapshot()
+        .expect("the revoke refreshed the members");
+    let mut denied: Vec<String> = denied.iter().map(ToString::to_string).collect();
+    let mut answered = done.denied.clone();
+    denied.sort();
+    answered.sort();
+    assert_eq!(denied, answered);
+}

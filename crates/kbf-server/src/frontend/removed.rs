@@ -48,6 +48,7 @@ mod tests {
         assert_eq!(listed.len(), unique.len(), "a flag is listed twice");
         assert_eq!(listed.len(), 21);
         assert_eq!(unique, refusing_flags());
-        assert!(flags().all(|(_, why)| why.contains("removed") && why.contains("delete")));
+        assert!(flags().all(|(_, why)| why.contains("removed")));
+        assert!(flags().all(|(_, why)| why.contains("delete")));
     }
 }
