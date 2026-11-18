@@ -58,8 +58,8 @@ state-store = "postgres:///kbf?host=/run/postgresql&user=kbf-server"
 `user=` names the role (`crates/js-state/src/postgres/mod.rs` in the jobscheduler repository, at the revision `Cargo.toml` pins). A store that does not
 flush commits is refused at the connection, so keep `synchronous_commit` on
 (`crates/js-state/src/postgres/schema.rs`, the `synchronous_commit` check). The schema is brought up to date
-by `kbf boot-check --mode=frontend`, which the units run before the start; in a container run it once per
-image tag as a job ([containers.md](containers.md#the-frontend)).
+by `kbf boot-check --mode=frontend`, which the units run before the start, and by the frontend itself
+when it starts, so a container needs no step ([containers.md](containers.md#the-frontend)).
 
 ## Two frontends
 

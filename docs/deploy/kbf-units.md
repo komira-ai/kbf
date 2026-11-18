@@ -207,7 +207,7 @@ with HTTP `/readyz`, not with a TCP connect. A wrong socket path or a wrong loca
 `--state-store` looks exactly like a Postgres that is not up yet: the frontend waits the window,
 exits 1, is restarted, and the log names the error. A Postgres that never comes back makes the
 frontend restart every window, visible as exit 1 in the journal. The unit's `kbf boot-check` step has no wait of its own: it exits 1 when the
-database cannot be reached, which `Restart=on-failure` starts again. For a Postgres in a
+database cannot be reached, which `Restart=on-failure` starts again. The frontend runs the same schema step itself once its store is open (a database `boot-check` already migrated is left alone; a step that fails exits 2), so the step is not what keeps a frontend off an old schema. For a Postgres in a
 container beside the unit, see
 [single-host.md](single-host.md#waiting-for-postgres).
 

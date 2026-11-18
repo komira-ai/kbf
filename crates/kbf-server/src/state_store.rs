@@ -191,6 +191,16 @@ impl StateStoreUri {
         }
     }
 
+    /// The step that brings this store's database to the schema this build needs (the one
+    /// `kbf boot-check` runs), or `None` for a SQLite store, which has no such schema.
+    #[must_use]
+    pub fn schema_step(&self) -> Option<kbf_state::postgres::boot::BootStep> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Postgres(url) => Some(kbf_pack_index::schema::boot_step((*url.config).clone())),
+        }
+    }
+
     /// Opens the store as a frontend that shares it with others.
     ///
     /// A Postgres store takes no generation: any number of frontends open it and write,

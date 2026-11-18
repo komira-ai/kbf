@@ -85,11 +85,12 @@ state-store = "postgres://kbf@db.example.invalid/kbf"
 ```
 
 `state-store` and `storage` are required: a frontend given none exits 2 naming the flag. The
-state database is brought to the schema this `kbf` needs by `kbf boot-check --mode=frontend`
-before the start (the units run it; [kbf-units.md](kbf-units.md)). In a container, run it once per
-image tag as a job with the entrypoint replaced (`/usr/bin/kbf boot-check --mode=frontend
---installer-config <file>`); it reads the `database` key of that `installer.toml`, and refuses a
-URL that carries a password, so the database it migrates is one a password is not needed for.
+state database is brought to the schema this `kbf` needs by the frontend itself when it starts
+(before it serves; a database already there is left alone, and a refusal exits 2 naming the cause):
+a container needs no step beforehand. The packaged units also run `kbf boot-check --mode=frontend`
+before the start ([kbf-units.md](kbf-units.md)), the same step; to run it by hand, use the image
+with the entrypoint replaced (`/usr/bin/kbf boot-check --mode=frontend --installer-config <file>`),
+which reads the `database` key of that `installer.toml` and refuses a URL that carries a password.
 
 ## The coordinator
 

@@ -746,7 +746,7 @@ fn bind_frontend(
         .server
         .state_store
         .as_ref()
-        .map(|uri| state_wait::open(uri, flags.state_store_wait))
+        .map(|uri| state_schema::open_migrated(uri, flags.state_store_wait))
         .transpose()?;
     let indexes = flags.server.open_indexes()?;
     let (pack_index, actions) = match indexes {
@@ -1469,6 +1469,7 @@ mod janitor;
 mod job_read;
 mod pack_flags;
 pub mod removed;
+mod state_schema;
 mod state_wait;
 mod stored;
 mod task_flags;
@@ -1477,6 +1478,8 @@ mod task_flags;
 mod executor_tests;
 #[cfg(test)]
 mod pack_tests;
+#[cfg(test)]
+mod state_schema_tests;
 #[cfg(test)]
 mod state_wait_tests;
 #[cfg(test)]

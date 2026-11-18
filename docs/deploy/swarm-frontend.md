@@ -91,6 +91,21 @@ needs none of this: the switch runs that check itself, with the container's own 
 refuses (`config_invalid`) before it drains or changes anything
 ([host-install.md](host-install.md#a-frontend-container)).
 
+## The state schema
+
+A frontend with a `postgres://` `--state-store` brings the database to the schema its build needs
+itself, before it serves: after the store is open and before the listeners accept, it runs the step
+`kbf boot-check --mode=frontend` runs (expand migrations only, under a lock, waiting at most 30
+seconds for it), over its own `--state-store` connection. A database already at that schema is left
+alone, and one line of the log says what the step did (`migrated the schema from 3 to 4`). Nothing
+else has to run before a release that raises the schema: no job, no manual `boot-check`. The
+database role the frontend connects as must be allowed to create the tables; if it is not, the
+schema is busy past the wait, or a pending migration is a `contract` step, the start exits 2 naming
+the cause and `kbf boot-check --mode=frontend`, and Swarm's rollback applies. In a start-first
+update the new task migrates while the old one serves; that is safe because a step only adds, and
+the previous release runs on a schema one step ahead
+([the N and N-1 design](../design/kbf-cicd.md)).
+
 ## Turn it on
 
 There is no required reviewer: a release that passed the pipeline deploys without an operator

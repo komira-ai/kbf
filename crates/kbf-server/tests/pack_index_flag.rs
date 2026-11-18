@@ -1,8 +1,7 @@
 //! `--pack-index` on a started frontend and a started cache server, against a real Postgres
 //! server: either given the flag carries the pack index and one without it carries none, and a
-//! frontend start on a schema without the pack tables is refused with the line that says what
-//! to run. The flag's refusals that need no server (no state store, a SQLite one) are the cache
-//! server's unit tests (`src/start.rs`).
+//! frontend start on a schema without the pack tables migrates it before it serves. The flag's refusals that need no server (no state store, a
+//! SQLite one) are the cache server's unit tests (`src/start.rs`).
 //!
 //! The tests need a server: `KBF_TEST_POSTGRES_URL` names a server they may create and drop
 //! databases on. Each test makes a database of its own. Without the variable they fail under
@@ -201,19 +200,27 @@ fn the_indexes_are_one_handle_with_the_action_cache_beside_the_pack_index() {
     assert!(both.actions.get_action(&other).expect("get").is_none());
 }
 
-/// Asserts that a start with the flag on a schema that has no pack tables is refused with the
-/// flag named and the installer command in the line, while a start without the flag on the
-/// same schema works.
+/// Asserts that a frontend started on a schema without the pack tables, with or without the
+/// flag, brings the database to the schema this build needs before it serves: the start
+/// succeeds, the tables are there afterwards (a pack recorded through the index is found), and
+/// a second start on the migrated database is the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_on_a_schema_without_the_pack_tables_is_refused_at_start() {
+async fn a_frontend_on_a_schema_without_the_pack_tables_migrates_it_at_start() {
     let Some(db) = Database::new(before_the_pack_tables) else {
         return;
     };
-    let refused = started(&flags(&db.url(), true));
-    let said = refused.err().expect("refused").to_string();
-    assert!(said.starts_with("--pack-index: "), "{said}");
-    assert!(said.contains("kbf-installer setup"), "{said}");
-    started(&flags(&db.url(), false)).expect("starts without the flag");
+    let config = PostgresConfig::parse(&db.url()).expect("parses");
+    assert_eq!(schema::current(&config).expect("read"), 1);
+    let off = started(&flags(&db.url(), false)).expect("starts and migrates without the flag");
+    drop(off);
+    assert_eq!(
+        schema::current(&config).expect("read"),
+        kbf_pack_index::schema::latest()
+    );
+    let on = started(&flags(&db.url(), true)).expect("starts with the flag on the migrated schema");
+    let index: Arc<dyn PackIndex> = on.pack_index().expect("the index is open");
+    let key = "cas/f/fe1/3/1";
+    assert!(index.record_pack(&pack(key)).expect("recorded").created);
 }
 
 /// Starts a cache server over `args` on a metadata log and a cold store of its own, in the
