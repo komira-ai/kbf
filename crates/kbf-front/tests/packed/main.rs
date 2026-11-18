@@ -13,6 +13,7 @@
 #[path = "../proxy/harness.rs"]
 mod harness;
 
+mod back_pressure;
 mod backend_many;
 mod bytestream;
 mod cas;

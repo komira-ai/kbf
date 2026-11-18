@@ -6,7 +6,7 @@
 //! store is built or contacted. The endpoint needs `--pack-index`, the bucket and the
 //! credentials file, which clap enforces (so does the file of `kbf.toml`, which becomes flags).
 //! The companions that have a default (`--pack-store-region`, `--pack-bytes`, `--pack-writer`,
-//! `--pack-inflight-bytes`, `--pack-upload-idle-timeout`) need nothing,
+//! `--pack-inflight-bytes`, `--pack-upload-idle-timeout`, `--pack-store-writes`) need nothing,
 //! since the config template writes every flag with a default as a live line.
 //!
 //! The credentials are a file and never a flag, as a command line is world-readable: JSON with
@@ -17,7 +17,7 @@
 //! that the store refuses to replace an object, and does not serve if it does not.
 
 use std::error::Error;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -42,6 +42,7 @@ const CACHE_DIR: &str = "pack_cache_dir";
 const CACHE_BYTES: &str = "pack_cache_bytes";
 const INFLIGHT_BYTES: &str = "pack_inflight_bytes";
 const UPLOAD_IDLE_TIMEOUT: &str = "pack_upload_idle_timeout";
+const STORE_WRITES: &str = "pack_store_writes";
 
 /// The id of `--pack-index`, which the endpoint needs.
 const PACK_INDEX: &str = "pack_index";
@@ -64,8 +65,11 @@ const MIN_INFLIGHT_BYTES: i64 = 64 << 20;
 /// The longest `--pack-upload-idle-timeout`, in seconds: a day, the longest the packs keep.
 const MAX_IDLE_SECS: u64 = kbf_front::MAX_UPLOAD_IDLE_TIMEOUT.as_secs();
 
-/// The ten flags.
-pub(super) fn args() -> [Arg; 10] {
+/// The most writes `--pack-store-writes` takes, as `--task-manifest-writes` does.
+const MAX_STORE_WRITES: u64 = 4096;
+
+/// The eleven flags.
+pub(super) fn args() -> [Arg; 11] {
     [
         Arg::new(ENDPOINT)
             .long("pack-store-endpoint")
@@ -161,6 +165,25 @@ pub(super) fn args() -> [Arg; 10] {
                  `--pack-inflight-bytes` is the only bound on that. At least 1, at most 86400. \
                  Used only with `--pack-store-endpoint`",
             ),
+        Arg::new(STORE_WRITES)
+            .long("pack-store-writes")
+            .value_name("WRITES")
+            .value_parser(clap::value_parser!(u64).range(1..=MAX_STORE_WRITES))
+            // kbf_front::STORE_WRITES, which clap cannot take as a computed string; the
+            // default-flags test compares them.
+            .default_value("64")
+            .help(
+                "The most writes this frontend has at the pack store at once, from 1 to 4096, \
+                 shared by every writer: the packs of client uploads, the large blobs past \
+                 them, and the blobs and manifests of action trees. A write past it waits at \
+                 the frontend for one to end, so a burst queues here and not at the store. A \
+                 pack the store answers 503 SlowDown (it is taking as many uploads as it can) \
+                 is written again after waits from 0.5 s doubling to 8 s, holding its slot, for \
+                 as long as the store answers it: the client sees the time it takes, and an \
+                 upload whose grpc-timeout passes first is ended DEADLINE_EXCEEDED. A streamed \
+                 upload of a client blob over 64 MiB cannot be sent twice, so a SlowDown fails \
+                 it. Used only with `--pack-store-endpoint`",
+            ),
         Arg::new(WRITER)
             .long("pack-writer")
             .value_name("NAME")
@@ -208,6 +231,8 @@ pub struct PackFlags {
     pub inflight_bytes: u32,
     /// `--pack-upload-idle-timeout`.
     pub upload_idle_timeout: Duration,
+    /// `--pack-store-writes`.
+    pub store_writes: NonZeroUsize,
     /// `--pack-writer`.
     pub writer: String,
     /// `--pack-cache-dir` and `--pack-cache-bytes`, both or neither.
@@ -222,6 +247,9 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<PackFlags> {
     let text = |id: &str| m.get_one::<String>(id).cloned().unwrap_or_default();
     let inflight = m.get_one::<u32>(INFLIGHT_BYTES).copied();
     let idle_secs = m.get_one::<u64>(UPLOAD_IDLE_TIMEOUT).copied();
+    let store_writes = m.get_one::<u64>(STORE_WRITES).copied();
+    // clap holds the flag to 1..=4096, which every usize holds.
+    let store_writes = store_writes.and_then(|n| usize::try_from(n).ok());
     Some(PackFlags {
         endpoints,
         bucket: text(BUCKET),
@@ -233,6 +261,9 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<PackFlags> {
         pack_bytes: m.get_one::<u64>(PACK_BYTES).copied().unwrap_or_default(),
         inflight_bytes: inflight.unwrap_or_default(),
         upload_idle_timeout: Duration::from_secs(idle_secs.unwrap_or_default()),
+        store_writes: store_writes
+            .and_then(NonZeroUsize::new)
+            .unwrap_or(kbf_front::STORE_WRITES),
         writer: text(WRITER),
         cache: m
             .get_one::<PathBuf>(CACHE_DIR)
@@ -289,6 +320,7 @@ impl PackFlags {
             inflight_bytes: self.inflight_bytes,
             upload_idle_timeout: self.upload_idle_timeout,
             cache: cache.map(Arc::new),
+            store_writes: self.store_writes,
             ..PackSettings::default()
         };
         let counted = Arc::new(StoreMetrics::packs());

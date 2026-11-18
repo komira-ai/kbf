@@ -57,6 +57,11 @@ impl Sleeper for TokioSleeper {
     }
 }
 
+/// The [`Sleeper`] of a running frontend, for another writer that waits out the store.
+pub(crate) fn tokio_sleeper() -> Arc<dyn Sleeper> {
+    Arc::new(TokioSleeper)
+}
+
 /// How a tree's writes are repeated. Cheap to clone.
 #[derive(Clone)]
 pub struct PutRetry {
@@ -100,7 +105,7 @@ pub(super) enum Failed<E = NoTree> {
 }
 
 /// Whether `error` is the store's back-pressure: a 503 `SlowDown`.
-fn is_slow_down(error: &ObjectStoreError) -> bool {
+pub(crate) fn is_slow_down(error: &ObjectStoreError) -> bool {
     matches!(error, ObjectStoreError::Service { status: 503, code, .. } if code == "SlowDown")
 }
 

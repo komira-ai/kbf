@@ -19,6 +19,7 @@ mod untrusted_task {
 }
 
 mod action_cache;
+mod back_pressure;
 mod backend;
 mod bytestream;
 mod cas;

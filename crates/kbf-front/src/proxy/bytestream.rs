@@ -104,6 +104,7 @@ use tonic::server::NamedService;
 use tonic::{Code, Status};
 
 use super::body::{Guard, Pass, Probe, Upload, collect, compressed, name_in};
+use super::deadline;
 use super::owners::{Owner, Owners, no_storage};
 use super::packed::{self, Packs};
 use super::{Direction, Meter, Method, name};
@@ -221,6 +222,7 @@ impl RawByteStream {
         parts: &http::request::Parts,
         body: Body,
     ) -> Result<http::Response<Body>, Status> {
+        let deadline = deadline::of_headers(&parts.headers);
         let upload = Upload::new(body);
         let mut up = Pass::new(
             upload.first(),
@@ -234,7 +236,8 @@ impl RawByteStream {
         let resource = self.authorized(parts, Method::Write, &name).await?;
         if let Some(packs) = self.packs_for(&name, &resource.digest) {
             let body = Body::new(up);
-            return packed::write_stream(packs, body, &name, resource.digest).await;
+            let stored = packed::write_stream(packs, body, &name, resource.digest);
+            return deadline::within(deadline, stored).await;
         }
         // The upload waits for an owner while it can be sent whole: nothing of it but the
         // frames above has been read from the client.

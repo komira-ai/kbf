@@ -282,7 +282,7 @@ async fn a_failing_length_question_is_followed_by_the_put() {
     assert_eq!(held.as_ref(), Some(bytes));
 }
 
-/// Asserts that a store that answers 503 (slow down) and one that answers 507 (full) to the put
+/// Asserts that a store that answers 503 (unavailable) and one that answers 507 (full) to the put
 /// each count `failed` (a store failure, not `aborted`), leave nothing under the key, and do not
 /// change the ingest, which is cached.
 #[tokio::test]

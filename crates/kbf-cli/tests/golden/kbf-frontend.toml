@@ -274,6 +274,8 @@ pack-inflight-bytes = 1073741824
 # pack-store-endpoint = []
 # The region the requests to `--pack-store-endpoint` are signed for
 pack-store-region = "us-east-1"
+# The most writes this frontend has at the pack store at once, from 1 to 4096, shared by every writer: the packs of client uploads, the large blobs past them, and the blobs and manifests of action trees. A write past it waits at the frontend for one to end, so a burst queues here and not at the store. A pack the store answers 503 SlowDown (it is taking as many uploads as it can) is written again after waits from 0.5 s doubling to 8 s, holding its slot, for as long as the store answers it: the client sees the time it takes, and an upload whose grpc-timeout passes first is ended DEADLINE_EXCEEDED. A streamed upload of a client blob over 64 MiB cannot be sent twice, so a SlowDown fails it. Used only with `--pack-store-endpoint`
+pack-store-writes = 64
 # How long, in seconds, a ByteStream upload into packs may go without a byte of its body arriving before it is ended DEADLINE_EXCEEDED and gives back its bytes, so that a client that stops sending cannot hold room for ever. The time before its resource name has arrived is not counted. An upload that keeps sending, however slowly, is never cut and keeps its bytes until it ends, so `--pack-inflight-bytes` is the only bound on that. At least 1, at most 86400. Used only with `--pack-store-endpoint`
 pack-upload-idle-timeout = 30
 # The name of this frontend in the keys of its packs and in the pack index's record of who wrote each: give each frontend of a farm one of its own. Used only with `--pack-store-endpoint`
@@ -386,7 +388,7 @@ task-janitor-page-size = 500
 # Removed with `--task-out-mode presigned`. Any value is refused at start
 # (not in --help)
 # task-large-max-bytes = "VALUE"
-# The most create-only writes of action-tree manifests to the tier store (`cas/l/<sha256>`) this frontend has open at once, across every run it prepares; a write past it waits at the frontend for one to end. A burst of runs then queues here and not at the store, whose every write would slow as more arrive. Used only with `--task-secret-file` and `--task-out-mode put-dir`
+# The most create-only writes of action-tree manifests to the tier store (`cas/l/<sha256>`) this frontend has open at once, across every run it prepares; a write past it waits at the frontend for one to end. A burst of runs then queues here and not at the store, whose every write would slow as more arrive. Each such write also takes one of the slots of `--pack-store-writes`, which every write to the pack store shares. Used only with `--task-secret-file` and `--task-out-mode put-dir`
 task-manifest-writes = 32
 # Removed with `--task-out-mode presigned`. Any value is refused at start
 # (not in --help)

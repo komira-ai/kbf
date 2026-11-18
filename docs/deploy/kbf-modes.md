@@ -124,6 +124,20 @@ that keeps sending, however slowly, is never cut and keeps its bytes until it en
 nothing holds only its reservation, never a buffer of the claimed size. Both flags are
 accepted and ignored without `--pack-store-endpoint`.
 
+Every write to the pack store shares one bound, `--pack-store-writes` (default 64, from 1 to
+4096): the packs of client uploads, the large blobs past them, and the blobs and manifests of
+action trees (a manifest takes its `--task-manifest-writes` slot first). A write past it waits
+at the frontend for one to end, so a burst queues here and not at the store. A store that
+answers 503 `SlowDown` (tierstore taking as many uploads as it can) is back-pressure: a pack is
+written again after waits from 0.5 s doubling to 8 s, holding its slot, for as long as the store
+answers it, and the writes of an action tree, which are streamed, wait it out as they did,
+past `--task-put-retry-secs`, giving the slot back between their attempts.
+A client upload is bounded by the `grpc-timeout` it sent: when that passes first, the call ends
+`DEADLINE_EXCEEDED` (a moment early, a tenth of the timeout and at most a second, so that the
+answer reaches the client before the transport cancels the call), never `UNAVAILABLE`; a call
+without a `grpc-timeout` waits for the store. A streamed upload of a client blob over 64 MiB
+cannot be sent twice, so a `SlowDown` fails it `UNAVAILABLE`, as before.
+
 Where the frontend runs the actions it is asked to execute is `--executor` (the `[executor]` table of
 `kbf.toml`). `js-agent`, the only value, runs every Execute that the action cache does not answer as one job of the job
 scheduler's job service ([direct-js.md](../design/direct-js.md)). Any other value is refused,

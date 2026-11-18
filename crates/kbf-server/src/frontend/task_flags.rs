@@ -176,7 +176,7 @@ fn live() -> [Arg; 14] {
             // kbf_front::action_tree::MANIFEST_WRITES; the default-flags test compares them.
             .default_value("32")
             .help(
-                "The most create-only writes of action-tree manifests to the tier store (`cas/l/<sha256>`) this frontend has open at once, across every run it prepares; a write past it waits at the frontend for one to end. A burst of runs then queues here and not at the store, whose every write would slow as more arrive. Used only with `--task-secret-file` and `--task-out-mode put-dir`",
+                "The most create-only writes of action-tree manifests to the tier store (`cas/l/<sha256>`) this frontend has open at once, across every run it prepares; a write past it waits at the frontend for one to end. A burst of runs then queues here and not at the store, whose every write would slow as more arrive. Each such write also takes one of the slots of `--pack-store-writes`, which every write to the pack store shares. Used only with `--task-secret-file` and `--task-out-mode put-dir`",
             ),
         Arg::new(URL_SLACK)
             .long("task-url-slack-secs")

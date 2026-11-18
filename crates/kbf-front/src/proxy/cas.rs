@@ -21,6 +21,7 @@ use kbf_proto::reapi::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
+use super::deadline;
 use super::owners::Owners;
 use super::packed::{self, Packs};
 use crate::{MAX_BATCH_TOTAL_BYTES, wire};
@@ -133,11 +134,13 @@ impl ContentAddressableStorage for ProxyCas {
     }
 
     /// Verifies each blob against its digest and stores it on its primary; each answers
-    /// alone, in request order.
+    /// alone, in request order. Into packs, the call ends DEADLINE_EXCEEDED when its
+    /// `grpc-timeout` passes before the store took the blobs ([`deadline`]).
     async fn batch_update_blobs(
         &self,
         request: Request<BatchUpdateBlobsRequest>,
     ) -> Result<Response<BatchUpdateBlobsResponse>, Status> {
+        let deadline = deadline::of_metadata(request.metadata());
         let caller = kbf_auth::metadata(&request);
         let request = request.into_inner();
         let authorizer = &self.authorizers.cas_put;
@@ -166,7 +169,8 @@ impl ContentAddressableStorage for ProxyCas {
             })
             .collect();
         if let Some(packs) = &self.packs {
-            let responses = packed::store_batch(packs, items).await;
+            let stored = async { Ok(packed::store_batch(packs, items).await) };
+            let responses = deadline::within(deadline, stored).await?;
             return Ok(Response::new(BatchUpdateBlobsResponse { responses }));
         }
         let responses = stream::iter(items)

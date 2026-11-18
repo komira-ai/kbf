@@ -39,7 +39,7 @@ use super::Stored;
 use super::uploads::Upload;
 use crate::READ_CHUNK_BYTES;
 use crate::proxy::name;
-use crate::proxy::{Method, Packs};
+use crate::proxy::{Method, Packs, deadline};
 
 /// The `ByteStream` service of a frontend with no storage node. Read is authorized by
 /// [`Authorizers::cas_get`], Write and QueryWriteStatus by [`Authorizers::cas_put`].
@@ -118,11 +118,13 @@ impl ByteStream for StoredByteStream {
         Ok(Response::new(chunked(windows)))
     }
 
-    /// Receives a blob from offset 0, stores and records it, and answers with its size.
+    /// Receives a blob from offset 0, stores and records it, and answers with its size. The
+    /// call ends DEADLINE_EXCEEDED when its `grpc-timeout` passes before the blob is stored.
     async fn write(
         &self,
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
+        let deadline = deadline::of_metadata(request.metadata());
         let caller = kbf_auth::metadata(&request);
         let mut stream = request.into_inner();
         let first = stream
@@ -161,11 +163,14 @@ impl ByteStream for StoredByteStream {
             received: 0,
             finished: false,
         };
-        if digest.size_bytes <= packs.max_blob_bytes() {
-            receiving.whole(packs).await?;
-        } else {
-            packs.put_large(&digest, || receiving.pieces()).await?;
-        }
+        let stored = async {
+            if digest.size_bytes <= packs.max_blob_bytes() {
+                receiving.whole(packs).await
+            } else {
+                packs.put_large(&digest, || receiving.pieces()).await
+            }
+        };
+        deadline::within(deadline, stored).await?;
         Ok(reply())
     }
 

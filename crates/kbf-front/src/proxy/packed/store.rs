@@ -5,6 +5,7 @@
 //! that depends on the object store's type, and it only hands calls to `kbf-pack`.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -24,6 +25,7 @@ use super::room::{Budget, DEFAULT_INFLIGHT_BYTES, Room};
 use super::verifying::VerifyingKeys;
 use crate::cache::is_empty_blob;
 use crate::large_backfill::LargeStore;
+use crate::store_writes::{STORE_WRITES, StoreWrites};
 
 /// The largest blob a frontend puts in a pack or serves from one by default: 64 MiB, the
 /// most it holds in memory to hash a blob before the first byte of it is sent.
@@ -55,6 +57,10 @@ pub struct PackSettings {
     pub upload_idle_timeout: Duration,
     /// The blobs read from packs are kept here, when there is a cache.
     pub cache: Option<Arc<ReadCache>>,
+    /// The most writes at the store at once, of every writer through the packs together
+    /// (`crate::store_writes`): a write past it waits for one to end. A write whose body is in
+    /// hand waits out the store's 503 `SlowDown` holding its slot.
+    pub store_writes: NonZeroUsize,
 }
 
 impl Default for PackSettings {
@@ -65,6 +71,7 @@ impl Default for PackSettings {
             inflight_bytes: DEFAULT_INFLIGHT_BYTES,
             upload_idle_timeout: DEFAULT_UPLOAD_IDLE_TIMEOUT,
             cache: None,
+            store_writes: STORE_WRITES,
         }
     }
 }
@@ -175,6 +182,8 @@ pub struct Packs {
     clock: Clock,
     /// The writer the packs are recorded under, which a large object is recorded under too.
     pub(super) writer: String,
+    /// [`PackSettings::store_writes`].
+    store_writes: NonZeroUsize,
 }
 
 impl fmt::Debug for Packs {
@@ -186,7 +195,9 @@ impl fmt::Debug for Packs {
 }
 
 impl Packs {
-    /// Packs written to `store` under `keys` and recorded in `index`, as `settings` say.
+    /// Packs written to `store` under `keys` and recorded in `index`, as `settings` say. Every
+    /// write to `store` through them, by any caller, takes one of
+    /// [`PackSettings::store_writes`] slots.
     ///
     /// # Errors
     /// [`PackError::NotCreateOnly`] when the store does not claim create-only writes. Call
@@ -202,6 +213,7 @@ impl Packs {
             ..PackerConfig::default()
         };
         let writer = keys.writer();
+        let store = Arc::new(StoreWrites::new(store, settings.store_writes));
         let packer = Packer::new(store.clone(), index.clone(), keys.clone(), config)?;
         let reader = Reader::new(
             Arc::clone(&store),
@@ -227,6 +239,7 @@ impl Packs {
             verifying: Arc::default(),
             clock: Arc::new(SystemTime::now),
             writer,
+            store_writes: settings.store_writes,
         })
     }
 
@@ -272,6 +285,12 @@ impl Packs {
     #[must_use]
     pub fn inflight_bytes(&self) -> u32 {
         self.budget.cap()
+    }
+
+    /// The most writes at the store at once ([`PackSettings::store_writes`]).
+    #[must_use]
+    pub fn store_writes(&self) -> NonZeroUsize {
+        self.store_writes
     }
 
     /// How long a ByteStream upload may go without a byte of its body arriving
@@ -395,8 +414,9 @@ impl Packs {
     ///
     /// # Errors
     /// INVALID_ARGUMENT when a blob's bytes are not its digest; UNAVAILABLE when the store
-    /// or the index failed; RESOURCE_EXHAUSTED when the blobs together are over all of the
-    /// room.
+    /// or the index failed (a 503 `SlowDown` is not a failure: the pack is written again after a
+    /// wait, for as long as the store answers it, until the caller drops the call);
+    /// RESOURCE_EXHAUSTED when the blobs together are over all of the room.
     pub async fn put(&self, blobs: Vec<(Digest, Bytes)>) -> Result<(), Status> {
         let bytes = blobs.iter().map(|(_, data)| data.len() as u64).sum();
         let room = self.reserve(bytes).await?;

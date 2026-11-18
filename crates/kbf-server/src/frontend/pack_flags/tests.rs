@@ -53,6 +53,7 @@ fn the_pack_flags_are_off_unless_the_endpoint_is_given() {
         "--pack-store-region=eu-west-1",
         "--pack-inflight-bytes=67108864",
         "--pack-upload-idle-timeout=5",
+        "--pack-store-writes=8",
     ];
     assert_eq!(parsed(&companions).expect("parses").packs, None);
 }
@@ -105,7 +106,8 @@ fn the_flags_need_each_other() {
 
 /// Asserts that the flags make the setting they say, and that the defaults are the frontend's:
 /// packs closed at 32 MiB, room for 1 GiB of uploads in flight, an idle timeout of 30 seconds,
-/// the writer called `frontend`, the region `us-east-1`, no cache.
+/// 64 writes at the store at once ([`kbf_front::STORE_WRITES`]), the writer called `frontend`,
+/// the region `us-east-1`, no cache.
 #[test]
 fn the_flags_make_the_setting() {
     let plain = parsed(&STORE).expect("parses").packs.expect("packs");
@@ -119,6 +121,7 @@ fn the_flags_make_the_setting() {
             pack_bytes: FRONTEND_PACK_BYTES,
             inflight_bytes: kbf_front::DEFAULT_INFLIGHT_BYTES,
             upload_idle_timeout: kbf_front::DEFAULT_UPLOAD_IDLE_TIMEOUT,
+            store_writes: kbf_front::STORE_WRITES,
             writer: "frontend".to_owned(),
             cache: None,
         }
@@ -129,6 +132,7 @@ fn the_flags_make_the_setting() {
         "--pack-bytes=4096",
         "--pack-inflight-bytes=134217728",
         "--pack-upload-idle-timeout=7",
+        "--pack-store-writes=9",
         "--pack-writer=fe7",
         "--pack-cache-dir=/var/cache/packs",
         "--pack-cache-bytes=1000000",
@@ -138,6 +142,7 @@ fn the_flags_make_the_setting() {
     assert_eq!((set.pack_bytes, set.writer.as_str()), (4096, "fe7"));
     assert_eq!(set.inflight_bytes, 128 << 20);
     assert_eq!(set.upload_idle_timeout, Duration::from_secs(7));
+    assert_eq!(set.store_writes.get(), 9);
     assert_eq!(
         set.cache,
         Some((PathBuf::from("/var/cache/packs"), 1_000_000))
@@ -197,6 +202,26 @@ fn the_room_and_idle_flags_are_bounded() {
     assert_eq!(set.upload_idle_timeout, Duration::from_secs(86_400));
 }
 
+/// Asserts the bounds of `--pack-store-writes`: refused at 0 and at 4097, accepted at 1 and at
+/// 4096, the bounds of `--task-manifest-writes`.
+#[test]
+fn the_store_writes_flag_is_bounded() {
+    let state = STORE[0];
+    for bad in ["--pack-store-writes=0", "--pack-store-writes=4097"] {
+        let kind = refused(&[state, bad]);
+        assert_eq!(kind, ErrorKind::ValueValidation, "{bad}");
+    }
+    for (given, want) in [
+        ("--pack-store-writes=1", 1),
+        ("--pack-store-writes=4096", 4096),
+    ] {
+        let mut more = STORE.to_vec();
+        more.push(given);
+        let set = parsed(&more).expect("parses").packs.expect("packs");
+        assert_eq!(set.store_writes.get(), want, "{given}");
+    }
+}
+
 /// The key pair file's text.
 const KEYS: &str = r#"{"access_key_id": "AKIDEXAMPLE", "secret_access_key": "hunter2"}"#;
 
@@ -252,6 +277,7 @@ fn flags(dir: &Path) -> PackFlags {
         pack_bytes: 1 << 20,
         inflight_bytes: 1 << 20,
         upload_idle_timeout: Duration::from_secs(5),
+        store_writes: NonZeroUsize::MIN.saturating_add(2),
         writer: "fe1".to_owned(),
         cache: None,
     }
@@ -262,7 +288,7 @@ fn index() -> Arc<dyn PackIndex> {
 }
 
 /// Asserts that the flags open into packs (nothing is sent to the store to do it) that carry
-/// the room for uploads and the idle timeout the flags say, with a cache when there is one, and
+/// the room for uploads, the idle timeout and the store writes the flags say, with a cache when there is one, and
 /// over two endpoints of one store, and that each thing the flags name that cannot be used is
 /// refused naming its flag: an endpoint the store client does not take, an endpoint given twice,
 /// no endpoint at all, a writer name a key cannot hold, a cache directory that
@@ -276,6 +302,7 @@ fn the_flags_open_into_packs_or_are_refused_by_flag() {
     assert_eq!(packs.max_blob_bytes(), kbf_front::MAX_PACKED_BLOB_BYTES);
     assert_eq!(packs.inflight_bytes(), 1 << 20);
     assert_eq!(packs.upload_idle_timeout(), Duration::from_secs(5));
+    assert_eq!(packs.store_writes().get(), 3);
     assert!(dir.path().join("cache").is_dir());
 
     let mut tls = flags(dir.path());

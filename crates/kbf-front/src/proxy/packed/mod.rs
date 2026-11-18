@@ -12,9 +12,11 @@
 //! index has its row (the write rule of `kbf-pack`). A ByteStream `Write` of a blob of at most
 //! [`Packs::max_blob_bytes`] is received whole, hashed and packed the same way; a larger one,
 //! and any upload of a compressed blob, goes to the storage nodes as it does without packs. A
-//! failed write answers UNAVAILABLE; the packs finished before the failure stay recorded (the
-//! packer records each pack before it starts the next), and a write sent again packs only the
-//! rest.
+//! pack the store answers 503 `SlowDown` is written again after a wait, for as long as the store
+//! answers it (`crate::store_writes`), and an upload whose `grpc-timeout` passes first is ended
+//! DEADLINE_EXCEEDED. A write that failed otherwise answers UNAVAILABLE; the packs finished
+//! before the failure stay recorded (the packer records each pack before it starts the next),
+//! and a write sent again packs only the rest.
 //!
 //! **Room.** The uploads of one frontend share a budget of bytes in flight
 //! ([`PackSettings::inflight_bytes`], `--pack-inflight-bytes`): a ByteStream `Write` takes the

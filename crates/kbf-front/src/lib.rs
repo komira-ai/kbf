@@ -92,6 +92,7 @@ mod routed;
 mod segments;
 mod storage;
 pub mod store_metrics;
+mod store_writes;
 mod wire;
 
 use std::sync::Arc;
@@ -162,6 +163,7 @@ pub use crate::segments::{
     SegmentsConfig, SegmentsService, Tracked,
 };
 pub use crate::storage::CacheStorage;
+pub use crate::store_writes::STORE_WRITES;
 
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
 /// advertised in the capabilities. Larger blobs go through ByteStream. A request is

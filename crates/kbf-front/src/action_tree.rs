@@ -86,6 +86,7 @@ pub use self::listing::Listing;
 pub use self::place::{HEADS_IN_FLIGHT, LOCATE_CHUNK, LOOKUP_DEADLINE};
 pub use self::places::PLACE_ENTRIES;
 pub use self::retry::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, PutRetry, Sleeper};
+pub(crate) use self::retry::{is_slow_down, tokio_sleeper};
 
 use self::encode::{Child, Manifest};
 use self::flight::Flights;

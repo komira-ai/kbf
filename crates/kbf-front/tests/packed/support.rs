@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -33,6 +33,7 @@ use kbf_state::ManualClock;
 use kbf_storage::Storage;
 use kbf_storage::service::{Admission, Config, StorageService};
 use kbf_types::Digest;
+use tokio::sync::{Semaphore, watch};
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Endpoint, Server};
@@ -49,16 +50,37 @@ fn injected() -> ObjectStoreError {
     injected_with(503)
 }
 
+/// A failure of the store that is not its back-pressure: a 503 that is not `SlowDown`, which no
+/// writer waits out, or the status asked for.
 fn injected_with(status: u32) -> ObjectStoreError {
     let code = if status == 507 {
         "InsufficientStorage"
     } else {
-        "SlowDown"
+        "ServiceUnavailable"
     };
     ObjectStoreError::Service {
         status: u16::try_from(status).expect("a status"),
         code: code.to_owned(),
         message: "injected".to_owned(),
+    }
+}
+
+/// The store's back-pressure, as tierstore answers it when it is taking as many uploads as it
+/// can.
+pub fn slow_down() -> ObjectStoreError {
+    ObjectStoreError::Service {
+        status: 503,
+        code: "SlowDown".to_owned(),
+        message: "injected".to_owned(),
+    }
+}
+
+/// A write inside the store, counted out when it ends, however it ends.
+struct Inside<'a>(&'a watch::Sender<usize>);
+
+impl Drop for Inside<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
     }
 }
 
@@ -92,6 +114,10 @@ pub struct Spy {
     on_len: Mutex<Option<Hook>>,
     on_delete: Mutex<Option<Hook>>,
     held_when_asked: Mutex<Vec<bool>>,
+    slow_downs: AtomicU32,
+    gate: Semaphore,
+    inside: watch::Sender<usize>,
+    most_inside: AtomicUsize,
 }
 
 impl Spy {
@@ -143,7 +169,54 @@ impl Spy {
             on_len: Mutex::new(None),
             on_delete: Mutex::new(None),
             held_when_asked: Mutex::new(Vec::new()),
+            slow_downs: AtomicU32::new(0),
+            gate: Semaphore::new(Semaphore::MAX_PERMITS),
+            inside: watch::Sender::new(0),
+            most_inside: AtomicUsize::new(0),
         }
+    }
+
+    /// The next `n` writes (whole or streamed) are answered 503 `SlowDown`.
+    pub fn slow_down_puts(&self, n: u32) {
+        self.slow_downs.store(n, SeqCst);
+    }
+
+    /// From now on every write waits inside the store until [`Spy::let_puts`] lets it on.
+    pub fn hold_puts(&self) {
+        self.gate.forget_permits(Semaphore::MAX_PERMITS);
+    }
+
+    /// Lets `n` more held writes on.
+    pub fn let_puts(&self, n: usize) {
+        self.gate.add_permits(n);
+    }
+
+    /// Waits until at least `n` writes are inside the store at once.
+    pub async fn until_inside(&self, n: usize) {
+        let mut inside = self.inside.subscribe();
+        inside
+            .wait_for(|now| *now >= n)
+            .await
+            .expect("the store lives");
+    }
+
+    /// The most writes that were inside the store at once.
+    pub fn most_inside(&self) -> usize {
+        self.most_inside.load(SeqCst)
+    }
+
+    /// Counts a write in, waits at the gate, and answers `SlowDown` if one is armed.
+    async fn enter(&self) -> (Inside<'_>, Result<(), ObjectStoreError>) {
+        self.inside.send_modify(|n| *n += 1);
+        let inside = Inside(&self.inside);
+        self.most_inside.fetch_max(*self.inside.borrow(), SeqCst);
+        self.gate.acquire().await.expect("never closed").forget();
+        let answer = if fires(&self.slow_downs) {
+            Err(slow_down())
+        } else {
+            Ok(())
+        };
+        (inside, answer)
     }
 
     /// From now on, each length asked of the store notes whether every one of `keys` is held by
@@ -316,8 +389,10 @@ impl ObjectStore for Spy {
         retain_until: Option<SystemTime>,
     ) -> Result<(), ObjectStoreError> {
         self.puts.fetch_add(1, SeqCst);
+        let (_inside, entered) = self.enter().await;
+        entered?;
         if fires(&self.reject_puts) {
-            return Err(injected());
+            return Err(injected_with(self.put_status.load(SeqCst)));
         }
         self.inner.put_new(key, body, retain_until).await
     }
@@ -330,6 +405,8 @@ impl ObjectStore for Spy {
     ) -> Result<(), ObjectStoreError> {
         self.puts.fetch_add(1, SeqCst);
         self.stream_puts.fetch_add(1, SeqCst);
+        let (_inside, entered) = self.enter().await;
+        entered?;
         if fires(&self.reject_puts) {
             return Err(injected_with(self.put_status.load(SeqCst)));
         }
