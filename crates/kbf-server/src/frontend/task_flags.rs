@@ -45,6 +45,7 @@ use crate::token::{TokenFileError, read_owner_only};
 
 const SECRET: &str = "task_secret_file";
 const PUT_RETRY: &str = "task_put_retry_secs";
+const MANIFEST_WRITES: &str = "task_manifest_writes";
 const URL_SLACK: &str = "task_url_slack_secs";
 const MAX_DIGESTS: &str = "task_closure_max_digests";
 const MAX_BYTES: &str = "task_closure_max_bytes";
@@ -69,6 +70,9 @@ const DEFAULT_URL_SLACK_SECS: u64 = 600;
 /// above).
 #[cfg(test)]
 const DEFAULT_PUT_RETRY_SECS: u64 = 60;
+
+/// The most writes `--task-manifest-writes` takes.
+const MAX_MANIFEST_WRITES: u64 = 4096;
 
 /// The longest slack a flag takes, in seconds: the 4 hour ceiling of the keys of a put
 /// directory ([`kbf_front::prepare_run::MAX_EXPIRY`]).
@@ -139,7 +143,7 @@ pub(super) fn args() -> Vec<Arg> {
 }
 
 /// The thirteen flags that are read.
-fn live() -> [Arg; 13] {
+fn live() -> [Arg; 14] {
     [
         Arg::new(SECRET)
             .long("task-secret-file")
@@ -163,7 +167,16 @@ fn live() -> [Arg; 13] {
             // DEFAULT_PUT_RETRY_SECS, as above.
             .default_value("60")
             .help(
-                "The most seconds the waits add up to before a create-only write of an action tree to the tier store (`cas/l/<sha256>`) gives up on a 503 (\"retry later\", which the store answers while it registers: 10 to 40 s), so the lease fails only after this long. A write whose connection turns out to be dead is made once more at once, whatever this says. 0 never waits for a 503. Used only with `--task-secret-file` and `--task-out-mode put-dir`",
+                "The most seconds the waits add up to before a create-only write of an action tree to the tier store (`cas/l/<sha256>`) gives up on a 503 (\"retry later\", which the store answers while it registers: 10 to 40 s), so the lease fails only after this long. A write whose connection turns out to be dead is made once more at once, whatever this says. 0 never waits for a 503. A 503 `SlowDown` (the store taking as many uploads as it can) is back-pressure and is waited out past this, until the run's preparation limit. Used only with `--task-secret-file` and `--task-out-mode put-dir`",
+            ),
+        Arg::new(MANIFEST_WRITES)
+            .long("task-manifest-writes")
+            .value_name("WRITES")
+            .value_parser(clap::value_parser!(u64).range(1..=MAX_MANIFEST_WRITES))
+            // kbf_front::action_tree::MANIFEST_WRITES; the default-flags test compares them.
+            .default_value("32")
+            .help(
+                "The most create-only writes of action-tree manifests to the tier store (`cas/l/<sha256>`) this frontend has open at once, across every run it prepares; a write past it waits at the frontend for one to end. A burst of runs then queues here and not at the store, whose every write would slow as more arrive. Used only with `--task-secret-file` and `--task-out-mode put-dir`",
             ),
         Arg::new(URL_SLACK)
             .long("task-url-slack-secs")
@@ -311,6 +324,8 @@ pub struct PutDirFlags {
     pub url_slack: Duration,
     /// `--task-put-retry-secs`.
     pub put_retry: Duration,
+    /// `--task-manifest-writes`.
+    pub manifest_writes: usize,
     /// `--task-closure-max-digests`.
     pub max_digests: usize,
     /// `--task-max-object-entries`.
@@ -348,6 +363,8 @@ pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<PutDirFlags>, String
         roots: PutDirRoots::new(root).map_err(|error| format!("--task-out-root: {error}"))?,
         url_slack: Duration::from_secs(m.get_one::<u64>(URL_SLACK).copied().unwrap_or_default()),
         put_retry: Duration::from_secs(m.get_one::<u64>(PUT_RETRY).copied().unwrap_or_default()),
+        manifest_writes: usize::try_from(m.get_one::<u64>(MANIFEST_WRITES).copied().unwrap_or(1))
+            .unwrap_or(usize::MAX),
         max_digests: usize::try_from(digests).unwrap_or(usize::MAX),
         max_object_entries: entries_of(m),
         max_object_manifest_bytes: m

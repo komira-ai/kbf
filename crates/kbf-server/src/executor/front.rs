@@ -252,6 +252,13 @@ impl PutDirParts {
         self.writer = self.writer.with_put_retry(retry);
         self
     }
+
+    /// These parts with at most `slots` manifest writes open at once.
+    #[must_use]
+    pub fn with_write_slots(mut self, slots: usize) -> Self {
+        self.writer = self.writer.with_write_slots(slots);
+        self
+    }
 }
 
 /// What [`Front`] holds of one run between [`Ingest::mint`] and [`Inputs::tree`].

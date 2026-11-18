@@ -386,6 +386,8 @@ task-janitor-page-size = 500
 # Removed with `--task-out-mode presigned`. Any value is refused at start
 # (not in --help)
 # task-large-max-bytes = "VALUE"
+# The most create-only writes of action-tree manifests to the tier store (`cas/l/<sha256>`) this frontend has open at once, across every run it prepares; a write past it waits at the frontend for one to end. A burst of runs then queues here and not at the store, whose every write would slow as more arrive. Used only with `--task-secret-file` and `--task-out-mode put-dir`
+task-manifest-writes = 32
 # Removed with `--task-out-mode presigned`. Any value is refused at start
 # (not in --help)
 # task-max-large = "VALUE"
@@ -416,7 +418,7 @@ task-out-mode = "put-dir"
 # Removed with `--task-out-mode presigned`. Any value is refused at start
 # (not in --help)
 # task-put-region = "VALUE"
-# The most seconds the waits add up to before a create-only write of an action tree to the tier store (`cas/l/<sha256>`) gives up on a 503 ("retry later", which the store answers while it registers: 10 to 40 s), so the lease fails only after this long. A write whose connection turns out to be dead is made once more at once, whatever this says. 0 never waits for a 503. Used only with `--task-secret-file` and `--task-out-mode put-dir`
+# The most seconds the waits add up to before a create-only write of an action tree to the tier store (`cas/l/<sha256>`) gives up on a 503 ("retry later", which the store answers while it registers: 10 to 40 s), so the lease fails only after this long. A write whose connection turns out to be dead is made once more at once, whatever this says. 0 never waits for a 503. A 503 `SlowDown` (the store taking as many uploads as it can) is back-pressure and is waited out past this, until the run's preparation limit. Used only with `--task-secret-file` and `--task-out-mode put-dir`
 task-put-retry-secs = 60
 # Removed with `--task-out-mode presigned`. Any value is refused at start
 # (not in --help)

@@ -64,6 +64,7 @@ fn the_task_flags_are_off_unless_the_secret_file_is_given() {
         "--task-out-format=one-pass",
         "--task-url-slack-secs=5",
         "--task-put-retry-secs=90",
+        "--task-manifest-writes=4",
         "--task-closure-max-digests=10",
         "--task-closure-max-bytes=1024",
         "--task-max-object-entries=7",
@@ -104,6 +105,7 @@ fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
     assert_eq!(set.roots, PutDirRoots::new("/mnt/ts/put").expect("roots"));
     assert_eq!(set.url_slack, Duration::from_secs(DEFAULT_URL_SLACK_SECS));
     assert_eq!(set.put_retry, Duration::from_secs(DEFAULT_PUT_RETRY_SECS));
+    assert_eq!(set.manifest_writes, kbf_front::action_tree::MANIFEST_WRITES);
     assert_eq!(set.max_digests, ClosureLimits::DEFAULT.max_digests);
     assert_eq!(set.max_bytes, ClosureLimits::DEFAULT.max_bytes);
     assert_eq!(set.max_object_entries, 1 << 20);
@@ -114,6 +116,7 @@ fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
     let set = put_dir(&[
         "--task-url-slack-secs=0",
         "--task-put-retry-secs=0",
+        "--task-manifest-writes=1",
         "--task-closure-max-digests=1000",
         "--task-closure-max-bytes=1048576",
         "--task-max-object-entries=7",
@@ -124,6 +127,7 @@ fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
     ]);
     assert_eq!(set.url_slack, Duration::ZERO);
     assert_eq!(set.put_retry, Duration::ZERO);
+    assert_eq!(set.manifest_writes, 1);
     assert_eq!(set.max_digests, 1_000);
     assert_eq!(set.max_bytes, 1 << 20);
     assert_eq!(set.max_object_entries, 7);
@@ -302,6 +306,7 @@ fn put_dir_flags(dir: &Path) -> PutDirFlags {
         roots: PutDirRoots::new("/mnt/ts/put").expect("roots"),
         url_slack: Duration::from_secs(DEFAULT_URL_SLACK_SECS),
         put_retry: Duration::from_secs(DEFAULT_PUT_RETRY_SECS),
+        manifest_writes: kbf_front::action_tree::MANIFEST_WRITES,
         max_digests: ClosureLimits::DEFAULT.max_digests,
         max_object_entries: 1 << 20,
         max_object_manifest_bytes: 4 << 20,
@@ -528,4 +533,21 @@ async fn the_parsed_cache_flags_keep_the_directories_of_a_run_on_the_disk() {
         error.to_string().starts_with("--task-directory-cache-dir "),
         "{error}"
     );
+}
+
+/// Asserts that `--task-manifest-writes` takes 1 to 4096 and refuses 0 (no write could ever be
+/// made) and 4097, by the value. Catches: a bound of zero that hangs every preparation.
+#[test]
+fn the_manifest_writes_are_one_to_4096() {
+    assert_eq!(
+        put_dir(&["--task-manifest-writes=4096"]).manifest_writes,
+        4096
+    );
+    let bad = ErrorKind::ValueValidation;
+    let mut zero = PUT_DIR_ONLY.to_vec();
+    zero.push("--task-manifest-writes=0");
+    assert_eq!(refused(&zero), bad);
+    let mut over = PUT_DIR_ONLY.to_vec();
+    over.push("--task-manifest-writes=4097");
+    assert_eq!(refused(&over), bad);
 }

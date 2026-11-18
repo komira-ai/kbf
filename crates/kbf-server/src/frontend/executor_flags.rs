@@ -56,7 +56,7 @@ use std::time::Duration;
 
 use clap::builder::ValueParser;
 use clap::{Arg, ArgMatches};
-use kbf_front::action_tree::{BaseTree, DEFAULT_TOTAL, PutRetry};
+use kbf_front::action_tree::{BaseTree, DEFAULT_TOTAL, MANIFEST_WRITES, PutRetry};
 use kbf_front::{Backend, Packs, Recorder};
 use kbf_job_client::{Client, Origin, Token};
 use kbf_types::ImageRef;
@@ -492,6 +492,9 @@ pub struct JsAgentFlags {
     /// `--task-put-retry-secs`: how long the waits for a 503 of the store add up to when the
     /// executor writes an action tree. Set by the task flags; the default until then.
     pub put_retry: Duration,
+    /// `--task-manifest-writes`: the most manifest writes of action trees open at once. Set by
+    /// the task flags; the default until then.
+    pub manifest_writes: usize,
 }
 
 /// What `--executor` says: jobs of a job service, or no executor.
@@ -618,6 +621,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         base_tree_timeout: secs(BASE_TREE_TIMEOUT),
         published: Arc::default(),
         put_retry: DEFAULT_TOTAL,
+        manifest_writes: MANIFEST_WRITES,
     })
 }
 
@@ -671,7 +675,8 @@ impl JsAgentFlags {
     #[must_use]
     pub fn front(&self, packs: Packs, backend: Backend, source: RunSource) -> Front {
         let put_dir = PutDirParts::new(&packs, &backend, Arc::clone(&self.published))
-            .with_put_retry(PutRetry::new(self.put_retry));
+            .with_put_retry(PutRetry::new(self.put_retry))
+            .with_write_slots(self.manifest_writes);
         Front::new(FrontParts {
             packs,
             backend,

@@ -446,5 +446,6 @@ fn js_flags(config: crate::executor::Config) -> super::super::JsAgentFlags {
         base_tree_timeout: Duration::from_secs(5),
         published: Arc::default(),
         put_retry: Duration::from_secs(5),
+        manifest_writes: kbf_front::action_tree::MANIFEST_WRITES,
     }
 }
