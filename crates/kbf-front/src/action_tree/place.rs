@@ -15,6 +15,7 @@
 //! bytes are wrong: the body ends in an error instead, and the store keeps nothing.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use kbf_types::Digest;
 use sha2::{Digest as _, Sha256};
 
 use super::NoTree;
-use super::retry::{Failed, PutRetry, retrying};
+use super::retry::{Failed, PutRetry, repeating, retrying};
 use crate::job_read::BlobSource;
 use crate::large_backfill::{LargeStore, large_key};
 
@@ -202,12 +203,34 @@ pub(super) async fn write_object(
     key: &ObjectKey,
     bytes: Bytes,
 ) -> Result<(), NoTree> {
+    store_object(store, retry, key, bytes)
+        .await
+        .map_err(|error| NoTree::Put {
+            key: key.to_string(),
+            why: error.to_string(),
+        })
+}
+
+/// [`write_object`], the failure the store's last answer.
+///
+/// # Errors
+/// The store's last answer.
+pub(super) async fn store_object(
+    store: &dyn LargeStore,
+    retry: &PutRetry,
+    key: &ObjectKey,
+    bytes: Bytes,
+) -> Result<(), ObjectStoreError> {
     let length = bytes.len() as u64;
-    retrying(retry, key, || async {
+    let stored = repeating::<Infallible, _, _>(retry, || async {
         let body = stream::once(std::future::ready(Ok(bytes.clone()))).boxed();
         put(store, key, length, body).await.map_err(Failed::Store)
     })
-    .await
+    .await;
+    stored.map_err(|failed| {
+        let Failed::Store(error) = failed;
+        error
+    })
 }
 
 /// One create-only write; an existing key is success.

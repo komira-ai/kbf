@@ -86,12 +86,13 @@ impl Default for PutRetry {
     }
 }
 
-/// Why one attempt of a write failed.
-pub(super) enum Failed {
+/// Why one attempt of a write failed. A write that can fail only at the store (a manifest's,
+/// whose bytes are in hand) takes `E` as [`std::convert::Infallible`].
+pub(super) enum Failed<E = NoTree> {
     /// The store's answer, which may be repeated.
     Store(ObjectStoreError),
     /// A failure that is not the store's (the blob's read, its digest): final.
-    Other(NoTree),
+    Other(E),
 }
 
 /// Whether `error` is a 503 of the store.
@@ -113,13 +114,34 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<(), Failed>>,
 {
+    repeating(retry, attempt)
+        .await
+        .map_err(|failed| match failed {
+            Failed::Store(error) => NoTree::Put {
+                key: key.to_string(),
+                why: error.to_string(),
+            },
+            Failed::Other(failure) => failure,
+        })
+}
+
+/// [`retrying`], the failure as the attempt gave it: the store's last answer, or the
+/// [`Failed::Other`] of an attempt.
+///
+/// # Errors
+/// The last attempt's [`Failed`].
+pub(super) async fn repeating<E, F, Fut>(retry: &PutRetry, attempt: F) -> Result<(), Failed<E>>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<(), Failed<E>>>,
+{
     let mut reconnected = false;
     let mut waited = Duration::ZERO;
     let mut next = FIRST_WAIT;
     loop {
         let error = match attempt().await {
             Ok(()) => return Ok(()),
-            Err(Failed::Other(failure)) => return Err(failure),
+            Err(Failed::Other(failure)) => return Err(Failed::Other(failure)),
             Err(Failed::Store(ObjectStoreError::AlreadyExists(_))) => return Ok(()),
             Err(Failed::Store(error)) => error,
         };
@@ -134,9 +156,6 @@ where
             next = (next * 2).min(LONGEST_WAIT);
             continue;
         }
-        return Err(NoTree::Put {
-            key: key.to_string(),
-            why: error.to_string(),
-        });
+        return Err(Failed::Store(error));
     }
 }

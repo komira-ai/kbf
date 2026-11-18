@@ -32,6 +32,8 @@ use kbf_types::Digest;
 use prost::Message as _;
 use tierstore::{TreeDigest, TreeEntry, flatten};
 
+#[path = "action_tree/flight.rs"]
+mod flight;
 #[path = "action_tree/golden.rs"]
 mod golden;
 #[path = "action_tree/kept.rs"]
@@ -80,6 +82,8 @@ struct Faults {
     script: BTreeMap<String, VecDeque<ObjectStoreError>>,
     /// The answers the next writes of any key give instead of storing, in order.
     any: VecDeque<ObjectStoreError>,
+    /// A key whose writes wait, once recorded, until the test opens [`Farm::gate`].
+    held: Option<String>,
 }
 
 #[derive(Default)]
@@ -188,6 +192,8 @@ struct Farm {
     backend: Backend,
     storage: Arc<dyn Storage>,
     state: Mutex<State>,
+    /// What a write of [`Faults::held`] waits for: one permit lets one write on.
+    gate: tokio::sync::Semaphore,
 }
 
 /// The key of `digest`'s whole object.
@@ -208,6 +214,7 @@ impl Farm {
             backend: Backend::remote(Arc::clone(&storage)),
             storage,
             state: Mutex::new(State::default()),
+            gate: tokio::sync::Semaphore::new(0),
         })
     }
 
@@ -407,11 +414,20 @@ impl LargeStore for Farm {
     ) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
         Box::pin(async move {
             let name = key.as_str().to_owned();
-            let refused = {
+            let (held, refused) = {
                 let mut state = self.state();
                 state.puts.push(name.clone());
-                state.faults.put.as_deref() == Some(name.as_str())
+                let faults = &state.faults;
+                let held = faults.held.as_deref() == Some(name.as_str());
+                (held, faults.put.as_deref() == Some(name.as_str()))
             };
+            if held {
+                self.gate
+                    .acquire()
+                    .await
+                    .expect("the gate is never closed")
+                    .forget();
+            }
             if refused {
                 return Err(ObjectStoreError::Unsupported("writes to this key"));
             }
