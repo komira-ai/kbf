@@ -422,6 +422,18 @@ impl TreeWriter {
         dropped > 0
     }
 
+    /// Drops what the memos say of a pack the store lost (`key`): every place memo entry that
+    /// places a blob in it, and, when one did, the manifest memo whole, since a remembered
+    /// manifest may name the pack as a file's source and the memo cannot be asked which. Returns
+    /// whether the place memo placed a blob in the pack.
+    pub fn lost_pack(&self, key: &str) -> bool {
+        let dropped = self.remembered().forget_pack(key);
+        if dropped > 0 {
+            self.lock().clear();
+        }
+        dropped > 0
+    }
+
     async fn write_as(
         &self,
         kept: &KeptClosure,

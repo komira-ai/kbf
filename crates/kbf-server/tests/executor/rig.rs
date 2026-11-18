@@ -112,7 +112,7 @@ pub struct FakeIngest {
     /// The wall each mint was asked to keep its directory good for, in order.
     pub walls: Mutex<Vec<Duration>>,
     /// Each object the store lost that a job named, with the action whose job named it.
-    pub lost: Mutex<Vec<(Digest, [u8; 32])>>,
+    pub lost: Mutex<Vec<(Digest, String)>>,
 }
 
 impl FakeIngest {
@@ -183,8 +183,8 @@ impl Ingest for FakeIngest {
             .unwrap_or_else(|| Self::ran(0))
     }
 
-    async fn lost(&self, action: &Digest, object: &[u8; 32]) {
-        locked(&self.lost).push((action.clone(), *object));
+    async fn lost(&self, action: &Digest, object: &str) {
+        locked(&self.lost).push((action.clone(), object.to_owned()));
     }
 }
 

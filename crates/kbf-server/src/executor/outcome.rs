@@ -58,11 +58,12 @@
 //! read, from the start of the detail, and only the detail's length is logged.
 //!
 //! **A lost object.** The detail of a start that failed on any code is also read for one thing
-//! more: 64 lower-case hex digits right before `: upstream 404`, which is how tierstore says the
-//! store has no object of a SHA-256 the job's tree names (`cannot fetch manifest <sha256>:
-//! upstream 404`) ([`lost_object`]). The store is a general-purpose one, and its objects can
-//! vanish while the frontend's state still names them. Only those digits are taken, and logged;
-//! the callers get a fixed phrase. The run is `infra` ([`Verdict::StoreLost`]): before the next
+//! more: the object right before `: upstream 404`, which is how tierstore says the store has no
+//! object the job's tree names ([`lost_object`]): an object key (`cas/...`), or a manifest's 64
+//! lower-case hex digits (`cannot fetch manifest <sha256>: upstream 404`), whose key is
+//! `cas/l/<sha256>`. The store is a general-purpose one, and its objects can vanish while the
+//! frontend's state still names them. Only that key is taken, and logged; the callers get a fixed
+//! phrase. The run is `infra` ([`Verdict::StoreLost`]): before the next
 //! attempt the frontend drops what its state says of the object, and writes that attempt's tree
 //! checked against the store, so a pack the store lost is forgotten and its blobs reported
 //! missing ([`Settled::Missing`]), which the client uploads again.
@@ -95,10 +96,10 @@ pub(super) enum Verdict {
     /// The job did not produce a result.
     Settled(Settled),
     /// The job did not start because the store does not have an object of its tree, `object`
-    /// (its SHA-256): the frontend's state is told before the run ends as `settled`.
+    /// (its key): the frontend's state is told before the run ends as `settled`.
     StoreLost {
-        /// The SHA-256 the store answered 404 for.
-        object: [u8; 32],
+        /// The key of the object the store answered 404 for.
+        object: String,
         /// How the run ends: `infra`.
         settled: Settled,
     },
@@ -140,31 +141,53 @@ fn agent_code(detail: &str) -> &str {
     &detail[..end]
 }
 
-/// What tierstore writes right after the SHA-256 of an object the store does not have.
+/// What tierstore writes right after the object the store does not have.
 const UPSTREAM_404: &str = ": upstream 404";
 
-/// The SHA-256 of the object a start failure's `detail` says the store answered 404 for: the 64
-/// lower-case hex digits right before [`UPSTREAM_404`], that are not the end of a longer run of
-/// hex digits, where the status is not the start of a longer number (the first such), or
-/// `None`. Nothing else of the detail is read.
-pub(super) fn lost_object(detail: &str) -> Option<[u8; 32]> {
+/// The longest object key the detail is read for.
+const MAX_KEY_BYTES: usize = 1024;
+
+/// The key of the object a start failure's `detail` says the store answered 404 for, read right
+/// before [`UPSTREAM_404`] where the status is not the start of a longer number (the first
+/// such): the run of key characters there when it is an object key under `cas/`, or else the
+/// 64 lower-case hex digits there, not the end of a longer run of hex digits, as `cas/l/<hex>`;
+/// `None` when there is neither. Nothing else of the detail is read.
+pub(super) fn lost_object(detail: &str) -> Option<String> {
     let is_hex = |b: &u8| b.is_ascii_digit() || (b'a'..=b'f').contains(b);
+    let is_key = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-');
     let bytes = detail.as_bytes();
     let mut from = 0;
     while let Some(found) = detail[from..].find(UPSTREAM_404) {
         let at = from + found;
         from = at + UPSTREAM_404.len();
-        let ends = bytes.get(from).is_none_or(|b| !b.is_ascii_digit());
+        if bytes.get(from).is_some_and(u8::is_ascii_digit) {
+            continue;
+        }
+        let begins = bytes[..at]
+            .iter()
+            .rposition(|b| !is_key(b))
+            .map_or(0, |i| i + 1);
+        let token = &detail[begins..at];
+        if token.starts_with("cas/") && token.len() <= MAX_KEY_BYTES {
+            return Some(token.to_owned());
+        }
         let Some(start) = at.checked_sub(64) else {
             continue;
         };
         let alone = start == 0 || !is_hex(&bytes[start - 1]);
-        let sha = sha256_of(&bytes[start..at]);
-        if let (true, true, Some(sha)) = (ends, alone, sha) {
-            return Some(sha);
+        if let (true, Some(sha)) = (alone, sha256_of(&bytes[start..at])) {
+            return Some(format!("cas/l/{}", hex(&sha)));
         }
     }
     None
+}
+
+/// The SHA-256 a `cas/l/<sha256>` key names, when `key` is one.
+pub(super) fn sha256_of_key(key: &str) -> Option<[u8; 32]> {
+    let hex = key.strip_prefix("cas/l/")?;
+    (hex.len() == 64)
+        .then(|| sha256_of(hex.as_bytes()))
+        .flatten()
 }
 
 /// The 32 bytes `hex` (64 bytes, as its one caller cuts it) spells, when every byte is a
@@ -183,7 +206,7 @@ fn sha256_of(hex: &[u8]) -> Option<[u8; 32]> {
 }
 
 /// The SHA-256 `sha` in lower-case hex.
-pub(super) fn hex(sha: &[u8; 32]) -> String {
+fn hex(sha: &[u8; 32]) -> String {
     sha.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -252,8 +275,7 @@ fn promote(job: &Job, result: &JobResult) -> Verdict {
 fn failed_to_start(job: &Job) -> Verdict {
     if let Some(object) = lost_object(&job.start_failure_detail) {
         let detail_bytes = job.start_failure_detail.len();
-        let object_hex = hex(&object);
-        tracing::warn!(job = %job.id, detail_bytes, object = %object_hex, "the job failed to start: the store does not have an object of its tree");
+        tracing::warn!(job = %job.id, detail_bytes, %object, "the job failed to start: the store does not have an object of its tree");
         let why = "the job failed to start: the store does not have an object of its tree";
         return Verdict::StoreLost {
             object,

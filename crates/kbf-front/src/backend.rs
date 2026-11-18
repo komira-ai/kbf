@@ -47,6 +47,7 @@ use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use kbf_meta::{ActionRecord, ActionWriteError, Role};
 use kbf_objstore::{ObjectStore, ObjectStoreError};
+use kbf_pack::Loss;
 use kbf_proto::reapi::ActionResult;
 use kbf_route::Router;
 use kbf_storage::{OpenPieces, ReadStream, Storage, StorageError};
@@ -299,12 +300,12 @@ impl Backend {
         packs.object_len(key).await.map_err(layered::unavailable)
     }
 
-    /// Forgets the pack `key` in the pack index if the store does not have it, or has it
-    /// shorter than `end` bytes ([`Packs::forget_lost`]); `false` when it is held or there are
-    /// no packs.
-    pub(crate) async fn forget_lost(&self, key: &str, end: u64) -> Result<bool, StorageError> {
+    /// Judges the pack `key` lost if the store does not have it, or has it shorter than `end`
+    /// bytes, and forgets it in the pack index once the loss is confirmed
+    /// ([`Packs::forget_lost`]); [`Loss::Held`] when there are no packs.
+    pub(crate) async fn forget_lost(&self, key: &str, end: u64) -> Result<Loss, StorageError> {
         let Some(packs) = self.0.packs() else {
-            return Ok(false);
+            return Ok(Loss::Held);
         };
         packs
             .forget_lost(key, end)

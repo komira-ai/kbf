@@ -240,15 +240,15 @@ impl Reading {
     }
 
     /// The failure of a blob whose object the store does not have, or has shorter than the index
-    /// says (`why`): the pack is forgotten once the store's length of it confirms the loss
-    /// ([`Packs::forget_lost`]), so the blob is missing and a client uploads it again. The read
-    /// is UNAVAILABLE either way: a client that asks again is answered NOT_FOUND once the row is
-    /// gone.
+    /// says (`why`): the pack is forgotten once the store's length of it and an earlier look
+    /// confirm the loss ([`Packs::forget_lost`]), so the blob is missing and a client uploads it
+    /// again. The read is UNAVAILABLE either way: a client that asks again is answered NOT_FOUND
+    /// once the row is gone.
     async fn lost(&self, why: String) -> Status {
         self.packs.metrics.lost.add(1);
         let end = self.base.saturating_add(self.digest.size_bytes);
         match self.packs.forget_lost(&self.pack_key, end).await {
-            Ok(forgotten) => self.packs.metrics.lost_forgotten.add(u64::from(forgotten)),
+            Ok(loss) => (self.packs.metrics.lost_forgotten).add(u64::from(loss.forgotten())),
             Err(status) => {
                 tracing::warn!(blob = %self.digest, %status, "a lost object could not be forgotten");
             }

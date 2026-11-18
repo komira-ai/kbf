@@ -665,8 +665,12 @@ impl PackIndex for Index {
         self.inner.drop_location(digest, pack_key)
     }
 
-    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
-        self.inner.forget_pack(pack_key)
+    fn forget_pack(
+        &self,
+        pack_key: &str,
+        min_age: Duration,
+    ) -> Result<Option<usize>, PackIndexError> {
+        self.inner.forget_pack(pack_key, min_age)
     }
 
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {

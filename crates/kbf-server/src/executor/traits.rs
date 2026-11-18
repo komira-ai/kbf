@@ -137,11 +137,12 @@ pub trait Ingest: Send + Sync {
         limits: &UntrustedLimits,
     ) -> Ingested;
 
-    /// A job of `action` did not start because the store does not have the object `object` (its
-    /// SHA-256) of its tree: what the frontend's state says of that object is dropped, and the
-    /// next [`Ingest::mint`] of `action` writes its tree checked against the store. Called before
-    /// the operation's next attempt is prepared. The default keeps no such state.
-    async fn lost(&self, action: &Digest, object: &[u8; 32]) {
+    /// A job of `action` did not start because the store does not have the object of its tree
+    /// whose key is `object` (a pack, or `cas/l/<sha256>` for a manifest or a whole blob): what
+    /// the frontend's state says of that object is dropped, and the next [`Ingest::mint`] of
+    /// `action` writes its tree checked against the store. Called before the operation's next
+    /// attempt is prepared. The default keeps no such state.
+    async fn lost(&self, action: &Digest, object: &str) {
         let _ = (action, object);
     }
 }

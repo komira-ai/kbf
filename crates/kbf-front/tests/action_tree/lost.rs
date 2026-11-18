@@ -6,6 +6,7 @@
 use super::listing::listed_base;
 use super::memo::{holding, holding_manifest, link_manifest, link_root};
 use super::*;
+use kbf_pack::Loss;
 
 /// The SHA-256 of the manifest whose digest is `hex`.
 fn sha(hex: &str) -> [u8; 32] {
@@ -219,7 +220,73 @@ impl BlobSource for Bare {
 #[tokio::test]
 async fn a_source_without_packs_forgets_nothing() {
     let rig = Rig::new().await;
-    assert!(!Bare.forget_lost("cas/f/w/p0", 5).await.expect("answered"));
-    let cas = &rig.farm.backend;
-    assert!(!cas.forget_lost("cas/f/w/p0", 5).await.expect("answered"));
+    let bare = Bare.forget_lost("cas/f/w/p0", 5).await.expect("answered");
+    assert_eq!(bare, Loss::Held);
+    let cas = rig.farm.backend.forget_lost("cas/f/w/p0", 5).await;
+    assert_eq!(cas.expect("answered"), Loss::Held);
+}
+
+/// Catches a loss the store has not confirmed yet taken for one it has, or for no loss: a checked
+/// write over a pack the store lacks whose loss is not yet confirmed fails as a store that could
+/// not answer (`why` `store`, run again), forgets no row, and drops both memos, so the next
+/// write looks every blob up again.
+#[tokio::test]
+async fn a_checked_write_over_a_loss_not_yet_confirmed_fails_and_forgets_nothing() {
+    let rig = Rig::new().await;
+    let blob = rig.farm.packed("below", "cas/f/w/p0", 0).await;
+    let root = root_over(&rig, &blob).await;
+    let kept = rig.kept(&root).await;
+    rig.writer
+        .write(&kept, &rig.base.tree)
+        .await
+        .expect("a tree");
+    rig.farm.state().doubted.insert("cas/f/w/p0".to_owned());
+
+    let failed = rig.writer.write_checked(&kept, &rig.base.tree).await;
+
+    let failed = failed.expect_err("not yet confirmed");
+    assert_eq!(failed.why(), "store");
+    let NoTree::Lookup { why } = &failed else {
+        panic!("not a lookup: {failed:?}");
+    };
+    assert!(why.contains("cas/f/w/p0"), "{why}");
+    assert!(rig.farm.state().spans.contains_key(&blob));
+    rig.farm.clear_records();
+    rig.writer
+        .write(&kept, &rig.base.tree)
+        .await
+        .expect("a tree");
+    assert!(rig.farm.asked().contains(&blob), "the memos were dropped");
+}
+
+/// Catches a lost pack's places kept, or other places dropped with them: the places in the pack
+/// are dropped and so is the manifest memo (a remembered manifest may name the pack), so the next
+/// tree looks the blob up again and writes its manifest again, while a blob placed in another
+/// pack keeps its place; a pack no place names drops nothing and says so.
+#[tokio::test]
+async fn a_lost_pack_drops_the_places_in_it_and_the_manifest_memo() {
+    let rig = Rig::new().await;
+    let lost = rig.farm.packed("lost!", "cas/f/w/p0", 0).await;
+    let other = rig.farm.packed("other", "cas/f/w/p1", 0).await;
+    let root = root_over(&rig, &lost).await;
+    let elsewhere = root_over(&rig, &other).await;
+    rig.write(&root).await.expect("a tree");
+    rig.write(&elsewhere).await.expect("a tree");
+    let (sub_hex, _) = file_manifest(&lost, "cas/f/w/p0", 0);
+
+    assert!(!rig.writer.lost_pack("cas/none"), "no place names it");
+    assert!(rig.writer.lost_pack("cas/f/w/p0"));
+    rig.farm.clear_records();
+    rig.write(&root).await.expect("a tree");
+
+    assert!(rig.farm.asked().contains(&lost), "its place was dropped");
+    assert!(
+        !rig.farm.asked().contains(&other),
+        "another pack's place is kept"
+    );
+    assert_eq!(
+        rig.farm.puts_of(&sub_hex),
+        1,
+        "the manifest memo was dropped"
+    );
 }

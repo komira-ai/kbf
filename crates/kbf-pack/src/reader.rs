@@ -5,12 +5,14 @@
 //! blobs that lie close together in a pack (within [`ReaderConfig::gap`] bytes) are one
 //! range. Every blob is hashed before it is handed out, and a blob whose bytes are not its
 //! digest is refused ([`Fetch::Damaged`]), never returned and never cached, and its location
-//! is dropped from the index ([`PackIndex::drop_location`]). A pack the store does not have, or
-//! has shorter than the index says, is asked for its length once, and when that confirms it the
-//! index forgets the pack ([`PackIndex::forget_pack`], [`Fetch::Lost`]): the store is a
+//! is dropped from the index ([`PackIndex::drop_location`]). A pack the store answers it does
+//! not have, or has shorter than the index says, is asked for its length once, and the reader's
+//! [`LossWitness`] judges the loss: confirmed by an earlier look and old enough, the index
+//! forgets the pack ([`PackIndex::forget_pack`], [`Fetch::Lost`]). The store is a
 //! general-purpose one, whose objects can vanish, and a row that names a vanished object would
-//! keep telling clients the blob is held. Blobs served are noted, and the index is told in
-//! batches ([`Reader::flush_touches`]) so that retention sees them as in use.
+//! keep telling clients the blob is held. A store that fails to answer (a 5xx) is the read's
+//! error and forgets nothing. Blobs served are noted, and the index is told in batches
+//! ([`Reader::flush_touches`]) so that retention sees them as in use.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -25,6 +27,7 @@ use crate::blocking::offload;
 use crate::cache::ReadCache;
 use crate::digest::verifies;
 use crate::error::ReadError;
+use crate::loss::{Loss, LossWitness};
 
 /// The most unwanted bytes read between two blobs of a pack to make them one request: 64 KiB.
 pub const DEFAULT_GAP: u64 = 64 << 10;
@@ -41,14 +44,15 @@ pub enum Fetch {
     Missing,
     /// The index has a row, and the store does not have the bytes it points at: the pack is
     /// gone or shorter than the row says. The reader then asked the store for the pack's length
-    /// and, when the pack is gone or ends before the blob does, forgot the pack in the index
-    /// ([`PackIndex::forget_pack`]): the next read of the digest finds no row
+    /// and judged the loss ([`LossWitness::judge`]); when it was confirmed, the index forgot the
+    /// pack ([`PackIndex::forget_pack`]): the next read of the digest finds no row
     /// ([`Fetch::Missing`]), and the index lists it as missing, so a client uploads it again.
     Lost {
         /// Whether the index forgot the pack. `false` when the length asked shows the pack
         /// whole after all (a read that raced its write), when the length could not be asked,
-        /// or when the index refused or failed the forget (each logged): the row stays, and the
-        /// next read finds the loss again.
+        /// on the first look at the loss or one too soon after it, for a pack too young, and
+        /// when the index refused or failed the forget (each logged): the row stays, and a
+        /// later read finds the loss again.
         forgotten: bool,
     },
     /// The store gave bytes that are not the digest. They are not returned. The reader
@@ -108,6 +112,8 @@ pub struct Reader<S: ObjectStore> {
     config: ReaderConfig,
     /// The blobs served that the index has not been told of.
     pending: Mutex<BTreeSet<BlobDigest>>,
+    /// The first looks that found packs lost ([`LossWitness`]).
+    witness: Arc<LossWitness>,
 }
 
 impl<S: ObjectStore> Reader<S> {
@@ -129,7 +135,22 @@ impl<S: ObjectStore> Reader<S> {
             cache,
             config,
             pending: Mutex::default(),
+            witness: Arc::default(),
         }
+    }
+
+    /// This reader, judging the losses it finds with `witness`, which other readers of the same
+    /// index may share.
+    #[must_use]
+    pub fn with_witness(mut self, witness: Arc<LossWitness>) -> Self {
+        self.witness = witness;
+        self
+    }
+
+    /// The witness this reader judges the losses it finds with.
+    #[must_use]
+    pub fn witness(&self) -> &Arc<LossWitness> {
+        &self.witness
     }
 
     /// Reads `digests`; the answer has one [`Fetch`] for each, in the order given. A digest
@@ -360,18 +381,16 @@ impl<S: ObjectStore> Reader<S> {
                     continue;
                 }
             };
-            if length.is_some_and(|length| length >= end) {
-                tracing::warn!(%pack, "a read found a pack lost that the store holds whole: the index keeps it");
-                continue;
-            }
-            let index = Arc::clone(&self.index);
-            let key = pack.to_string();
-            match offload(move || index.forget_pack(&key)).await {
-                Ok(rows) => {
+            let judged = self.witness.judge(&self.index, pack.as_str(), length, end);
+            match judged.await {
+                Ok(Loss::Forgotten { rows }) => {
                     tracing::warn!(%pack, rows, ?length, "the store does not have a pack the index named: the index forgot it, and its blobs are missing until uploaded again");
                     for digest in blobs {
                         found.insert(digest, Fetch::Lost { forgotten: true });
                     }
+                }
+                Ok(loss) => {
+                    tracing::warn!(%pack, ?loss, ?length, "a read found a pack lost: the index keeps it until a later look confirms the loss");
                 }
                 Err(error) => {
                     tracing::warn!(%error, %pack, "could not forget a lost pack in the pack index");

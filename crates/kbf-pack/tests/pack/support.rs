@@ -314,6 +314,8 @@ impl ObjectStore for FaultyStore {
 /// record, whether the object store holds the pack being recorded.
 pub struct FlakyIndex {
     inner: MemoryPackIndex,
+    /// The index's clock: what a row's age is read by.
+    clock: Arc<ManualClock>,
     store: Arc<FaultyStore>,
     fail_record: AtomicU32,
     refuse_record: AtomicU32,
@@ -332,8 +334,10 @@ pub struct FlakyIndex {
 
 impl FlakyIndex {
     pub fn over(store: Arc<FaultyStore>) -> Self {
+        let clock = Arc::new(ManualClock::default());
         Self {
-            inner: MemoryPackIndex::new(Arc::new(ManualClock::default())),
+            inner: MemoryPackIndex::new(Arc::clone(&clock) as Arc<dyn kbf_state::Clock>),
+            clock,
             store,
             fail_record: AtomicU32::new(0),
             refuse_record: AtomicU32::new(0),
@@ -389,6 +393,11 @@ impl FlakyIndex {
     /// The next `n` drops of a location are refused as unsupported.
     pub fn fail_drop(&self, n: u32) {
         self.fail_drop.store(n, Ordering::SeqCst);
+    }
+
+    /// Moves the index's clock on by `by`: the rows recorded before are that much older.
+    pub fn advance(&self, by: Duration) {
+        self.clock.advance(by);
     }
 
     /// The next `n` forgets of a pack fail.
@@ -483,11 +492,15 @@ impl PackIndex for FlakyIndex {
         self.inner.drop_location(digest, pack_key)
     }
 
-    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
+    fn forget_pack(
+        &self,
+        pack_key: &str,
+        min_age: Duration,
+    ) -> Result<Option<usize>, PackIndexError> {
         if fires(&self.fail_forget) {
             return Err(PackIndexError::NotMigrated);
         }
-        self.inner.forget_pack(pack_key)
+        self.inner.forget_pack(pack_key, min_age)
     }
 }
 

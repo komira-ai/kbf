@@ -6,16 +6,21 @@
 //! swapped for an empty one, a bucket emptied). A job that read a lost manifest says so, and its
 //! next tree is checked: every pack the tree names is asked for its length once, at most
 //! [`HEADS_IN_FLIGHT`] at once, and a pack the store does not have, or has shorter than a blob
-//! in it ends, is forgotten by the pack index ([`BlobSource::forget_lost`]). Its blobs are then
-//! missing, which FindMissingBlobs answers too, so the client uploads them again; the tree is
-//! refused naming them ([`NoTree::Lost`]), and both memos are dropped whole: the place memo may
-//! place other blobs in the packs forgotten, and a remembered manifest may name them as a
-//! file's source, which neither memo can be asked about.
+//! in it ends, is judged lost ([`BlobSource::forget_lost`], `kbf_pack::LossWitness`). Once the
+//! loss is confirmed (an earlier look, a pack old enough) the pack index forgets it: its blobs
+//! are then missing, which FindMissingBlobs answers too, so the client uploads them again, and
+//! the tree is refused naming them ([`NoTree::Lost`]). A loss not yet confirmed fails the tree
+//! as a store that could not answer ([`NoTree::Lookup`], run again), and forgets nothing. Either
+//! way both memos are dropped whole: the place memo may place other blobs in those packs, and a
+//! remembered manifest may name them as a file's source, which neither memo can be asked
+//! about.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use futures::stream::{self, StreamExt as _};
 use kbf_types::Digest;
+
+use kbf_pack::Loss;
 
 use super::place::{HEADS_IN_FLIGHT, Place};
 use super::{NoTree, TreeWriter};
@@ -50,11 +55,21 @@ impl TreeWriter {
             .collect()
             .await;
         let mut forgotten: BTreeSet<String> = BTreeSet::new();
+        let mut doubted: BTreeSet<String> = BTreeSet::new();
         for (key, answer) in answers {
-            let gone = answer.map_err(|e| NoTree::Lookup { why: e.to_string() })?;
-            if gone {
-                forgotten.insert(key);
+            match answer.map_err(|e| NoTree::Lookup { why: e.to_string() })? {
+                Loss::Held => {}
+                Loss::Forgotten { .. } => {
+                    forgotten.insert(key);
+                }
+                Loss::Unconfirmed | Loss::Young => {
+                    doubted.insert(key);
+                }
             }
+        }
+        if !forgotten.is_empty() || !doubted.is_empty() {
+            self.remembered().clear();
+            self.lock().clear();
         }
         let lost: Vec<Digest> = (places.iter())
             .filter(
@@ -63,10 +78,17 @@ impl TreeWriter {
             .map(|(digest, _)| *digest)
             .collect();
         if lost.is_empty() {
-            return Ok(());
+            let Some(first) = doubted.first() else {
+                return Ok(());
+            };
+            return Err(NoTree::Lookup {
+                why: format!(
+                    "the store does not have the pack {first} ({} in all): kept until a later \
+                     look confirms the loss",
+                    doubted.len()
+                ),
+            });
         }
-        self.remembered().clear();
-        self.lock().clear();
         tracing::warn!(
             packs = forgotten.len(),
             blobs = lost.len(),

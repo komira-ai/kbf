@@ -13,8 +13,8 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use kbf_objstore::{BodyStream, ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_pack::{
-    Blob, FRONTEND_PACK_BYTES, Fetch, PackError, PackKeys, Packed, Packer, PackerConfig, ReadCache,
-    ReadError, Reader, ReaderConfig, check_create_only,
+    Blob, FRONTEND_PACK_BYTES, Fetch, Loss, LossWitness, PackError, PackKeys, Packed, Packer,
+    PackerConfig, ReadCache, ReadError, Reader, ReaderConfig, check_create_only,
 };
 use kbf_pack_index::{BlobDigest, Location, MAX_BATCH, PackIndex, PackIndexError};
 use kbf_types::{Digest, DigestFunction};
@@ -184,6 +184,8 @@ pub struct Packs {
     pub(super) writer: String,
     /// [`PackSettings::store_writes`].
     store_writes: NonZeroUsize,
+    /// The first looks that found packs lost, shared with the reader ([`LossWitness`]).
+    witness: Arc<LossWitness>,
 }
 
 impl fmt::Debug for Packs {
@@ -215,12 +217,14 @@ impl Packs {
         let writer = keys.writer();
         let store = Arc::new(StoreWrites::new(store, settings.store_writes));
         let packer = Packer::new(store.clone(), index.clone(), keys.clone(), config)?;
+        let witness = Arc::<LossWitness>::default();
         let reader = Reader::new(
             Arc::clone(&store),
             Arc::clone(&index),
             settings.cache,
             ReaderConfig::default(),
-        );
+        )
+        .with_witness(Arc::clone(&witness));
         let over = Over {
             store,
             keys,
@@ -240,6 +244,7 @@ impl Packs {
             clock: Arc::new(SystemTime::now),
             writer,
             store_writes: settings.store_writes,
+            witness,
         })
     }
 
@@ -253,11 +258,20 @@ impl Packs {
         self
     }
 
-    /// These packs judging the age of a task key by `clock` (the wall clock unless told).
+    /// These packs judging the age of a task key, and the time between two looks at a lost
+    /// pack ([`LossWitness`]), by `clock` (the wall clock unless told).
     #[must_use]
     pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.witness.set_clock(Arc::clone(&clock));
         self.clock = clock;
         self
+    }
+
+    /// The witness that judges the packs a read finds lost, shared by every clone and by the
+    /// reader: its rule is [`kbf_pack::LossRule::default`] unless set.
+    #[must_use]
+    pub fn loss_witness(&self) -> &Arc<LossWitness> {
+        &self.witness
     }
 
     /// The time these packs judge the age of a task key by.
@@ -404,29 +418,33 @@ impl Packs {
     }
 
     /// Forgets the pack `key` in the index if the store does not have it, or has it shorter than
-    /// `end` bytes: a reader of `key` was told the object is not there. The store is asked for
-    /// the object's length first, so a read that raced the object's write, or a caller that
-    /// named an object that is there, forgets nothing. Returns whether the pack was forgotten.
+    /// `end` bytes, and the loss is confirmed: a reader of `key` was told the object is not
+    /// there. The store is asked for the object's length first, so a read that raced the
+    /// object's write, or a caller that named an object that is there, forgets nothing; then
+    /// the packs' [`LossWitness`] judges the loss (a first look is only remembered, a young pack
+    /// is kept). Returns what the look came to.
     ///
     /// # Errors
     /// UNAVAILABLE when `key` is not an object key, or the store or the index fails.
-    pub(crate) async fn forget_lost(&self, key: &str, end: u64) -> Result<bool, Status> {
+    pub(crate) async fn forget_lost(&self, key: &str, end: u64) -> Result<Loss, Status> {
         let length = self.object_len(key).await?;
-        if length.is_some_and(|length| length >= end) {
-            tracing::warn!(key, "an object a reader found lost is held whole: kept");
-            return Ok(false);
+        let judged = self.witness.judge(&self.index, key, length, end).await;
+        let loss = judged.map_err(|e| Status::unavailable(format!("pack index: {e}")))?;
+        match loss {
+            Loss::Forgotten { rows } => tracing::warn!(
+                key,
+                rows,
+                ?length,
+                "the store does not have an object the index named: the index forgot it, and its blobs are missing until uploaded again"
+            ),
+            _ => tracing::warn!(
+                key,
+                ?loss,
+                ?length,
+                "an object a reader found lost is kept: held whole, its loss not yet confirmed, or too young"
+            ),
         }
-        let index = Arc::clone(&self.index);
-        let pack = key.to_owned();
-        let rows = offload(move || index.forget_pack(&pack)).await;
-        let rows = rows.map_err(|e| Status::unavailable(format!("pack index: {e}")))?;
-        tracing::warn!(
-            key,
-            rows,
-            ?length,
-            "the store does not have an object the index named: the index forgot it, and its blobs are missing until uploaded again"
-        );
-        Ok(true)
+        Ok(loss)
     }
 
     /// Writes `blobs` into packs and records them. They are in the pack index, and the packs

@@ -34,12 +34,15 @@
 //! - **An object the store lost** ([`Ingest::lost`]): a job that did not start because the store
 //!   does not have an object of its tree. The store is general-purpose, and its objects can
 //!   vanish while the frontend's state names them. The action's remembered trees are dropped,
-//!   the writer's memos drop what they say of the object ([`TreeWriter::lost_manifest`]), and the
-//!   action's next tree is written checked against the store ([`TreeWriter::write_checked`]): a
-//!   pack the store lost is forgotten by the pack index, and the run is answered with its blobs
-//!   missing ([`MintError::Missing`]), which the client uploads again. An object neither memo nor
-//!   the action's tree names is taken for one of the kbf base tree's, whose objects the frontend
-//!   publishes again ([`PutDirParts::with_republish`]), one publish at a time.
+//!   the writer's memos drop what they say of the object ([`TreeWriter::lost_pack`],
+//!   [`TreeWriter::lost_manifest`]), the object is looked at once (the first look a later one
+//!   confirms, `kbf_pack::LossWitness`), and the action's next tree is written checked against
+//!   the store ([`TreeWriter::write_checked`]): a pack whose loss is confirmed is forgotten by
+//!   the pack index, and the run is answered with its blobs missing ([`MintError::Missing`]),
+//!   which the client uploads again; one not yet confirmed fails the tree as a store that could
+//!   not answer, and the run is tried again. An object nothing names is taken for one of the kbf
+//!   base tree's, whose objects the frontend publishes again ([`PutDirParts::with_republish`]),
+//!   one publish at a time.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -49,6 +52,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_front::action_tree::NoTree;
 use kbf_front::action_tree::{BaseTree, MEMO_TTL, PutRetry, TreeWriter};
+use kbf_front::job_read::BlobSource as _;
 use kbf_front::prepare_run::{
     ClosureError, KeptClosure, PrepareError as RunPrepError, PrepareFault, PutDirPrep, PutDirRun,
 };
@@ -517,20 +521,28 @@ impl Ingest for Front {
         }
     }
 
-    async fn lost(&self, action: &Digest, object: &[u8; 32]) {
+    async fn lost(&self, action: &Digest, object: &str) {
         let Ok(action) = cas_digest(action) else {
             return;
         };
-        let hex = super::outcome::hex(object);
         let mut own = false;
         for form in [InputTree::Manifests, InputTree::Provider] {
             let tree = self.trees().remove(&(action, form));
-            own |= tree.is_some_and(|(tree, _)| tree.ends_with(&hex));
+            // A tree of manifests is named by its root's hex, a tree list by its key.
+            own |= tree.is_some_and(|(tree, _)| {
+                tree == object || object.strip_prefix("cas/l/") == Some(tree.as_str())
+            });
         }
+        // Before the next attempt is prepared: its tree is then written checked.
         self.checked().put(action, ());
-        let named = self.parts.put_dir.writer.lost_manifest(object);
-        tracing::warn!(%action, object = %hex, named, own, "the store lost an object of an action's tree: its next tree is written checked");
-        if !named && !own {
+        let writer = &self.parts.put_dir.writer;
+        let placed = writer.lost_pack(object);
+        let sha = super::outcome::sha256_of_key(object);
+        let named = sha.is_some_and(|sha| writer.lost_manifest(&sha));
+        // The first look at the object, which the next attempt's check may confirm.
+        let looked = self.parts.backend.forget_lost(object, 1).await;
+        tracing::warn!(%action, object, placed, named, own, ?looked, "the store lost an object of an action's tree: its next tree is written checked");
+        if !placed && !named && !own {
             self.republish_base().await;
         }
     }

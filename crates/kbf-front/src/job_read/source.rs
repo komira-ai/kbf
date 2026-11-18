@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use kbf_pack::Loss;
 use kbf_storage::{ReadStream, StorageError};
 use kbf_types::Digest;
 
@@ -58,16 +59,17 @@ pub trait BlobSource: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
-    /// Forgets the pack `key` in the pack index if the store does not have it whole up to `end`
-    /// bytes, after asking the store for its length; whether it was forgotten. The default has
-    /// no packs, so it forgets nothing.
+    /// Judges the pack `key` lost if the store does not have it whole up to `end` bytes, after
+    /// asking the store for its length, and forgets it in the pack index once the loss is
+    /// confirmed ([`Loss`]). The default has no packs: every pack it is asked about is
+    /// [`Loss::Held`].
     fn forget_lost<'a>(
         &'a self,
         key: &'a str,
         end: u64,
-    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+    ) -> BoxFuture<'a, Result<Loss, StorageError>> {
         let _ = (key, end);
-        Box::pin(async { Ok(false) })
+        Box::pin(async { Ok(Loss::Held) })
     }
 }
 
@@ -120,7 +122,7 @@ impl BlobSource for Backend {
         &'a self,
         key: &'a str,
         end: u64,
-    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+    ) -> BoxFuture<'a, Result<Loss, StorageError>> {
         Box::pin(Backend::forget_lost(self, key, end))
     }
 }

@@ -83,6 +83,19 @@ impl Places {
         }
     }
 
+    /// Drops every entry that places a blob in the pack `key`, and returns how many it dropped.
+    pub(super) fn forget_pack(&mut self, key: &str) -> usize {
+        let named: Vec<(Digest, u64)> = (self.entries.iter())
+            .filter(|(_, (place, _, _))| matches!(place, Place::Packed { key: k, .. } if k == key))
+            .map(|(digest, (_, _, at))| (*digest, *at))
+            .collect();
+        for (digest, at) in &named {
+            self.entries.remove(digest);
+            self.order.remove(at);
+        }
+        named.len()
+    }
+
     /// Drops every entry.
     pub(super) fn clear(&mut self) {
         self.entries.clear();

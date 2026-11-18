@@ -277,15 +277,21 @@ pub trait PackIndex: Send + Sync {
         Err(PackIndexError::Unsupported)
     }
 
-    /// Forgets the pack recorded under `pack_key`: removes every blob row that points into it
-    /// and the pack's own row, in one transaction. Returns how many blob rows it removed; a key
-    /// nobody recorded removes nothing and answers 0.
+    /// Forgets the pack recorded under `pack_key`, if it was recorded at least `min_age` ago by
+    /// the index's clock: removes every blob row that points into it and the pack's own row, in
+    /// one transaction, and returns how many blob rows it removed. `None` when no pack is
+    /// recorded under the key, or it was recorded less than `min_age` ago: nothing is removed.
     ///
-    /// A caller calls it when the object store answers that the object under `pack_key` is not
-    /// there. Afterwards [`PackIndex::find_missing`] lists the pack's blobs, so a client uploads
-    /// them again, and a pack recorded under the same key again is a new pack whose blobs get
-    /// rows ([`PackIndex::record_pack`] answers `created: true`), where a pack row kept with no
-    /// rows would answer `created: false` and make none.
+    /// A caller calls it when the object store has said, and said again, that the object under
+    /// `pack_key` is not there. The age is checked in the same transaction as the delete, so a
+    /// pack recorded again under the key a moment before is never the one removed, and a pack too
+    /// new for every view of the store to have it yet is kept. Afterwards
+    /// [`PackIndex::find_missing`] lists the pack's blobs, so a client uploads them again, and a
+    /// pack recorded under the same key again is a new pack whose blobs get rows
+    /// ([`PackIndex::record_pack`] answers `created: true`), where a pack row kept with no rows
+    /// would answer `created: false` and make none. A blob whose first location was this pack
+    /// and that another pack also holds is missing too, until it is uploaded again: the index
+    /// keeps one location of a blob, and has none of the other pack's to fall back on.
     ///
     /// The default answers [`PackIndexError::Unsupported`], as [`PackIndex::drop_location`]
     /// does.
@@ -293,8 +299,12 @@ pub trait PackIndex: Send + Sync {
     /// # Errors
     /// [`PackIndexError::Unsupported`] or [`PackIndexError::Refused`] from an index that does
     /// not take or allow the call; [`PackIndexError::Store`] when the store fails.
-    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
-        let _ = pack_key;
+    fn forget_pack(
+        &self,
+        pack_key: &str,
+        min_age: Duration,
+    ) -> Result<Option<usize>, PackIndexError> {
+        let _ = (pack_key, min_age);
         Err(PackIndexError::Unsupported)
     }
 

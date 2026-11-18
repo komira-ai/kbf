@@ -644,13 +644,9 @@ fn only_an_ending_of_the_farms_is_run_again() {
 /// The SHA-256 of an object the store lost, as tierstore writes it.
 const LOST_HEX: &str = "9e1bf90c91fe575d7dacd35d1b21d058c2f1fd7abd0d23ffa41c4a0da2facb7f";
 
-/// [`LOST_HEX`] as bytes.
-fn lost_sha() -> [u8; 32] {
-    let mut sha = [0_u8; 32];
-    for (i, byte) in sha.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&LOST_HEX[2 * i..2 * i + 2], 16).expect("hex");
-    }
-    sha
+/// The key of the manifest [`LOST_HEX`] names.
+fn lost_key() -> String {
+    format!("cas/l/{LOST_HEX}")
 }
 
 /// Catches a start that failed for an object the store lost being judged by its code alone:
@@ -675,7 +671,7 @@ fn a_start_that_failed_on_a_lost_object_is_infra_whatever_its_code() {
         let Verdict::StoreLost { object, settled } = verdict else {
             panic!("{code:?}: not a lost object: {verdict:?}");
         };
-        assert_eq!(object, lost_sha(), "{code:?}");
+        assert_eq!(object, lost_key(), "{code:?}");
         assert!(settled.retried(), "{code:?}");
         let status = settled.status();
         assert_eq!(status.code, Code::Unavailable as i32, "{code:?}");
@@ -686,16 +682,17 @@ fn a_start_that_failed_on_a_lost_object_is_infra_whatever_its_code() {
     }
 }
 
-/// Catches a detail read for more than the object's digest, or for a digest that is not one:
-/// only 64 lower-case hex digits right before `: upstream 404` count, alone (not the end of a
-/// longer run of hex digits) and before the status 404 itself (not a longer number); a tree list
-/// named by its key counts; a first mention that does not qualify is passed over for a later
-/// one; and anything else is no lost object.
+/// Catches a detail read for more than the object it names, or for one it does not: an object
+/// key under `cas/` right before `: upstream 404` is taken as it is (a pack, a whole object); else
+/// 64 lower-case hex digits there, alone (not the end of a longer run of hex digits), name a
+/// manifest by its key `cas/l/<sha256>`; the status must be 404 itself (not a longer number); a
+/// first mention that does not qualify is passed over for a later one; and anything else (a key
+/// over the longest one read, a token not under `cas/`) is no lost object.
 #[test]
-fn only_a_whole_sha256_right_before_upstream_404_names_a_lost_object() {
-    use super::{hex, lost_object};
-    let found = |detail: &str| lost_object(detail).map(|sha| hex(&sha));
-    let named = Some(LOST_HEX.to_owned());
+fn only_an_object_key_or_a_whole_sha256_right_before_upstream_404_names_a_lost_object() {
+    use super::{lost_object, sha256_of_key};
+    let named = Some(lost_key());
+    let found = |detail: &str| lost_object(detail);
     assert_eq!(
         found(&format!("cannot fetch manifest {LOST_HEX}: upstream 404")),
         named
@@ -708,8 +705,18 @@ fn only_a_whole_sha256_right_before_upstream_404_names_a_lost_object() {
         )),
         named
     );
+    let pack = "cas/f/fe1/boot1/0000000000000007";
+    assert_eq!(
+        found(&format!("cannot fill {pack}: upstream 404")),
+        Some(pack.to_owned())
+    );
+    assert_eq!(
+        found(&format!("{pack}: upstream 404")),
+        Some(pack.to_owned())
+    );
     let upper = LOST_HEX.to_uppercase();
     let short = &LOST_HEX[1..];
+    let long = format!("cas/{}", "k".repeat(1021));
     for detail in [
         String::new(),
         "upstream 404".to_owned(),
@@ -722,10 +729,21 @@ fn only_a_whole_sha256_right_before_upstream_404_names_a_lost_object() {
         format!("cannot fetch manifest {LOST_HEX}: upstream 4040"),
         format!("cannot fetch manifest {LOST_HEX} upstream 404"),
         format!("é{}: upstream 404", &LOST_HEX[1..]),
+        format!("{long}: upstream 404"),
+        "tmp/f/fe1/boot1/7: upstream 404".to_owned(),
         "quota-unavailable".to_owned(),
     ] {
         assert_eq!(found(&detail), None, "{detail}");
     }
+    assert_eq!(
+        found(&format!("{}: upstream 404", &long[..1024])).map(|k| k.len()),
+        Some(1024)
+    );
+    let sha = sha256_of_key(&lost_key()).expect("a sha");
+    let back: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(back, LOST_HEX);
+    assert_eq!(sha256_of_key(pack), None);
+    assert_eq!(sha256_of_key(&format!("cas/l/{short}")), None);
 }
 
 /// Catches a host's detail text reaching the log or the answer through a lost object: the log

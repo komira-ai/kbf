@@ -610,7 +610,7 @@ answers do not change. "Rerun" is a new farm lease and charges `FARM_RERUNS` (2)
 | A fill failed while the job ran (`EIO`: a moved pack, the store down past tierstore's bound) | whatever it says (the job may even have succeeded) | **new**: `release` names the failure: infra, rerun; the root's memo entries dropped; the outputs not promoted (5.2) | the rerun's result, or `INTERNAL` |
 | The action timed out (in `kbf-task`) or hit its wall limit, and `release` reports `stall_ms` over a tenth of the action's timeout | `SUCCEEDED` with a timeout in the manifest, or `WALL_LIMIT` | **new**: infra, rerun, not a timeout | as above |
 | `release` is not answered (the node's tierstore down) | any | **new**: retried until the hold's expiry; then, if the job did not succeed, infra, rerun; if it did, the outputs are not promoted and the action reruns | as above |
-| A job's start fails because the store has no object its tree names (the detail ends `<sha256>: upstream 404`, as tierstore's `cannot fetch manifest`): the store is general-purpose, and an object can vanish while the frontend's state names it | `FAILED_TO_START`, any code | **new**: infra, rerun; before the rerun the frontend drops the action's remembered trees and the memo entries that name the object or reach it, and an object neither names has the base tree published again (one publish at a time); the rerun's tree is written checked: no memo hit, and every pack it names asked after in the store, a pack the store lacks forgotten by the pack index (its rows and its own row) | the rerun's result, or as the next row |
+| A job's start fails because the store has no object its tree names (the detail names the object right before `: upstream 404`: its key `cas/...`, or a manifest's `<sha256>` as tierstore's `cannot fetch manifest` does): the store is general-purpose, and an object can vanish while the frontend's state names it | `FAILED_TO_START`, any code | **new**: infra, rerun; before the rerun the frontend drops the action's remembered trees, the memo entries that name the object or reach it and the places in a pack it names, takes a first look at the object, and has the base tree published again for an object nothing names (one publish at a time); the rerun's tree is written checked: no memo hit, and every pack it names asked after in the store. A pack the store lacks is forgotten by the pack index (its rows and its own row) only once the loss is confirmed (the note below); until then the tree fails as a store that could not answer, and is run again | the rerun's result, or as the next row |
 | A run's inputs are not held when its run is prepared or its checked tree is written (the store lost them after the Execute found them held, or a checked tree found their pack gone) | (no job) | **new**: missing, not run again; the pack index no longer names the blobs, so FindMissingBlobs reports them | `FAILED_PRECONDITION` with a `MISSING` violation per blob: the client uploads them again and executes again |
 | The submit is answered with a spec that lacks the layer or the passed-through port (a server older than the layered-root release) | `SubmitJob` answer | **new**: cancel, infra, an error naming the server | as above; fixed by upgrading the server |
 | The action's own timeout (fired inside `kbf-task`: exit 0, a timeout in the manifest) | `SUCCEEDED`, exit 0 | promote, as today | `DEADLINE_EXCEEDED` with the partial result |
@@ -642,9 +642,14 @@ Notes:
 - **Retries stay kbf's**; the job service retries nothing.
 - **A read is a check too.** Any read of a pack or a large object the store answers 404 for (a
   client's ByteStream or BatchRead, the frontend's own read of an input it writes whole) asks the
-  store for the object's length once, and when that confirms it gone or short the pack index
-  forgets the pack: FindMissingBlobs reports its blobs from then on, and an action-cache entry
-  that names one is a miss, so the client uploads the blobs again or runs the action again.
+  store for the object's length once. The pack index forgets the pack only when the loss is
+  confirmed (`kbf_pack::LossWitness`): the length shows the object gone or short; an earlier look
+  found it so at least 30 s before (the first look is only remembered); and the pack was recorded
+  at least 15 min ago by the index's clock, checked in the same statement as the delete. A store
+  that fails to answer (a 5xx) is the read's error and forgets nothing. Once forgotten,
+  FindMissingBlobs reports its blobs, and an action-cache entry that names one is a miss, so the
+  client uploads the blobs again or runs the action again. A blob that another pack also holds
+  (the index keeps one location of a blob) is uploaded again too.
 
 ## 7. What is deleted, and when
 

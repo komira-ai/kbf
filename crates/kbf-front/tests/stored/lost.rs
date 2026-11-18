@@ -1,10 +1,19 @@
 //! An object the store lost while the pack index still names it: the store is general-purpose,
 //! and its objects can vanish (a store swapped for an empty one). A read that finds the object
-//! gone has the index forget it, so FindMissingBlobs reports its blobs, a client uploads them
-//! again, and an action-cache entry that names one is a miss until then.
+//! gone, confirmed by a later read (`kbf_pack::LossWitness`), has the index forget it, so
+//! FindMissingBlobs reports its blobs, a client uploads them again, and an action-cache entry
+//! that names one is a miss until then.
+//!
+//! The flows here run a witness that confirms at the second look at once ([`confirming`]): how
+//! long a loss waits for its second look, and how old a pack must be, are the kbf-pack tests'
+//! (`tests/pack/reader.rs`, `tests/pack/loss.rs`), and the default rule is held here only by
+//! [`two_looks_at_once_forget_nothing_by_default`].
 
 use bytes::Bytes;
+use std::time::Duration;
+
 use kbf_objstore::{ObjectKey, ObjectStore as _};
+use kbf_pack::{Loss, LossRule};
 use kbf_pack_index::PackIndex as _;
 use kbf_proto::reapi::{self, ActionResult, OutputFile};
 use kbf_types::Digest;
@@ -19,6 +28,15 @@ fn proto(digest: &Digest) -> reapi::Digest {
         hash: digest.hash_hex(),
         size_bytes: digest.size_bytes as i64,
     }
+}
+
+/// The frontend's witness of lost packs confirming a loss at the second look, however soon, for a
+/// pack of any age.
+fn confirming(rig: &Rig) {
+    rig.stored.packs().loss_witness().set_rule(LossRule {
+        confirm_after: Duration::ZERO,
+        min_age: Duration::ZERO,
+    });
 }
 
 /// Stores the blob `bytes` as a client uploads one.
@@ -83,13 +101,15 @@ fn names(output: &Digest) -> ActionResult {
 }
 
 /// Asserts the loop a lost pack takes, from a state that says present to a blob held again: while
-/// the index names the lost pack FindMissingBlobs says the blob is held; a read of it is
-/// NOT_FOUND, and the pack is forgotten (its row and the pack's row gone); FindMissingBlobs then
-/// reports the blob missing, so the client uploads it again, and the upload is stored and read
-/// back. A blob of another pack keeps its row throughout.
+/// the index names the lost pack FindMissingBlobs says the blob is held; the first read of it is
+/// NOT_FOUND and forgets nothing; the second confirms the loss and the pack is forgotten (its row
+/// and the pack's row gone); FindMissingBlobs then reports the blob missing, so the client uploads
+/// it again, and the upload is stored and read back. A blob of another pack keeps its row
+/// throughout.
 #[tokio::test]
 async fn a_read_of_a_lost_pack_makes_its_blob_missing_until_it_is_uploaded_again() {
     let rig = Rig::new().await;
+    confirming(&rig);
     let (lost, lost_bytes) = blob_of(b"a blob whose pack the store lost");
     let (kept, kept_bytes) = blob_of(b"a blob whose pack the store keeps");
     upload(&rig, &lost, &lost_bytes).await;
@@ -98,10 +118,14 @@ async fn a_read_of_a_lost_pack_makes_its_blob_missing_until_it_is_uploaded_again
 
     let believed = missing(&rig, &[lost, kept]).await.expect("asked");
     let first = read(&rig, &[lost]).await.expect("read");
+    let looked = missing(&rig, &[lost, kept]).await.expect("asked");
+    let second = read(&rig, &[lost]).await.expect("read");
     let after = missing(&rig, &[lost, kept]).await.expect("asked");
 
     assert!(believed.is_empty(), "the index still names the lost pack");
     assert_eq!(first[0].0, Code::NotFound as i32);
+    assert!(looked.is_empty(), "one look forgets nothing");
+    assert_eq!(second[0].0, Code::NotFound as i32);
     assert_eq!(after, [lost]);
     assert!(rig.index.pack(&key).expect("asked").is_none());
     assert_eq!(forgotten(&rig), 1);
@@ -114,13 +138,36 @@ async fn a_read_of_a_lost_pack_makes_its_blob_missing_until_it_is_uploaded_again
     assert_eq!(again[1], (Code::Ok as i32, kept_bytes.to_vec()));
 }
 
+/// Asserts that with the frontend's default rule two reads of a lost pack at once forget
+/// nothing: the second look is too soon after the first, and the pack too young, so both reads are
+/// NOT_FOUND, the blob stays held for FindMissingBlobs and nothing is counted.
+#[tokio::test]
+async fn two_looks_at_once_forget_nothing_by_default() {
+    let rig = Rig::new().await;
+    let (lost, bytes) = blob_of(b"a blob whose pack the store lost a moment ago");
+    upload(&rig, &lost, &bytes).await;
+    lose(&rig, &lost).await;
+
+    let first = read(&rig, &[lost]).await.expect("read");
+    let second = read(&rig, &[lost]).await.expect("read");
+
+    assert_eq!(
+        (first[0].0, second[0].0),
+        (Code::NotFound as i32, Code::NotFound as i32)
+    );
+    assert!(missing(&rig, &[lost]).await.expect("asked").is_empty());
+    assert_eq!(forgotten(&rig), 0);
+}
+
 /// Asserts that an action-cache hit whose output's pack the store lost is served while the index
-/// names the pack, that the client's read of the output is NOT_FOUND, and that from then on the
-/// entry is a miss (NOT_FOUND, the client runs the action again) and its output is missing; once
-/// the output is uploaded again, the entry names only held blobs and is a hit.
+/// names the pack, that the client's reads of the output are NOT_FOUND, and that once a read
+/// confirms the loss the entry is a miss (NOT_FOUND, the client runs the action again) and its
+/// output is missing; once the output is uploaded again, the entry names only held blobs and is
+/// a hit.
 #[tokio::test]
 async fn an_action_result_whose_output_is_lost_is_a_miss_once_a_read_finds_it_gone() {
     let rig = Rig::new().await;
+    confirming(&rig);
     let (action, _) = blob_of(b"an action");
     let (output, bytes) = blob_len(100, 7);
     upload(&rig, &output, &bytes).await;
@@ -129,14 +176,19 @@ async fn an_action_result_whose_output_is_lost_is_a_miss_once_a_read_finds_it_go
         .await
         .expect("written");
     lose(&rig, &output).await;
+    let name = upload_name(&output);
 
     let believed = get(&rig, &action).await;
-    let fetched = stream_read(&rig, &upload_name(&output), 0, 0).await;
+    let first = stream_read(&rig, &name, 0, 0).await;
+    let still = get(&rig, &action).await;
+    let second = stream_read(&rig, &name, 0, 0).await;
     let after = get(&rig, &action).await;
     let reported = missing(&rig, &[output]).await.expect("asked");
 
     assert_eq!(believed, Ok(names(&output)));
-    assert_eq!(fetched.expect_err("lost").code(), Code::NotFound);
+    assert_eq!(first.expect_err("lost").code(), Code::NotFound);
+    assert_eq!(still, Ok(names(&output)), "one look forgets nothing");
+    assert_eq!(second.expect_err("lost").code(), Code::NotFound);
     assert_eq!(after, Err(Code::NotFound));
     assert_eq!(reported, [output]);
 
@@ -145,23 +197,28 @@ async fn an_action_result_whose_output_is_lost_is_a_miss_once_a_read_finds_it_go
 }
 
 /// Asserts that a large blob (an object of its own under `cas/l/`) whose object the store lost is
-/// forgotten on the read that finds it gone, which is UNAVAILABLE; that the next read is
-/// NOT_FOUND and FindMissingBlobs reports it; and that its upload, which writes the same key
-/// again, is recorded anew and read back whole.
+/// forgotten at the read that confirms the loss, the reads that find it gone being UNAVAILABLE;
+/// that the next read is NOT_FOUND and FindMissingBlobs reports it; and that its upload, which
+/// writes the same key again, is recorded anew and read back whole.
 #[tokio::test]
 async fn a_lost_large_blob_is_forgotten_and_its_upload_under_the_same_key_is_recorded() {
     let rig = Rig::new().await;
+    confirming(&rig);
     let (large, bytes) = blob_len(3000, 9);
     upload(&rig, &large, &bytes).await;
     let key = lose(&rig, &large).await;
     let name = upload_name(&large);
 
     let first = stream_read(&rig, &name, 0, 0).await;
+    let looked = missing(&rig, &[large]).await.expect("asked");
     let second = stream_read(&rig, &name, 0, 0).await;
+    let third = stream_read(&rig, &name, 0, 0).await;
     let reported = missing(&rig, &[large]).await.expect("asked");
 
     assert_eq!(first.expect_err("lost").code(), Code::Unavailable);
-    assert_eq!(second.expect_err("forgotten").code(), Code::NotFound);
+    assert!(looked.is_empty(), "one look forgets nothing");
+    assert_eq!(second.expect_err("lost").code(), Code::Unavailable);
+    assert_eq!(third.expect_err("forgotten").code(), Code::NotFound);
     assert_eq!(reported, [large]);
     assert!(rig.index.pack(&key).expect("asked").is_none());
     assert_eq!(forgotten(&rig), 1);
@@ -173,19 +230,23 @@ async fn a_lost_large_blob_is_forgotten_and_its_upload_under_the_same_key_is_rec
 }
 
 /// Asserts that a lost large blob whose object's length the store cannot give is not forgotten:
-/// the read is UNAVAILABLE and the index keeps its row, so nothing a store that merely failed to
+/// the reads are UNAVAILABLE and the index keeps its row, so nothing a store that merely failed to
 /// answer says is taken for a loss.
 #[tokio::test]
 async fn a_loss_the_store_cannot_confirm_forgets_nothing() {
     let rig = Rig::new().await;
+    confirming(&rig);
     let (large, bytes) = blob_len(3000, 11);
     upload(&rig, &large, &bytes).await;
     let key = lose(&rig, &large).await;
     rig.store.fail_len_of(&key);
+    let name = upload_name(&large);
 
-    let first = stream_read(&rig, &upload_name(&large), 0, 0).await;
+    let first = stream_read(&rig, &name, 0, 0).await;
+    let second = stream_read(&rig, &name, 0, 0).await;
 
     assert_eq!(first.expect_err("lost").code(), Code::Unavailable);
+    assert_eq!(second.expect_err("lost").code(), Code::Unavailable);
     assert!(missing(&rig, &[large]).await.expect("asked").is_empty());
     assert_eq!(forgotten(&rig), 0);
 }
@@ -196,6 +257,7 @@ async fn a_loss_the_store_cannot_confirm_forgets_nothing() {
 #[tokio::test]
 async fn a_large_read_that_raced_its_object_forgets_nothing() {
     let rig = Rig::new().await;
+    confirming(&rig);
     let (large, bytes) = blob_len(3000, 13);
     upload(&rig, &large, &bytes).await;
     rig.store.lose_reads(1);
@@ -216,45 +278,52 @@ async fn a_large_read_that_raced_its_object_forgets_nothing() {
 #[tokio::test]
 async fn a_forget_the_index_fails_is_made_by_the_next_read() {
     let rig = Rig::new().await;
+    confirming(&rig);
     let (large, bytes) = blob_len(3000, 15);
     upload(&rig, &large, &bytes).await;
     lose(&rig, &large).await;
-    rig.index.fail_forget(1);
     let name = upload_name(&large);
 
     let first = stream_read(&rig, &name, 0, 0).await;
+    rig.index.fail_forget(1);
+    let refused = stream_read(&rig, &name, 0, 0).await;
     let kept = missing(&rig, &[large]).await.expect("asked");
-    let second = stream_read(&rig, &name, 0, 0).await;
+    let third = stream_read(&rig, &name, 0, 0).await;
 
     assert_eq!(first.expect_err("lost").code(), Code::Unavailable);
+    assert_eq!(refused.expect_err("lost").code(), Code::Unavailable);
     assert!(kept.is_empty());
-    assert_eq!(second.expect_err("lost").code(), Code::Unavailable);
+    assert_eq!(third.expect_err("lost").code(), Code::Unavailable);
     assert_eq!(missing(&rig, &[large]).await.expect("asked"), [large]);
     assert_eq!(forgotten(&rig), 1);
 }
 
 /// Asserts the frontend's own check of a pack through its CAS (what an action tree's check asks):
-/// a pack the store holds whole is kept, one it lost is forgotten, and a second check of it says
-/// it is gone again and changes nothing.
+/// a pack the store holds whole is `Held`; one it lost is `Unconfirmed` at the first look and
+/// `Forgotten` at the second, its rows gone; and a third look is a new first look, which forgets
+/// nothing more.
 #[tokio::test]
 async fn the_backend_forgets_a_pack_the_store_lost_and_keeps_a_held_one() {
     use kbf_front::job_read::BlobSource as _;
     let rig = Rig::new().await;
+    confirming(&rig);
     let (lost, lost_bytes) = blob_of(b"a blob whose pack the store lost");
     let (kept, kept_bytes) = blob_of(b"a blob whose pack is held");
     upload(&rig, &lost, &lost_bytes).await;
     upload(&rig, &kept, &kept_bytes).await;
     let held = rig.index.where_is(&[kept]).remove(0).expect("indexed");
     let key = lose(&rig, &lost).await;
+    let cas = &rig.backend;
 
-    let kept_check = rig
-        .backend
-        .forget_lost(&held.pack_key, held.offset + kept.size_bytes);
-    let lost_check = rig.backend.forget_lost(&key, 1);
+    let whole = cas.forget_lost(&held.pack_key, held.offset + kept.size_bytes);
+    let first = cas.forget_lost(&key, 1).await.expect("asked");
+    let second = cas.forget_lost(&key, 1).await.expect("asked");
+    let third = cas.forget_lost(&key, 1).await.expect("asked");
 
-    assert!(!kept_check.await.expect("asked"));
-    assert!(lost_check.await.expect("asked"));
+    assert_eq!(whole.await.expect("asked"), Loss::Held);
+    assert_eq!(first, Loss::Unconfirmed);
+    assert_eq!(second, Loss::Forgotten { rows: 1 });
+    assert_eq!(third, Loss::Unconfirmed, "a new first look");
     assert_eq!(missing(&rig, &[lost, kept]).await.expect("asked"), [lost]);
-    assert!(rig.backend.forget_lost(&key, 1).await.expect("asked"));
     assert!(rig.index.pack(&key).expect("asked").is_none());
 }

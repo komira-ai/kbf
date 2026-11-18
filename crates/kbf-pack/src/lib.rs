@@ -43,6 +43,7 @@ mod cache;
 mod digest;
 mod error;
 mod keys;
+mod loss;
 mod packer;
 mod reader;
 mod sweep;
@@ -65,6 +66,7 @@ pub use kbf_task_pack::{
     read_manifest, read_manifest_with, write_pack, write_pack_with,
 };
 pub use keys::{PackKeys, WriterKind};
+pub use loss::{CONFIRM_AFTER, Clock, Loss, LossRule, LossWitness, MIN_AGE, WITNESS_ENTRIES};
 pub use packer::{
     Blob, FRONTEND_PACK_BYTES, Packed, Packer, PackerConfig, StoredPack, check_create_only,
 };

@@ -246,8 +246,7 @@ async fn a_job_that_did_not_start_for_a_lost_object_tells_the_frontend_and_runs_
 
     assert_eq!(exit_code(&caller.done().await), 0);
     assert_eq!(told.len(), 1, "{told:?}");
-    let hex: String = told[0].1.iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(hex, LOST);
+    assert_eq!(told[0].1, format!("cas/l/{LOST}"));
     assert_eq!(
         rig.ingest.forms.lock().expect("lock").len(),
         2,

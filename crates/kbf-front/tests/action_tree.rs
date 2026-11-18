@@ -24,6 +24,7 @@ use kbf_front::prepare_run::{ClosureLimits, KeptClosure, collect_closure_keeping
 use kbf_front::{Backend, Cache, CacheStorage, SegmentsConfig};
 use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::{BodyStream, ObjectKey, ObjectStoreError};
+use kbf_pack::Loss;
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::reapi::{self, Directory, DirectoryNode, FileNode, SymlinkNode};
 use kbf_proto::worker::segments_server::Segments;
@@ -115,6 +116,8 @@ struct State {
     puts: Vec<String>,
     /// Packs the store lost: a check of one has the index forget it.
     lost: BTreeSet<String>,
+    /// Packs the store lacks whose loss a check does not confirm yet.
+    doubted: BTreeSet<String>,
     /// Every check of a pack against the store: its key and the end of its furthest blob asked.
     checks: Vec<(String, u64)>,
     /// The bytes a write whose body ended in an error had received, by key.
@@ -412,18 +415,27 @@ impl BlobSource for Farm {
         &'a self,
         key: &'a str,
         end: u64,
-    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+    ) -> BoxFuture<'a, Result<Loss, StorageError>> {
         Box::pin(async move {
-            let (check, lost) = {
+            let (check, lost, doubted) = {
                 let mut state = self.state();
                 state.checks.push((key.to_owned(), end));
-                (state.faults.check, state.lost.contains(key))
+                let (lost, doubted) = (state.lost.contains(key), state.doubted.contains(key));
+                (state.faults.check, lost, doubted)
             };
             fault(check).await?;
-            if lost {
-                self.state().spans.retain(|_, span| span.key != key);
+            if doubted {
+                return Ok(Loss::Unconfirmed);
             }
-            Ok(lost)
+            if !lost {
+                return Ok(Loss::Held);
+            }
+            let mut state = self.state();
+            let before = state.spans.len();
+            state.spans.retain(|_, span| span.key != key);
+            Ok(Loss::Forgotten {
+                rows: before - state.spans.len(),
+            })
         })
     }
 

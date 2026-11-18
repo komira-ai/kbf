@@ -776,38 +776,62 @@ pub fn p11_a_location_can_be_dropped<B: PackBackend>(backend: &B) {
     );
 }
 
-fn forgot(index: &dyn PackIndex, key: &str) -> usize {
-    index.forget_pack(key).expect("forget_pack")
+/// How old a pack must be to be forgotten in P12.
+const MIN_AGE: Duration = Duration::from_secs(600);
+
+fn forgot(index: &dyn PackIndex, key: &str) -> Option<usize> {
+    index.forget_pack(key, MIN_AGE).expect("forget_pack")
 }
 
 /// P12: forgetting a pack whose object the store lost removes every row that points into it and
-/// the pack's own row, and nothing else. Its blobs are listed as missing and have no location;
-/// a blob of the pack that has its row in another pack keeps it; the other pack is untouched; a
-/// second forget and a key nobody recorded remove nothing; the pack is not listed as dead (it
-/// has no row left to sweep); and the same pack recorded again, as a re-upload records it, is a
-/// new pack whose blobs get their rows back.
+/// the pack's own row, and nothing else, once the pack is at least the age asked: a pack
+/// recorded less than that ago is kept whole. Its blobs are then listed as missing and have no
+/// location; a blob of the pack that has its row in another pack keeps it; the other pack is
+/// untouched; a second forget and a key nobody recorded remove nothing; the pack is not listed
+/// as dead (it has no row left to sweep); and the same pack recorded again, as a re-upload
+/// records it, is a new pack whose blobs get their rows back, and is itself too young to be
+/// forgotten.
 pub fn p12_a_lost_pack_can_be_forgotten<B: PackBackend>(backend: &B) {
     let clock = Arc::new(ManualClock::default());
+    clock.advance(Duration::from_secs(10_000));
     let index = backend.open_index(Arc::clone(&clock));
     let other = packed(OTHER, "n2", &[(3, 30), (4, 40)]);
     let lost = packed(KEY, "n1", &[(1, 10), (2, 20), (3, 30)]);
     record(&index, &other);
     same("P12 recorded", record(&index, &lost), created(2));
     let all = [digest(1, 10), digest(2, 20), digest(3, 30), digest(4, 40)];
+    clock.advance(MIN_AGE - Duration::from_secs(1));
+    same(
+        "P12 young: a pack younger than the age is kept",
+        forgot(&index, KEY),
+        None,
+    );
+    same(
+        "P12 young rows: a young pack keeps its rows",
+        missing(&index, &all),
+        Vec::<BlobDigest>::new(),
+    );
+    clock.advance(Duration::from_secs(1));
     same(
         "P12 forget: every row that points into the pack is removed",
         forgot(&index, KEY),
-        2,
+        Some(2),
     );
     same(
         "P12 missing: the forgotten pack's blobs are listed as missing, the rest are not",
         missing(&index, &all),
         vec![digest(1, 10), digest(2, 20)],
     );
+    let recorded = at(&clock) - micros_of_duration(MIN_AGE);
     same(
         "P12 located: a blob of the pack whose row is in another pack keeps it",
         locate(&index, &all),
-        vec![None, None, loc(OTHER, 0, 30, 0), loc(OTHER, 30, 40, 0)],
+        vec![
+            None,
+            None,
+            loc(OTHER, 0, 30, recorded),
+            loc(OTHER, 30, 40, recorded),
+        ],
     );
     same(
         "P12 pack: the pack's own row is gone",
@@ -817,17 +841,17 @@ pub fn p12_a_lost_pack_can_be_forgotten<B: PackBackend>(backend: &B) {
     same(
         "P12 other: the other pack is untouched",
         info(&index, OTHER),
-        info_of(OTHER, "n2", other.size, (0, 2, 2)),
+        info_of(OTHER, "n2", other.size, (recorded, 2, 2)),
     );
     same(
         "P12 twice: a second forget removes nothing",
         forgot(&index, KEY),
-        0,
+        None,
     );
     same(
         "P12 unknown: a key nobody recorded removes nothing",
         forgot(&index, "cas/none"),
-        0,
+        None,
     );
     clock.advance(Duration::from_secs(3600));
     same(
@@ -840,10 +864,20 @@ pub fn p12_a_lost_pack_can_be_forgotten<B: PackBackend>(backend: &B) {
         record(&index, &lost),
         created(2),
     );
-    let at = at(&clock);
+    let again = at(&clock);
     same(
         "P12 back: its blobs have rows again, in the pack, at their offsets",
         locate(&index, &all[..2]),
-        vec![loc(KEY, 0, 10, at), loc(KEY, 10, 20, at)],
+        vec![loc(KEY, 0, 10, again), loc(KEY, 10, 20, again)],
     );
+    same(
+        "P12 new: the pack recorded again is too young to be forgotten",
+        forgot(&index, KEY),
+        None,
+    );
+}
+
+/// `duration` in microseconds, as the index stamps its rows.
+fn micros_of_duration(duration: Duration) -> i64 {
+    i64::try_from(duration.as_micros()).unwrap_or(i64::MAX)
 }

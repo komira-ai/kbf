@@ -150,11 +150,15 @@ impl PackIndex for Index {
         self.inner.drop_location(digest, pack_key)
     }
 
-    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
+    fn forget_pack(
+        &self,
+        pack_key: &str,
+        min_age: Duration,
+    ) -> Result<Option<usize>, PackIndexError> {
         if fires(&self.fail_forget) {
             return Err(PackIndexError::NotMigrated);
         }
-        self.inner.forget_pack(pack_key)
+        self.inner.forget_pack(pack_key, min_age)
     }
 
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {

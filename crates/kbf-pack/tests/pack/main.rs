@@ -5,6 +5,7 @@ mod adopt;
 mod adopt_support;
 mod cache;
 mod keys;
+mod loss;
 mod packer;
 mod reader;
 mod support;

@@ -11,13 +11,14 @@ use tokio::sync::{Notify, Semaphore};
 use super::put_dir::{DirPrep, WALL, action_with_input, base, listed_base, rig_over};
 use super::*;
 
-/// The SHA-256 bytes of the 64 hex digits `hex`.
-fn sha(hex: &str) -> [u8; 32] {
-    let mut sha = [0_u8; 32];
-    for (i, byte) in sha.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("hex");
-    }
-    sha
+/// The key of the manifest whose digest is the 64 hex digits `hex`.
+fn manifest_key(hex: &str) -> String {
+    format!("cas/l/{hex}")
+}
+
+/// The key of a manifest no memo and no tree names.
+fn unnamed() -> String {
+    manifest_key(&"09".repeat(32))
 }
 
 /// A rig in put-directory mode with the base published, whose base is published again by what
@@ -67,7 +68,7 @@ async fn a_lost_object_of_an_actions_tree_has_its_next_tree_written_checked_once
     mint_tree(&rig, &action).await.expect("remembered");
     assert_eq!((prepare.prepared(), prepare.minted()), (1, 1));
 
-    rig.front.lost(&action, &sha(&tree)).await;
+    rig.front.lost(&action, &manifest_key(&tree)).await;
     let again = mint_tree(&rig, &action).await.expect("written again");
     let after = mint_tree(&rig, &action).await.expect("remembered again");
 
@@ -77,16 +78,22 @@ async fn a_lost_object_of_an_actions_tree_has_its_next_tree_written_checked_once
     assert_eq!(runs.load(Ordering::SeqCst), 0, "not the base's");
 }
 
-/// Asserts that a checked tree over a pack the store lost answers the run's inputs missing,
-/// naming the blob, and has the pack index forget it (FindMissingBlobs then reports it), and that
-/// the action stays checked until a checked tree is written: once the blob is uploaded again, the
-/// next mint writes its tree and the one after uses it.
+/// Asserts that a checked tree over a pack the store lost first fails as a store that could not
+/// answer (the loss is only seen once, nothing forgotten), then, at the look that confirms the
+/// loss, answers the run's inputs missing, naming the blob, and has the pack index forget it
+/// (FindMissingBlobs then reports it); and that the action stays checked until a checked tree is
+/// written: once the blob is uploaded again, the next mint writes its tree and the one after uses
+/// it.
 #[tokio::test]
 async fn a_checked_tree_over_a_lost_pack_answers_its_blob_missing_until_it_is_uploaded() {
     let rig = super::put_dir::rig();
     let bytes = Bytes::from_static(b"an input held in a pack");
     let blob = kbf_segments::sha256(&bytes);
     let packs = rig.front.parts.packs.clone();
+    packs.loss_witness().set_rule(kbf_pack::LossRule {
+        confirm_after: Duration::ZERO,
+        min_age: Duration::ZERO,
+    });
     packs
         .put(vec![(blob, bytes.clone())])
         .await
@@ -113,9 +120,16 @@ async fn a_checked_tree_over_a_lost_pack_answers_its_blob_missing_until_it_is_up
     let key = ObjectKey::new(&pack.pack_key).expect("a key");
     rig.store.inner.delete(&key).await.expect("lost");
 
-    rig.front.lost(&action, &sha(&tree)).await;
+    rig.front.lost(&action, &manifest_key(&tree)).await;
+    let unconfirmed = mint_tree(&rig, &action).await;
+    let held = packs.missing(&[blob]).await.expect("asked");
     let missing = mint_tree(&rig, &action).await;
 
+    assert!(
+        matches!(&unconfirmed, Err(MintError::Unavailable(why)) if why.contains(&pack.pack_key)),
+        "{unconfirmed:?}"
+    );
+    assert!(held.is_empty(), "one look forgets nothing");
     assert_eq!(missing, Err(MintError::Missing(vec![blob])));
     assert_eq!(packs.missing(&[blob]).await.expect("asked"), [blob]);
     packs
@@ -156,7 +170,7 @@ async fn a_lost_object_of_the_base_has_it_published_again_one_at_a_time() {
     let (rig, _) = rig_republishing(republish);
     let action = action_with_input(&rig, "input").await;
     mint_tree(&rig, &action).await.expect("a tree");
-    let unknown = [9_u8; 32];
+    let unknown = unnamed();
 
     let first = rig.front.lost(&action, &unknown);
     let second = async {
@@ -188,7 +202,7 @@ async fn a_lost_object_with_no_publish_again_still_checks_the_next_tree() {
     let action = action_with_input(&rig, "input").await;
     mint_tree(&rig, &action).await.expect("a tree");
 
-    rig.front.lost(&action, &[9; 32]).await;
+    rig.front.lost(&action, &unnamed()).await;
     mint_tree(&rig, &action).await.expect("written again");
 
     assert!(
@@ -214,14 +228,13 @@ async fn a_lost_tree_list_has_the_next_list_written_checked_once() {
             .expect("a dir");
         rig.front.tree(lease()).await.expect("a list")
     };
-    let key = mint().await;
-    let hex = key.strip_prefix("cas/l/").expect("a cas/l/ key");
+    let list = mint().await;
 
-    rig.front.lost(&action, &sha(hex)).await;
+    rig.front.lost(&action, &list).await;
     let again = mint().await;
     let after = mint().await;
 
-    assert_eq!((again, after), (key.clone(), key));
+    assert_eq!((again, after), (list.clone(), list));
     assert_eq!((prepare.prepared(), prepare.minted()), (2, 1));
 }
 
@@ -237,7 +250,7 @@ async fn a_lost_object_of_an_action_that_is_no_digest_changes_nothing() {
         size_bytes: -1,
     };
 
-    rig.front.lost(&bad, &sha(&tree)).await;
+    rig.front.lost(&bad, &manifest_key(&tree)).await;
     mint_tree(&rig, &action).await.expect("remembered");
 
     assert_eq!((prepare.prepared(), prepare.minted()), (1, 1));
@@ -248,4 +261,55 @@ async fn a_lost_object_of_an_action_that_is_no_digest_changes_nothing() {
 fn a_publish_again_shows_as_its_name() {
     let republish = Republish::new(|| async { Ok(()) }.boxed());
     assert_eq!(format!("{republish:?}"), "Republish");
+}
+
+/// Asserts that a start failure naming the pack itself has the frontend look at the pack before
+/// the next attempt: the pack is placed by the writer's memo (so the base is not published again),
+/// the place is dropped, and that look is the first one, so the next attempt's checked tree
+/// confirms the loss at once and answers the blob missing; the attempt does not reuse the pack.
+#[tokio::test]
+async fn a_lost_pack_named_by_the_job_is_looked_at_before_the_next_attempt() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let republish = Arc::new(OnceLock::new());
+    let _ = republish.set(counting(&runs, Ok(())));
+    let (rig, _) = rig_republishing(republish);
+    let bytes = Bytes::from_static(b"an input held in a pack");
+    let blob = kbf_segments::sha256(&bytes);
+    let packs = rig.front.parts.packs.clone();
+    packs.loss_witness().set_rule(kbf_pack::LossRule {
+        confirm_after: Duration::ZERO,
+        min_age: Duration::ZERO,
+    });
+    packs.put(vec![(blob, bytes)]).await.expect("packed");
+    let root = rig
+        .store(&Directory {
+            files: vec![FileNode {
+                name: "input".to_owned(),
+                digest: Some(wire(&blob)),
+                ..FileNode::default()
+            }],
+            ..Directory::default()
+        })
+        .await;
+    let action = rig
+        .action(|a| a.input_root_digest = Some(wire(&root)), |_| {})
+        .await;
+    mint_tree(&rig, &action).await.expect("a tree");
+    let pack = packs
+        .locate_stored(&blob)
+        .await
+        .expect("asked")
+        .expect("packed");
+    let object = ObjectKey::new(&pack.pack_key).expect("a key");
+    rig.store.inner.delete(&object).await.expect("lost");
+
+    rig.front.lost(&action, &pack.pack_key).await;
+    let retry = mint_tree(&rig, &action).await;
+
+    assert_eq!(retry, Err(MintError::Missing(vec![blob])));
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "the pack was placed: not the base's"
+    );
 }
