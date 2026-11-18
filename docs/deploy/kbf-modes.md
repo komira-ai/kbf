@@ -130,8 +130,13 @@ action trees (a manifest takes its `--task-manifest-writes` slot first). A write
 at the frontend for one to end, so a burst queues here and not at the store. A store that
 answers 503 `SlowDown` (tierstore taking as many uploads as it can) is back-pressure: a pack is
 written again after waits from 0.5 s doubling to 8 s, holding its slot, for as long as the store
-answers it, and the writes of an action tree, which are streamed, wait it out as they did,
-past `--task-put-retry-secs`, giving the slot back between their attempts.
+answers it. The writes of an action tree are streamed, so the bound does not repeat them: they
+wait out `SlowDown` as they did, past `--task-put-retry-secs`, in their own retry, which sits
+above the bound, so each attempt takes a slot and gives it back when it ends, and no slot is
+held while the retry waits. A streamed write holds its slot for its whole body: a client's
+upload of a blob over 64 MiB keeps one for as long as it takes to send (one that stops sending
+is ended by `--pack-upload-idle-timeout`), so as many slow large uploads as there are slots hold
+the other writers back until one ends.
 A client upload is bounded by the `grpc-timeout` it sent: when that passes first, the call ends
 `DEADLINE_EXCEEDED` (a moment early, a tenth of the timeout and at most a second, so that the
 answer reaches the client before the transport cancels the call), never `UNAVAILABLE`; a call

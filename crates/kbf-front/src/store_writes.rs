@@ -11,6 +11,13 @@
 //!   the frontend, where it costs the callers time, instead of at the store, which answers
 //!   `SlowDown` to all of them. A write holds its slot until it ends, its waits for `SlowDown`
 //!   included. Reads, lengths, deletes and listings take no slot.
+//! - **Streamed writes hold a slot for their whole body.** A streamed write takes its slot before
+//!   it reads its body and keeps it until the store has the last byte. For a client's blob over
+//!   the packs' bound, that is as long as the client takes to send it: a client that stops
+//!   sending is ended by `--pack-upload-idle-timeout`, which gives the slot back, but one that
+//!   keeps sending slowly keeps it. As many such uploads as there are slots leave none for the
+//!   other writers until one ends. Streamed writes are not given a share of their own, because
+//!   the action trees' blobs and manifests are streamed writes too, and would share it.
 //! - **`SlowDown`.** tierstore answers a 503 `SlowDown` when it is taking as many uploads as it
 //!   can: back-pressure, not a fault. A write whose body is in hand ([`ObjectStore::put_new`]) is
 //!   made again after a wait that starts at [`FIRST_WAIT`] and doubles up to [`LONGEST_WAIT`], for
