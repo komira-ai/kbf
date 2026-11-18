@@ -102,6 +102,10 @@ pub enum MintError {
     /// The store could not answer: the operation runs again as its next attempt.
     #[error("{0}")]
     Unavailable(String),
+    /// Input blobs the store no longer has, which the pack index said it held: the index forgot
+    /// them, and the client is to upload them again.
+    #[error("{} input blobs are missing", .0.len())]
+    Missing(Vec<kbf_types::Digest>),
 }
 
 /// Issues, reads, verifies and commits what a task wrote. Called after a run ended with
@@ -132,6 +136,14 @@ pub trait Ingest: Send + Sync {
         action: &Digest,
         limits: &UntrustedLimits,
     ) -> Ingested;
+
+    /// A job of `action` did not start because the store does not have the object `object` (its
+    /// SHA-256) of its tree: what the frontend's state says of that object is dropped, and the
+    /// next [`Ingest::mint`] of `action` writes its tree checked against the store. Called before
+    /// the operation's next attempt is prepared. The default keeps no such state.
+    async fn lost(&self, action: &Digest, object: &[u8; 32]) {
+        let _ = (action, object);
+    }
 }
 
 /// What the executor reads of an action before it runs one.

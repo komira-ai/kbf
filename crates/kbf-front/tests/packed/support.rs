@@ -94,6 +94,7 @@ pub struct Spy {
     claims: Capabilities,
     reject_puts: AtomicU32,
     reject_reads: AtomicU32,
+    lose_reads: AtomicU32,
     reject_lens: AtomicU32,
     /// The range reads so far, and the number of the one that fails (`u64::MAX`: none).
     reads: AtomicU64,
@@ -150,6 +151,7 @@ impl Spy {
             claims,
             reject_puts: AtomicU32::new(0),
             reject_reads: AtomicU32::new(0),
+            lose_reads: AtomicU32::new(0),
             reject_lens: AtomicU32::new(0),
             reads: AtomicU64::new(0),
             fail_read_at: AtomicU64::new(u64::MAX),
@@ -249,6 +251,12 @@ impl Spy {
     /// The next `n` writes fail before they store anything.
     pub fn reject_puts(&self, n: u32) {
         self.reject_puts.store(n, SeqCst);
+    }
+
+    /// The next `n` range reads answer that the object is not there, whatever the store holds: a
+    /// read that raced the object's write.
+    pub fn lose_reads(&self, n: u32) {
+        self.lose_reads.store(n, SeqCst);
     }
 
     /// The next `n` range reads fail (after they are logged).
@@ -444,6 +452,9 @@ impl ObjectStore for Spy {
         }
         if range.size() >= 1 << 20 && fires(&self.reject_big_reads) {
             return Err(injected());
+        }
+        if fires(&self.lose_reads) {
+            return Err(ObjectStoreError::NotFound(key.clone()));
         }
         self.inner.get_range(key, range).await
     }
@@ -652,6 +663,10 @@ impl PackIndex for Index {
 
     fn drop_location(&self, digest: &BlobDigest, pack_key: &str) -> Result<bool, PackIndexError> {
         self.inner.drop_location(digest, pack_key)
+    }
+
+    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
+        self.inner.forget_pack(pack_key)
     }
 
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {

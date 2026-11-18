@@ -1,4 +1,4 @@
-//! The pack index on a real Postgres server: the conformance clauses P1 to P10 (the clauses
+//! The pack index on a real Postgres server: the conformance clauses P1 to P12 (the clauses
 //! `tests/pack_index_memory.rs` runs against the in-memory index), and what is Postgres's
 //! alone: recording takes none of the locks a state transaction holds, a schema without the
 //! pack tables is refused, rows are stamped with the database's clock when none is injected,
@@ -17,7 +17,7 @@ use kbf_pack_index::conformance::{
     p4_first_location_is_kept, p5_batches_of_a_thousand, p6_touch_changes_only_the_touch_time,
     p7_dead_packs_and_unreferenced_keys, p8_concurrent_records_all_succeed,
     p9_a_pack_that_cannot_exist_is_refused, p10_concurrent_records_of_one_pack_agree,
-    p11_a_location_can_be_dropped,
+    p11_a_location_can_be_dropped, p12_a_lost_pack_can_be_forgotten,
 };
 use kbf_pack_index::postgres::{PostgresPackBackend, PostgresPackIndex};
 use kbf_pack_index::schema::{self as pack_schema, test_database};
@@ -166,6 +166,15 @@ fn p10_two_connections_record_the_same_pack_at_once() {
 #[test]
 fn p11_a_location_is_dropped_only_from_its_own_pack() {
     p11_a_location_can_be_dropped(&backend());
+}
+
+/// Asserts the forget of a lost pack against Postgres: every row that points into the pack and
+/// the pack's row are removed in one statement, its blobs are missing, a blob whose row is in
+/// another pack keeps it, a repeat and an unknown key remove nothing, the pack is not listed as
+/// dead, and the same pack recorded again is new and indexes its blobs.
+#[test]
+fn p12_a_lost_pack_is_forgotten_with_its_rows() {
+    p12_a_lost_pack_can_be_forgotten(&backend());
 }
 
 // ---- Postgres's own parts ----------------------------------------------------------------

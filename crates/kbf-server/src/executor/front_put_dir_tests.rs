@@ -41,6 +41,11 @@ impl DirPrep {
         })
     }
 
+    /// Sets the CAS the closures are collected over: once, by the rig.
+    pub(super) fn set_backend(&self, backend: Backend) {
+        self.backend.set(backend).expect("set once");
+    }
+
     /// The runs prepared with their closure so far.
     pub(super) fn prepared(&self) -> usize {
         self.prepared.load(Ordering::SeqCst)

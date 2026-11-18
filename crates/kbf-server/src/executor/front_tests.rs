@@ -326,8 +326,9 @@ async fn an_image_named_by_tag_or_a_negative_timeout_is_invalid() {
 
 /// Catches a refusal of the real preparation being sorted by its text or its kind and not by whose
 /// it is to fix: only a store that could not be read is the farm's to retry; a blob that is
-/// missing, a tree over budget and a lease no key can carry are the caller's, and neither says
-/// more than the preparation did.
+/// missing is the client's to upload again (the Execute found it held, so the store lost it
+/// since) and is answered as missing inputs, naming it; a tree over budget and a lease no key can
+/// carry are the caller's, and neither says more than the preparation did.
 #[test]
 fn the_real_preparations_refusals_are_sorted_by_whose_they_are() {
     use kbf_front::prepare_run::ClosureError;
@@ -342,11 +343,16 @@ fn the_real_preparations_refusals_are_sorted_by_whose_they_are() {
         PrepareError::Unavailable(text.clone())
     );
     assert!(text.contains("the store is down"), "{text}");
+    let missing = RunPrepError::Closure(ClosureError::Missing {
+        what: "a file",
+        digest,
+    });
+    assert_eq!(prepare_error(missing), PrepareError::Missing(digest));
+    assert_eq!(
+        MintError::from(PrepareError::Missing(digest)),
+        MintError::Missing(vec![digest])
+    );
     for refused in [
-        RunPrepError::Closure(ClosureError::Missing {
-            what: "a file",
-            digest,
-        }),
         RunPrepError::Closure(ClosureError::TooManyDigests { limit: 3 }),
         RunPrepError::Clock,
     ] {
@@ -711,6 +717,9 @@ mod cache;
 
 #[path = "front_twice_tests.rs"]
 mod twice;
+
+#[path = "front_lost_tests.rs"]
+mod lost;
 fn props(pairs: &[(&str, &str)]) -> Platform {
     let property = |(name, value): &(&str, &str)| Property {
         name: (*name).to_owned(),

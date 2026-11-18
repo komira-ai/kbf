@@ -133,6 +133,7 @@ fn start(dir: &Path, packs: Packs, state: Option<Arc<dyn Store>>) -> Start {
         state,
         slot: Arc::new(std::sync::OnceLock::new()),
         list: false,
+        republish: Arc::default(),
     }
 }
 
@@ -315,6 +316,45 @@ async fn the_published_base_is_set_for_the_executor_and_a_failed_one_is_not() {
     assert!(empty.get().is_none());
 }
 
+/// Asserts that a publish sets, for the executor, a publish again of the same bundle into the
+/// same store: once the store lost the tree's root, it writes the root back and nothing else (each
+/// object held costs a length check) and says so in a line; with the bundle gone from the cache it
+/// fails naming why; and a failed first publish sets none.
+#[tokio::test]
+async fn a_publish_sets_a_publish_again_that_writes_back_what_the_store_lost() {
+    let dir = scratch_dir("base-tree-again");
+    let root = bundle_dir(&dir, COMMIT, &["linux-x86_64"]).root;
+    let (packs, objects) = packs();
+    let ready = start(&dir, packs.clone(), None);
+    let again = Arc::clone(&ready.republish);
+    let published = ready.publish_as(COMMIT, now).await.expect("published");
+    objects.delete(&key_of(&root)).await.expect("lost");
+    let lines = capture();
+
+    let republish = again.get().expect("set for the executor");
+    republish.run().await.expect("published again");
+
+    assert!(
+        objects
+            .len(&key_of(&root))
+            .await
+            .expect("a length")
+            .is_some()
+    );
+    let text = lines.text();
+    assert!(text.contains("published the kbf base tree again"), "{text}");
+    assert!(text.contains("written=1"), "{text}");
+    let held = published.written - 1;
+    assert!(text.contains(&format!("held={held}")), "{text}");
+    std::fs::remove_file(dir.join(file_name(COMMIT, "linux-x86_64"))).expect("removed");
+    assert!(republish.run().await.is_err());
+
+    let failed = start(&dir, packs, None);
+    let none = Arc::clone(&failed.republish);
+    assert!(failed.publish_as("another-commit", now).await.is_err());
+    assert!(none.get().is_none());
+}
+
 /// Asserts that a start whose cache directory is empty fetches the release it is, publishes the
 /// tree of the fetched bundle exactly as one staged by hand, and logs that the bundle is ready;
 /// and that a start over a cache of another release's files (a release that is not the one this
@@ -445,6 +485,7 @@ fn js_flags(config: crate::executor::Config) -> super::super::JsAgentFlags {
         base_tree_keep: 1,
         base_tree_timeout: Duration::from_secs(5),
         published: Arc::default(),
+        republish: Arc::default(),
         put_retry: Duration::from_secs(5),
         manifest_writes: kbf_front::action_tree::MANIFEST_WRITES,
     }

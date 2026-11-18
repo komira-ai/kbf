@@ -70,7 +70,8 @@ use run::{Op, Start};
 pub use config::{Config, ConfigError, FINISHED_RETENTION, InputTree, LIVE};
 pub use driver::Running;
 pub use front::{
-    Front, FrontParts, MintedDir, PrepareError, PreparedPutDir, PutDirParts, RunPrepare, RunSource,
+    Front, FrontParts, MintedDir, PrepareError, PreparedPutDir, PutDirParts, Republish, RunPrepare,
+    RunSource,
 };
 pub use mac::{
     DEFAULT_MAC_OS_VERSION, MAC_OS, MAC_OUT_TARGET, MacPool, MacPoolError, System, TREE_TARGET,

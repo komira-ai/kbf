@@ -27,4 +27,5 @@ mod denied;
 mod directories;
 mod empty_blob;
 mod large;
+mod lost;
 mod rig;

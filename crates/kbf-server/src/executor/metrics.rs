@@ -29,16 +29,19 @@ pub(crate) enum RunEnd {
     Lost,
     /// An action that cannot run here.
     Invalid,
+    /// Inputs the store lost: the client uploads them again.
+    Missing,
 }
 
 impl RunEnd {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Ran,
         Self::Infra,
         Self::Timeout,
         Self::OutOfMemory,
         Self::Lost,
         Self::Invalid,
+        Self::Missing,
     ];
 
     const fn label(self) -> &'static str {
@@ -49,6 +52,7 @@ impl RunEnd {
             Self::OutOfMemory => "out_of_memory",
             Self::Lost => "lost",
             Self::Invalid => "invalid",
+            Self::Missing => "missing",
         }
     }
 
@@ -60,6 +64,7 @@ impl RunEnd {
             Settled::OutOfMemory => Self::OutOfMemory,
             Settled::Lost(_) => Self::Lost,
             Settled::Invalid(_) => Self::Invalid,
+            Settled::Missing(_) => Self::Missing,
         }
     }
 }
@@ -112,7 +117,7 @@ const REASONS: [(RejectReason, &str); 9] = [
 /// The executor's counters.
 #[derive(Debug, Default)]
 pub struct Metrics {
-    runs: [AtomicU64; 6],
+    runs: [AtomicU64; RunEnd::ALL.len()],
     ingests: [AtomicU64; 11],
     jobs_submitted: AtomicU64,
     jobs_resubmitted: AtomicU64,

@@ -38,6 +38,7 @@
 //! | failed to start exclusive-not-ready | `infra` | `UNAVAILABLE`: rerun |
 //! | failed to start input-unavailable | `infra` | `UNAVAILABLE`: a host path the job named could not be read on its host, rerun |
 //! | failed to start host-unsafe | `infra` | `UNAVAILABLE`: rerun |
+//! | failed to start, any code, its detail naming an object of its tree the store answered 404 for | `infra` | `UNAVAILABLE`: the frontend drops what its state says of the object, and the next attempt's tree is checked against the store, rerun |
 //! | failed to start egress-unchecked | `infra` | `UNAVAILABLE`: the host's agent could not check the limits of the job's network, rerun |
 //! | failed to start, any other code or detail | `infra` | `UNAVAILABLE`: rerun |
 //! | in a state this server does not know | `infra` | `UNAVAILABLE`: rerun |
@@ -55,6 +56,16 @@
 //! carries the arguments and the mounts. The agent's detail of a start it refused is a
 //! code (`quota-unavailable`, ...) or text that can quote those: only the code is
 //! read, from the start of the detail, and only the detail's length is logged.
+//!
+//! **A lost object.** The detail of a start that failed on any code is also read for one thing
+//! more: 64 lower-case hex digits right before `: upstream 404`, which is how tierstore says the
+//! store has no object of a SHA-256 the job's tree names (`cannot fetch manifest <sha256>:
+//! upstream 404`) ([`lost_object`]). The store is a general-purpose one, and its objects can
+//! vanish while the frontend's state still names them. Only those digits are taken, and logged;
+//! the callers get a fixed phrase. The run is `infra` ([`Verdict::StoreLost`]): before the next
+//! attempt the frontend drops what its state says of the object, and writes that attempt's tree
+//! checked against the store, so a pack the store lost is forgotten and its blobs reported
+//! missing ([`Settled::Missing`]), which the client uploads again.
 //!
 //! What a job that did not end well wrote goes with the status as a detail, cut to a cap
 //! ([`output`](super::output)); the code and the message above are unchanged by it.
@@ -83,6 +94,14 @@ pub(super) enum Verdict {
     Ingest,
     /// The job did not produce a result.
     Settled(Settled),
+    /// The job did not start because the store does not have an object of its tree, `object`
+    /// (its SHA-256): the frontend's state is told before the run ends as `settled`.
+    StoreLost {
+        /// The SHA-256 the store answered 404 for.
+        object: [u8; 32],
+        /// How the run ends: `infra`.
+        settled: Settled,
+    },
 }
 
 /// A job that did not produce a pack, by what follows.
@@ -98,6 +117,9 @@ pub(crate) enum Settled {
     Lost(&'static str),
     /// The action cannot run here: the caller's to fix.
     Invalid(String),
+    /// Input blobs the store no longer has, which the index said it held: the frontend forgot
+    /// them, and the client is to upload them again and execute again.
+    Missing(Vec<kbf_types::Digest>),
 }
 
 /// The codes an agent gives a start it refuses, as `js-agent-wire` spells them.
@@ -116,6 +138,53 @@ fn agent_code(detail: &str) -> &str {
         .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
         .unwrap_or(detail.len());
     &detail[..end]
+}
+
+/// What tierstore writes right after the SHA-256 of an object the store does not have.
+const UPSTREAM_404: &str = ": upstream 404";
+
+/// The SHA-256 of the object a start failure's `detail` says the store answered 404 for: the 64
+/// lower-case hex digits right before [`UPSTREAM_404`], that are not the end of a longer run of
+/// hex digits, where the status is not the start of a longer number (the first such), or
+/// `None`. Nothing else of the detail is read.
+pub(super) fn lost_object(detail: &str) -> Option<[u8; 32]> {
+    let is_hex = |b: &u8| b.is_ascii_digit() || (b'a'..=b'f').contains(b);
+    let bytes = detail.as_bytes();
+    let mut from = 0;
+    while let Some(found) = detail[from..].find(UPSTREAM_404) {
+        let at = from + found;
+        from = at + UPSTREAM_404.len();
+        let ends = bytes.get(from).is_none_or(|b| !b.is_ascii_digit());
+        let Some(start) = at.checked_sub(64) else {
+            continue;
+        };
+        let alone = start == 0 || !is_hex(&bytes[start - 1]);
+        let sha = sha256_of(&bytes[start..at]);
+        if let (true, true, Some(sha)) = (ends, alone, sha) {
+            return Some(sha);
+        }
+    }
+    None
+}
+
+/// The 32 bytes `hex` (64 bytes, as its one caller cuts it) spells, when every byte is a
+/// lower-case hex digit.
+fn sha256_of(hex: &[u8]) -> Option<[u8; 32]> {
+    let digit = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    };
+    let mut sha = [0_u8; 32];
+    for (byte, pair) in sha.iter_mut().zip(hex.chunks_exact(2)) {
+        *byte = digit(pair[0])? << 4 | digit(pair[1])?;
+    }
+    Some(sha)
+}
+
+/// The SHA-256 `sha` in lower-case hex.
+pub(super) fn hex(sha: &[u8; 32]) -> String {
+    sha.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// An infrastructure ending, logged with the job id and the detail's length only.
@@ -181,6 +250,16 @@ fn promote(job: &Job, result: &JobResult) -> Verdict {
 
 /// The verdict on a job that did not start.
 fn failed_to_start(job: &Job) -> Verdict {
+    if let Some(object) = lost_object(&job.start_failure_detail) {
+        let detail_bytes = job.start_failure_detail.len();
+        let object_hex = hex(&object);
+        tracing::warn!(job = %job.id, detail_bytes, object = %object_hex, "the job failed to start: the store does not have an object of its tree");
+        let why = "the job failed to start: the store does not have an object of its tree";
+        return Verdict::StoreLost {
+            object,
+            settled: Settled::Infra(why.to_owned()),
+        };
+    }
     match job.start_failure() {
         StartFailureCode::NoCapacity => infra(job, "the job failed to start: no-capacity"),
         StartFailureCode::StartTimeout => infra(job, "the job failed to start: start-timeout"),
@@ -253,8 +332,8 @@ pub(super) fn refused(error: &Error) -> Option<Settled> {
 
 impl Settled {
     /// Whether the operation is submitted again, if it has an attempt left ([`RESUBMITS`]):
-    /// every ending of the farm's. The action's own timeout and an action that cannot run here
-    /// are answered at once.
+    /// every ending of the farm's. The action's own timeout, an action that cannot run here and
+    /// inputs the client is to upload again are answered at once.
     pub(super) const fn retried(&self) -> bool {
         matches!(self, Self::Infra(_) | Self::Lost(_) | Self::OutOfMemory)
     }
@@ -287,6 +366,7 @@ impl Settled {
                 answer
             }
             Self::Invalid(why) => status(Code::InvalidArgument, why),
+            Self::Missing(digests) => kbf_front::missing_status(digests),
         }
     }
 }
