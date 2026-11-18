@@ -19,8 +19,9 @@
 //! The phases:
 //!
 //! - `prepare`: the Execute to its job being ready (the CAS read, the put directory and the
-//!   action tree's name; a first attempt's tree writes end after its submit);
-//! - `start`: ready to the job service answering the submit with the job (including each submit that
+//!   action tree's name);
+//! - `start`: ready to the job service answering the submit with the job (the wait for the tree's
+//!   writes, with the operation's row written meanwhile, then each submit, including each one that
 //!   was not answered and was sent again);
 //! - `queue`: accepted to first read back as running (queued, placed and starting);
 //! - `task`: first read back as running to read back as ended;

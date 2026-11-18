@@ -74,7 +74,8 @@
 //! each run's action tree written over the published base tree, as manifests or as a tree list.
 //! A tree's name is a digest of what it holds, known before anything is written:
 //! [`TreeWriter::write_named`] and [`TreeWriter::write_listing_named`] hand it out then, so the
-//! executor submits the job while the tree's writes go on.
+//! executor writes the operation's row while the tree's writes go on, and submits the job once
+//! they end.
 
 mod base;
 mod check;

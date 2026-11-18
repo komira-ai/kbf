@@ -21,9 +21,10 @@
 //! - `held`: the closure's check that the store holds every blob of the closure;
 //! - `tree`: the action tree, from the collected closure to the tree's name, its blobs located
 //!   and its manifests or tree list built; the writes of the tree are not in it;
-//! - `tree_wait`: the run waiting for its tree's writes: after the submit for a first attempt,
-//!   which submits while the tree is written, and before it for a later attempt;
-//! - `row`: the operation's row written to the state store, before the submit;
+//! - `tree_wait`: the run waiting for its tree's writes, before its submit, while its row is
+//!   written;
+//! - `row`: the operation's row written to the state store, while the tree's writes end and
+//!   before the submit;
 //! - `rpc`: one `SubmitJob` call, from the call to its answer or to the end of its limit;
 //! - `backoff`: the wait before a submit whose answer was lost is sent again.
 

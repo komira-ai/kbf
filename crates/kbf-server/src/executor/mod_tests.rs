@@ -97,6 +97,9 @@ pub(crate) struct FakeIngest {
     pub release: tokio::sync::Notify,
     /// Every wait for a tree's writes, by run, in the order asked.
     pub stored_asked: Mutex<Vec<RunId>>,
+    /// Every wait for a tree's writes that answered the tree stored, by run, in the order
+    /// answered.
+    pub stored_done: Mutex<Vec<RunId>>,
 }
 
 impl FakeIngest {
@@ -132,7 +135,13 @@ impl Ingest for FakeIngest {
         if self.hold_stored.load(Ordering::SeqCst) {
             self.release.notified().await;
         }
-        locked(&self.stored_script).pop_front().map_or(Ok(()), Err)
+        locked(&self.stored_script).pop_front().map_or_else(
+            || {
+                locked(&self.stored_done).push(run);
+                Ok(())
+            },
+            Err,
+        )
     }
 
     async fn ingest(
@@ -480,6 +489,7 @@ impl Rig {
             hold_stored: AtomicBool::new(false),
             release: tokio::sync::Notify::new(),
             stored_asked: Mutex::new(Vec::new()),
+            stored_done: Mutex::new(Vec::new()),
         });
         let metrics = Arc::new(Metrics::default());
         let mut rig = Self {

@@ -5,16 +5,11 @@
 //! submit whose answer was lost is sent again, the same spec under the same id, every
 //! [`Config::poll`](super::Config::poll), so the service makes one job.
 //!
-//! The tree's writes go on while the row is written and the job submitted
-//! ([`Ingest::stored`](super::Ingest::stored)): its name is a digest of what it holds, and the
-//! job's host reads it only once the job is placed. A first attempt waits for the writes once
-//! its submit is answered, before it reads the job back, and cancels its job when they fail, so
-//! that the job does not fail on its host; the operation then runs again. A job placed before
-//! its tree is in the store fails to start for an input it could not read, which runs the
-//! operation again too; by then the first attempt has waited for the writes, so the next attempt
-//! finds the tree stored and the race costs at most one attempt. A later attempt waits for its
-//! own tree's writes before it submits: those of a run whose earlier attempt ended before it
-//! waited (its submit refused, or the operation handed over) are not known to be stored. The job is then read
+//! The tree's writes go on while the row is written ([`Ingest::stored`](super::Ingest::stored)):
+//! its name is a digest of what it holds, known before any write. Every attempt waits for the
+//! writes before it submits its job, since the job's host opens the tree as soon as the job is
+//! placed and a tree not yet in the store fails the job's start; a failed write ends the run
+//! with no job submitted, and a cancel then ends it with nothing to withdraw. The job is then read
 //! back every poll until it ends ([`outcome::judge`](super::outcome)): a job that ended well has
 //! its pack ingested and answers the callers with the result; an ending of the farm's submits the
 //! operation's next attempt, while it has one ([`RESUBMITS`]); any other ending, and the last
@@ -282,12 +277,6 @@ async fn fresh(
         }
     };
     timeline.stamp(Mark::Prepared, Instant::now(), metrics);
-    // A first attempt submits while its tree is written. A later one may follow a run whose
-    // job was placed before its tree was in the store: it waits for the tree first.
-    let early = run.attempt == 0;
-    if !early && let Err(ended) = tree_written(inner, run, cancel).await {
-        return ended;
-    }
     let job = prepared.spec.job_id.clone();
     let row = OpRow {
         owner: String::new(),
@@ -300,17 +289,26 @@ async fn fresh(
         whole_machine: op.whole_machine,
     };
     let id = op.id;
-    let started = Instant::now();
-    let written = on_rows(inner, move |rows| rows.put_op(id, &row)).await;
-    if written.is_some() {
-        metrics.step_took(Step::Row, started.elapsed());
-    }
+    let put_row = async {
+        let started = Instant::now();
+        let written = on_rows(inner, move |rows| rows.put_op(id, &row)).await;
+        if written.is_some() {
+            metrics.step_took(Step::Row, started.elapsed());
+        }
+        written
+    };
+    // The row is written while the tree's writes end; the job is submitted only once the tree
+    // is stored, so its host never opens a tree the store does not have yet.
+    let (tree, written) = tokio::join!(tree_written(inner, run, cancel), put_row);
     match written {
         Some(Err(RowsError::Conflict { .. })) => return Ended::HandedOver,
         Some(Err(error)) => {
             tracing::warn!(operation = %op.id, %error, "the operation's row is not in the state store: no other frontend can take it up");
         }
         Some(Ok(())) | None => {}
+    }
+    if let Err(ended) = tree {
+        return ended;
     }
     let answer = tokio::select! {
         biased;
@@ -327,11 +325,6 @@ async fn fresh(
     metrics.job_submitted();
     timeline.stamp(Mark::Posted, Instant::now(), metrics);
     tracing::debug!(operation = %op.id, %run, %job, "submitted");
-    if early && let Err(ended) = tree_written(inner, run, cancel).await {
-        // The job cannot read its tree: it is not left to fail on its host.
-        withdraw(inner, &job).await;
-        return ended;
-    }
     if op.recorded {
         record::granted(&inner.deps.recorder, run, &job);
     }
