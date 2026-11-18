@@ -189,3 +189,17 @@ fn the_put_retry_total_reaches_the_executor() {
         Duration::from_secs(60)
     );
 }
+
+/// Asserts that `--task-manifest-writes` reaches the executor's flags and is
+/// [`kbf_front::action_tree::MANIFEST_WRITES`] by default. Catches: a flag that parses and is
+/// dropped, leaving the writer at its own bound.
+#[test]
+fn the_manifest_writes_reach_the_executor() {
+    let flags = parsed(argv(&[], &["--task-manifest-writes=5"])).expect("accepted");
+    assert_eq!(flags.executor.js.expect("js-agent").manifest_writes, 5);
+    let flags = parsed(argv(&[], &[])).expect("accepted");
+    assert_eq!(
+        flags.executor.js.expect("js-agent").manifest_writes,
+        kbf_front::action_tree::MANIFEST_WRITES
+    );
+}

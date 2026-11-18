@@ -179,19 +179,6 @@ async fn write_blob(
     .await
 }
 
-/// Writes `bytes` to `cas/l/<sha256 of bytes>` (`manifest`), create-only.
-///
-/// # Errors
-/// [`NoTree::Put`]: the store refused it.
-pub(super) async fn write_manifest(
-    store: &dyn LargeStore,
-    retry: &PutRetry,
-    manifest: &Digest,
-    bytes: Bytes,
-) -> Result<(), NoTree> {
-    write_object(store, retry, &large_key(manifest), bytes).await
-}
-
 /// Writes `bytes` to `key`, create-only: an existing key is success, since every key this
 /// writer writes is named by its content.
 ///

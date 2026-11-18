@@ -267,6 +267,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "task-janitor-page-size",
             "task-large-credentials-file",
             "task-large-max-bytes",
+            "task-manifest-writes",
             "task-max-large",
             "task-max-object-entries",
             "task-max-object-manifest-bytes",

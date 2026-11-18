@@ -165,6 +165,42 @@ async fn a_refused_shared_write_reaches_every_waiter_and_is_made_anew() {
     );
 }
 
+/// Catches: manifest writes bounded per preparation only, so a burst of preparations of distinct
+/// trees opens a store request for every manifest of every one at once, and each request slows
+/// with the others: across eight preparations of four manifests each, never more than the
+/// writer's slots are open at once, the slots are all used, and every tree is made.
+#[tokio::test]
+async fn manifest_writes_across_preparations_never_exceed_the_slots() {
+    const SLOTS: usize = 3;
+    let rig = Rig::new().await.with_write_slots(SLOTS);
+    let mut kepts = Vec::new();
+    for at in 0..8 {
+        let leaf = link_root(&rig, &format!("a{at}")).await;
+        let root = holding(&rig, "z", &leaf).await;
+        kepts.push(rig.kept(&root).await);
+    }
+    rig.farm.state().faults.hold_all = true;
+    let writes = kepts
+        .iter()
+        .map(|kept| rig.writer.write(kept, &rig.base.tree));
+    let mut all = pin!(futures::future::join_all(writes));
+    let trees = loop {
+        if let std::task::Poll::Ready(trees) = poll!(all.as_mut()) {
+            break trees;
+        }
+        let open = rig.farm.state().open;
+        assert!(open <= SLOTS, "{open} writes open, over the {SLOTS} slots");
+        rig.farm.gate.add_permits(1);
+    };
+    assert_eq!(rig.farm.state().peak, SLOTS);
+    assert_eq!(rig.farm.puts().len(), 8 * 4, "each manifest written once");
+    for tree in trees {
+        rig.farm
+            .flatten(&tree.expect("a tree"))
+            .expect("every manifest is stored");
+    }
+}
+
 /// A copy of a [`NoTree::Put`] (`NoTree` is not `Clone`).
 trait CloneRefusal {
     fn clone_refusal(&self) -> Self;

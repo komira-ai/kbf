@@ -84,6 +84,8 @@ struct Faults {
     any: VecDeque<ObjectStoreError>,
     /// A key whose writes wait, once recorded, until the test opens [`Farm::gate`].
     held: Option<String>,
+    /// Every write waits, once recorded, until the test opens [`Farm::gate`].
+    hold_all: bool,
 }
 
 #[derive(Default)]
@@ -109,6 +111,28 @@ struct State {
     puts: Vec<String>,
     /// The bytes a write whose body ended in an error had received, by key.
     received: BTreeMap<String, u64>,
+    /// The writes open now: made and not yet answered.
+    open: usize,
+    /// The most writes that were open at once.
+    peak: usize,
+}
+
+/// One open write of [`Farm`]'s, counted in [`State::open`] and [`State::peak`] until dropped.
+struct Open<'a>(&'a Farm);
+
+impl<'a> Open<'a> {
+    fn enter(farm: &'a Farm) -> Self {
+        let mut state = farm.state();
+        state.open += 1;
+        state.peak = state.peak.max(state.open);
+        Self(farm)
+    }
+}
+
+impl Drop for Open<'_> {
+    fn drop(&mut self) {
+        self.0.state().open -= 1;
+    }
 }
 
 /// A storage node's blobs in a map, so that a tree of a hundred thousand files is stored in
@@ -413,12 +437,13 @@ impl LargeStore for Farm {
         mut body: BodyStream,
     ) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
         Box::pin(async move {
+            let _open = Open::enter(self);
             let name = key.as_str().to_owned();
             let (held, refused) = {
                 let mut state = self.state();
                 state.puts.push(name.clone());
                 let faults = &state.faults;
-                let held = faults.held.as_deref() == Some(name.as_str());
+                let held = faults.hold_all || faults.held.as_deref() == Some(name.as_str());
                 (held, faults.put.as_deref() == Some(name.as_str()))
             };
             if held {
@@ -625,6 +650,17 @@ impl Rig {
             base,
             command,
         }
+    }
+
+    /// This rig, its writer holding at most `slots` manifest writes open at once.
+    fn with_write_slots(mut self, slots: usize) -> Self {
+        let now = Arc::clone(&self.clock);
+        let clock: kbf_front::Clock =
+            Arc::new(move || *now.lock().unwrap_or_else(PoisonError::into_inner));
+        let source = Arc::clone(&self.farm) as Arc<dyn BlobSource>;
+        let store = Arc::clone(&self.farm) as Arc<dyn LargeStore>;
+        self.writer = TreeWriter::new(source, store, clock).with_write_slots(slots);
+        self
     }
 
     /// Moves the test clock on by `by`.

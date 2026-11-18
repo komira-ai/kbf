@@ -6,6 +6,11 @@
 //! until the first of them has stored a subtree no memo names it, so without this each would
 //! write it, the store taking one create-only write per preparation of every shared manifest.
 //!
+//! At most a fixed number of writes are at the store at once, across every preparation
+//! ([`Flights::new`]): a write past the bound waits for a slot before it makes its request, so a
+//! burst of preparations queues at the frontend instead of at the store, where every request
+//! would wait and each preparation's writes would take longer the more there are.
+//!
 //! A write is entered under its manifest's digest when the first preparation asks for it, and
 //! taken out by whichever of its waiters sees it end, stored or failed: a write that failed is
 //! made anew by the next preparation that asks. A waiter dropped part way (its preparation ran
@@ -20,6 +25,7 @@ use bytes::Bytes;
 use futures::FutureExt as _;
 use futures::future::{BoxFuture, Shared};
 use kbf_types::Digest;
+use tokio::sync::Semaphore;
 
 use super::NoTree;
 use super::place::store_object;
@@ -29,13 +35,21 @@ use crate::large_backfill::{LargeStore, large_key};
 /// One write in flight: its end, the store's answer (`why` it failed) for every waiter.
 type Flight = Shared<BoxFuture<'static, Result<(), String>>>;
 
-/// The writes in flight, by manifest digest.
-#[derive(Default)]
+/// The writes in flight, by manifest digest, and the slots they make their requests in.
 pub(super) struct Flights {
     writes: Mutex<BTreeMap<Digest, Flight>>,
+    slots: Arc<Semaphore>,
 }
 
 impl Flights {
+    /// No write in flight; at most `slots` at the store at once.
+    pub(super) fn new(slots: usize) -> Self {
+        Self {
+            writes: Mutex::new(BTreeMap::new()),
+            slots: Arc::new(Semaphore::new(slots)),
+        }
+    }
+
     /// Writes the manifest `digest` (`bytes`) to `cas/l/` through `store`, repeated by `retry`,
     /// or waits for the write of it already in flight.
     ///
@@ -53,7 +67,11 @@ impl Flights {
             .entry(digest)
             .or_insert_with(|| {
                 let (store, retry) = (Arc::clone(store), retry.clone());
+                let slots = Arc::clone(&self.slots);
                 async move {
+                    // Held until the write ends, retries and their waits included. The
+                    // semaphore is never closed, so this is always a permit.
+                    let _slot = slots.acquire_owned().await;
                     let key = large_key(&digest);
                     let stored = store_object(&*store, &retry, &key, bytes).await;
                     stored.map_err(|error| error.to_string())
