@@ -294,9 +294,10 @@ the passed-through port is out of its reach. `tierstore fs` fetches blobs over t
 ### 4.1 From an input root to an action tree
 
 The frontend builds the manifests, in the executor's `prepare`, and names the tree before it submits; the manifests
-are written while the job is submitted, since the tree's name is a digest of what it holds and the job's host reads
-it only once the job is placed. A first attempt waits for the writes after its submit and cancels its job when they
-fail; a later attempt waits for them before it submits [proposed, D5].
+are written while the operation's row is written, since the tree's name is a digest of what it holds. Every attempt
+waits for the writes before it submits: the job's host opens the tree as soon as the job is placed, and a tree not yet
+in the store fails the job's start and costs the operation an attempt. A failed write ends the run with no job
+submitted [proposed, D5].
 
 **The `Directory` messages.** A manifest per `Directory` needs each one's names, kinds, executable bits, symlink
 targets and child digests. `collect_closure` already reads every `Directory` of the input root before every submit and

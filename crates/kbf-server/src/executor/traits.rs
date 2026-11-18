@@ -130,8 +130,9 @@ pub trait Ingest: Send + Sync {
 
     /// Waits until the action tree [`Ingest::mint`] named for `run` is in the store. A mint
     /// hands out the tree's name as soon as it is known and writes the tree after it, so that
-    /// the job is submitted while the tree is written; the job's host reads the tree only once
-    /// the job is placed. Asked once for a run, after its mint; a run whose tree needed no
+    /// the run's row is written while the tree is; the job is submitted only once this answers,
+    /// since the job's host opens the tree as soon as the job is placed. Asked once for a run,
+    /// after its mint; a run whose tree needed no
     /// writes, or that was never minted, is answered at once. By default every tree is in the
     /// store when its mint answers.
     ///
