@@ -126,9 +126,8 @@ pipeline run once, only when every failed job is an artifact build or move job.
 `release.yml` is started by one event: the completion of a `pipeline` run (`workflow_run`).
 `plan` checks that run's conclusion (`success`), event (`push`), branch (`main`) and
 repository. Every other job needs `plan`, and all of them but `verify` repeat the check. It has its own concurrency group, `release-main`, which never cancels. When
-`plan` finds the range since the last tag is docs only, or changes the pipeline itself,
-the jobs after `plan` are skipped and the run is green. The code ships with the next
-release. A commit that the highest release tag is already after (an older run that
+`plan` finds the range since the last tag is docs only, the jobs after `plan` are
+skipped and the run is green. A commit that changes the pipeline releases itself. A commit that the highest release tag is already after (an older run that
 completes late) is also a green no-op, so the newest release is the only one deployed.
 
 The workflow has no secret but the release bot's GitHub App key (`RELEASE_BOT_PRIVATE_KEY`,

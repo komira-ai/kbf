@@ -648,16 +648,16 @@ the tag of the commit being re-run), not from the one push: code from a push tha
 queued behind a running pipeline, is always in the next release, and a docs-only push after code changes still releases that
 code. A commit that the highest release tag is already after (a run that completes late, behind a newer release) is superseded: the plan is a green no-op with `code` false, so the newest release is the only one deployed and the older run does not go red. With no release tag yet, the first release is everything. **Releases therefore happen at least once per pipeline
 length**: as long as a pipeline can finish, the commit it finishes on releases everything since the last release. `code`
-and `site` are classified over that whole range; `pipeline` is the commit's own change (its diff over its first parent),
-because a range keeps a pipeline file until a release clears it, and a release that waits for no pipeline file in the range
-would never be made. **The residual risks, stated:** (1) the run that started the release is read by id
+and `site` are classified over that whole range. A commit that changes the pipeline (`.github/`, `infra/`, `crates/xtask/`
+and the like) releases itself: the release follows that commit's own pipeline run, which passed, and runs `release.yml`
+as `main` has it (that commit, or a newer one); holding it for the next commit added no check (the next release runs the same
+machinery) and only delayed every release behind it. **The residual risks, stated:** (1) the run that started the release is read by id
 (`github.event.workflow_run.id`): `release locate` refuses a run that is not the successful push run on `main` for the
 commit, and one that no longer holds the artifacts (they expire after 90 days); (2) a release job a person cancels, or that
 fails, is re-run from the run's page (failed jobs only), and `release tag` and `release publish` are idempotent, so a
-half-made release is completed, not repeated; (3) a commit that changes the pipeline does not release itself, and the
-next commit that does not releases both. Until then the newest release is the one before, however many code commits the pipeline commit follows;
-when no such commit is queued, a small docs-only commit is the way to release (the plan counts `docs/` as not code but measures the code
-range from the last tag).
+half-made release is completed, not repeated; (3) a change to the release workflow is first exercised by the release
+of its own commit: a broken one fails that release, and the fix (or a revert) releases itself as soon as its own pipeline
+passes.
 
 The workflow lints hold all of it (`crates/kbf-integration-test/tests/pipeline_workflow`, `release_workflow` and
 `workflows`): the order of the stages and their `needs`, the triggers of the called workflows, the single call of each,

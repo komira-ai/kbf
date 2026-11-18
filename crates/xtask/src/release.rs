@@ -53,7 +53,7 @@
 //! - `release plan --repo <owner/repo> --sha <sha>
 //!   [--repo-dir <checkout>]
 //!   [--freeze <text>] [--output <file>] [--gh <program>]` ([`plan`]): the next version
-//!   (`VERSION` and the release tags), the class of what changed since the last release (code, site, pipeline), and the
+//!   (`VERSION` and the release tags), the class of what changed since the last release (code, site), and the
 //!   refusals: a freeze, a base below an existing tag, a tag that diverged from the commit
 //!   ([`tags::placed`]); a commit the highest tag is after plans nothing (`code=false`).
 //!   Prints `key=value` lines and appends them to `--output`.

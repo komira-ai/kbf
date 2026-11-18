@@ -841,7 +841,7 @@ can create one. The jobs, each with the least token it needs:
 
 | job | does | scopes |
 |---|---|---|
-| `plan` | the next version from `VERSION` and the tags, and whether the push is code, the site or the pipeline itself (`release plan`, measured from the highest release tag that is an ancestor of the commit); the stop switch `RELEASE_FREEZE` is read here | `contents`, `actions`: read |
+| `plan` | the next version from `VERSION` and the tags, and whether the push is code or the site (`release plan`, measured from the highest release tag that is an ancestor of the commit); the stop switch `RELEASE_FREEZE` is read here | `contents`, `actions`: read |
 | `verify` | refuses a commit not on `main` and a run that is not the successful push run for it (`release locate`), checks the files of that run and every attestation (below), before anything is tagged | `contents`, `actions`, `attestations`: read |
 | `tag` | writes the Beta record and creates the annotated tag at the commit, create-only, with the release bot's token (`release verdict-write`, `release tag`) | `contents: read`; environment `release` |
 | `notes` | checks the tag (`release verify`), the identity of this release and of the one before it, and writes the notes | read |
@@ -849,10 +849,10 @@ can create one. The jobs, each with the least token it needs:
 | `bump` | opens the pull request in the internal repository that moves its submodule to the release (`release bump-internal`) | `contents: read`; environment `release` |
 Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (in the release workflow, `gamma` holds `id-token: write` for its network join, the apt read and write jobs for the cloud role they assume, and `deploy` for the docker-swarm-updater workflow it calls, and none of them signs anything; see [Releases](#releases)), and only
 
-Every job after `plan` runs only when `plan` says the push ships code and does not change the
-pipeline (`.github/`, `infra/`, `crates/xtask/` and the like): a push of docs only releases
-nothing and the run is green, and a push that changes the pipeline is released by the next one
-that does not. `tag`, `notes`, `publish`, `bump` and `gamma` also repeat the condition on the run that started the
+Every job after `plan` runs only when `plan` says the push ships code: a push of docs only
+releases nothing and the run is green. A push that changes the pipeline (`.github/`, `infra/`,
+`crates/xtask/` and the like) releases itself: the release follows that commit's own pipeline
+run, which passed, and runs `release.yml` as `main` has it (that commit, or a newer one). `tag`, `notes`, `publish`, `bump` and `gamma` also repeat the condition on the run that started the
 workflow (conclusion `success`, event `push`, branch `main`, this repository). The pipeline run is never cancelled
 and the newest waiting push queues behind it; `plan` measures from the highest release tag that is an ancestor of the
 commit, so the code of a push that was replaced while waiting is released with the next one. A commit that the highest tag is already after (a run that completes late) is a green no-op at `plan`, so the older run does not go red. No job runs after a red one (no `always()`, no

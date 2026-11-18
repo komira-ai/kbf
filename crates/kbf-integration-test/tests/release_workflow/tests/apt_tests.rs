@@ -442,11 +442,7 @@ fn the_conditions_of_the_apt_jobs_are_exact() {
         "the workflow uses `cancelled()`",
     );
     red(
-        &plant(
-            "deploy-tool",
-            " && needs.plan.outputs.pipeline != 'true'",
-            "",
-        ),
+        &plant("deploy-tool", " && needs.plan.outputs.code == 'true'", ""),
         "the job `deploy-tool` has `if:",
     );
     red(

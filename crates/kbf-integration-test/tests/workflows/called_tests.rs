@@ -126,7 +126,7 @@ fn the_deploy_condition_allows_the_oidc_token_and_nothing_else() {
             "CP_DEPLOY_TAILSCALE_TAGS != ''",
             "CP_DEPLOY_TAILSCALE_TAGS == ''",
         ),
-        DEPLOY_ONLY.replace(" && needs.plan.outputs.pipeline != 'true'", ""),
+        DEPLOY_ONLY.replace(" && needs.plan.outputs.code == 'true'", ""),
         "${{ vars.CP_DEPLOY_ENDPOINT != '' }}".to_owned(),
     ];
     for condition in loosened {

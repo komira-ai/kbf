@@ -14,8 +14,8 @@
 //!   directly or through another. Only `publish` holds a write scope (`contents`), `id-token` is
 //!   held by `gamma`, the apt read and write jobs and `deploy` alone ([`may_hold_id_token`]), and the
 //!   jobs that tag, publish, bump, run the gamma stage or build the tool of the apt jobs only
-//!   under [`RELEASE_IF`]: a successful pipeline run for a push to `main` of code that is not a
-//!   change to the pipeline (the apt jobs after the first add the clauses of
+//!   under [`RELEASE_IF`]: a successful pipeline run for a push to `main` of code, a change to
+//!   the pipeline included (the apt jobs after the first add the clauses of
 //!   `workflows::release_ifs`). The frontend's deploy runs under the same condition with its
 //!   endpoint set ([`deploy`]).
 //! - **Never cancelled, never queued behind a skipped run.** The concurrency group is `release`
@@ -118,14 +118,13 @@ const ENVIRONMENT: &str = "release";
 pub const COMMIT_EXPR: &str = "${{ github.event.workflow_run.head_sha }}";
 pub const RUN_EXPR: &str = "${{ github.event.workflow_run.id }}";
 
-/// The `if:` of `verify`: a push that ships code and does not change the pipeline.
-pub const VERIFY_IF: &str =
-    "${{ needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
+/// The `if:` of `verify`: a push that ships code.
+pub const VERIFY_IF: &str = "${{ needs.plan.outputs.code == 'true' }}";
 
 /// The `if:` of every job that tags, publishes or bumps: a successful pipeline run for a push to
-/// `main` (so a run that was cancelled, or red, writes nothing), of code, that is not a change
-/// to the release pipeline itself.
-pub const RELEASE_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
+/// `main` (so a run that was cancelled, or red, writes nothing), of code. A change to the release
+/// pipeline releases itself: the run that passed is that commit's own pipeline run.
+pub const RELEASE_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' }}";
 
 /// The `if:` of `plan`, which every other job needs: the run that started this one succeeded (so
 /// ci, the builds, the signing and the smoke did; suites.yml is another run, not waited for),
@@ -859,7 +858,7 @@ fn plan_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         flag_is(&words, verb, "--output", "$GITHUB_OUTPUT", out);
         env_is("plan", step, "FREEZE", "${{ vars.RELEASE_FREEZE }}", out);
         let id = step.id.as_deref().unwrap_or("");
-        for name in ["version", "tag", "code", "site", "pipeline"] {
+        for name in ["version", "tag", "code", "site"] {
             output_is(release, "plan", name, id, name, out)?;
         }
     }

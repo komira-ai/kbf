@@ -19,8 +19,8 @@ pub const SUITES: [&str; 2] = ["testing", "stable"];
 pub const ATTEMPTS: [u8; 3] = [1, 2, 3];
 
 /// The release's condition without its `${{ }}`: a successful run of the pipeline for a push to
-/// `main` of this repository, of code that is not a change to the pipeline.
-pub const RELEASE_BODY: &str = "github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true'";
+/// `main` of this repository, of code.
+pub const RELEASE_BODY: &str = "github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true'";
 
 /// The three jobs of a suite and attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

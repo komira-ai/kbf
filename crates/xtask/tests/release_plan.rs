@@ -349,7 +349,7 @@ fn a_commit_beside_the_highest_tag_or_one_github_cannot_compare_is_refused() {
 #[test]
 fn a_commit_behind_the_highest_tag_is_a_green_no_op() {
     // Catches: an older run that finished late going red (or releasing): a commit the
-    // highest tag is a descendant of plans code=false, site=false, pipeline=false, with the
+    // highest tag is a descendant of plans code=false and site=false, with the
     // exact lines in the output file and a line naming the superseding tag.
     let fx = fx("behind", "0.0\n");
     let sha = fx.commit(&[("crates/a/src/lib.rs", Some("a"))]);
@@ -358,7 +358,7 @@ fn a_commit_behind_the_highest_tag_is_a_green_no_op() {
     std::fs::write(&file, "earlier=line\n").expect("output");
     let (code, out, err) = fx.plan(&sha, &["--output", file.to_str().expect("utf-8")]);
     assert_eq!(code, Some(0), "{err}");
-    let keys = "version=0.0.4\ntag=v0.0.4\nreused=false\ncode=false\nsite=false\npipeline=false\n";
+    let keys = "version=0.0.4\ntag=v0.0.4\nreused=false\ncode=false\nsite=false\n";
     assert_eq!(
         out,
         format!(
@@ -389,7 +389,7 @@ fn a_commit_behind_a_release_of_a_higher_base_is_a_green_no_op_too() {
         out,
         format!(
             "superseded: {sha} is behind the release v0.1.2: nothing is released for it\n\
-             version=0.1.2\ntag=v0.1.2\nreused=false\ncode=false\nsite=false\npipeline=false\n"
+             version=0.1.2\ntag=v0.1.2\nreused=false\ncode=false\nsite=false\n"
         )
     );
 }
@@ -522,7 +522,7 @@ fn a_list_github_does_not_give_fails_the_run_rather_than_reading_as_empty() {
 }
 
 /// A change to a repository (`VERSION` is there already), and the class it must have.
-type Case = (&'static [(&'static str, &'static str)], [bool; 3]);
+type Case = (&'static [(&'static str, &'static str)], [bool; 2]);
 
 #[test]
 fn the_push_is_classified_by_the_files_it_changed() {
@@ -531,74 +531,60 @@ fn the_push_is_classified_by_the_files_it_changed() {
     // its old path, a path git would quote read wrong.
     let fx = fx("classify", "0.0\n");
     fx.github(&[], &[], &[]);
-    // (files written; [code, site, pipeline])
+    // (files written; [code, site]). The release machinery (`.github/`, `infra/`,
+    // `crates/xtask/`, the toolchain and lock files) is classified like any other path.
     let cases: &[Case] = &[
-        (&[("README.md", "x")], [false, false, false]),
-        (&[("crates/a/README.md", "x")], [true, false, false]),
-        (&[("crates/a/docs/x.md", "x")], [true, false, false]),
-        (&[("docs/a.txt", "x")], [false, true, false]),
-        (&[("docs/b.md", "x")], [false, true, false]),
-        (&[("site/index.html", "x")], [false, true, false]),
-        (&[(".github/CODEOWNERS", "x")], [false, false, true]),
-        (
-            &[(".github/actions/a/action.yml", "x")],
-            [false, false, true],
-        ),
-        (&[(".github/dependabot.yml", "x")], [false, false, true]),
-        (&[(".github/workflows/ci.yml", "x")], [false, false, true]),
-        (&[("infra/site/main.ts", "x")], [false, false, true]),
-        (&[("infra/other/main.ts", "x")], [false, false, true]),
-        (&[("crates/xtask/Cargo.toml", "x")], [true, false, true]),
-        (
-            &[("crates/xtask/tests/golden/a.txt", "x")],
-            [true, false, true],
-        ),
-        (&[("crates/kbf-gate/src/lib.rs", "x")], [true, false, true]),
-        (&[(".config/nextest.toml", "x")], [true, false, true]),
-        (&[("rust-toolchain.toml", "x")], [true, false, true]),
-        (&[("deny.toml", "x")], [true, false, true]),
-        (&[("Cargo.lock", "x")], [true, false, true]),
-        (&[(".cargo/config.toml", "x")], [true, false, true]),
-        (&[("crates/a/Cargo.toml", "x")], [true, false, false]),
-        (&[("crates/a/src/lib.rs", "x")], [true, false, false]),
-        (&[("src/docs/x.rs", "x")], [true, false, false]),
-        (&[("src/site/x.rs", "x")], [true, false, false]),
-        (&[("VERSION", "0.1\n")], [true, false, false]),
-        (&[("crates/xtask/src/release.rs", "x")], [true, false, true]),
-        (
-            &[("crates/xtask/src/release/plan.rs", "x")],
-            [true, false, true],
-        ),
-        (&[("crates/xtask/src/lib.rs", "x")], [true, false, true]),
-        (
-            &[("crates/xtask/tests/release.rs", "x")],
-            [true, false, true],
-        ),
-        (&[("notes.md.txt", "x")], [true, false, false]),
+        (&[("README.md", "x")], [false, false]),
+        (&[("crates/a/README.md", "x")], [true, false]),
+        (&[("crates/a/docs/x.md", "x")], [true, false]),
+        (&[("docs/a.txt", "x")], [false, true]),
+        (&[("docs/b.md", "x")], [false, true]),
+        (&[("site/index.html", "x")], [false, true]),
+        (&[(".github/CODEOWNERS", "x")], [false, false]),
+        (&[(".github/actions/a/action.yml", "x")], [false, false]),
+        (&[(".github/dependabot.yml", "x")], [false, false]),
+        (&[(".github/workflows/ci.yml", "x")], [false, false]),
+        (&[("infra/site/main.ts", "x")], [false, false]),
+        (&[("infra/other/main.ts", "x")], [false, false]),
+        (&[("crates/xtask/Cargo.toml", "x")], [true, false]),
+        (&[("crates/xtask/tests/golden/a.txt", "x")], [true, false]),
+        (&[("crates/kbf-gate/src/lib.rs", "x")], [true, false]),
+        (&[(".config/nextest.toml", "x")], [true, false]),
+        (&[("rust-toolchain.toml", "x")], [true, false]),
+        (&[("deny.toml", "x")], [true, false]),
+        (&[("Cargo.lock", "x")], [true, false]),
+        (&[(".cargo/config.toml", "x")], [true, false]),
+        (&[("crates/a/Cargo.toml", "x")], [true, false]),
+        (&[("crates/a/src/lib.rs", "x")], [true, false]),
+        (&[("src/docs/x.rs", "x")], [true, false]),
+        (&[("src/site/x.rs", "x")], [true, false]),
+        (&[("VERSION", "0.1\n")], [true, false]),
+        (&[("crates/xtask/src/release.rs", "x")], [true, false]),
+        (&[("crates/xtask/src/release/plan.rs", "x")], [true, false]),
+        (&[("crates/xtask/src/lib.rs", "x")], [true, false]),
+        (&[("crates/xtask/tests/release.rs", "x")], [true, false]),
+        (&[("notes.md.txt", "x")], [true, false]),
         (
             &[("README.md", "y"), ("crates/a/src/lib.rs", "y")],
-            [true, false, false],
+            [true, false],
         ),
-        (
-            &[("README.md", "z"), ("docs/a.txt", "z")],
-            [false, true, false],
-        ),
+        (&[("README.md", "z"), ("docs/a.txt", "z")], [false, true]),
         (
             &[("docs/a.txt", "z"), ("site/index.html", "z")],
-            [false, true, false],
+            [false, true],
         ),
         (
             &[
                 (".github/workflows/ci.yml", "y"),
                 ("crates/a/src/lib.rs", "z"),
             ],
-            [true, false, true],
+            [true, false],
         ),
-        (&[("src/my file.rs", "x")], [true, false, false]),
-        (&[("docs/\u{e9}t\u{e9}.txt", "x")], [false, true, false]),
-        (&[("src/\u{e9}t\u{e9}.rs", "x")], [true, false, false]),
+        (&[("src/my file.rs", "x")], [true, false]),
+        (&[("docs/\u{e9}t\u{e9}.txt", "x")], [false, true]),
+        (&[("src/\u{e9}t\u{e9}.rs", "x")], [true, false]),
     ];
-    for (i, (files, [code, site, pipeline])) in cases.iter().enumerate() {
+    for (i, (files, [code, site])) in cases.iter().enumerate() {
         // The release before this case: only what the case changes is in the range.
         fx.tag(&format!("v0.0.{}", i + 1), "HEAD");
         // Each case writes contents no earlier case did, so every file it names changes.
@@ -610,12 +596,8 @@ fn the_push_is_classified_by_the_files_it_changed() {
         let sha = fx.commit(&files);
         let (status, out, err) = fx.plan(&sha, &[]);
         assert_eq!(status, Some(0), "{files:?}: {err}");
-        let got = [
-            value(&out, "code"),
-            value(&out, "site"),
-            value(&out, "pipeline"),
-        ];
-        let want = [code, site, pipeline].map(|b| b.to_string());
+        let got = [value(&out, "code"), value(&out, "site")];
+        let want = [code, site].map(|b| b.to_string());
         assert_eq!(got.map(str::to_owned), want, "{files:?}");
     }
 }
@@ -646,34 +628,20 @@ fn a_push_that_changed_no_file_is_neither_code_nor_site() {
     let sha = fx.commit(&[]);
     let (code, out, err) = fx.plan(&sha, &[]);
     assert_eq!(code, Some(0), "{err}");
-    assert_eq!(
-        [
-            value(&out, "code"),
-            value(&out, "site"),
-            value(&out, "pipeline")
-        ],
-        ["false"; 3]
-    );
+    assert_eq!([value(&out, "code"), value(&out, "site")], ["false"; 2]);
 }
 
 #[test]
 fn with_no_release_tag_the_first_release_is_everything() {
     // Catches: a first release measured over the last commit only (here docs), which
-    // would release nothing, or a first release read as a change to the pipeline.
+    // would release nothing.
     let fx = fx("first", "0.0\n");
     fx.github(&[], &[], &[]);
     fx.commit(&[("crates/a/src/lib.rs", Some("x"))]);
     fx.commit(&[("README.md", Some("x"))]);
     let (code, out, err) = fx.plan_head();
     assert_eq!(code, Some(0), "{err}");
-    assert_eq!(
-        [
-            value(&out, "code"),
-            value(&out, "site"),
-            value(&out, "pipeline")
-        ],
-        ["true", "true", "false"]
-    );
+    assert_eq!([value(&out, "code"), value(&out, "site")], ["true", "true"]);
 }
 
 #[test]
@@ -705,12 +673,8 @@ fn only_docs_since_the_last_tag_releases_nothing() {
     let (code, out, err) = fx.plan_head();
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(
-        [
-            value(&out, "code"),
-            value(&out, "site"),
-            value(&out, "pipeline")
-        ],
-        ["false", "true", "false"]
+        [value(&out, "code"), value(&out, "site")],
+        ["false", "true"]
     );
 }
 
@@ -749,21 +713,58 @@ fn a_rerun_of_the_tagged_commit_is_measured_over_the_release_before_it() {
 }
 
 #[test]
-fn the_pipeline_flag_is_the_commits_own_change_not_the_range() {
-    // Catches: a pipeline file anywhere since the last tag blocking every later release
-    // (it stays in the range until a release clears it, and none is made); and the
-    // reverse, the head commit's own pipeline change not blocking.
-    let fx = fx("pipeline-own", "0.0\n");
+fn a_commit_that_changes_the_pipeline_releases_itself() {
+    // Catches: a commit that changes the release machinery held back for a later commit,
+    // as the commit alone (xtask, the lock file, the toolchain, xtask's own goldens) and
+    // as the head of a range whose earlier commit changed a workflow; and a pipeline
+    // change read as the site. The plan has no key that holds a release back.
+    let fx = fx("pipeline-releases", "0.0\n");
+    fx.github(&[], &[], &[]);
+    let alone: &[&[(&str, Option<&str>)]] = &[
+        &[("crates/xtask/src/release/plan.rs", Some("a"))],
+        &[("crates/kbf-gate/src/lib.rs", Some("a"))],
+        &[("Cargo.lock", Some("a"))],
+        &[("rust-toolchain.toml", Some("a"))],
+        &[("crates/xtask/tests/golden/release-plan.txt", Some("a"))],
+        &[
+            (".github/workflows/release.yml", Some("a")),
+            ("crates/xtask/src/release/plan.rs", Some("b")),
+        ],
+    ];
+    for (i, files) in alone.iter().enumerate() {
+        fx.tag(&format!("v0.0.{}", i + 1), "HEAD");
+        let sha = fx.commit(files);
+        let (status, out, err) = fx.plan(&sha, &[]);
+        assert_eq!(status, Some(0), "{files:?}: {err}");
+        assert_eq!(
+            out,
+            format!("version=0.0.1\ntag=v0.0.1\nreused=false\ncode=true\nsite=false\n"),
+            "{files:?}"
+        );
+    }
+    fx.tag("v0.0.9", "HEAD");
+    fx.commit(&[(".github/workflows/release.yml", Some("c"))]);
+    let sha = fx.commit(&[("crates/xtask/src/lib.rs", Some("c"))]);
+    let (status, out, err) = fx.plan(&sha, &[]);
+    assert_eq!(status, Some(0), "{err}");
+    assert_eq!(
+        out,
+        "version=0.0.1\ntag=v0.0.1\nreused=false\ncode=true\nsite=false\n"
+    );
+}
+
+#[test]
+fn a_change_to_the_workflows_alone_ships_nothing() {
+    // Catches: a range of workflow and infra files only read as code, which would burn a
+    // version on a release whose files are the same as the last one.
+    let fx = fx("workflows-only", "0.0\n");
     fx.github(&[], &[], &[]);
     fx.tag("v0.0.1", "HEAD");
-    fx.commit(&[(".github/workflows/x.yml", Some("x"))]);
-    let sha = fx.commit(&[("crates/a/src/lib.rs", Some("x"))]);
-    let (_, out, err) = fx.plan(&sha, &[]);
-    assert_eq!(value(&out, "pipeline"), "false", "{out}{err}");
-    assert_eq!(value(&out, "code"), "true");
-    let sha = fx.commit(&[("crates/a/src/lib.rs", Some("y")), ("deny.toml", Some("y"))]);
-    let (_, out, err) = fx.plan(&sha, &[]);
-    assert_eq!(value(&out, "pipeline"), "true", "{out}{err}");
+    fx.commit(&[(".github/workflows/release.yml", Some("a"))]);
+    let sha = fx.commit(&[("infra/site/main.ts", Some("a"))]);
+    let (status, out, err) = fx.plan(&sha, &[]);
+    assert_eq!(status, Some(0), "{err}");
+    assert_eq!([value(&out, "code"), value(&out, "site")], ["false"; 2]);
 }
 
 #[test]

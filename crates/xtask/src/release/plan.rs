@@ -10,7 +10,7 @@
 //! 4. Rule S ([`tags::placed`]): the highest release tag names `--sha` or an ancestor of it.
 //!    A tag that is a descendant of `--sha` (an older run that finished after a newer commit
 //!    was released) is not a refusal: the plan prints that the commit is superseded by the
-//!    tag and writes `code=false`, `site=false` and `pipeline=false`, so the release
+//!    tag and writes `code=false` and `site=false`, so the release
 //!    workflow's jobs all skip and the run is green. A tag that diverged from `--sha` refuses.
 //!    `release tag` and `release publish` refuse a superseded commit all the same.
 //!
@@ -24,26 +24,25 @@
 //!   `.github/**`, `site/**`, `infra/**` (a `.md` under `crates/` is code: it may be
 //!   `include_str!`ed). `VERSION` is code (a bump releases). A mixed range is code.
 //! - `site`: some file is under `site/` or `docs/`, which kbf.dev renders.
-//! - `pipeline`: some file the commit `--sha` itself changed (over its first parent) is the
-//!   release machinery or what it trusts (`.github/`, `infra/`, `crates/xtask/`,
-//!   `crates/kbf-gate/`, `.config/`, `.cargo/`, `rust-toolchain*`, `deny.toml`,
-//!   `Cargo.lock`): the pipeline does not release a commit that changes it; the next
-//!   commit that does not releases both. It is the commit's own change and not the range's:
-//!   a range keeps a pipeline file until a release clears it, and none would be made.
-//!   Classes are not exclusive: such a file under `crates/` is code too.
+//!
+//! A commit that changes the release machinery (`.github/`, `infra/`, `crates/xtask/`,
+//! `crates/kbf-gate/`, the toolchain and lock files) is classified like any other: when it
+//! ships code it releases itself. The release workflow runs only after that commit's own
+//! pipeline run passed, and holding it for a later commit would add no check (that release
+//! would run the same machinery), only a delay.
 //!
 //! Because the range runs from the last release and not from the push, a push that a newer
 //! push superseded or queued behind is released with the next, and a docs-only push after
 //! code releases that code. With no release tag yet, the first release is all of it
 //! (`code=true`, `site=true`). A range with no changed file is not code, and not a site.
 //!
-//! Prints `version`, `tag`, `reused`, `code`, `site` and `pipeline` as `key=value` lines,
+//! Prints `version`, `tag`, `reused`, `code` and `site` as `key=value` lines,
 //! and appends them to `--output` (on Actions, `GITHUB_OUTPUT`).
 
 use std::path::{Path, PathBuf};
 
 use super::append_output;
-use super::git::{commit_of, git, git_output, is_ancestor, release_tags};
+use super::git::{commit_of, git, is_ancestor, release_tags};
 use super::tags::{self, Base, Placed, Standing, Version};
 use crate::Error;
 use crate::build_commit::full_commit;
@@ -77,7 +76,6 @@ pub struct PlanArgs {
 pub struct Class {
     pub code: bool,
     pub site: bool,
-    pub pipeline: bool,
 }
 
 /// A path that ships in no release. A markdown file under `crates/` may be
@@ -89,26 +87,6 @@ fn ships_nothing(path: &str) -> bool {
             .any(|dir| path.starts_with(dir))
 }
 
-/// The release machinery and what it trusts: the workflows and every other file under
-/// `.github/` and `infra/`, all of `crates/xtask/` and `crates/kbf-gate/` (the record
-/// and the notes use them), and the toolchain, dependency and policy files. Fail closed:
-/// a push that touches one never releases itself.
-fn is_pipeline(path: &str) -> bool {
-    [
-        ".github/",
-        "infra/",
-        "crates/xtask/",
-        "crates/kbf-gate/",
-        ".config/",
-        ".cargo/",
-        "rust-toolchain",
-        "deny.toml",
-        "Cargo.lock",
-    ]
-    .iter()
-    .any(|prefix| path.starts_with(prefix))
-}
-
 /// The class of a push that changed exactly `paths`.
 pub fn classify(paths: &[String]) -> Class {
     Class {
@@ -116,7 +94,6 @@ pub fn classify(paths: &[String]) -> Class {
         site: paths
             .iter()
             .any(|p| p.starts_with("site/") || p.starts_with("docs/")),
-        pipeline: paths.iter().any(|p| is_pipeline(p)),
     }
 }
 
@@ -153,20 +130,8 @@ fn base_tag(repo_dir: &Path, sha: &str) -> Result<Option<String>, Error> {
     Ok(best.map(|(_, tag)| tag))
 }
 
-/// The files `sha` itself changed over its first parent: none for a root commit.
-fn own_change(repo_dir: &Path, sha: &str) -> Result<Vec<String>, Error> {
-    let probe = format!("{sha}^1^{{commit}}");
-    if !git_output(repo_dir, &["rev-parse", "--verify", "--quiet", &probe])?
-        .status
-        .success()
-    {
-        return Ok(Vec::new());
-    }
-    changed(repo_dir, &format!("{sha}^1"), sha)
-}
-
 /// The plan of a commit that the highest release tag `top` is a descendant of: it says so
-/// and releases nothing (`code`, `site` and `pipeline` false). `version` and `tag` are
+/// and releases nothing (`code` and `site` false). `version` and `tag` are
 /// `top`'s, the release that stands.
 fn superseded_plan(a: &PlanArgs, top: Version) -> Result<Vec<String>, Error> {
     let lines = vec![
@@ -180,7 +145,6 @@ fn superseded_plan(a: &PlanArgs, top: Version) -> Result<Vec<String>, Error> {
         "reused=false".to_owned(),
         "code=false".to_owned(),
         "site=false".to_owned(),
-        "pipeline=false".to_owned(),
     ];
     if let Some(output) = &a.output {
         append_output(output, &lines[1..])?;
@@ -235,18 +199,13 @@ pub fn run(a: &PlanArgs) -> Result<Vec<String>, Error> {
     };
     // Code and site over everything since the highest release tag, so the code of a
     // push that was superseded or queued is in the next release; with no tag yet, over
-    // everything. The pipeline flag is the commit's own change (see the module doc).
-    let (code, site) = match base_tag(&a.repo_dir, &a.sha)? {
-        None => (true, true),
-        Some(tag) => {
-            let class = classify(&changed(&a.repo_dir, &format!("refs/tags/{tag}"), &a.sha)?);
-            (class.code, class.site)
-        }
-    };
-    let class = Class {
-        code,
-        site,
-        pipeline: classify(&own_change(&a.repo_dir, &a.sha)?).pipeline,
+    // everything.
+    let class = match base_tag(&a.repo_dir, &a.sha)? {
+        None => Class {
+            code: true,
+            site: true,
+        },
+        Some(tag) => classify(&changed(&a.repo_dir, &format!("refs/tags/{tag}"), &a.sha)?),
     };
     let lines = vec![
         format!("version={version}"),
@@ -254,7 +213,6 @@ pub fn run(a: &PlanArgs) -> Result<Vec<String>, Error> {
         format!("reused={reused}"),
         format!("code={}", class.code),
         format!("site={}", class.site),
-        format!("pipeline={}", class.pipeline),
     ];
     if let Some(output) = &a.output {
         append_output(output, &lines)?;

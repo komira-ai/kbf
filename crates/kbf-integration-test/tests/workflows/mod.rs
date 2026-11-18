@@ -25,7 +25,7 @@
 //!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
 //!   exactly [`RELEASE_PUSH_ONLY`]. So no pull request or merge-queue run holds a
 //!   token that can sign an attestation, every attestation this repository signs names
-//!   `refs/heads/main`, and only the successful pipeline run of a push to `main` of code (never of the pipeline itself) runs a job that can create a release
+//!   `refs/heads/main`, and only the successful pipeline run of a push to `main` of code runs a job that can create a release
 //!   (or push to the repository), and `issues` ([`ISSUE_SCOPES`]), which may be `write`
 //!   only in a job whose `if:` is exactly [`ISSUES_MAIN_ONLY`] (the advisories workflow
 //!   keeps one issue) or exactly [`ISSUES_RELEASE_RED`] (the `release-red` job of `suites.yml`,
@@ -191,9 +191,9 @@ const RELEASE_SCOPES: &[&str] = &["contents"];
 
 /// The one `if:` spelling under which a job may hold [`RELEASE_SCOPES`] for writing: the
 /// successful run of the pipeline for a push to `main` of this repository (never a pull
-/// request, a tag, or a run that was cancelled or red), of code, that is not a change to the
-/// release pipeline itself (`release plan` outputs, read through the job's `needs`).
-const RELEASE_PUSH_ONLY: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}";
+/// request, a tag, or a run that was cancelled or red), of code (the `release plan` output,
+/// read through the job's `needs`).
+const RELEASE_PUSH_ONLY: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' }}";
 
 /// Token scopes a job may set to `write` when it runs only on `main`'s ref: the issues
 /// API, which the advisories workflow uses to open, update and close its one issue.

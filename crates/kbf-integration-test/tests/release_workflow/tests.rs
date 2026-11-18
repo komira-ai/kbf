@@ -311,7 +311,7 @@ fn only_publish_writes_and_no_job_signs() {
 #[test]
 fn the_jobs_that_write_run_only_for_a_successful_pipeline_run_that_releases() {
     // Catches: a release of a pipeline run that was cancelled or red, of a pull request's run,
-    // of another branch or repository; a release of docs only or of the pipeline itself.
+    // of another branch or repository; a release of docs only.
     // Each clause of the condition of each writing job dropped in turn, the condition widened,
     // or the condition dropped.
     for job in ["tag", "notes", "publish", "bump"] {
@@ -325,7 +325,6 @@ fn the_jobs_that_write_run_only_for_a_successful_pipeline_run_that_releases() {
             &format!("the job `{job}` has `if:"),
         );
         for clause in [
-            " && needs.plan.outputs.pipeline != 'true'",
             " && needs.plan.outputs.code == 'true'",
             "github.event.workflow_run.conclusion == 'success' && ",
             "github.event.workflow_run.event == 'push' && ",
@@ -636,7 +635,7 @@ fn the_plan_job_sees_the_history_and_the_freeze_and_hands_on_the_class() {
         &plant("plan", "FREEZE: ${{ vars.RELEASE_FREEZE }}", "FREEZE: ''"),
         "does not set `FREEZE:",
     );
-    for name in ["version", "tag", "code", "site", "pipeline"] {
+    for name in ["version", "tag", "code", "site"] {
         let line = format!("      {name}: ${{{{ steps.plan.outputs.{name} }}}}\n");
         red(
             &plant("plan", &line, ""),
@@ -1311,7 +1310,7 @@ fn the_rehearsals_run_after_publish_read_only_under_the_release_condition() {
             &format!("the job `{job}` holds `id-token: write`"),
         );
         red(
-            &plant(job, " && needs.plan.outputs.pipeline != 'true' }}", " }}"),
+            &plant(job, " && needs.plan.outputs.code == 'true' }}", " }}"),
             job,
         );
     }
@@ -1387,8 +1386,8 @@ fn gamma_runs_after_publish_with_the_run_token_and_no_write_scope() {
     red(
         &plant(
             "gamma",
-            "needs.plan.outputs.pipeline != 'true' }}",
-            "needs.plan.outputs.pipeline != 'false' }}",
+            "needs.plan.outputs.code == 'true' }}",
+            "needs.plan.outputs.code == 'false' }}",
         ),
         "the job `gamma` has `if:",
     );
