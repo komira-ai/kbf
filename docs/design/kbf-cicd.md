@@ -736,6 +736,11 @@ directory and rebuilds from segment footers). A release containing either is fla
 notes carry it, an automatic rollback (Planned) would be off for it, and the contract step ships one release after the expand
 step, never in it.
 
+The notes also carry a "Config migration" section under "Before you click": the flags the release's `kbf --version --json`
+lists as `removed_flags` that the previous release's did not, read from the two builds' identities like the rest of the
+section, for the operator to delete from each frontend's config file before the release starts (all of the release's,
+with a line saying so, when the previous release prints no such list).
+
 ## 9. N/N-1 compatibility in CI
 
 Nodes are updated asynchronously, so every pair of adjacent releases must work together in both directions for as long as a

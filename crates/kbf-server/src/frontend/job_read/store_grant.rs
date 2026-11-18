@@ -13,7 +13,7 @@ use clap::Arg;
 use clap::builder::ValueParser;
 
 /// The flags, by long name.
-pub(super) const REMOVED: [&str; 3] = [
+pub(in crate::frontend) const REMOVED: [&str; 3] = [
     "job-store-grant-key-file",
     "job-store-url",
     "job-store-bucket",
@@ -21,7 +21,7 @@ pub(super) const REMOVED: [&str; 3] = [
 
 /// What a start that gives one of the flags is told, after clap's `invalid value ... for
 /// '--<flag> <VALUE>'`, which names the flag.
-pub(super) const REMOVED_WHY: &str = "the flag was removed: tierstore v0.3.29 removed the store \
+pub(in crate::frontend) const REMOVED_WHY: &str = "the flag was removed: tierstore v0.3.29 removed the store \
      read grants it configured, so `GET /locate` hands out none and a task reads every blob from \
      the job listener; delete the flag";
 

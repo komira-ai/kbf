@@ -5,6 +5,10 @@
 
 use kbf_installer::binary::Version;
 
+/// The fields of the line that only `release notes` reads: the installer's `Version` does not
+/// hold them and ignores them.
+const NOT_READ_BY_THE_INSTALLER: [&str; 1] = ["removed_flags"];
+
 /// Catches a field added to `kbf --version --json` that the installer's `Version` does
 /// not know (`admin_protocol` was, from the day it was emitted: every real release was
 /// refused at staging), and a field the parser accepts but drops. Every key kbf emits
@@ -40,15 +44,28 @@ fn the_installer_parses_what_kbf_prints() {
     assert_eq!(parsed.profile, text("profile"));
     assert_eq!(parsed.version, text("version"));
     // Every key kbf emits is one `Version` holds (`Debug` names each field it has), so a
-    // new key cannot be added here without a typed line above.
+    // new key cannot be added here without a typed line above, except a key the installer has
+    // no use for: it ignores it, which the parse above shows.
     let held = format!("{parsed:?}");
-    for key in said.as_object().expect("an object").keys() {
+    for key in said
+        .as_object()
+        .expect("an object")
+        .keys()
+        .filter(|key| !NOT_READ_BY_THE_INSTALLER.contains(&key.as_str()))
+    {
         assert!(
             held.contains(&format!("{key}: ")),
             "Version holds no {key}: {held}"
         );
     }
     assert_eq!(parsed.platform, None);
+    for key in NOT_READ_BY_THE_INSTALLER {
+        assert!(said.get(key).is_some(), "{key} is no longer printed");
+        assert!(
+            !held.contains(&format!("{key}: ")),
+            "{key} is read now: {held}"
+        );
+    }
 }
 
 /// The installer rolls a `bundled` host back only to a `kbf` that declares the relay

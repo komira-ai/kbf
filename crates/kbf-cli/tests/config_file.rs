@@ -21,6 +21,9 @@ fn scratch(name: &str) -> TestDir {
     TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("config-file-{name}"))
 }
 
+/// What clap adds after the message of a refused file.
+const USAGE_TAIL: &str = "\nUsage: kbf [OPTIONS]\n\nFor more information, try '--help'.\n";
+
 /// A file named `kbf.toml` in `dir` holding `text`, with permission bits `mode`.
 fn file(dir: &Path, text: &str, mode: u32) -> PathBuf {
     let path = dir.join("kbf.toml");
@@ -393,15 +396,18 @@ fn a_removed_store_grant_key_is_refused_naming_the_tierstore_release() {
         let err =
             kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None).expect_err(key);
         assert_eq!(err.exit_code(), 2, "{key}");
-        let msg = err.to_string();
-        assert!(
-            msg.contains(&format!(
-                "invalid value '{value}' for '--{key} <VALUE>': the flag was removed: tierstore \
-                 v0.3.29 removed the store read grants it configured, so `GET /locate` hands out \
-                 none and a task reads every blob from the job listener; delete the flag"
-            )),
-            "{key}: {msg}"
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "error: kbf frontend: removed key `job-read.{key}` in {}: the flag was removed: \
+                 tierstore v0.3.29 removed the store read grants it configured, so `GET /locate` \
+                 hands out none and a task reads every blob from the job listener; delete the \
+                 flag\n{USAGE_TAIL}",
+                path.display()
+            ),
+            "{key}"
         );
+        let _ = value;
     }
 }
 
@@ -558,16 +564,132 @@ fn a_removed_presigned_path_key_is_refused_naming_the_release() {
             kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None).expect_err(key);
         assert_eq!(err.exit_code(), 2, "{key}");
         let msg = err.to_string();
-        let shown = value.trim_matches('"');
+        let line = format!(
+            "error: kbf frontend: removed key `executor.{key}` in {}: ",
+            path.display()
+        );
+        let why = msg
+            .strip_prefix(&line)
+            .unwrap_or_else(|| panic!("{key}: {msg}"));
         assert!(
-            msg.contains(&format!(
-                "invalid value '{shown}' for '--{key} <VALUE>': the flag was removed in this \
-                 release (kbf-server "
-            )),
+            why.starts_with("the flag was removed in this release (kbf-server ")
+                && why.ends_with(&format!(
+                    "with the executor's presigned path, the only code that read it: a \
+                     put-directory job is given no secret and no network; delete the flag\n\
+                     {USAGE_TAIL}"
+                )),
             "{key}: {msg}"
         );
-        assert!(msg.contains("delete the flag"), "{key}: {msg}");
+        let _ = value;
     }
+}
+
+/// The reason a removed flag's refusal gives, as the frontend's list holds it.
+fn why(flag: &str) -> &'static str {
+    kbf_server::frontend::removed::flags()
+        .find(|(name, _)| *name == flag)
+        .map(|(_, why)| why)
+        .unwrap_or_else(|| panic!("{flag} is not a removed flag"))
+}
+
+/// Catches a file with several removed keys refused one at a time (the first flag clap meets):
+/// a frontend file holding five removed keys from the three removed sets, three of them in one
+/// table, is refused once, with one line per key naming the file, the table, the key and the
+/// reason of its set, in the order of the file's tables and keys.
+#[test]
+fn a_file_with_several_removed_keys_is_refused_naming_every_one() {
+    let dir = scratch("several-removed");
+    let body = format!(
+        "{FRONTEND_FILE}\n[executor]\nexecutor-secret-delivery = \"argv\"\n\
+         executor-allow-plain-http-put = true\nexecutor-allow-plain-http-grant = false\n\n\
+         [task-runs]\ntask-put-bucket = \"b\"\n\n[job-read]\njob-store-url = \"https://s:1\"\n"
+    );
+    let path = file(&dir, &body, 0o600);
+    let err =
+        kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None).expect_err("refused");
+    assert_eq!(err.exit_code(), 2);
+    let f = path.display();
+    let line = |table: &str, key: &str| format!("removed key `{table}.{key}` in {f}: {}", why(key));
+    let lines = [
+        line("executor", "executor-allow-plain-http-grant"),
+        line("executor", "executor-allow-plain-http-put"),
+        line("executor", "executor-secret-delivery"),
+        line("job-read", "job-store-url"),
+        line("task-runs", "task-put-bucket"),
+    ];
+    assert_eq!(
+        err.to_string(),
+        format!("error: kbf frontend: {}\n{USAGE_TAIL}", lines.join("\n"))
+    );
+}
+
+/// Catches a removed key hiding the other problems of the file: a removed key, an unknown key
+/// and a removed key in a table that is not its own are all named in one refusal.
+#[test]
+fn a_removed_key_is_named_with_the_other_problems_of_the_file() {
+    let dir = scratch("removed-and-unknown");
+    let body = format!(
+        "{FRONTEND_FILE}\n[executor]\nexecutor-locate = false\nbogus = 1\n\n[log]\njob-store-bucket = \"t\"\n"
+    );
+    let path = file(&dir, &body, 0o600);
+    let err =
+        kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None).expect_err("refused");
+    let f = path.display();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "error: kbf frontend: unknown key `executor.bogus` in {f}: kbf has no flag --bogus in this mode\n\
+             removed key `executor.executor-locate` in {f}: {}\n\
+             removed key `log.job-store-bucket` in {f}: {}\n{USAGE_TAIL}",
+            why("executor-locate"),
+            why("job-store-bucket"),
+        )
+    );
+}
+
+/// Catches the file's removed-key line replacing the command line's refusal: a removed flag
+/// given on the command line is refused by clap, naming the flag and its value, as before.
+#[test]
+fn a_removed_flag_on_the_command_line_is_refused_by_clap() {
+    let err = kbf_cli::parse_with(
+        argv(
+            &[
+                "kbf",
+                "frontend",
+                "--storage=http://127.0.0.1:1",
+                "--executor-secret-delivery=argv",
+            ],
+            None,
+        ),
+        None,
+    )
+    .expect_err("refused");
+    assert_eq!(err.exit_code(), 2);
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with(&format!(
+            "error: invalid value 'argv' for '--executor-secret-delivery <VALUE>': {}",
+            why("executor-secret-delivery")
+        )),
+        "{msg}"
+    );
+    assert!(!msg.contains("removed key"), "{msg}");
+}
+
+/// Catches the removed keys of the frontend reaching a storage node: a storage node's file with
+/// one is refused as an unknown key, not as a removed one.
+#[test]
+fn a_storage_file_with_a_frontends_removed_key_is_an_unknown_key() {
+    let dir = scratch("storage-removed");
+    let path = file(&dir, "[executor]\nexecutor-locate = false\n", 0o600);
+    let err =
+        kbf_cli::parse_with(argv(&["kbf", "storage"], Some(&path)), None).expect_err("refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown key `executor.executor-locate`"),
+        "{msg}"
+    );
+    assert!(!msg.contains("removed key"), "{msg}");
 }
 
 /// Catches a golden whose keys the loader would refuse (a template that is not a config):
@@ -737,6 +859,7 @@ fn small_args(text: &str, name: &str) -> Result<Vec<OsString>, String> {
     config::file_args(
         &small_command(),
         &std::collections::BTreeSet::new(),
+        &std::collections::BTreeMap::new(),
         &path,
         &std::collections::BTreeSet::new(),
     )
@@ -753,6 +876,7 @@ fn a_file_that_is_not_text_is_refused() {
     let err = config::file_args(
         &small_command(),
         &std::collections::BTreeSet::new(),
+        &std::collections::BTreeMap::new(),
         &path,
         &std::collections::BTreeSet::new(),
     )

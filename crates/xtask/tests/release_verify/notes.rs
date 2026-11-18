@@ -803,3 +803,152 @@ fn notes_that_cannot_be_written_fail() {
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("write "), "{err}");
 }
+
+/// An identity of the build of `commit` that names `removed` as its `removed_flags`, or has no
+/// such field when `removed` is `None` (a build before it).
+fn identity_removing(commit: &str, removed: Option<serde_json::Value>) -> String {
+    let mut v: serde_json::Value =
+        serde_json::from_str(&identity(commit, Some(3), Some(1))).unwrap();
+    if let Some(r) = removed {
+        v["removed_flags"] = r;
+    }
+    v.to_string()
+}
+
+/// The `### Config migration` section of the notes of a release built with `cur` after a
+/// previous release (`v0.9.0`) built with `prev`, whole.
+fn migration_section(
+    name: &str,
+    cur: serde_json::Value,
+    prev: Option<serde_json::Value>,
+) -> String {
+    let fx = with_notes(name, |_| {});
+    let ((code, o, err), out) = notes_run(
+        &fx,
+        &identity_removing(RELEASE, Some(cur)),
+        Some(&identity_removing(&fx.first, prev)),
+    );
+    assert_eq!(code, Some(0), "{o}{err}");
+    let notes = std::fs::read_to_string(out).unwrap();
+    let start = notes.find("### Config migration").expect("a section");
+    let rest = &notes[start..];
+    rest[..rest.find("\n### Waivers").expect("followed by waivers")].to_owned()
+}
+
+const DELETE_HEAD: &str =
+    "- delete these keys from every frontend's config file (--config) before this release starts: ";
+const DELETE_TAIL: &str = "; `kbf --mode=frontend --check --config FILE` with this release names every one a file still holds";
+
+/// Catches the section listing every removed flag of the release, or the ones the previous
+/// release refused too, or in the order the identity wrote them: only the flags the new build
+/// names and the previous build did not are listed, sorted.
+#[test]
+fn the_config_migration_lists_the_flags_this_release_adds_sorted() {
+    let section = migration_section(
+        "migration-new",
+        serde_json::json!(["zeta-flag", "old-flag", "alpha-flag"]),
+        Some(serde_json::json!(["old-flag", "gone-flag"])),
+    );
+    assert_eq!(
+        section,
+        format!("### Config migration\n\n{DELETE_HEAD}`alpha-flag`, `zeta-flag`{DELETE_TAIL}\n")
+    );
+}
+
+/// Catches a section that lists something, or says nothing, when the release removes no flag
+/// the previous one still took: one line says so.
+#[test]
+fn the_config_migration_says_when_no_flag_is_new() {
+    for (name, cur) in [
+        ("migration-same", serde_json::json!(["a", "b"])),
+        ("migration-fewer", serde_json::json!(["a"])),
+        ("migration-empty", serde_json::json!([])),
+    ] {
+        let section = migration_section(name, cur, Some(serde_json::json!(["a", "b"])));
+        assert_eq!(
+            section,
+            "### Config migration\n\nNo flag is removed by this release that the previous release still took: no key of a frontend's config file needs deleting.\n",
+            "{name}"
+        );
+    }
+}
+
+/// Catches a previous release without `removed_flags` (every build before the field) read as
+/// having refused nothing new or everything already: every flag of this release is listed, and
+/// the line says the previous release did not say.
+#[test]
+fn the_config_migration_lists_every_flag_when_the_previous_release_does_not_say() {
+    let section = migration_section("migration-no-prev", serde_json::json!(["b", "a"]), None);
+    assert_eq!(
+        section,
+        format!(
+            "### Config migration\n\n{DELETE_HEAD}`a`, `b`{DELETE_TAIL}. v0.9.0 does not say which flags it refused, so this lists every flag this release refuses\n"
+        )
+    );
+}
+
+/// Catches a build that prints no `removed_flags` read as removing nothing: the section says
+/// the release does not say, and tells operators to check their files with it.
+#[test]
+fn the_config_migration_says_when_this_release_does_not_say() {
+    let fx = with_notes("migration-no-cur", |_| {});
+    let ((code, o, err), out) = notes_run(
+        &fx,
+        &identity_removing(RELEASE, None),
+        Some(&identity_removing(
+            &fx.first,
+            Some(serde_json::json!(["a"])),
+        )),
+    );
+    assert_eq!(code, Some(0), "{o}{err}");
+    let notes = std::fs::read_to_string(out).unwrap();
+    assert!(
+        notes.contains(
+            "### Config migration\n\n- this release does not say which flags it removes (its version output has no removed_flags): run `kbf --mode=frontend --check --config FILE` with this release against every frontend's config file before it starts\n"
+        ),
+        "{notes}"
+    );
+}
+
+/// Catches a first release given flags to delete, and a section out of place: it says there is
+/// no earlier config file, and sits between Not reversible and Waivers.
+#[test]
+fn the_first_release_has_no_config_to_migrate_and_the_section_sits_after_not_reversible() {
+    let fx = fx("notes-first-migration");
+    fx.annotate(TAG, RELEASE, &msg(&good()));
+    let notes = notes_of(&fx);
+    assert!(
+        notes.contains(
+            "### Config migration\n\nFirst release: there is no earlier config file to migrate.\n"
+        ),
+        "{notes}"
+    );
+    let at = |h: &str| notes.find(h).unwrap_or_else(|| panic!("{h}: {notes}"));
+    assert!(
+        at("### Not reversible") < at("### Config migration"),
+        "{notes}"
+    );
+    assert!(at("### Config migration") < at("### Waivers"), "{notes}");
+}
+
+/// Catches a `removed_flags` that is not a list of names being skipped: the notes are refused
+/// (exit 1), since what operators must delete cannot be determined.
+#[test]
+fn a_removed_flags_that_is_not_a_list_of_names_is_refused() {
+    for (name, bad) in [
+        ("migration-text", serde_json::json!("a")),
+        ("migration-number-in-list", serde_json::json!(["a", 1])),
+    ] {
+        let fx = with_notes(name, |_| {});
+        let ((code, _, err), _) = notes_run(
+            &fx,
+            &identity_removing(RELEASE, Some(bad)),
+            Some(&identity_removing(&fx.first, None)),
+        );
+        assert_eq!(code, Some(1), "{name}: {err}");
+        assert!(
+            err.contains("removed_flags is not a list of flag names"),
+            "{name}: {err}"
+        );
+    }
+}

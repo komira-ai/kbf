@@ -173,15 +173,24 @@ fn the_generated_kbf_toml_parses_to_what_the_rendered_flags_parsed_to() {
 /// Catches a key of the harness's tables that `kbf` does not take in that mode or reads in
 /// another table (the harness reads `tests/golden/kbf-<mode>.toml`, a text that `kbf-cli`
 /// holds equal to the flags): a file of every key of every mode, a switch on and the rest
-/// text, is accepted by `kbf`'s loader.
+/// text, is accepted by `kbf`'s loader, except the keys of the flags the frontend removed (the
+/// golden still lists them, as comments): those are refused, each named.
 #[test]
 fn every_key_the_harness_knows_is_a_key_kbf_takes_in_its_group() {
     let dir = scratch("keys");
     for mode in Mode::ALL {
         let mut text = String::new();
         let mut by_table: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        let removed: Vec<&str> = kbf_server::frontend::removed::flags()
+            .map(|(name, _)| name)
+            .collect();
+        let mut refused = Vec::new();
         for (key, (table, switch)) in keys(mode) {
             assert_eq!(kbf_cli::config::group_of(key), Some(table), "{mode} {key}");
+            if mode.name() == "frontend" && removed.contains(&key) {
+                refused.push(format!("{table}.{key}"));
+                continue;
+            }
             let value = if switch { "true" } else { "\"x\"" };
             by_table
                 .entry(table)
@@ -197,6 +206,32 @@ fn every_key_the_harness_knows_is_a_key_kbf_takes_in_its_group() {
             .expect("mode");
         if let Err(e) = kbf_cli::check_settings(mode.name(), &path) {
             panic!("{mode}: kbf refuses a key of the harness's table:\n{e}");
+        }
+        if !refused.is_empty() {
+            let mut tables: BTreeMap<&str, String> = BTreeMap::new();
+            for key in &refused {
+                let (table, key) = key.split_once('.').expect("a table and a key");
+                tables
+                    .entry(table)
+                    .or_default()
+                    .push_str(&format!("{key} = \"x\"\n"));
+            }
+            let text: String = tables
+                .iter()
+                .map(|(table, lines)| format!("[{table}]\n{lines}\n"))
+                .collect();
+            let path = dir.path().join("removed.toml");
+            std::fs::write(&path, text).expect("write");
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .expect("mode");
+            let err = kbf_cli::check_settings(mode.name(), &path).expect_err("removed keys");
+            for key in &refused {
+                assert!(
+                    err.contains(&format!("removed key `{key}`")),
+                    "{key}: {err}"
+                );
+            }
+            assert_eq!(err.lines().count(), refused.len(), "{err}");
         }
     }
 }

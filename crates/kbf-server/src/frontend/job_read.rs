@@ -60,7 +60,7 @@ use crate::listen::{Binder, Latch, Socket, Stoppable};
 use crate::serve::ServeError;
 use crate::token::{TokenFileError, read_owner_only};
 
-mod store_grant;
+pub(super) mod store_grant;
 
 const LISTEN: &str = "job_listen";
 const TLS_CERT: &str = "job_tls_cert";

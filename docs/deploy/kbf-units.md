@@ -51,7 +51,7 @@ lists the mode's flags. There is no `node` mode and no `enroll` word.
   error and exits 2 (a restart cannot fix it) or 75 (it may heal).
 - **The flags.** Whether `kbf` takes a unit's flags is `kbf --mode=<mode> --check`'s
   answer, and `crates/kbf-cli/tests/package_units.rs` parses each packaged unit's flags with
-  `kbf`'s own parser.
+  `kbf`'s own parser. A `--config` file that holds keys of removed flags fails the same check, naming every one (kbf-modes.md, "Removed flags in a `kbf.toml`").
 
 Drop-ins on the host (`/etc/systemd/system/<unit>.d/*.conf`) are the operator's and are not
 checked by the package test.

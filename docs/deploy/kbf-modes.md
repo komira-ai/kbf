@@ -413,6 +413,22 @@ A prepare that hits all of them reads nothing from the store and writes nothing.
 memory held by the process (the disk half of the first aside) and lose nothing a restart cannot
 fetch again.
 
+**Removed flags in a `kbf.toml`.** The flags a frontend removed are the executor's presigned
+path (eight), the presigned task outputs (ten) and the store read grants (three, under
+`[job-read]`). A `kbf.toml` read by `kbf --mode=frontend` (a start or `--check`) that holds any of
+them as keys is refused once, exit status 2, before anything starts and before `--check` looks at
+the host: one line per problem of the file, every removed key named as ``removed key
+`<table>.<key>` in <file>: <why>`` (the reason of its set, which ends in the way out, to delete
+it), together with every other problem the file has, so the operator deletes them all in one
+edit. A removed flag given on the command line is still refused by the flag parser, naming that
+flag. `kbf --version --json` lists the flags a build refuses as `removed_flags`, and the release
+notes' "Config migration" section (under "Before you click") lists the ones a release adds to the
+previous release's list: delete those keys from every frontend's `--config` file before the release
+starts. When the previous release prints no `removed_flags` (every release before the field), the
+section lists all of the new release's and says the previous release does not say which it refused.
+`kbf --mode=frontend --check --config FILE`, run with the new release's binary, names every key a
+file still holds.
+
 **Where a task's outputs go** (`--task-out-mode`, `put-dir`, the only value and the default; the
 `[task-runs]` table). The `presigned` mode of the releases before, a presigned write of each pack
 to the tier store and a read grant for the inputs, was removed: `--task-out-mode presigned` is

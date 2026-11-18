@@ -156,7 +156,7 @@ fn number(id: &'static str, long: &'static str, help: &'static str, default: &'s
 }
 
 /// The flags of the presigned path that was removed, by long name: they only refuse.
-const REMOVED: [&str; 8] = [
+pub(super) const REMOVED: [&str; 8] = [
     "executor-secret-delivery",
     "executor-insecure-argv-secrets",
     "executor-work-dir",
@@ -169,7 +169,7 @@ const REMOVED: [&str; 8] = [
 
 /// What a start that gives one of the removed flags is told, after clap's `invalid value ... for
 /// '--<flag> <VALUE>'`, which names the flag.
-const REMOVED_WHY: &str = concat!(
+pub(super) const REMOVED_WHY: &str = concat!(
     "the flag was removed in this release (kbf-server ",
     env!("CARGO_PKG_VERSION"),
     "+",

@@ -132,6 +132,16 @@ fn refused_own(entry: Entry) -> BTreeSet<String> {
     }
 }
 
+/// The flags a mode removed, by long name, each with what its refusal tells: a key of the
+/// settings file for one is a problem that names it ([`config::file_args`]). Only the frontend
+/// has any.
+fn removed_own(entry: Entry) -> BTreeMap<&'static str, &'static str> {
+    match entry {
+        Entry::Frontend => kbf_server::frontend::removed::flags().collect(),
+        Entry::Storage => BTreeMap::new(),
+    }
+}
+
 /// The long names of the flags mode `mode` refuses: every flag of another mode's own
 /// command line that its own does not take (flags that modes share stay accepted).
 /// Empty for a mode that takes the union.
@@ -665,6 +675,7 @@ pub fn check_settings(mode: &str, path: &std::path::Path) -> Result<(), String> 
     config::file_args(
         &own_command(m.entry),
         &refused_own(m.entry),
+        &removed_own(m.entry),
         path,
         &BTreeSet::new(),
     )
@@ -683,8 +694,14 @@ fn parse_with_file(mut args: Vec<OsString>) -> Result<Invocation, clap::Error> {
             .filter(|id| m.value_source(id) == Some(clap::parser::ValueSource::CommandLine))
             .map(str::to_owned)
             .collect();
-        let extra = config::file_args(&own, &refused_own(entry), &path, &given)
-            .map_err(|why| command().error(ErrorKind::Io, format!("kbf {mode}: {why}")))?;
+        let extra = config::file_args(
+            &own,
+            &refused_own(entry),
+            &removed_own(entry),
+            &path,
+            &given,
+        )
+        .map_err(|why| command().error(ErrorKind::Io, format!("kbf {mode}: {why}")))?;
         args.extend(extra);
     }
     parse_invocation(&args)

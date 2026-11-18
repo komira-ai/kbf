@@ -5,6 +5,7 @@
 //! The record is audit only: a tag without one, or with one that failed, gets notes all the
 //! same, which say so.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use kbf_gate::{ResultDoc, Verdict, reversible};
@@ -76,6 +77,7 @@ pub fn notes(s: &Subject, ids: &Identities) -> Result<String, Error> {
         }
     };
     let found = irreversible(since.as_deref(), &current, previous.as_ref())?;
+    let migration = config_migration(since.as_deref(), &current, previous.as_ref())?;
     let commits = git::commits(s.repo_dir, since.as_deref(), s.commit)?;
     Ok(render(
         verified.record.as_ref(),
@@ -83,6 +85,7 @@ pub fn notes(s: &Subject, ids: &Identities) -> Result<String, Error> {
         since.as_deref(),
         &commits,
         &found,
+        &migration,
     ))
 }
 
@@ -127,6 +130,67 @@ fn irreversible(
     }
     found.extend(installer_line(current, previous));
     Ok(found)
+}
+
+/// The flags an identity's `removed_flags` names: `None` when it has no such field (a build
+/// before it), an error when the field is not a list of names.
+fn removed_flags(identity: &Value) -> Result<Option<BTreeSet<String>>, Error> {
+    let bad = || Error::Failed("removed_flags is not a list of flag names".to_owned());
+    match identity.get("removed_flags") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(names)) => names
+            .iter()
+            .map(|n| n.as_str().map(str::to_owned).ok_or_else(bad))
+            .collect::<Result<_, _>>()
+            .map(Some),
+        Some(_) => Err(bad()),
+    }
+}
+
+/// What operators do to their frontends' config files before this release starts, one line
+/// each: the flags the current build's `removed_flags` names that the previous build's did not.
+/// Read from the two identities, never typed. Empty when nothing new is removed and for a first
+/// release. A previous build that prints no `removed_flags` (every build before the field) did
+/// not say which flags it refused, so every flag of this release is listed, and the line says so;
+/// a current build that prints none is unknown, which the line says too.
+fn config_migration(
+    since: Option<&str>,
+    current: &Value,
+    previous: Option<&Value>,
+) -> Result<Vec<String>, Error> {
+    let (Some(since), Some(previous)) = (since, previous) else {
+        return Ok(Vec::new());
+    };
+    let Some(now) = removed_flags(current)? else {
+        return Ok(vec![
+            "this release does not say which flags it removes (its version output has no \
+             removed_flags): run `kbf --mode=frontend --check --config FILE` with this release \
+             against every frontend's config file before it starts"
+                .to_owned(),
+        ]);
+    };
+    let before = removed_flags(previous)?;
+    let new: Vec<String> = now
+        .iter()
+        .filter(|flag| before.as_ref().is_none_or(|before| !before.contains(*flag)))
+        .map(|flag| format!("`{flag}`"))
+        .collect();
+    if new.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut line = format!(
+        "delete these keys from every frontend's config file (--config) before this release \
+         starts: {}; `kbf --mode=frontend --check --config FILE` with this release names every \
+         one a file still holds",
+        new.join(", ")
+    );
+    if before.is_none() {
+        line.push_str(&format!(
+            ". {since} does not say which flags it refused, so this lists every flag this \
+             release refuses"
+        ));
+    }
+    Ok(vec![line])
 }
 
 /// The line telling operators to upgrade kbf-installer first: the current build's version
@@ -198,6 +262,7 @@ fn render(
     since: Option<&str>,
     commits: &[String],
     found: &[String],
+    migration: &[String],
 ) -> String {
     let mut out = format!("# {tag}\n\n## Before you click\n");
     // Only what verify computed from the two builds (`found`). The verdict's own
@@ -209,6 +274,17 @@ fn render(
         found,
         "Nothing in this release is flagged as not reversible: the metadata log and the wire \
          protocol are the previous release's.",
+    );
+    section(
+        &mut out,
+        "### Config migration",
+        migration,
+        if since.is_some() {
+            "No flag is removed by this release that the previous release still took: no key of \
+             a frontend's config file needs deleting."
+        } else {
+            "First release: there is no earlier config file to migrate."
+        },
     );
     let waivers: Vec<String> = record
         .into_iter()

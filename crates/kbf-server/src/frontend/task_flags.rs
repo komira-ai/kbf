@@ -92,7 +92,7 @@ const PRESIGNED_REMOVED: &str = concat!(
 );
 
 /// The flags of the mode that was removed, by long name: they only refuse.
-const REMOVED: [&str; 10] = [
+pub(super) const REMOVED: [&str; 10] = [
     "task-put-endpoint",
     "task-put-bucket",
     "task-put-region",
@@ -107,7 +107,7 @@ const REMOVED: [&str; 10] = [
 
 /// What a start that gives one of the removed flags is told, after clap's `invalid value ... for
 /// '--<flag> <VALUE>'`, which names the flag.
-const REMOVED_WHY: &str = concat!(
+pub(super) const REMOVED_WHY: &str = concat!(
     "the flag was removed in this release (kbf-server ",
     env!("CARGO_PKG_VERSION"),
     "+",

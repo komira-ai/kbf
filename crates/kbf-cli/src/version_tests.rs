@@ -109,3 +109,24 @@ fn seq_is_read_from_the_build_not_written_down() {
         "seq must be read from build_seq(): {insert}"
     );
 }
+
+/// Catches `removed_flags` left out of `kbf --version --json`, unsorted, or not the frontend's
+/// own list: it is the sorted long names of `kbf_server::frontend::removed::flags`, each of which
+/// the frontend's command refuses, printed between `relay` and `seq`.
+#[test]
+fn removed_flags_are_the_frontends_sorted() {
+    let names = removed_flags();
+    assert_eq!(names.len(), 21);
+    assert!(names.windows(2).all(|w| w[0] < w[1]), "{names:?}");
+    assert!(names.contains(&"executor-allow-plain-http-grant"));
+    assert!(names.contains(&"job-store-url"));
+    assert!(names.contains(&"task-put-bucket"));
+    assert_eq!(identity()["removed_flags"], serde_json::json!(names));
+    let line = line();
+    let at = |key: &str| {
+        line.find(&format!("\"{key}\":"))
+            .unwrap_or_else(|| panic!("{key} is printed: {line}"))
+    };
+    assert!(at("relay") < at("removed_flags"), "{line}");
+    assert!(at("removed_flags") < at("seq"), "{line}");
+}

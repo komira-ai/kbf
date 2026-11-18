@@ -14,6 +14,8 @@
 //! - a flag given on the command line overrides the file's key for it;
 //! - a key that is not a flag of the mode, or sits in another table than the flag's
 //!   group, is refused naming the key and the file;
+//! - a key whose flag the mode removed is refused naming the key, the file and the reason of the
+//!   removal; every such key, and every other problem of the file, is named in the one refusal;
 //! - the file must be a regular file that neither group nor other can write, since it
 //!   decides what the process serves and where it keeps its keys;
 //! - a secret is never a value in the file: the flags that take a secret take the path of
@@ -489,14 +491,17 @@ pub fn check_own_tables(path: &Path, text: &str) -> Result<(), String> {
 /// The flags the file at `path` stands for, for the mode whose own command is `own`:
 /// `--key=value` per setting, in the file's order of tables and keys, leaving out each
 /// flag in `given` (an id of `own`: it was given on the command line, which wins).
+/// `removed` maps the long name of each flag the mode removed to the reason its refusal gives: a
+/// key of one is a problem naming it, so that a file with several is refused with all of them.
 ///
 /// # Errors
 /// Every problem of the file, one per line: it may not be read ([`check_file`]), it is
-/// not TOML, a key is not a flag of the mode or is in the wrong table, or a value is not
-/// what the flag takes.
+/// not TOML, a key is not a flag of the mode, is in the wrong table or was removed, or a
+/// value is not what the flag takes.
 pub fn file_args(
     own: &Command,
     refused: &BTreeSet<String>,
+    removed: &BTreeMap<&str, &str>,
     path: &Path,
     given: &BTreeSet<String>,
 ) -> Result<Vec<OsString>, String> {
@@ -566,6 +571,13 @@ pub fn file_args(
                 ));
                 continue;
             };
+            if let Some(why) = removed.get(key.as_str()) {
+                problems.push(format!(
+                    "removed key `{group}.{key}` in {}: {why}",
+                    path.display()
+                ));
+                continue;
+            }
             match group_of(key) {
                 Some(g) if g == group => {}
                 Some(g) => {

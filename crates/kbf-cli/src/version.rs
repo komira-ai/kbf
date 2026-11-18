@@ -28,6 +28,10 @@
 //!   ([`RELAY`]); the installer reads it before it rolls a `release_source = "bundled"` host back
 //!   to a release, which only a `kbf` that relays can be run beside. A build before this field
 //!   prints none;
+//! - `removed_flags`: the long names, sorted, of the flags `kbf --mode=frontend` refuses
+//!   ([`removed_flags`]); a `--config` file that holds one as a key is refused, so `release
+//!   notes` lists the ones a release adds for the operator to delete first. A build before this
+//!   field prints none, and a reader that does not know it ignores it;
 //! - `seq`: the number of commits behind the commit built (`git rev-list --count HEAD`,
 //!   [`build_seq`]), so two builds of one branch are put in order by it: a later commit has
 //!   the larger number. It is 0 when the build could not count them (a shallow checkout,
@@ -75,6 +79,18 @@ pub fn build_seq() -> u64 {
     kbf_server::BUILD_SEQ
 }
 
+/// The long names (no dashes before them) of the flags `kbf --mode=frontend` removed and refuses
+/// in a command line and in a `--config` file, sorted: what a host's file must not hold for this
+/// release to start.
+#[must_use]
+pub fn removed_flags() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = kbf_server::frontend::removed::flags()
+        .map(|(name, _)| name)
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 /// The identity of this build.
 #[must_use]
 pub fn identity() -> Value {
@@ -105,6 +121,7 @@ fn identity_for(commit_full: &str) -> Value {
         kbf_server::worker::PROTOCOL_VERSION.into(),
     );
     fields.insert("relay".to_owned(), RELAY.into());
+    fields.insert("removed_flags".to_owned(), removed_flags().into());
     fields.insert("seq".to_owned(), build_seq().into());
     fields.insert(
         "state_schema".to_owned(),

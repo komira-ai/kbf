@@ -1468,6 +1468,7 @@ mod handoff;
 mod janitor;
 mod job_read;
 mod pack_flags;
+pub mod removed;
 mod state_wait;
 mod stored;
 mod task_flags;

@@ -340,6 +340,61 @@ fn check_refuses_what_a_start_refuses() {
     );
 }
 
+/// Catches `--check` of a frontend file with removed keys that names only the first, or that
+/// goes on to the host checks: a file holding three removed keys (from two of the removed sets)
+/// exits 2 for both a start and `--check` (which never reaches the host checks), prints nothing on standard output, and names every key with its table and the
+/// file on standard error, one line each.
+#[test]
+fn check_and_start_name_every_removed_key_of_a_frontend_file() {
+    let dir = scratch("check-removed-keys");
+    let toml = dir.join("kbf.toml");
+    write(
+        &toml,
+        "[storage-client]\nstorage = \"http://127.0.0.1:1\"\n\n[executor]\n\
+         executor-secret-delivery = \"argv\"\nexecutor-allow-plain-http-grant = true\n\n\
+         [task-runs]\ntask-put-bucket = \"b\"\n",
+        0o600,
+    );
+    let file = toml.display();
+    for check in [true, false] {
+        let mut words = vec!["frontend".to_owned()];
+        if check {
+            words.push("--check".to_owned());
+        }
+        words.push(format!("--config={file}"));
+        let r = run(&words);
+        assert_eq!(r.code, Some(2), "check={check}: {}", r.err);
+        assert!(r.out.is_empty(), "check={check}: {}", r.out);
+        let keys: Vec<&str> = r
+            .err
+            .lines()
+            .filter_map(|l| {
+                l.strip_prefix("error: kbf frontend: removed key `")
+                    .or_else(|| l.strip_prefix("removed key `"))
+            })
+            .filter_map(|l| l.split_once('`').map(|(key, _)| key))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "executor.executor-allow-plain-http-grant",
+                "executor.executor-secret-delivery",
+                "task-runs.task-put-bucket",
+            ],
+            "check={check}: {}",
+            r.err
+        );
+        assert!(
+            r.err
+                .lines()
+                .filter(|l| l.contains("removed key"))
+                .all(|l| l.contains(&format!("in {file}: the flag was removed in this release"))),
+            "check={check}: {}",
+            r.err
+        );
+    }
+}
+
 /// Catches `--check` that passes a command line a start refuses for its words, not its
 /// host: a flag no mode has, and a mode that is not one (`cluster` is a command, not a
 /// mode). Each exits 2 in both spellings of the mode, with the refusal as the first line

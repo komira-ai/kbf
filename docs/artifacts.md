@@ -211,7 +211,7 @@ words, in either order): one JSON object on one line of stdout, exit 0, the fiel
 sorted by name.
 
 ```text
-{"admin_protocol":1,"commit":"0123456789ab","commit_full":"0123456789abcdef0123456789abcdef01234567","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"relay":1,"seq":812,"state_schema":1,"version":"0.1.0"}
+{"admin_protocol":1,"commit":"0123456789ab","commit_full":"0123456789abcdef0123456789abcdef01234567","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"relay":1,"removed_flags":["executor-allow-open-network","job-store-url","task-put-bucket"],"seq":812,"state_schema":1,"version":"0.1.0"}
 ```
 
 - `admin_protocol`: the version of the admin calls that `kbf --mode frontend` served
@@ -240,6 +240,13 @@ sorted by name.
   installer needs (`kbf_installer::binary::RELAY_NEEDED`); a build before this field prints none. An
   installer whose reader refuses keys it does not know refuses to stage a `kbf` that prints
   it, so the installers ship first.
+- `removed_flags`: a list of the long names (no leading dashes), sorted, of the flags
+  `kbf --mode=frontend` removed and refuses, on the command line and as a key of a `--config`
+  file (the example above lists three of them). `release notes` reads it from the two builds' identities and lists, under "Config
+  migration", the flags this release names that the previous release's list did not, for the
+  operator to delete from each frontend's file before the release starts. A build before this field
+  prints none, and then the notes list all of the new release's flags and say the previous release
+  does not say which it refused. A reader that does not know the field ignores it.
 - `seq`: the number of commits behind the commit built (`git rev-list --count HEAD`), so
   two builds of one branch are put in order by it: a later commit has the larger number.
   It is `0` when the build could not count them (a shallow checkout, which holds only part

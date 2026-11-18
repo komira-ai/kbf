@@ -87,6 +87,7 @@ fn version_json_reports_the_build_identity() {
             "profile",
             "protocol",
             "relay",
+            "removed_flags",
             "seq",
             "state_schema",
             "version",
@@ -95,6 +96,10 @@ fn version_json_reports_the_build_identity() {
         want.sort_unstable();
         assert_eq!(fields, want, "{out}");
         assert_eq!(v["relay"], kbf_cli::version::RELAY);
+        assert_eq!(
+            v["removed_flags"],
+            serde_json::json!(kbf_cli::version::removed_flags())
+        );
         assert_eq!(v["commit"], kbf_server::BUILD_COMMIT);
         assert_eq!(
             v["commit_full"].as_str().unwrap_or_default(),
