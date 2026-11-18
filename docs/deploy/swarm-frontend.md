@@ -36,21 +36,21 @@ start, and pass its health check, while the old one is running.
 
 Both tasks name the slot's `file://` history directory, and that works: the directory is opened
 shared. A shared open takes no `LOCK`; each process keeps its own file under `instances/` locked
-for as long as it runs, and its temporary files in `tmp/` carry its name. Every key a history
+for as long as it runs, and its temporary files, in `tmp-shared/`, carry its name. Every key a history
 writer writes carries its own writer id (its start time in microseconds), so the old and the new
 task never write one key, and nothing in history deletes, evicts or lists the directory. The new
 task starts, serves and passes its health check beside the old one, and each of them goes on
 writing under its own id until the old one has drained and exited. A new task's open removes
-the leftovers of a task that is gone (its `tmp/` files and its `instances/` file) and leaves a
+the leftovers of a task that is gone (its `tmp-shared/` files and its `instances/` file) and leaves a
 running task's alone. The cold store's directory is a different matter: it is evicted, scanned
 and cleaned, and one process owns it (`LOCK`).
 
 A release that still opens the directory exclusively (the one before this) holds `LOCK` for as
 long as it runs. The new task opens the directory beside it all the same, since a shared open
-does not look at `LOCK`. The reverse is the one cost: an old-release process that starts beside
-a new one (a rollback, or a task restarted by Swarm) empties `tmp/` as it opens, which can cut
-one in-flight write of the new task; that write fails and is dropped and counted like any
-failed history write (`kbf_history_dropped_total`), and the next one works.
+does not look at `LOCK`. The reverse costs nothing: an old-release process that starts beside a
+new one (a rollback, or a task restarted by Swarm) empties `tmp/` as it opens, and a new task
+keeps its temporary files in `tmp-shared/`, which the old release never lists or empties, so
+no write of the new task is cut and the old process's open does not fail.
 
 What bounds the overlap is the service's health check: a new task that has not passed it by the
 end of its `start_period` and retries is replaced, and that counts as a failed update.
@@ -65,6 +65,31 @@ taking writes, for at most five seconds, so a rolling update leaves the old task
 History is not all an update with `order: start-first` needs: the old and the new frontend must
 also share the executor's jobs, which is the subject of
 [docs/design/n-frontends.md](../design/n-frontends.md) (section 9 gives the order of the steps).
+
+## A release that removes flags
+
+A frontend refuses a `--config` file that still sets a flag its release removed: the start exits
+2 and names every such key of the file at once, each as a line `removed key <table>.<key> in <file>: ...`,
+and `--check` says the same without starting. Under `order: start-first` the old task keeps
+serving and the update fails on the new task, so nothing is lost but the update; still, the
+file has to change before the release can run.
+
+The deploy does not check the service's file against the new image before it updates the
+service: docker-swarm-updater has no step that runs the new image first. So, before a release
+whose notes list flags under "Config migration" (the flags it removed that the release before it
+still took, read from the two builds), delete those keys from the service's file, and check the
+file with the new image, mounted where the service mounts it:
+
+```text
+docker run --rm --volume <the service's kbf.toml>:/etc/kbf/kbf.toml:ro <the release's image> --config /etc/kbf/kbf.toml --check
+```
+
+(the image's entry point is `kbf --mode=frontend`; arguments after the image replace its default
+`--config /etc/kbf/kbf.toml`, so the command names the file again). It exits 0 when the release takes the file, and 2 naming every key it
+refuses. A host whose frontend container is switched by `kbf-host-install --frontend-container`
+needs none of this: the switch runs that check itself, with the container's own mounts, and
+refuses (`config_invalid`) before it drains or changes anything
+([host-install.md](host-install.md#a-frontend-container)).
 
 ## Turn it on
 

@@ -100,7 +100,8 @@ async fn a_shared_open_keeps_a_running_instances_temporary_file() {
 }
 
 /// A shared open removes what an instance whose process is gone left (its temporary
-/// files and its instance file) and the temporary files that name no instance, and keeps
+/// files in `tmp-shared/` and its instance file) and the temporary files that name no
+/// instance, and keeps
 /// a running instance's, which another store of this process stands for here.
 #[tokio::test]
 async fn a_shared_open_removes_a_stopped_instances_leftovers() {
@@ -112,7 +113,7 @@ async fn a_shared_open_removes_a_stopped_instances_leftovers() {
         .expect("a dot")
         .0
         .to_owned();
-    let tmp = dir.join("tmp");
+    let tmp = dir.join("tmp-shared");
     let instances = dir.join("instances");
     // An instance whose process is gone: its file is not locked by anyone.
     fs::write(instances.join("gone-1-0"), b"").expect("instance");
@@ -136,21 +137,24 @@ async fn a_shared_open_removes_a_stopped_instances_leftovers() {
     assert_eq!(left, [file_name(&kept), "stuck-3-0.0".to_owned()]);
 }
 
-/// The temporary files of exclusive mode (names without a dot) are removed by a shared
-/// open when `LOCK` is free, and left while an exclusive store holds it, since that
-/// store's writes are in flight.
+/// Every file in `tmp/` (only exclusive mode writes there, named by a number) is removed
+/// by a shared open when `LOCK` is free, and left while an exclusive store holds it,
+/// since that store's writes are in flight.
 #[tokio::test]
 async fn a_shared_open_removes_exclusive_temporary_files_only_when_no_exclusive_store_is_open() {
     let dir = dir("kbf-objstore-shared-legacy");
     let exclusive = FsStore::open(&dir, Floor::Bytes(1)).expect("exclusive");
     let tmp = dir.join("tmp");
     fs::write(tmp.join("0"), b"in flight").expect("plant");
+    fs::write(tmp.join("old-1-0.5"), b"in flight").expect("plant");
     let beside = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("shared");
     assert!(tmp.join("0").exists(), "removed under a held LOCK");
+    assert!(tmp.join("old-1-0.5").exists(), "removed under a held LOCK");
     drop((beside, exclusive));
 
     let after = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("shared");
     assert!(!tmp.join("0").exists(), "left with LOCK free");
+    assert!(!tmp.join("old-1-0.5").exists(), "left with LOCK free");
     // The lock the open took is released: an exclusive store opens at once.
     drop(after);
     FsStore::open(&dir, Floor::Bytes(1)).expect("LOCK was left held");
@@ -170,6 +174,7 @@ async fn two_shared_stores_writing_one_key_leave_the_first_writers_object() {
         "{second:?}"
     );
     assert_eq!(read(&b, "k").await.expect("read"), "first");
+    assert_eq!(names(&dir.join("tmp-shared")), Vec::<String>::new());
     assert_eq!(names(&dir.join("tmp")), Vec::<String>::new());
 }
 
@@ -197,18 +202,96 @@ async fn exclusive_and_shared_opens_read_what_the_other_wrote() {
     );
 }
 
-/// An exclusive open (the previous release's, started beside a shared store) empties
-/// `tmp/`, including a shared store's in-flight file: the open does not fail, and the
-/// shared store's next write works.
+/// A shared store keeps its temporary files in `tmp-shared/` and none in `tmp/`.
 #[tokio::test]
-async fn an_exclusive_open_empties_a_shared_stores_temporary_files() {
+async fn a_shared_store_writes_its_temporary_files_under_tmp_shared_only() {
+    let dir = dir("kbf-objstore-shared-tmp-dir");
+    let shared = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("shared");
+    let planted = plant_tmp(&shared, 0);
+    assert_eq!(planted.parent(), Some(dir.join("tmp-shared").as_path()));
+    assert_eq!(names(&dir.join("tmp")), Vec::<String>::new());
+}
+
+/// An exclusive open (the previous release's, started beside a shared store) leaves a
+/// shared store's write in flight alone: the open succeeds, the file stays, and the
+/// write, a streamed put whose body is not finished when the open happens, completes.
+#[tokio::test]
+async fn an_exclusive_open_beside_a_shared_stores_write_in_flight_cuts_nothing() {
     let dir = dir("kbf-objstore-shared-cut");
     let shared = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("shared");
-    let cut = plant_tmp(&shared, 0);
+    let (send, recv) = futures::channel::mpsc::unbounded::<Result<Bytes, ObjectStoreError>>();
+    let writer = shared.clone();
+    let put = tokio::spawn(async move { writer.put_stream(&key("k"), 10, recv.boxed()).await });
+    let tmp = dir.join("tmp-shared");
+    while names(&tmp).is_empty() {
+        tokio::task::yield_now().await;
+    }
+    let in_flight = names(&tmp);
+    send.unbounded_send(Ok(Bytes::from_static(b"hello")))
+        .expect("first piece");
+
     let exclusive = FsStore::open(&dir, Floor::Bytes(1)).expect("exclusive");
-    assert!(!cut.exists());
+
+    assert_eq!(names(&tmp), in_flight, "the in-flight file was touched");
+    send.unbounded_send(Ok(Bytes::from_static(b"world")))
+        .expect("second piece");
+    drop(send);
+    put.await
+        .expect("join")
+        .expect("the write in flight completes");
+    assert_eq!(read(&exclusive, "k").await.expect("read"), "helloworld");
+    assert_eq!(names(&tmp), Vec::<String>::new());
+}
+
+/// An exclusive open succeeds with `tmp-shared/` holding files, those of a running
+/// instance and of a stopped one, and leaves every one of them where it is.
+#[tokio::test]
+async fn an_exclusive_open_leaves_a_non_empty_tmp_shared_untouched() {
+    let dir = dir("kbf-objstore-shared-exclusive-open");
+    let shared = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("shared");
+    let mine = plant_tmp(&shared, 900);
+    let stopped = dir.join("tmp-shared").join("gone-1-0.0");
+    fs::write(&stopped, b"x").expect("plant");
+    let exclusive = FsStore::open(&dir, Floor::Bytes(1)).expect("exclusive");
+    assert!(mine.exists() && stopped.exists());
     put(&shared, "k", b"v").await.expect("put");
     assert_eq!(read(&exclusive, "k").await.expect("read"), "v");
+}
+
+/// An exclusive open empties `tmp/` whatever it holds, a dotted name included.
+#[tokio::test]
+async fn an_exclusive_open_empties_tmp() {
+    let dir = dir("kbf-objstore-shared-exclusive-empties");
+    let shared = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("shared");
+    let tmp = dir.join("tmp");
+    fs::write(tmp.join("0"), b"x").expect("plant");
+    fs::write(tmp.join("a-1-0.2"), b"x").expect("plant");
+    FsStore::open(&dir, Floor::Bytes(1)).expect("exclusive");
+    assert_eq!(names(&tmp), Vec::<String>::new());
+    drop(shared);
+}
+
+/// A leftover already gone counts as removed, so a removal that raced the open does not
+/// fail it.
+#[test]
+fn a_leftover_that_is_already_gone_counts_as_removed() {
+    let dir = dir("kbf-objstore-shared-leftover-gone");
+    remove_leftover(&dir.join("absent")).expect("a missing file is removed");
+    let present = dir.join("present");
+    fs::write(&present, b"x").expect("file");
+    remove_leftover(&present).expect("removed");
+    assert!(!present.exists());
+}
+
+/// A leftover that cannot be removed for another reason (a directory) is an error.
+#[test]
+fn a_leftover_that_cannot_be_removed_is_an_error() {
+    let dir = dir("kbf-objstore-shared-leftover-stuck");
+    let stuck = dir.join("stuck");
+    fs::create_dir(&stuck).expect("dir");
+    let err = remove_leftover(&stuck).expect_err("a directory is not removed");
+    assert_ne!(err.kind(), io::ErrorKind::NotFound);
+    assert!(stuck.exists());
 }
 
 /// Dropping the last handle of a shared store removes its instance file, and a clone

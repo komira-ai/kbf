@@ -1,5 +1,6 @@
 //! The shared open of [`FsStore`] (see the module docs of `fs_store`): no `LOCK`, a
-//! locked file of its own under `instances/`, and temporary files named after it.
+//! locked file of its own under `instances/`, and temporary files named after it in
+//! `tmp-shared/`, a directory an exclusive open never touches.
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
@@ -15,7 +16,7 @@ impl FsStore {
     /// delete (see the module docs, "Shared mode"): the directory may be open in other
     /// shared stores, in this process or another, and in an exclusive store. Creates the
     /// directory and its layout if missing, and removes what stopped shared stores left
-    /// in `tmp/`. A write is refused while the file system would be left with less than
+    /// in `tmp-shared/`. A write is refused while the file system would be left with less than
     /// `floor` free.
     ///
     /// # Errors
@@ -37,18 +38,26 @@ impl FsStore {
         space: SpaceSource,
     ) -> Result<Self, FsStoreError> {
         fs::create_dir_all(dir).map_err(open_failed("create", dir))?;
-        let (objects, tmp) = create_layout(dir)?;
+        let (objects, legacy_tmp) = create_layout(dir)?;
+        let tmp = dir.join("tmp-shared");
+        fs::create_dir_all(&tmp).map_err(open_failed("create", &tmp))?;
         let instances = dir.join("instances");
         fs::create_dir_all(&instances).map_err(open_failed("create", &instances))?;
-        // `tmp/` is listed before `instances/`: an instance creates its file before any
+        // `tmp-shared/` is listed before `instances/`: an instance creates its file before any
         // temporary file, so a name seen in the first listing and absent from the second
         // belongs to an instance that is gone.
         let seen = entries(&tmp).map_err(open_failed("list", &tmp))?;
         let (name, path, file) = claim(&instances, instance_name, |_| {})?;
         // From here every way out of the open, an error included, unlocks.
         let lock = DirLock(file);
-        sweep(dir, &instances, &seen)?;
-        for path in [tmp.as_path(), instances.as_path(), objects.as_path(), dir] {
+        sweep(dir, &legacy_tmp, &instances, &seen)?;
+        for path in [
+            tmp.as_path(),
+            legacy_tmp.as_path(),
+            instances.as_path(),
+            objects.as_path(),
+            dir,
+        ] {
             sync_dir(path).map_err(open_failed("sync", path))?;
         }
         Ok(Self {
@@ -117,9 +126,15 @@ fn names_file(file: &File, path: &Path) -> bool {
     })
 }
 
-/// Removes what stopped instances left. `seen` is `tmp/` as listed before this store's
-/// instance file was created. A removal that fails leaves its file to the next open.
-fn sweep(dir: &Path, instances: &Path, seen: &[PathBuf]) -> Result<(), FsStoreError> {
+/// Removes what stopped instances left. `seen` is `tmp-shared/` as listed before this
+/// store's instance file was created; `legacy_tmp` is `tmp/`, where only exclusive mode
+/// writes. A removal that fails leaves its file to the next open.
+fn sweep(
+    dir: &Path,
+    legacy_tmp: &Path,
+    instances: &Path,
+    seen: &[PathBuf],
+) -> Result<(), FsStoreError> {
     let mut named = BTreeSet::new();
     let mut gone = BTreeSet::new();
     for path in entries(instances).map_err(open_failed("list", instances))? {
@@ -136,18 +151,13 @@ fn sweep(dir: &Path, instances: &Path, seen: &[PathBuf]) -> Result<(), FsStoreEr
         }
         named.insert(name);
     }
-    let mut legacy = Vec::new();
     for path in seen {
-        match file_name(path).split_once('.') {
-            Some((owner, _)) if gone.contains(owner) || !named.contains(owner) => {
-                let _ = fs::remove_file(path);
-            }
-            Some(_) => {}
-            None => legacy.push(path),
+        let stopped = file_name(path)
+            .split_once('.')
+            .is_none_or(|(owner, _)| gone.contains(owner) || !named.contains(owner));
+        if stopped {
+            let _ = fs::remove_file(path);
         }
-    }
-    if legacy.is_empty() {
-        return Ok(());
     }
     // The temporary files of exclusive mode are removed only while no exclusive store is
     // open, and none can open while this holds the lock.
@@ -160,8 +170,8 @@ fn sweep(dir: &Path, instances: &Path, seen: &[PathBuf]) -> Result<(), FsStoreEr
         .map_err(open_failed("open", &lock_path))?;
     let lock = DirLock(file);
     if lock.0.try_lock().is_ok() {
-        for path in legacy {
-            let _ = fs::remove_file(path);
+        for path in entries(legacy_tmp).map_err(open_failed("list", legacy_tmp))? {
+            let _ = remove_leftover(&path);
         }
     }
     Ok(())
@@ -176,7 +186,7 @@ fn file_name(path: &Path) -> String {
 }
 
 /// The `objects/<hh>` directories and `tmp/` of `dir`, created if missing: the layout
-/// both opens share. Returns `objects/` and `tmp/`.
+/// both opens share (a shared store adds `tmp-shared/` and `instances/`). Returns `objects/` and `tmp/`.
 pub(super) fn create_layout(dir: &Path) -> Result<(PathBuf, PathBuf), FsStoreError> {
     let objects = dir.join("objects");
     for shard in 0..=u8::MAX {

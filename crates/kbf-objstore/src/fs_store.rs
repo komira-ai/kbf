@@ -12,7 +12,10 @@
 //!   spread over 256 directories, all created at open. A file is a header (`kbf-obj1`,
 //!   the key's length as a big-endian `u16`, the key) and then the object's bytes.
 //! - `tmp/`: objects being written. Emptied at open: a file there is a write that a
-//!   crash or a failure cut short, and that was never answered.
+//!   crash or a failure cut short, and that was never answered. A file that is already
+//!   gone when the open removes it counts as removed.
+//! - `tmp-shared/`: the objects being written by shared stores (see below). An exclusive
+//!   open never lists or empties it.
 //!
 //! # Shared mode
 //!
@@ -23,24 +26,25 @@
 //! store (the previous release's) holds it. Each shared store holds an exclusive `flock`
 //! on its own file `instances/<name>` for its life (the name is unique to the store: the
 //! process id, a start time and a counter) and names its temporary files
-//! `tmp/<name>.<n>`, plain files directly in `tmp/`. At open it removes what stopped
-//! instances left: the `tmp/<name>.*` files, and the `instances/<name>` file, of every
-//! instance whose `flock` it can take; `tmp/` files that name no instance; and the
-//! dotless temporary files of exclusive mode, only when it can take `LOCK` at that
-//! moment (no exclusive store is open). Dropping the last handle removes the instance
-//! file. Everything else, the objects, the header, the floor and the conditional
+//! `tmp-shared/<name>.<n>`: it keeps them out of `tmp/`, which an exclusive open empties,
+//! so no exclusive open (the previous release's included) lists, removes or races a
+//! shared store's temporary files. At open it removes what stopped instances left: the
+//! `tmp-shared/<name>.*` files, and the `instances/<name>` file, of every instance whose
+//! `flock` it can take, and `tmp-shared/` files that name no instance. It also removes
+//! every file in `tmp/`, which only exclusive mode writes, but only when it can take `LOCK`
+//! at that moment (no exclusive store is open). Dropping the last handle removes the
+//! instance file. Everything else, the objects, the header, the floor and the conditional
 //! writes, is as in exclusive mode; the store does not list, scan or delete for its
 //! owner, since another process may be writing under it.
 //!
-//! An exclusive open of a directory shared stores are using is allowed and empties
-//! `tmp/`, which is what the exclusive mode does: a process of a release that has only
-//! the exclusive mode, started beside a shared store, can cut one in-flight write of it,
-//! which then fails as any failed write does. Only a directory of the cold store, which
-//! evicts, scans and deletes, needs the exclusive mode.
+//! An exclusive open of a directory shared stores are using is allowed and succeeds: it
+//! empties `tmp/` and leaves `tmp-shared/` alone, so it cuts no write of a shared store.
+//! Only a directory of the cold store, which evicts, scans and deletes, needs the
+//! exclusive mode.
 //!
-//! A write goes to a new file in `tmp/`, which is synced, then linked under its final
-//! name, then unlinked from `tmp/`; then the final name's directory is synced, and only
-//! then is the write answered. A link never replaces an existing name, so the store
+//! A write goes to a new file in `tmp/` (`tmp-shared/` for a shared store), which is
+//! synced, then linked under its final name, then unlinked from there; then the final
+//! name's directory is synced, and only then is the write answered. A link never replaces an existing name, so the store
 //! has conditional writes: of two writers of one key, exactly one succeeds and the
 //! other is answered [`ObjectStoreError::AlreadyExists`]. A crash never leaves a partial
 //! object under its final name, and an answered write survives a power cut.
@@ -341,7 +345,7 @@ impl FsStore {
         let lock = DirLock(file);
         let (objects, tmp) = shared::create_layout(dir)?;
         for path in entries(&tmp).map_err(open_failed("list", &tmp))? {
-            fs::remove_file(&path).map_err(open_failed("remove", &path))?;
+            remove_leftover(&path).map_err(open_failed("remove", &path))?;
         }
         for path in [tmp.as_path(), objects.as_path(), dir] {
             sync_dir(path).map_err(open_failed("sync", path))?;
@@ -364,6 +368,15 @@ impl FsStore {
                 dir: dir.to_path_buf(),
             }),
         })
+    }
+}
+
+/// Removes a file the open found in `tmp/`. A file already gone counts as removed, which
+/// is what the open wanted; any other failure is an error.
+fn remove_leftover(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
