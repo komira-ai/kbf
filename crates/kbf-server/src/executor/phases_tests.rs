@@ -184,7 +184,8 @@ fn the_metric_family_renders_every_phase_label_once() {
 }
 
 /// Catches a duration in the wrong bucket: a bound is inclusive, a duration over every bound is
-/// only in `+Inf`, the buckets are cumulative, and the sum and the count are the observations'.
+/// only in `+Inf`, the buckets are cumulative down to the millisecond ones, and the sum and the
+/// count are the observations'.
 #[test]
 fn an_observation_lands_in_every_bucket_at_or_over_it() {
     let metrics = Metrics::default();
@@ -200,8 +201,13 @@ fn an_observation_lands_in_every_bucket_at_or_over_it() {
         )
         .to_owned()
     };
+    assert_eq!(bucket("0.001"), "0");
+    assert_eq!(bucket("0.0025"), "0");
     assert_eq!(bucket("0.005"), "1");
+    assert_eq!(bucket("0.01"), "2");
     assert_eq!(bucket("0.025"), "2");
+    assert_eq!(bucket("0.05"), "2");
+    assert_eq!(bucket("0.25"), "2");
     assert_eq!(bucket("3600"), "2");
     assert_eq!(bucket("+Inf"), "3");
     assert_eq!(

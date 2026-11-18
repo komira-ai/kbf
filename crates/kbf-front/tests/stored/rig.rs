@@ -1,8 +1,8 @@
 //! Fixtures: the pack index with the action cache, that fails when told to, and the frontend
 //! with no storage node in front of an object store.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -41,6 +41,10 @@ pub struct Index {
     fail_record_directories: AtomicU32,
     fail_forget: AtomicU32,
     keeps_no_directories: AtomicBool,
+    /// Whether a record of Directory rows waits (inside the index call) until released.
+    holds_records: Mutex<bool>,
+    released: Condvar,
+    record_entered: tokio::sync::Notify,
 }
 
 impl Index {
@@ -56,7 +60,33 @@ impl Index {
             fail_record_directories: AtomicU32::new(0),
             fail_forget: AtomicU32::new(0),
             keeps_no_directories: AtomicBool::new(false),
+            holds_records: Mutex::new(false),
+            released: Condvar::new(),
+            record_entered: tokio::sync::Notify::new(),
         }
+    }
+
+    /// From now on a record of Directory rows waits inside the index call, before it writes,
+    /// until [`Index::release_record_directories`].
+    pub fn hold_record_directories(&self) {
+        *self
+            .holds_records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+    }
+
+    /// Lets the records waiting (and those to come) go on.
+    pub fn release_record_directories(&self) {
+        *self
+            .holds_records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = false;
+        self.released.notify_all();
+    }
+
+    /// Completes once a record of Directory rows has reached the index call.
+    pub async fn record_directories_entered(&self) {
+        self.record_entered.notified().await;
     }
 
     /// From now on the index keeps no Directory rows: both Directory calls are `Unsupported`, as
@@ -175,6 +205,18 @@ impl PackIndex for Index {
         if self.keeps_no_directories.load(SeqCst) {
             return Err(PackIndexError::Unsupported);
         }
+        self.record_entered.notify_one();
+        let mut held = self
+            .holds_records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while *held {
+            held = self
+                .released
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(held);
         if fires(&self.fail_record_directories) {
             return Err(PackIndexError::NotMigrated);
         }

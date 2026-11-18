@@ -6,10 +6,17 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use kbf_front::action_tree::{BaseFacts, BaseTree};
-use kbf_front::prepare_run::{ClosureLimits, collect_closure_keeping};
+use kbf_front::prepare_run::{ClosureLimits, PrepareTook, collect_closure_keeping};
 use tierstore::TreeDigest;
 
 use super::*;
+
+/// How long [`DirPrep`] says the parts of each closure it collects took.
+pub(super) const TOOK: PrepareTook = PrepareTook {
+    action: Duration::from_millis(1),
+    walk: Duration::from_millis(2),
+    held: Duration::from_millis(3),
+};
 
 /// A preparation that makes put directories with the real mint and the real closure over the
 /// rig's CAS, or refuses as told, and counts what it was asked for.
@@ -92,6 +99,7 @@ impl RunPrepare for DirPrep {
             dir: dir.dir().to_owned(),
             kept,
             not_after: NOW + self.good_for,
+            took: TOOK,
         })
     }
 

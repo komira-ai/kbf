@@ -5,7 +5,9 @@
 //! walk's answer, its errors and its asks of the store for the files and the Command are the
 //! same with a cache as without one.
 
-use kbf_front::prepare_run::{DIRECTORY_MEMORY_BYTES, DirectoryCache, KeptClosure, PutDirPrep};
+use kbf_front::prepare_run::{
+    DIRECTORY_MEMORY_BYTES, DetachedWrites, DirectoryCache, KeptClosure, PutDirPrep,
+};
 use kbf_pack::ReadCache;
 use kbf_pack_index::BlobDigest;
 use kbf_testkit::dir::TestDir;
@@ -21,6 +23,7 @@ fn prep_over(store: &Arc<Watched>, cache: &Arc<DirectoryCache>) -> PutDirPrep {
         ClosureLimits::DEFAULT,
     )
     .with_directories(Arc::clone(cache))
+    .with_detached_writes(DetachedWrites::new(8))
 }
 
 fn memory() -> Arc<DirectoryCache> {
@@ -31,12 +34,15 @@ fn scratch(name: &str) -> TestDir {
     TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
-/// The closure of `action` through `prep`.
+/// The closure of `action` through `prep`, once the writes the preparation left running have
+/// ended.
 async fn walk(prep: &PutDirPrep, action: &Digest) -> KeptClosure {
-    prep.prepare_put_dir(LEASE, action, now(), WALL)
+    let run = prep
+        .prepare_put_dir(LEASE, action, now(), WALL)
         .await
-        .expect("prepared")
-        .kept
+        .expect("prepared");
+    prep.detached_writes().settled().await;
+    run.kept
 }
 
 /// Forgets the blobs read so far.
@@ -456,4 +462,28 @@ async fn mint_put_dir_refuses_a_time_the_mint_cannot_name() {
         .await
         .expect_err("refused");
     assert!(matches!(error, PrepareError::Mint(_)), "{error}");
+}
+
+/// Asserts that with no permit free the disk half is not written (and the skip is counted), the
+/// preparation still gives the same closure, and a cache opened again on the directory reads the
+/// Directories from the store.
+#[tokio::test]
+async fn a_disk_write_with_no_permit_free_is_skipped_and_counted() {
+    let (parts, store, _) = standard().await;
+    let dir = scratch("front-directories-no-permit");
+    let open = || DirectoryCache::open(dir.path(), DIRECTORY_MEMORY_BYTES, 1 << 20);
+    let first = {
+        let prep = prep_over(&store, &Arc::new(open().expect("a cache")))
+            .with_detached_writes(DetachedWrites::new(0));
+        let kept = walk(&prep, &parts.action).await;
+        // The record of the rows and the write of the disk half each find no permit.
+        assert_eq!(prep.detached_writes().skipped(), 2);
+        kept
+    };
+    forget_reads(&store);
+    let prep = prep_over(&store, &Arc::new(open().expect("a cache")));
+    let second = walk(&prep, &parts.action).await;
+    assert_eq!(store.reads(), read_set(&parts, &all_directories(&parts)));
+    assert_eq!(second, first);
+    assert_eq!(prep.detached_writes().skipped(), 0);
 }

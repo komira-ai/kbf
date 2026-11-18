@@ -88,7 +88,9 @@ async fn the_attempts_bound_ends_in_unavailable_with_the_output_attached() {
 }
 
 /// Catches a submit whose answer was lost being given up, or sent as another job: it is sent
-/// again, the same spec under the same id, and the service makes one job.
+/// again, the same spec under the same id, and the service makes one job. Catches the submit's
+/// steps not timed as they happen too: two `rpc` calls and one `backoff`, whose sum is the one
+/// poll waited on the paused clock, and one `facts` and one `tree_wait` for the run.
 #[tokio::test(start_paused = true)]
 async fn a_submit_whose_answer_was_lost_is_resent_with_the_same_spec_and_counted() {
     let rig = Rig::start().await;
@@ -115,6 +117,22 @@ async fn a_submit_whose_answer_was_lost_is_resent_with_the_same_spec_and_counted
     let job = rig.job_of(&caller, 0);
     rig.host_finishes(&job, 0);
     assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));
+    let step = |part: &str, step: &str| {
+        let mut page = String::new();
+        rig.metrics.render(&mut page);
+        let series = format!("kbf_executor_step_seconds_{part}{{step=\"{step}\"}} ");
+        page.lines()
+            .find_map(|line| line.strip_prefix(&series).map(str::to_owned))
+            .unwrap_or_else(|| panic!("no {series}"))
+    };
+    assert_eq!(step("count", "rpc"), "2");
+    assert_eq!(step("count", "backoff"), "1");
+    let poll = rig.cfg.poll.as_micros();
+    let waited = format!("{}.{:06}", poll / 1_000_000, poll % 1_000_000);
+    assert_eq!(step("sum", "backoff"), waited, "one poll");
+    assert_eq!(step("count", "facts"), "1");
+    assert_eq!(step("count", "tree_wait"), "1");
+    assert_eq!(step("count", "row"), "0", "no state store");
 }
 
 /// A submit the job service refuses for a reason of its own (not the job's) runs the

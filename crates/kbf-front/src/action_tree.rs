@@ -68,8 +68,10 @@
 //! (`--executor-input-tree provider`).
 //!
 //! The executor's runs that commit into a put directory call it (`--task-out-mode put-dir`),
-//! each run's action tree written over the published base tree before the job is submitted, as
-//! manifests or as a tree list.
+//! each run's action tree written over the published base tree, as manifests or as a tree list.
+//! A tree's name is a digest of what it holds, known before anything is written:
+//! [`TreeWriter::write_named`] and [`TreeWriter::write_listing_named`] hand it out then, so the
+//! executor submits the job while the tree's writes go on.
 
 mod base;
 mod check;
@@ -394,7 +396,28 @@ impl TreeWriter {
     /// manifests written before a failure stay: each is content-bound, and nothing names them
     /// until a tree is returned.
     pub async fn write(&self, kept: &KeptClosure, base: &BaseTree) -> Result<ActionTree, NoTree> {
-        self.write_as(kept, base, Trust::Memos).await
+        self.write_as(kept, base, Trust::Memos, |_| ()).await
+    }
+
+    /// As [`TreeWriter::write`], and calls `named` with the tree's name as soon as it is known:
+    /// after the blobs are located and every manifest is built and checked, before the first
+    /// blob or manifest is written. A tree that is refused, or whose lookups fail, is never
+    /// named. A name handed to `named` is not yet a stored tree: the writes that follow it may
+    /// still fail, and only the tree this returns is in the store. The writes keep their order,
+    /// blobs first and the root last, so a reader that finds the root finds every manifest and
+    /// blob below it.
+    ///
+    /// # Errors
+    /// As [`TreeWriter::write`], except that a write that fails after `named` ran leaves the
+    /// name handed out for a tree that is not in the store; the blobs and manifests written
+    /// before it stay.
+    pub async fn write_named(
+        &self,
+        kept: &KeptClosure,
+        base: &BaseTree,
+        named: impl FnOnce(&ActionTree) + Send,
+    ) -> Result<ActionTree, NoTree> {
+        self.write_as(kept, base, Trust::Memos, named).await
     }
 
     /// [`TreeWriter::write`] for a tree whose last job found a manifest lost: nothing is taken
@@ -409,7 +432,22 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
     ) -> Result<ActionTree, NoTree> {
-        self.write_as(kept, base, Trust::Store).await
+        self.write_as(kept, base, Trust::Store, |_| ()).await
+    }
+
+    /// [`TreeWriter::write_checked`], naming the tree as [`TreeWriter::write_named`] does: a
+    /// pack the store lost is found before the tree is named, so a tree that is
+    /// [`NoTree::Lost`] is never named.
+    ///
+    /// # Errors
+    /// As [`TreeWriter::write_checked`] and [`TreeWriter::write_named`].
+    pub async fn write_checked_named(
+        &self,
+        kept: &KeptClosure,
+        base: &BaseTree,
+        named: impl FnOnce(&ActionTree) + Send,
+    ) -> Result<ActionTree, NoTree> {
+        self.write_as(kept, base, Trust::Store, named).await
     }
 
     /// Drops what the memos say of a manifest the store lost (`manifest`, its SHA-256): every
@@ -427,6 +465,7 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
         trust: Trust,
+        named: impl FnOnce(&ActionTree) + Send,
     ) -> Result<ActionTree, NoTree> {
         reserved_input(kept)?;
         let now = (self.clock)();
@@ -482,6 +521,8 @@ impl TreeWriter {
         children.push(encode::dir(INPUT_ROOT, &manifests[kept.root()]));
         children.push(encode::dir(".kbf", &kbf.digest));
         let root = top(children)?;
+        let tree = ActionTree { digest: root.tree };
+        named(&tree);
         self.write_whole(unlocated, now).await?;
         self.store_built(&plan, &built, &measures, &manifests)
             .await?;
@@ -492,7 +533,7 @@ impl TreeWriter {
         flights
             .write(&self.store, &self.retry, root.digest, root.bytes)
             .await?;
-        Ok(ActionTree { digest: root.tree })
+        Ok(tree)
     }
 
     /// Publishes the tierstore manifests of an output directory a task wrote, from the facts of

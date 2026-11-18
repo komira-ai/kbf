@@ -180,6 +180,57 @@ fn put_op_writes_the_row_for_its_owner_and_refuses_another_writer() {
     assert_eq!(a.op(op(9)).expect("read").expect("there").attempt, 2);
 }
 
+/// Catches a first attempt's row that costs a read before its write, or a row written over
+/// one another process owns: a new operation's first row is one write and no read; a later
+/// attempt's row is read, then written; a first attempt's row where this process's row already
+/// is (an earlier write whose answer was lost) is written over at the version read; and where
+/// another process's row is, it is refused and left as it was.
+#[test]
+fn a_first_attempts_row_is_one_write_and_another_process_row_is_still_refused() {
+    let env = env();
+    let (a, b) = (env.rows("a"), env.rows("b"));
+    let calls = || {
+        (
+            env.store.reads.load(Ordering::SeqCst),
+            env.store.batches.load(Ordering::SeqCst),
+        )
+    };
+    let first = OpRow {
+        attempt: 0,
+        ..row(1)
+    };
+    let before = calls();
+    a.put_op(op(5), &first).expect("a new row");
+    assert_eq!(calls(), (before.0, before.1 + 1), "one write, no read");
+    let later = OpRow {
+        attempt: 1,
+        ..row(1)
+    };
+    let before = calls();
+    a.put_op(op(5), &later).expect("its own row");
+    assert_eq!(
+        calls(),
+        (before.0 + 1, before.1 + 1),
+        "a read, then a write"
+    );
+    let before = calls();
+    a.put_op(op(5), &first).expect("its own row again");
+    assert_eq!(
+        calls(),
+        (before.0 + 1, before.1 + 2),
+        "a refused write, a read, a write"
+    );
+    assert_eq!(a.op(op(5)).expect("read").expect("there").attempt, 0);
+    assert_eq!(
+        b.put_op(op(5), &first),
+        Err(RowsError::Conflict { key: op_key(op(5)) })
+    );
+    let kept = a.op(op(5)).expect("read").expect("there");
+    assert_eq!(kept.owner, "a");
+    env.store.writes_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(a.put_op(op(6), &first), Err(RowsError::Store(_))));
+}
+
 /// A row this build does not know, or cannot read, is not overwritten as if it were its own.
 #[test]
 fn put_op_does_not_overwrite_a_row_it_cannot_read_or_does_not_know() {

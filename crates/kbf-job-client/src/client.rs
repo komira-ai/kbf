@@ -34,6 +34,16 @@ const CANCEL_JOB: &str = "/jobscheduler.v1.JobService/CancelJob";
 const GET_RESULT: &str = "/jobscheduler.v1.JobService/GetResult";
 const GET_LOGS: &str = "/jobscheduler.v1.JobService/GetLogs";
 
+/// How long the connection may sit idle before the client sends an HTTP/2 PING. A
+/// connection a NAT or load balancer dropped, or whose peer restarted without a FIN, gives
+/// no sign of it; the PING finds it within this time and the timeout below, instead of each
+/// call waiting out its whole deadline.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long the client waits for the answer to a PING before it drops the connection, so
+/// that the next call dials a new one.
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A client of one job service. Cheap to clone; the clones share one channel, so any number
 /// of calls may be in flight at once.
 #[derive(Clone)]
@@ -84,7 +94,11 @@ impl Client {
             request_timeout,
         } = config;
         let dial = Dial::new(&origin, ca_pem.as_deref(), connect_timeout)?;
-        let endpoint = Endpoint::from(origin.endpoint().clone()).origin(origin.uri().clone());
+        let endpoint = Endpoint::from(origin.endpoint().clone())
+            .origin(origin.uri().clone())
+            .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
+            .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
+            .keep_alive_while_idle(true);
         let channel = endpoint.connect_with_connector_lazy(dial);
         let grpc = Grpc::new(channel)
             .max_decoding_message_size(Self::MAX_MESSAGE)

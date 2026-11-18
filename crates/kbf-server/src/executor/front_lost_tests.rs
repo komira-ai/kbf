@@ -86,7 +86,7 @@ async fn a_checked_tree_over_a_lost_pack_answers_its_blob_missing_until_it_is_up
     let rig = super::put_dir::rig();
     let bytes = Bytes::from_static(b"an input held in a pack");
     let blob = kbf_segments::sha256(&bytes);
-    let packs = rig.front.parts.packs.clone();
+    let packs = rig.front.packs.clone();
     packs
         .put(vec![(blob, bytes.clone())])
         .await

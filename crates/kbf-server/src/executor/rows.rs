@@ -356,6 +356,11 @@ impl Rows {
     /// Writes `row` as the row of `operation`, which this process runs: a new row, or one this
     /// process owns.
     ///
+    /// The row of a first attempt is written in one transaction, on the condition that there is
+    /// none yet, which is so for a new operation; only when there is one is it read, and
+    /// written over at the version read if this process owns it. A later attempt's row is read
+    /// first, since this process wrote the attempt before it.
+    ///
     /// # Errors
     /// [`RowsError::Conflict`] when another process owns the row; the store cannot be written.
     pub fn put_op(&self, operation: OperationId, row: &OpRow) -> Result<(), RowsError> {
@@ -364,8 +369,15 @@ impl Rows {
             owner: self.instance.clone(),
             ..row.clone()
         };
+        let value = encode(&row);
+        if row.attempt == 0 {
+            match self.commit(Txn::new().put(key.clone(), value.clone(), Cond::Absent)) {
+                Err(RowsError::Conflict { .. }) => {}
+                written => return written,
+            }
+        }
         let cond = self.ours(&key)?;
-        self.commit(Txn::new().put(key, encode(&row), cond))
+        self.commit(Txn::new().put(key, value, cond))
     }
 
     /// Finishes `operation` of `action` as `finished`: its row deleted, if this process owns it

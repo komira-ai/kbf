@@ -35,12 +35,15 @@ use std::time::Duration;
 use js_proto::v1::{JobSpec, Needs, NetworkLevel};
 use kbf_proto::reapi::Digest;
 use ring::digest::{SHA256, digest};
+use tokio::time::Instant;
 
 use crate::executor::config::{Config, InputTree};
 use crate::executor::mac::{MacJob, System, check_version, mac_argv, mac_spec};
+use crate::executor::metrics::Metrics;
 use crate::executor::out::{PutDirRoots, TASK_IN_TREE, provider_layer};
 use crate::executor::outcome::Settled;
 use crate::executor::size_class::{SIZE_CLASS_LABEL, SizeClass};
+use crate::executor::steps::Step;
 use crate::executor::task::{PackKey, RunId, build_id, put_dir_argv};
 use crate::executor::traits::{InputsError, MintError};
 use crate::executor::{Ingest, Inputs};
@@ -159,6 +162,8 @@ pub(super) struct Preparer<'a> {
     pub(super) cfg: &'a Config,
     pub(super) inputs: &'a Arc<dyn Inputs>,
     pub(super) ingest: &'a Arc<dyn Ingest>,
+    /// Where the steps of the preparation are timed.
+    pub(super) metrics: &'a Metrics,
 }
 
 /// The job of `run`, which runs `action` with `booking`, with its put directory.
@@ -168,7 +173,10 @@ pub(super) async fn prepare(
     action: &Digest,
     booking: Booking,
 ) -> Result<Prepared, Settled> {
-    let facts = ctx.inputs.action(action).await?;
+    let started = Instant::now();
+    let facts = ctx.inputs.action(action).await;
+    ctx.metrics.step_took(Step::Facts, started.elapsed());
+    let facts = facts?;
     let class = &facts.size_class;
     let timeout = facts.timeout.unwrap_or(ctx.cfg.default_timeout);
     require(timeout <= ctx.cfg.max_run, || {
@@ -262,11 +270,18 @@ async fn minted(
     tree: InputTree,
 ) -> Result<PackKey, Settled> {
     let minted = ctx.ingest.mint(run, action, wall, tree).await;
-    minted.map_err(|e| match e {
+    minted.map_err(not_minted)
+}
+
+/// What a run whose put directory or action tree could not be had settles as: a mint's
+/// failure, or the failure of the tree's writes after the mint named it
+/// ([`Ingest::stored`](crate::executor::Ingest::stored)).
+pub(super) fn not_minted(error: MintError) -> Settled {
+    match error {
         MintError::Refused(why) => Settled::Invalid(format!("no put directory: {why}")),
         MintError::Unavailable(why) => Settled::Infra(format!("no put directory: {why}")),
         MintError::Missing(digests) => Settled::Missing(digests),
-    })
+    }
 }
 
 /// The labels of a job: the frontends' name and this process's id, and its size class if it

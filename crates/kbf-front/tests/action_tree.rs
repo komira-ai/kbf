@@ -46,6 +46,8 @@ mod listing;
 mod lost;
 #[path = "action_tree/memo.rs"]
 mod memo;
+#[path = "action_tree/named.rs"]
+mod named;
 #[path = "action_tree/places.rs"]
 mod places;
 #[path = "action_tree/retry.rs"]

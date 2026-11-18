@@ -513,6 +513,8 @@ async fn the_parsed_cache_flags_keep_the_directories_of_a_run_on_the_disk() {
         .await
         .expect("prepared");
     assert_eq!(run.kept.directory_count(), 1);
+    // The cache is written by a task the preparation does not wait for.
+    prep.detached_writes().settled().await;
     let kept: Vec<String> = std::fs::read_dir(&cache)
         .expect("the cache directory")
         .map(|entry| {

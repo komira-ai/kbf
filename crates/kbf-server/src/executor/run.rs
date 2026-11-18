@@ -1,9 +1,20 @@
 //! The task of one operation: its runs, one job each, until one answers its callers.
 //!
 //! A run is prepared (the action read, its key minted and, for a put directory, its tree
-//! written), its row written to the state store when there is one, and its job submitted; a
+//! named), its row written to the state store when there is one, and its job submitted; a
 //! submit whose answer was lost is sent again, the same spec under the same id, every
-//! [`Config::poll`](super::Config::poll), so the service makes one job. The job is then read
+//! [`Config::poll`](super::Config::poll), so the service makes one job.
+//!
+//! The tree's writes go on while the row is written and the job submitted
+//! ([`Ingest::stored`](super::Ingest::stored)): its name is a digest of what it holds, and the
+//! job's host reads it only once the job is placed. A first attempt waits for the writes once
+//! its submit is answered, before it reads the job back, and cancels its job when they fail, so
+//! that the job does not fail on its host; the operation then runs again. A job placed before
+//! its tree is in the store fails to start for an input it could not read, which runs the
+//! operation again too; by then the first attempt has waited for the writes, so the next attempt
+//! finds the tree stored and the race costs at most one attempt. A later attempt waits for its
+//! own tree's writes before it submits: those of a run whose earlier attempt ended before it
+//! waited (its submit refused, or the operation handed over) are not known to be stored. The job is then read
 //! back every poll until it ends ([`outcome::judge`](super::outcome)): a job that ended well has
 //! its pack ingested and answers the callers with the result; an ending of the farm's submits the
 //! operation's next attempt, while it has one ([`RESUBMITS`]); any other ending, and the last
@@ -24,7 +35,7 @@
 use std::future::pending;
 use std::sync::Arc;
 
-use js_proto::v1::{JobResult, JobState};
+use js_proto::v1::{JobResult, JobSpec, JobState};
 use kbf_front::{Finished, Stage};
 use kbf_proto::google::rpc;
 use kbf_proto::reapi;
@@ -41,7 +52,8 @@ use super::output::{Output, Tail};
 use super::phases::{Mark, Phase, Timeline};
 use super::record;
 use super::rows::{Look, OpRow, Rows, RowsError};
-use super::submit::{Booking, Preparer, prepare};
+use super::steps::Step;
+use super::submit::{Booking, Preparer, not_minted, prepare};
 use super::task::{PackKey, RunId};
 use super::traits::{Ingested, UntrustedLimits};
 
@@ -253,6 +265,7 @@ async fn fresh(
         cfg: &inner.cfg,
         inputs: &inner.deps.inputs,
         ingest: &inner.deps.ingest,
+        metrics,
     };
     let booking = Booking::of(op.whole_machine);
     let prepared = tokio::select! {
@@ -269,6 +282,12 @@ async fn fresh(
         }
     };
     timeline.stamp(Mark::Prepared, Instant::now(), metrics);
+    // A first attempt submits while its tree is written. A later one may follow a run whose
+    // job was placed before its tree was in the store: it waits for the tree first.
+    let early = run.attempt == 0;
+    if !early && let Err(ended) = tree_written(inner, run, cancel).await {
+        return ended;
+    }
     let job = prepared.spec.job_id.clone();
     let row = OpRow {
         owner: String::new(),
@@ -281,39 +300,38 @@ async fn fresh(
         whole_machine: op.whole_machine,
     };
     let id = op.id;
-    match on_rows(inner, move |rows| rows.put_op(id, &row)).await {
+    let started = Instant::now();
+    let written = on_rows(inner, move |rows| rows.put_op(id, &row)).await;
+    if written.is_some() {
+        metrics.step_took(Step::Row, started.elapsed());
+    }
+    match written {
         Some(Err(RowsError::Conflict { .. })) => return Ended::HandedOver,
         Some(Err(error)) => {
             tracing::warn!(operation = %op.id, %error, "the operation's row is not in the state store: no other frontend can take it up");
         }
         Some(Ok(())) | None => {}
     }
-    let api = inner.api();
-    loop {
-        let answer = tokio::select! {
-            biased;
-            () = cancel_asked(cancel) => {
-                // The submit may have been taken with its answer lost.
-                withdraw(inner, &job).await;
-                return Ended::Cancelled;
-            }
-            answer = api.submit_job(prepared.spec.clone()) => answer,
-        };
-        match answer {
-            Ok(_) => break,
-            Err(error) => {
-                if let Some(settled) = refused(&error) {
-                    return Ended::Again(settled, None);
-                }
-                note("submitting a job", &Err::<(), _>(error));
-                metrics.job_resubmitted();
-                sleep(inner.cfg.poll).await;
-            }
+    let answer = tokio::select! {
+        biased;
+        () = cancel_asked(cancel) => {
+            // The submit may have been taken with its answer lost.
+            withdraw(inner, &job).await;
+            return Ended::Cancelled;
         }
+        answer = submit_job(inner, &prepared.spec) => answer,
+    };
+    if let Err(settled) = answer {
+        return Ended::Again(settled, None);
     }
     metrics.job_submitted();
     timeline.stamp(Mark::Posted, Instant::now(), metrics);
     tracing::debug!(operation = %op.id, %run, %job, "submitted");
+    if early && let Err(ended) = tree_written(inner, run, cancel).await {
+        // The job cannot read its tree: it is not left to fail on its host.
+        withdraw(inner, &job).await;
+        return ended;
+    }
     if op.recorded {
         record::granted(&inner.deps.recorder, run, &job);
     }
@@ -322,6 +340,61 @@ async fn fresh(
         key: prepared.key,
     };
     watch_job(inner, op, run, &submitted, cancel, timeline).await
+}
+
+/// Submits `spec` until the job service answers with the job, sending it again every poll
+/// while the answer is lost: the same spec under the same id, so the service makes one job.
+/// Each call is timed as [`Step::Rpc`] and each wait as [`Step::Backoff`].
+///
+/// # Errors
+/// What the service's refusal of the job settles the run as.
+async fn submit_job(inner: &Inner, spec: &JobSpec) -> Result<(), Settled> {
+    let (api, metrics) = (inner.api(), &inner.deps.metrics);
+    loop {
+        let started = Instant::now();
+        let answer = api.submit_job(spec.clone()).await;
+        metrics.step_took(Step::Rpc, started.elapsed());
+        let Err(error) = answer else {
+            return Ok(());
+        };
+        if let Some(settled) = refused(&error) {
+            return Err(settled);
+        }
+        note("submitting a job", &Err::<(), _>(error));
+        metrics.job_resubmitted();
+        let started = Instant::now();
+        sleep(inner.cfg.poll).await;
+        metrics.step_took(Step::Backoff, started.elapsed());
+    }
+}
+
+/// Waits for the writes of `run`'s action tree ([`Ingest::stored`](super::Ingest::stored)),
+/// timed as [`Step::TreeWait`] and held to the run's preparation limit. A failed write ends the
+/// run as the mint's failure would have; a caller's cancel ends it cancelled.
+async fn tree_written(
+    inner: &Arc<Inner>,
+    run: RunId,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), Ended> {
+    let started = Instant::now();
+    let stored = timeout(inner.cfg.prepare_limit, inner.deps.ingest.stored(run));
+    let stored = tokio::select! {
+        biased;
+        () = cancel_asked(cancel) => return Err(Ended::Cancelled),
+        stored = stored => stored,
+    };
+    inner
+        .deps
+        .metrics
+        .step_took(Step::TreeWait, started.elapsed());
+    let settled = match stored {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(error)) => not_minted(error),
+        Err(_) => Settled::Infra(
+            "the run's action tree was not written within the preparation's limit".to_owned(),
+        ),
+    };
+    Err(Ended::Again(settled, None))
 }
 
 /// Runs `run` from the row a gone process left: its job read back where it is.
@@ -562,3 +635,6 @@ mod store_tests;
 #[cfg(test)]
 #[path = "run_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "run_tree_tests.rs"]
+mod tree_tests;

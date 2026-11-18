@@ -2,7 +2,8 @@
 //! the packs, and what it asked of the job service: the jobs submitted, those submitted again
 //! after an answer was lost, the operations run again as a new attempt, the jobs cancelled for
 //! their callers, the operations taken up from the state store, and the jobs seen on a host that
-//! missed its grace.
+//! missed its grace; and how long the phases of a run ([`crate::executor::phases`]) and the
+//! steps of its preparation and submit ([`crate::executor::steps`]) took.
 //!
 //! The counters are shared by the executor and the page that renders them. A server that never
 //! builds an executor builds none of this and renders none of it.
@@ -13,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::executor::RejectReason;
 use crate::executor::outcome::Settled;
 use crate::executor::phases::{Phase, PhaseHistograms};
+use crate::executor::steps::{Step, StepHistograms};
 
 /// How a run ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +128,7 @@ pub struct Metrics {
     reattached: AtomicU64,
     host_silence_seen: AtomicU64,
     phases: PhaseHistograms,
+    steps: StepHistograms,
 }
 
 impl Metrics {
@@ -144,6 +147,11 @@ impl Metrics {
     /// One `phase` of a run took `took`.
     pub(crate) fn phase_took(&self, phase: Phase, took: std::time::Duration) {
         self.phases.observe(phase, took);
+    }
+
+    /// One `step` of a run's preparation or submit took `took`.
+    pub(crate) fn step_took(&self, step: Step, took: std::time::Duration) {
+        self.steps.observe(step, took);
     }
 
     /// The job service answered a submit with the job.
@@ -244,6 +252,7 @@ impl Metrics {
             );
         }
         self.phases.render(out);
+        self.steps.render(out);
     }
 }
 

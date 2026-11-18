@@ -198,7 +198,27 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_as(kept, base, Trust::Memos).await
+        self.write_listing_as(kept, base, Trust::Memos, |_| ())
+            .await
+    }
+
+    /// As [`TreeWriter::write_listing`], and calls `named` with the listing as soon as its key
+    /// is known: after the blobs are located and the list is encoded and read back, before the
+    /// first blob or the list is written. A list that is refused, or whose lookups fail, is
+    /// never named. A listing handed to `named` is not yet stored: the writes that follow it
+    /// may still fail, and only the listing this returns is in the store. The list is written
+    /// last, after every blob it names.
+    ///
+    /// # Errors
+    /// As [`TreeWriter::write_listing`], except that a write that fails after `named` ran leaves
+    /// the key handed out for a list that is not in the store; the blobs written before it stay.
+    pub async fn write_listing_named(
+        &self,
+        kept: &KeptClosure,
+        base: &BaseTree,
+        named: impl FnOnce(&Listing) + Send,
+    ) -> Result<Listing, NoTree> {
+        self.write_listing_as(kept, base, Trust::Memos, named).await
     }
 
     /// [`TreeWriter::write_listing`] for a tree whose last job found an object lost: no place
@@ -213,7 +233,23 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_as(kept, base, Trust::Store).await
+        self.write_listing_as(kept, base, Trust::Store, |_| ())
+            .await
+    }
+
+    /// [`TreeWriter::write_listing_checked`], naming the list as
+    /// [`TreeWriter::write_listing_named`] does: a pack the store lost is found before the
+    /// list is named, so a list that is [`NoTree::Lost`] is never named.
+    ///
+    /// # Errors
+    /// As [`TreeWriter::write_listing_checked`] and [`TreeWriter::write_listing_named`].
+    pub async fn write_listing_checked_named(
+        &self,
+        kept: &KeptClosure,
+        base: &BaseTree,
+        named: impl FnOnce(&Listing) + Send,
+    ) -> Result<Listing, NoTree> {
+        self.write_listing_as(kept, base, Trust::Store, named).await
     }
 
     async fn write_listing_as(
@@ -221,6 +257,7 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
         trust: Trust,
+        named: impl FnOnce(&Listing) + Send,
     ) -> Result<Listing, NoTree> {
         reserved_input(kept)?;
         let Some(listed) = &base.listing else {
@@ -261,11 +298,13 @@ impl TreeWriter {
         read_back(&bytes)?;
         // tierstore names a tree list `cas/l/<sha256 of its bytes>` (`tree_list_key`).
         let key: ObjectKey = large_key(&kbf_segments::sha256(&bytes));
+        let listing = Listing {
+            key: key.to_string(),
+        };
+        named(&listing);
         self.write_whole(unlocated, now).await?;
         place::write_object(&*self.store, &self.retry, &key, Bytes::from(bytes)).await?;
-        Ok(Listing {
-            key: key.to_string(),
-        })
+        Ok(listing)
     }
 }
 

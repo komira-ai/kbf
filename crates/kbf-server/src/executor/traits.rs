@@ -115,8 +115,8 @@ pub trait Ingest: Send + Sync {
     /// The put directory `run` may commit the run of `action` into, good for a run of `wall`.
     /// Issued by the same secret that [`ingest`](Self::ingest) verifies it with: a directory the
     /// ingest did not issue for this run and this action is refused there. Called once for a
-    /// run. The run's input tree is written here too, as `tree` says, for
-    /// [`Inputs::tree`].
+    /// run. The run's input tree is named here too, as `tree` says, for [`Inputs::tree`], and
+    /// may still be being written when the mint answers ([`Ingest::stored`]).
     ///
     /// # Errors
     /// [`MintError`].
@@ -127,6 +127,20 @@ pub trait Ingest: Send + Sync {
         wall: Duration,
         tree: InputTree,
     ) -> Result<PackKey, MintError>;
+
+    /// Waits until the action tree [`Ingest::mint`] named for `run` is in the store. A mint
+    /// hands out the tree's name as soon as it is known and writes the tree after it, so that
+    /// the job is submitted while the tree is written; the job's host reads the tree only once
+    /// the job is placed. Asked once for a run, after its mint; a run whose tree needed no
+    /// writes, or that was never minted, is answered at once. By default every tree is in the
+    /// store when its mint answers.
+    ///
+    /// # Errors
+    /// [`MintError`]: a write of the tree failed, as the mint would have answered it.
+    async fn stored(&self, run: RunId) -> Result<(), MintError> {
+        let _ = run;
+        Ok(())
+    }
 
     /// What `key` holds, for `action`, run under `run`. Never trusts the pack.
     async fn ingest(
@@ -181,7 +195,7 @@ pub trait Inputs: Send + Sync {
     /// [`InputsError`].
     async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError>;
 
-    /// The action tree [`Ingest::mint`] wrote for the run of `run` that commits into a put
+    /// The action tree [`Ingest::mint`] named for the run of `run` that commits into a put
     /// directory, as it was asked to write it: with [`InputTree::Manifests`], its root
     /// manifest's digest, 64 lowercase hex digits; with [`InputTree::Provider`], the key of its
     /// tree list. Handed out once.
