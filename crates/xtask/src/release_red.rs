@@ -48,6 +48,7 @@ use serde_json::{Value, json};
 
 use crate::Error;
 use crate::advisories::{Call, Process, Tools, check_repo};
+use crate::pages::{PER_PAGE, Pages};
 use crate::pipeline_watch::jobs_path;
 
 /// The label of the issue.
@@ -55,9 +56,6 @@ pub const LABEL: &str = "main-red";
 
 /// What every issue title starts with.
 pub const PREFIX: &str = "RELEASE-RED: kbf ";
-
-/// Items GitHub lists per page (its maximum).
-const PAGE: usize = 100;
 
 /// `Failing` lines in one body.
 const MAX_FAILING: usize = 5;
@@ -206,10 +204,11 @@ fn read_run(gh: &mut impl Github, repo: &str, run_id: u64) -> Result<Run, Error>
 /// The completed jobs of the latest attempt, in the API's order, from every page.
 fn completed_jobs(gh: &mut impl Github, repo: &str, run_id: u64) -> Result<Vec<Job>, Error> {
     let mut jobs = vec![];
-    for page in 1.. {
-        let path = jobs_path(repo, run_id, page);
+    let mut pages = Pages::new(format!("repos/{repo}/actions/runs/{run_id}/jobs"));
+    loop {
+        let path = jobs_path(repo, run_id, pages.number());
         let items = array(&get(gh, &path)?, Some("jobs"), &path)?;
-        let last = items.len() < PAGE;
+        let more = pages.more(&items)?;
         let text = |job: &Value, key: &str| job[key].as_str().unwrap_or_default().to_owned();
         jobs.extend(
             items
@@ -221,19 +220,21 @@ fn completed_jobs(gh: &mut impl Github, repo: &str, run_id: u64) -> Result<Vec<J
                     conclusion: text(j, "conclusion"),
                 }),
         );
-        if last {
-            break;
+        if !more {
+            return Ok(jobs);
         }
     }
-    Ok(jobs)
 }
 
 /// The number of the open issue of the red, if there is one. A pull request is not one,
 /// though GitHub lists them with the issues.
 fn open_issue(gh: &mut impl Github, repo: &str) -> Result<Option<u64>, Error> {
-    for page in 1.. {
-        let path =
-            format!("repos/{repo}/issues?state=open&labels={LABEL}&per_page={PAGE}&page={page}");
+    let mut pages = Pages::new(format!("repos/{repo}/issues?state=open&labels={LABEL}"));
+    loop {
+        let page = pages.number();
+        let path = format!(
+            "repos/{repo}/issues?state=open&labels={LABEL}&per_page={PER_PAGE}&page={page}"
+        );
         let items = array(&get(gh, &path)?, None, &path)?;
         let found = items.iter().find(|i| {
             i.get("pull_request").is_none()
@@ -245,11 +246,10 @@ fn open_issue(gh: &mut impl Github, repo: &str) -> Result<Option<u64>, Error> {
                 .map(Some)
                 .ok_or_else(|| Error::Failed(format!("gh api {path}: an issue with no number")));
         }
-        if items.len() < PAGE {
-            break;
+        if !pages.more(&items)? {
+            return Ok(None);
         }
     }
-    Ok(None)
 }
 
 fn red(

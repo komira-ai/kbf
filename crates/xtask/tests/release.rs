@@ -1043,7 +1043,7 @@ fn tags_standing(root: &Path, tags: &[&str], top: &str, status: &str) {
         .map(|t| serde_json::json!({ "ref": format!("refs/tags/{t}") }))
         .collect();
     map.insert(
-        format!("repos/{REPO}/git/matching-refs/tags/v?per_page=100&page=1"),
+        format!("repos/{REPO}/git/matching-refs/tags/v"),
         serde_json::Value::Array(refs),
     );
     map.insert(
