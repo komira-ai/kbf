@@ -12,7 +12,8 @@ use tierstore::{BuiltTree, ListRange, Mode, RecordChild, TreeLimits, TreeListV2,
 use super::*;
 
 /// The SHA-256 of no bytes, in hex: what a file of size 0 has.
-const EMPTY_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+pub(super) const EMPTY_HEX: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// The base of the rig with every entry below its root listed, from the manifests the farm
 /// holds.
@@ -106,14 +107,23 @@ fn describe(built: &BuiltTree) -> BTreeMap<String, String> {
     described
 }
 
-/// The list stored at `key`, read by tierstore's version 2 reader as its mount provider reads it.
-fn built(rig: &Rig, key: &str) -> (BuiltTree, Vec<ListRange>) {
+/// The list stored at `key`, read by tierstore's version 2 reader as its mount provider reads it:
+/// the tree it builds, and its ranges as the key of the pack, the first byte and the length (a
+/// range names its key by its number in the list's keys).
+fn built(rig: &Rig, key: &str) -> (BuiltTree, Vec<(String, u64, u64)>) {
     let bytes = rig.farm.object(key).expect("the list is stored");
     let list = TreeListV2::open(&bytes).expect("a list the reader opens");
     let built = list
         .build(&TreeLimits::default(), |_| {})
         .expect("a list the reader builds");
-    (built, list.ranges().collect())
+    let ranges = (list.ranges())
+        .map(|range: ListRange| {
+            let key =
+                (list.keys().get(range.key as usize)).expect("a range names a key of the list");
+            (key.to_string(), range.offset, range.len)
+        })
+        .collect();
+    (built, ranges)
 }
 
 /// The list stored at `key`, described.
@@ -122,12 +132,12 @@ fn stored(rig: &Rig, key: &str) -> BTreeMap<String, String> {
 }
 
 /// The list the writer stored for `listing`.
-fn read(rig: &Rig, listing: &Listing) -> BTreeMap<String, String> {
+pub(super) fn read(rig: &Rig, listing: &Listing) -> BTreeMap<String, String> {
     stored(rig, listing.key())
 }
 
 /// A file line of the list.
-fn file_line(mode: &str, size: u64, src: &str, sha: &str) -> String {
+pub(super) fn file_line(mode: &str, size: u64, src: &str, sha: &str) -> String {
     format!("file {mode} size={size} src={src} sha={sha}")
 }
 
@@ -585,8 +595,8 @@ async fn a_refused_write_of_the_list_is_put() {
     assert!(rig.farm.object(&whole_key(&blob.hash_hex())).is_some());
 }
 
-/// Catches: a name tierstore's tree-list reader refuses (a whiteout prefix, `..`, a name given
-/// twice) stored in a list anyway: `NoTree::ListingRefused`, `why=unrepresentable`, and nothing
+/// Catches: a name tierstore's tree-list reader refuses (`..`, a name given twice) stored in a
+/// list anyway: `NoTree::ListingRefused`, `why=unrepresentable`, and nothing
 /// is written, not even the blob that is nowhere yet.
 #[tokio::test]
 async fn a_name_the_lists_reader_refuses_makes_no_list() {
@@ -596,7 +606,6 @@ async fn a_name_the_lists_reader_refuses_makes_no_list() {
         .store(&directory(vec![], vec![], vec![link("x", "t")]))
         .await;
     let cases = [
-        directory(vec![file(".wh.x", &blob, false)], vec![], vec![]),
         directory(vec![], vec![], vec![link("..", "t")]),
         directory(
             vec![file("x", &blob, false)],
@@ -661,8 +670,8 @@ async fn the_ranges_table_holds_every_pack_span_merged_within_64_kib() {
     let (_, ranges) = built(&rig, listing.key());
     let of = |key: &str| -> Vec<(u64, u64)> {
         (ranges.iter())
-            .filter(|range| &*range.key == key)
-            .map(|range| (range.offset, range.len))
+            .filter(|(of, _, _)| of == key)
+            .map(|&(_, offset, len)| (offset, len))
             .collect()
     };
     assert_eq!(of("cas/f/w/p0"), [(0, 6 + gap), (6 + 2 * gap + 1, 3)]);

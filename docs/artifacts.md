@@ -708,8 +708,9 @@ it, in the `linux-*` jobs after the task image is an asset, from that same image
    `kbf-task` layer) are not read.
 2. The base layers are applied in order onto one tree. A regular file of size 0 named `.wh.<name>` removes `<name>` from the
    layers below, and one named `.wh..wh..opq` removes everything the lower layers put in its directory, before what its own layer
-   adds, whatever the order of the tar. A later entry replaces an earlier one at the same path (a directory over a
-   directory keeps what it holds). A hard link becomes a separate file with the bytes and the mode of its target.
+   adds, whatever the order of the tar. Any other entry named `.wh.<...>` (a directory, a symlink, a file with bytes, the
+   bare `.wh.`) is not a whiteout and stays in the tree under its name, which tierstore takes like any other. A later
+   entry replaces an earlier one at the same path (a directory over a directory keeps what it holds). A hard link becomes a separate file with the bytes and the mode of its target.
 3. The packages of `crates/xtask/src/base_tree/removed.rs` are left out, each as `dpkg --purge` would remove it with no
    maintainer script run, from the base's own dpkg database: every path of its file list (a directory only once it is
    empty and no kept package lists it), its control files, its stanza of `/var/lib/dpkg/status` and its diversions, an
@@ -746,9 +747,8 @@ release build, not a deployment):
   hard link whose target has a `..` or is anything but a regular file the layers hold at that point (a symbolic link's
   target is kept as the image has it, absolute or with `..`: in a job the tree is the container's root, so it resolves
   inside the tree);
-- a name with tierstore's `.wh.` prefix left after the whiteouts are applied (a directory, a symlink or a file with bytes named
-  `.wh.x` is not a whiteout) and a base that alone passes one of tierstore's limits (2^24 - 1 entries, a manifest over
-  64 MiB, depth over 4096), by tierstore's own message.
+- a base that alone passes one of tierstore's limits (2^24 - 1 entries, a manifest over 64 MiB, depth over 4096), by
+  tierstore's own message.
 
 The bundle is a release asset like the others: listed in `SHA256SUMS`, so it has build provenance (it is one subject of the
 attestation of `SHA256SUMS`, and `verify-assets attestations` checks it with the SBOMs and the facts), and, like the facts,

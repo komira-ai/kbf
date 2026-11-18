@@ -97,9 +97,9 @@ async fn node_properties_anywhere_make_no_tree() {
     }
 }
 
-/// Catches: a name tierstore's reader refuses (a whiteout's `.wh.` prefix, `..`, `.`, empty, a
-/// slash) or one name given twice across REAPI's node lists, stored in a manifest: no tree,
-/// the reader's own refusal named, nothing written.
+/// Catches: a name tierstore's reader refuses (`..`, `.`, empty, a slash) or one name given twice
+/// across REAPI's node lists, stored in a manifest: no tree, the reader's own refusal named,
+/// nothing written.
 #[tokio::test]
 async fn a_name_tierstores_reader_refuses_makes_no_tree() {
     let rig = Rig::new().await;
@@ -108,10 +108,6 @@ async fn a_name_tierstores_reader_refuses_makes_no_tree() {
         .store(&directory(vec![], vec![], vec![link("x", "t")]))
         .await;
     let cases = [
-        (
-            directory(vec![file(".wh.x", &blob, false)], vec![], vec![]),
-            TreeError::UnsupportedName(".wh.x".to_owned()),
-        ),
         (
             directory(vec![], vec![], vec![link("..", "t")]),
             TreeError::UnsupportedName("..".to_owned()),

@@ -61,7 +61,7 @@ pub enum Reason {
     AccessDenied,
     /// The tree's version is not one the node reads.
     UnsupportedVersion,
-    /// A name of an entry is empty, `.`, `..`, has a `/` or a NUL, or begins `.wh.`.
+    /// A name of an entry is empty, `.`, `..`, or has a `/` or a NUL.
     UnsupportedEntryName,
     /// A digest is not 32 bytes.
     MalformedDigest,

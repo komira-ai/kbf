@@ -92,8 +92,10 @@ fn the_pinned_reader_flattens_a_tree_of_kbfs_shape() {
 }
 
 /// Catches: a pinned reader that takes what the writer must never produce, or refuses it under
-/// another name: bytes that do not hash to their digest, a whiteout name, and a file of size 0
-/// with a source. The limits the writer's tests hit at their boundaries are the design's.
+/// another name: bytes that do not hash to their digest, the name `..`, and a file of size 0
+/// with a source; and one that refuses a name beginning `.wh.` (an OCI whiteout file a build
+/// outputs), which it reads as any other name. The limits the writer's tests hit at their
+/// boundaries are the design's.
 #[test]
 fn the_pinned_reader_refuses_by_name_and_has_the_designs_limits() {
     let (manifests, root) = tree();
@@ -106,11 +108,19 @@ fn the_pinned_reader_refuses_by_name_and_has_the_designs_limits() {
             actual: root
         })
     );
-    let whiteout = br#"{"v":1,"children":[{"name":".wh.x","kind":"symlink","target":"t"}]}"#;
+    let dotdot = br#"{"v":1,"children":[{"name":"..","kind":"symlink","target":"t"}]}"#;
     assert_eq!(
-        parse_manifest(whiteout, &TreeDigest::of(whiteout)),
-        Err(TreeError::UnsupportedName(".wh.x".to_owned()))
+        parse_manifest(dotdot, &TreeDigest::of(dotdot)),
+        Err(TreeError::UnsupportedName("..".to_owned()))
     );
+    for name in [".wh.x", ".wh..wh..opq"] {
+        let whiteout =
+            format!(r#"{{"v":1,"children":[{{"name":"{name}","kind":"symlink","target":"t"}}]}}"#);
+        let read = parse_manifest(whiteout.as_bytes(), &TreeDigest::of(whiteout.as_bytes()))
+            .expect("a whiteout name is read");
+        assert_eq!(read.children.len(), 1);
+        assert_eq!(&*read.children[0].name, name);
+    }
     let empty = format!(
         r#"{{"v":1,"children":[{{"name":"e","kind":"file","sha256":"{CONTENTS}","size":0,"source":{{"key":"k","offset":0}}}}]}}"#
     );

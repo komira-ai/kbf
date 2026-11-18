@@ -11,9 +11,9 @@
 //! - a symlink: `{"name","kind":"symlink","target"}`.
 //!
 //! What tierstore's reader refuses is refused here first, by name and path: a name that is
-//! empty, `.`, `..`, holds a `/` or a NUL, or begins with `.wh.` ([`TreeError::Name`]); a
-//! manifest over [`MAX_MANIFEST_BYTES`]; more than [`MAX_ENTRIES`] entries below the root; an
-//! entry deeper than [`MAX_DEPTH`].
+//! empty, `.`, `..`, or holds a `/` or a NUL ([`TreeError::Name`]); a manifest over
+//! [`MAX_MANIFEST_BYTES`]; more than [`MAX_ENTRIES`] entries below the root; an entry deeper
+//! than [`MAX_DEPTH`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,13 +30,10 @@ pub const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 /// `MAX_DEPTH`).
 pub const MAX_DEPTH: usize = 4096;
 
-/// The prefix of the names tierstore keeps for whiteouts, which no entry of a tree may have.
-pub const WHITEOUT_PREFIX: &str = ".wh.";
-
 /// Why a tree cannot be written as tierstore manifests.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TreeError {
-    /// A name tierstore refuses: empty, `.`, `..`, with a `/` or a NUL, or beginning `.wh.`.
+    /// A name tierstore refuses: empty, `.`, `..`, or with a `/` or a NUL.
     #[error("{path}: the name {name:?} is one a tierstore tree cannot hold")]
     Name {
         /// The directory that holds it (`/` for the root).
@@ -225,11 +222,7 @@ fn quoted(text: &str) -> String {
 
 /// Whether tierstore takes `name` as the name of an entry.
 fn takes(name: &str) -> bool {
-    !(name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains(['/', '\0'])
-        || name.starts_with(WHITEOUT_PREFIX))
+    !(name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']))
 }
 
 impl ManifestWriter {

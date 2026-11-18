@@ -371,34 +371,65 @@ fn the_root_entry_of_a_layer_is_a_directory_and_adds_nothing() {
     );
 }
 
-/// Asserts a name with tierstore's `.wh.` prefix that is not a whiteout (a directory, a symlink, a
-/// file with bytes, a bare `.wh.`) is let into the tree and refused by the tree build by its
-/// directory and name, and that a whiteout that removed what it names leaves nothing to refuse.
-/// Catches: a `.wh.` name left in the tree that tierstore would refuse on every node, and every
-/// `.wh.` name treated as a whiteout, which would drop a directory silently.
+/// Asserts a name with the `.wh.` prefix that is not a whiteout (a directory, a symlink, a file
+/// with bytes, a bare `.wh.`) goes into the tree under its own name and kind, at the root and
+/// below, and that a whiteout that removed what it names is not itself left in the tree.
+/// Catches: a base image refused for a `.wh.` name tierstore stores, and every `.wh.` name
+/// treated as a whiteout, which would drop a directory silently.
 #[test]
-fn a_whiteout_name_left_after_the_whiteouts_is_refused_by_the_tree_build() {
-    for (entry, dir, name) in [
-        (E::dir("etc/.wh.x/", 0o755), "/etc", ".wh.x"),
-        (E::file("etc/.wh.x", 0o644, b"not empty"), "/etc", ".wh.x"),
-        (E::symlink("etc/.wh.x", "y"), "/etc", ".wh.x"),
-        (E::file("etc/.wh.", 0o644, b""), "/etc", ".wh."),
-        (E::file(".wh.top", 0o644, b"x"), "/", ".wh.top"),
-        (E::dir(".wh..wh..opq/", 0o755), "/", ".wh..wh..opq"),
-    ] {
-        assert_eq!(
-            refused(&[layer(&[entry])]),
-            [format!(
-                "the tree is refused: {dir}: the name {name:?} is one a tierstore tree cannot hold"
-            )]
-        );
-    }
+fn a_whiteout_name_left_after_the_whiteouts_goes_into_the_tree() {
+    let tree = built(&[layer(&[
+        E::dir("etc/.wh.d/", 0o755),
+        E::file("etc/.wh.d/inside", 0o644, b"in"),
+        E::file("etc/.wh.x", 0o644, b"not empty"),
+        E::symlink("etc/.wh.y", "x"),
+        E::file("etc/.wh.", 0o644, b""),
+        E::file(".wh.top", 0o644, b"x"),
+        E::dir(".wh..wh..opq/", 0o755),
+    ])]);
+    let listed = listing(&tree);
+    assert_eq!(listed.get("/etc/.wh.d"), Some(&Seen::Dir));
+    assert_eq!(
+        listed.get("/etc/.wh.d/inside"),
+        Some(&Seen::File {
+            exec: false,
+            bytes: b"in".to_vec()
+        })
+    );
+    assert_eq!(
+        listed.get("/etc/.wh.x"),
+        Some(&Seen::File {
+            exec: false,
+            bytes: b"not empty".to_vec()
+        })
+    );
+    assert_eq!(
+        listed.get("/etc/.wh.y"),
+        Some(&Seen::Symlink("x".to_owned()))
+    );
+    assert_eq!(
+        listed.get("/.wh.top"),
+        Some(&Seen::File {
+            exec: false,
+            bytes: b"x".to_vec()
+        })
+    );
+    assert_eq!(listed.get("/.wh..wh..opq"), Some(&Seen::Dir));
+    // A bare `.wh.` names nothing to remove, so even empty it is a file, not a whiteout.
+    assert_eq!(
+        listed.get("/etc/.wh."),
+        Some(&Seen::File {
+            exec: false,
+            bytes: Vec::new()
+        })
+    );
     let tree = built(&[
         layer(&[E::file("etc/x", 0o644, b"x")]),
         layer(&[E::whiteout("etc/.wh.x")]),
     ]);
     assert_eq!(listing(&tree).get("/etc"), Some(&Seen::Dir));
     assert!(!listing(&tree).contains_key("/etc/x"));
+    assert!(!listing(&tree).contains_key("/etc/.wh.x"));
 }
 
 /// Asserts modes are normalised: a file is 0755 if any execute bit is set and else 0644, a

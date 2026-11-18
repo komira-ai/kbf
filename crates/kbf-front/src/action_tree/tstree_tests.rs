@@ -296,12 +296,8 @@ fn a_tree_of_every_shape_is_the_bytes_tierstores_writer_writes() {
     // Eleven files with bytes, two of them of one digest: a span is handed out per digest.
     assert_eq!(spans.len(), 10);
     let gap = RANGE_MERGE_GAP;
-    let range = |key: &str, offset: u64, len: u64| ListRange {
-        key: key.into(),
-        offset,
-        len,
-    };
-    let ranges: Vec<ListRange> = list.ranges().collect();
+    let range = |key: &str, offset: u64, len: u64| (key.to_owned(), offset, len);
+    let ranges: Vec<(String, u64, u64)> = list.ranges().map(|range| keyed(&list, &range)).collect();
     assert_eq!(
         ranges,
         [
@@ -314,6 +310,16 @@ fn a_tree_of_every_shape_is_the_bytes_tierstores_writer_writes() {
             range(&format!("cas/l/{}", "9".repeat(64)), 0, 9),
         ]
     );
+}
+
+/// A range of `list` as the key of its pack, its first byte and its length: a range names its
+/// key by its number in the list's keys.
+fn keyed(list: &TreeListV2<'_>, range: &ListRange) -> (String, u64, u64) {
+    let key = list
+        .keys()
+        .get(range.key as usize)
+        .expect("a range names a key of the list");
+    (key.to_string(), range.offset, range.len)
 }
 
 /// Asserts that a tree's bytes do not depend on the order its directories give their children
@@ -377,8 +383,9 @@ fn a_smaller_gap_writes_more_ranges_and_nothing_else_differs() {
     let list = TreeListV2::open(&narrow).expect("the reader opens it");
     let p0: Vec<(u64, u64)> = list
         .ranges()
-        .filter(|range| &*range.key == "cas/f/w/p0")
-        .map(|range| (range.offset, range.len))
+        .map(|range| keyed(&list, &range))
+        .filter(|(key, _, _)| key == "cas/f/w/p0")
+        .map(|(_, offset, len)| (offset, len))
         .collect();
     let gap = RANGE_MERGE_GAP;
     assert_eq!(

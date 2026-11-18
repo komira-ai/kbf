@@ -89,7 +89,7 @@ pub(super) struct Manifest {
 /// ([`parse_manifest`]), so that nothing is stored that tierstore would refuse to read.
 ///
 /// # Errors
-/// What the reader says: a name it refuses (`.wh.`, `..`, ...), a name twice, a manifest over
+/// What the reader says: a name it refuses (`..`, empty, with a `/`, ...), a name twice, a manifest over
 /// its size limit, a span that runs past 2^64.
 pub(super) fn manifest(mut children: Vec<Child>) -> Result<Manifest, TreeError> {
     children.sort_unstable_by(|a, b| a.0.cmp(&b.0));

@@ -84,11 +84,11 @@ js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3
 # tierstore and objstore-s3 moved to the tierstore repository (https://github.com/komira-ai/tierstore).
 # Both are taken from it at this one revision. The revision is raised by a pull request of
 # its own that runs the whole CI, never along with other changes.
-objstore-s3 = { git = "https://github.com/komira-ai/tierstore", rev = "2849287b8931a244ad64ae919c8f079bb15b124d" } # tree list version 2, TSTREE (komira-ai/tierstore#341, its head)
-tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "2849287b8931a244ad64ae919c8f079bb15b124d" } # tree list version 2, TSTREE (komira-ai/tierstore#341, its head)
+objstore-s3 = { git = "https://github.com/komira-ai/tierstore", rev = "e83fba50c60e4b2d9e710cc8ce8202af755bc87e" } # entry names beginning .wh. (komira-ai/tierstore#348; main at komira-ai/tierstore#378)
+tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "e83fba50c60e4b2d9e710cc8ce8202af755bc87e" } # entry names beginning .wh. (komira-ai/tierstore#348; main at komira-ai/tierstore#378)
 # The trees API's wire contract (TreesService: its proto and generated stubs), at the same
 # revision; members take its `client` feature, and kbf-trees-client's fake the `server` one.
-tierstore-trees-api = { git = "https://github.com/komira-ai/tierstore", rev = "2849287b8931a244ad64ae919c8f079bb15b124d" } # tree list version 2, TSTREE (komira-ai/tierstore#341, its head)
+tierstore-trees-api = { git = "https://github.com/komira-ai/tierstore", rev = "e83fba50c60e4b2d9e710cc8ce8202af755bc87e" } # entry names beginning .wh. (komira-ai/tierstore#348; main at komira-ai/tierstore#378)
 # The enrollment profile kbf-deploy writes (`mdm push-cert`), an XML property list.
 # No default features: the profile is built as a value, not through serde.
 plist = { version = "1.10.1", default-features = false }
