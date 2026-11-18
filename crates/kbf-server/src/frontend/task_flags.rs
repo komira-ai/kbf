@@ -167,7 +167,7 @@ fn live() -> [Arg; 14] {
             // DEFAULT_PUT_RETRY_SECS, as above.
             .default_value("60")
             .help(
-                "The most seconds the waits add up to before a create-only write of an action tree to the tier store (`cas/l/<sha256>`) gives up on a 503 (\"retry later\", which the store answers while it registers: 10 to 40 s), so the lease fails only after this long. A write whose connection turns out to be dead is made once more at once, whatever this says. 0 never waits for a 503. Used only with `--task-secret-file` and `--task-out-mode put-dir`",
+                "The most seconds the waits add up to before a create-only write of an action tree to the tier store (`cas/l/<sha256>`) gives up on a 503 (\"retry later\", which the store answers while it registers: 10 to 40 s), so the lease fails only after this long. A write whose connection turns out to be dead is made once more at once, whatever this says. 0 never waits for a 503. A 503 `SlowDown` (the store taking as many uploads as it can) is back-pressure and is waited out past this, until the run's preparation limit. Used only with `--task-secret-file` and `--task-out-mode put-dir`",
             ),
         Arg::new(MANIFEST_WRITES)
             .long("task-manifest-writes")

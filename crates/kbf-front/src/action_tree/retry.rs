@@ -3,7 +3,7 @@
 //!
 //! Every write of a tree is create-only and content-bound (the same key always gets the same
 //! bytes), so repeating one is safe: an object an earlier attempt did store is `AlreadyExists`,
-//! which the write counts as done. Two answers are repeated, and no other:
+//! which the write counts as done. Three answers are repeated, and no other:
 //!
 //! - **A connection-level failure** ([`ObjectStoreError::Transport`]: a pooled connection the
 //!   store had closed, "connection closed before message completed", "Broken pipe"): once, at
@@ -14,6 +14,10 @@
 //!   [`PutRetry::total`] (`--task-put-retry-secs`, [`DEFAULT_TOTAL`] by default); the wait that
 //!   would pass the total is cut to end there, and when the waits have added up to it, the 503
 //!   is the failure. A total of zero never retries a 503.
+//! - **A 503 `SlowDown`** (the store is taking as many uploads as it can: back-pressure, not a
+//!   fault): with the same doubling waits, for as long as the store answers it; its waits do
+//!   not count toward the total. What ends it is the caller: a preparation that runs out of its
+//!   limit drops the write, and with it the retry.
 //!
 //! Every other answer (a 403, a 500, a body that failed its digest check) is reported on the
 //! first attempt. A write whose body is read from a source is made again by reading the source
@@ -95,13 +99,18 @@ pub(super) enum Failed<E = NoTree> {
     Other(E),
 }
 
+/// Whether `error` is the store's back-pressure: a 503 `SlowDown`.
+fn is_slow_down(error: &ObjectStoreError) -> bool {
+    matches!(error, ObjectStoreError::Service { status: 503, code, .. } if code == "SlowDown")
+}
+
 /// Whether `error` is a 503 of the store.
 fn is_unavailable(error: &ObjectStoreError) -> bool {
     matches!(error, ObjectStoreError::Service { status: 503, .. })
 }
 
 /// Runs `attempt` (one create-only write of `key`), and again after a connection-level failure
-/// (once) or a 503 (within the total).
+/// (once), a 503 (within the total) or a 503 `SlowDown` (for as long as the store answers it).
 ///
 /// # Errors
 /// [`NoTree::Put`] with the store's last answer, or the [`Failed::Other`] of an attempt.
@@ -147,6 +156,11 @@ where
         };
         if matches!(error, ObjectStoreError::Transport(_)) && !reconnected {
             reconnected = true;
+            continue;
+        }
+        if is_slow_down(&error) {
+            retry.sleeper.sleep(next).await;
+            next = (next * 2).min(LONGEST_WAIT);
             continue;
         }
         if is_unavailable(&error) && waited < retry.total {

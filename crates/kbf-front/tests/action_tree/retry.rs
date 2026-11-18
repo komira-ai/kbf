@@ -1,6 +1,6 @@
 //! The retry of a create-only write to `cas/l/`: a connection that turns out to be dead is
-//! tried once more, a 503 is waited out within the configured total, and nothing else is
-//! repeated. The waits are recorded by a fake [`Sleeper`], never taken.
+//! tried once more, a 503 is waited out within the configured total, a 503 `SlowDown`
+//! (back-pressure) is waited out past it, and nothing else is repeated. The waits are recorded by a fake [`Sleeper`], never taken.
 
 use kbf_front::action_tree::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, Sleeper};
 
@@ -45,8 +45,17 @@ fn dead_connection() -> ObjectStoreError {
 fn unavailable() -> ObjectStoreError {
     ObjectStoreError::Service {
         status: 503,
-        code: "SlowDown".to_owned(),
+        code: "ServiceUnavailable".to_owned(),
         message: "retry later".to_owned(),
+    }
+}
+
+/// The store's back-pressure, as tierstore answers it.
+fn slow_down() -> ObjectStoreError {
+    ObjectStoreError::Service {
+        status: 503,
+        code: "SlowDown".to_owned(),
+        message: "The server is taking as many uploads as it can; retry after a moment.".to_owned(),
     }
 }
 
@@ -153,7 +162,7 @@ async fn a_503_past_the_total_fails_with_the_stores_answer() {
         failed,
         NoTree::Put {
             key: key.clone(),
-            why: "store answered 503 SlowDown: retry later".to_owned()
+            why: "store answered 503 ServiceUnavailable: retry later".to_owned()
         }
     );
     assert_eq!(failed.why(), "store");
@@ -268,4 +277,51 @@ async fn the_timer_of_a_running_frontend_waits_out_a_503() {
     rig.write(&root).await.expect("a tree");
     assert_eq!(rig.farm.object(&key), Some(bytes));
     assert_eq!(rig.farm.puts_of(&key["cas/l/".len()..]), 2);
+}
+
+/// Catches: the store's back-pressure taken for a failure once the 503 total is spent, so that a
+/// burst of preparations fails its runs as the farm's: fifty `SlowDown`s, under a total of
+/// 5 s, are waited out with doubling waits held at [`LONGEST_WAIT`], well past the total, and
+/// the blob is stored.
+#[tokio::test]
+async fn a_slow_down_is_waited_out_past_the_total() {
+    let (rig, sleeps) = rig(Duration::from_secs(5)).await;
+    let (root, key, bytes) = unlocated(&rig).await;
+    script(&rig, &key, (0..50).map(|_| slow_down()).collect());
+    rig.write(&root).await.expect("a tree");
+    assert_eq!(rig.farm.object(&key), Some(bytes));
+    assert_eq!(rig.farm.puts_of(&key["cas/l/".len()..]), 51);
+    let waits = sleeps.waits();
+    assert_eq!(waits.len(), 50);
+    assert_eq!(
+        &waits[..5],
+        [
+            FIRST_WAIT,
+            FIRST_WAIT * 2,
+            FIRST_WAIT * 4,
+            FIRST_WAIT * 8,
+            LONGEST_WAIT
+        ]
+    );
+    assert!(waits[4..].iter().all(|wait| *wait == LONGEST_WAIT));
+}
+
+/// Catches: a `SlowDown` that a total of zero (which never retries a 503) turns into a failure,
+/// and a manifest's write that gives up on it: with no total, a manifest answered `SlowDown`
+/// twice is waited out and the tree is made.
+#[tokio::test]
+async fn a_slow_down_is_waited_out_with_a_zero_total() {
+    let (rig, sleeps) = rig(Duration::ZERO).await;
+    let packed = rig.farm.packed("packed", "cas/f/w/p0", 0).await;
+    let root = rig
+        .store(&directory(vec![file("p", &packed, false)], vec![], vec![]))
+        .await;
+    rig.farm
+        .state()
+        .faults
+        .any
+        .extend([slow_down(), slow_down()]);
+    let tree = rig.write(&root).await.expect("a tree");
+    rig.farm.flatten(&tree).expect("every manifest is stored");
+    assert_eq!(sleeps.waits(), [FIRST_WAIT, FIRST_WAIT * 2]);
 }
