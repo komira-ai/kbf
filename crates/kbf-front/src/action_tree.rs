@@ -34,7 +34,13 @@
 //! roots share is built and stored once; a hit skips both, and the files below it are not looked
 //! up. It holds at most [`MEMO_ENTRIES`] entries, each good for [`MEMO_TTL`] on the writer's
 //! clock and no longer than its subdirectories' entries; [`TreeWriter::forget`] drops an input
-//! root's entries.
+//! root's entries. A directory is remembered as soon as its manifest and every manifest of its
+//! subtree are stored, not when the whole tree is: a preparation cut off part way keeps what it
+//! stored, and the next tree of the input root writes only the rest.
+//!
+//! **The writes in flight** ([`flight`]) are shared: a preparation that needs a manifest another
+//! preparation is writing waits for that write, so concurrent trees that share a subtree store
+//! each of its manifests once.
 //!
 //! **The place memo** ([`places`]) maps a blob's digest to where it was found (a pack span, or
 //! the whole object `cas/l/<sha256>`), so that a tree naming blobs an earlier tree named asks
@@ -57,6 +63,7 @@
 
 mod base;
 mod encode;
+mod flight;
 mod listing;
 mod memo;
 mod place;
@@ -70,7 +77,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use futures::stream::{self, StreamExt as _, TryStreamExt as _};
+use futures::stream::{self, StreamExt as _};
 use kbf_types::Digest;
 use tierstore::{MAX_DEPTH, MAX_ENTRIES, TreeDigest, TreeError};
 
@@ -81,6 +88,7 @@ pub use self::places::PLACE_ENTRIES;
 pub use self::retry::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, PutRetry, Sleeper};
 
 use self::encode::{Child, Manifest};
+use self::flight::Flights;
 use self::memo::{Measure, Memo, Remembered};
 use self::place::Place;
 use self::places::Places;
@@ -259,8 +267,8 @@ impl ActionTree {
     }
 }
 
-/// The manifest writer. Shared by every preparation: the manifest memo and the place memo are
-/// the only state it holds.
+/// The manifest writer. Shared by every preparation: the manifest memo, the place memo and the
+/// manifest writes in flight are the only state it holds.
 pub struct TreeWriter {
     source: Arc<dyn BlobSource>,
     store: Arc<dyn LargeStore>,
@@ -269,6 +277,9 @@ pub struct TreeWriter {
     memo: Mutex<Memo>,
     /// Where blobs were found ([`places`]).
     places: Mutex<Places>,
+    /// The manifest writes in flight, which every preparation that needs one waits for
+    /// ([`flight`]).
+    flights: Flights,
     /// The most entries a tree list holds ([`MAX_ENTRIES`] unless a test lowers it).
     list_entries: u64,
 }
@@ -304,6 +315,7 @@ impl TreeWriter {
             retry: PutRetry::default(),
             memo: Mutex::new(Memo::new(entries)),
             places: Mutex::new(Places::new(PLACE_ENTRIES)),
+            flights: Flights::default(),
             list_entries: MAX_ENTRIES,
         }
     }
@@ -393,19 +405,9 @@ impl TreeWriter {
         children.push(encode::dir(".kbf", &kbf.digest));
         let root = top(children)?;
         self.write_whole(unlocated, now).await?;
-        let store = &*self.store;
-        // Collected, as `place`'s asks are, so the future can be proved `Send`.
-        let writes: Vec<_> = built
-            .iter()
-            .map(|manifest| {
-                place::write_manifest(store, &self.retry, &manifest.digest, manifest.bytes.clone())
-            })
-            .collect();
-        stream::iter(writes)
-            .buffered(place::WRITES_IN_FLIGHT)
-            .try_collect::<()>()
+        self.store_built(&plan, &built, &measures, &manifests)
             .await?;
-        self.remember(&plan, &measures, &manifests);
+        let store = &*self.store;
         place::write_manifest(store, &self.retry, &kbf.digest, kbf.bytes).await?;
         place::write_manifest(store, &self.retry, &root.digest, root.bytes).await?;
         Ok(ActionTree { digest: root.tree })
@@ -460,18 +462,8 @@ impl TreeWriter {
             manifests.insert(*digest, manifest.digest);
             built.push(manifest);
         }
-        let store = &*self.store;
-        let writes: Vec<_> = built
-            .iter()
-            .map(|manifest| {
-                place::write_manifest(store, &self.retry, &manifest.digest, manifest.bytes.clone())
-            })
-            .collect();
-        stream::iter(writes)
-            .buffered(place::WRITES_IN_FLIGHT)
-            .try_collect::<()>()
+        self.store_built(&plan, &built, &measures, &manifests)
             .await?;
-        self.remember(&plan, &measures, &manifests);
         Ok(manifests[root])
     }
 
@@ -572,17 +564,39 @@ impl TreeWriter {
         Ok(Plan { order, hits })
     }
 
-    /// Remembers every directory `plan` built, once its manifest is stored.
-    fn remember(
+    /// Stores `built`, the manifests of `plan`'s directories in its order, at most
+    /// [`place::WRITES_IN_FLIGHT`] at once, each write shared with every other preparation that
+    /// needs it ([`flight`]); and remembers each directory as soon as its manifest and every
+    /// manifest before it in the order are stored. The order is children first, so a directory
+    /// is remembered only when its whole subtree is stored, and a preparation cut off part way
+    /// (its time ran out, a write failed) keeps the subtrees it finished: the next tree of the
+    /// same input root writes only the rest.
+    ///
+    /// # Errors
+    /// [`NoTree::Put`]: the store refused a write; the directories before it stay remembered.
+    async fn store_built(
         &self,
         plan: &Plan<'_>,
+        built: &[Manifest],
         measures: &BTreeMap<Digest, Measure>,
         manifests: &BTreeMap<Digest, Digest>,
-    ) {
-        let mut memo = self.lock();
-        for (digest, directory) in &plan.order {
+    ) -> Result<(), NoTree> {
+        // Collected, as `place`'s asks are, so the future can be proved `Send`.
+        let writes: Vec<_> = built
+            .iter()
+            .map(|manifest| {
+                let bytes = manifest.bytes.clone();
+                self.flights
+                    .write(&self.store, &self.retry, manifest.digest, bytes)
+            })
+            .collect();
+        let mut stored = stream::iter(writes)
+            .buffered(place::WRITES_IN_FLIGHT)
+            .zip(stream::iter(&plan.order));
+        while let Some((answer, (digest, directory))) = stored.next().await {
+            answer?;
             let children = directory.directories.iter().map(|(_, child)| *child);
-            memo.put(
+            self.lock().put(
                 *digest,
                 Remembered {
                     manifest: manifests[digest],
@@ -591,6 +605,7 @@ impl TreeWriter {
                 },
             );
         }
+        Ok(())
     }
 }
 

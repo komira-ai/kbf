@@ -6,20 +6,20 @@ use kbf_front::action_tree::MEMO_TTL;
 use super::*;
 
 /// The manifest digest of the Directory listing only the symlink `name` (to `t`).
-fn link_manifest(name: &str) -> String {
+pub(super) fn link_manifest(name: &str) -> String {
     let text =
         format!(r#"{{"v":1,"children":[{{"name":"{name}","kind":"symlink","target":"t"}}]}}"#);
     TreeDigest::of(text.as_bytes()).to_string()
 }
 
 /// A Directory listing only the symlink `name` (to `t`).
-async fn link_root(rig: &Rig, name: &str) -> Digest {
+pub(super) async fn link_root(rig: &Rig, name: &str) -> Digest {
     rig.store(&directory(vec![], vec![], vec![link(name, "t")]))
         .await
 }
 
 /// A Directory holding the subdirectory `sub` as `name`, and the symlink `name` to `t`.
-async fn holding(rig: &Rig, name: &str, sub: &Digest) -> Digest {
+pub(super) async fn holding(rig: &Rig, name: &str, sub: &Digest) -> Digest {
     rig.store(&directory(
         vec![],
         vec![subdir("s", sub)],
@@ -30,7 +30,7 @@ async fn holding(rig: &Rig, name: &str, sub: &Digest) -> Digest {
 
 /// The manifest digest of [`holding`]'s Directory, its subdirectory's manifest `sub` (whose
 /// text is `sub_text`).
-fn holding_manifest(name: &str, sub: &str, sub_len: usize) -> String {
+pub(super) fn holding_manifest(name: &str, sub: &str, sub_len: usize) -> String {
     let text = format!(
         r#"{{"v":1,"children":[{{"name":"s","kind":"dir","sha256":"{sub}","size":{sub_len}}},{{"name":"{name}","kind":"symlink","target":"t"}}]}}"#
     );
@@ -38,7 +38,7 @@ fn holding_manifest(name: &str, sub: &str, sub_len: usize) -> String {
 }
 
 /// The text of [`link_root`]'s manifest.
-fn link_text(name: &str) -> String {
+pub(super) fn link_text(name: &str) -> String {
     format!(r#"{{"v":1,"children":[{{"name":"{name}","kind":"symlink","target":"t"}}]}}"#)
 }
 

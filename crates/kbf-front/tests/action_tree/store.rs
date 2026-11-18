@@ -116,8 +116,9 @@ async fn a_key_already_taken_is_success() {
 }
 
 /// Catches: a refused write taken for written: a blob's and an input manifest's each make no
-/// tree, `why=store`, naming the key; and a directory is remembered only once every directory
-/// manifest of its tree was stored.
+/// tree, `why=store`, naming the key; a directory whose manifest was refused is not
+/// remembered, and its subdirectory, stored before the refusal, is: the next tree writes the
+/// refused manifest again and not the subdirectory's.
 #[tokio::test]
 async fn a_refused_write_names_no_tree() {
     let rig = Rig::new().await;
@@ -162,11 +163,18 @@ async fn a_refused_write_names_no_tree() {
     );
     assert_eq!(rig.farm.puts_of(&sub_hex), 1);
     rig.farm.state().faults.put = None;
+    let work_hex = TreeDigest::of(work_manifest.as_bytes()).to_string();
+    let refused_before = rig.farm.puts_of(&work_hex);
     rig.write(&root).await.expect("a tree");
     assert_eq!(
         rig.farm.puts_of(&sub_hex),
-        2,
-        "the subdirectory was not remembered, so it is built and written again"
+        1,
+        "the subdirectory was stored before the refusal and remembered: not written again"
+    );
+    assert_eq!(
+        rig.farm.puts_of(&work_hex),
+        refused_before + 1,
+        "the refused manifest was not remembered: it is written again"
     );
 }
 

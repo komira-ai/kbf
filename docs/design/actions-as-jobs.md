@@ -350,6 +350,9 @@ content-bound. A failure is "no tree" for that job (4.6).
   minutes, a constant, B20; on the frontend's injected clock) and no later than the earliest-expiring of its children.
   A failure `release` reports (section 6) drops every entry of that action's input root, so the rerun's manifests come from the
   index as it is then.
+  A directory is remembered as soon as its own manifest and its subtree's are stored, so a preparation that runs out
+  of time keeps the subtrees it finished; and a manifest another preparation is writing is waited for, not PUT again,
+  so concurrent trees sharing a toolchain PUT each of its manifests once.
 - **tierstore's caches** are keyed by blob SHA-256 (`_tiering/fill/<sha256>` on a build node), so a file read by two
   actions, two trees or two jobs on a node is fetched once per node; manifests are blobs too, so the base's
   manifests and files named by every action tree are fetched once per node, as is a toolchain subtree two input
