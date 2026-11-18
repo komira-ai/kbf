@@ -94,7 +94,7 @@ struct Flaky {
 
 impl Flaky {
     /// From now until `window` has passed on the runtime's clock, every call (a write, a read, a
-    /// length, a delete, a listing) is answered 503 `ServiceUnavailable`, as tierstore answers
+    /// length, a delete, a listing) is answered 503 `ServiceUnavailable`, as a store answers
     /// while it fails over its metadata.
     fn fail_over_for(&self, window: Duration) {
         let until = tokio::time::Instant::now() + window;

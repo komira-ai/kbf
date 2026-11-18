@@ -134,13 +134,13 @@ slow large uploads as there are slots hold the other writers back until one ends
 
 Every call of the frontend to the pack store (a client's upload or read, an action's preparation
 and ingest, base publication, the janitor's listings and deletes) waits out a store that answers
-503, such as a tierstore failing over its block metadata (up to about 30 s). The call is made
+503, such as a store failing over its metadata (up to about 30 s). The call is made
 again after jittered waits that double from about 0.5 s to 8 s (each between half and all of
 its nominal length, so that the calls a failover stopped together do not come back together),
 until the waits add up to 60 s; a 503 after that is the call's answer, its message saying how
 long it waited. The store is then taken as down: until it answers a call with anything but a
 503, every 503 is its call's answer at once, so a store down for good costs 60 s once, not once
-for each call a write, a preparation or a sweep makes. tierstore's `Retry-After` is not read: the store client gives the frontend no
+for each call a write, a preparation or a sweep makes. The store's `Retry-After` is not read: the store client gives the frontend no
 header of an error answer. A 503 `SlowDown` (tierstore taking as many uploads as it can) of a
 write whose body is in hand is back-pressure: it is waited out, holding the write's slot, for as
 long as the store answers it, and those waits do not count toward the 60 s. The writes of an

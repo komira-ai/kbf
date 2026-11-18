@@ -10,7 +10,7 @@ use kbf_front::store_wait::STORE_WAIT;
 use super::put_dir::{WALL, action_with_input, rig};
 use super::*;
 
-/// A failover of tierstore's metadata: the longest the store answers 503 for.
+/// A failover of the store's metadata: the longest the store answers 503 for.
 const FAILOVER: Duration = Duration::from_secs(30);
 
 /// The waits taken so far, of every op.

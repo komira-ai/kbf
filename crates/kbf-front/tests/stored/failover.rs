@@ -26,7 +26,7 @@ use crate::rig::{Rig, SMALL, blob_len, blob_of};
 const OK: i32 = Code::Ok as i32;
 const UNAVAILABLE: i32 = Code::Unavailable as i32;
 
-/// A failover of tierstore's metadata: the longest the store answers 503 for.
+/// A failover of the store's metadata: the longest the store answers 503 for.
 const FAILOVER: Duration = Duration::from_secs(30);
 
 /// A rig holding the blobs `small` (packed) and `large` (an object of its own, past [`SMALL`]).

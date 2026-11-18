@@ -52,7 +52,7 @@ fn injected() -> ObjectStoreError {
     injected_with(500)
 }
 
-/// A failure of the store of `status`: a 500, a 503 that is not `SlowDown` (what tierstore
+/// A failure of the store of `status`: a 500, a 503 that is not `SlowDown` (what a store
 /// answers while it fails over its metadata) or a 507 (full).
 fn injected_with(status: u32) -> ObjectStoreError {
     let code = match status {
@@ -192,7 +192,7 @@ impl Spy {
 
     /// From now until `window` has passed on the runtime's clock, every call of the store (a
     /// write, a ranged read, a length, a presence check, a delete, a listing) is answered 503
-    /// `ServiceUnavailable`, as tierstore answers while it fails over its metadata.
+    /// `ServiceUnavailable`, as a store answers while it fails over its metadata.
     pub fn fail_over_for(&self, window: Duration) {
         let until = tokio::time::Instant::now() + window;
         *self.failover.lock().unwrap_or_else(PoisonError::into_inner) = Some(until);

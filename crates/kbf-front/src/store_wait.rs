@@ -6,13 +6,13 @@
 //! ([`PutRetry`](crate::action_tree::PutRetry)) shares.
 //!
 //! - **What is waited out.** A 503 of the store ([`ObjectStoreError::Service`] with status 503):
-//!   tierstore answers one while it fails over its metadata (up to about 30 s, for writes,
+//!   a store answers one while it fails over its metadata (up to about 30 s, for writes,
 //!   deletes, listings and lookups of keys it has to find), and a `SlowDown` while it is taking
 //!   as many uploads as it can. Every other answer is the call's answer at once.
 //! - **The waits.** The first wait is about [`FIRST_WAIT`] and each one after is about twice the
 //!   one before, up to [`LONGEST_WAIT`]. Each is jittered: a wait of a nominal `w` lasts
 //!   between `w / 2` and `w`, so the callers a failover stopped together do not come back
-//!   together. tierstore's `Retry-After` is not read: the store client gives kbf no header of
+//!   together. The store's `Retry-After` is not read: the store client gives kbf no header of
 //!   an error answer. The waits of one call add up to at most [`STORE_WAIT`] (60 s); the wait
 //!   that would pass it is cut to end there, and a 503 when the waits have added up to it is
 //!   the call's answer, with the time waited in its message. A failover of 30 s is ridden out
