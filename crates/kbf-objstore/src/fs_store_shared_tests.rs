@@ -32,12 +32,12 @@ fn names(dir: &Path) -> Vec<String> {
 }
 
 /// A file named as a temporary file of `store` is: its prefix and `n`.
-fn plant_tmp(store: &FsStore, n: u64) -> PathBuf {
+fn write_tmp(store: &FsStore, n: u64) -> PathBuf {
     let path = store
         .inner
         .tmp
         .join(format!("{}{n}", store.inner.tmp_prefix));
-    fs::write(&path, b"in flight").expect("plant");
+    fs::write(&path, b"in flight").expect("write a temporary file");
     path
 }
 
@@ -92,7 +92,7 @@ async fn an_exclusive_open_is_refused_while_another_exclusive_store_is_open() {
 async fn a_shared_open_keeps_a_running_instances_temporary_file() {
     let dir = dir("kbf-objstore-shared-inflight");
     let first = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("first");
-    let mine = plant_tmp(&first, 0);
+    let mine = write_tmp(&first, 0);
     let second = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("second");
     assert!(mine.exists(), "the first's in-flight file was removed");
     put(&second, "k", b"v").await.expect("put");
@@ -107,7 +107,7 @@ async fn a_shared_open_keeps_a_running_instances_temporary_file() {
 async fn a_shared_open_removes_a_stopped_instances_leftovers() {
     let dir = dir("kbf-objstore-shared-stopped");
     let live = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("live");
-    let kept = plant_tmp(&live, 3);
+    let kept = write_tmp(&live, 3);
     let live_name = file_name(&kept)
         .split_once('.')
         .expect("a dot")
@@ -145,8 +145,8 @@ async fn a_shared_open_removes_exclusive_temporary_files_only_when_no_exclusive_
     let dir = dir("kbf-objstore-shared-legacy");
     let exclusive = FsStore::open(&dir, Floor::Bytes(1)).expect("exclusive");
     let tmp = dir.join("tmp");
-    fs::write(tmp.join("0"), b"in flight").expect("plant");
-    fs::write(tmp.join("old-1-0.5"), b"in flight").expect("plant");
+    fs::write(tmp.join("0"), b"in flight").expect("write a temporary file");
+    fs::write(tmp.join("old-1-0.5"), b"in flight").expect("write a temporary file");
     let beside = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("shared");
     assert!(tmp.join("0").exists(), "removed under a held LOCK");
     assert!(tmp.join("old-1-0.5").exists(), "removed under a held LOCK");
@@ -207,8 +207,8 @@ async fn exclusive_and_shared_opens_read_what_the_other_wrote() {
 async fn a_shared_store_writes_its_temporary_files_under_tmp_shared_only() {
     let dir = dir("kbf-objstore-shared-tmp-dir");
     let shared = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("shared");
-    let planted = plant_tmp(&shared, 0);
-    assert_eq!(planted.parent(), Some(dir.join("tmp-shared").as_path()));
+    let written = write_tmp(&shared, 0);
+    assert_eq!(written.parent(), Some(dir.join("tmp-shared").as_path()));
     assert_eq!(names(&dir.join("tmp")), Vec::<String>::new());
 }
 
@@ -249,9 +249,9 @@ async fn an_exclusive_open_beside_a_shared_stores_write_in_flight_cuts_nothing()
 async fn an_exclusive_open_leaves_a_non_empty_tmp_shared_untouched() {
     let dir = dir("kbf-objstore-shared-exclusive-open");
     let shared = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("shared");
-    let mine = plant_tmp(&shared, 900);
+    let mine = write_tmp(&shared, 900);
     let stopped = dir.join("tmp-shared").join("gone-1-0.0");
-    fs::write(&stopped, b"x").expect("plant");
+    fs::write(&stopped, b"x").expect("write a temporary file");
     let exclusive = FsStore::open(&dir, Floor::Bytes(1)).expect("exclusive");
     assert!(mine.exists() && stopped.exists());
     put(&shared, "k", b"v").await.expect("put");
@@ -264,8 +264,8 @@ async fn an_exclusive_open_empties_tmp() {
     let dir = dir("kbf-objstore-shared-exclusive-empties");
     let shared = FsStore::open_shared(&dir, Floor::Bytes(1)).expect("shared");
     let tmp = dir.join("tmp");
-    fs::write(tmp.join("0"), b"x").expect("plant");
-    fs::write(tmp.join("a-1-0.2"), b"x").expect("plant");
+    fs::write(tmp.join("0"), b"x").expect("write a temporary file");
+    fs::write(tmp.join("a-1-0.2"), b"x").expect("write a temporary file");
     FsStore::open(&dir, Floor::Bytes(1)).expect("exclusive");
     assert_eq!(names(&tmp), Vec::<String>::new());
     drop(shared);
