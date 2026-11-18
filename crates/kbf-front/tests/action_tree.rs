@@ -54,6 +54,8 @@ mod places;
 mod retry;
 #[path = "action_tree/store.rs"]
 mod store;
+#[path = "action_tree/whiteout.rs"]
+mod whiteout;
 
 /// The time the test clock starts at.
 const START_SECS: u64 = 1_790_000_000;

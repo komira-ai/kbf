@@ -9,7 +9,7 @@
 //! - a regular file of size 0 named `.wh.<name>` removes `<name>` from its directory; one named
 //!   `.wh..wh..opq` removes everything the lower layers put in its directory. Any other entry
 //!   named `.wh.<...>` (a directory, a symlink, a file with bytes) is not a whiteout: it goes into
-//!   the tree, and the tree build refuses its name ([`kbf_tree_bundle::TreeError::Name`]);
+//!   the tree under its own name, which tierstore takes like any other;
 //! - a later entry replaces an earlier one at the same path; a directory over a directory keeps
 //!   what the directory holds and takes the new mode;
 //! - a parent that no entry made is made as a directory with no mode of its own (it is a tree's

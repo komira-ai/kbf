@@ -217,8 +217,7 @@ init-script helpers, the libraries only those use, and util-linux's `su`, so the
    `passwd`, `mount` and the rest, go with their packages, and `su` alone from util-linux). It lists every normalised
    path in the bundle's facts with the tree's entry count and depth (which every action tree counts with its own,
    4.6), and refuses, by name, what changes behaviour or what tierstore would refuse: a
-   device node, a FIFO or socket, an extended attribute, a name with tierstore's `.wh.` prefix left after the
-   whiteouts are applied, a path of the five reserved ones (`/kbf-work`, `/work`, `/.kbf`, `/.kbf-run`, `/.kbf-tools`) in the
+   device node, a FIFO or socket, an extended attribute, a path of the five reserved ones (`/kbf-work`, `/work`, `/.kbf`, `/.kbf-run`, `/.kbf-tools`) in the
    image, and a base that alone passes one of tierstore's limits (4.6). A refused base fails the release build, not a
    deployment.
 3. **Published by the frontend.** "Published by the release" means by the release's own frontend, at its start: the
@@ -470,7 +469,7 @@ job when [proposed, D9]:
 | `off` | `executor-trees` is off (8.3) |
 | `whole_host` | a `whole_machine` lease (D12) |
 | `store` | the index or tierstore did not answer within the writer's deadline, or a PUT failed |
-| `unrepresentable` | a name tierstore refuses (`.wh.` prefix), `node_properties` (4.1), or a tierstore limit passed (2^24 - 1 entries, a manifest over 64 MiB, depth over 4096), counted over the whole action tree: entries are the base's (from the bundle's facts, 3.3), the input root's and four (`kbf-work`, `.kbf` and its two files); depth is the larger of the base's and one more than the input root's |
+| `unrepresentable` | a name tierstore refuses (`..`, `.`, empty, with a `/`), `node_properties` (4.1), or a tierstore limit passed (2^24 - 1 entries, a manifest over 64 MiB, depth over 4096), counted over the whole action tree: entries are the base's (from the bundle's facts, 3.3), the input root's and four (`kbf-work`, `.kbf` and its two files); depth is the larger of the base's and one more than the input root's |
 | `refused` | the resubmit, once, of a tree job whose submit or start was refused (section 6) |
 
 Each is counted (`kbf_executor_inputs_total{from="fetch",why}` beside `{from="tree"}`). These are states that change
@@ -812,8 +811,9 @@ passed-through port and the spec echo, and a fake of tierstore's `hydrate` and `
   hash is not written and the job is today's (`why=store`);
 - 65,536 and 65,537 packed blobs, 256 and 257 large ones, all in one tree (chunks, not the listener's caps);
 - each tierstore limit at its boundary and one past it, counted with a base tree's entries and depth (an input root
-  that fits alone but not beside the base is refused), a `.wh.` name, and `node_properties` on a `Directory`, a file
-  node and a directory node: `why=unrepresentable`;
+  that fits alone but not beside the base is refused), a name tierstore refuses, and `node_properties` on a
+  `Directory`, a file node and a directory node: `why=unrepresentable`; an input root holding `.wh.` names (a whiteout
+  file, the opaque marker `.wh..wh..opq`) is a tree like any other;
 - a create-only PUT that finds the key: success; one that fails: `why=store`.
 
 **Base tree bundle and publishing** (`cargo xtask base-tree`, the frontend's start): a base image with each refused kind
@@ -833,8 +833,8 @@ with different `kbf-task` builds, and a different root digest; the facts' entry 
 frontend publishes only the objects the store lacks (a second release on the same pin writes only its `kbf-task`,
 `/.kbf-tools` manifest and root manifest), treats an existing key as success, refuses to start on a bundle not in
 `SHA256SUMS` or a publish that failed, and records `job-tree/<digest>`; a previous release's state reader skips that
-record; a base image holding `/.kbf-run`, a `.wh.` name left after the whiteouts, or more entries than tierstore's
-limit alone is refused by name; under `kbf-daemon` nothing is published, and an `arch` with no bundle fails the
+record; a base image holding `/.kbf-run` or more entries than tierstore's limit alone is refused by name, and one with
+a `.wh.` name left after the whiteouts keeps it; under `kbf-daemon` nothing is published, and an `arch` with no bundle fails the
 start; a standing `hydrate` hold on the kbf base tree is sent to each node, sent again before its expiry while its
 release runs, and not renewed by a later release (4.5).
 

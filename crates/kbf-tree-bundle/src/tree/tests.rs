@@ -154,11 +154,10 @@ fn an_empty_root_has_no_entry_and_depth_zero() {
 }
 
 /// Asserts each name tierstore refuses is refused by name and directory, at the root and below.
-/// Catches: a name that would make tierstore refuse the whole tree on the nodes (a `.wh.` left
-/// after the whiteouts, among them) passing the build.
+/// Catches: a name that would make tierstore refuse the whole tree on the nodes passing the build.
 #[test]
 fn each_name_tierstore_refuses_is_refused_with_its_directory() {
-    for name in ["", ".", "..", "a/b", "a\0b", ".wh.gone", ".wh..wh..opq"] {
+    for name in ["", ".", "..", "a/b", "a\0b"] {
         let mut root = Dir::new();
         root.insert(name, Node::file(b"x", false));
         assert_eq!(
@@ -185,6 +184,62 @@ fn each_name_tierstore_refuses_is_refused_with_its_directory() {
     root.insert(".whiteout-like", Node::file(b"x", false));
     root.insert("..a", Node::file(b"x", false));
     assert!(root.build().is_ok(), "names that only look alike are taken");
+}
+
+/// Asserts names with the OCI whiteout prefix `.wh.` (a whiteout file's `.wh.ssl`, the opaque
+/// marker `.wh..wh..opq`, the bare prefix `.wh.`), which tierstore takes as ordinary names, are
+/// built into the tree as files, a directory and a symlink, at the root and below, and that
+/// tierstore's own reader and flattener read the manifests back with every one at its path.
+/// Catches: a tree refused for a `.wh.` name that tierstore stores, which would keep a base
+/// image with such a name left after its whiteouts off the nodes.
+#[test]
+fn names_with_the_whiteout_prefix_are_built_and_read_back_by_tierstore() {
+    let mut etc = Dir::new();
+    etc.insert(".wh.ssl", Node::file(b"", false));
+    etc.insert(".wh..wh..opq", Node::file(b"", false));
+    etc.insert(".wh.", Node::file(b"x", true));
+    etc.insert(".wh.dir", Node::Dir(Dir::new()));
+    etc.insert(
+        ".wh.link",
+        Node::Symlink {
+            target: "ssl".to_owned(),
+        },
+    );
+    let mut root = Dir::new();
+    root.insert("etc", Node::Dir(etc));
+    root.insert(".wh.top", Node::file(b"top", false));
+    let built = root.build().expect("a tree with .wh. names is built");
+    assert_eq!((built.entries, built.depth), (7, 2));
+    let manifests = by_digest(&built);
+    let digest = TreeDigest::from_hex(&built.root).expect("root");
+    let entries = flatten(&digest, |d: &TreeDigest| {
+        manifests.get(&d.to_string()).cloned().ok_or("missing")
+    })
+    .expect("tierstore flattens it");
+    // Depth first, so a directory's path is known before its children's.
+    let mut paths: Vec<String> = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let path = match entry.parent {
+            None => String::new(),
+            Some(0) => entry.name.to_string(),
+            Some(parent) => format!("{}/{}", paths[parent as usize], entry.name),
+        };
+        paths.push(path);
+    }
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            "",
+            ".wh.top",
+            "etc",
+            "etc/.wh.",
+            "etc/.wh..wh..opq",
+            "etc/.wh.dir",
+            "etc/.wh.link",
+            "etc/.wh.ssl",
+        ]
+    );
 }
 
 /// A chain of `levels` directories, `d/d/...`, with a file at the bottom.

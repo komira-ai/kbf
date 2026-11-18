@@ -146,7 +146,7 @@ pub enum NoTree {
         node: String,
     },
     /// tierstore's reader refuses the manifest of a `Directory`: a name it does not take
-    /// (`.wh.`, `..`, empty, ...), a name twice, or a manifest over its size limit.
+    /// (`..`, empty, with a `/`, ...), a name twice, or a manifest over its size limit.
     #[error("the manifest of the Directory {directory} is one tierstore refuses: {error}")]
     Refused {
         /// The `Directory`.
