@@ -50,7 +50,7 @@ fn exit_code(finished: &Finished) -> i32 {
 }
 
 /// The row of an operation is there from before its submit to its finish, naming its job and
-/// owner; its answer and action are there after.
+/// owner, and its write is timed as the `row` step; its answer and action are there after.
 #[tokio::test(start_paused = true)]
 async fn an_operation_keeps_its_row_from_before_its_submit_until_it_finishes() {
     let rig = Rig::stored().await;
@@ -73,6 +73,11 @@ async fn an_operation_keeps_its_row_from_before_its_submit_until_it_finishes() {
             whole_machine: false,
             ..row_of(1, "")
         }
+    );
+    assert_eq!(
+        rig.counted("kbf_executor_step_seconds_count{step=\"row\"} "),
+        1,
+        "the row's write is timed"
     );
     rig.host_finishes(&job, 0);
     let finished = rig.until_done(&caller).await;
