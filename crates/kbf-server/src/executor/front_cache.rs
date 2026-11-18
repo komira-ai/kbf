@@ -47,4 +47,11 @@ impl<K: Ord + Clone, V: Clone> Bounded<K, V> {
             self.entries.remove(&key);
         }
     }
+
+    /// Forgets `key`, and returns what was remembered for it.
+    pub(super) fn remove(&mut self, key: &K) -> Option<V> {
+        let (value, at) = self.entries.remove(key)?;
+        self.order.remove(&at);
+        Some(value)
+    }
 }

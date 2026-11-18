@@ -8,7 +8,7 @@
 
 use js_proto::v1::{ResultReason, StartFailureCode};
 use kbf_front::Finished;
-use kbf_server::executor::{Ingested, RejectReason};
+use kbf_server::executor::{Ingested, MintError, RejectReason};
 use tonic::Code;
 
 use crate::rig::{FakeIngest, HOST, Rig};
@@ -223,4 +223,65 @@ async fn a_job_killed_for_memory_at_every_attempt_is_answered_out_of_memory() {
         "{detail}"
     );
     assert_eq!(rig.jobs_of(1).len(), 3);
+}
+
+/// The SHA-256 of a manifest the store lost, as tierstore names it.
+const LOST: &str = "9e1bf90c91fe575d7dacd35d1b21d058c2f1fd7abd0d23ffa41c4a0da2facb7f";
+
+/// Catches a job that did not start because the store lost an object of its tree being run again
+/// over the same stale state, or answered as the action's failure: the frontend is told the
+/// object and the action once, before the next attempt is prepared, and the next job's OK is the
+/// caller's answer; the run is counted `infra`.
+#[tokio::test]
+async fn a_job_that_did_not_start_for_a_lost_object_tells_the_frontend_and_runs_again() {
+    let rig = Rig::start(&[HOST], |_| {}).await;
+    let mut caller = rig.submit(1);
+    let first = rig.first_job(1).await;
+    let detail = format!("cannot fetch manifest {LOST}: upstream 404");
+
+    assert!(rig.fake.refuse_start(first.id(), &detail));
+    let second = rig.until_jobs(1, 2).await.remove(1);
+    let told = rig.ingest.lost.lock().expect("lock").clone();
+    rig.host_finishes(second.id(), HOST, 0);
+
+    assert_eq!(exit_code(&caller.done().await), 0);
+    assert_eq!(told.len(), 1, "{told:?}");
+    let hex: String = told[0].1.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(hex, LOST);
+    assert_eq!(
+        rig.ingest.forms.lock().expect("lock").len(),
+        2,
+        "minted again"
+    );
+    let row = "kbf_executor_runs_total{outcome=\"infra\"} 1\n";
+    let counted = rig.counted();
+    assert!(counted.contains(row), "{row} in {counted}");
+}
+
+/// Catches inputs the store lost (found when the next attempt's tree is written) answered as
+/// anything but REAPI's missing inputs, or run again before the client uploads them: the caller
+/// is answered FAILED_PRECONDITION naming the blob, no job is made, and the run is counted
+/// `missing`.
+#[tokio::test]
+async fn inputs_the_store_lost_are_answered_missing_without_a_job() {
+    let rig = Rig::start(&[HOST], |_| {}).await;
+    let blob = kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [4; 32], 9);
+    rig.ingest
+        .mint_fails
+        .lock()
+        .expect("lock")
+        .push_back(MintError::Missing(vec![blob]));
+    let mut caller = rig.submit(1);
+
+    let finished = caller.done().await;
+
+    assert_eq!(code(&finished), Code::FailedPrecondition, "{finished:?}");
+    let Finished::Failed(status) = &finished else {
+        panic!("not failed: {finished:?}");
+    };
+    assert_eq!(status.message, "1 input blob(s) are not in the CAS");
+    assert!(rig.jobs_of(1).is_empty(), "a job was made");
+    let row = "kbf_executor_runs_total{outcome=\"missing\"} 1\n";
+    let counted = rig.counted();
+    assert!(counted.contains(row), "{row} in {counted}");
 }

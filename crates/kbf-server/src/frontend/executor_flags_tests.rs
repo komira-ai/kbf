@@ -360,6 +360,7 @@ fn flags_of(url: &str, token: &Path, ca: Option<&Path>) -> JsAgentFlags {
         base_tree_keep: 1,
         base_tree_timeout: std::time::Duration::from_secs(60),
         published: std::sync::Arc::default(),
+        republish: std::sync::Arc::default(),
         put_retry: std::time::Duration::from_secs(60),
         manifest_writes: kbf_front::action_tree::MANIFEST_WRITES,
     }

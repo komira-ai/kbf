@@ -265,6 +265,7 @@ async fn minted(
     minted.map_err(|e| match e {
         MintError::Refused(why) => Settled::Invalid(format!("no put directory: {why}")),
         MintError::Unavailable(why) => Settled::Infra(format!("no put directory: {why}")),
+        MintError::Missing(digests) => Settled::Missing(digests),
     })
 }
 

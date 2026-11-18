@@ -145,6 +145,16 @@ const DROP: &str = concat!(
     "SELECT count(*) FROM d"
 );
 
+/// `$1` pack key: deletes every blob row that points into the pack and the pack's row, and
+/// answers how many blob rows it deleted. The pack row is locked first, as [`DROP`] and a record
+/// of the key lock it, so a forget and a record of the key take turns.
+const FORGET: &str = concat!(
+    "WITH p AS (SELECT pack_id FROM pack WHERE key = $1 FOR UPDATE), ",
+    "d AS (DELETE FROM blob b USING p WHERE b.pack_id = p.pack_id RETURNING 1), ",
+    "k AS (DELETE FROM pack USING p WHERE pack.pack_id = p.pack_id RETURNING 1) ",
+    "SELECT count(*) FROM d"
+);
+
 /// A failed client call as the index reports it.
 fn failed(err: postgres::Error) -> PackIndexError {
     PackIndexError::Store(store_error(err))
@@ -439,6 +449,13 @@ impl PackIndex for PostgresPackIndex {
         let removed = session.conn().query_one(DROP, &args).map_err(failed)?;
         let removed: i64 = removed.get(0);
         Ok(removed > 0)
+    }
+
+    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
+        let mut session = self.session()?;
+        let removed = session.conn().query_one(FORGET, &[&pack_key]);
+        let removed: i64 = removed.map_err(failed)?.get(0);
+        Ok(usize::try_from(removed).unwrap_or(usize::MAX))
     }
 
     fn directories(&self, digests: &[BlobDigest]) -> Result<Vec<Option<Vec<u8>>>, PackIndexError> {

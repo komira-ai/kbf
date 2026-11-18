@@ -28,4 +28,5 @@ mod directories;
 mod empty_blob;
 mod failover;
 mod large;
+mod lost;
 mod rig;

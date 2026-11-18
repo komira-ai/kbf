@@ -247,6 +247,17 @@ fn cases() -> Vec<(&'static str, Case)> {
             judged(refused_to_start("egress-unchecked"), none.clone()),
         ),
         (
+            "failed to start, any code, its detail naming an object of its tree the store answered 404 for",
+            judged(
+                job(
+                    JobState::FailedToStart,
+                    StartFailureCode::InputUnavailable,
+                    &format!("cannot fetch manifest {LOST_HEX}: upstream 404"),
+                ),
+                none.clone(),
+            ),
+        ),
+        (
             "failed to start, any other code or detail",
             judged(refused_to_start("scratch-failed"), none.clone()),
         ),
@@ -304,11 +315,14 @@ fn answer(case: &Case) -> Verdict {
 fn class_of(verdict: &Verdict) -> &'static str {
     match verdict {
         Verdict::Ingest => "ingest",
-        Verdict::Settled(Settled::Infra(_)) => "infra",
-        Verdict::Settled(Settled::Timeout) => "timeout",
-        Verdict::Settled(Settled::OutOfMemory) => "out-of-memory",
-        Verdict::Settled(Settled::Lost(_)) => "lost",
-        Verdict::Settled(Settled::Invalid(_)) => "invalid",
+        Verdict::Settled(settled) | Verdict::StoreLost { settled, .. } => match settled {
+            Settled::Infra(_) => "infra",
+            Settled::Timeout => "timeout",
+            Settled::OutOfMemory => "out-of-memory",
+            Settled::Lost(_) => "lost",
+            Settled::Invalid(_) => "invalid",
+            Settled::Missing(_) => "missing",
+        },
     }
 }
 
@@ -361,7 +375,7 @@ fn each_job_end_maps_to_one_failure_class() {
             .find(|(row, _)| row == what)
             .expect("a row of the case");
         assert_eq!(class, doc_class, "{what}");
-        let Verdict::Settled(settled) = verdict else {
+        let (Verdict::Settled(settled) | Verdict::StoreLost { settled, .. }) = verdict else {
             continue;
         };
         let (code, retried) = match class {
@@ -625,4 +639,144 @@ fn only_an_ending_of_the_farms_is_run_again() {
     assert!(!Settled::Timeout.retried());
     assert!(!Settled::Invalid(String::new()).retried());
     assert_eq!(RESUBMITS, 2);
+}
+
+/// The SHA-256 of an object the store lost, as tierstore writes it.
+const LOST_HEX: &str = "9e1bf90c91fe575d7dacd35d1b21d058c2f1fd7abd0d23ffa41c4a0da2facb7f";
+
+/// [`LOST_HEX`] as bytes.
+fn lost_sha() -> [u8; 32] {
+    let mut sha = [0_u8; 32];
+    for (i, byte) in sha.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&LOST_HEX[2 * i..2 * i + 2], 16).expect("hex");
+    }
+    sha
+}
+
+/// Catches a start that failed for an object the store lost being judged by its code alone:
+/// whatever the code, a detail that names the object's SHA-256 before `: upstream 404` is
+/// `infra` (run again) with the object named for the frontend, and the callers are told a fixed
+/// phrase.
+#[test]
+fn a_start_that_failed_on_a_lost_object_is_infra_whatever_its_code() {
+    let detail = format!("cannot fetch manifest {LOST_HEX}: upstream 404");
+    for code in [
+        StartFailureCode::NoCapacity,
+        StartFailureCode::StartTimeout,
+        StartFailureCode::ExclusiveNotReady,
+        StartFailureCode::InputUnavailable,
+        StartFailureCode::AgentRefused,
+        StartFailureCode::Unspecified,
+    ] {
+        let verdict = judge(
+            &job(JobState::FailedToStart, code, &detail),
+            &JobResult::default(),
+        );
+        let Verdict::StoreLost { object, settled } = verdict else {
+            panic!("{code:?}: not a lost object: {verdict:?}");
+        };
+        assert_eq!(object, lost_sha(), "{code:?}");
+        assert!(settled.retried(), "{code:?}");
+        let status = settled.status();
+        assert_eq!(status.code, Code::Unavailable as i32, "{code:?}");
+        assert_eq!(
+            status.message,
+            "the job failed to start: the store does not have an object of its tree"
+        );
+    }
+}
+
+/// Catches a detail read for more than the object's digest, or for a digest that is not one:
+/// only 64 lower-case hex digits right before `: upstream 404` count, alone (not the end of a
+/// longer run of hex digits) and before the status 404 itself (not a longer number); a tree list
+/// named by its key counts; a first mention that does not qualify is passed over for a later
+/// one; and anything else is no lost object.
+#[test]
+fn only_a_whole_sha256_right_before_upstream_404_names_a_lost_object() {
+    use super::{hex, lost_object};
+    let found = |detail: &str| lost_object(detail).map(|sha| hex(&sha));
+    let named = Some(LOST_HEX.to_owned());
+    assert_eq!(
+        found(&format!("cannot fetch manifest {LOST_HEX}: upstream 404")),
+        named
+    );
+    assert_eq!(found(&format!("cas/l/{LOST_HEX}: upstream 404")), named);
+    assert_eq!(found(&format!("{LOST_HEX}: upstream 404")), named);
+    assert_eq!(
+        found(&format!(
+            "x: upstream 404; manifest {LOST_HEX}: upstream 404 (twice)"
+        )),
+        named
+    );
+    let upper = LOST_HEX.to_uppercase();
+    let short = &LOST_HEX[1..];
+    for detail in [
+        String::new(),
+        "upstream 404".to_owned(),
+        ": upstream 404".to_owned(),
+        format!("cannot fetch manifest {upper}: upstream 404"),
+        format!("cannot fetch manifest {short}: upstream 404"),
+        format!("cannot fetch manifest 9g{}: upstream 404", &LOST_HEX[2..]),
+        format!("cannot fetch manifest a{LOST_HEX}: upstream 404"),
+        format!("cannot fetch manifest {LOST_HEX}: upstream 503"),
+        format!("cannot fetch manifest {LOST_HEX}: upstream 4040"),
+        format!("cannot fetch manifest {LOST_HEX} upstream 404"),
+        format!("é{}: upstream 404", &LOST_HEX[1..]),
+        "quota-unavailable".to_owned(),
+    ] {
+        assert_eq!(found(&detail), None, "{detail}");
+    }
+}
+
+/// Catches a host's detail text reaching the log or the answer through a lost object: the log
+/// holds the object's digest and the detail's length, never the rest of the detail, and the
+/// answer is the fixed phrase.
+#[test]
+fn a_lost_object_reaches_the_log_as_its_digest_only() {
+    let quoted = "--pack-url https://store/key?sig=MARKER-SECRET";
+    let detail = format!("{quoted} cannot fetch manifest {LOST_HEX}: upstream 404");
+    let log = Log::default();
+    let verdict = log.capture(|| judge(&refused_to_start(&detail), &JobResult::default()));
+    let Verdict::StoreLost { settled, .. } = verdict else {
+        panic!("not a lost object: {verdict:?}");
+    };
+    let text = log.text();
+    assert!(text.contains(LOST_HEX), "{text}");
+    assert!(
+        text.contains(&format!("detail_bytes={}", detail.len())),
+        "{text}"
+    );
+    assert!(!text.contains("MARKER-SECRET"), "{text}");
+    assert!(!settled.status().message.contains("MARKER-SECRET"));
+}
+
+/// Catches inputs the store lost answered as anything but REAPI's missing inputs: the callers get
+/// FAILED_PRECONDITION with one `MISSING` violation per blob, which is what makes a client upload
+/// them again, and the run is not run again (the client's upload comes first).
+#[test]
+fn inputs_the_store_lost_are_answered_missing_and_not_run_again() {
+    use kbf_proto::google::rpc::PreconditionFailure;
+    let one = kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 5);
+    let two = kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [2; 32], 7);
+    let settled = Settled::Missing(vec![one, two]);
+
+    let status = settled.status();
+
+    assert!(!settled.retried());
+    assert_eq!(status.code, Code::FailedPrecondition as i32);
+    assert_eq!(status.details.len(), 1);
+    let failure = PreconditionFailure::decode(status.details[0].value.as_slice()).expect("decodes");
+    let subjects: Vec<&str> = failure
+        .violations
+        .iter()
+        .map(|v| v.subject.as_str())
+        .collect();
+    assert_eq!(
+        subjects,
+        [
+            format!("blobs/{}/5", one.hash_hex()),
+            format!("blobs/{}/7", two.hash_hex())
+        ]
+    );
+    assert!(failure.violations.iter().all(|v| v.r#type == "MISSING"));
 }

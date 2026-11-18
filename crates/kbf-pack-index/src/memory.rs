@@ -228,6 +228,15 @@ impl PackIndex for MemoryPackIndex {
         Ok(true)
     }
 
+    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        let before = state.blobs.len();
+        state.blobs.retain(|_, row| row.pack != pack_key);
+        state.packs.remove(pack_key);
+        Ok(before - state.blobs.len())
+    }
+
     fn directories(&self, digests: &[BlobDigest]) -> Result<Vec<Option<Vec<u8>>>, PackIndexError> {
         directory::read(&self.lock(), digests)
     }

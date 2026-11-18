@@ -15,10 +15,17 @@
 //! cause. The [`Published`] tree is held by `FrontendHandle::serve` until it ends, and its base
 //! ([`BaseTree`]) is set in the slot the executor writes its action trees over
 //! (`--task-out-mode put-dir`) before the executor is started.
+//!
+//! **Published again.** The store is a general-purpose one, and its objects can vanish while
+//! the frontend holds the base as published. Once published, the same publish is set in the
+//! executor's slot ([`JsAgentFlags::republish`]): when a job did not start for an object the
+//! store lost that is none of its action tree's own, the executor runs it again, which writes
+//! every object of the bundle the store lacks and costs one length check for each it has.
 
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
+use futures::FutureExt as _;
 use kbf_front::Packs;
 use kbf_front::action_tree::BaseTree;
 use kbf_front::base_publish::{Published, publish};
@@ -26,7 +33,7 @@ use kbf_state::Store;
 
 use super::JsAgentFlags;
 use super::base_fetch::Cache;
-use crate::executor::InputTree;
+use crate::executor::{InputTree, Republish};
 use crate::job_tree::{self, Recorded};
 use crate::serve::ServeError;
 
@@ -41,6 +48,8 @@ pub(super) struct Start {
     /// Whether the base is listed: the executor writes tree lists
     /// (`--executor-input-tree provider`).
     list: bool,
+    /// Where the publish again is set for the executor.
+    republish: Arc<OnceLock<Republish>>,
 }
 
 impl Start {
@@ -60,6 +69,7 @@ impl Start {
             state,
             slot: Arc::clone(&js.published),
             list: js.config.input_tree == InputTree::Provider,
+            republish: Arc::clone(&js.republish),
         }
     }
 
@@ -83,7 +93,8 @@ impl Start {
             .await
             .map_err(|why| refused(&why))?;
         tracing::info!(dir = %dir.display(), ?origin, "the kbf base tree bundle is ready");
-        let published = publish(&dir, commit, &self.platform, packs, self.list)
+        let store: Arc<Packs> = Arc::clone(&packs);
+        let published = publish(&dir, commit, &self.platform, store, self.list)
             .await
             .map_err(|why| refused(&why))?;
         let root = published.root.hash_hex();
@@ -106,8 +117,39 @@ impl Start {
         }
         // A frontend publishes once; a slot set already holds the same release's base.
         let _ = self.slot.set(published.base.clone());
+        let again = again(self.cache, commit, self.platform, packs, self.list);
+        let _ = self.republish.set(again);
         Ok(published)
     }
+}
+
+/// The publish of the bundle of `commit` for `platform` into `packs` again, as [`Start`] made it
+/// the first time: the bundle from the cache, and each of its objects the store lacks written.
+/// Nothing is recorded: the tree is the one recorded the first time.
+fn again(cache: Cache, commit: &str, platform: String, packs: Arc<Packs>, list: bool) -> Republish {
+    let commit = commit.to_owned();
+    Republish::new(move || {
+        let (cache, commit, platform, packs) = (
+            cache.clone(),
+            commit.clone(),
+            platform.clone(),
+            Arc::clone(&packs),
+        );
+        async move {
+            let (dir, _) = (cache.ensure(&commit, &platform).await).map_err(|e| e.to_string())?;
+            let store: Arc<Packs> = packs;
+            let published = publish(&dir, &commit, &platform, store, list).await;
+            let published = published.map_err(|e| e.to_string())?;
+            tracing::warn!(
+                root = published.root.hash_hex(),
+                written = published.written,
+                held = published.held,
+                "published the kbf base tree again"
+            );
+            Ok(())
+        }
+        .boxed()
+    })
 }
 
 /// Publishes the base tree `start` describes, if the frontend has one to publish (it runs

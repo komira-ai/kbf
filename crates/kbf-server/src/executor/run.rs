@@ -429,6 +429,13 @@ async fn watch_job(
             let output = output(inner, run, job, Some(&result)).await;
             Ended::Again(settled, Some(output))
         }
+        Verdict::StoreLost { object, settled } => {
+            // Before the next attempt is prepared: its tree is then written checked.
+            let action = reapi_digest(&op.key.action);
+            inner.deps.ingest.lost(&action, &object).await;
+            let output = output(inner, run, job, Some(&result)).await;
+            Ended::Again(settled, Some(output))
+        }
         Verdict::Ingest => {
             let ingested = ingest(inner, run, &op.key, &submitted.key).await;
             timeline.stamp(Mark::Done, Instant::now(), metrics);

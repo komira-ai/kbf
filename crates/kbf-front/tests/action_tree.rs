@@ -42,6 +42,8 @@ mod kept;
 mod limits;
 #[path = "action_tree/listing.rs"]
 mod listing;
+#[path = "action_tree/lost.rs"]
+mod lost;
 #[path = "action_tree/memo.rs"]
 mod memo;
 #[path = "action_tree/places.rs"]
@@ -86,6 +88,8 @@ struct Faults {
     held: Option<String>,
     /// Every write waits, once recorded, until the test opens [`Farm::gate`].
     hold_all: bool,
+    /// The checks of a pack against the store.
+    check: Fault,
 }
 
 #[derive(Default)]
@@ -109,6 +113,10 @@ struct State {
     reads: Vec<Digest>,
     /// Every write, by key, in the order made.
     puts: Vec<String>,
+    /// Packs the store lost: a check of one has the index forget it.
+    lost: BTreeSet<String>,
+    /// Every check of a pack against the store: its key and the end of its furthest blob asked.
+    checks: Vec<(String, u64)>,
     /// The bytes a write whose body ended in an error had received, by key.
     received: BTreeMap<String, u64>,
     /// The writes open now: made and not yet answered.
@@ -397,6 +405,25 @@ impl BlobSource for Farm {
                 spans.pop();
             }
             Ok(spans)
+        })
+    }
+
+    fn forget_lost<'a>(
+        &'a self,
+        key: &'a str,
+        end: u64,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            let (check, lost) = {
+                let mut state = self.state();
+                state.checks.push((key.to_owned(), end));
+                (state.faults.check, state.lost.contains(key))
+            };
+            fault(check).await?;
+            if lost {
+                self.state().spans.retain(|_, span| span.key != key);
+            }
+            Ok(lost)
         })
     }
 

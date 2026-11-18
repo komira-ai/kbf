@@ -299,6 +299,19 @@ impl Backend {
         packs.object_len(key).await.map_err(layered::unavailable)
     }
 
+    /// Forgets the pack `key` in the pack index if the store does not have it, or has it
+    /// shorter than `end` bytes ([`Packs::forget_lost`]); `false` when it is held or there are
+    /// no packs.
+    pub(crate) async fn forget_lost(&self, key: &str, end: u64) -> Result<bool, StorageError> {
+        let Some(packs) = self.0.packs() else {
+            return Ok(false);
+        };
+        packs
+            .forget_lost(key, end)
+            .await
+            .map_err(layered::unavailable)
+    }
+
     pub(crate) async fn action_result(
         &self,
         action: &Digest,
