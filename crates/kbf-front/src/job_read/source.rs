@@ -57,6 +57,18 @@ pub trait BlobSource: Send + Sync {
         let _ = digest;
         Box::pin(async { Ok(None) })
     }
+
+    /// Forgets the pack `key` in the pack index if the store does not have it whole up to `end`
+    /// bytes, after asking the store for its length; whether it was forgotten. The default has
+    /// no packs, so it forgets nothing.
+    fn forget_lost<'a>(
+        &'a self,
+        key: &'a str,
+        end: u64,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        let _ = (key, end);
+        Box::pin(async { Ok(false) })
+    }
 }
 
 impl BlobSource for Backend {
@@ -102,5 +114,13 @@ impl BlobSource for Backend {
         digest: &'a Digest,
     ) -> BoxFuture<'a, Result<Option<u64>, StorageError>> {
         Box::pin(async move { Backend::object_len(self, &large_key(digest)).await })
+    }
+
+    fn forget_lost<'a>(
+        &'a self,
+        key: &'a str,
+        end: u64,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(Backend::forget_lost(self, key, end))
     }
 }

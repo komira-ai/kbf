@@ -1,4 +1,4 @@
-//! The conformance suite for [`PackIndex`], P1 to P11, generic over a [`PackBackend`] factory
+//! The conformance suite for [`PackIndex`], P1 to P12, generic over a [`PackBackend`] factory
 //! so the in-memory index and the Postgres one run the same clauses. A backend's own tests
 //! call [`run_all`] or one clause with their factory.
 //!
@@ -29,7 +29,7 @@ pub trait PackBackend {
     fn reconnect(&self, index: &Self::Index) -> Self::Index;
 }
 
-/// Runs P1 to P11 against `backend`.
+/// Runs P1 to P12 against `backend`.
 pub fn run_all<B: PackBackend>(backend: &B) {
     p1_record_and_locate(backend);
     p2_record_is_idempotent(backend);
@@ -42,6 +42,7 @@ pub fn run_all<B: PackBackend>(backend: &B) {
     p9_a_pack_that_cannot_exist_is_refused(backend);
     p10_concurrent_records_of_one_pack_agree(backend);
     p11_a_location_can_be_dropped(backend);
+    p12_a_lost_pack_can_be_forgotten(backend);
 }
 
 pub(crate) const KEY: &str = "cas/d/n1/1/1";
@@ -772,5 +773,77 @@ pub fn p11_a_location_can_be_dropped<B: PackBackend>(backend: &B) {
         "P11 relocated: the blob is located in the pack recorded after the drop",
         locate(&index, &[two]),
         vec![loc(THIRD, 0, 20, 0)],
+    );
+}
+
+fn forgot(index: &dyn PackIndex, key: &str) -> usize {
+    index.forget_pack(key).expect("forget_pack")
+}
+
+/// P12: forgetting a pack whose object the store lost removes every row that points into it and
+/// the pack's own row, and nothing else. Its blobs are listed as missing and have no location;
+/// a blob of the pack that has its row in another pack keeps it; the other pack is untouched; a
+/// second forget and a key nobody recorded remove nothing; the pack is not listed as dead (it
+/// has no row left to sweep); and the same pack recorded again, as a re-upload records it, is a
+/// new pack whose blobs get their rows back.
+pub fn p12_a_lost_pack_can_be_forgotten<B: PackBackend>(backend: &B) {
+    let clock = Arc::new(ManualClock::default());
+    let index = backend.open_index(Arc::clone(&clock));
+    let other = packed(OTHER, "n2", &[(3, 30), (4, 40)]);
+    let lost = packed(KEY, "n1", &[(1, 10), (2, 20), (3, 30)]);
+    record(&index, &other);
+    same("P12 recorded", record(&index, &lost), created(2));
+    let all = [digest(1, 10), digest(2, 20), digest(3, 30), digest(4, 40)];
+    same(
+        "P12 forget: every row that points into the pack is removed",
+        forgot(&index, KEY),
+        2,
+    );
+    same(
+        "P12 missing: the forgotten pack's blobs are listed as missing, the rest are not",
+        missing(&index, &all),
+        vec![digest(1, 10), digest(2, 20)],
+    );
+    same(
+        "P12 located: a blob of the pack whose row is in another pack keeps it",
+        locate(&index, &all),
+        vec![None, None, loc(OTHER, 0, 30, 0), loc(OTHER, 30, 40, 0)],
+    );
+    same(
+        "P12 pack: the pack's own row is gone",
+        info(&index, KEY),
+        None,
+    );
+    same(
+        "P12 other: the other pack is untouched",
+        info(&index, OTHER),
+        info_of(OTHER, "n2", other.size, (0, 2, 2)),
+    );
+    same(
+        "P12 twice: a second forget removes nothing",
+        forgot(&index, KEY),
+        0,
+    );
+    same(
+        "P12 unknown: a key nobody recorded removes nothing",
+        forgot(&index, "cas/none"),
+        0,
+    );
+    clock.advance(Duration::from_secs(3600));
+    same(
+        "P12 dead: a forgotten pack is not listed for the sweep",
+        keys_of(&dead(&index, Duration::from_secs(1), 10)),
+        Vec::<&str>::new(),
+    );
+    same(
+        "P12 again: the same pack recorded again is a new pack",
+        record(&index, &lost),
+        created(2),
+    );
+    let at = at(&clock);
+    same(
+        "P12 back: its blobs have rows again, in the pack, at their offsets",
+        locate(&index, &all[..2]),
+        vec![loc(KEY, 0, 10, at), loc(KEY, 10, 20, at)],
     );
 }

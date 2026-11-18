@@ -49,6 +49,16 @@
 //! lookups is remembered when they answer; a blob written to `cas/l/` is remembered as whole only
 //! after its write succeeded. [`TreeWriter::forget`] drops the place memo whole.
 //!
+//! **A lost object** is one the frontend's state names and the store does not have: the store is
+//! general-purpose, and its objects can vanish. A job whose tree named a manifest the store lost
+//! says so, and [`TreeWriter::lost_manifest`] drops the memo's entries that name it and every
+//! entry above them, and the place memo whole. The next tree of that action is written with
+//! [`TreeWriter::write_checked`] (or [`TreeWriter::write_listing_checked`]): no memo hit, no
+//! remembered place, and every pack it names asked after in the store ([`check`]); a pack the
+//! store lacks is forgotten by the pack index, both memos are dropped whole, and the tree is
+//! refused naming its blobs ([`NoTree::Lost`], `why` `missing`), which are then missing for
+//! FindMissingBlobs too.
+//!
 //! **The tree list** ([`listing`], [`TreeWriter::write_listing`]) is the same action tree as one
 //! object, tierstore's tree list in its version 2, the `TSTREE` layout ([`tstree`]): every entry
 //! as a fixed record, breadth first from the root, the base tree's included
@@ -64,6 +74,7 @@
 //! executor submits the job while the tree's writes go on.
 
 mod base;
+mod check;
 mod encode;
 mod flight;
 mod listing;
@@ -233,10 +244,19 @@ pub enum NoTree {
     /// them: [`TreeWriter::write_listing`] only.
     #[error("the kbf base tree is not listed: no tree list can be written")]
     BaseNotListed,
+    /// The store does not have the packs of these blobs, which the pack index named: the index
+    /// forgot those packs, so the blobs are missing until a client uploads them again.
+    /// [`TreeWriter::write_checked`] and [`TreeWriter::write_listing_checked`] only.
+    #[error("the store lost the packs of {} input blobs, which are missing now", blobs.len())]
+    Lost {
+        /// The blobs, in digest order; at least one.
+        blobs: Vec<Digest>,
+    },
 }
 
 impl NoTree {
-    /// The fallback reason of the design's 4.6: `unrepresentable` or `store`.
+    /// The fallback reason of the design's 4.6: `unrepresentable` or `store`; or `missing`, for
+    /// inputs the store lost ([`NoTree::Lost`]), which the client is to upload again.
     #[must_use]
     pub const fn why(&self) -> &'static str {
         match self {
@@ -256,6 +276,7 @@ impl NoTree {
             | Self::Put { .. }
             | Self::NotKept { .. }
             | Self::BaseNotListed => "store",
+            Self::Lost { .. } => "missing",
         }
     }
 }
@@ -289,6 +310,16 @@ pub struct TreeWriter {
     flights: Flights,
     /// The most entries a tree list holds ([`MAX_ENTRIES`] unless a test lowers it).
     list_entries: u64,
+}
+
+/// What a write takes on trust: the memos, or nothing but the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Trust {
+    /// The memo's manifests and the place memo's places, while they are good.
+    Memos,
+    /// Neither: every manifest is built, every blob looked up, and every pack asked after in
+    /// the store ([`check`]).
+    Store,
 }
 
 /// The directories of a tree a write builds, children first, each once, and those the memo
@@ -365,7 +396,7 @@ impl TreeWriter {
     /// manifests written before a failure stay: each is content-bound, and nothing names them
     /// until a tree is returned.
     pub async fn write(&self, kept: &KeptClosure, base: &BaseTree) -> Result<ActionTree, NoTree> {
-        self.write_named(kept, base, |_| ()).await
+        self.write_as(kept, base, Trust::Memos, |_| ()).await
     }
 
     /// As [`TreeWriter::write`], and calls `named` with the tree's name as soon as it is known:
@@ -386,9 +417,59 @@ impl TreeWriter {
         base: &BaseTree,
         named: impl FnOnce(&ActionTree) + Send,
     ) -> Result<ActionTree, NoTree> {
+        self.write_as(kept, base, Trust::Memos, named).await
+    }
+
+    /// [`TreeWriter::write`] for a tree whose last job found a manifest lost: nothing is taken
+    /// from the memos, every manifest is built and stored again, and every pack the tree names
+    /// is asked after in the store ([`check`]).
+    ///
+    /// # Errors
+    /// As [`TreeWriter::write`]; and [`NoTree::Lost`] when the store lacks a pack the index
+    /// names, which the index then forgets.
+    pub async fn write_checked(
+        &self,
+        kept: &KeptClosure,
+        base: &BaseTree,
+    ) -> Result<ActionTree, NoTree> {
+        self.write_as(kept, base, Trust::Store, |_| ()).await
+    }
+
+    /// [`TreeWriter::write_checked`], naming the tree as [`TreeWriter::write_named`] does: a
+    /// pack the store lost is found before the tree is named, so a tree that is
+    /// [`NoTree::Lost`] is never named.
+    ///
+    /// # Errors
+    /// As [`TreeWriter::write_checked`] and [`TreeWriter::write_named`].
+    pub async fn write_checked_named(
+        &self,
+        kept: &KeptClosure,
+        base: &BaseTree,
+        named: impl FnOnce(&ActionTree) + Send,
+    ) -> Result<ActionTree, NoTree> {
+        self.write_as(kept, base, Trust::Store, named).await
+    }
+
+    /// Drops what the memos say of a manifest the store lost (`manifest`, its SHA-256): every
+    /// memo entry that names it and every entry above one, and the place memo whole, since
+    /// the store that lost one object may have lost the packs the memo places blobs in. Returns
+    /// whether the memo named the manifest.
+    pub fn lost_manifest(&self, manifest: &[u8; 32]) -> bool {
+        let dropped = self.lock().forget_manifest(manifest);
+        self.remembered().clear();
+        dropped > 0
+    }
+
+    async fn write_as(
+        &self,
+        kept: &KeptClosure,
+        base: &BaseTree,
+        trust: Trust,
+        named: impl FnOnce(&ActionTree) + Send,
+    ) -> Result<ActionTree, NoTree> {
         reserved_input(kept)?;
         let now = (self.clock)();
-        let plan = self.plan(kept, now)?;
+        let plan = self.plan(kept, now, trust)?;
         let measures = measure(&plan, now);
         let input = measures[kept.root()];
         let entries = base
@@ -415,7 +496,7 @@ impl TreeWriter {
             .filter(|digest| digest.size_bytes > 0)
             .collect();
         let blobs: Vec<Digest> = blobs.into_iter().collect();
-        let (places, unlocated) = self.locate(&blobs, now).await?;
+        let (places, unlocated) = self.locate(&blobs, now, trust).await?;
         let mut manifests: BTreeMap<Digest, Digest> = plan
             .hits
             .iter()
@@ -473,7 +554,8 @@ impl TreeWriter {
         spans: &BTreeMap<Digest, u64>,
     ) -> Result<Digest, NoTree> {
         let now = (self.clock)();
-        let plan = self.plan_of(root, &|digest| directories.get(digest), now)?;
+        let lookup = |digest: &Digest| directories.get(digest);
+        let plan = self.plan_of(root, &lookup, now, Trust::Memos)?;
         let measures = measure(&plan, now);
         // The limits of a whole action tree are applied when one is written ([`TreeWriter::write`]),
         // which counts this directory again with the base's.
@@ -526,13 +608,23 @@ impl TreeWriter {
     /// which are placed [`Place::Whole`] and must be written before a manifest names them. What
     /// the lookups found is remembered, except the blobs that are nowhere: they are remembered
     /// once [`TreeWriter::write_whole`] has written them.
+    ///
+    /// With [`Trust::Store`] the place memo answers nothing, and every pack the lookups name is
+    /// asked after in the store before anything is remembered ([`check`]).
     async fn locate(
         &self,
         blobs: &[Digest],
         now: SystemTime,
+        trust: Trust,
     ) -> Result<(BTreeMap<Digest, Place>, Vec<Digest>), NoTree> {
-        let (mut places, unknown) = self.remembered().split(blobs, now);
+        let (mut places, unknown) = match trust {
+            Trust::Memos => self.remembered().split(blobs, now),
+            Trust::Store => (BTreeMap::new(), blobs.to_vec()),
+        };
         let (found, unlocated) = place::locate(&*self.source, &unknown).await?;
+        if trust == Trust::Store {
+            self.check_objects(&found).await?;
+        }
         let nowhere: BTreeSet<&Digest> = unlocated.iter().collect();
         let located = found
             .iter()
@@ -563,16 +655,23 @@ impl TreeWriter {
 
     /// The directories of `kept`'s tree to build, children first, each once, and the memo's
     /// hits, whose subtrees are not walked.
-    fn plan<'a>(&self, kept: &'a KeptClosure, now: SystemTime) -> Result<Plan<'a>, NoTree> {
-        self.plan_of(kept.root(), &|digest| kept.directory(digest), now)
+    fn plan<'a>(
+        &self,
+        kept: &'a KeptClosure,
+        now: SystemTime,
+        trust: Trust,
+    ) -> Result<Plan<'a>, NoTree> {
+        self.plan_of(kept.root(), &|digest| kept.directory(digest), now, trust)
     }
 
     /// [`TreeWriter::plan`] for the directory `root` of any set of directories `lookup` finds.
+    /// With [`Trust::Store`] the memo has no hits: every directory is built.
     fn plan_of<'a>(
         &self,
         root: &Digest,
         lookup: &dyn Fn(&Digest) -> Option<&'a KeptDirectory>,
         now: SystemTime,
+        trust: Trust,
     ) -> Result<Plan<'a>, NoTree> {
         let mut memo = self.lock();
         let mut order = Vec::new();
@@ -588,7 +687,8 @@ impl TreeWriter {
             if !seen.insert(digest) {
                 continue;
             }
-            if let Some(hit) = memo.get(&digest, now) {
+            let hit = (trust == Trust::Memos).then(|| memo.get(&digest, now));
+            if let Some(hit) = hit.flatten() {
                 hits.insert(digest, hit);
                 continue;
             }

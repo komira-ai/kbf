@@ -1,7 +1,8 @@
 //! The name of an action tree, handed out before its writes (`TreeWriter::write_named`,
 //! `TreeWriter::write_listing_named`): it comes before any blob or manifest is written, it is
 //! the tree the writes end with, a tree the writer refuses or cannot look up is never named,
-//! and a write that fails after the name was handed out still fails the write.
+//! a write that fails after the name was handed out still fails the write, and a write checked
+//! against the store is named the same way.
 
 use kbf_front::action_tree::Listing;
 
@@ -172,4 +173,40 @@ async fn a_list_is_named_only_when_listed_and_a_failed_write_still_fails() {
         matches!(&refused, NoTree::Put { key, .. } if key == named.key()),
         "{refused:?}"
     );
+}
+
+/// Catches a checked write that is named after its writes began, or not named the tree it
+/// writes: a tree and a list written checked against the store are named while the store has
+/// been asked for no write, and each is the one written.
+#[tokio::test]
+async fn a_checked_tree_and_list_are_named_before_their_first_write() {
+    let rig = Rig::new().await;
+    let blob = rig.farm.cas("a file of the input root").await;
+    let root = one_file(&rig, &blob).await;
+    let kept = rig.kept(&root).await;
+    let at_name = seen::<ActionTree>();
+    let into = Arc::clone(&at_name);
+    let farm = Arc::clone(&rig.farm);
+    let written = (rig.writer)
+        .write_checked_named(&kept, &rig.base.tree, move |tree| {
+            let puts = farm.puts().len();
+            *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, puts));
+        })
+        .await
+        .expect("a tree");
+    assert_eq!(take(&at_name), Some((written, 0)));
+
+    let base = listed_base(&rig);
+    rig.farm.clear_records();
+    let at_list = seen::<Listing>();
+    let into = Arc::clone(&at_list);
+    let farm = Arc::clone(&rig.farm);
+    let listed = (rig.writer)
+        .write_listing_checked_named(&kept, &base, move |listing| {
+            let puts = farm.puts().len();
+            *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((listing.clone(), puts));
+        })
+        .await
+        .expect("a list");
+    assert_eq!(take(&at_list), Some((listed, 0)));
 }

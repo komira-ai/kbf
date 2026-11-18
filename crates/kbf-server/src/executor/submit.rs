@@ -270,10 +270,18 @@ async fn minted(
     tree: InputTree,
 ) -> Result<PackKey, Settled> {
     let minted = ctx.ingest.mint(run, action, wall, tree).await;
-    minted.map_err(|e| match e {
+    minted.map_err(not_minted)
+}
+
+/// What a run whose put directory or action tree could not be had settles as: a mint's
+/// failure, or the failure of the tree's writes after the mint named it
+/// ([`Ingest::stored`](crate::executor::Ingest::stored)).
+pub(super) fn not_minted(error: MintError) -> Settled {
+    match error {
         MintError::Refused(why) => Settled::Invalid(format!("no put directory: {why}")),
         MintError::Unavailable(why) => Settled::Infra(format!("no put directory: {why}")),
-    })
+        MintError::Missing(digests) => Settled::Missing(digests),
+    }
 }
 
 /// The labels of a job: the frontends' name and this process's id, and its size class if it

@@ -154,9 +154,12 @@ async fn an_empty_blob_is_found_without_a_request() {
 }
 
 /// Asserts that a row whose pack the store does not hold, whose range starts past the end of
-/// the object, or whose range the object cuts short, is lost, not an error.
+/// the object, or whose range the object cuts short, is lost, not an error; that each such pack
+/// is asked for its length once and then forgotten by the index, so the index lists its blob as
+/// missing and the next read finds no row; and that a blob packed again, as a client's upload
+/// after the loss packs it, is found.
 #[tokio::test]
-async fn bytes_the_store_does_not_have_are_lost() {
+async fn bytes_the_store_does_not_have_are_lost_and_their_packs_forgotten() {
     let gone = blob("a blob whose pack was deleted");
     let past = blob("a blob that starts past the end of its object");
     let cut = blob("a blob that its object ends in the middle of");
@@ -173,7 +176,108 @@ async fn bytes_the_store_does_not_have_are_lost() {
 
     let got = reader.read(&asked).await.unwrap();
 
-    assert_eq!(got, [Fetch::Lost, Fetch::Lost, Fetch::Lost]);
+    let forgotten = Fetch::Lost { forgotten: true };
+    assert_eq!(got, [forgotten.clone(), forgotten.clone(), forgotten]);
+    let mut asked_lengths = rig.store.lens();
+    asked_lengths.sort();
+    assert_eq!(asked_lengths, [&*pack_key(0), "cas/x/cut", "cas/x/past"]);
+    assert_eq!(rig.index.find_missing(&asked).unwrap(), asked);
+    assert!(rig.index.pack("cas/x/cut").unwrap().is_none());
+    let again = reader.read(&asked).await.unwrap();
+    assert_eq!(again, [Fetch::Missing, Fetch::Missing, Fetch::Missing]);
+
+    let packer = rig.packer(PackerConfig::default());
+    pack_all(&packer, std::slice::from_ref(&gone)).await;
+    let uploaded = reader.read(&[gone.digest]).await.unwrap();
+    assert_eq!(uploaded, [found(&gone)]);
+}
+
+/// Asserts that a lost pack is forgotten alone: the blobs of another pack read in the same call
+/// are found and keep their rows.
+#[tokio::test]
+async fn forgetting_a_lost_pack_keeps_the_rows_of_the_others() {
+    let gone = blob("a blob whose pack was deleted");
+    let kept = blob("a blob whose pack is held");
+    let rig = Rig::new();
+    let packer = rig.packer(PackerConfig::default());
+    pack_all(&packer, std::slice::from_ref(&gone)).await;
+    pack_all(&packer, std::slice::from_ref(&kept)).await;
+    rig.store.delete(&keys().key(0)).await.unwrap();
+    let reader = rig.reader(None, ReaderConfig::default());
+
+    let got = reader.read(&[gone.digest, kept.digest]).await.unwrap();
+
+    assert_eq!(got, [Fetch::Lost { forgotten: true }, found(&kept)]);
+    let missing = rig.index.find_missing(&[gone.digest, kept.digest]).unwrap();
+    assert_eq!(missing, [gone.digest]);
+    assert_eq!(rig.store.lens(), [pack_key(0)]);
+}
+
+/// Asserts that a read that finds a pack missing while the store holds it whole (the read raced
+/// the pack's write) keeps the rows: the length asked shows the pack, the blob is lost for this
+/// read only, and the next read finds it.
+#[tokio::test]
+async fn a_pack_the_store_holds_whole_after_all_is_kept() {
+    let held = blob("a blob whose first read raced its pack");
+    let rig = packed(std::slice::from_ref(&held)).await;
+    rig.store.lose_gets(1);
+    let reader = rig.reader(None, ReaderConfig::default());
+
+    let first = reader.read(&[held.digest]).await.unwrap();
+    let second = reader.read(&[held.digest]).await.unwrap();
+
+    assert_eq!(first, [Fetch::Lost { forgotten: false }]);
+    assert_eq!(rig.store.lens(), [pack_key(0)]);
+    assert!(rig.index.find_missing(&[held.digest]).unwrap().is_empty());
+    assert_eq!(second, [found(&held)]);
+}
+
+/// Asserts that a lost pack whose length the store does not give is kept, and that one whose
+/// forget the index fails keeps its rows too; each is lost and not forgotten, and the next read
+/// finds the loss again and forgets the pack.
+#[tokio::test]
+async fn a_loss_that_cannot_be_confirmed_or_forgotten_keeps_the_rows() {
+    let gone = blob("a blob whose pack was deleted");
+    let rig = packed(std::slice::from_ref(&gone)).await;
+    rig.store.delete(&keys().key(0)).await.unwrap();
+    rig.store.fail_lens(1);
+    rig.index.fail_forget(1);
+    let reader = rig.reader(None, ReaderConfig::default());
+
+    let unasked = reader.read(&[gone.digest]).await.unwrap();
+    let refused = reader.read(&[gone.digest]).await.unwrap();
+    let still = rig.index.find_missing(&[gone.digest]).unwrap();
+    let forgotten = reader.read(&[gone.digest]).await.unwrap();
+
+    assert_eq!(unasked, [Fetch::Lost { forgotten: false }]);
+    assert_eq!(refused, [Fetch::Lost { forgotten: false }]);
+    assert!(still.is_empty());
+    assert_eq!(forgotten, [Fetch::Lost { forgotten: true }]);
+    assert_eq!(
+        rig.index.find_missing(&[gone.digest]).unwrap(),
+        [gone.digest]
+    );
+}
+
+/// Asserts that a damaged blob whose second read finds no bytes is lost, not damaged, and its
+/// pack is asked after as any lost pack is: here the store holds it whole, so its row is kept.
+#[tokio::test]
+async fn a_damaged_blob_lost_on_its_second_read_has_its_pack_asked_after() {
+    let genuine = blob("0123456789");
+    let rig = Rig::new();
+    rig.store.seed("cas/x/honest", b"0123456789").await;
+    rig.index
+        .record_pack(&row("cas/x/honest", 10, &genuine, 0))
+        .unwrap();
+    rig.store.garble_gets(1);
+    rig.store.lose_gets_after(1, 1);
+    let reader = rig.reader(None, ReaderConfig::default());
+
+    let got = reader.read(&[genuine.digest]).await.unwrap();
+
+    assert_eq!(got, [Fetch::Lost { forgotten: false }]);
+    assert_eq!(rig.store.lens(), ["cas/x/honest"]);
+    assert!(rig.index.locate(&[genuine.digest]).unwrap()[0].is_some());
 }
 
 /// Asserts that bytes that are not the digest are refused and not cached, that the blobs read

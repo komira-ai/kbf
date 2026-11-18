@@ -53,9 +53,9 @@ use super::phases::{Mark, Phase, Timeline};
 use super::record;
 use super::rows::{Look, OpRow, Rows, RowsError};
 use super::steps::Step;
-use super::submit::{Booking, Preparer, prepare};
+use super::submit::{Booking, Preparer, not_minted, prepare};
 use super::task::{PackKey, RunId};
-use super::traits::{Ingested, MintError, UntrustedLimits};
+use super::traits::{Ingested, UntrustedLimits};
 
 /// An operation, as its task holds it.
 pub(crate) struct Op {
@@ -387,14 +387,14 @@ async fn tree_written(
         .deps
         .metrics
         .step_took(Step::TreeWait, started.elapsed());
-    let why = match stored {
+    let settled = match stored {
         Ok(Ok(())) => return Ok(()),
-        // The mint's answer names the tree already.
-        Ok(Err(MintError::Refused(why))) => return Err(Ended::Again(Settled::Invalid(why), None)),
-        Ok(Err(MintError::Unavailable(why))) => why,
-        Err(_) => "the run's action tree was not written within the preparation's limit".to_owned(),
+        Ok(Err(error)) => not_minted(error),
+        Err(_) => Settled::Infra(
+            "the run's action tree was not written within the preparation's limit".to_owned(),
+        ),
     };
-    Err(Ended::Again(Settled::Infra(why), None))
+    Err(Ended::Again(settled, None))
 }
 
 /// Runs `run` from the row a gone process left: its job read back where it is.
@@ -499,6 +499,13 @@ async fn watch_job(
     timeline.stamp(Mark::Ended, Instant::now(), metrics);
     match judge(&read, &result) {
         Verdict::Settled(settled) => {
+            let output = output(inner, run, job, Some(&result)).await;
+            Ended::Again(settled, Some(output))
+        }
+        Verdict::StoreLost { object, settled } => {
+            // Before the next attempt is prepared: its tree is then written checked.
+            let action = reapi_digest(&op.key.action);
+            inner.deps.ingest.lost(&action, &object).await;
             let output = output(inner, run, job, Some(&result)).await;
             Ended::Again(settled, Some(output))
         }

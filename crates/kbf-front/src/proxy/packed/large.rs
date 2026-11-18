@@ -204,24 +204,21 @@ impl Reading {
             return Ok(None);
         };
         let wanted = range.size();
-        let window = self
-            .packs
-            .store
-            .read_range(&self.key, range)
-            .await
-            .map_err(|e| {
+        let window = match self.packs.store.read_range(&self.key, range).await {
+            Ok(window) => window,
+            Err(e) if is_absent(&e) => return Err(self.lost(e.to_string()).await),
+            Err(e) => {
                 self.packs.metrics.read_errors.add(1);
-                Status::unavailable(format!(
+                return Err(Status::unavailable(format!(
                     "reading {} from the object store: {e}",
                     self.digest
-                ))
-            })?;
+                )));
+            }
+        };
         if window.len() as u64 != wanted {
-            self.packs.metrics.lost.add(1);
-            return Err(Status::unavailable(format!(
-                "the object of {} is shorter than the index says",
-                self.digest
-            )));
+            return Err(self
+                .lost("it is shorter than the index says".to_owned())
+                .await);
         }
         self.pos += wanted;
         self.packs.metrics.read_bytes.add(wanted);
@@ -242,6 +239,26 @@ impl Reading {
         Ok(Some((window, None)))
     }
 
+    /// The failure of a blob whose object the store does not have, or has shorter than the index
+    /// says (`why`): the pack is forgotten once the store's length of it confirms the loss
+    /// ([`Packs::forget_lost`]), so the blob is missing and a client uploads it again. The read
+    /// is UNAVAILABLE either way: a client that asks again is answered NOT_FOUND once the row is
+    /// gone.
+    async fn lost(&self, why: String) -> Status {
+        self.packs.metrics.lost.add(1);
+        let end = self.base.saturating_add(self.digest.size_bytes);
+        match self.packs.forget_lost(&self.pack_key, end).await {
+            Ok(forgotten) => self.packs.metrics.lost_forgotten.add(u64::from(forgotten)),
+            Err(status) => {
+                tracing::warn!(blob = %self.digest, %status, "a lost object could not be forgotten");
+            }
+        }
+        Status::unavailable(format!(
+            "the object of {} could not be read: {why}",
+            self.digest
+        ))
+    }
+
     /// The failure of a blob whose object is other bytes than its digest: the row is dropped,
     /// so the blob is missing and a client uploads it again.
     async fn damaged(&self) -> Status {
@@ -259,6 +276,15 @@ impl Reading {
             self.digest
         ))
     }
+}
+
+/// Whether the store answered that it does not have the bytes asked for (the object is gone,
+/// or ends before the range starts), as opposed to failing to answer.
+fn is_absent(error: &ObjectStoreError) -> bool {
+    matches!(
+        error,
+        ObjectStoreError::NotFound(_) | ObjectStoreError::InvalidRange { .. }
+    )
 }
 
 /// `pieces` as the body of a put of the blob `digest`: each piece handed on one piece late and

@@ -1,4 +1,4 @@
-//! The in-memory pack index against the conformance clauses P1 to P10 (the clauses
+//! The in-memory pack index against the conformance clauses P1 to P12 (the clauses
 //! `tests/postgres_pack_index.rs` runs against Postgres), and what the pack index says when it
 //! refuses a call.
 
@@ -12,8 +12,8 @@ use kbf_state::{ManualClock, StoreError};
 
 /// Asserts that the in-memory index passes every clause of the suite: recording and locating,
 /// idempotent and conflicting records, the first location kept, batches of a thousand, touches,
-/// the garbage-collection queries, concurrent records, packs that cannot exist and concurrent
-/// records of one pack.
+/// the garbage-collection queries, concurrent records, packs that cannot exist, concurrent
+/// records of one pack, and forgetting a pack whose object the store lost.
 #[test]
 fn the_memory_index_passes_every_clause() {
     run_all(&MemoryPackBackend);

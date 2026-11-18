@@ -38,7 +38,7 @@ use super::place::{self, Place};
 use super::tstree::{
     self, Child, DIR_MODE, EMPTY_SHA256, ENTRY_BYTES, HEADER_LEN, Item, RANGE_MERGE_GAP,
 };
-use super::{BaseTree, INPUT_ROOT, NoTree, TreeWriter, reserved_input};
+use super::{BaseTree, INPUT_ROOT, NoTree, TreeWriter, Trust, reserved_input};
 use crate::large_backfill::large_key;
 use crate::prepare_run::{KeptClosure, KeptDirectory};
 
@@ -198,7 +198,8 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_named(kept, base, |_| ()).await
+        self.write_listing_as(kept, base, Trust::Memos, |_| ())
+            .await
     }
 
     /// As [`TreeWriter::write_listing`], and calls `named` with the listing as soon as its key
@@ -215,6 +216,47 @@ impl TreeWriter {
         &self,
         kept: &KeptClosure,
         base: &BaseTree,
+        named: impl FnOnce(&Listing) + Send,
+    ) -> Result<Listing, NoTree> {
+        self.write_listing_as(kept, base, Trust::Memos, named).await
+    }
+
+    /// [`TreeWriter::write_listing`] for a tree whose last job found an object lost: no place
+    /// is taken from the place memo, and every pack the list names is asked after in the store
+    /// ([`super::check`]).
+    ///
+    /// # Errors
+    /// As [`TreeWriter::write_listing`]; and [`NoTree::Lost`] when the store lacks a pack the
+    /// index names, which the index then forgets.
+    pub async fn write_listing_checked(
+        &self,
+        kept: &KeptClosure,
+        base: &BaseTree,
+    ) -> Result<Listing, NoTree> {
+        self.write_listing_as(kept, base, Trust::Store, |_| ())
+            .await
+    }
+
+    /// [`TreeWriter::write_listing_checked`], naming the list as
+    /// [`TreeWriter::write_listing_named`] does: a pack the store lost is found before the
+    /// list is named, so a list that is [`NoTree::Lost`] is never named.
+    ///
+    /// # Errors
+    /// As [`TreeWriter::write_listing_checked`] and [`TreeWriter::write_listing_named`].
+    pub async fn write_listing_checked_named(
+        &self,
+        kept: &KeptClosure,
+        base: &BaseTree,
+        named: impl FnOnce(&Listing) + Send,
+    ) -> Result<Listing, NoTree> {
+        self.write_listing_as(kept, base, Trust::Store, named).await
+    }
+
+    async fn write_listing_as(
+        &self,
+        kept: &KeptClosure,
+        base: &BaseTree,
+        trust: Trust,
         named: impl FnOnce(&Listing) + Send,
     ) -> Result<Listing, NoTree> {
         reserved_input(kept)?;
@@ -238,7 +280,7 @@ impl TreeWriter {
             .into_iter()
             .collect();
         let now = (self.clock)();
-        let (places, unlocated) = self.locate(&blobs, now).await?;
+        let (places, unlocated) = self.locate(&blobs, now, trust).await?;
         let lay = Layout {
             listed,
             directories: &survey.directories,

@@ -9,6 +9,7 @@ use kbf_front::{Dispatch, Finished};
 use tonic::Code;
 
 use super::*;
+use crate::executor::MintError;
 use crate::executor::tests::{Rig, settle};
 
 /// The runs whose tree writes were waited for, in order.

@@ -63,6 +63,11 @@ pub struct PackMetrics {
     /// (each also a [`PackMetrics::digest_mismatches`]): the next read of that blob finds no
     /// row and goes to the storage nodes.
     pub locations_dropped: Counter,
+    /// Of the reads counted in [`PackMetrics::lost`], those after which the index forgot the
+    /// pack, its length having shown it gone or shorter than the index says: its blobs are
+    /// missing from then on, so clients upload them again, and action-cache entries that name
+    /// them are misses.
+    pub lost_forgotten: Counter,
     /// Uploads that had to wait for room, because the uploads in flight held all of
     /// `--pack-inflight-bytes`.
     pub upload_waits: Counter,
@@ -294,6 +299,11 @@ impl PackMetrics {
                 "kbf_pack_locations_dropped_total",
                 "Pack locations dropped from the index after a read found other bytes than the digest",
                 &self.locations_dropped,
+            ),
+            (
+                "kbf_pack_read_lost_forgotten_total",
+                "Reads of a lost blob after which the index forgot its pack, gone from the store",
+                &self.lost_forgotten,
             ),
             (
                 "kbf_pack_upload_waits_total",

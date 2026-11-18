@@ -39,6 +39,7 @@ pub struct Index {
     fail_put_action: AtomicU32,
     fail_directories: AtomicU32,
     fail_record_directories: AtomicU32,
+    fail_forget: AtomicU32,
     keeps_no_directories: AtomicBool,
     /// Whether a record of Directory rows waits (inside the index call) until released.
     holds_records: Mutex<bool>,
@@ -57,6 +58,7 @@ impl Index {
             fail_put_action: AtomicU32::new(0),
             fail_directories: AtomicU32::new(0),
             fail_record_directories: AtomicU32::new(0),
+            fail_forget: AtomicU32::new(0),
             keeps_no_directories: AtomicBool::new(false),
             holds_records: Mutex::new(false),
             released: Condvar::new(),
@@ -101,6 +103,11 @@ impl Index {
     /// The next `n` records of Directory rows fail.
     pub fn fail_record_directories(&self, n: u32) {
         self.fail_record_directories.store(n, SeqCst);
+    }
+
+    /// The next `n` forgets of a pack fail.
+    pub fn fail_forget(&self, n: u32) {
+        self.fail_forget.store(n, SeqCst);
     }
 
     /// The next `n` records fail.
@@ -171,6 +178,13 @@ impl PackIndex for Index {
 
     fn drop_location(&self, digest: &BlobDigest, pack_key: &str) -> Result<bool, PackIndexError> {
         self.inner.drop_location(digest, pack_key)
+    }
+
+    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
+        if fires(&self.fail_forget) {
+            return Err(PackIndexError::NotMigrated);
+        }
+        self.inner.forget_pack(pack_key)
     }
 
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {

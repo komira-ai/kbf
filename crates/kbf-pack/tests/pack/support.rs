@@ -58,8 +58,11 @@ pub struct FaultyStore {
     pass_lists: AtomicU32,
     fail_lists: AtomicU32,
     garble_gets: AtomicU32,
+    lose_gets: AtomicU32,
+    fail_lens: AtomicU32,
     vanishing: Mutex<Option<String>>,
     ranges: Mutex<Vec<(String, u64, u64)>>,
+    lens: Mutex<Vec<String>>,
 }
 
 impl FaultyStore {
@@ -89,9 +92,34 @@ impl FaultyStore {
             pass_lists: AtomicU32::new(0),
             fail_lists: AtomicU32::new(0),
             garble_gets: AtomicU32::new(0),
+            lose_gets: AtomicU32::new(0),
+            fail_lens: AtomicU32::new(0),
             vanishing: Mutex::new(None),
             ranges: Mutex::new(Vec::new()),
+            lens: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The next `n` reads answer that the object is not there, whatever the store holds: a
+    /// read that raced the object's write.
+    pub fn lose_gets(&self, n: u32) {
+        self.lose_gets.store(n, Ordering::SeqCst);
+    }
+
+    /// After `ok` reads, the next `n` answer that the object is not there.
+    pub fn lose_gets_after(&self, ok: u32, n: u32) {
+        self.pass_gets.store(ok, Ordering::SeqCst);
+        self.lose_gets.store(n, Ordering::SeqCst);
+    }
+
+    /// The next `n` questions of an object's length fail.
+    pub fn fail_lens(&self, n: u32) {
+        self.fail_lens.store(n, Ordering::SeqCst);
+    }
+
+    /// The key of every object whose length was asked, in order.
+    pub fn lens(&self) -> Vec<String> {
+        entries(&self.lens)
     }
 
     /// The next `n` reads answer the bytes asked for with their first byte flipped.
@@ -226,6 +254,9 @@ impl ObjectStore for FaultyStore {
         if doomed.as_deref() == Some(key.as_str()) {
             self.inner.delete(key).await?;
         }
+        if !passes && fires(&self.lose_gets) {
+            return Err(ObjectStoreError::NotFound(key.clone()));
+        }
         let bytes = self.inner.get_range(key, range).await?;
         if fires(&self.garble_gets) {
             let mut garbled = bytes.to_vec();
@@ -239,6 +270,14 @@ impl ObjectStore for FaultyStore {
 
     async fn may_hold(&self, key: &ObjectKey) -> Result<bool, ObjectStoreError> {
         self.inner.may_hold(key).await
+    }
+
+    async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
+        note(&self.lens, key.to_string());
+        if fires(&self.fail_lens) {
+            return Err(injected());
+        }
+        self.inner.len(key).await
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
@@ -284,6 +323,7 @@ pub struct FlakyIndex {
     fail_touch: AtomicU32,
     fail_unreferenced: AtomicU32,
     fail_drop: AtomicU32,
+    fail_forget: AtomicU32,
     held: Mutex<Vec<bool>>,
     finds: Mutex<Vec<usize>>,
     locates: Mutex<Vec<usize>>,
@@ -303,6 +343,7 @@ impl FlakyIndex {
             fail_touch: AtomicU32::new(0),
             fail_unreferenced: AtomicU32::new(0),
             fail_drop: AtomicU32::new(0),
+            fail_forget: AtomicU32::new(0),
             held: Mutex::new(Vec::new()),
             finds: Mutex::new(Vec::new()),
             locates: Mutex::new(Vec::new()),
@@ -348,6 +389,11 @@ impl FlakyIndex {
     /// The next `n` drops of a location are refused as unsupported.
     pub fn fail_drop(&self, n: u32) {
         self.fail_drop.store(n, Ordering::SeqCst);
+    }
+
+    /// The next `n` forgets of a pack fail.
+    pub fn fail_forget(&self, n: u32) {
+        self.fail_forget.store(n, Ordering::SeqCst);
     }
 
     /// For each record, whether the store held the pack when it was recorded.
@@ -435,6 +481,13 @@ impl PackIndex for FlakyIndex {
             return Err(PackIndexError::Unsupported);
         }
         self.inner.drop_location(digest, pack_key)
+    }
+
+    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
+        if fires(&self.fail_forget) {
+            return Err(PackIndexError::NotMigrated);
+        }
+        self.inner.forget_pack(pack_key)
     }
 }
 

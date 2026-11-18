@@ -403,6 +403,32 @@ impl Packs {
         self.store.len(&key).await.map_err(|e| failed(&e))
     }
 
+    /// Forgets the pack `key` in the index if the store does not have it, or has it shorter than
+    /// `end` bytes: a reader of `key` was told the object is not there. The store is asked for
+    /// the object's length first, so a read that raced the object's write, or a caller that
+    /// named an object that is there, forgets nothing. Returns whether the pack was forgotten.
+    ///
+    /// # Errors
+    /// UNAVAILABLE when `key` is not an object key, or the store or the index fails.
+    pub(crate) async fn forget_lost(&self, key: &str, end: u64) -> Result<bool, Status> {
+        let length = self.object_len(key).await?;
+        if length.is_some_and(|length| length >= end) {
+            tracing::warn!(key, "an object a reader found lost is held whole: kept");
+            return Ok(false);
+        }
+        let index = Arc::clone(&self.index);
+        let pack = key.to_owned();
+        let rows = offload(move || index.forget_pack(&pack)).await;
+        let rows = rows.map_err(|e| Status::unavailable(format!("pack index: {e}")))?;
+        tracing::warn!(
+            key,
+            rows,
+            ?length,
+            "the store does not have an object the index named: the index forgot it, and its blobs are missing until uploaded again"
+        );
+        Ok(true)
+    }
+
     /// Writes `blobs` into packs and records them. They are in the pack index, and the packs
     /// are stored, when this returns `Ok`. When it fails, the packs finished before the failure
     /// stay recorded (each pack is recorded before the next is started), so a call repeated
@@ -555,10 +581,14 @@ impl Packs {
                 tracing::debug!(%digest, "not in a pack: asking the storage nodes");
                 Ok(None)
             }
-            Fetch::Lost => {
+            Fetch::Lost { forgotten } => {
+                // When the reader forgot the pack, the index no longer has a row for the
+                // digest: FindMissingBlobs lists it, so a client uploads it again.
                 self.metrics.lost.add(1);
+                self.metrics.lost_forgotten.add(u64::from(forgotten));
                 tracing::warn!(
                     %digest,
+                    forgotten,
                     "the index has the blob and its pack does not: asking the storage nodes"
                 );
                 Ok(None)

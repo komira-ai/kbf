@@ -452,3 +452,21 @@ fn remembering_a_key_again_replaces_its_value_in_place() {
     map.put(2, "two");
     assert_eq!((map.get(&1), map.get(&2)), (None, Some("two")));
 }
+
+/// Asserts that a key forgotten is gone and its value handed back, that forgetting a key the map
+/// does not hold changes nothing, and that a forgotten key no longer counts toward the bound: the
+/// entries remembered after it are kept.
+#[test]
+fn a_forgotten_key_is_gone_and_frees_its_place() {
+    let mut map = Bounded::new(2);
+    map.put(1, "one");
+    map.put(2, "two");
+    assert_eq!(map.remove(&1), Some("one"));
+    assert_eq!(map.remove(&1), None);
+    assert_eq!(map.remove(&9), None);
+    map.put(3, "three");
+    assert_eq!(
+        (map.get(&1), map.get(&2), map.get(&3)),
+        (None, Some("two"), Some("three"))
+    );
+}

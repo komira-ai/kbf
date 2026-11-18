@@ -63,7 +63,7 @@ use kbf_types::ImageRef;
 
 use crate::executor::{
     Config, DEFAULT_MAC_OS_VERSION, Deps, Executor, Front, FrontParts, InputTree, MacPool, Metrics,
-    PutDirParts, PutDirRoots, RunSource,
+    PutDirParts, PutDirRoots, Republish, RunSource,
 };
 
 const KIND: &str = "executor";
@@ -489,6 +489,10 @@ pub struct JsAgentFlags {
     /// Where the base tree published from [`JsAgentFlags::base_tree`] is set when the frontend
     /// starts: what the executor writes its action trees over (`--task-out-mode put-dir`).
     pub published: Arc<OnceLock<BaseTree>>,
+    /// What publishes that base tree again, set when the frontend has published it
+    /// ([`super::base_tree`]): the executor calls it when a job did not start for an object
+    /// of the base tree the store lost.
+    pub republish: Arc<OnceLock<Republish>>,
     /// `--task-put-retry-secs`: how long the waits for a 503 of the store add up to when the
     /// executor writes an action tree. Set by the task flags; the default until then.
     pub put_retry: Duration,
@@ -620,6 +624,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
             .unwrap_or_default(),
         base_tree_timeout: secs(BASE_TREE_TIMEOUT),
         published: Arc::default(),
+        republish: Arc::default(),
         put_retry: DEFAULT_TOTAL,
         manifest_writes: MANIFEST_WRITES,
     })
@@ -676,7 +681,8 @@ impl JsAgentFlags {
     pub fn front(&self, packs: Packs, backend: Backend, source: RunSource) -> Front {
         let put_dir = PutDirParts::new(&packs, &backend, Arc::clone(&self.published))
             .with_put_retry(PutRetry::new(self.put_retry))
-            .with_write_slots(self.manifest_writes);
+            .with_write_slots(self.manifest_writes)
+            .with_republish(Arc::clone(&self.republish));
         Front::new(FrontParts {
             packs,
             backend,

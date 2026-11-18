@@ -10,8 +10,13 @@
 //! - **Forgotten by root**: [`Memo::forget`] drops an input root's entry and every entry it
 //!   reaches through its subdirectories, so that the next tree of that root is built from the
 //!   pack index as it is then.
+//! - **Forgotten by a lost manifest**: [`Memo::forget_manifest`] drops every entry that names a
+//!   manifest the store no longer has, and every entry above one (a parent's manifest names its
+//!   child's), so that the next tree that holds them writes them again; and the whole memo is
+//!   dropped once a pack is found lost ([`Memo::clear`]), since no entry says which packs its
+//!   manifest names.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use kbf_types::Digest;
@@ -92,6 +97,37 @@ impl Memo {
                 stack.extend(remembered.children);
             }
         }
+    }
+
+    /// Drops every entry whose manifest's SHA-256 is `manifest`, and every entry that reaches
+    /// one through its subdirectories, expired ones included. Returns how many it dropped.
+    pub(super) fn forget_manifest(&mut self, manifest: &[u8; 32]) -> usize {
+        let mut gone: BTreeSet<Digest> = (self.entries.iter())
+            .filter(|(_, (remembered, _))| remembered.manifest.hash == *manifest)
+            .map(|(digest, _)| *digest)
+            .collect();
+        // Each pass adds the parents of what is gone; a pass that adds none ends it.
+        loop {
+            let parents: Vec<Digest> = (self.entries.iter())
+                .filter(|(digest, _)| !gone.contains(*digest))
+                .filter(|(_, (remembered, _))| remembered.children.iter().any(|c| gone.contains(c)))
+                .map(|(digest, _)| *digest)
+                .collect();
+            if parents.is_empty() {
+                break;
+            }
+            gone.extend(parents);
+        }
+        for digest in &gone {
+            self.remove(digest);
+        }
+        gone.len()
+    }
+
+    /// Drops every entry.
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
     }
 
     fn remove(&mut self, digest: &Digest) -> Option<(Remembered, u64)> {

@@ -38,10 +38,14 @@
 //!   asks the index to drop that blob's row, but only while it still points into the pack
 //!   the bytes came from; a row that points at another pack is kept. A dropped blob has no
 //!   row until a pack that holds it is recorded: the first location wins again.
+//! - **A pack can be forgotten.** A reader the object store told that a pack is gone (or
+//!   shorter than its rows say) asks the index to forget it: every row that points into it and
+//!   the pack's own row go, so its blobs are missing until a pack that holds them is recorded,
+//!   and the same key recorded again is a new pack.
 //! - **Reads are queries.** [`PackIndex::locate`], [`PackIndex::find_missing`],
 //!   [`PackIndex::dead_packs`] and [`PackIndex::unreferenced_keys`] write nothing, and
 //!   [`PackIndex::touch`] writes `last_touch_us` and nothing else. Blob rows are inserted by
-//!   a record and removed only by [`PackIndex::drop_location`].
+//!   a record and removed only by [`PackIndex::drop_location`] and [`PackIndex::forget_pack`].
 
 use std::time::Duration;
 
@@ -270,6 +274,27 @@ pub trait PackIndex: Send + Sync {
     /// not take or allow the call; [`PackIndexError::Store`] when the store fails.
     fn drop_location(&self, digest: &BlobDigest, pack_key: &str) -> Result<bool, PackIndexError> {
         let _ = (digest, pack_key);
+        Err(PackIndexError::Unsupported)
+    }
+
+    /// Forgets the pack recorded under `pack_key`: removes every blob row that points into it
+    /// and the pack's own row, in one transaction. Returns how many blob rows it removed; a key
+    /// nobody recorded removes nothing and answers 0.
+    ///
+    /// A caller calls it when the object store answers that the object under `pack_key` is not
+    /// there. Afterwards [`PackIndex::find_missing`] lists the pack's blobs, so a client uploads
+    /// them again, and a pack recorded under the same key again is a new pack whose blobs get
+    /// rows ([`PackIndex::record_pack`] answers `created: true`), where a pack row kept with no
+    /// rows would answer `created: false` and make none.
+    ///
+    /// The default answers [`PackIndexError::Unsupported`], as [`PackIndex::drop_location`]
+    /// does.
+    ///
+    /// # Errors
+    /// [`PackIndexError::Unsupported`] or [`PackIndexError::Refused`] from an index that does
+    /// not take or allow the call; [`PackIndexError::Store`] when the store fails.
+    fn forget_pack(&self, pack_key: &str) -> Result<usize, PackIndexError> {
+        let _ = pack_key;
         Err(PackIndexError::Unsupported)
     }
 

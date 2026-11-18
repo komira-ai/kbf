@@ -36,14 +36,27 @@
 //!   digests, so what they say cannot change. Only a read that succeeded is remembered.
 //! - **The steps of a mint are timed** into the executor's `kbf_executor_step_seconds`
 //!   ([`Front::with_metrics`]): the put directory, the closure's parts and the tree's name.
+//! - **An object the store lost** ([`Ingest::lost`]): a job that did not start because the store
+//!   does not have an object of its tree. The store is general-purpose, and its objects can
+//!   vanish while the frontend's state names them. The action's remembered trees are dropped,
+//!   the writer's memos drop what they say of the object ([`TreeWriter::lost_manifest`]), and the
+//!   action's next tree is written checked against the store ([`TreeWriter::write_checked`]): a
+//!   pack the store lost is forgotten by the pack index, and the run is answered with its blobs
+//!   missing ([`MintError::Missing`]), which the client uploads again. An object neither memo nor
+//!   the action's tree names is taken for one of the kbf base tree's, whose objects the frontend
+//!   publishes again ([`PutDirParts::with_republish`]), one publish at a time.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+
+use futures::future::BoxFuture;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::action_tree::{BaseTree, MEMO_TTL, PutRetry, TreeWriter};
+use kbf_front::action_tree::NoTree;
+use kbf_front::action_tree::{ActionTree, BaseTree, Listing, MEMO_TTL, PutRetry, TreeWriter};
 use kbf_front::prepare_run::{
-    KeptClosure, PrepareError as RunPrepError, PrepareFault, PrepareTook, PutDirPrep, PutDirRun,
+    ClosureError, KeptClosure, PrepareError as RunPrepError, PrepareFault, PrepareTook, PutDirPrep,
+    PutDirRun,
 };
 use kbf_front::{Backend, Described, IssuedPutDir, PackKeyMint, Packs};
 use kbf_proto::reapi::{self, Action, Command, Digest};
@@ -80,6 +93,9 @@ pub enum PrepareError {
     /// The store could not answer.
     #[error("{0}")]
     Unavailable(String),
+    /// A blob of the inputs is not held: the store lost it after the Execute found it held.
+    #[error("{0} is not in the store")]
+    Missing(kbf_types::Digest),
 }
 
 /// The frontend's preparation of a run: its put directory, and the closure of its inputs.
@@ -142,6 +158,7 @@ impl From<PrepareError> for MintError {
         match error {
             PrepareError::Refused(why) => Self::Refused(why),
             PrepareError::Unavailable(why) => Self::Unavailable(why),
+            PrepareError::Missing(digest) => Self::Missing(vec![digest]),
         }
     }
 }
@@ -189,6 +206,11 @@ fn prepared_put_dir(run: PutDirRun) -> PreparedPutDir {
 }
 
 fn prepare_error(error: RunPrepError) -> PrepareError {
+    // The Execute found every input held, so a blob missing now is one the store lost since:
+    // the client uploads it again, and its next Execute runs.
+    if let RunPrepError::Closure(ClosureError::Missing { digest, .. }) = error {
+        return PrepareError::Missing(digest);
+    }
     let why = error.to_string();
     match error.fault() {
         PrepareFault::Unavailable => PrepareError::Unavailable(why),
@@ -246,6 +268,34 @@ pub struct PutDirParts {
     /// The kbf base tree every action tree is written over: set when the frontend has published
     /// it, before the executor is started.
     pub base: Arc<OnceLock<BaseTree>>,
+    /// What publishes the base tree again, set when the frontend has published it: called when a
+    /// job did not start for an object the store lost that is not one of the action tree's own.
+    pub republish: Arc<OnceLock<Republish>>,
+}
+
+/// Publishes the kbf base tree again: writes each of its objects the store lacks, or says why it
+/// could not.
+#[derive(Clone)]
+pub struct Republish(Arc<dyn Fn() -> BoxFuture<'static, Result<(), String>> + Send + Sync>);
+
+impl Republish {
+    /// The publish `run` makes, each time it is called.
+    pub fn new(
+        run: impl Fn() -> BoxFuture<'static, Result<(), String>> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(run))
+    }
+
+    /// Publishes the base tree again.
+    pub(crate) async fn run(&self) -> Result<(), String> {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for Republish {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Republish")
+    }
 }
 
 impl PutDirParts {
@@ -256,7 +306,15 @@ impl PutDirParts {
         Self {
             writer: TreeWriter::new(Arc::new(backend.clone()), Arc::new(packs.clone()), clock),
             base,
+            republish: Arc::default(),
         }
+    }
+
+    /// These parts publishing the base tree again with what `republish` will hold.
+    #[must_use]
+    pub fn with_republish(mut self, republish: Arc<OnceLock<Republish>>) -> Self {
+        self.republish = republish;
+        self
     }
 
     /// These parts writing action trees with `retry`.
@@ -313,6 +371,14 @@ pub struct Front {
     facts: Mutex<Bounded<(String, i64), ActionFacts>>,
     /// Where the steps of a preparation are timed ([`Step`]).
     metrics: Arc<Metrics>,
+    /// The actions whose next tree is written checked against the store: a job of theirs did
+    /// not start for an object the store lost. Shared with the tasks that write the trees, which
+    /// clear an action once its checked tree is stored.
+    checked: Arc<Mutex<Bounded<kbf_types::Digest, ()>>>,
+    /// Held while the base tree is published again: one publish at a time.
+    republishing: tokio::sync::Mutex<()>,
+    /// What publishes the base tree again.
+    republish: Arc<OnceLock<Republish>>,
 }
 
 type Trees = Bounded<(kbf_types::Digest, InputTree), (String, SystemTime)>;
@@ -334,7 +400,12 @@ impl Front {
             prepare,
             base_image,
             kbf_image,
-            put_dir: PutDirParts { writer, base },
+            put_dir:
+                PutDirParts {
+                    writer,
+                    base,
+                    republish,
+                },
         } = parts;
         Self {
             // The ingest judges the age of a key by the clock the keys are minted by.
@@ -352,6 +423,9 @@ impl Front {
             trees: Arc::new(Mutex::new(Bounded::new(TREE_ENTRIES))),
             facts: Mutex::new(Bounded::new(FACTS_ENTRIES)),
             metrics: Arc::new(Metrics::default()),
+            checked: Arc::new(Mutex::new(Bounded::new(TREE_ENTRIES))),
+            republishing: tokio::sync::Mutex::new(()),
+            republish,
         }
     }
 
@@ -386,6 +460,28 @@ impl Front {
 
     fn facts(&self) -> MutexGuard<'_, Bounded<(String, i64), ActionFacts>> {
         self.facts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn checked(&self) -> MutexGuard<'_, Bounded<kbf_types::Digest, ()>> {
+        self.checked.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Publishes the base tree again, if the frontend set what does: one publish at a time, and
+    /// a caller that finds one running waits for it and publishes nothing more.
+    async fn republish_base(&self) {
+        let Some(republish) = self.republish.get() else {
+            return;
+        };
+        let Ok(_alone) = self.republishing.try_lock() else {
+            let _ran = self.republishing.lock().await;
+            return;
+        };
+        match republish.run().await {
+            Ok(()) => tracing::warn!(
+                "published the kbf base tree again: a job's tree named an object the store lost"
+            ),
+            Err(error) => tracing::error!(%error, "could not publish the kbf base tree again"),
+        }
     }
 
     /// The name of the action tree remembered for `action` in `form`, if it is good at `now`.
@@ -484,6 +580,24 @@ impl Ingest for Front {
             kbf_front::Ingested::Unavailable(why) => Ingested::Unavailable(why.to_string()),
         }
     }
+
+    async fn lost(&self, action: &Digest, object: &[u8; 32]) {
+        let Ok(action) = cas_digest(action) else {
+            return;
+        };
+        let hex = super::outcome::hex(object);
+        let mut own = false;
+        for form in [InputTree::Manifests, InputTree::Provider] {
+            let tree = self.trees().remove(&(action, form));
+            own |= tree.is_some_and(|(tree, _)| tree.ends_with(&hex));
+        }
+        self.checked().put(action, ());
+        let named = self.writer.lost_manifest(object);
+        tracing::warn!(%action, object = %hex, named, own, "the store lost an object of an action's tree: its next tree is written checked");
+        if !named && !own {
+            self.republish_base().await;
+        }
+    }
 }
 
 /// The put directory the frontend issued, from its text `cas/b/<build>/<nonce>`.
@@ -524,8 +638,13 @@ impl Front {
         }
         let build = build_id(run);
         let prepare = &self.prepare;
+        // Checked until a checked tree is stored: a run that fails before keeps it so.
+        let checked = self.checked().get(action).is_some();
+        let remembered = (!checked)
+            .then(|| self.remembered_tree(action, form, now))
+            .flatten();
         let started = Instant::now();
-        let (dir, not_after, tree, writes) = match self.remembered_tree(action, form, now) {
+        let (dir, not_after, tree, writes) = match remembered {
             Some(tree) => {
                 let minted = prepare.mint_put_dir(&build, action, now, wall).await;
                 self.metrics.step_took(Step::PutDir, started.elapsed());
@@ -546,7 +665,8 @@ impl Front {
                     self.metrics.step_took(step, took);
                 }
                 lasts(prepared.not_after, now, wall)?;
-                let (tree, writes) = self.write_tree(prepared.kept, *action, form, now).await?;
+                let (tree, writes) =
+                    (self.write_tree(prepared.kept, *action, form, now, checked)).await?;
                 (prepared.dir, prepared.not_after, tree, Some(writes))
             }
         };
@@ -574,16 +694,21 @@ impl Front {
         action: kbf_types::Digest,
         form: InputTree,
         now: SystemTime,
+        checked: bool,
     ) -> Result<(String, JoinHandle<Result<(), MintError>>), MintError> {
         let started = Instant::now();
-        let (writer, base, trees) = (
+        let (writer, base, trees, checks) = (
             Arc::clone(&self.writer),
             Arc::clone(&self.base),
             Arc::clone(&self.trees),
+            Arc::clone(&self.checked),
         );
         let (named, name) = oneshot::channel::<String>();
         let writes = tokio::spawn(async move {
-            let tree = write_named(&writer, &base, &kept, form, named).await?;
+            let tree = write_named(&writer, &base, &kept, (form, checked), named).await?;
+            if checked {
+                lock_checked(&checks).remove(&action);
+            }
             let expires = now.checked_add(MEMO_TTL).unwrap_or(now);
             lock_trees(&trees).put((action, form), (tree, expires));
             Ok(())
@@ -600,6 +725,13 @@ impl Front {
     }
 }
 
+/// The actions to check behind `checked`'s lock.
+fn lock_checked(
+    checked: &Mutex<Bounded<kbf_types::Digest, ()>>,
+) -> MutexGuard<'_, Bounded<kbf_types::Digest, ()>> {
+    checked.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The trees remembered behind `trees`' lock.
 fn lock_trees(trees: &Mutex<Trees>) -> MutexGuard<'_, Trees> {
     trees.lock().unwrap_or_else(PoisonError::into_inner)
@@ -610,37 +742,52 @@ fn broke() -> MintError {
     MintError::Unavailable("the task writing the action tree ended without an answer".to_owned())
 }
 
-/// Writes the action tree of `kept` over the base tree `base` holds as `form` says, and sends
-/// its name (its root manifest's digest in hex, or its tree list's key) to `named` as soon as
-/// the writer has it, before any write. Returns the name once every write succeeded.
+/// Writes the action tree of `kept` over the base tree `base` holds as `form` says, `checked`
+/// against the store when a job of the action did not start for an object the store lost, and
+/// sends its name (its root manifest's digest in hex, or its tree list's key) to `named` as soon
+/// as the writer has it, before any write. Returns the name once every write succeeded.
 async fn write_named(
     writer: &TreeWriter,
     base: &OnceLock<BaseTree>,
     kept: &KeptClosure,
-    form: InputTree,
+    (form, checked): (InputTree, bool),
     named: oneshot::Sender<String>,
 ) -> Result<String, MintError> {
     // The mint checked the base before it collected the closure, and a base once set stays.
     let Some(base) = base.get() else {
         return Err(broke());
     };
-    let name = |tree: String| {
-        let _ = named.send(tree);
-    };
     let tree = match form {
-        InputTree::Manifests => (writer
-            .write_named(kept, base, |tree| name(tree.digest().to_string()))
-            .await)
-            .map(|tree| tree.digest().to_string()),
-        InputTree::Provider => (writer
-            .write_listing_named(kept, base, |listing| name(listing.key().to_owned()))
-            .await)
-            .map(|listing| listing.key().to_owned()),
+        InputTree::Manifests => {
+            let of_tree = move |tree: &ActionTree| {
+                let _ = named.send(tree.digest().to_string());
+            };
+            let tree = match checked {
+                true => writer.write_checked_named(kept, base, of_tree).await,
+                false => writer.write_named(kept, base, of_tree).await,
+            };
+            tree.map(|tree| tree.digest().to_string())
+        }
+        InputTree::Provider => {
+            let of_list = move |listing: &Listing| {
+                let _ = named.send(listing.key().to_owned());
+            };
+            let listing = match checked {
+                true => {
+                    writer
+                        .write_listing_checked_named(kept, base, of_list)
+                        .await
+                }
+                false => writer.write_listing_named(kept, base, of_list).await,
+            };
+            listing.map(|listing| listing.key().to_owned())
+        }
     };
     tree.map_err(|no| {
         let why = format!("no action tree: {no}");
-        match no.why() {
-            "store" => MintError::Unavailable(why),
+        match no {
+            NoTree::Lost { blobs } => MintError::Missing(blobs),
+            _ if no.why() == "store" => MintError::Unavailable(why),
             _ => MintError::Refused(why),
         }
     })
