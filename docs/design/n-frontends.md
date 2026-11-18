@@ -52,8 +52,8 @@ is what still assumes it is alone. Each row below is a behaviour of the code tod
 Four things beside the executor, found while reading for this document, would also break a second frontend. They are not the
 executor's, but N frontends need them (section 6):
 
-- The history is `file://`, locked by `flock` for the life of the process (`kbf-objstore/src/fs_store.rs`); the new task cannot open
-  the slot's history directory until the old one exits (`history/lock_wait.rs` retries the open). `--history-objects=s3://…`
+- The history was `file://`, locked by `flock` for the life of the process (`kbf-objstore/src/fs_store.rs`), so the new task could not
+  open the slot's history directory until the old one exited; history now opens the directory shared (`fs_store_shared.rs`), and both write it. `--history-objects=s3://…`
   took its key pair only from the process environment (`history/flags.rs` `process_env`), and a Swarm secret is a file; PR 2
   added `--history-credentials-file`.
 - The base-tree cache directory `/var/lib/kbf-frontend/base-tree` is shared by the two tasks and its fetch is not safe for two
@@ -397,7 +397,7 @@ history never deletes, so it does not arise on `history/`.
 What is missing is the key pair: `--history-objects` reads `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` from the environment, and
 Swarm secrets are files (this is the second point of #1746). PR 2 adds `--history-credentials-file` (JSON
 `{"access_key_id","secret_access_key"}`, owner-only mode, as `--cold-store-credentials-file` and `--pack-store-credentials-file` are
-read), a flag, not an environment variable (S2). With an `s3://` history there is no `LOCK`: the slot's history directory and its
+read), a flag, not an environment variable (S2). With an `s3://` history there is no directory to share: the slot's history directory and its
 bind go away.
 
 The NUC's proxy is the gateway of `docker_gwbridge` (port 9300 on that bridge; komira-internal names it by the

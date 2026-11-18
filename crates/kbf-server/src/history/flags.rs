@@ -1,6 +1,6 @@
 //! `--history-objects`, `--history-credentials-file` and `--history-index-root`: where build history is kept.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use kbf_history::{HistoryRoot, IndexRoot};
@@ -24,7 +24,7 @@ const AFTER_ALL: usize = 900;
 // server starts rather than clap when it parses.
 #[derive(Clone, Debug, Default, clap::Args)]
 pub struct HistoryFlags {
-    /// Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the one in `--history-credentials-file`, else the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory this process owns, not the cold store's). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded
+    /// Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the one in `--history-credentials-file`, else the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory several kbf processes may share, such as the old and the new frontend of a rolling update, each writing under its own writer id; not the cold store's directory, which one process owns). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded
     #[arg(long, value_name = "URI", display_order = AFTER_ALL)]
     pub history_objects: Option<StoreUri>,
     /// A file with the key pair of an `s3://` `--history-objects`, JSON `{"access_key_id": "...", "secret_access_key": "..."}` in the form of `--pack-store-credentials-file`: a regular file, not a link, that this user owns, mode 0600 or 0400. When given, the environment's `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are not read. The secret is never a flag. Needs `--history-objects`, and an `s3://` one
@@ -107,17 +107,6 @@ impl HistoryFlags {
         state: Option<&StateStore>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Option<History>, HistoryError> {
-        self.open_by(state, env, &mut |dir| FsStore::open(dir, Floor::KeepFree))
-    }
-
-    /// [`HistoryFlags::open_with`], opening a `file://` directory with `file` (the
-    /// frontend's waits while another process holds it: [`super::lock_wait`]).
-    pub(super) fn open_by(
-        &self,
-        state: Option<&StateStore>,
-        env: &dyn Fn(&str) -> Option<String>,
-        file: &mut dyn FnMut(&Path) -> Result<FsStore, FsStoreError>,
-    ) -> Result<Option<History>, HistoryError> {
         let Some(uri) = &self.history_objects else {
             return Ok(None);
         };
@@ -132,7 +121,7 @@ impl HistoryFlags {
                 Err(HistoryError::KeyFileOnFileStore)
             }
             StoreUri::File(dir) => {
-                let objects = file(dir)?;
+                let objects = FsStore::open_shared(dir, Floor::KeepFree)?;
                 let root = HistoryRoot::under(&KeyPrefix::new(FILE_PREFIX_ROOT)?)?;
                 Ok(Some(over(objects, root, store, index_root, options)))
             }

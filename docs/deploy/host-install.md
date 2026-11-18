@@ -809,8 +809,7 @@ paths (and different `--socket-user`s, or the same one with a socket each). Each
 other frontend in `peers`.
 
 The helper makes each container with the mounts its own file lists, and shares nothing between
-the two. So each file must give its frontend its own state directory and, when
-`--history-objects` is a `file://` directory, its own history directory. The file store locks
-`LOCK` in that directory (`crates/kbf-objstore/src/fs_store.rs:294-304`), so a second frontend on
-the same directory never opens it while the first runs: it waits for the lock, logging every
-attempt, with no deadline, and does not serve.
+the two. So each file must give its frontend its own state directory. A `file://`
+`--history-objects` directory may be the same for both: history opens it shared
+(`crates/kbf-objstore/src/fs_store_shared.rs`), takes no `LOCK`, and each frontend writes only keys
+that carry its own writer id, so two frontends write one directory at once.

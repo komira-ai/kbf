@@ -122,7 +122,8 @@ with `412`, and the writer counts that as a failed write and tries the chunk aga
 step. Several frontends write one store at once: each history writer has an id of its own
 (the time of its start in microseconds), every object key carries it, and the index rows
 the writers share are written only if they still hold what the writer read. A `file://`
-directory cannot be shared: its `LOCK` lets one process in ([single-host.md](single-host.md)).
+directory can be shared by frontends on one host, since history opens it without `LOCK`
+([single-host.md](single-host.md)); frontends on different hosts need the `s3://` store.
 
 **The same certificates' names, not the same keys.** Every frontend serves the REAPI and
 worker listeners under the farm's one DNS name (the load balancer's), so the certificate

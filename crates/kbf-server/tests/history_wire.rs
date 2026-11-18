@@ -827,32 +827,50 @@ fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
     kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("history-wire-{name}"))
 }
 
-/// Catches: a `file://` history directory that is not opened and locked (two servers
-/// would write one directory), and an error that is not told.
+/// Catches: a `file://` history directory that is opened exclusively (a second server, such
+/// as the new task of a start-first update, could not open it while the first runs), and
+/// an error that is not told: two opens of one directory both give a writer, and a
+/// directory that cannot be made is refused with the flag's name.
 #[tokio::test]
-async fn a_file_history_store_is_opened_and_held_by_one_server() {
+async fn a_file_history_store_is_opened_shared_by_servers_and_an_error_is_told() {
     let dir = scratch("file");
-    let args = Args::try_parse_from([
-        "kbf-server",
-        "--state-store",
-        "sqlite:///var/state.db",
-        "--history-objects",
-        &format!("file://{}", dir.display()),
-    ])
-    .expect("parses");
+    let args = |dir: &std::path::Path| {
+        Args::try_parse_from([
+            "kbf-server",
+            "--state-store",
+            "sqlite:///var/state.db",
+            "--history-objects",
+            &format!("file://{}", dir.display()),
+        ])
+        .expect("parses")
+    };
     let store: Arc<dyn Store> = Gated::new();
     let state = StateStore {
         store,
         members: Default::default(),
         history: None,
     };
-    let first = args.history.open(Some(&state)).expect("opens");
+    let args_here = args(&dir);
+    let first = args_here.history.open(Some(&state)).expect("opens");
     assert!(first.is_some());
-    let second = args.history.open(Some(&state)).expect_err("held");
-    assert!(matches!(second, HistoryError::Open(_)), "{second}");
+    let second = args_here
+        .history
+        .open(Some(&state))
+        .expect("opens beside the first");
+    assert!(second.is_some());
+
+    let file = dir.join("a-file");
+    std::fs::write(&file, b"not a directory").expect("write");
+    let blocked = args(&file.join("history"));
+    let refused = blocked
+        .history
+        .open(Some(&state))
+        .map(|_| ())
+        .expect_err("refused");
+    assert!(matches!(refused, HistoryError::Open(_)), "{refused}");
     assert!(
-        second.to_string().starts_with("--history-objects: "),
-        "{second}"
+        refused.to_string().starts_with("--history-objects: "),
+        "{refused}"
     );
 }
 

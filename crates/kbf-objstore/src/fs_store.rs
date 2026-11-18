@@ -14,6 +14,30 @@
 //! - `tmp/`: objects being written. Emptied at open: a file there is a write that a
 //!   crash or a failure cut short, and that was never answered.
 //!
+//! # Shared mode
+//!
+//! [`FsStore::open_shared`] opens the same layout for writers whose keys never collide
+//! and that never delete: the build history of `kbf-server`, whose every key carries its
+//! writer's id, so the old and the new frontend of a start-first rolling update can write
+//! one directory at once. A shared store takes no `LOCK`, so it opens while an exclusive
+//! store (the previous release's) holds it. Each shared store holds an exclusive `flock`
+//! on its own file `instances/<name>` for its life (the name is unique to the store: the
+//! process id, a start time and a counter) and names its temporary files
+//! `tmp/<name>.<n>`, plain files directly in `tmp/`. At open it removes what stopped
+//! instances left: the `tmp/<name>.*` files, and the `instances/<name>` file, of every
+//! instance whose `flock` it can take; `tmp/` files that name no instance; and the
+//! dotless temporary files of exclusive mode, only when it can take `LOCK` at that
+//! moment (no exclusive store is open). Dropping the last handle removes the instance
+//! file. Everything else, the objects, the header, the floor and the conditional
+//! writes, is as in exclusive mode; the store does not list, scan or delete for its
+//! owner, since another process may be writing under it.
+//!
+//! An exclusive open of a directory shared stores are using is allowed and empties
+//! `tmp/`, which is what the exclusive mode does: a process of a release that has only
+//! the exclusive mode, started beside a shared store, can cut one in-flight write of it,
+//! which then fails as any failed write does. Only a directory of the cold store, which
+//! evicts, scans and deletes, needs the exclusive mode.
+//!
 //! A write goes to a new file in `tmp/`, which is synced, then linked under its final
 //! name, then unlinked from `tmp/`; then the final name's directory is synced, and only
 //! then is the write answered. A link never replaces an existing name, so the store
@@ -74,6 +98,9 @@ use futures::StreamExt;
 use kbf_threads::disk::{FreeSpace as _, Space, Statvfs, keep_free};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
+
+#[path = "fs_store_shared.rs"]
+mod shared;
 
 use crate::released::{Gate, Released};
 use crate::{
@@ -200,7 +227,10 @@ struct Inner {
     /// Woken each time a write is refused for want of room.
     full: Notify,
     tmp: PathBuf,
-    /// The name of the next temporary file.
+    /// What a temporary file's name starts with: nothing for an exclusive store, the
+    /// instance name and a dot for a shared one (see [`FsStore::open_shared`]).
+    tmp_prefix: String,
+    /// The number in the name of the next temporary file.
     next: AtomicU64,
     /// The sorted keys of the last listing, for the pages that continue it.
     listing: Mutex<Option<Listing>>,
@@ -209,8 +239,11 @@ struct Inner {
     /// How many times a listing read every header: once per listing, not per page.
     walks: AtomicU64,
     /// Held for the store's life; released when the last handle is dropped
-    /// ([`Inner`]'s `Drop`).
+    /// ([`Inner`]'s `Drop`). The directory's `LOCK` for an exclusive store, the
+    /// instance file for a shared one.
     lock: DirLock,
+    /// The instance file of a shared store, removed when the last handle is dropped.
+    instance: Option<PathBuf>,
     /// Opened when the lock is released ([`Released`]).
     released: Arc<Gate>,
     /// The store's directory, for [`Released`] to name.
@@ -223,6 +256,10 @@ impl Drop for Inner {
         // that cannot be unlocked is released with the file at the end of this drop,
         // just after the gate opens (an `unlock` on an open file does not fail).
         self.released.release(|| {
+            if let Some(path) = &self.instance {
+                // Best effort: a file left behind is removed by the next shared open.
+                let _ = fs::remove_file(path);
+            }
             self.lock.unlock();
         });
     }
@@ -302,13 +339,7 @@ impl FsStore {
         })?;
         // From here every way out of the open, an error included, unlocks.
         let lock = DirLock(file);
-        let objects = dir.join("objects");
-        for shard in 0..=u8::MAX {
-            let path = objects.join(format!("{shard:02x}"));
-            fs::create_dir_all(&path).map_err(open_failed("create", &path))?;
-        }
-        let tmp = dir.join("tmp");
-        fs::create_dir_all(&tmp).map_err(open_failed("create", &tmp))?;
+        let (objects, tmp) = shared::create_layout(dir)?;
         for path in entries(&tmp).map_err(open_failed("list", &tmp))? {
             fs::remove_file(&path).map_err(open_failed("remove", &path))?;
         }
@@ -322,11 +353,13 @@ impl FsStore {
                 space,
                 full: Notify::new(),
                 tmp,
+                tmp_prefix: String::new(),
                 next: AtomicU64::new(0),
                 listing: Mutex::new(None),
                 window: LISTING_WINDOW,
                 walks: AtomicU64::new(0),
                 lock,
+                instance: None,
                 released: Arc::new(Gate::default()),
                 dir: dir.to_path_buf(),
             }),
@@ -425,8 +458,11 @@ impl Inner {
 
     /// A new name in `tmp/`.
     fn tmp_path(&self) -> PathBuf {
-        self.tmp
-            .join(self.next.fetch_add(1, Ordering::Relaxed).to_string())
+        self.tmp.join(format!(
+            "{}{}",
+            self.tmp_prefix,
+            self.next.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     /// Links the synced file `tmp` under `key`'s name if `written` (its writing)
@@ -901,170 +937,5 @@ impl ObjectStore for FsStore {
 }
 
 #[cfg(test)]
-mod tests {
-    use kbf_testkit::dir::TestDir;
-
-    use super::*;
-
-    fn key(name: &str) -> ObjectKey {
-        ObjectKey::new(name).expect("a valid key")
-    }
-
-    async fn list_all(store: &FsStore, prefix: &KeyPrefix) -> Vec<String> {
-        let mut keys = Vec::new();
-        let mut after = None;
-        loop {
-            let page = store
-                .list(prefix, after.as_ref(), PageSize::new(2).expect("size"))
-                .await
-                .expect("list");
-            keys.extend(page.objects.into_iter().map(|o| o.key.as_str().to_owned()));
-            match page.next {
-                Some(t) => after = Some(t),
-                None => return keys,
-            }
-        }
-    }
-
-    /// Catches a listing that reads every header again for each page (a rebuild over
-    /// a directory of N objects would open N files per page, N squared over the
-    /// listing): 7 keys in pages of 2 take one walk. A listing interleaved with one of
-    /// another prefix walks again rather than cutting its pages from the other's keys,
-    /// a token of a listing no longer kept or used under another prefix walks again,
-    /// and a listing that ended keeps nothing for the next.
-    #[tokio::test]
-    async fn a_paged_listing_reads_the_headers_once() {
-        let dir = TestDir::under(std::env::temp_dir(), "kbf-objstore-walks");
-        let store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
-        for i in 0..7 {
-            for p in ["a", "b"] {
-                let k = key(&format!("{p}/{i}"));
-                store
-                    .put_new(&k, Bytes::from_static(b"x"), None)
-                    .await
-                    .expect("put");
-            }
-        }
-        let walks = || store.inner.walks.load(Ordering::Relaxed);
-        let a = KeyPrefix::new("a/").expect("prefix");
-        let b = KeyPrefix::new("b/").expect("prefix");
-        let want: Vec<String> = (0..7).map(|i| format!("a/{i}")).collect();
-        assert_eq!(list_all(&store, &a).await, want);
-        assert_eq!(walks(), 1);
-        assert!(store.inner.listing.lock().expect("lock").is_none());
-
-        let size = PageSize::new(2).expect("size");
-        let first = store.list(&a, None, size).await.expect("list");
-        let other = store.list(&b, None, size).await.expect("list");
-        assert_eq!(other.objects[0].key.as_str(), "b/0");
-        let second = store
-            .list(&a, first.next.as_ref(), size)
-            .await
-            .expect("list");
-        let keys: Vec<&str> = second.objects.iter().map(|o| o.key.as_str()).collect();
-        assert_eq!(keys, ["a/2", "a/3"]);
-        assert_eq!(walks(), 4);
-
-        // A token of a listing no longer kept (here, of a's first walk) walks again,
-        // and so does a token of the kept listing used under another prefix.
-        let stale = store
-            .list(&a, first.next.as_ref(), size)
-            .await
-            .expect("list");
-        let keys: Vec<&str> = stale.objects.iter().map(|o| o.key.as_str()).collect();
-        assert_eq!(keys, ["a/2", "a/3"]);
-        assert_eq!(walks(), 5);
-        let elsewhere = store
-            .list(&b, stale.next.as_ref(), size)
-            .await
-            .expect("list");
-        let keys: Vec<&str> = elsewhere.objects.iter().map(|o| o.key.as_str()).collect();
-        assert_eq!(keys, ["b/0", "b/1"]);
-        assert_eq!(walks(), 6);
-        drop(store);
-    }
-
-    /// Catches a listing that keeps every key under its prefix (memory growing with the
-    /// prefix, not the window), one that ends at the end of its first window, and one
-    /// that cuts the next page from a used-up window instead of reading the next: 7
-    /// keys through a window of 3 in pages of 2 come back whole, in order, never more
-    /// than 3 kept, in 3 walks. Pages that stay within a window walk no more. A file in
-    /// a shard directory that is not an object is skipped by every walk.
-    #[tokio::test]
-    async fn a_listing_longer_than_its_window_keeps_one_window_at_a_time() {
-        let dir = TestDir::under(std::env::temp_dir(), "kbf-objstore-window");
-        let mut store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
-        Arc::get_mut(&mut store.inner).expect("one handle").window = 3;
-        for i in 0..7 {
-            for p in ["a", "b"] {
-                let k = key(&format!("{p}/{i}"));
-                store
-                    .put_new(&k, Bytes::from_static(b"x"), None)
-                    .await
-                    .expect("put");
-            }
-        }
-        let shard = store.inner.objects.join("00");
-        fs::create_dir_all(&shard).expect("shard");
-        fs::write(shard.join("foreign"), b"not an object").expect("plant");
-        let a = KeyPrefix::new("a/").expect("prefix");
-        let size = PageSize::new(2).expect("size");
-        let (mut got, mut after, mut most) = (Vec::new(), None, 0);
-        loop {
-            let page = store.list(&a, after.as_ref(), size).await.expect("list");
-            if let Some(kept) = store.inner.listing.lock().expect("lock").as_ref() {
-                most = most.max(kept.keys.len());
-            }
-            got.extend(page.objects.into_iter().map(|o| o.key.as_str().to_owned()));
-            match page.next {
-                Some(t) => after = Some(t),
-                None => break,
-            }
-        }
-        let want: Vec<String> = (0..7).map(|i| format!("a/{i}")).collect();
-        assert_eq!(got, want);
-        assert_eq!(most, 3, "the most keys a listing kept");
-        assert_eq!(store.inner.walks.load(Ordering::Relaxed), 3);
-        assert!(store.inner.listing.lock().expect("lock").is_none());
-        drop(store);
-    }
-
-    /// Catches a fresh listing [`ListToken::after`] a key that walks from the start of
-    /// the prefix (with more keys before the resume key than the window holds, the
-    /// window is used up before it and the listing ends empty), or that starts at the
-    /// key: resumed after a/2 and after a/5 through a window of 3, in pages of 1 and 2,
-    /// the listing is exactly the keys after it, in order.
-    #[tokio::test]
-    async fn a_file_store_listing_resumed_past_its_window_lists_only_the_rest() {
-        let dir = TestDir::under(std::env::temp_dir(), "kbf-objstore-resume");
-        let mut store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
-        Arc::get_mut(&mut store.inner).expect("one handle").window = 3;
-        for i in 0..9 {
-            let k = key(&format!("a/{i}"));
-            store
-                .put_new(&k, Bytes::from_static(b"x"), None)
-                .await
-                .expect("put");
-        }
-        let a = KeyPrefix::new("a/").expect("prefix");
-        for (from, first) in [("a/2", 3), ("a/5", 6)] {
-            for size in [1, 2] {
-                let size = PageSize::new(size).expect("size");
-                let (mut got, mut after) = (Vec::new(), Some(ListToken::after(&key(from))));
-                loop {
-                    let page = store.list(&a, after.as_ref(), size).await.expect("list");
-                    got.extend(page.objects.into_iter().map(|o| o.key.as_str().to_owned()));
-                    // A listing that repeats a key would otherwise never end.
-                    assert!(got.len() <= 9, "after {from}: a key listed twice: {got:?}");
-                    match page.next {
-                        Some(t) => after = Some(t),
-                        None => break,
-                    }
-                }
-                let want: Vec<String> = (first..9).map(|i| format!("a/{i}")).collect();
-                assert_eq!(got, want, "after {from} in pages of {}", size.get());
-            }
-        }
-        drop(store);
-    }
-}
+#[path = "fs_store_tests.rs"]
+mod tests;

@@ -82,12 +82,12 @@ image tag as a job ([containers.md](containers.md#the-frontend)).
   copy of `kbf.toml`. The copies are the same except `state-store`, which is the socket URL
   above. The file must not be writable by group or other, or the start is refused
   (`crates/kbf-cli/src/config.rs:346-368`).
-- **its own history objects directory**, if `--history-objects` is a `file://` directory. The
-  file store takes an exclusive lock on `LOCK` in that directory when it opens
-  (`crates/kbf-objstore/src/fs_store.rs:294-304`), so a second frontend pointed at the same
-  directory never opens it while the first runs: it waits for the lock, logging every attempt,
-  with no deadline (`crates/kbf-server/src/history/lock_wait.rs`), and does not serve. Give each frontend its own directory, or one `s3://`
-  store for all of them, as
+- **its history objects directory**, if `--history-objects` is a `file://` directory: the same
+  directory for every frontend is fine. History opens it shared (no `LOCK`; each frontend
+  keeps a locked file of its own under `instances/`, `crates/kbf-objstore/src/fs_store_shared.rs`)
+  and every key a frontend writes carries its own writer id, so several frontends write one
+  directory at once. The cold store's directory is not shared this way: one process owns it.
+  An `s3://` store for all of them works too, as
   [frontends-behind-a-load-balancer.md](frontends-behind-a-load-balancer.md#what-the-frontends-share)
   describes.
 - **65532-owned copies of the certificates, keys and the operator token** that `kbf.toml`

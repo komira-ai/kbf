@@ -27,23 +27,37 @@ the farm takes it). A failed `deploy` makes the release run red; the release sta
 ## The old and the new task of one slot
 
 A frontend stops by draining: it waits for its open work, however long that takes, and only
-then exits. Swarm does not wait that long before it starts the slot's next task, even with
-`order: stop-first` and a long `stop_grace_period`: it starts the new task once the old one has
-stopped or one minute after it told the old one to stop, whichever comes first (the grace
-period only puts off the kill). So a drain longer than a minute overlaps the new task, and both
-name the slot's `file://` history directory, which the old process holds (`LOCK`) until it
-exits. The new frontend waits for it: it logs `the history directory is still locked, waiting
-to try again` at every attempt, opens the directory once the old process has exited, and only
-then serves and passes its health check. A stop signal during the wait (a rollback, for one)
-ends it with exit 0. Every other start error still exits 2 at once.
+then exits. With `order: start-first` Swarm starts the slot's new task first and tells the old
+one to stop once the new one is healthy; with `order: stop-first` it starts the new task once
+the old one has stopped or one minute after it told the old one to stop, whichever comes first
+(the grace period only puts off the kill). So a drain longer than a minute overlaps the new task
+under either order, and under `start-first` the overlap is the whole point: the new task must
+start, and pass its health check, while the old one is running.
 
-What still bounds the overlap is the service's health check: a new task that has not passed it
-by the end of its `start_period` and retries is replaced, and that counts as a failed update. A
-`start_period` shorter than the longest drain the frontends see makes such an update roll back.
+Both tasks name the slot's `file://` history directory, and that works: the directory is opened
+shared. A shared open takes no `LOCK`; each process keeps its own file under `instances/` locked
+for as long as it runs, and its temporary files in `tmp/` carry its name. Every key a history
+writer writes carries its own writer id (its start time in microseconds), so the old and the new
+task never write one key, and nothing in history deletes, evicts or lists the directory. The new
+task starts, serves and passes its health check beside the old one, and each of them goes on
+writing under its own id until the old one has drained and exited. A new task's open removes
+the leftovers of a task that is gone (its `tmp/` files and its `instances/` file) and leaves a
+running task's alone. The cold store's directory is a different matter: it is evicted, scanned
+and cleaned, and one process owns it (`LOCK`).
+
+A release that still opens the directory exclusively (the one before this) holds `LOCK` for as
+long as it runs. The new task opens the directory beside it all the same, since a shared open
+does not look at `LOCK`. The reverse is the one cost: an old-release process that starts beside
+a new one (a rollback, or a task restarted by Swarm) empties `tmp/` as it opens, which can cut
+one in-flight write of the new task; that write fails and is dropped and counted like any
+failed history write (`kbf_history_dropped_total`), and the next one works.
+
+What bounds the overlap is the service's health check: a new task that has not passed it by the
+end of its `start_period` and retries is replaced, and that counts as a failed update.
 
 With an `s3://` `--history-objects` (`conditional-put=true`, the key pair in
-`--history-credentials-file`) there is no `LOCK` and no wait: the old and the new task write the
-one store at once, each under its own writer id
+`--history-credentials-file`) the old and the new task write the
+one store at once in the same way, each under its own writer id
 ([frontends-behind-a-load-balancer.md](frontends-behind-a-load-balancer.md#what-the-frontends-share)),
 and the new task serves as soon as it has started. When a frontend stops, after its drain, its
 history writer closes every build it recorded and writes until nothing is left or its stores stop

@@ -1,17 +1,18 @@
-//! Two `kbf frontend` processes on one `file://` history directory, as a release update
-//! makes them when the service manager starts the new frontend before the old one has
-//! exited (Docker Swarm does, one minute after it told the old task to stop, whatever
-//! the update's order): the second waits for the directory while the first holds it,
-//! starts once the first has stopped, and a stop signal ends its wait with exit 0.
-//! Each frontend has a SQLite state store of its own, so only the history directory is
-//! shared.
+//! Two `kbf frontend` processes on one `file://` history directory, as a start-first
+//! update makes them: the service manager starts the new frontend while the old one is
+//! still running, and stops the old one only once the new one is healthy. The history
+//! directory is opened shared, so the new frontend starts and serves beside the old one,
+//! which is never signalled before that; and it starts beside a previous release's
+//! frontend, which holds the directory's `LOCK`. Each frontend has a SQLite state store
+//! of its own, so only the history directory is shared.
 
-use std::io::{BufRead as _, BufReader};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
+use kbf_objstore::{Floor, FsStore};
 use kbf_testkit::dir::TestDir;
 use rustix::process::{Pid, Signal, kill_process};
 
@@ -21,16 +22,13 @@ const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 /// bound on the frontend: every wait ends on an event of its own.
 const HANG: Duration = Duration::from_secs(60);
 
-/// What the second frontend logs at each attempt on the held directory.
-const WAITING: &str = "the history directory is still locked, waiting to try again";
-
 /// A `kbf frontend` child, its stdout's first line and its stderr's lines as they come;
 /// killed and reaped when dropped.
 struct Front {
     child: Child,
     stdout: Receiver<String>,
     stderr: Receiver<String>,
-    /// Every stderr line [`Front::wait_for`] has read.
+    /// Every stderr line [`Front::rest_of_stderr`] has read.
     seen: Vec<String>,
 }
 
@@ -69,7 +67,8 @@ impl Front {
         }
     }
 
-    /// The start line, once printed.
+    /// The start line, once printed. A frontend that never starts fails the test here
+    /// instead of hanging it.
     fn start_line(&self) -> String {
         match self.stdout.recv_timeout(HANG) {
             Ok(line) => line,
@@ -77,23 +76,15 @@ impl Front {
         }
     }
 
-    /// Reads stderr until a line holds `text`.
-    fn wait_for(&mut self, text: &str) {
-        loop {
-            match self.stderr.recv_timeout(HANG) {
-                Ok(line) => {
-                    let found = line.contains(text);
-                    self.seen.push(line);
-                    if found {
-                        return;
-                    }
-                }
-                Err(e) => panic!("no line holding {text:?} ({e}): {:#?}", self.seen),
-            }
-        }
+    /// The operator API's address, from the start line.
+    fn api(line: &str) -> String {
+        line.split_whitespace()
+            .find_map(|word| word.strip_prefix("api="))
+            .unwrap_or_else(|| panic!("no api= in the start line {line:?}"))
+            .to_owned()
     }
 
-    /// Every stderr line from here to the exit, after the ones [`Front::wait_for`] read.
+    /// Every stderr line from here to the exit.
     fn rest_of_stderr(&mut self) -> String {
         while let Ok(line) = self.stderr.recv_timeout(HANG) {
             self.seen.push(line);
@@ -104,6 +95,11 @@ impl Front {
     fn signal(&self, signal: Signal) {
         let pid = Pid::from_raw(self.child.id().cast_signed()).expect("pid");
         kill_process(pid, signal).expect("signal the frontend");
+    }
+
+    /// Whether the process is still running.
+    fn running(&mut self) -> bool {
+        self.child.try_wait().expect("try_wait").is_none()
     }
 
     /// The exit status, once the process has exited.
@@ -139,99 +135,90 @@ fn lines_of(out: impl std::io::Read + Send + 'static) -> Receiver<String> {
     received
 }
 
-/// The release update the deploy failed on: the first frontend serves over the history
-/// directory, and a second on the same directory neither exits nor serves while the
-/// first holds it; it logs the wait at each attempt. Once the first has stopped (exit 0),
-/// the second opens the directory and prints its start line, and stops with exit 0 in
-/// turn. Catches the second frontend exiting 2 on the lock ("is another server using
-/// this directory?"), which made Swarm fail and roll back the update, and a wait that
-/// never tries again.
+/// The status code of one `GET` on the operator API at `api`.
+fn status_of(api: &str, path: &str) -> u16 {
+    let mut stream = std::net::TcpStream::connect(api).expect("connect to the API");
+    let bound = Some(HANG);
+    stream.set_read_timeout(bound).expect("a read timeout");
+    stream.set_write_timeout(bound).expect("a write timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n"
+    )
+    .expect("send");
+    let mut text = String::new();
+    stream.read_to_string(&mut text).expect("read");
+    let (head, _) = text.split_once("\r\n\r\n").expect("a head and a body");
+    head.split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("a status code")
+}
+
+/// The update a start-first rollout makes: the first frontend runs and is never
+/// signalled; the second starts on the same history directory, prints its start line and
+/// answers `/healthz` 200 beside it; only then is the first stopped (exit 0), and the
+/// second goes on answering until it is stopped in turn. Catches the second frontend
+/// waiting for a directory the first holds, which start-first never releases (Swarm stops
+/// the old task only once the new one is healthy), and one that exits 2 on it.
 #[test]
-fn a_second_frontend_waits_for_the_history_directory_and_starts_once_the_first_stops() {
-    let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-history-lock");
+fn a_second_frontend_starts_and_serves_while_the_first_still_runs_on_the_history_directory() {
+    let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-history-overlap");
     let history = scratch.join("history");
     let mut first = Front::spawn(&scratch.join("first"), &history);
-    assert!(first.start_line().starts_with("kbf-frontend "));
+    let first_line = first.start_line();
+    assert!(first_line.starts_with("kbf-frontend "), "{first_line}");
+    let first_api = Front::api(&first_line);
 
     let mut second = Front::spawn(&scratch.join("second"), &history);
-    second.wait_for(WAITING);
-    second.wait_for(WAITING);
-    assert_eq!(
-        second.stdout.try_recv().err(),
-        Some(std::sync::mpsc::TryRecvError::Empty),
-        "no start line while the first holds the directory"
-    );
-    assert!(second.child.try_wait().expect("try_wait").is_none());
+    let second_line = second.start_line();
+    assert!(second_line.starts_with("kbf-frontend "), "{second_line}");
+    let second_api = Front::api(&second_line);
+    assert_eq!(status_of(&second_api, "/healthz"), 200);
+    assert_eq!(status_of(&first_api, "/healthz"), 200);
+    assert!(first.running(), "the first stopped before it was told to");
 
     first.signal(Signal::TERM);
     assert!(first.exit().success());
 
-    assert!(second.start_line().starts_with("kbf-frontend "));
-    second.wait_for("the history directory is free, opened");
+    assert_eq!(status_of(&second_api, "/healthz"), 200);
+    assert!(second.running());
     second.signal(Signal::TERM);
     assert!(second.exit().success());
 }
 
-/// A frontend whose history directory is held stops on a SIGTERM or SIGINT sent before
-/// its wait has paused once, with exit 0, without a start line, and says why on stderr;
-/// the first frontend goes on serving and holding the directory. The SIGTERM is sent
-/// once the start has logged where its history is, before the directory is tried at all;
-/// the SIGINT once the first attempt has found it locked, before the first pause. Each
-/// line is written after the frontend's handlers are installed, so the signal never meets
-/// the default action. Catches a wait that a stop does not end (the wait has no deadline:
-/// Swarm's stop of the waiting task, a rollback for one, would wait out the stop grace
-/// period), and a stop that exits 2 as a refused start. (That the watch is made before the
-/// start, so that no signal the handlers take is missed, is not something a test can force
-/// from outside: a signal reaches a listener through the runtime's driver thread.)
+/// A frontend started while another process holds the history directory's `LOCK` (what a
+/// previous release's frontend holds for as long as it runs, and a new frontend is
+/// started beside it in the very update that ships this) starts and serves, and its stop
+/// leaves that holder's lock alone. The holder is a store opened exclusively in this
+/// process, as the previous release opens the directory. Catches a start that takes or
+/// waits for `LOCK`, and one that exits 2 with "is another server using this directory?".
 #[test]
-fn a_frontend_waiting_for_the_history_directory_stops_on_sigterm_and_sigint() {
-    let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-history-lock-stop");
+fn a_frontend_starts_on_a_history_directory_whose_lock_a_previous_release_holds() {
+    let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-history-old-lock");
     let history = scratch.join("history");
-    let mut first = Front::spawn(&scratch.join("first"), &history);
-    assert!(first.start_line().starts_with("kbf-frontend "));
-    let lock = history.join("LOCK");
+    let previous = FsStore::open(&history, Floor::KeepFree).expect("the previous release's open");
 
-    let before = [
-        (Signal::TERM, "history: objects in file://"),
-        (
-            Signal::INT,
-            "the history directory is locked by another process",
+    let mut front = Front::spawn(&scratch.join("new"), &history);
+    let line = front.start_line();
+    assert!(line.starts_with("kbf-frontend "), "{line}");
+    assert_eq!(status_of(&Front::api(&line), "/healthz"), 200);
+    front.signal(Signal::TERM);
+    assert!(front.exit().success());
+
+    assert!(
+        matches!(
+            FsStore::open(&history, Floor::KeepFree),
+            Err(kbf_objstore::FsStoreError::Locked { .. })
         ),
-    ];
-    for (n, (signal, line)) in before.into_iter().enumerate() {
-        let mut second = Front::spawn(&scratch.join(format!("second-{n}")), &history);
-        second.wait_for(line);
-        second.signal(signal);
-        let status = second.exit();
-        assert_eq!(status.code(), Some(0), "{signal:?}: {status}");
-        let said = second.rest_of_stderr();
-        assert!(
-            said.contains(&format!(
-                "kbf frontend: --history-objects: stopped by a signal while {} was still \
-                 locked by another process",
-                lock.display()
-            )),
-            "{signal:?}: {said}"
-        );
-        assert!(
-            said.contains("a stop signal came while waiting for the history directory"),
-            "{signal:?}: {said}"
-        );
-        assert!(
-            second.stdout.recv_timeout(HANG).is_err(),
-            "{signal:?}: no start line"
-        );
-        assert!(first.child.try_wait().expect("try_wait").is_none());
-    }
-
-    first.signal(Signal::TERM);
-    assert!(first.exit().success());
+        "the previous release's lock is still held"
+    );
+    drop(previous);
 }
 
-/// A history directory that cannot be made (a file is in the way) is not waited for: the
-/// frontend exits 2 at once with the reason and no start line, as before the wait. Catches
-/// a wait on a failure that time does not clear, which would leave the start hanging where
-/// it used to say what is wrong.
+/// A history directory that cannot be made (a file is in the way) exits 2 at once with the
+/// reason and no start line. Catches a start that retries a failure that time does not
+/// clear, which would leave it hanging where it should say what is wrong.
 #[test]
 fn a_history_directory_that_cannot_be_made_exits_two_at_once() {
     let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-history-unmade");
@@ -248,6 +235,5 @@ fn a_history_directory_that_cannot_be_made_exits_two_at_once() {
         )),
         "{said}"
     );
-    assert!(!said.contains(WAITING), "{said}");
     assert!(front.stdout.recv_timeout(HANG).is_err(), "no start line");
 }
