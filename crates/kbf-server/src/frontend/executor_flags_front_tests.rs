@@ -79,6 +79,7 @@ fn flags() -> JsAgentFlags {
         base_tree_timeout: std::time::Duration::from_secs(60),
         published: Arc::default(),
         put_retry: std::time::Duration::from_secs(60),
+        manifest_writes: kbf_front::action_tree::MANIFEST_WRITES,
     }
 }
 

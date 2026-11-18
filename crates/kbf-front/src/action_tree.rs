@@ -100,6 +100,10 @@ use crate::proxy::Clock;
 /// The most `Directory` manifests the memo remembers.
 pub const MEMO_ENTRIES: usize = 100_000;
 
+/// The most manifest writes the writer has at the store at once, across every preparation
+/// ([`flight`]); [`TreeWriter::with_write_slots`] lowers it in a test.
+pub const MANIFEST_WRITES: usize = 32;
+
 /// How long a memo entry is good for, at most.
 pub const MEMO_TTL: Duration = Duration::from_secs(600);
 
@@ -315,7 +319,7 @@ impl TreeWriter {
             retry: PutRetry::default(),
             memo: Mutex::new(Memo::new(entries)),
             places: Mutex::new(Places::new(PLACE_ENTRIES)),
-            flights: Flights::default(),
+            flights: Flights::new(MANIFEST_WRITES),
             list_entries: MAX_ENTRIES,
         }
     }
@@ -333,6 +337,14 @@ impl TreeWriter {
     #[must_use]
     pub fn with_list_entries(mut self, entries: u64) -> Self {
         self.list_entries = entries;
+        self
+    }
+
+    /// This writer, with at most `slots` manifest writes at the store at once
+    /// ([`MANIFEST_WRITES`] by default; a test scales it down).
+    #[must_use]
+    pub fn with_write_slots(mut self, slots: usize) -> Self {
+        self.flights = Flights::new(slots);
         self
     }
 
@@ -407,9 +419,13 @@ impl TreeWriter {
         self.write_whole(unlocated, now).await?;
         self.store_built(&plan, &built, &measures, &manifests)
             .await?;
-        let store = &*self.store;
-        place::write_manifest(store, &self.retry, &kbf.digest, kbf.bytes).await?;
-        place::write_manifest(store, &self.retry, &root.digest, root.bytes).await?;
+        let flights = &self.flights;
+        flights
+            .write(&self.store, &self.retry, kbf.digest, kbf.bytes)
+            .await?;
+        flights
+            .write(&self.store, &self.retry, root.digest, root.bytes)
+            .await?;
         Ok(ActionTree { digest: root.tree })
     }
 
