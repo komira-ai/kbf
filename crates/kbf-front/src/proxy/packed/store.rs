@@ -698,4 +698,18 @@ impl LargeStore for Packs {
     ) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
         self.store.put_stream(key, len, body)
     }
+
+    fn read_range<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        offset: u64,
+        len: u64,
+    ) -> BoxFuture<'a, Result<Bytes, ObjectStoreError>> {
+        match ByteRange::new(offset, len) {
+            Some(range) => self.store.read_range(key, range),
+            None => Box::pin(std::future::ready(Err(ObjectStoreError::Unsupported(
+                "a read of no bytes",
+            )))),
+        }
+    }
 }

@@ -53,6 +53,20 @@ const PLAIN: u16 = 0o644;
 pub(super) const FITTING_ENTRIES: u64 =
     ((MAX_TREE_LIST_BYTES - HEADER_LEN) / ENTRY_BYTES) as u64 - 1;
 
+/// How [`TreeWriter::write_listing_with`] writes a tree list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListingWrite {
+    /// No place is taken from the place memo and every pack the list names is asked after in
+    /// the store, as [`TreeWriter::write_listing_checked`] does: a job of the action found an
+    /// object of its tree lost.
+    pub checked: bool,
+    /// The miss path of a list a node refused as not L2 (`ListVersionUnsupported`, tierstore's
+    /// design 3.5): every object the list names whose cells are not recorded is read once, its
+    /// cells recorded, and the list's L2 sidecar written, so the next job of the action finds
+    /// it.
+    pub republish: bool,
+}
+
 /// The base tree's entries as tierstore's [`tierstore::flatten`] gave them, the root first, and
 /// the children of each, so that a list is laid out from them without a path.
 #[derive(Debug, PartialEq, Eq)]
@@ -250,6 +264,27 @@ impl TreeWriter {
         named: impl FnOnce(&Listing) + Send,
     ) -> Result<Listing, NoTree> {
         self.write_listing_as(kept, base, Trust::Store, named).await
+    }
+
+    /// Lists the action tree of `kept` over `base` as one tree list and stores it as `how`
+    /// says, naming it as [`TreeWriter::write_listing_named`] does: checked against the store
+    /// as [`TreeWriter::write_listing_checked`] is, and with its L2 sidecar republished
+    /// ([`ListingWrite::republish`]).
+    ///
+    /// # Errors
+    /// As [`TreeWriter::write_listing_checked_named`].
+    pub async fn write_listing_with(
+        &self,
+        kept: &KeptClosure,
+        base: &BaseTree,
+        how: ListingWrite,
+        named: impl FnOnce(&Listing) + Send,
+    ) -> Result<Listing, NoTree> {
+        let trust = match how.checked {
+            true => Trust::Store,
+            false => Trust::Memos,
+        };
+        self.write_listing_as(kept, base, trust, named).await
     }
 
     async fn write_listing_as(

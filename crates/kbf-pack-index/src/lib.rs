@@ -11,6 +11,8 @@
 //! [`action`]. It holds the bytes of each REAPI Directory a walk has read, too, by the
 //! Directory's digest, so a walk of an input tree reads a level with one query: see
 //! [`directory`].
+//! It keeps the cell digests of objects and the trees whose L2 sidecar is not written yet, which
+//! the L2 sidecar of a tree list is made from: see [`cells`].
 //!
 //! [`PackIndex`] is the typed view; `postgres::PostgresPackIndex` (feature `postgres`) keeps
 //! it in tables of the Postgres state store (migration 2, [`schema`]) that are outside the key/value and feed tables
@@ -52,6 +54,7 @@ use std::time::Duration;
 
 use kbf_state::StoreError;
 
+use crate::cells::{LivePack, ObjectCells, Unlisted};
 use crate::directory::NewDirectory;
 #[cfg(any(test, feature = "test-support", feature = "postgres"))]
 use kbf_state::StoreTime;
@@ -59,6 +62,9 @@ use kbf_state::StoreTime;
 pub mod action;
 #[cfg(any(test, feature = "test-support"))]
 pub mod action_conformance;
+pub mod cells;
+#[cfg(any(test, feature = "test-support"))]
+pub mod cells_conformance;
 #[cfg(any(test, feature = "test-support"))]
 pub mod conformance;
 pub mod directory;
@@ -348,6 +354,100 @@ pub trait PackIndex: Send + Sync {
     /// [`PackIndexError::Store`] when the store fails.
     fn record_directories(&self, directories: &[NewDirectory]) -> Result<usize, PackIndexError> {
         let _ = directories;
+        Err(PackIndexError::Unsupported)
+    }
+
+    /// For each of `keys`, in order, the cells recorded for the object under it, or `None`
+    /// when it has none. Writes nothing. See [`cells`] for the rules.
+    ///
+    /// The default answers [`PackIndexError::Unsupported`], for an index that keeps no cell
+    /// rows: the caller then writes no L2 sidecar.
+    ///
+    /// # Errors
+    /// [`PackIndexError::TooMany`] for more than [`MAX_BATCH`] keys;
+    /// [`PackIndexError::NotMigrated`] when the schema has no cell table;
+    /// [`PackIndexError::Unsupported`] from an index that keeps no cell rows;
+    /// [`PackIndexError::Store`] when the store fails.
+    fn object_cells(&self, keys: &[String]) -> Result<Vec<Option<ObjectCells>>, PackIndexError> {
+        let _ = keys;
+        Err(PackIndexError::Unsupported)
+    }
+
+    /// Records the cells of the object under `key`. Returns `true` when it inserted the row,
+    /// `false` when the same cells were recorded before (nothing changes).
+    ///
+    /// The default answers [`PackIndexError::Unsupported`], as [`PackIndex::object_cells`]
+    /// does.
+    ///
+    /// # Errors
+    /// [`PackIndexError::Invalid`] for an empty key or cells that cannot exist
+    /// ([`ObjectCells::checked`]); [`PackIndexError::Conflict`] when other cells are recorded
+    /// under `key`, and nothing is changed; [`PackIndexError::NotMigrated`],
+    /// [`PackIndexError::Unsupported`] and [`PackIndexError::Store`] as for
+    /// [`PackIndex::object_cells`].
+    fn record_cells(&self, key: &str, cells: &ObjectCells) -> Result<bool, PackIndexError> {
+        let _ = (key, cells);
+        Err(PackIndexError::Unsupported)
+    }
+
+    /// Records that the L2 sidecar of the tree `tree` (the SHA-256 of its version 2 list) is not
+    /// written: a new row has the index's clock as its first and last time, a row already there
+    /// gets it as its last time.
+    ///
+    /// The default answers [`PackIndexError::Unsupported`], as [`PackIndex::object_cells`]
+    /// does.
+    ///
+    /// # Errors
+    /// As [`PackIndex::object_cells`], without [`PackIndexError::TooMany`].
+    fn record_unlisted(&self, tree: &[u8; 32]) -> Result<(), PackIndexError> {
+        let _ = tree;
+        Err(PackIndexError::Unsupported)
+    }
+
+    /// At most `limit` (at most [`cells::MAX_PAGE`]) unlisted trees last recorded at most
+    /// `within` ago by the index's clock, in the order of their ids, each after `after` when it
+    /// is given. Writes nothing.
+    ///
+    /// The default answers [`PackIndexError::Unsupported`], as [`PackIndex::object_cells`]
+    /// does.
+    ///
+    /// # Errors
+    /// [`PackIndexError::TooMany`] for a `limit` over [`cells::MAX_PAGE`]; otherwise as
+    /// [`PackIndex::object_cells`].
+    fn unlisted(
+        &self,
+        within: Duration,
+        after: Option<&[u8; 32]>,
+        limit: usize,
+    ) -> Result<Vec<Unlisted>, PackIndexError> {
+        let _ = (within, after, limit);
+        Err(PackIndexError::Unsupported)
+    }
+
+    /// Removes the unlisted tree `tree`, once its sidecar is written. Returns whether a row was
+    /// removed.
+    ///
+    /// The default answers [`PackIndexError::Unsupported`], as [`PackIndex::object_cells`]
+    /// does.
+    ///
+    /// # Errors
+    /// As [`PackIndex::record_unlisted`].
+    fn drop_unlisted(&self, tree: &[u8; 32]) -> Result<bool, PackIndexError> {
+        let _ = tree;
+        Err(PackIndexError::Unsupported)
+    }
+
+    /// At most `limit` (at most [`cells::MAX_PAGE`]) packs whose `live_blobs` is above zero, in
+    /// the order of their keys, each after `after` when it is given, with whether their cells
+    /// are recorded. Writes nothing.
+    ///
+    /// The default answers [`PackIndexError::Unsupported`], as [`PackIndex::object_cells`]
+    /// does.
+    ///
+    /// # Errors
+    /// As [`PackIndex::unlisted`].
+    fn live_packs(&self, after: Option<&str>, limit: usize) -> Result<Vec<LivePack>, PackIndexError> {
+        let _ = (after, limit);
         Err(PackIndexError::Unsupported)
     }
 }

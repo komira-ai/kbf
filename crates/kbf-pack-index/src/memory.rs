@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::conformance::PackBackend;
+use crate::cells::{LivePack, ObjectCells, Unlisted};
 use crate::directory::NewDirectory;
 use crate::{
     BlobDigest, Forgot, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
@@ -25,6 +26,7 @@ pub struct MemoryPackIndex {
 }
 
 mod action;
+mod cells;
 mod directory;
 
 #[derive(Clone, Default)]
@@ -37,6 +39,10 @@ struct State {
     actions: BTreeMap<BlobDigest, (Vec<u8>, i64)>,
     /// The Directory rows: the body of each recorded Directory.
     directories: BTreeMap<BlobDigest, Vec<u8>>,
+    /// The cell rows: the cells of each object recorded, by its key.
+    cells: BTreeMap<String, ObjectCells>,
+    /// The unlisted trees: when each was first and last recorded.
+    unlisted: BTreeMap<[u8; 32], (i64, i64)>,
 }
 
 #[derive(Clone)]
@@ -253,6 +259,38 @@ impl PackIndex for MemoryPackIndex {
     fn record_directories(&self, directories: &[NewDirectory]) -> Result<usize, PackIndexError> {
         let checked = crate::directory::checked(directories)?;
         Ok(directory::record(&mut self.lock(), &checked))
+    }
+
+    fn object_cells(&self, keys: &[String]) -> Result<Vec<Option<ObjectCells>>, PackIndexError> {
+        cells::read(&self.lock(), keys)
+    }
+
+    fn record_cells(&self, key: &str, cells: &ObjectCells) -> Result<bool, PackIndexError> {
+        cells::record(&mut self.lock(), key, cells)
+    }
+
+    fn record_unlisted(&self, tree: &[u8; 32]) -> Result<(), PackIndexError> {
+        let now = micros_of(self.clock.now());
+        cells::record_unlisted(&mut self.lock(), tree, now);
+        Ok(())
+    }
+
+    fn unlisted(
+        &self,
+        within: Duration,
+        after: Option<&[u8; 32]>,
+        limit: usize,
+    ) -> Result<Vec<Unlisted>, PackIndexError> {
+        let now = micros_of(self.clock.now());
+        cells::unlisted(&self.lock(), (within, now), after, limit)
+    }
+
+    fn drop_unlisted(&self, tree: &[u8; 32]) -> Result<bool, PackIndexError> {
+        Ok(self.lock().unlisted.remove(tree).is_some())
+    }
+
+    fn live_packs(&self, after: Option<&str>, limit: usize) -> Result<Vec<LivePack>, PackIndexError> {
+        cells::live_packs(&self.lock(), after, limit)
     }
 }
 
