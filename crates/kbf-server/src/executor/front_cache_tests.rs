@@ -122,6 +122,8 @@ async fn run(rig: &Rig, lease: RunId, action: &Digest, form: InputTree) -> (Pack
     let dir = rig.front.mint(lease, action, WALL, form).await;
     let dir = dir.expect("a dir");
     let tree = rig.front.tree(lease).await.expect("a tree");
+    // As the executor does before it submits the job: the tree's writes are done.
+    rig.front.stored(lease).await.expect("stored");
     (dir, tree)
 }
 
