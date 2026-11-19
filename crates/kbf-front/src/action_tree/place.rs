@@ -25,11 +25,14 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use kbf_objstore::{BodyStream, ObjectKey, ObjectStoreError};
+use kbf_pack_index::cells::ObjectCells;
 use kbf_storage::ReadStream;
 use kbf_types::Digest;
 use sha2::{Digest as _, Sha256};
+use tierstore_list::CellHasher;
 
 use super::NoTree;
+use super::sidecar::Sidecars;
 use super::retry::{Failed, PutRetry, repeating, retrying};
 use crate::job_read::BlobSource;
 use crate::large_backfill::{LargeStore, large_key};
@@ -138,23 +141,44 @@ async fn lookups(
 /// [`NoTree`]: a blob could not be read, its bytes are not its digest's, or the store refused
 /// the write.
 pub(super) async fn write_whole(
-    source: &dyn BlobSource,
-    store: &dyn LargeStore,
+    (source, store): (&dyn BlobSource, &dyn LargeStore),
     retry: &PutRetry,
     blobs: Vec<Digest>,
+    sidecars: Option<&Sidecars>,
 ) -> Result<(), NoTree> {
     stream::iter(blobs)
-        .map(|digest| write_blob(source, store, retry, digest))
+        .map(|digest| write_blob(source, store, retry, digest, sidecars))
         .buffered(WRITES_IN_FLIGHT)
         .try_collect()
         .await
 }
 
+/// Writes the blob `digest` to `cas/l/<sha256>`; with `sidecars`, the cells of its bytes,
+/// hashed as they pass to the store, are recorded once the write succeeds (an existing key holds
+/// the same bytes: the key is content-bound).
 async fn write_blob(
     source: &dyn BlobSource,
     store: &dyn LargeStore,
     retry: &PutRetry,
     digest: Digest,
+    sidecars: Option<&Sidecars>,
+) -> Result<(), NoTree> {
+    let key = large_key(&digest);
+    let hashed = Arc::new(Mutex::new(None));
+    written_blob(source, store, retry, digest, &hashed).await?;
+    let cells = hashed.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let (Some(sidecars), Some(cells)) = (sidecars, cells) {
+        sidecars.record(&key, cells).await;
+    }
+    Ok(())
+}
+
+async fn written_blob(
+    source: &dyn BlobSource,
+    store: &dyn LargeStore,
+    retry: &PutRetry,
+    digest: Digest,
+    hashed: &Arc<Mutex<Option<ObjectCells>>>,
 ) -> Result<(), NoTree> {
     let key = large_key(&digest);
     // An attempt reads the blob again: a body is gone once a write has taken it.
@@ -169,10 +193,12 @@ async fn write_blob(
         let body = Checked {
             inner: read,
             hasher: Sha256::new(),
+            cells: CellHasher::new(),
             held: None,
             digest,
             ended: false,
             failure: Arc::clone(&failure),
+            hashed: Arc::clone(hashed),
         }
         .into_body();
         put(store, &key, digest.size_bytes, body)
@@ -245,10 +271,14 @@ struct Checked {
     inner: ReadStream,
     hasher: Sha256,
     held: Option<Bytes>,
+    /// The cells of the bytes, hashed in the same pass (the L2 sidecar's).
+    cells: CellHasher,
     digest: Digest,
     ended: bool,
     /// Why the body ended in an error, for the write to report.
     failure: Arc<Mutex<Option<NoTree>>>,
+    /// The cells of the bytes once they have hashed to the digest.
+    hashed: Arc<Mutex<Option<ObjectCells>>>,
 }
 
 /// What the body says when it ends in an error: the store must keep nothing.
@@ -268,6 +298,7 @@ impl Checked {
             let failure = match self.inner.next().await {
                 Some(Ok(chunk)) => {
                     self.hasher.update(&chunk);
+                    self.cells.update(&chunk);
                     if let Some(ready) = self.held.replace(chunk) {
                         return Some((Ok(ready), self));
                     }
@@ -281,6 +312,12 @@ impl Checked {
                     self.ended = true;
                     let hash: [u8; 32] = self.hasher.finalize_reset().into();
                     if hash == self.digest.hash {
+                        let cells = std::mem::take(&mut self.cells).finish();
+                        let row = ObjectCells {
+                            size: cells.size,
+                            digests: cells.digests,
+                        };
+                        *self.hashed.lock().unwrap_or_else(PoisonError::into_inner) = Some(row);
                         return self.held.take().map(|last| (Ok(last), self));
                     }
                     NoTree::Mismatch {

@@ -29,6 +29,10 @@ impl Reserved {
 /// it counts.
 #[derive(Debug, Default)]
 pub struct PackMetrics {
+    /// The L2 sidecars of the tree lists written over these packs ([`Packs::sidecars`]).
+    ///
+    /// [`Packs::sidecars`]: super::Packs::sidecars
+    pub l2: std::sync::Arc<crate::action_tree::SidecarCounters>,
     /// The bytes that uploads into packs have reserved of `--pack-inflight-bytes`.
     pub(super) reserved: Reserved,
     /// Packs stored and recorded in the index.

@@ -38,6 +38,7 @@ use super::place::{self, Place};
 use super::tstree::{
     self, Child, DIR_MODE, EMPTY_SHA256, ENTRY_BYTES, HEADER_LEN, Item, RANGE_MERGE_GAP,
 };
+use super::sidecar::Sidecars;
 use super::{BaseTree, INPUT_ROOT, NoTree, TreeWriter, Trust, reserved_input};
 use crate::large_backfill::large_key;
 use crate::prepare_run::{KeptClosure, KeptDirectory};
@@ -212,7 +213,7 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_as(kept, base, Trust::Memos, |_| ())
+        self.write_listing_as(kept, base, (Trust::Memos, false), |_| ())
             .await
     }
 
@@ -232,7 +233,7 @@ impl TreeWriter {
         base: &BaseTree,
         named: impl FnOnce(&Listing) + Send,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_as(kept, base, Trust::Memos, named).await
+        self.write_listing_as(kept, base, (Trust::Memos, false), named).await
     }
 
     /// [`TreeWriter::write_listing`] for a tree whose last job found an object lost: no place
@@ -247,7 +248,7 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_as(kept, base, Trust::Store, |_| ())
+        self.write_listing_as(kept, base, (Trust::Store, false), |_| ())
             .await
     }
 
@@ -263,7 +264,7 @@ impl TreeWriter {
         base: &BaseTree,
         named: impl FnOnce(&Listing) + Send,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_as(kept, base, Trust::Store, named).await
+        self.write_listing_as(kept, base, (Trust::Store, false), named).await
     }
 
     /// Lists the action tree of `kept` over `base` as one tree list and stores it as `how`
@@ -284,14 +285,15 @@ impl TreeWriter {
             true => Trust::Store,
             false => Trust::Memos,
         };
-        self.write_listing_as(kept, base, trust, named).await
+        let how = (trust, how.republish);
+        self.write_listing_as(kept, base, how, named).await
     }
 
     async fn write_listing_as(
         &self,
         kept: &KeptClosure,
         base: &BaseTree,
-        trust: Trust,
+        (trust, republish): (Trust, bool),
         named: impl FnOnce(&Listing) + Send,
     ) -> Result<Listing, NoTree> {
         reserved_input(kept)?;
@@ -338,8 +340,29 @@ impl TreeWriter {
         };
         named(&listing);
         self.write_whole(unlocated, now).await?;
-        place::write_object(&*self.store, &self.retry, &key, Bytes::from(bytes)).await?;
+        let bytes = Bytes::from(bytes);
+        place::write_object(&*self.store, &self.retry, &key, bytes.clone()).await?;
+        if let Some(sidecars) = &self.sidecars {
+            sidecar(sidecars, &key, &bytes, republish).await;
+        }
         Ok(listing)
+    }
+}
+
+/// Writes the L2 sidecar of the list `bytes` stored at `key`: from recorded cells only, or,
+/// on the miss path (`republish`), reading each object that has none once. A failure is logged
+/// and never fails the list: old readers read the list, and a new reader's refusal of a tree
+/// with no sidecar takes the executor's miss path.
+async fn sidecar(sidecars: &Sidecars, key: &ObjectKey, bytes: &[u8], republish: bool) {
+    let written = match republish {
+        false => sidecars.emit(bytes).await.map(|emitted| format!("{emitted:?}")),
+        true => sidecars.backfill(bytes).await.map(|done| format!("{done:?}")),
+    };
+    match written {
+        Ok(done) => tracing::debug!(list = %key, republish, done, "the tree list's L2 sidecar"),
+        Err(error) => {
+            tracing::warn!(list = %key, republish, %error, "the tree list's L2 sidecar was not written")
+        }
     }
 }
 

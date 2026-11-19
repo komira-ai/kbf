@@ -309,7 +309,8 @@ impl PutDirParts {
     pub fn new(packs: &Packs, backend: &Backend, base: Arc<OnceLock<BaseTree>>) -> Self {
         let clock: kbf_front::Clock = Arc::new(SystemTime::now);
         Self {
-            writer: TreeWriter::new(Arc::new(backend.clone()), Arc::new(packs.clone()), clock),
+            writer: TreeWriter::new(Arc::new(backend.clone()), Arc::new(packs.clone()), clock)
+                .with_sidecars(Arc::new(packs.sidecars())),
             base,
             republish: Arc::default(),
         }

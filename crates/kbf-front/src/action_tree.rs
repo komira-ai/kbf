@@ -89,6 +89,8 @@ mod sidecar;
 mod retry;
 mod tstree;
 #[cfg(test)]
+mod sidecar_tests;
+#[cfg(test)]
 mod tstree_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -101,7 +103,9 @@ use tierstore::{MAX_DEPTH, MAX_ENTRIES, TreeDigest, TreeError};
 
 pub use self::base::{BaseFacts, BaseTree, BaseTreeError, INPUT_ROOT, RESERVED_NAMES};
 pub use self::listing::{Listing, ListingWrite};
-pub use self::sidecar::{Backfilled, Emitted, READ_WINDOW, SidecarError, Sidecars};
+pub use self::sidecar::{
+    Backfilled, Emitted, READ_WINDOW, SidecarCounters, SidecarError, Sidecars, read_cells,
+};
 pub use self::place::{HEADS_IN_FLIGHT, LOCATE_CHUNK, LOOKUP_DEADLINE};
 pub use self::places::PLACE_ENTRIES;
 pub use self::retry::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, PutRetry, Sleeper};
@@ -316,6 +320,8 @@ pub struct TreeWriter {
     flights: Flights,
     /// The most entries a tree list holds ([`MAX_ENTRIES`] unless a test lowers it).
     list_entries: u64,
+    /// Where each tree list's L2 sidecar is written ([`sidecar`]); none without a pack index.
+    sidecars: Option<Arc<Sidecars>>,
 }
 
 /// What a write takes on trust: the memos, or nothing but the store.
@@ -361,6 +367,7 @@ impl TreeWriter {
             places: Mutex::new(Places::new(PLACE_ENTRIES)),
             flights: Flights::new(MANIFEST_WRITES),
             list_entries: MAX_ENTRIES,
+            sidecars: None,
         }
     }
 
@@ -385,6 +392,14 @@ impl TreeWriter {
     #[must_use]
     pub fn with_write_slots(mut self, slots: usize) -> Self {
         self.flights = Flights::new(slots);
+        self
+    }
+
+    /// This writer, writing the L2 sidecar of each tree list it stores with `sidecars` and
+    /// recording there the cells of each whole object it writes.
+    #[must_use]
+    pub fn with_sidecars(mut self, sidecars: Arc<Sidecars>) -> Self {
+        self.sidecars = Some(sidecars);
         self
     }
 
@@ -655,7 +670,8 @@ impl TreeWriter {
     /// whole once every write has succeeded: a write that failed is asked about again.
     async fn write_whole(&self, unlocated: Vec<Digest>, now: SystemTime) -> Result<(), NoTree> {
         let written = unlocated.clone();
-        place::write_whole(&*self.source, &*self.store, &self.retry, unlocated).await?;
+        let (stores, sidecars) = ((&*self.source, &*self.store), self.sidecars.as_deref());
+        place::write_whole(stores, &self.retry, unlocated, sidecars).await?;
         let whole = written.into_iter().map(|digest| (digest, Place::Whole));
         self.remembered().remember(whole, now);
         Ok(())
