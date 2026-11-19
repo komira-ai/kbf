@@ -46,7 +46,7 @@ fn host_with_disk(disk: Option<u64>) -> Machine {
 /// Catches a submitted job that gives the action more than it should or leaks what it must
 /// not: no image, no port, no environment, no file, the task tool in the tree as the job's
 /// command, no network, the labels, which every list of jobs shows, hold the frontend, the
-/// process and the size class and nothing else, no argument carries a url, a grant or a
+/// process, the size class and the kind and nothing else, no argument carries a url, a grant or a
 /// secret, and the flags of the removed presigned task (`--pack-url`, `--grant-token`,
 /// `--insecure-argv-secrets`, `--allow-plain-http-put`, `--allow-plain-http-grant`,
 /// `--locate`, `--work-dir`) and the retired `--root-der` are absent.
@@ -62,10 +62,14 @@ async fn a_job_holds_no_image_port_file_network_or_secret() {
     assert!(spec.files.is_empty());
     assert_eq!(spec.network(), NetworkLevel::None);
     let labels = &spec.labels;
-    assert_eq!(labels.len(), 3, "{labels:?}");
+    assert_eq!(labels.len(), 4, "{labels:?}");
     assert_eq!(
         labels.get("size-class").map(String::as_str),
         Some("root.pkg.t.build")
+    );
+    assert_eq!(
+        labels.get("size-fallback").map(String::as_str),
+        Some("cc.build.kind")
     );
     assert_eq!(
         labels.get("kbf-frontend").map(String::as_str),

@@ -27,7 +27,7 @@ sequenceDiagram
     X->>X: join an open operation of the same action, or open operations/<id>
     X->>X: prepare the run: read the action, mint the key, write the tree
     X->>S: exec/op/<id> {owner, action, attempt, job, key}
-    X->>J: SubmitJob(k<frontend hash>-<id>-<attempt>)  (no CPU, no memory; size-class label)
+    X->>J: SubmitJob(k<frontend hash>-<id>-<attempt>)  (no CPU, no memory; size-class and size-fallback labels)
     loop every --executor-poll-ms
         X->>J: GetJob
     end
@@ -39,8 +39,9 @@ sequenceDiagram
 
 - **Joining.** An Execute of an action that is open on this frontend joins its operation: one job, every caller answered.
 - **The job.** As before ([jobs-on-jobscheduler-and-tierstore.md](jobs-on-jobscheduler-and-tierstore.md)): the kbf image or the
-  action tree, no CPU and no memory, labelled `size-class` with the build target and kind (the job service sizes it from that
-  class's history), `kbf-frontend` and `kbf-instance`. A platform that names `kbf-lease=whole_machine` gets a whole host.
+  action tree, no CPU and no memory, labelled `size-class` with the build target and whether it is a test (the job service
+  sizes it from that class's history), `size-fallback` with its kind, what runs (whose history sizes it while the target has
+  too few runs; jobscheduler's `docs/design/sizing.md`, section 7.8), `kbf-frontend` and `kbf-instance`. A platform that names `kbf-lease=whole_machine` gets a whole host.
 - **The id.** `k<first 8 hex of sha256(--executor-frontend-id)>-<operation>-<attempt>`: a submit whose answer was lost is sent
   again unchanged and makes no second job, and a frontend that takes the operation up computes the same id. It has three parts
   where the ids of earlier releases had four.

@@ -1,11 +1,11 @@
-//! The class the job service sizes an action's job by: the value of the job's `size-class`
-//! label. A job that leaves its CPU and memory at zero is booked what the history of its class
+//! The class the job service sizes an action's job by, the value of the job's `size-class`
+//! label, and the class of its kind, the value of its `size-fallback` label (below). A job that leaves its CPU and memory at zero is booked what the history of its class
 //! says (jobscheduler's `docs/design/sizing.md`, section 7.7), so every run of one piece of work
 //! must name one class, and no other work may share it.
 //!
 //! The work is the build target the action belongs to, read from the action's own `buck-out`
 //! paths ([`Shape::target`]: buck2 sends no target with the call), and what the action does to
-//! it: a test run ([`Shape::test`]) is one kind and anything else, a compile or a link, the
+//! it: a test run ([`Shape::test`]) is one mode and anything else, a compile or a link, the
 //! other. One target's compile and its test are two classes, `<target> build` and
 //! `<target> test`, so a test that needs much more memory than its compile does not book that
 //! for the compile, nor the compile's size for the test. The words are written as a label
@@ -16,8 +16,27 @@
 //! ([`crate::action_usage::ShapeKey`], `shape.<16 hex digits>`): what stays the same across builds of one action, so its runs
 //! still share a history, and a class of its own, apart from every other such action.
 //!
-//! No two kinds of class meet: a target's ends in `.build` or `.test`, or, cut because it is
+//! No two sorts of class meet: a target's ends in `.build` or `.test`, or, cut because it is
 //! long, in `-` and 16 hex digits; a shape's is `shape.` and 16 hex digits, and is never cut.
+//!
+//! **The kind** ([`SizeClass::kind`]), sent as the job's `size-fallback` label (jobscheduler's
+//! `docs/design/sizing.md`, section 7.8): the class whose history sizes the job while its own
+//! class has too few runs. A build farm's cache answers every action whose inputs did not
+//! change, so a target gathers runs slowly and, alone, is booked the cold size for its first
+//! five; the work of one kind is alike across targets and runs many times a minute, so a kind
+//! has an estimate after two of its runs, on any target. The kind is what runs, read from the
+//! shape's program words ([`Shape::program`], already free of configuration and content
+//! hashes): the first word (the program: a bare name, an absolute path's file name, or the
+//! pattern of a tool built under `buck-out`), and the second when it is a word of letters,
+//! digits, `-` and `_` only (a subcommand or a flag such as `cc` of `zig cc`, `make` of
+//! `env make`, `-c` of `clang -c`; never a word holding a `/`, a `.` or an `@`, a path or a file
+//! name with an extension, which would name one target's files. A bare file name such as the
+//! `out` of `cc -o out a.c` is kept, and makes a kind of its own), then the test-or-build word of the class: `zig cc build kind` is `zig.cc.build.kind`.
+//! A shape's program holds a second word only after a bare-name first one, so a tool built
+//! under `buck-out` is its own kind, with every subcommand of it. An action with no program
+//! (no arguments) has no kind, and its job names no fallback. A kind's class ends in `.kind`
+//! (or, cut, in `-` and 16 hex digits of a name that ends in `.kind`), so it never meets a
+//! target's or a shape's class.
 //!
 //! The words are written as `js_types::SizeClass::of_target` writes them, byte for byte, by a
 //! copy of its rule here: the jobscheduler revision this workspace takes predates it. The tests
@@ -27,6 +46,11 @@ use crate::action_usage::Shape;
 
 /// The label whose value names a job's class: jobscheduler's `js_types::SIZE_CLASS_LABEL`.
 pub(crate) const SIZE_CLASS_LABEL: &str = "size-class";
+
+/// The label whose value names a job's fallback class, its kind: `js_types::SIZE_FALLBACK_LABEL`
+/// of jobscheduler's main, copied here since the jobscheduler revision this workspace takes
+/// predates it.
+pub(crate) const SIZE_FALLBACK_LABEL: &str = "size-fallback";
 
 /// Longest label value, in bytes.
 const MAX_VALUE_LEN: usize = 63;
@@ -40,30 +64,57 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// The 64-bit FNV-1a prime.
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// A job's size class: a valid value of the label [`SIZE_CLASS_LABEL`] (1 to 63 bytes of
-/// `[a-z0-9._-]`) that starts and ends with a letter or a digit.
+/// A job's size class, and the class of its kind: each a valid value of the labels
+/// [`SIZE_CLASS_LABEL`] and [`SIZE_FALLBACK_LABEL`] (1 to 63 bytes of `[a-z0-9._-]`) that starts
+/// and ends with a letter or a digit.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SizeClass(String);
+pub struct SizeClass {
+    /// The class: the target and whether it is a test, or the shape's key.
+    class: String,
+    /// The kind: what runs, and whether it is a test; `None` for an action with no program.
+    kind: Option<String>,
+}
 
 impl SizeClass {
-    /// The class of the action whose shape is `shape` (see the module docs).
+    /// The class of the action whose shape is `shape`, and its kind (see the module docs).
     #[must_use]
     pub fn of_action(shape: &Shape) -> Self {
-        match &shape.target {
-            // Never empty: the kind is a word.
-            Some(target) => {
-                let kind = if shape.test { "test" } else { "build" };
-                Self(written(&format!("{} {kind}", target.label)))
-            }
-            None => Self(format!("shape.{}", shape.key)),
+        let test = if shape.test { "test" } else { "build" };
+        let class = match &shape.target {
+            // Never empty: the test-or-build word is a word.
+            Some(target) => written(&format!("{} {test}", target.label)),
+            None => format!("shape.{}", shape.key),
+        };
+        Self {
+            class,
+            kind: kind_of(&shape.program, test),
         }
     }
 
     /// The class as the label's value.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.class
     }
+
+    /// The kind as the value of the label [`SIZE_FALLBACK_LABEL`]; `None` for an action with no
+    /// program.
+    pub(crate) fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+}
+
+/// The kind of an action whose shape's program words are `program`, a test or a build as `test`
+/// says (see the module docs): `None` when the program is no word with a letter or a digit
+/// (no arguments, whose program is `-`).
+fn kind_of(program: &[String], test: &str) -> Option<String> {
+    let first = program.first().filter(|first| !written(first).is_empty())?;
+    let second = program.get(1).filter(|word| {
+        word.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    });
+    let words = second.map_or_else(|| first.clone(), |second| format!("{first} {second}"));
+    Some(written(&format!("{words} {test} kind")))
 }
 
 /// `name` written as a class, as `js_types::SizeClass::of_target` writes a build target's

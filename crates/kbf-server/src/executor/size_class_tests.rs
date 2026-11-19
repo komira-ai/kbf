@@ -183,3 +183,118 @@ fn a_long_targets_classes_are_label_values_and_stay_apart() {
     hashed(&built, "very_long_package_name.integration.build");
     hashed(&run, "very_long_package_name.integration.test");
 }
+
+/// Asserts that one kind of work is one kind across targets and builds: `zig cc` writing two
+/// targets' objects, in two configurations, is `zig.cc.build.kind` for both, a label value,
+/// while each target keeps its own class; a program given by its absolute path is the kind of
+/// its file name. Catches a kind that holds the target or the configuration (it would learn no
+/// faster than the target), and a job sent no kind at all.
+#[test]
+fn a_kind_is_what_runs_whatever_the_target() {
+    let zig = |program: &str, cfg: &str, target: &str| {
+        let out = format!("buck-out/v2/art/root/{cfg}/pkg/__{target}__/{target}.o");
+        SizeClass::of_action(&shape(&[program, "cc", "-c", "src.c", "-o", &out], &[&out]))
+    };
+    let one = zig("zig", CFG, "one");
+    let two = zig("zig", "0123456789abcdef", "two");
+    assert_eq!(one.kind(), Some("zig.cc.build.kind"));
+    assert_eq!(two.kind(), one.kind());
+    assert_ne!(one.as_str(), two.as_str());
+    assert_eq!(zig("/opt/zig/0.15/zig", CFG, "one").kind(), one.kind());
+    assert!(is_label_value(one.kind().expect("a kind")));
+}
+
+/// Asserts which second word of the program a kind keeps: a subcommand or a flag of letters,
+/// digits, `-` and `_` (`env make`, `clang -c`), never one with a `/`, a `.` or an `@`
+/// (`cc a.o a.c` is `cc`, `mojo <script>` is `mojo`, `env make <genrule.mk>` is `env make`),
+/// while a bare file name is kept (`cc -o out a.c` is `cc out`); and that a tool
+/// built under `buck-out` is its own kind, every subcommand of it in one. Catches a kind that
+/// keeps a file or script path (one target's, so every target its own kind), and one that
+/// drops the subcommand, so `zig cc` and `zig ar` would meet only through the cold size.
+#[test]
+fn a_kind_keeps_a_subcommand_and_never_a_path() {
+    let kind = |argv: &[&str]| {
+        SizeClass::of_action(&shape(argv, &["out/o"]))
+            .kind()
+            .map(str::to_owned)
+    };
+    let genrule = format!("buck-out/v2/art/root/{CFG}/pkg/__g__/genrule.mk");
+    assert_eq!(
+        kind(&["env", "make", "-f", &genrule]).as_deref(),
+        Some("env.make.build.kind")
+    );
+    assert_eq!(
+        kind(&["clang", "-c", "a.c"]).as_deref(),
+        Some("clang.-c.build.kind")
+    );
+    assert_eq!(
+        kind(&["cc", "-o", "a.o", "a.c"]).as_deref(),
+        Some("cc.build.kind")
+    );
+    assert_eq!(
+        kind(&["cc", "-o", "out", "a.c"]).as_deref(),
+        Some("cc.out.build.kind")
+    );
+    assert_eq!(
+        kind(&["mojo", "prelude/tools/make_comp_db.mojo", "gen"]).as_deref(),
+        Some("mojo.build.kind")
+    );
+    let tool = format!("buck-out/v2/art/prelude/{CFG}/toolchains/__zig_wrapper__/zig");
+    assert_eq!(
+        kind(&[&tool, "cc", "a.c"]).as_deref(),
+        Some("prelude.toolchains.__zig_wrapper__.zig.build.kind")
+    );
+    assert_eq!(kind(&[&tool, "ar", "a.o"]), kind(&[&tool, "cc", "a.c"]));
+}
+
+/// Asserts that a test run and a build of one program are two kinds, as a target's compile and
+/// its test are two classes. Catches a test's memory booked for every compile of its kind.
+#[test]
+fn a_kinds_build_and_its_test_are_two_kinds() {
+    let test_out = "buck-out/v2/test/execution/root/0123456789abcdef/fedcba9876543210/default/o";
+    let run = SizeClass::of_action(&shape(&["cargo", "test", "--release"], &[test_out]));
+    let built = SizeClass::of_action(&shape(&["cargo", "test", "--release"], &["out/o"]));
+    assert_eq!(run.kind(), Some("cargo.test.test.kind"));
+    assert_eq!(built.kind(), Some("cargo.test.build.kind"));
+}
+
+/// Asserts that an action with no arguments, or whose program holds no ASCII letter or digit,
+/// has no kind, so its job names no fallback, while it keeps its class. Catches every such
+/// action pooled into one kind `build.kind` (the largest of them would size them all).
+#[test]
+fn an_action_with_no_program_has_no_kind() {
+    let none = SizeClass::of_action(&shape(&[], &["out/o"]));
+    assert_eq!(none.kind(), None);
+    assert!(none.as_str().starts_with("shape."), "{none:?}");
+    assert_eq!(
+        SizeClass::of_action(&shape(&["日本"], &["out/o"])).kind(),
+        None
+    );
+}
+
+/// Asserts that a kind's class never meets a target's or a shape's: the target `zig//:cc`
+/// built is `zig.cc.build` where `zig cc` is `zig.cc.build.kind`, a program named `shape` is
+/// not a shape's class, and a kind long enough to be cut is a label value whose kept part ends
+/// in `.kind`, then a hash. Catches a kind whose history merges with a target's or a
+/// shape's, which would size the one from the other's runs.
+#[test]
+fn a_kind_never_meets_a_targets_or_a_shapes_class() {
+    let out = format!("buck-out/v2/art/zig/{CFG}/__cc__/o");
+    let target = SizeClass::of_action(&shape(&["zig", "cc"], &[&out]));
+    assert_eq!(target.as_str(), "zig.cc.build");
+    assert_eq!(target.kind(), Some("zig.cc.build.kind"));
+    let named = SizeClass::of_action(&shape(&["shape"], &["out/o"]));
+    assert_eq!(named.kind(), Some("shape.build.kind"));
+    assert_ne!(named.kind(), Some(named.as_str()));
+    let long = format!(
+        "buck-out/v2/art/root/{CFG}/{}__t__/tool",
+        "deep_tool_dir/".repeat(6)
+    );
+    let cut = SizeClass::of_action(&shape(&[&long], &["out/o"]));
+    let kind = cut.kind().expect("a kind");
+    assert!(is_label_value(kind), "{kind:?}");
+    let (head, hash) = kind.rsplit_once('-').expect("a hash");
+    assert!(head.ends_with("tool.build.kind"), "{kind:?}");
+    assert_eq!(hash.len(), 16, "{kind:?}");
+    assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()), "{kind:?}");
+}

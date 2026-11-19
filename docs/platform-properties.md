@@ -21,7 +21,8 @@ Any other value of `kbf-lease` is refused with `INVALID_ARGUMENT`. Every other p
 (`gpu`, `ISA`, `Arch`, `Pool`, ...) is accepted and does nothing: kbf does not match an action
 to a worker, books no cores, GPUs or memory for it, and reads neither `kbf-book-cpus` nor
 `kbf-book-mem-gib` (the job asks for no CPU and no memory; the job service sizes it from the
-history of the action's build target, which kbf gives it as the job's `size-class` label). Like
+history of the action's build target, which kbf gives it as the job's `size-class` label, and of
+its kind, the job's `size-fallback` label). Like
 every platform property they are part of the action digest, so changing one reruns the action
 once.
 

@@ -5,8 +5,10 @@
 //! answer was lost, names the job already made, and the service answers from it; and a frontend
 //! that takes up an unfinished operation from the state store computes the same id. Two labels
 //! name the frontends and the process; a third, `size-class`, names the action's class
-//! ([`crate::executor::size_class`]), its target and kind, except on a whole-host job, which
-//! books a whole host and so is never sized.
+//! ([`crate::executor::size_class`]), its target and whether it is a test, and a fourth,
+//! `size-fallback`, the class of its kind (what runs), whose history sizes the job while its
+//! own class has too few runs; a whole-host job, which books a whole host and so is never
+//! sized, has neither, and an action with no program has no kind.
 //!
 //! A Linux run commits into a put directory (`--task-out-root`, [`Config::task_out`]) and is a
 //! job ([`put_dir_spec`]): no image, its root the action tree as its one layer (the host
@@ -23,7 +25,7 @@
 //!
 //! An action whose platform asks for a Mac is a Mac job ([`crate::executor::mac`]): the
 //! release's `kbf-task` bundle, the tree and the put directory mounted under `/work`, no layer, of
-//! a Mac in the native runtime, with no CPU or memory and the class's label. It is refused as
+//! a Mac in the native runtime, with no CPU or memory and the class's labels. It is refused as
 //! the caller's on an executor with no Macs, and as for Linux for a whole machine.
 //!
 //! A [`JobSpec`] is sent and kept, and never logged.
@@ -42,7 +44,7 @@ use crate::executor::mac::{MacJob, System, check_version, mac_argv, mac_spec};
 use crate::executor::metrics::Metrics;
 use crate::executor::out::{PutDirRoots, TASK_IN_TREE, provider_layer};
 use crate::executor::outcome::Settled;
-use crate::executor::size_class::{SIZE_CLASS_LABEL, SizeClass};
+use crate::executor::size_class::{SIZE_CLASS_LABEL, SIZE_FALLBACK_LABEL, SizeClass};
 use crate::executor::steps::Step;
 use crate::executor::task::{PackKey, RunId, build_id, put_dir_argv};
 use crate::executor::traits::{InputsError, MintError};
@@ -284,9 +286,10 @@ pub(super) fn not_minted(error: MintError) -> Settled {
     }
 }
 
-/// The labels of a job: the frontends' name and this process's id, and its size class if it
-/// has one.
+/// The labels of a job: the frontends' name and this process's id, and its size class and the
+/// class of its kind if it has them.
 fn labels(ctx: &Preparer<'_>, class: Option<&SizeClass>) -> BTreeMap<String, String> {
+    let kind = class.and_then(SizeClass::kind);
     let class = class.map(|class| (SIZE_CLASS_LABEL, class.as_str()));
     [
         (FRONTEND_LABEL, ctx.cfg.frontend.as_str()),
@@ -294,6 +297,7 @@ fn labels(ctx: &Preparer<'_>, class: Option<&SizeClass>) -> BTreeMap<String, Str
     ]
     .into_iter()
     .chain(class)
+    .chain(kind.map(|kind| (SIZE_FALLBACK_LABEL, kind)))
     .map(|(key, value)| (key.to_owned(), value.to_owned()))
     .collect()
 }

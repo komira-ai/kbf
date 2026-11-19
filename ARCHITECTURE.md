@@ -116,7 +116,8 @@ role (`--role=all`). The flags are:
 
 **Where an action runs.** Every Execute that the action cache does not answer runs as one job of
 the jobscheduler's job service, submitted at once by the frontend's executor (`--executor
-js-agent`, the only value) with no CPU or memory and the build target as its size-class label.
+js-agent`, the only value) with no CPU or memory, the build target as its size-class label and
+the action's kind (what runs) as its size-fallback label.
 kbf does not schedule: how many jobs run, where and when is the job service's. The executor
 reads each job back every `--executor-poll-ms` (250 ms) until it ends
 ([direct-js.md](docs/design/direct-js.md)). The job is the

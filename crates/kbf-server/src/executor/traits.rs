@@ -185,8 +185,9 @@ pub struct ActionFacts {
     /// The system the action's platform asks for: a Linux host, or a Mac
     /// ([`crate::executor::mac`]).
     pub system: System,
-    /// The class the job service sizes the action's job by: its target and kind, read from
-    /// its `Command` ([`SizeClass::of_action`]).
+    /// The class the job service sizes the action's job by, its target and whether it is a
+    /// test, and the class of its kind, what runs, read from its `Command`
+    /// ([`SizeClass::of_action`]).
     pub size_class: SizeClass,
 }
 
