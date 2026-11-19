@@ -278,6 +278,14 @@ and if the host refuses that too, gives the action's jobs its tree as manifests 
 mount provider). Neither run spends one of the operation's attempts
 (`kbf_executor_list_refused_total{step}` counts them). A Mac job always reads manifests.
 
+Beside each tree list the frontend stores its L2 sidecar (`cas/l2/<sha256>`, the same id: tierstore's
+`docs/design/fetch-cache-serve.md`, 3.5): the list's entries with the SHA-256 of every 1 MiB cell of
+each object it names, so a tierstore that reads only L2 lists verifies any cell on arrival. Older
+tierstores read the list and never the sidecar. The cells are recorded in the pack index as objects
+are written (each pack the frontend packs, each whole object the tree writer writes); a list that
+names an object with none recorded is stored without a sidecar and recorded unlisted, for
+`kbf-l2-backfill` (docs/deploy/l2-backfill.md). The miss path above reads each such object once.
+
 **Over a state store.** With `--state-store` the executor keeps the rows `exec/op/<operation>` (owner,
 action, attempt, job id), `exec/live/<instance>` and `done/`, `doneof/` that
 [direct-js.md](../design/direct-js.md) section 3 lists, and the operation ids come from the store's
