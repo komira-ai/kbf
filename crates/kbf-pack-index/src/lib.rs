@@ -446,7 +446,11 @@ pub trait PackIndex: Send + Sync {
     ///
     /// # Errors
     /// As [`PackIndex::unlisted`].
-    fn live_packs(&self, after: Option<&str>, limit: usize) -> Result<Vec<LivePack>, PackIndexError> {
+    fn live_packs(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<LivePack>, PackIndexError> {
         let _ = (after, limit);
         Err(PackIndexError::Unsupported)
     }
@@ -504,6 +508,18 @@ pub(crate) fn check_batch(given: usize) -> Result<(), PackIndexError> {
         return Err(PackIndexError::TooMany {
             given,
             max: MAX_BATCH,
+        });
+    }
+    Ok(())
+}
+
+/// `Err(TooMany)` when a page asks for more than [`cells::MAX_PAGE`] rows.
+#[cfg(any(test, feature = "test-support", feature = "postgres"))]
+pub(crate) fn check_page(limit: usize) -> Result<(), PackIndexError> {
+    if limit > cells::MAX_PAGE {
+        return Err(PackIndexError::TooMany {
+            given: limit,
+            max: cells::MAX_PAGE,
         });
     }
     Ok(())

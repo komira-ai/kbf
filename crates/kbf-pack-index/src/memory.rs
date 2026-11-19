@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use crate::conformance::PackBackend;
 use crate::cells::{LivePack, ObjectCells, Unlisted};
+use crate::conformance::PackBackend;
 use crate::directory::NewDirectory;
 use crate::{
     BlobDigest, Forgot, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
@@ -289,7 +289,11 @@ impl PackIndex for MemoryPackIndex {
         Ok(self.lock().unlisted.remove(tree).is_some())
     }
 
-    fn live_packs(&self, after: Option<&str>, limit: usize) -> Result<Vec<LivePack>, PackIndexError> {
+    fn live_packs(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<LivePack>, PackIndexError> {
         cells::live_packs(&self.lock(), after, limit)
     }
 }

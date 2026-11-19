@@ -5,19 +5,8 @@ use std::collections::btree_map::Entry;
 use std::time::Duration;
 
 use super::State;
-use crate::cells::{LivePack, MAX_PAGE, ObjectCells, Unlisted};
-use crate::{PackIndexError, check_batch, micros};
-
-/// `Err(TooMany)` for a page longer than [`MAX_PAGE`].
-fn check_page(limit: usize) -> Result<(), PackIndexError> {
-    if limit > MAX_PAGE {
-        return Err(PackIndexError::TooMany {
-            given: limit,
-            max: MAX_PAGE,
-        });
-    }
-    Ok(())
-}
+use crate::cells::{LivePack, ObjectCells, Unlisted};
+use crate::{PackIndexError, check_batch, check_page, micros};
 
 /// [`crate::PackIndex::object_cells`] on the index's state.
 pub(super) fn read(
@@ -25,7 +14,10 @@ pub(super) fn read(
     keys: &[String],
 ) -> Result<Vec<Option<ObjectCells>>, PackIndexError> {
     check_batch(keys.len())?;
-    Ok(keys.iter().map(|key| state.cells.get(key).cloned()).collect())
+    Ok(keys
+        .iter()
+        .map(|key| state.cells.get(key).cloned())
+        .collect())
 }
 
 /// [`crate::PackIndex::record_cells`] on the index's state.

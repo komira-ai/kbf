@@ -30,6 +30,7 @@ use postgres::types::ToSql;
 use kbf_state::Clock;
 use kbf_state::postgres::{Conn, ExtensionPool, Loan, PostgresConfig, store_error};
 
+use crate::cells::{LivePack, ObjectCells, Unlisted};
 use crate::directory::NewDirectory;
 use crate::{
     BlobDigest, Forgot, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
@@ -39,6 +40,7 @@ use crate::{
 mod action;
 #[cfg(any(test, feature = "test-support"))]
 mod backend;
+mod cells;
 mod directory;
 #[cfg(any(test, feature = "test-support"))]
 pub use backend::PostgresPackBackend;
@@ -476,5 +478,38 @@ impl PackIndex for PostgresPackIndex {
 
     fn record_directories(&self, directories: &[NewDirectory]) -> Result<usize, PackIndexError> {
         self.insert_directories(directories)
+    }
+
+    fn object_cells(&self, keys: &[String]) -> Result<Vec<Option<ObjectCells>>, PackIndexError> {
+        self.read_cells(keys)
+    }
+
+    fn record_cells(&self, key: &str, cells: &ObjectCells) -> Result<bool, PackIndexError> {
+        self.insert_cells(key, cells)
+    }
+
+    fn record_unlisted(&self, tree: &[u8; 32]) -> Result<(), PackIndexError> {
+        self.upsert_unlisted(tree)
+    }
+
+    fn unlisted(
+        &self,
+        within: Duration,
+        after: Option<&[u8; 32]>,
+        limit: usize,
+    ) -> Result<Vec<Unlisted>, PackIndexError> {
+        self.read_unlisted(within, after, limit)
+    }
+
+    fn drop_unlisted(&self, tree: &[u8; 32]) -> Result<bool, PackIndexError> {
+        self.delete_unlisted(tree)
+    }
+
+    fn live_packs(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<LivePack>, PackIndexError> {
+        self.read_live_packs(after, limit)
     }
 }

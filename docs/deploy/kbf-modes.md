@@ -681,6 +681,11 @@ What it does itself, with those three:
   not wait for; see `docs/design/metadata-in-postgres.md`. A database at migration 3 starts and
   every walk reads the blobs, logging a warning for each failed read, and for a failed record
   of the walk's rows.
+- **Cell rows and unlisted trees.** The pack index keeps the SHA-256 of each 1 MiB cell of an
+  object (`object_cells`) and the tree lists whose L2 sidecar is not written yet (`unlisted_tree`)
+  in two more tables of the state store, made by the installer's migration 5; see
+  `crates/kbf-pack-index/src/cells.rs` for the rules. A database at migration 4 opens for the pack
+  index, and each call on these tables fails `NotMigrated` until the installer has run.
 - **Readiness.** `GET /readyz` and `grpc.health.v1` fail when the state store does not answer a
   read and when the job service does not answer a read of a job (`executor` in the failing
   list). Nothing probes the object store or any storage node: an object store that is down is

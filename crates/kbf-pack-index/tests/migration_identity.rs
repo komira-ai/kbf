@@ -6,7 +6,7 @@
 
 use kbf_pack_index::schema::{
     self, ACTION_CACHE_NAME, ACTION_CACHE_SQL, ACTION_CACHE_VERSION, DIRECTORY_NAME, DIRECTORY_SQL,
-    DIRECTORY_VERSION, NAME, SQL, VERSION,
+    DIRECTORY_VERSION, L2_CELLS_NAME, L2_CELLS_SQL, L2_CELLS_VERSION, NAME, SQL, VERSION,
 };
 use kbf_state::postgres::schema::{self as state_schema, Kind};
 use sha2::{Digest, Sha256};
@@ -78,8 +78,29 @@ fn the_directory_migration_is_pinned() {
     assert_eq!(migration.kind(), Kind::Expand);
 }
 
+/// The SHA-256 of `migrations/0005_l2_cells.sql`, written out so a changed byte fails here.
+const L2_CELLS_SHA256: &str = "05702b7f544a876185abdd2a064c12c8946e339fb6455a92bf2b8e330ff1643a";
+
+/// Asserts that the L2 cells' migration is number 5, named `l2_cells`, an expand step, and that
+/// its file is the one this test pins, which a deployed database may have run.
+/// Catches: an edit to the file (even whitespace), a renumbering and a rename.
+#[test]
+fn the_l2_cells_migration_is_pinned() {
+    let hex: String = Sha256::digest(L2_CELLS_SQL.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(hex, L2_CELLS_SHA256, "the migration file changed");
+    let migration = schema::l2_cells_migration();
+    assert_eq!(migration.version(), 5);
+    assert_eq!(L2_CELLS_VERSION, 5);
+    assert_eq!(migration.name(), "l2_cells");
+    assert_eq!(L2_CELLS_NAME, "l2_cells");
+    assert_eq!(migration.kind(), Kind::Expand);
+}
+
 /// Asserts that the set a release embeds is the state store's first migration followed by the
-/// pack index's, the action cache's and the Directory rows', numbered 1 to 4, though the state store's own set
+/// pack index's, the action cache's, the Directory rows' and the L2 cells', numbered 1 to 5, though the state store's own set
 /// goes on past the first (its migration 2, `writer_generation`, would take the number a
 /// database recorded for `pack_index`). Catches: the state store's whole set taken, which
 /// would renumber or rename what a deployed database has; a caller that took its set from the
@@ -100,10 +121,11 @@ fn the_release_set_is_the_state_stores_first_then_the_pack_index_the_action_cach
             (1, "state"),
             (2, "pack_index"),
             (3, "action_cache"),
-            (4, "directory")
+            (4, "directory"),
+            (5, "l2_cells")
         ]
     );
     assert_eq!(&set[..1], &own[..1]);
-    assert_eq!(schema::latest(), 4);
+    assert_eq!(schema::latest(), 5);
     assert_eq!(state_schema::latest_of(&set), schema::latest());
 }
