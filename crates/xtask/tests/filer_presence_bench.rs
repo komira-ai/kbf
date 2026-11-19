@@ -586,8 +586,8 @@ fn flags_that_do_not_fit_are_usage_errors() {
     for (filer, want) in [
         ("a b:1", "--filer: invalid URI"),
         (
-            "node-02",
-            "the filer address \"node-02\" is not <host>:<port>",
+            "filer-host",
+            "the filer address \"filer-host\" is not <host>:<port>",
         ),
     ] {
         let error = run(&args(&bench_line(filer, &ROWS))).expect_err(filer);
@@ -860,7 +860,7 @@ fn the_verb_runs_from_the_command_line() {
         .args([
             "filer-presence-bench",
             "--filer",
-            "node-02",
+            "filer-host",
             "--filer-root",
             ROOT,
         ])
@@ -873,7 +873,7 @@ fn the_verb_runs_from_the_command_line() {
         ),
         (
             Some(2),
-            "xtask: the filer address \"node-02\" is not <host>:<port>\n".to_owned()
+            "xtask: the filer address \"filer-host\" is not <host>:<port>\n".to_owned()
         )
     );
 }

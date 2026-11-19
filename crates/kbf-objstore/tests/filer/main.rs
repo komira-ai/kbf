@@ -411,12 +411,12 @@ async fn the_length_is_the_one_seaweedfs_answers_a_head_with() {
 async fn the_address_must_be_host_and_port() {
     let root = FilerRoot::new(ROOT).expect("root");
     for bad in [
-        "node-02",
+        "filer-host",
         ":18888",
-        "http://node-02:18888",
-        "node-02:0",
-        "node-02:port",
-        "node 02:18888",
+        "http://filer-host:18888",
+        "filer-host:0",
+        "filer-host:port",
+        "filer host:18888",
     ] {
         let made = FilerPresence::connect_lazy(bad, root.clone(), Duration::from_secs(1));
         let error = made.expect_err(bad);
@@ -425,7 +425,7 @@ async fn the_address_must_be_host_and_port() {
             format!("the filer address {bad:?} is not <host>:<port>")
         );
     }
-    for good in ["node-02:18888", "127.0.0.1:1", "[::1]:18888"] {
+    for good in ["filer-host:18888", "127.0.0.1:1", "[::1]:18888"] {
         let made = FilerPresence::connect_lazy(good, root.clone(), Duration::from_secs(1));
         assert!(made.is_ok(), "{good}");
     }
