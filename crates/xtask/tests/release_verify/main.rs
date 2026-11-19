@@ -2,4 +2,5 @@
 
 mod fixture;
 mod notes;
+mod previous;
 mod verify;

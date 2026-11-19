@@ -5,6 +5,7 @@
 //! `v0.1.2-probe`, `v01.2.3`, `latest`) is no release tag: it is never counted and never
 //! the highest. Versions compare number by number, so 10 is above 9.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde_json::Value;
@@ -120,6 +121,28 @@ pub fn release_versions(gh: &Path, repo: &str) -> Result<Vec<Version>, Error> {
         .iter()
         .filter_map(|r| Version::parse_tag(r["tag_name"].as_str()?))
         .collect())
+}
+
+/// The tags of the published releases of `repo`: every release that is not a draft. A
+/// release whose `draft` is not a boolean is an error, not a guess either way.
+pub fn published_tags(gh: &Path, repo: &str) -> Result<BTreeSet<String>, Error> {
+    let path = format!("repos/{repo}/releases");
+    let mut published = BTreeSet::new();
+    for release in listed(gh, &path)? {
+        let tag = release["tag_name"].as_str();
+        match (tag, release["draft"].as_bool()) {
+            (Some(tag), Some(false)) => {
+                published.insert(tag.to_owned());
+            }
+            (Some(_), Some(true)) => {}
+            _ => {
+                return Err(Error::Failed(format!(
+                    "gh api {path}: a release without a tag_name or a boolean draft: {release}"
+                )));
+            }
+        }
+    }
+    Ok(published)
 }
 
 /// How a commit stands to the highest release tag, when it does not contradict it.

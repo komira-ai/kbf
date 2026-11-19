@@ -331,9 +331,13 @@ jobs:
       # themselves: `kbf --version --json` of this release and of the one before it. A
       # binary runs here only after the attestation step above has verified the files it
       # comes from (the workflow lint holds the order). No previous release, no second file.
+      # The release before is the nearest earlier tag with a published release: a tag whose
+      # release run failed before it published has no files, and is passed over (and named).
       - name: The release before this one, if any
         id: previous
-        run: cargo xtask release previous --tag "$TAG" --commit "$COMMIT" --output "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask release previous --repo "$GITHUB_REPOSITORY" --tag "$TAG" --commit "$COMMIT" --output "$GITHUB_OUTPUT"
       - name: This release's identity, from the verified linux tarball
         run: cargo xtask release identity dist --commit "$COMMIT" --out version.json
       - name: The previous release's files
@@ -369,8 +373,9 @@ jobs:
       # is empty when there is none), and when the file names another build.
       - name: Write the release notes
         env:
+          PREVIOUS: ${{ steps.previous.outputs.previous }}
           PREVIOUS_IDENTITY: ${{ steps.previous.outputs.previous != '' && 'previous-version.json' || '' }}
-        run: cargo xtask release notes dist --tag "$TAG" --commit "$COMMIT" --version-json version.json --previous-version-json "$PREVIOUS_IDENTITY" --out release-notes.md
+        run: cargo xtask release notes dist --tag "$TAG" --commit "$COMMIT" --version-json version.json --previous "$PREVIOUS" --previous-version-json "$PREVIOUS_IDENTITY" --out release-notes.md
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-notes
