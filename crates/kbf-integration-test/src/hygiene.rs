@@ -12,8 +12,11 @@
 //!   number has at least three digits and no section part, so `RFC 9113`, `RFC 3339.`
 //!   and `RFC-7540` pass, while a section number (`5.8`, `10`), a word (`section`,
 //!   `sections`, `§`, a possessive, a plural) or nothing after it is reported, and so is
-//!   that document's file name (`FARM_` and the acronym, in any case). A public design
-//!   doc is cited by its path under `docs/` instead;
+//!   that document's file name (`FARM_` and the acronym, in any case). An acronym that
+//!   ends its line is followed by the next line, after its indent and comment leader
+//!   (`//`, `#`, `*`, `;`, `-`): a comment wrapped between the acronym and its number, as
+//!   in a vendored upstream file, cites the number. A public design doc is cited by its
+//!   path under `docs/` instead;
 //! - a git conflict marker: a line that starts with `<<<<<<< ` or `>>>>>>> ` (git
 //!   follows each with a label), and a line that is exactly `=======` in a text that
 //!   holds either of those. A `=======` line in a text with neither is a heading
@@ -146,7 +149,8 @@ pub fn scan(text: &str) -> Vec<Finding> {
     let merging = text
         .lines()
         .any(|l| conflict_marker(l).is_some_and(|m| m != SEPARATOR));
-    for (i, line) in text.lines().enumerate() {
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, line) in lines.iter().copied().enumerate() {
         match conflict_marker(line) {
             // A heading underline: the text holds no other marker.
             Some(SEPARATOR) if !merging => {}
@@ -173,7 +177,7 @@ pub fn scan(text: &str) -> Vec<Finding> {
                 kind: Kind::HomePath(p),
             });
         }
-        for c in design_citations_in(line) {
+        for c in design_citations_in(line, lines.get(i + 1).copied()) {
             out.push(Finding {
                 line: i + 1,
                 kind: Kind::DesignCitation(c),
@@ -205,7 +209,9 @@ fn conflict_marker(line: &str) -> Option<&'static str> {
 /// [`ACRONYM`] not followed by an IETF number, and each [`FILE`] in any case (reported
 /// once, as the file name). A token has no letter or digit before it and no capital
 /// letter after it (an acronym that starts a longer capitalised word is another word).
-fn design_citations_in(line: &str) -> Vec<String> {
+/// A token that ends the line is followed by `next`, the line after it, read from its
+/// first character that is no indent or comment leader.
+fn design_citations_in(line: &str, next: Option<&str>) -> Vec<String> {
     let b = line.as_bytes();
     let excerpt = |at: usize| line[at..].chars().take(16).collect::<String>();
     let lower = line.to_ascii_lowercase();
@@ -218,7 +224,11 @@ fn design_citations_in(line: &str) -> Vec<String> {
             && lower[at - (FILE.len() - ACRONYM.len())..].starts_with(FILE)
     };
     for (at, _) in line.match_indices(ACRONYM) {
-        let after = &b[at + ACRONYM.len()..];
+        let mut after = &b[at + ACRONYM.len()..];
+        if after.iter().all(u8::is_ascii_whitespace) {
+            let leader = |c: char| c.is_whitespace() || "/#*;-".contains(c);
+            after = next.unwrap_or("").trim_start_matches(leader).as_bytes();
+        }
         let word_before = at > 0 && b[at - 1].is_ascii_alphanumeric();
         let word_after = after.first().is_some_and(u8::is_ascii_uppercase);
         if word_before || word_after || in_file_name(at) || is_ietf_number(after) {
@@ -522,6 +532,36 @@ mod tests {
         let text =
             format!("{a} 9113, {a} 3339. {a}-7540 {a}6570 Section 3.2.2 {a}OMM X{a} to_rfc3339");
         assert_eq!(scan(&text), vec![]);
+    }
+
+    #[test]
+    fn a_number_on_the_next_line_of_a_wrapped_comment_is_an_ietf_number() {
+        // Catches: an IETF citation that a comment wraps between the acronym and its
+        // number (as the vendored filer.proto of SeaweedFS wraps one) taken
+        // for a design citation, and the continuation read too widely: a section number,
+        // a word or no line after the wrapped acronym is still reported, and only an
+        // acronym that ends its line reads the next one.
+        let a = acronym();
+        for wrapped in [
+            format!("// maps semantics (e.g. {a}\n// 7232) to clauses"),
+            format!("# see {a}  \n#   9113 for frames"),
+            format!("/* {a}\n * 3339 */"),
+            format!("-- {a}\n-- 5737"),
+            format!("{a}\n1918"),
+        ] {
+            assert_eq!(scan(&wrapped), vec![], "{wrapped:?}");
+        }
+        for (planted, line) in [
+            (format!("// see {a}\n// 5.8 for the rule"), 1),
+            (format!("// see {a}\n// section 9"), 1),
+            (format!("// the end, {a}"), 1),
+            (format!("ok\n// see {a}\n"), 2),
+            (format!("// {a} section\n// 7232"), 1),
+        ] {
+            let f = scan(&planted);
+            assert_eq!(f.len(), 1, "{planted:?}: {f:?}");
+            assert_eq!(f[0].line, line, "{planted:?}");
+        }
     }
 
     /// A conflict as git writes it, its markers assembled at run time so this file does

@@ -8,6 +8,7 @@
 //! - a gRPC service path that differs from the one clients dial, which would make
 //!   every REAPI or worker call fail with UNIMPLEMENTED.
 
+use kbf_proto::filer_pb::seaweed_filer_server::SeaweedFilerServer;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::google::longrunning::operations_server::OperationsServer;
 use kbf_proto::google::rpc::Status;
@@ -100,6 +101,12 @@ fn services_have_their_upstream_names() {
     assert_eq!(
         <PackIndexServer<()> as NamedService>::NAME,
         "kbf.worker.v1.PackIndex"
+    );
+    // The name SeaweedFS's filer serves: under any other, every lookup of the filer
+    // client is answered UNIMPLEMENTED.
+    assert_eq!(
+        <SeaweedFilerServer<()> as NamedService>::NAME,
+        "filer_pb.SeaweedFiler"
     );
 }
 

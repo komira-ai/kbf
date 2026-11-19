@@ -27,6 +27,8 @@ test = false
 # The statement a provenance bundle's DSSE envelope carries (`bundles`): its subject is
 # compared with the tarball's digest. Already in the tree through other crates.
 base64.workspace = true
+# The lag objects `filer-presence-bench` writes.
+bytes.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
@@ -37,9 +39,14 @@ kbf-gate.workspace = true
 # the cap and the strictness (`binary::Version`), and of running a program with an empty
 # environment and a time limit (`run::SystemRunner`).
 kbf-installer.workspace = true
+# `filer-presence-bench`: the filer batch lookup it times (`filer::FilerPresence`) and the S3
+# store it writes the lag objects through.
+kbf-objstore.workspace = true
 # The native package's version rule and the update hook's manifest constants (`release desired`,
 # `pkg-config --native-version-of`, `channels check-apt`): the hook's own definitions.
 kbf-package-hook.workspace = true
+# The filer's listing, which `filer-presence-bench` takes its present keys from.
+kbf-proto.workspace = true
 # `base-tree`: the kbf base tree as tierstore manifests and its release asset (a leaf crate).
 kbf-tree-bundle.workspace = true
 # The platforms a release is built for and the tarballs a host of each needs
@@ -57,13 +64,23 @@ rustls-native-certs.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+# The runtime `filer-presence-bench` drives its calls on.
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+# The filer's gRPC endpoint and status (`filer-presence-bench`).
+tonic.workspace = true
 # `fetch-pinned-js` reads kbf-js-version.toml.
 toml.workspace = true
 ureq.workspace = true
 # The zip archive of a pinned tool (`fetch --extract zip`).
 zip.workspace = true
+# The lag objects' key pair, wiped when the file's text is dropped (`filer-presence-bench`).
+zeroize.workspace = true
 
 [dev-dependencies]
+# The fake filer and S3 service `filer-presence-bench` is tested over.
+kbf-objstore = { workspace = true, features = ["testkit"] }
+# The fake filer's entries.
+kbf-proto.workspace = true
 # The Linux layout's paths, for the unit test that holds the trust directory the package installs
 # to the one the hosts read (`kbf_installer::layout`, a dependency above).
 kbf-host.workspace = true
