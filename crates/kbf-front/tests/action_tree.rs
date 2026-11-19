@@ -52,6 +52,8 @@ mod named;
 mod places;
 #[path = "action_tree/retry.rs"]
 mod retry;
+#[path = "action_tree/sidecars.rs"]
+mod sidecars;
 #[path = "action_tree/store.rs"]
 mod store;
 #[path = "action_tree/whiteout.rs"]
@@ -127,6 +129,8 @@ struct State {
     open: usize,
     /// The most writes that were open at once.
     peak: usize,
+    /// Every ranged read of an object: its key, the offset and the length.
+    ranged: Vec<(String, u64, u64)>,
 }
 
 /// One open write of [`Farm`]'s, counted in [`State::open`] and [`State::peak`] until dropped.
@@ -517,6 +521,21 @@ impl LargeStore for Farm {
             state.objects.insert(name, Bytes::from(got));
             Ok(())
         })
+    }
+
+    fn read_range<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        offset: u64,
+        len: u64,
+    ) -> BoxFuture<'a, Result<Bytes, ObjectStoreError>> {
+        let mut state = self.state();
+        state.ranged.push((key.to_string(), offset, len));
+        let answer = match state.objects.get(key.as_str()) {
+            Some(bytes) => Ok(bytes.slice(offset as usize..(offset + len) as usize)),
+            None => Err(ObjectStoreError::NotFound(key.clone())),
+        };
+        Box::pin(std::future::ready(answer))
     }
 }
 

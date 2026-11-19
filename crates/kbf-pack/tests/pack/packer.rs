@@ -558,3 +558,46 @@ async fn a_refused_record_is_not_tried_again() {
 
     assert_eq!(again.packs[0].key, pack_key(1));
 }
+
+/// Asserts that each pack written has its cells recorded, those of the bytes stored (one
+/// SHA-256 per 1 MiB, the last cell short), hashed from the bytes in hand: the store is read
+/// for nothing.
+#[tokio::test]
+async fn a_pack_written_has_the_cells_of_its_bytes_recorded() {
+    let rig = Rig::new();
+    let packer = rig.packer(PackerConfig::default());
+    let blobs = [filler((1 << 20) + 10, 1), blob("small")];
+
+    let packed = pack_all(&packer, &blobs).await;
+
+    let pack = &packed.packs[0];
+    let whole = ByteRange::new(0, pack.size).unwrap();
+    let object = rig.store.get_range(&keys().key(0), whole).await.unwrap();
+    let expected = tierstore_list::PackCells::of(&object);
+    let cells = rig.index.cells_of(&pack.key).expect("recorded");
+    assert_eq!((cells.size, cells.digests), (expected.size, expected.digests));
+    assert_eq!(expected.size, pack.size);
+    assert_eq!(rig.store.ranges().len(), 1, "only the read of this test");
+}
+
+/// Asserts that a pack whose cells the index does not record, because it fails or keeps none,
+/// is still written and recorded: the cells are left to the backfill.
+#[tokio::test]
+async fn a_pack_whose_cells_are_not_recorded_is_still_written() {
+    let rig = Rig::new();
+    let packer = rig.packer(limits(2_000, 100));
+    rig.index.fail_cells(1);
+    rig.index.keep_no_cells(1);
+    let blobs: Vec<Blob> = (0..3).map(|i| filler(1_500, i)).collect();
+
+    let packed = pack_all(&packer, &blobs).await;
+
+    assert_eq!(packed.packs.len(), 3);
+    let recorded: Vec<bool> = (packed.packs.iter())
+        .map(|pack| rig.index.cells_of(&pack.key).is_some())
+        .collect();
+    assert_eq!(recorded, [false, false, true]);
+    for pack in &packed.packs {
+        assert!(rig.index.pack(&pack.key).unwrap().is_some(), "the pack is recorded");
+    }
+}
