@@ -73,8 +73,10 @@ pub fn previous_release(
 }
 
 /// `previous` as the release before `tag` that `release notes` is told of (empty: none):
-/// one of its [`candidates`], or refused. Which candidate is published is `release
-/// previous`'s to say; that it is one is checked here again.
+/// one of its [`candidates`], or refused. Which candidate is the nearest published one is
+/// `release previous`'s to say, and is not checked here: an older published candidate
+/// passes, so the workflow hands `release previous`'s answer on unchanged (its lint holds
+/// the wiring).
 fn checked_previous(
     repo: &Path,
     tag: &str,
