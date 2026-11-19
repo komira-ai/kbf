@@ -60,7 +60,7 @@ client's window is set equal to `VERIFIED_FOR` (6.2), and kbf itself deletes not
 
 **A deletion by the store inside that window fails a build. It is not a rebuild.** Buck2 does not recover from MISSING
 (section 6). The user reruns once the window has passed, which recovers an input the client still has (it uploads it
-again). For an output the daemon holds only by digest, the user runs `buck2 killall` and builds again, which reruns the
+again). For an output the daemon holds only by digest, the user restarts the daemon (`./buck2 kill`) and builds again, which reruns the
 producer.
 
 For a client that asks again, the worst case is a rebuild.
@@ -325,7 +325,7 @@ is then deleted, and the same daemon builds B, which takes X as an input.
 - A failed action's error is not cached, so building again recomputes B. But A's result stays in DICE
   (`app/buck2_build_api/src/actions/calculation.rs:681-709`), so the same daemon fails B the same way every time.
 
-**After `buck2 killall`, a fresh daemon asks the action cache for A before executing it.**
+**After a restart (`buck2 kill`, or `buck2 killall`), a fresh daemon asks the action cache for A before executing it.**
 
 - `app/buck2_action_impl/src/actions/impls/run.rs:1168` and `app/buck2_execute_impl/src/executors/action_cache.rs:155-161`.
 - The daemon's persisted materializer state (`buck2.sqlite_materializer_state`, on by default,
@@ -373,11 +373,11 @@ store.
 
 - **An input the client still has** (a source): rerun after the window, 5 min. Buck2 asks again, is told missing,
   uploads the input, and the build succeeds.
-- **An output the daemon holds only by digest:** run `buck2 killall` and build again. Buck2's own message already
-  says so when the producer is 5 h old or more. Otherwise the failure carries kbf's MISSING answer, whose message
+- **An output the daemon holds only by digest:** restart the daemon (`./buck2 kill`) and build again. Buck2's own
+  message says to restart it (with `buck2 killall`) when the producer is 5 h old or more. Otherwise the failure carries kbf's MISSING answer, whose message
   Buck2 keeps when it reports it (`app/buck2_execute/src/re/error.rs:97-118`). Phase 2 makes that message say both,
   for example: `1 input blob is not in the CAS (blobs/<hash>/<size>); the store deleted it. If you hold it, it is
-  uploaded again when you rerun after 5 min; if it is an output this Buck2 daemon built earlier, run "buck2 killall"
+  uploaded again when you rerun after 5 min; if it is an output this Buck2 daemon built earlier, run "./buck2 kill"
   and build again`.
 - The status and its one MISSING detail per blob are unchanged, so Bazel and other clients still re-upload. An Execute
   answered MISSING is still right: it fails fast, before any job, and it is true. It is just not a recovery path for
@@ -414,9 +414,9 @@ The steps:
 3. `buck2 build //:b --materializations=none` in the same daemon. Expected from 6.1: X is under 5 h old, so Buck2 skips
    it, sends Execute, kbf answers MISSING before any job, and the build fails at `remote_call_error`.
 4. Build `//:b` again in the same daemon. Expected: the same failure. A stays cached in DICE.
-5. `buck2 killall`, then `buck2 build //:b`. Expected: the action-cache lookup of `//:a` misses, `//:a` runs again, X
+5. `buck2 kill`, then `buck2 build //:b`. Expected: the action-cache lookup of `//:a` misses, `//:a` runs again, X
    is recorded in a new pack, and the build succeeds.
-6. The 5 h branch: `buck2 killall`, write a new nonce, build `//:a` again (digest only), and delete its pack. Wait 5 h
+6. The 5 h branch: `buck2 kill`, write a new nonce, build `//:a` again (digest only), and delete its pack. Wait 5 h
    with the same daemon, then build `//:b`. Expected: `ReCasArtifactExpired` before any Execute reaches kbf.
 7. The hybrid variant: steps 1 to 3 on a platform with local execution enabled. This records which error reaches the
    user, Buck2's `CasNotFoundError` or kbf's message. That decides whether kbf's message is seen at all.
