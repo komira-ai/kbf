@@ -25,7 +25,11 @@
 //!
 //! When the state store shows another process runs the operation now (a write of its row is
 //! refused), this process stops running it, and its callers follow the answer that process
-//! writes ([`follow`]).
+//! writes ([`follow`]). When the first attempt's row finds another frontend running an operation
+//! of the same action ([`Rows::open_op`]), no job is submitted: the operation follows that one
+//! and answers its callers with that answer, so one action runs once whichever frontend its
+//! callers reached. If the operation followed was cancelled by its own callers, this one runs on
+//! its own.
 
 use std::future::pending;
 use std::sync::Arc;
@@ -46,7 +50,7 @@ use super::outcome::{RESUBMITS, Settled, Verdict, forgotten, judge, refused};
 use super::output::{Output, Tail};
 use super::phases::{Mark, Phase, Timeline};
 use super::record;
-use super::rows::{Look, OpRow, Rows, RowsError};
+use super::rows::{Look, OpRow, Opened, Rows, RowsError};
 use super::steps::Step;
 use super::submit::{Booking, Preparer, not_minted, prepare};
 use super::task::{PackKey, RunId};
@@ -109,6 +113,8 @@ enum Ended {
     Cancelled,
     /// Another process runs the operation now.
     HandedOver,
+    /// Another frontend runs an operation of the same action: this one follows it.
+    Joined(OperationId),
 }
 
 /// `digest` as REAPI spells it.
@@ -149,7 +155,7 @@ async fn on_rows<T: Send + 'static>(
 /// Runs `op` from `start` on a task of its own, and answers its callers INTERNAL if that task
 /// breaks, so no operation is left open with nothing to run it.
 pub(crate) fn spawn(inner: Arc<Inner>, op: Op, start: Start, cancel: watch::Receiver<bool>) {
-    let operation = op.id;
+    let (operation, key) = (op.id, op.key.clone());
     tokio::spawn(async move {
         let task = tokio::spawn(run(Arc::clone(&inner), op, start, cancel));
         if let Err(error) = task.await {
@@ -159,9 +165,37 @@ pub(crate) fn spawn(inner: Arc<Inner>, op: Op, start: Start, cancel: watch::Rece
                 message: "the executor's task of the operation broke".to_owned(),
                 details: Vec::new(),
             });
-            inner.ops().finish(operation, broke, Instant::now());
+            inner.ops().finish(operation, broke.clone(), Instant::now());
+            write_later(inner, operation, key, broke).await;
         }
     });
+}
+
+/// Writes the answer `finished` of `operation` of `key`, which its callers have, to the state
+/// store until the store takes it, every poll: its rows, the action's among them, go with it,
+/// so no later Execute of the action follows an operation no one answers in the store. Ends
+/// at once without a store, and when another process answered or runs the operation.
+async fn write_later(
+    inner: Arc<Inner>,
+    operation: OperationId,
+    key: ActionKey,
+    finished: Finished,
+) {
+    let retention = inner.cfg.finished_retention;
+    loop {
+        let (key, answer) = (key.clone(), finished.clone());
+        let written = on_rows(&inner, move |rows| {
+            rows.finish(operation, &key, &answer, retention)
+        })
+        .await;
+        match written {
+            Some(Err(RowsError::Store(error))) => {
+                tracing::warn!(%operation, %error, "the answer is not in the state store yet: writing it again");
+                sleep(inner.cfg.poll).await;
+            }
+            _ => return,
+        }
+    }
 }
 
 /// Drives `op` from `start` until a run answers its callers.
@@ -189,6 +223,18 @@ pub(crate) async fn run(
             Ended::Answer(finished) => break Some((run, finished)),
             Ended::Cancelled => break Some((run, cancelled())),
             Ended::HandedOver => break None,
+            Ended::Joined(other) => {
+                tracing::info!(operation = %op.id, %other, "another frontend runs the action: the operation follows its answer");
+                metrics.joined();
+                match follow_other(&inner, other, &op.key, &mut cancel).await {
+                    None => break Some((run, cancelled())),
+                    Some(Some(finished)) => break Some((run, finished)),
+                    Some(None) => {
+                        began = Instant::now();
+                        continue;
+                    }
+                }
+            }
             Ended::Again(settled, output) => {
                 metrics.run_ended(RunEnd::of(&settled));
                 if settled.retried() && attempt < RESUBMITS {
@@ -234,7 +280,9 @@ async fn finish(inner: &Arc<Inner>, op: &Op, run: RunId, finished: Finished) {
             return;
         }
         Some(Err(error)) => {
-            tracing::warn!(operation = %op.id, %error, "the answer is not in the state store: only this frontend answers the operation by name");
+            tracing::warn!(operation = %op.id, %error, "the answer is not in the state store: it is written again until it is");
+            let later = write_later(Arc::clone(inner), op.id, op.key.clone(), finished.clone());
+            tokio::spawn(later);
             finished
         }
     };
@@ -289,9 +337,17 @@ async fn fresh(
         whole_machine: op.whole_machine,
     };
     let id = op.id;
+    let first = run.attempt == 0;
     let put_row = async {
         let started = Instant::now();
-        let written = on_rows(inner, move |rows| rows.put_op(id, &row)).await;
+        let written = on_rows(inner, move |rows| {
+            if first {
+                rows.open_op(id, &row)
+            } else {
+                rows.put_op(id, &row).map(|()| Opened::Ours)
+            }
+        })
+        .await;
         if written.is_some() {
             metrics.step_took(Step::Row, started.elapsed());
         }
@@ -305,7 +361,8 @@ async fn fresh(
         Some(Err(error)) => {
             tracing::warn!(operation = %op.id, %error, "the operation's row is not in the state store: no other frontend can take it up");
         }
-        Some(Ok(())) | None => {}
+        Some(Ok(Opened::Joined(other))) => return Ended::Joined(other),
+        Some(Ok(Opened::Ours)) | None => {}
     }
     if let Err(ended) = tree {
         return ended;
@@ -584,6 +641,32 @@ pub(crate) fn follow(
         tokio::spawn(follow_task(Arc::clone(inner), operation));
     }
     stage
+}
+
+/// Follows `other`, the operation of the same action another frontend runs, until its answer:
+/// `Some(Some(answer))` for this operation's callers; `Some(None)` when that answer is none this
+/// operation can give (its own callers cancelled it), so this one runs the action itself; `None`
+/// when a caller of this operation cancels it first, which leaves `other` running for its own.
+async fn follow_other(
+    inner: &Arc<Inner>,
+    other: OperationId,
+    key: &ActionKey,
+    cancel: &mut watch::Receiver<bool>,
+) -> Option<Option<Finished>> {
+    let mut stage = follow(inner, other, key.clone());
+    let answer = tokio::select! {
+        biased;
+        () = cancel_asked(cancel) => return None,
+        done = stage.wait_for(|stage| matches!(stage, Stage::Done(_))) => done.ok().and_then(|stage| match &*stage {
+            Stage::Done(finished) => Some(finished.clone()),
+            _ => None,
+        }),
+    };
+    let cancelled = |status: &rpc::Status| status.code == Code::Cancelled as i32;
+    Some(
+        answer
+            .filter(|finished| !matches!(finished, Finished::Failed(status) if cancelled(status))),
+    )
 }
 
 /// Reads the state store every poll until it has `operation`'s answer, and shows it to the

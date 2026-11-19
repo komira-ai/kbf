@@ -190,6 +190,7 @@ fn cache(dir: &Path, fake: &Fake) -> Cache {
         keep: 1,
         timeout: Duration::from_secs(5),
         instance: "one".to_owned(),
+        held: Arc::default(),
     }
 }
 
@@ -770,4 +771,100 @@ fn prune_passes_over_a_download_that_is_gone() {
 
     assert_eq!(removed, std::slice::from_ref(&aged));
     assert!(!aged.exists());
+}
+
+/// Catches a prune that removes the release another process serves from (an old frontend
+/// draining beside two newer ones, all over one cache): a release held under a shared lock is
+/// passed over, whatever `keep` says and however old it is, and removed by the first prune after
+/// it is let go. A file that bears a commit's name is no release and is never removed.
+#[test]
+fn prune_passes_over_a_release_another_process_holds() {
+    let dir = scratch_dir("base-fetch-prune-held");
+    let (now, day) = (SystemTime::now(), Duration::from_secs(86_400));
+    let (held, free) = ("6".repeat(40), "7".repeat(40));
+    for commit in [&held, &free] {
+        std::fs::create_dir(dir.path().join(commit)).expect("a release");
+        old(&dir.path().join(commit));
+    }
+    let holder = std::fs::File::open(dir.path().join(&held)).expect("opened");
+    holder.lock_shared().expect("held");
+    // A file with a commit's name is no release, and is left.
+    let loose = dir.path().join("8".repeat(40));
+    std::fs::write(&loose, "a file").expect("a file");
+
+    let removed = prune(dir.path(), COMMIT, 0, now, day).expect("pruned");
+    assert_eq!(removed, [dir.path().join(&free)]);
+    assert!(
+        dir.path().join(&held).is_dir(),
+        "a held release was removed"
+    );
+
+    drop(holder);
+    let removed = prune(dir.path(), COMMIT, 0, now, day).expect("pruned");
+    assert_eq!(removed, [dir.path().join(&held)]);
+    assert!(loose.is_file(), "a file named as a commit was removed");
+}
+
+/// Catches two updates within one drain removing the release of the frontend still draining:
+/// the first frontend's cache holds its release from its start, so the fetches of two later
+/// releases into the same cache, each keeping no other, leave it; once its process is gone
+/// (its cache dropped) the next fetch removes it, and still not the release a later frontend
+/// holds.
+#[tokio::test]
+async fn a_running_frontends_release_survives_later_fetches_into_its_cache() {
+    let dir = scratch_dir("base-fetch-held");
+    let fake = Fake::start().await;
+    let (first, second, third) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+    let keeping_none = |instance: &str| Cache {
+        keep: 0,
+        instance: instance.to_owned(),
+        ..cache(dir.path(), &fake)
+    };
+    fake.release(&first);
+    let draining = keeping_none("one");
+    let (_, origin) = draining.ensure(&first, PLATFORM).await.expect("fetched");
+    assert_eq!(origin, Origin::Fetched);
+
+    fake.release(&second);
+    let newer = keeping_none("two");
+    newer.ensure(&second, PLATFORM).await.expect("fetched");
+    assert!(
+        dir.path().join(&first).is_dir(),
+        "the draining release was removed"
+    );
+    let (_, origin) = draining.ensure(&first, PLATFORM).await.expect("held");
+    assert_eq!(
+        origin,
+        Origin::Cached,
+        "the draining frontend fetched again"
+    );
+
+    drop(draining);
+    fake.release(&third);
+    keeping_none("three")
+        .ensure(&third, PLATFORM)
+        .await
+        .expect("fetched");
+    assert!(
+        !dir.path().join(&first).exists(),
+        "a release let go was kept"
+    );
+    assert!(
+        dir.path().join(&second).is_dir(),
+        "a held release was removed"
+    );
+}
+
+/// Catches a release that cannot be held for a reason other than its absence (here its path
+/// runs through a file) being taken as held: it is not used, nothing is kept held, and a release
+/// held later is the one the cache keeps.
+#[tokio::test]
+async fn a_release_that_cannot_be_opened_is_not_held() {
+    let dir = scratch_dir("base-fetch-unholdable");
+    let fake = Fake::start().await;
+    let cache = cache(dir.path(), &fake);
+    std::fs::write(dir.path().join("a-file"), "not a directory").expect("a file");
+    let through_a_file = dir.path().join("a-file").join(COMMIT);
+    assert!(!cache.held_staged(&through_a_file, COMMIT, PLATFORM).await);
+    assert!(cache.held.get().is_none(), "held what it could not open");
 }

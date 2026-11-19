@@ -92,7 +92,7 @@ turn of a member is:
    itself is not asked.
 2. **Drain** (`draining`). `POST /v1/frontend/drain` on the member's operator API. The frontend
    then runs its own drain, which does not depend on the balancer: `/readyz` 503, no new work and
-   GOAWAY on its listeners, a wait for the executions open on it, and its exit. The roll waits
+   GOAWAY on its listeners, a wait for the executions and calls open on it, and its exit. The roll waits
    until the member's operator API refuses the connection (it has exited) or its
    `GET /v1/frontend/drain` reports `"phase": "closing"` (the streams that are left are being
    closed and the process exits within seconds; a status with another phase, or none, is taken
@@ -116,7 +116,7 @@ which is ready or is not. The next member is rolled only when this one is ready,
 what the next check asks of it.
 
 **The bound.** There is none unless `--frontend-drain-deadline-secs` is given: the roll waits for
-the member to exit however long the executions open on it run, and cuts none of them. The
+the member to exit however long the executions and calls open on it run, and cuts none of them. The
 frontend in this tree puts no bound of its own on a drain that its endpoint began
 (`--shutdown-timeout-secs` bounds only a drain that a signal began). With the flag, a drain that
 outlasts the deadline fails the roll with `drain_failed` and `frontend member a (fe-a) is left

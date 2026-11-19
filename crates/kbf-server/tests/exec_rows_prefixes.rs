@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use kbf_server::executor::rows::{LIVE_PREFIX, OP_PREFIX, ROOT};
+use kbf_server::executor::rows::{ACT_PREFIX, LIVE_PREFIX, OP_PREFIX, ROOT};
 
 /// The crates that scan the state store (`kbf-state` in their manifests).
 const CRATES: [&str; 15] = [
@@ -97,7 +97,7 @@ fn no_scan_prefix_of_any_family_is_a_prefix_of_exec() {
 
 #[test]
 fn the_row_families_lie_under_the_root() {
-    for prefix in [LIVE_PREFIX, OP_PREFIX] {
+    for prefix in [LIVE_PREFIX, OP_PREFIX, ACT_PREFIX] {
         assert!(
             prefix.starts_with(ROOT) && prefix.ends_with('/'),
             "{prefix}"

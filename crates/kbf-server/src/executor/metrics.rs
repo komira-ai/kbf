@@ -126,6 +126,7 @@ pub struct Metrics {
     attempts: AtomicU64,
     jobs_cancelled: AtomicU64,
     reattached: AtomicU64,
+    joined: AtomicU64,
     host_silence_seen: AtomicU64,
     phases: PhaseHistograms,
     steps: StepHistograms,
@@ -178,6 +179,12 @@ impl Metrics {
     /// An unfinished operation another process left in the state store was taken up.
     pub(crate) fn reattached(&self) {
         self.reattached.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An operation follows one of the same action another frontend runs, with no job of its
+    /// own.
+    pub(crate) fn joined(&self) {
+        self.joined.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A job was seen on a host that has missed its grace.
@@ -237,6 +244,12 @@ impl Metrics {
                 "kbf_executor_operations_reattached_total",
                 "Unfinished operations another process left in the state store, taken up",
                 &self.reattached,
+            ),
+            (
+                "kbf_executor_operations_joined_total",
+                "Operations that followed an operation of the same action another frontend runs, \
+                 with no job of their own",
+                &self.joined,
             ),
             (
                 "kbf_executor_host_silence_seen_total",

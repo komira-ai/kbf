@@ -277,9 +277,11 @@ it out on its own health check and its connections' GOAWAY (the order and each p
 3. New Execute calls are refused `UNAVAILABLE` (Buck2 retries them), the frontend takes no
    more work from the state store, and the REAPI,
    worker and operator API listeners are sent GOAWAY.
-4. The frontend waits until no execution is open, however long that takes. There is no
+4. The frontend waits until no execution is open and no REAPI call is being answered (a
+   ByteStream write or read, a cache call, an Execute still being prepared:
+   `kbf_front_open_calls`), however long that takes, so the exit cuts no upload. There is no
    default deadline. `--drain-deadline` (seconds, at least 1, no upper bound) only reports:
-   when it passes with executions open, the frontend logs a WARN with their count and sets
+   when it passes with executions or calls open, the frontend logs a WARN with their counts and sets
    `deadline_passed` in `GET /v1/frontend/drain`, and goes on waiting with the process up and
    every stream open, whether a stop signal or `POST /v1/frontend/drain` began the drain.
    Nothing is cancelled by the drain, nor by a stop: the jobs of the operations still open run on
@@ -300,6 +302,16 @@ what ends the drain: `TimeoutStopSec=infinity` for the unit (below); for a Docke
 plus the longest action plus 5 minutes (a pod needs no `preStop` sleep: the wait is the
 frontend's own, from the SIGTERM). A frontend that is the only one has nothing
 to hand its work to: its queued operations that have not started wait with the rest.
+
+**A container orchestrator that starts the new process beside the old one** (Docker Swarm's
+`update_config` with `order: start-first`) stops the old one as soon as the new one passes the
+service's health check. Make that check `GET /startedz`, not `/healthz`: `/healthz` answers
+`200` from the first moment the process runs, before it can serve, so the old frontend would
+be told to stop, and would close its listeners after `--drain-lb-wait`, while the load
+balancer still counts the new one unready. `/startedz` answers `200` only once the process has
+been ready, and keeps answering `200` while a dependency is down or a drain runs, so the
+orchestrator never restarts a frontend that has served for an outage of its state store or job
+service. The load balancer keeps asking `/readyz`.
 
 ### Stopping a frontend: TimeoutStopSec=infinity
 

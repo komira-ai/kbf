@@ -275,7 +275,8 @@ can serve is refused by the job service and the farm sees an infrastructure fail
 reads manifests.
 
 **Over a state store.** With `--state-store` the executor keeps the rows `exec/op/<operation>` (owner,
-action, attempt, job id), `exec/live/<instance>` and `done/`, `doneof/` that
+action, attempt, job id), `exec/act/` (the open operation of each action, so an Execute of an action
+another frontend runs follows it and submits no second job), `exec/live/<instance>` and `done/`, `doneof/` that
 [direct-js.md](../design/direct-js.md) section 3 lists, and the operation ids come from the store's
 shared counter. Any frontend of the store answers `WaitExecution` and `GetOperation` of any operation by name,
 and a process whose liveness row has expired (`--executor-live-secs`, default 20 seconds after its
@@ -357,7 +358,11 @@ start fetches nothing. Two frontends that share `<DIR>` may fetch one commit at 
 that renames second keeps the other's checked release and removes its own download. After a
 fetch the cache keeps the running release and the `--executor-base-tree-keep` (default 1) newest
 other releases, for a rollback of the frontend, and removes the rest and the downloads of a
-stopped start once they are a day old (a younger one may be another frontend's, filling); it
+stopped start once they are a day old (a younger one may be another frontend's, filling). A
+release another running frontend serves from is never removed, whatever the keep: each frontend
+holds a shared lock on its own release directory for as long as it runs, and a prune removes a
+release only under an exclusive lock taken without waiting, so an old frontend that drains beside
+two newer ones keeps its release. It
 never touches files loose in
 `<DIR>` or names that are not a commit. `--executor-base-tree-url=""` fetches nothing: the files
 are expected in `<DIR>` as before, and a missing one is named by the publish.
@@ -955,7 +960,7 @@ whose operation was never started, that no worker on this frontend can run and t
 other frontend can take, which ends `UNAVAILABLE` at the end of the load balancer wait;
 then it ends the worker streams and exits 0. There is no default deadline. A
 `--drain-deadline` that is set (no upper bound) only reports when it passes with executions
-open: a WARN with the count, and `deadline_passed` in `GET /v1/frontend/drain`; no stream is
+or calls open: a WARN with the counts, and `deadline_passed` in `GET /v1/frontend/drain`; no stream is
 ended, the process stays up, and the drain keeps waiting, whether a signal or the endpoint
 began it. `GET /v1/frontend/drain` reports the phase. The way to force a stop is a second
 signal, which skips the waits, or `--shutdown-timeout-secs` running out on a drain a

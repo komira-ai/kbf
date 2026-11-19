@@ -315,7 +315,8 @@ pub(super) fn args() -> Vec<Arg> {
             .help(
                 "How many releases besides the running one stay in the `--executor-base-tree` \
                  cache after a fetch, for a rollback of the frontend: the newest fetched. 0 \
-                 keeps none. Used only with `--executor js-agent`",
+                 keeps none. A release another running frontend serves from stays too, \
+                 whatever this says. Used only with `--executor js-agent`",
             ),
         number(
             BASE_TREE_TIMEOUT,

@@ -257,7 +257,7 @@ fn name_adopt(routes: Vec<Route>) -> Vec<Route> {
 }
 
 /// The exact number of `(method, path)` routes, verbs expanded. A new route moves it.
-const ROUTES: usize = 49;
+const ROUTES: usize = 50;
 
 fn server_routes() -> Vec<Route> {
     let mut files = Vec::new();

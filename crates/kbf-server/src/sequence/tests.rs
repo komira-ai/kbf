@@ -121,6 +121,31 @@ async fn the_wait_serves_everything_and_the_end_of_it_refuses_and_sends_goaway()
     assert_eq!(rig.drain.phase(), Phase::Closing);
 }
 
+/// Catches a drain that stands down while a call other than an open execution is still
+/// being answered, which the exit then cuts: a ByteStream write in flight (any call in
+/// `open_calls`, with no execution open) keeps the drain in its wait, past the end of the
+/// load balancer wait and long after it, until it is answered; then the drain ends.
+#[tokio::test(start_paused = true)]
+async fn a_call_in_flight_keeps_the_drain_going_until_it_is_answered() {
+    let rig = Rig::new(no_deadline(10));
+    let write = rig.backend.metrics().execute.open_calls.raise();
+
+    assert!(rig.sequence.begin());
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert_eq!(rig.drain.phase(), Phase::Draining);
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    assert_eq!(rig.drain.phase(), Phase::Draining, "stood down over a call");
+    assert!(rig.drain.sequence_finished().now_or_never().is_none());
+    assert!(!rig.readiness.is_handed_over(), "handed over over a call");
+
+    drop(write);
+    let ended = tokio::time::timeout(Duration::from_secs(10), rig.drain.sequence_finished());
+    ended
+        .await
+        .expect("the drain ends once the call is answered");
+    assert_eq!(rig.drain.phase(), Phase::Closing);
+}
+
 /// Asserts that a second stop signal (`Drain::close`) skips the waits: with a wait of ten
 /// minutes and a deadline of fifteen, and an execution that never ends, the drain is over at
 /// once.
@@ -312,5 +337,45 @@ async fn a_deadline_passed_with_an_execution_open_is_reported_and_the_drain_goes
 
     drop(open);
     rig.drain.sequence_finished().await;
+    assert_eq!(rig.drain.phase(), Phase::Closing);
+}
+
+/// Catches a deadline that does not see a drain held by a call alone: a ByteStream write open
+/// past the deadline, with no execution open, is reported (`deadline_passed`) and still waited
+/// for.
+#[tokio::test(start_paused = true)]
+async fn a_deadline_passed_with_only_a_call_open_is_reported_and_the_drain_goes_on() {
+    let rig = Rig::new(timing(0, 30));
+    let write = rig.backend.metrics().execute.open_calls.raise();
+    assert!(rig.sequence.begin());
+
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    assert!(
+        rig.drain.deadline_passed(),
+        "a call held the drain unreported"
+    );
+    assert!(rig.drain.sequence_finished().now_or_never().is_none());
+
+    drop(write);
+    rig.drain.sequence_finished().await;
+    assert_eq!(rig.drain.phase(), Phase::Closing);
+}
+
+/// Catches a deadline that is reported with nothing open: a call that ended just before the
+/// deadline passed (by hand, before the wait looks again) leaves `deadline_passed` unset, and
+/// the drain ends.
+#[tokio::test(start_paused = true)]
+async fn a_deadline_passed_once_nothing_is_open_reports_nothing() {
+    let rig = Rig::new(timing(0, 86_400));
+    let write = rig.backend.metrics().execute.open_calls.raise();
+    assert!(rig.sequence.begin());
+    // Between two looks of the wait (every 50 ms), so the deadline is seen before the next one.
+    tokio::time::sleep(Duration::from_millis(1_025)).await;
+    assert_eq!(rig.drain.phase(), Phase::Draining);
+
+    drop(write);
+    rig.drain.pass_deadline();
+    rig.drain.sequence_finished().await;
+    assert!(!rig.drain.deadline_passed(), "reported with nothing open");
     assert_eq!(rig.drain.phase(), Phase::Closing);
 }

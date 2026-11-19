@@ -106,6 +106,11 @@ pub struct ExecuteMetrics {
     /// `in_flight` it holds no call that is still being authorized or prepared and none
     /// answered from the action cache, so it is the count a drain waits to see reach 0.
     pub open_executions: Gauge,
+    /// REAPI calls of every kind being answered (`crate::calls::CallsLayer`): from a call's
+    /// arrival until its response body has ended or been dropped, so a ByteStream write, a
+    /// cache call and an Execute still being prepared are in it beside the open streams. A
+    /// drain waits for it to reach 0 before the process stands down.
+    pub open_calls: Gauge,
     /// Execute calls the front took (not refused for a drain), a cache hit included.
     /// A rollout that sees it flat while `open_executions` is 0 sees a frontend no
     /// client is using.
@@ -138,6 +143,7 @@ impl Default for ExecuteMetrics {
             errors: ErrorCounts::default(),
             in_flight: Gauge::default(),
             open_executions: Gauge::default(),
+            open_calls: Gauge::default(),
             started: Counter::default(),
             queued: Gauge::default(),
             prepare: Histogram::new(Unit::Seconds),
@@ -204,6 +210,11 @@ impl ExecuteMetrics {
             "kbf_front_open_executions",
             "Execute and WaitExecution operation streams alive, from the stream's making to its end",
             self.open_executions.get(),
+        );
+        out.gauge(
+            "kbf_front_open_calls",
+            "REAPI calls being answered, from a call's arrival until its response has been sent",
+            self.open_calls.get(),
         );
         out.counter(
             "kbf_front_executes_started_total",

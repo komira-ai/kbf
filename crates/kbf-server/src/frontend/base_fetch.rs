@@ -23,12 +23,23 @@
 //! After a fetch the cache keeps this release and the `--executor-base-tree-keep` newest others
 //! (a rollback to one of them fetches nothing) and removes the rest, and the downloads of a
 //! stopped start once they are a day old (a younger one may be another process's, filling);
-//! a failure to remove is logged, not an error. The digest the bundle is checked against is the
+//! a failure to remove is logged, not an error.
+//!
+//! **Releases in use are never removed.** Several frontends share the cache, and during an
+//! update the old one drains beside the new one, still serving from its own release (a job
+//! whose base objects are gone publishes them again from it). Each process holds a shared lock
+//! on the directory of the release it serves from for as long as it runs ([`Cache::ensure`]),
+//! and a prune removes a release only under an exclusive lock it takes without waiting: a
+//! release another process holds is passed over, however old, so two updates within one drain
+//! remove nothing a running frontend reads. A process takes its lock before it checks the
+//! release, so a release removed under it is fetched again, not used. The digest the bundle is checked against is the
 //! one `SHA256SUMS` of the same release lists, over https from the release's own page: the same
 //! file an operator used to copy by hand.
 
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use kbf_front::base_publish::{self, PublishError, SUMS};
@@ -103,6 +114,9 @@ pub(super) struct Cache {
     /// This process's id in the names of its download directories: the executor's instance id,
     /// drawn at every start.
     pub(super) instance: String,
+    /// The release directory this process serves from, under a shared lock for as long as the
+    /// cache is kept (the process's life): no other process's prune removes it.
+    pub(super) held: Arc<OnceLock<File>>,
 }
 
 impl Cache {
@@ -120,7 +134,7 @@ impl Cache {
         // not looked up or fetched: the publish names what the directory lacks.
         let named = is_commit(commit);
         let release = self.dir.join(commit);
-        if named && base_publish::is_staged(&release, commit, platform) {
+        if named && self.held_staged(&release, commit, platform).await {
             return Ok((release, Origin::Cached));
         }
         if !named || base_publish::is_staged(&self.dir, commit, platform) || self.url.is_empty() {
@@ -128,8 +142,44 @@ impl Cache {
         }
         let name = base_publish::bundle_name(commit, platform);
         self.fetch(commit, platform, &name).await?;
+        // Held before the prune, so no other process's prune removes it from here on; one that
+        // removed it in between leaves files the publish names as missing.
+        let _ = self.held_staged(&release, commit, platform).await;
         self.prune(commit).await;
         Ok((release, Origin::Fetched))
+    }
+
+    /// Whether `release` holds the files of `commit` for `platform`, taking it under a shared
+    /// lock for the life of the cache first (once: a cache that holds its release already only
+    /// checks it). The lock waits for a prune that holds it exclusively and then removes it, so
+    /// the check after it finds it gone; a release that fails the check is not kept held. A lock
+    /// that cannot be taken for another reason is logged, and the release used unheld.
+    async fn held_staged(&self, release: &Path, commit: &str, platform: &str) -> bool {
+        if self.held.get().is_some() {
+            return base_publish::is_staged(release, commit, platform);
+        }
+        let path = release.to_owned();
+        let locked = tokio::task::spawn_blocking(move || {
+            let dir = File::open(&path)?;
+            dir.lock_shared()?;
+            Ok::<_, io::Error>(dir)
+        })
+        .await
+        .map_err(io::Error::other)
+        .and_then(std::convert::identity);
+        let dir = match locked {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+            Err(e) => {
+                tracing::warn!(dir = %release.display(), error = %e, "the base tree release could not be held: another frontend's prune may remove it");
+                return base_publish::is_staged(release, commit, platform);
+            }
+        };
+        if !base_publish::is_staged(release, commit, platform) {
+            return false;
+        }
+        let _ = self.held.set(dir);
+        true
     }
 
     /// Downloads the release's files into `<cache>/.fetch-<commit>-<instance>/`, checks them and
@@ -353,7 +403,9 @@ fn is_commit(text: &str) -> bool {
 
 /// Removes from `dir` the commit directories but `commit` and the `keep` newest others (by the
 /// time each was last changed), and the downloads of [`STAGING`] last changed `stale` or more
-/// before `now`: a younger one may be another process's, filling. Gives what it removed.
+/// before `now`: a younger one may be another process's, filling. A commit directory another
+/// process holds ([`Cache::ensure`]) is passed over: it is removed only under an exclusive lock,
+/// taken without waiting. Gives what it removed.
 ///
 /// # Errors
 /// The first path that could not be read or removed, with what failed.
@@ -388,9 +440,19 @@ fn prune(
         }
     }
     others.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    removable.extend(others.into_iter().skip(keep).map(|(_, path)| path));
     for path in &removable {
         std::fs::remove_dir_all(path).map_err(|e| failed(path, e))?;
+    }
+    for (_, path) in others.into_iter().skip(keep) {
+        // Removed only under an exclusive lock: one held by a running frontend, or one that
+        // cannot be taken, keeps the release.
+        let locked = File::open(&path)
+            .ok()
+            .filter(|release| release.try_lock().is_ok());
+        if let Some(_held) = locked {
+            std::fs::remove_dir_all(&path).map_err(|e| failed(&path, e))?;
+            removable.push(path);
+        }
     }
     Ok(removable)
 }

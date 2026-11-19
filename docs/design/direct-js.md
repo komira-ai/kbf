@@ -67,6 +67,7 @@ a later one's result.
 | `meta/next_op` | the shared counter operation ids are reserved from, in blocks of 1024 (the format of earlier releases) |
 | `exec/live/<instance>` | this process is alive; renewed every quarter of `--executor-live-secs` (20 s), with that time to live |
 | `exec/op/<operation>` | an unfinished operation: owner, instance, action, attempt, job id, put directory (version byte + JSON) |
+| `exec/act/<hash>-<size>/<instance, hex>` | the unfinished operation of an action (version byte + 8-byte id), written with the first attempt's `exec/op/` row and deleted with its answer |
 | `done/<operation>`, `doneof/<operation>` | how it finished and what it ran (the format of earlier releases), at least 10 minutes |
 
 - **By name.** `WaitExecution` and `GetOperation` of `operations/<id>` are answered from memory, else from `done/`; an
@@ -76,11 +77,17 @@ a later one's result.
   into a put directory is finished from it; one that writes to a presigned url, which only the process that held the url can
   finish, is cancelled and run again. Clients reattach with `WaitExecution`. Nothing is cancelled when a frontend stops: a
   stop deletes the liveness row, so another frontend takes its operations up at once.
+- **One job per action.** An Execute of an action that another frontend of the store runs follows that operation (found
+  by its `exec/act/` row) instead of submitting a job of its own, and is answered with its answer under its own name; the
+  join of Executes within one process stays in memory. A follower whose operation its own callers cancelled runs the action
+  itself. A row naming an operation that is no longer open (an earlier release finished it) is deleted and written again.
 - **Ownership.** Only the row's owner writes it, each write a compare-and-set on the version it read with itself as owner; an
   owner that lost the row stops running the operation and its callers follow the answer the new owner writes.
 
-What an earlier release loses by not knowing `exec/live/` and `exec/op/` (B8): nothing it reads; its own `op/` rows are not read
-by this release, so a client of an operation it left reattaches by Execute (a cache hit or a new run).
+What an earlier release loses by not knowing `exec/live/`, `exec/op/` and `exec/act/` (B8): nothing it reads; its own `op/` rows
+are not read by this release, so a client of an operation it left reattaches by Execute (a cache hit or a new run). It writes no
+`exec/act/` row, so an Execute on a frontend of this release does not join an operation an earlier release runs: the join across
+frontends is lost while both run, nothing else.
 
 ## 4. What is kept as a bound
 
