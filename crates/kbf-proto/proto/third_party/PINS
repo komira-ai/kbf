@@ -24,3 +24,5 @@ remote-apis https://github.com/bazelbuild/remote-apis adbf4a27c86fbea4a37637a6cb
 remote-apis https://github.com/bazelbuild/remote-apis adbf4a27c86fbea4a37637a6cbcacef372406fe7 22b2af125690142af1c8152ba3a4ca15ffaa1265111dedc6e39b5412989b5be1 build/bazel/semver/semver.proto
 grpc-proto https://github.com/grpc/grpc-proto 813330824839bfdd3abc52f41807095c0de2ec19 cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 LICENSE
 grpc-proto https://github.com/grpc/grpc-proto 813330824839bfdd3abc52f41807095c0de2ec19 164b670058855c6277a0511a14e2a302dd5a8ff899853ca6851b6b201a413d28 grpc/health/v1/health.proto
+seaweedfs https://github.com/seaweedfs/seaweedfs 5ef99c1d8dbbeb4a035c055e3b464620506aefac d789d433cc11da163273d1e39be2e8fa67642f9a58ef220d3f258fa9c14ef613 LICENSE
+seaweedfs https://github.com/seaweedfs/seaweedfs 5ef99c1d8dbbeb4a035c055e3b464620506aefac b28b8b8e0d1d366d0f70d33f2b4a95a02c3fd3246193eca8cad9457e3b6e7071 weed/pb/filer.proto

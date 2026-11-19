@@ -10,13 +10,16 @@ publish.workspace = true
 [features]
 # `testkit`: `s3::fake`, an S3 service on loopback that keeps multipart uploads, for
 # other crates' tests (and this one's, through the dev-dependency on itself).
-testkit = ["objstore-s3/testkit"]
+# `filer::fake`, a SeaweedFS filer on loopback serving the batch lookup and the listing.
+testkit = ["objstore-s3/testkit", "tokio/net"]
 
 [dependencies]
 bytes.workspace = true
 # The stream of footers (`footers`).
 futures.workspace = true
 hex.workspace = true
+# SeaweedFS's filer protocol (`filer_pb`), the batch lookup of `filer`.
+kbf-proto.workspace = true
 # The segment footer format, read back by `footers`.
 kbf-segments.workspace = true
 # `Digest`, the key of a segment's index.
@@ -28,6 +31,8 @@ objstore-s3.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
+# The filer's gRPC channel (`filer`), and the fake's server.
+tonic.workspace = true
 
 [dev-dependencies]
 # Loopback ports nothing can take (kbf_testkit::port).

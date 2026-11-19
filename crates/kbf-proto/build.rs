@@ -1,6 +1,7 @@
 //! Compiles the vendored REAPI, googleapis and gRPC health protos, `kbf.worker.v1` (its
 //! `Worker`, `Segments` and `PackIndex` services), `kbf.storage.v1`, `kbf.log.v1`,
-//! `kbf.map.v1`, `kbf.enroll.v1` and `kbf.update.v1` into Rust.
+//! `kbf.map.v1`, `kbf.enroll.v1` and `kbf.update.v1` into Rust, and SeaweedFS's filer
+//! protocol (`filer_pb`) as its release 4.54 ships it.
 //!
 //! Parsing is done by `protox`, in pure Rust, so the build needs no `protoc` binary.
 //! Nothing generated is checked in; the code lands in `OUT_DIR`.
@@ -49,6 +50,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // message.
         .btree_map(".google.rpc.ErrorInfo")
         .compile_fds(descriptors)?;
+
+    // The filer's service has some 35 methods, and kbf calls two. Its server trait gets a
+    // default body for each (UNIMPLEMENTED), so a test's fake filer writes only the ones it
+    // serves; the services above keep a trait every method of which must be written.
+    let filer_root = root.join("third_party/seaweedfs/weed/pb");
+    let filer = protox::compile(["filer.proto"], [filer_root])?;
+    tonic_prost_build::configure()
+        .build_client(true)
+        .build_server(true)
+        .generate_default_stubs(true)
+        .compile_fds(filer)?;
 
     println!("cargo:rerun-if-changed={}", root.display());
     Ok(())
