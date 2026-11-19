@@ -32,8 +32,8 @@ use sha2::{Digest as _, Sha256};
 use tierstore_list::CellHasher;
 
 use super::NoTree;
-use super::sidecar::Sidecars;
 use super::retry::{Failed, PutRetry, repeating, retrying};
+use super::sidecar::Sidecars;
 use crate::job_read::BlobSource;
 use crate::large_backfill::{LargeStore, large_key};
 use crate::store_wait::STORE_WAIT;

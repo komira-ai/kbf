@@ -120,7 +120,11 @@ impl SidecarCounters {
             ("present", &self.present),
             ("failed", &self.failed),
         ] {
-            let _ = writeln!(families.0, "{name}{{result=\"{result}\"}} {}", counter.get());
+            let _ = writeln!(
+                families.0,
+                "{name}{{result=\"{result}\"}} {}",
+                counter.get()
+            );
         }
         families.counter(
             "kbf_l2_sidecar_missing_total",
@@ -290,8 +294,8 @@ impl Sidecars {
 
 /// The tree id of `v2` (the SHA-256 of its bytes) and the keys it names, sorted and each once.
 fn list_of(v2: &[u8]) -> Result<([u8; 32], Vec<String>), SidecarError> {
-    let list =
-        tierstore::TreeListV2::open(v2).map_err(|error| SidecarError::NotAList(error.to_string()))?;
+    let list = tierstore::TreeListV2::open(v2)
+        .map_err(|error| SidecarError::NotAList(error.to_string()))?;
     let keys = list.keys().iter().map(|key| key.to_string()).collect();
     Ok((kbf_segments::sha256(v2).hash, keys))
 }

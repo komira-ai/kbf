@@ -105,7 +105,9 @@ impl LargeStore for Objects {
         len: u64,
     ) -> BoxFuture<'a, Result<Bytes, ObjectStoreError>> {
         locked(&self.reads).push((key.to_string(), offset, len));
-        let vanished = locked(&self.vanishing).iter().any(|gone| gone == key.as_str());
+        let vanished = locked(&self.vanishing)
+            .iter()
+            .any(|gone| gone == key.as_str());
         let short = locked(&self.short).iter().any(|cut| cut == key.as_str()) as u64;
         let answer = match (vanished, self.get(key.as_str())) {
             (false, Some(bytes)) => {
@@ -234,8 +236,15 @@ fn three_objects(h: &Harness) -> (Vec<u8>, [Vec<u8>; 3]) {
 }
 
 fn record_all(h: &Harness, objects: &[Vec<u8>; 3]) {
-    for (key, bytes) in ["cas/f/w/b/1", "cas/f/w/b/2", "cas/l/cc"].iter().zip(objects) {
-        assert!(h.index.record_cells(key, &cells_of(bytes)).expect("recorded"));
+    for (key, bytes) in ["cas/f/w/b/1", "cas/f/w/b/2", "cas/l/cc"]
+        .iter()
+        .zip(objects)
+    {
+        assert!(
+            h.index
+                .record_cells(key, &cells_of(bytes))
+                .expect("recorded")
+        );
     }
 }
 
@@ -245,11 +254,21 @@ async fn dual_emission_writes_a_sidecar_whose_tree_id_is_the_lists_and_reads_no_
     let (v2, objects) = three_objects(&h);
     record_all(&h, &objects);
 
-    assert_eq!(h.sidecars.emit(&v2).await.expect("emitted"), Emitted::Written);
+    assert_eq!(
+        h.sidecars.emit(&v2).await.expect("emitted"),
+        Emitted::Written
+    );
 
-    let sidecar = h.objects.get(&sidecar_of(&v2)).expect("the sidecar is stored");
+    let sidecar = h
+        .objects
+        .get(&sidecar_of(&v2))
+        .expect("the sidecar is stored");
     let opened = TreeListL2::open_sidecar(Some(&sidecar[..]), &tree_of(&v2)).expect("it opens");
-    assert_eq!(opened.projection_digest(), tree_of(&v2), "its projection is the list");
+    assert_eq!(
+        opened.projection_digest(),
+        tree_of(&v2),
+        "its projection is the list"
+    );
     assert!(locked(&h.objects.reads).is_empty(), "no object is read");
     let expected = tierstore_list::sidecar_from_v2(&v2, |key| {
         let bytes = match key {
@@ -264,7 +283,11 @@ async fn dual_emission_writes_a_sidecar_whose_tree_id_is_the_lists_and_reads_no_
         })
     })
     .expect("a sidecar");
-    assert_eq!(&sidecar[..], &expected[..], "the cells are the objects' own");
+    assert_eq!(
+        &sidecar[..],
+        &expected[..],
+        "the cells are the objects' own"
+    );
 }
 
 #[tokio::test]
@@ -280,7 +303,10 @@ async fn a_list_naming_an_object_with_no_cells_gets_no_sidecar_and_is_recorded_u
     assert_eq!(emitted, Emitted::Unlisted { missing: 2 });
     assert!(h.objects.get(&sidecar_of(&v2)).is_none(), "no sidecar");
     assert!(locked(&h.objects.reads).is_empty(), "no object is read");
-    let rows = h.index.unlisted(Duration::from_secs(60), None, 10).expect("rows");
+    let rows = h
+        .index
+        .unlisted(Duration::from_secs(60), None, 10)
+        .expect("rows");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].tree, tree_of(&v2));
     let mut text = String::new();
@@ -292,17 +318,27 @@ async fn a_list_naming_an_object_with_no_cells_gets_no_sidecar_and_is_recorded_u
 async fn a_sidecar_already_written_is_kept_and_nothing_is_asked_of_the_index() {
     let h = harness();
     let (v2, _) = three_objects(&h);
-    h.objects.hold(&sidecar_of(&v2), b"the first sidecar".to_vec());
+    h.objects
+        .hold(&sidecar_of(&v2), b"the first sidecar".to_vec());
 
-    assert_eq!(h.sidecars.emit(&v2).await.expect("emitted"), Emitted::Written);
+    assert_eq!(
+        h.sidecars.emit(&v2).await.expect("emitted"),
+        Emitted::Written
+    );
 
     assert_eq!(
         h.objects.get(&sidecar_of(&v2)).as_deref(),
         Some(&b"the first sidecar"[..])
     );
     assert!(locked(&h.objects.puts).is_empty(), "nothing is written");
-    let rows = h.index.unlisted(Duration::from_secs(60), None, 10).expect("rows");
-    assert!(rows.is_empty(), "an object with no cells was not even looked at");
+    let rows = h
+        .index
+        .unlisted(Duration::from_secs(60), None, 10)
+        .expect("rows");
+    assert!(
+        rows.is_empty(),
+        "an object with no cells was not even looked at"
+    );
 }
 
 #[tokio::test]
@@ -327,24 +363,45 @@ async fn backfill_reads_each_object_with_no_cells_once_and_writes_the_sidecar() 
             bytes_read: a + c
         }
     );
-    assert_eq!(h.objects.read_of("cas/f/w/b/1"), a, "the pack named twice is read once");
+    assert_eq!(
+        h.objects.read_of("cas/f/w/b/1"),
+        a,
+        "the pack named twice is read once"
+    );
     assert_eq!(h.objects.read_of("cas/l/cc"), c);
-    assert_eq!(h.objects.read_of("cas/f/w/b/2"), 0, "an object with cells is not read");
+    assert_eq!(
+        h.objects.read_of("cas/f/w/b/2"),
+        0,
+        "an object with cells is not read"
+    );
     let reads = locked(&h.objects.reads).clone();
     let of_a: Vec<(u64, u64)> = reads
         .iter()
         .filter(|(key, _, _)| key == "cas/f/w/b/1")
         .map(|(_, offset, len)| (*offset, *len))
         .collect();
-    assert_eq!(of_a, vec![(0, a)], "one window: the pack is under one window");
+    assert_eq!(
+        of_a,
+        vec![(0, a)],
+        "one window: the pack is under one window"
+    );
     let cells = h
         .index
         .object_cells(&["cas/f/w/b/1".to_owned(), "cas/l/cc".to_owned()])
         .expect("cells");
-    assert_eq!(cells, vec![Some(cells_of(&objects[0])), Some(cells_of(&objects[2]))]);
-    let sidecar = h.objects.get(&sidecar_of(&v2)).expect("the sidecar is stored");
+    assert_eq!(
+        cells,
+        vec![Some(cells_of(&objects[0])), Some(cells_of(&objects[2]))]
+    );
+    let sidecar = h
+        .objects
+        .get(&sidecar_of(&v2))
+        .expect("the sidecar is stored");
     TreeListL2::open_sidecar(Some(&sidecar[..]), &tree_of(&v2)).expect("it opens");
-    let rows = h.index.unlisted(Duration::from_secs(60), None, 10).expect("rows");
+    let rows = h
+        .index
+        .unlisted(Duration::from_secs(60), None, 10)
+        .expect("rows");
     assert!(rows.is_empty(), "the tree is no longer unlisted");
 }
 
@@ -364,7 +421,11 @@ async fn a_second_list_over_the_same_pack_reads_nothing_more() {
     let done = h.sidecars.backfill(&other).await.expect("backfilled");
 
     assert_eq!(done, Backfilled::default());
-    assert_eq!(locked(&h.objects.reads).len(), read, "no read of a pack with cells");
+    assert_eq!(
+        locked(&h.objects.reads).len(),
+        read,
+        "no read of a pack with cells"
+    );
     assert!(h.objects.get(&sidecar_of(&other)).is_some());
 }
 
@@ -398,7 +459,10 @@ async fn an_object_that_vanishes_between_its_head_and_its_read_is_lost() {
     assert!(matches!(&error, SidecarError::Lost { key } if key == "cas/f/w/b/1"));
     let mut text = String::new();
     h.sidecars.counters().render(&mut text);
-    assert!(text.contains("kbf_l2_sidecars_total{result=\"failed\"} 1\n"), "{text}");
+    assert!(
+        text.contains("kbf_l2_sidecars_total{result=\"failed\"} 1\n"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -409,8 +473,14 @@ async fn a_read_answered_short_is_a_store_failure_and_records_no_cells() {
 
     let error = h.sidecars.backfill(&v2).await.expect_err("short");
 
-    assert!(matches!(error, SidecarError::Store(ObjectStoreError::Body(_))), "{error:?}");
-    let cells = h.index.object_cells(&["cas/f/w/b/1".to_owned()]).expect("cells");
+    assert!(
+        matches!(error, SidecarError::Store(ObjectStoreError::Body(_))),
+        "{error:?}"
+    );
+    let cells = h
+        .index
+        .object_cells(&["cas/f/w/b/1".to_owned()])
+        .expect("cells");
     assert_eq!(cells, vec![None]);
 }
 
@@ -421,7 +491,11 @@ async fn bytes_that_are_not_a_tree_list_are_refused_by_name() {
     let error = h.sidecars.emit(b"not a list").await.expect_err("refused");
 
     assert!(matches!(error, SidecarError::NotAList(_)), "{error:?}");
-    let error = h.sidecars.backfill(b"not a list").await.expect_err("refused");
+    let error = h
+        .sidecars
+        .backfill(b"not a list")
+        .await
+        .expect_err("refused");
     assert!(matches!(error, SidecarError::NotAList(_)), "{error:?}");
 }
 
@@ -434,10 +508,16 @@ async fn a_failed_write_of_the_sidecar_is_the_stores_error_and_is_counted() {
 
     let error = h.sidecars.emit(&v2).await.expect_err("failed");
 
-    assert!(matches!(error, SidecarError::Store(ObjectStoreError::Protocol(_))), "{error:?}");
+    assert!(
+        matches!(error, SidecarError::Store(ObjectStoreError::Protocol(_))),
+        "{error:?}"
+    );
     let mut text = String::new();
     h.sidecars.counters().render(&mut text);
-    assert!(text.contains("kbf_l2_sidecars_total{result=\"failed\"} 1\n"), "{text}");
+    assert!(
+        text.contains("kbf_l2_sidecars_total{result=\"failed\"} 1\n"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -459,8 +539,7 @@ async fn an_index_that_keeps_no_cells_fails_the_sidecar_and_never_the_caller() {
         fn locate(
             &self,
             digests: &[kbf_pack_index::BlobDigest],
-        ) -> Result<Vec<Option<kbf_pack_index::Location>>, kbf_pack_index::PackIndexError>
-        {
+        ) -> Result<Vec<Option<kbf_pack_index::Location>>, kbf_pack_index::PackIndexError> {
             Ok(vec![None; digests.len()])
         }
         fn find_missing(
@@ -512,7 +591,10 @@ async fn record_keeps_the_cells_of_an_object_just_written() {
 
     h.sidecars.record(&key, cells_of(b"four")).await;
 
-    let cells = h.index.object_cells(&["cas/l/dd".to_owned()]).expect("cells");
+    let cells = h
+        .index
+        .object_cells(&["cas/l/dd".to_owned()])
+        .expect("cells");
     assert_eq!(cells, vec![Some(cells_of(b"four"))]);
 }
 

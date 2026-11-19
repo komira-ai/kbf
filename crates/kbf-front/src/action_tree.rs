@@ -85,11 +85,11 @@ mod listing;
 mod memo;
 mod place;
 mod places;
-mod sidecar;
 mod retry;
-mod tstree;
+mod sidecar;
 #[cfg(test)]
 mod sidecar_tests;
+mod tstree;
 #[cfg(test)]
 mod tstree_tests;
 
@@ -103,13 +103,13 @@ use tierstore::{MAX_DEPTH, MAX_ENTRIES, TreeDigest, TreeError};
 
 pub use self::base::{BaseFacts, BaseTree, BaseTreeError, INPUT_ROOT, RESERVED_NAMES};
 pub use self::listing::{Listing, ListingWrite};
-pub use self::sidecar::{
-    Backfilled, Emitted, READ_WINDOW, SidecarCounters, SidecarError, Sidecars, read_cells,
-};
 pub use self::place::{HEADS_IN_FLIGHT, LOCATE_CHUNK, LOOKUP_DEADLINE};
 pub use self::places::PLACE_ENTRIES;
 pub use self::retry::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, PutRetry, Sleeper};
 pub(crate) use self::retry::{is_slow_down, tokio_sleeper};
+pub use self::sidecar::{
+    Backfilled, Emitted, READ_WINDOW, SidecarCounters, SidecarError, Sidecars, read_cells,
+};
 
 use self::encode::{Child, Manifest};
 use self::flight::Flights;

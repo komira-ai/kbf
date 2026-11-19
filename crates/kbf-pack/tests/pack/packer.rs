@@ -575,7 +575,10 @@ async fn a_pack_written_has_the_cells_of_its_bytes_recorded() {
     let object = rig.store.get_range(&keys().key(0), whole).await.unwrap();
     let expected = tierstore_list::PackCells::of(&object);
     let cells = rig.index.cells_of(&pack.key).expect("recorded");
-    assert_eq!((cells.size, cells.digests), (expected.size, expected.digests));
+    assert_eq!(
+        (cells.size, cells.digests),
+        (expected.size, expected.digests)
+    );
     assert_eq!(expected.size, pack.size);
     assert_eq!(rig.store.ranges().len(), 1, "only the read of this test");
 }
@@ -598,6 +601,9 @@ async fn a_pack_whose_cells_are_not_recorded_is_still_written() {
         .collect();
     assert_eq!(recorded, [false, false, true]);
     for pack in &packed.packs {
-        assert!(rig.index.pack(&pack.key).unwrap().is_some(), "the pack is recorded");
+        assert!(
+            rig.index.pack(&pack.key).unwrap().is_some(),
+            "the pack is recorded"
+        );
     }
 }

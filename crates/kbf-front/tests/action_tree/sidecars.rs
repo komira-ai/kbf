@@ -114,7 +114,10 @@ async fn a_list_over_objects_with_no_cells_is_stored_and_left_unlisted() {
 
     let listing = super::listing::list(&rig, &root).await.expect("a listing");
 
-    assert!(rig.farm.object(listing.key()).is_some(), "the list is stored");
+    assert!(
+        rig.farm.object(listing.key()).is_some(),
+        "the list is stored"
+    );
     let sidecar = tierstore_list::sidecar_key(&id_of(listing.key()));
     assert!(rig.farm.object(&sidecar).is_none(), "no sidecar");
     assert!(rig.farm.state().ranged.is_empty(), "no object is read");
@@ -163,7 +166,10 @@ async fn the_miss_path_reads_each_object_with_no_cells_once() {
         .object_cells(&["cas/f/w/p9".to_owned()])
         .expect("cells");
     let digest: [u8; 32] = Sha256::digest(vec![9u8; 4096]).into();
-    assert_eq!(cells[0].as_ref().map(|row| row.digests.clone()), Some(vec![digest]));
+    assert_eq!(
+        cells[0].as_ref().map(|row| row.digests.clone()),
+        Some(vec![digest])
+    );
     let reads = rig.farm.state().ranged.len();
 
     rig.writer
@@ -171,7 +177,11 @@ async fn the_miss_path_reads_each_object_with_no_cells_once() {
         .await
         .expect("a listing");
 
-    assert_eq!(rig.farm.state().ranged.len(), reads, "nothing is read again");
+    assert_eq!(
+        rig.farm.state().ranged.len(),
+        reads,
+        "nothing is read again"
+    );
 }
 
 /// Catches: a miss path that fails the list when an object it names is gone: the list is still
@@ -192,7 +202,10 @@ async fn a_lost_object_on_the_miss_path_never_fails_the_list() {
         .await
         .expect("a listing");
 
-    assert!(rig.farm.object(listing.key()).is_some(), "the list is stored");
+    assert!(
+        rig.farm.object(listing.key()).is_some(),
+        "the list is stored"
+    );
     let sidecar = tierstore_list::sidecar_key(&id_of(listing.key()));
     assert!(rig.farm.object(&sidecar).is_none(), "no sidecar");
 }

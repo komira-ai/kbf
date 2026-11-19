@@ -35,10 +35,10 @@ use kbf_types::Digest;
 use tierstore::{BlobSource, EntryKind, MAX_TREE_LIST_BYTES, TreeEntry, TreeLimits, TreeListV2};
 
 use super::place::{self, Place};
+use super::sidecar::Sidecars;
 use super::tstree::{
     self, Child, DIR_MODE, EMPTY_SHA256, ENTRY_BYTES, HEADER_LEN, Item, RANGE_MERGE_GAP,
 };
-use super::sidecar::Sidecars;
 use super::{BaseTree, INPUT_ROOT, NoTree, TreeWriter, Trust, reserved_input};
 use crate::large_backfill::large_key;
 use crate::prepare_run::{KeptClosure, KeptDirectory};
@@ -233,7 +233,8 @@ impl TreeWriter {
         base: &BaseTree,
         named: impl FnOnce(&Listing) + Send,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_as(kept, base, (Trust::Memos, false), named).await
+        self.write_listing_as(kept, base, (Trust::Memos, false), named)
+            .await
     }
 
     /// [`TreeWriter::write_listing`] for a tree whose last job found an object lost: no place
@@ -264,7 +265,8 @@ impl TreeWriter {
         base: &BaseTree,
         named: impl FnOnce(&Listing) + Send,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_as(kept, base, (Trust::Store, false), named).await
+        self.write_listing_as(kept, base, (Trust::Store, false), named)
+            .await
     }
 
     /// Lists the action tree of `kept` over `base` as one tree list and stores it as `how`
@@ -355,8 +357,14 @@ impl TreeWriter {
 /// with no sidecar takes the executor's miss path.
 async fn sidecar(sidecars: &Sidecars, key: &ObjectKey, bytes: &[u8], republish: bool) {
     let written = match republish {
-        false => sidecars.emit(bytes).await.map(|emitted| format!("{emitted:?}")),
-        true => sidecars.backfill(bytes).await.map(|done| format!("{done:?}")),
+        false => sidecars
+            .emit(bytes)
+            .await
+            .map(|emitted| format!("{emitted:?}")),
+        true => sidecars
+            .backfill(bytes)
+            .await
+            .map(|done| format!("{done:?}")),
     };
     match written {
         Ok(done) => tracing::debug!(list = %key, republish, done, "the tree list's L2 sidecar"),
