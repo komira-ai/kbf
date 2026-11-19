@@ -6,14 +6,26 @@
 //! | `meta/next_op` | the next free operation id, 8 bytes big-endian | a block of [`ID_BLOCK`] ids reserved by compare-and-set |
 //! | `exec/live/<instance>` | empty | by its process, every quarter of `--executor-live-secs`, with that time to live |
 //! | `exec/op/<operation>` | [`OpRow`] | before each attempt's submit; deleted when the operation finishes |
+//! | `exec/act/<hash>-<size>/<instance, hex>` | the open operation of the action, version 1 and 8 bytes big-endian | with the first attempt's `exec/op/` row, in its transaction; deleted with it |
 //! | `done/<operation>` | `Finished::to_row` | when the operation finishes, for at least [`DONE_FLOOR`] |
 //! | `doneof/<operation>` | the action and instance (version 1, size, hash, instance) | beside `done/` |
 //!
 //! `meta/next_op`, `done/` and `doneof/` keep the format of earlier releases, so a frontend of
 //! the release before and one of this release over one store never give one id twice and each
-//! answers by name an operation the other finished. The `exec/live/` and `exec/op/` families
-//! are new: no scan of an earlier release reads a prefix of them (B8: it loses nothing by not
-//! knowing them, they are this executor's own bookkeeping).
+//! answers by name an operation the other finished. The `exec/live/`, `exec/op/` and
+//! `exec/act/` families are new: no scan of an earlier release reads a prefix of them (B8: it
+//! loses nothing by not knowing them, they are this executor's own bookkeeping).
+//!
+//! **One job per action across frontends.** An Execute of an action another frontend of the
+//! store is running joins that operation instead of submitting a second job (a rebuild): the
+//! first attempt's `exec/op/` row is written in one transaction with the action's `exec/act/`
+//! row, on the condition that neither is there, and an `exec/act/` row already there names the
+//! operation to follow ([`Rows::open_op`]). The operation that finishes deletes the action's row
+//! in the transaction that puts its answer, if the row still names it. A row that names an
+//! operation the store no longer has open (a release before this one finished it, which never
+//! deletes the row) is stale: it is deleted at the version read and the write tried again. A
+//! release before this one writes no `exec/act/` row and reads none, so an operation it runs is
+//! not joined from another frontend, as before (B8: it loses only the join).
 //!
 //! **Who runs an operation.** An `exec/op/` row names the process that runs the operation, its
 //! `owner`. Only the owner writes it, each write a compare-and-set on the version it read with
@@ -51,8 +63,14 @@ pub const LIVE_PREFIX: &str = "exec/live/";
 /// The prefix of the operation rows: `exec/op/<operation, 16 hex digits>`.
 pub const OP_PREFIX: &str = "exec/op/";
 
+/// The prefix of the action rows: `exec/act/<hash>-<size>/<instance, hex>`.
+pub const ACT_PREFIX: &str = "exec/act/";
+
 /// The version byte every `exec/op/` value begins with.
 pub const VERSION: u8 = 1;
+
+/// The version byte of an `exec/act/` value.
+const ACT_VERSION: u8 = 1;
 
 /// The counter of operation ids every frontend of the store reserves its blocks from.
 const NEXT_OP: &str = "meta/next_op";
@@ -145,6 +163,16 @@ impl OpRow {
     }
 }
 
+/// What [`Rows::open_op`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Opened {
+    /// The operation is this process's to run: its rows are written.
+    Ours,
+    /// Another operation of the same action is open on the store: the caller follows it, and
+    /// nothing of this operation is written.
+    Joined(OperationId),
+}
+
 /// Where an operation stands, as the store has it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Look {
@@ -182,6 +210,35 @@ pub struct Rows {
 #[must_use]
 pub fn op_key(operation: OperationId) -> String {
     format!("{OP_PREFIX}{:016x}", operation.0)
+}
+
+/// The key of the row that names the open operation of `instance`'s action `hash`, `size`.
+/// The instance is spelled in hex: a name may hold any character, a slash too.
+#[must_use]
+pub fn act_key(instance: &str, hash: &str, size: u64) -> String {
+    use std::fmt::Write as _;
+    let mut key = format!("{ACT_PREFIX}{hash}-{size}/");
+    for byte in instance.as_bytes() {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
+/// The value of an `exec/act/` row naming `operation`.
+fn encode_act(operation: OperationId) -> Vec<u8> {
+    let mut value = vec![ACT_VERSION];
+    value.extend(operation.0.to_be_bytes());
+    value
+}
+
+/// The operation an `exec/act/` value names; `None` for a version this build does not know or a
+/// value that is not one.
+fn decode_act(value: &[u8]) -> Option<OperationId> {
+    let [ACT_VERSION, rest @ ..] = value else {
+        return None;
+    };
+    let bytes: [u8; 8] = rest.try_into().ok()?;
+    Some(OperationId(u64::from_be_bytes(bytes)))
 }
 
 fn done_key(operation: OperationId) -> String {
@@ -380,6 +437,63 @@ impl Rows {
         self.commit(Txn::new().put(key, value, cond))
     }
 
+    /// Opens `operation`, the first attempt of a new operation whose row is `row`: writes its
+    /// row and its action's row in one transaction, unless another operation of the action is
+    /// open on the store, which the caller then follows ([`Opened::Joined`]).
+    ///
+    /// An action row naming an operation that is no longer open is stale and deleted, and the
+    /// write tried again. An action row this build cannot read, or one that changes under every
+    /// try, leaves the operation to run on its own: its row is written alone, as a release before
+    /// this one writes it.
+    ///
+    /// # Errors
+    /// [`RowsError::Conflict`] when another process owns the operation's row; the store cannot
+    /// be read or written, or a row is not what it says.
+    pub fn open_op(&self, operation: OperationId, row: &OpRow) -> Result<Opened, RowsError> {
+        let key = op_key(operation);
+        let act = act_key(&row.instance, &row.hash, row.size);
+        let value = encode(&OpRow {
+            owner: self.instance.clone(),
+            ..row.clone()
+        });
+        for _ in 0..CAS_TRIES {
+            let txn = Txn::new()
+                .put(key.clone(), value.clone(), Cond::Absent)
+                .put(act.clone(), encode_act(operation), Cond::Absent);
+            match self.commit(txn) {
+                Ok(()) => return Ok(Opened::Ours),
+                Err(RowsError::Conflict { key: lost }) if lost == act => {}
+                // The operation's row is there: a write of it whose answer was lost.
+                Err(RowsError::Conflict { .. }) => {
+                    return self.put_op(operation, row).map(|()| Opened::Ours);
+                }
+                Err(error) => return Err(error),
+            }
+            let Some(found) = self.store.get(&act)? else {
+                continue;
+            };
+            match decode_act(&found.value) {
+                None => break,
+                Some(other) if other == operation => {
+                    return self.put_op(operation, row).map(|()| Opened::Ours);
+                }
+                Some(other) => {
+                    if matches!(self.look(other)?, Look::Open(_)) {
+                        return Ok(Opened::Joined(other));
+                    }
+                    tracing::info!(%other, act = %act, "an action row names an operation that is no longer open: it is deleted");
+                    let stale = Txn::new().delete(act.clone(), Cond::Version(found.version));
+                    match self.commit(stale) {
+                        Ok(()) | Err(RowsError::Conflict { .. }) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+        tracing::warn!(%operation, act = %act, "the action row could not be written: the operation runs without it");
+        self.put_op(operation, row).map(|()| Opened::Ours)
+    }
+
     /// Finishes `operation` of `action` as `finished`: its row deleted, if this process owns it
     /// (or no row is left), and its answer and action put for `retention` (at least
     /// [`DONE_FLOOR`]). An answer another frontend wrote first is kept, and returned.
@@ -394,12 +508,51 @@ impl Rows {
         retention: Duration,
     ) -> Result<Finished, RowsError> {
         let key = op_key(operation);
+        let act = act_key(
+            &action.instance,
+            &action.action.hash_hex(),
+            action.action.size_bytes,
+        );
         let ttl = retention.max(DONE_FLOOR);
-        let txn = match self.ours(&key)? {
-            Cond::Version(version) => Txn::new().delete(key.clone(), Cond::Version(version)),
-            // No row is left: the answer is put alone.
-            _ => Txn::new(),
-        };
+        let mut tried = 1;
+        loop {
+            let txn = match self.ours(&key)? {
+                Cond::Version(version) => Txn::new().delete(key.clone(), Cond::Version(version)),
+                // No row is left: the answer is put alone.
+                _ => Txn::new(),
+            };
+            // The action's row goes with the operation, if it still names it; after the last
+            // try that found it changed, it is left for the next open to find stale.
+            let found = if tried < CAS_TRIES {
+                self.store.get(&act)?
+            } else {
+                None
+            };
+            let txn = match found {
+                Some(found) if decode_act(&found.value) == Some(operation) => {
+                    txn.delete(act.clone(), Cond::Version(found.version))
+                }
+                _ => txn,
+            };
+            match self.finish_txn(operation, action, finished, ttl, &key, txn) {
+                Err(RowsError::Conflict { key: lost }) if lost == act => {
+                    tried += 1;
+                }
+                done => return done,
+            }
+        }
+    }
+
+    /// The finish of `operation` in `txn` (the deletes of its rows), with its answer put.
+    fn finish_txn(
+        &self,
+        operation: OperationId,
+        action: &ActionKey,
+        finished: &Finished,
+        ttl: Duration,
+        key: &str,
+        txn: Txn,
+    ) -> Result<Finished, RowsError> {
         let txn = txn
             .put_ttl(done_key(operation), finished.to_row(), ttl, Cond::Absent)
             .put_ttl(
@@ -409,7 +562,9 @@ impl Rows {
                 Cond::Absent,
             );
         match self.commit(txn) {
-            Err(RowsError::Conflict { key: lost }) if lost != key => {
+            Err(RowsError::Conflict { key: lost })
+                if lost != key && !lost.starts_with(ACT_PREFIX) =>
+            {
                 // Another frontend answered it first: its answer stands, and the row goes.
                 let answer = self.done(operation)?.map(|(_, answer)| answer);
                 let answer = answer.ok_or_else(|| corrupt(&lost, "the answer is gone"))?;
@@ -538,6 +693,9 @@ impl Rows {
     }
 }
 
+#[cfg(test)]
+#[path = "rows_act_tests.rs"]
+mod act_tests;
 #[cfg(test)]
 #[path = "rows_tests.rs"]
 mod tests;

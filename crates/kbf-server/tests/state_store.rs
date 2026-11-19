@@ -28,6 +28,8 @@ use tonic::Code;
 
 #[path = "state_store/frontends.rs"]
 mod frontends;
+#[path = "state_store/live_update.rs"]
+mod live_update;
 mod support;
 
 use support::{Cell, FakeState, Job, Ran, StateHandle, done, response};

@@ -468,7 +468,7 @@ pod's deletion) begin the same one.
 { "draining": false, "phase": "serving", "open_executions": 3, "queued_operations": 0 }
 ```
 
-Once a configured `--drain-deadline` has passed with executions open, the answer also holds
+Once a configured `--drain-deadline` has passed with executions or calls open, the answer also holds
 `"deadline_passed": true` (the field is left out until then).
 
 - `draining`: a drain has begun, by this endpoint or by SIGTERM or SIGINT: the phase is any
@@ -509,10 +509,15 @@ over a state store (`kbf frontend` requires one):
    drains their connections: calls in flight on a connection finish and new ones open
    elsewhere. The REAPI and worker listeners stop accepting; this API goes on answering, so
    the drain can be read. Phase `draining`.
-4. **Wait for the executions.** The wait lasts until `open_executions` is 0, however long
-   that takes: there is no default deadline, and the drain never ends a stream because
+4. **Wait for the executions and the calls.** The wait lasts until `open_executions` is 0
+   and no REAPI call is being answered (`kbf_front_open_calls`: a ByteStream write or read, a
+   cache call, an Execute still being prepared, from its arrival until its answer has been
+   sent), however long that takes, so the exit cuts no upload. Buck2 sends a cut write again
+   from its first byte, on a new connection, at most five times within about two seconds, and
+   never asks `QueryWriteStatus`; the frontend accepts a write only from offset 0, and a cut
+   write leaves no blob that a read could find. There is no default deadline, and the drain never ends a stream because
    time has passed. `--drain-deadline` (seconds, at least 1, no upper bound, absent by
-   default) only reports: when it passes with executions open, the frontend logs a WARN
+   default) only reports: when it passes with executions or calls open, the frontend logs a WARN
    with the count, sets `deadline_passed` in `GET /v1/frontend/drain`, and goes on waiting,
    serving the open streams, with the process up, whether a
    signal or the endpoint began the drain. Buck2 retries only the opening of an Execute
@@ -1179,6 +1184,20 @@ long as the server runs, during a stop too:
 
 ```json
 { "status": "alive", "version": "0.1.0+0123456789ab", "commit": "0123456789ab" }
+```
+
+**`GET /startedz`**: the process has been ready once. `503` until `/readyz`'s checks first
+all pass, with the failing checks and why, as `/readyz` lists them; `200` from then on, for as
+long as the server runs, during a stop and while a dependency is down too. It is the check for
+a container orchestrator that starts a new process beside the old one and stops the old one
+once the new one passes (Docker Swarm's health check with `order: start-first`): a process that
+cannot serve yet does not pass it, so the old one is not stopped too soon, and a process that
+has served is not restarted for an outage of its state store or job service, as `/readyz`
+would have it:
+
+```json
+{ "started": false, "version": "0.1.0+0123456789ab", "commit": "0123456789ab",
+  "failing": [ { "check": "state_store", "reason": "the state store did not answer within 2000 ms" } ] }
 ```
 
 **`GET /readyz`**: the server is ready to serve. `200` when every check passes, `503`

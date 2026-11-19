@@ -651,8 +651,9 @@ fn a_read_that_fails_part_way_through_a_call_fails_the_call() {
         .finish(op(3), &action(3), &ran(0), DONE_FLOOR)
         .expect("their answer");
     a.put_op(op(3), &row(3)).expect("row");
-    // The row and its ownership, then the answer's reads after the conflict.
-    env.store.fail_nth_read(2);
+    // The row and its ownership, the action's row, then the answer's reads after the
+    // conflict.
+    env.store.fail_nth_read(3);
     assert!(
         matches!(
             a.finish(op(3), &action(3), &ran(1), DONE_FLOOR),

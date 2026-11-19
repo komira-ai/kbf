@@ -22,7 +22,7 @@ async fn at_the_deadline_the_drain_reports_and_goes_on_waiting() {
     assert!(rig.drain.deadline_passed());
     let text = log.text();
     assert!(
-        text.contains("deadline passed with executions open"),
+        text.contains("deadline passed with executions or calls open"),
         "{text}"
     );
     assert!(text.contains("open=1"), "{text}");

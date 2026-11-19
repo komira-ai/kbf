@@ -377,6 +377,9 @@ fn process_base() -> u64 {
 }
 
 #[cfg(test)]
+#[path = "dispatch_join_tests.rs"]
+mod dispatch_join_tests;
+#[cfg(test)]
 #[path = "dispatch_tests.rs"]
 mod dispatch_tests;
 #[cfg(test)]

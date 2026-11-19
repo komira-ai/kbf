@@ -63,6 +63,7 @@ impl Start {
                 keep: js.base_tree_keep,
                 timeout: js.base_tree_timeout,
                 instance: js.config.instance.clone(),
+                held: Arc::default(),
             },
             platform: format!("linux-{}", js.config.arch),
             packs,

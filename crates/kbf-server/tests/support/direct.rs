@@ -156,17 +156,21 @@ impl Direct {
     }
 
     /// The executor over this job service for a server over `cache`, keeping its rows in `store`
-    /// if given. Built on the server's own runtime, where it is used.
+    /// if given, alive for `live` (the default when none). Built on the server's own runtime, where it is used.
     pub fn executor(
         &self,
         cache: Arc<Cache<GateLog, SharedStore>>,
         store: Option<Arc<dyn kbf_state::Store>>,
         finished_retention: Duration,
+        live: Option<Duration>,
     ) -> Executor {
         let mut cfg = Config::new("front-1");
         cfg.task_out = Some(PutDirRoots::new("/mnt/ts/put").expect("roots"));
         cfg.poll = Duration::from_millis(20);
         cfg.finished_retention = finished_retention;
+        if let Some(live) = live {
+            cfg.live = live;
+        }
         let seams = Arc::new(Seams {
             direct: self.clone(),
             cache,
