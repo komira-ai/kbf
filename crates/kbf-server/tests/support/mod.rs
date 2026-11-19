@@ -478,7 +478,9 @@ impl Cell {
         let stop = self.stop.take().expect("the server is running");
         let stopped = self.stopped.take().expect("the server is running");
         drop(self);
-        stop.send(()).expect("the server is running");
+        // A server whose drain was closed ([`kbf_server::Drain::close`]) may have stopped on its
+        // own already, its stop signal's receiver with it: it is waited for all the same.
+        let _ = stop.send(());
         timeout(PROMPT * 4, stopped)
             .await
             .expect("the old server stops in time")
