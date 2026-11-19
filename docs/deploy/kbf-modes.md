@@ -271,8 +271,12 @@ default, writes the action tree as tierstore manifests and gives the job the hos
 the job tierstore's mount provider, which the host's agent asks for the tree as soon as the job is
 assigned (docs/design/actions-as-jobs.md, 4.7). `provider` needs `--task-out-mode put-dir` and a pool
 whose hosts serve the provider (`--mount-provider tierstore=<socket>` on their agents); a job no host
-can serve is refused by the job service and the farm sees an infrastructure failure. A Mac job always
-reads manifests.
+can serve is refused by the job service and the farm sees an infrastructure failure. A job whose
+tree list a host's tierstore refuses as not mountable (`tree list not supported: ...`, the list has no
+readable L2 sidecar) is not failed for it: the frontend writes that action's list again with its sidecar,
+and if the host refuses that too, gives the action's jobs its tree as manifests (`manifests` form, no
+mount provider). Neither run spends one of the operation's attempts
+(`kbf_executor_list_refused_total{step}` counts them). A Mac job always reads manifests.
 
 **Over a state store.** With `--state-store` the executor keeps the rows `exec/op/<operation>` (owner,
 action, attempt, job id), `exec/live/<instance>` and `done/`, `doneof/` that

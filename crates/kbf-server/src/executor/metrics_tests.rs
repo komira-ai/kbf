@@ -140,3 +140,31 @@ fn each_plain_counter_renders_under_its_name_and_counts() {
         assert!(!text.contains(gone), "no {gone} family: {text}");
     }
 }
+
+/// Asserts that a refused tree list is counted under the step of the miss path the frontend took,
+/// each step on its own row of one counter family, and that the run it ends is a `list_refused`
+/// run whichever step it was.
+#[test]
+fn a_refused_tree_list_is_counted_by_the_step_taken() {
+    use crate::executor::traits::MissPath;
+    let metrics = Metrics::default();
+    metrics.list_refused(MissPath::Republish);
+    for _ in 0..3 {
+        metrics.list_refused(MissPath::Manifests);
+    }
+    let mut text = String::new();
+    metrics.render(&mut text);
+    assert!(
+        text.contains("# TYPE kbf_executor_list_refused_total counter\n"),
+        "{text}"
+    );
+    for row in [
+        "kbf_executor_list_refused_total{step=\"republish\"} 1\n",
+        "kbf_executor_list_refused_total{step=\"manifests\"} 3\n",
+    ] {
+        assert!(text.contains(row), "{row}in {text}");
+    }
+    for path in [MissPath::Republish, MissPath::Manifests] {
+        assert_eq!(RunEnd::of(&Settled::ListRefused(path)), RunEnd::ListRefused);
+    }
+}

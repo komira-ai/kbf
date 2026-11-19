@@ -259,6 +259,17 @@ fn cases() -> Vec<(&'static str, Case)> {
             ),
         ),
         (
+            "failed to start, any code, its detail saying the host refused the job's tree list as not mountable (`tree list not supported: <reason>`)",
+            judged(
+                job(
+                    JobState::FailedToStart,
+                    StartFailureCode::InputUnavailable,
+                    "tree list not supported: missing_sidecar",
+                ),
+                none.clone(),
+            ),
+        ),
+        (
             "failed to start, any other code or detail",
             judged(refused_to_start("scratch-failed"), none.clone()),
         ),
@@ -316,6 +327,7 @@ fn answer(case: &Case) -> Verdict {
 fn class_of(verdict: &Verdict) -> &'static str {
     match verdict {
         Verdict::Ingest => "ingest",
+        Verdict::ListRefused => "list-refused",
         Verdict::Settled(settled) | Verdict::StoreLost { settled, .. } => match settled {
             Settled::Infra(_) => "infra",
             Settled::Timeout => "timeout",
@@ -323,6 +335,7 @@ fn class_of(verdict: &Verdict) -> &'static str {
             Settled::Lost(_) => "lost",
             Settled::Invalid(_) => "invalid",
             Settled::Missing(_) => "missing",
+            Settled::ListRefused(_) => "list-refused",
         },
     }
 }

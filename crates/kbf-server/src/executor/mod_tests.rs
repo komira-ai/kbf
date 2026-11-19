@@ -100,6 +100,12 @@ pub(crate) struct FakeIngest {
     /// Every wait for a tree's writes that answered the tree stored, by run, in the order
     /// answered.
     pub stored_done: Mutex<Vec<RunId>>,
+    /// The form of the tree each mint was asked for, in order.
+    pub minted_as: Mutex<Vec<InputTree>>,
+    /// Every action a host refused the tree list of ([`Ingest::list_refused`]), in order; the
+    /// first is answered `Republish`, the others `Manifests`, and from the second on the form of
+    /// an action's tree is manifests.
+    pub list_refused: Mutex<Vec<kbf_proto::reapi::Digest>>,
 }
 
 impl FakeIngest {
@@ -121,8 +127,9 @@ impl Ingest for FakeIngest {
         run: RunId,
         _action: &kbf_proto::reapi::Digest,
         _wall: Duration,
-        _tree: InputTree,
+        tree: InputTree,
     ) -> Result<PackKey, MintError> {
+        locked(&self.minted_as).push(tree);
         if let Some(why) = locked(&self.mint_fails).pop_front() {
             return Err(why);
         }
@@ -155,6 +162,22 @@ impl Ingest for FakeIngest {
         locked(&self.script)
             .pop_front()
             .unwrap_or_else(|| Self::ran(0))
+    }
+
+    async fn list_refused(&self, action: &kbf_proto::reapi::Digest) -> MissPath {
+        let mut refused = locked(&self.list_refused);
+        refused.push(action.clone());
+        match refused.len() {
+            1 => MissPath::Republish,
+            _ => MissPath::Manifests,
+        }
+    }
+
+    fn input_tree(&self, _action: &kbf_proto::reapi::Digest, configured: InputTree) -> InputTree {
+        match locked(&self.list_refused).len() {
+            0 | 1 => configured,
+            _ => InputTree::Manifests,
+        }
     }
 }
 
@@ -490,6 +513,8 @@ impl Rig {
             release: tokio::sync::Notify::new(),
             stored_asked: Mutex::new(Vec::new()),
             stored_done: Mutex::new(Vec::new()),
+            minted_as: Mutex::new(Vec::new()),
+            list_refused: Mutex::new(Vec::new()),
         });
         let metrics = Arc::new(Metrics::default());
         let mut rig = Self {

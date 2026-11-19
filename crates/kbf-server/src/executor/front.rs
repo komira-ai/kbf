@@ -49,6 +49,12 @@
 //!   yet confirmed lost is named again. An object neither memo nor
 //!   the action's tree names is taken for one of the kbf base tree's, whose objects the frontend
 //!   publishes again ([`PutDirParts::with_republish`]), one publish at a time.
+//! - **A tree list a host refused** ([`Ingest::list_refused`], `front_miss.rs`): a job that did
+//!   not start because the host's tierstore found no readable L2 sidecar for its tree list. The
+//!   first time for an action, its remembered trees are dropped and its next tree list is written
+//!   checked and with its sidecar republished ([`kbf_front::action_tree::ListingWrite`]); the
+//!   second time, [`Ingest::input_tree`] gives the action's jobs [`InputTree::Manifests`], for as
+//!   long as the memo keeps the action (bounded as the trees are).
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -57,7 +63,9 @@ use futures::future::BoxFuture;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_front::action_tree::NoTree;
-use kbf_front::action_tree::{ActionTree, BaseTree, Listing, MEMO_TTL, PutRetry, TreeWriter};
+use kbf_front::action_tree::{
+    ActionTree, BaseTree, Listing, ListingWrite, MEMO_TTL, PutRetry, TreeWriter,
+};
 use kbf_front::prepare_run::{
     ClosureError, KeptClosure, PrepareError as RunPrepError, PrepareFault, PrepareTook, PutDirPrep,
     PutDirRun,
@@ -79,9 +87,13 @@ use crate::executor::size_class::SizeClass;
 use crate::executor::steps::Step;
 use crate::executor::task::{PackKey, RunId, build_id};
 use crate::executor::traits::{
-    ActionFacts, Ingest, Ingested, Inputs, InputsError, LostObject, MintError, RejectReason,
-    UntrustedLimits,
+    ActionFacts, Ingest, Ingested, Inputs, InputsError, LostObject, MintError, MissPath,
+    RejectReason, UntrustedLimits,
 };
+
+#[path = "front_miss.rs"]
+mod miss;
+use miss::Misses;
 
 /// The most action trees [`Front`] remembers.
 const TREE_ENTRIES: usize = 100_000;
@@ -381,6 +393,9 @@ pub struct Front {
     /// not start for an object the store lost. Shared with the tasks that write the trees, which
     /// clear an action once its checked tree is stored.
     checked: Arc<Mutex<Bounded<kbf_types::Digest, ()>>>,
+    /// The step of the miss path an action is on, after a host refused its tree list as not
+    /// mountable ([`Ingest::list_refused`]).
+    misses: Misses,
     /// Held while the base tree is published again: one publish at a time.
     republishing: tokio::sync::Mutex<()>,
     /// What publishes the base tree again.
@@ -430,6 +445,7 @@ impl Front {
             facts: Mutex::new(Bounded::new(FACTS_ENTRIES)),
             metrics: Arc::new(Metrics::default()),
             checked: Arc::new(Mutex::new(Bounded::new(TREE_ENTRIES))),
+            misses: Mutex::new(Bounded::new(TREE_ENTRIES)),
             republishing: tokio::sync::Mutex::new(()),
             republish,
         }
@@ -614,6 +630,21 @@ impl Ingest for Front {
             self.republish_base().await;
         }
     }
+
+    async fn list_refused(&self, action: &Digest) -> MissPath {
+        // A digest the mint took is a digest here; one that is not has no tree of ours to redo.
+        let Ok(action) = cas_digest(action) else {
+            return MissPath::Manifests;
+        };
+        self.miss_step(&action)
+    }
+
+    fn input_tree(&self, action: &Digest, configured: InputTree) -> InputTree {
+        match cas_digest(action) {
+            Ok(action) => self.form_of(&action, configured),
+            Err(_) => configured,
+        }
+    }
 }
 
 /// The put directory the frontend issued, from its text `cas/b/<build>/<nonce>`.
@@ -720,8 +751,9 @@ impl Front {
             Arc::clone(&self.checked),
         );
         let (named, name) = oneshot::channel::<String>();
+        let how = self.listing_write(&action, form, checked);
         let writes = tokio::spawn(async move {
-            let tree = write_named(&writer, &base, &kept, (form, checked), named).await?;
+            let tree = write_named(&writer, &base, &kept, (form, how), named).await?;
             if checked {
                 lock_checked(&checks).remove(&action);
             }
@@ -759,14 +791,14 @@ fn broke() -> MintError {
 }
 
 /// Writes the action tree of `kept` over the base tree `base` holds as `form` says, `checked`
-/// against the store when a job of the action did not start for an object the store lost, and
-/// sends its name (its root manifest's digest in hex, or its tree list's key) to `named` as soon
+/// against the store when a job of the action did not start for an object the store lost (and
+/// a tree list with its sidecar republished, as `how` says), and sends its name (its root manifest's digest in hex, or its tree list's key) to `named` as soon
 /// as the writer has it, before any write. Returns the name once every write succeeded.
 async fn write_named(
     writer: &TreeWriter,
     base: &OnceLock<BaseTree>,
     kept: &KeptClosure,
-    (form, checked): (InputTree, bool),
+    (form, how): (InputTree, ListingWrite),
     named: oneshot::Sender<String>,
 ) -> Result<String, MintError> {
     // The mint checked the base before it collected the closure, and a base once set stays.
@@ -778,7 +810,7 @@ async fn write_named(
             let of_tree = move |tree: &ActionTree| {
                 let _ = named.send(tree.digest().to_string());
             };
-            let tree = match checked {
+            let tree = match how.checked {
                 true => writer.write_checked_named(kept, base, of_tree).await,
                 false => writer.write_named(kept, base, of_tree).await,
             };
@@ -788,14 +820,7 @@ async fn write_named(
             let of_list = move |listing: &Listing| {
                 let _ = named.send(listing.key().to_owned());
             };
-            let listing = match checked {
-                true => {
-                    writer
-                        .write_listing_checked_named(kept, base, of_list)
-                        .await
-                }
-                false => writer.write_listing_named(kept, base, of_list).await,
-            };
+            let listing = writer.write_listing_with(kept, base, how, of_list).await;
             listing.map(|listing| listing.key().to_owned())
         }
     };

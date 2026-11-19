@@ -12,7 +12,10 @@
 //! with no job submitted, and a cancel then ends it with nothing to withdraw. The job is then read
 //! back every poll until it ends ([`outcome::judge`](super::outcome)): a job that ended well has
 //! its pack ingested and answers the callers with the result; an ending of the farm's submits the
-//! operation's next attempt, while it has one ([`RESUBMITS`]); any other ending, and the last
+//! operation's next attempt, while it has one ([`RESUBMITS`]); a job whose tree list a host refused
+//! as not mountable also runs again, the first [`LIST_REFUSALS`] times in an operation without
+//! spending an attempt (a resumed operation counts them from zero), after the frontend takes its
+//! miss path ([`Ingest::list_refused`](super::Ingest::list_refused)); any other ending, and the last
 //! attempt, answers them with its status, the job's output attached.
 //!
 //! A cancel asked for by a caller cancels the job (or, before the submit, stops the run) and
@@ -42,7 +45,7 @@ use tonic::Code;
 use super::Inner;
 use super::api::{answered, not_found, note};
 use super::metrics::{IngestEnd, RunEnd};
-use super::outcome::{RESUBMITS, Settled, Verdict, forgotten, judge, refused};
+use super::outcome::{LIST_REFUSALS, RESUBMITS, Settled, Verdict, forgotten, judge, refused};
 use super::output::{Output, Tail};
 use super::phases::{Mark, Phase, Timeline};
 use super::record;
@@ -177,6 +180,8 @@ pub(crate) async fn run(
     };
     let metrics = Arc::clone(&inner.deps.metrics);
     let mut began = op.created;
+    // The runs refused as not mountable that spent no attempt: counted here, from zero.
+    let mut refused = 0_u32;
     let answer = loop {
         let run = RunId::new(op.id, attempt);
         let mut timeline = Timeline::default();
@@ -191,8 +196,10 @@ pub(crate) async fn run(
             Ended::HandedOver => break None,
             Ended::Again(settled, output) => {
                 metrics.run_ended(RunEnd::of(&settled));
-                if settled.retried() && attempt < RESUBMITS {
-                    tracing::warn!(operation = %op.id, %run, ?settled, "the run ended for a reason of the farm's: the operation runs again");
+                let free = matches!(settled, Settled::ListRefused(_)) && refused < LIST_REFUSALS;
+                if free || (settled.retried() && attempt.saturating_sub(refused) < RESUBMITS) {
+                    refused += u32::from(free);
+                    tracing::warn!(operation = %op.id, %run, ?settled, free, "the run ended for a reason of the farm's: the operation runs again");
                     metrics.attempt_resubmitted();
                     if op.recorded {
                         record::requeued(&inner.deps.recorder, run);
@@ -495,6 +502,13 @@ async fn watch_job(
             let output = output(inner, run, job, Some(&result)).await;
             Ended::Again(settled, Some(output))
         }
+        Verdict::ListRefused => {
+            // Before the next attempt is prepared: its tree is then written as the miss path says.
+            let action = reapi_digest(&op.key.action);
+            let path = inner.deps.ingest.list_refused(&action).await;
+            let output = output(inner, run, job, Some(&result)).await;
+            Ended::Again(Settled::ListRefused(path), Some(output))
+        }
         Verdict::StoreLost { object, settled } => {
             // Before the next attempt is prepared: its tree is then written checked.
             let action = reapi_digest(&op.key.action);
@@ -622,6 +636,9 @@ async fn follow_task(inner: Arc<Inner>, operation: OperationId) {
 #[cfg(test)]
 #[path = "run_end_tests.rs"]
 mod end_tests;
+#[cfg(test)]
+#[path = "run_list_tests.rs"]
+mod list_tests;
 #[cfg(test)]
 #[path = "run_store_tests.rs"]
 mod store_tests;
