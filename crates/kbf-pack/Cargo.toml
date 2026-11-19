@@ -28,6 +28,9 @@ kbf-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# `CellHasher`: the cell digests of each pack the packer writes, hashed from the bytes it holds,
+# and `l2`'s one-pass read of an object that has none recorded (the L2 sidecar's cells).
+tierstore-list.workspace = true
 # `rt`, to run the blocking index and cache calls off the async worker threads; `time`, to
 # space out the segments an adoption handles.
 tokio = { workspace = true, features = ["rt", "time"] }
