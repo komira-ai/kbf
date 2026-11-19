@@ -1722,6 +1722,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-l2-backfill"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures",
+ "kbf-front",
+ "kbf-objstore",
+ "kbf-pack-index",
+ "kbf-state",
+ "kbf-testkit",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tierstore",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "kbf-log"
 version = "0.1.0"
 dependencies = [
