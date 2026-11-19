@@ -410,8 +410,14 @@ async fn bench(plan: &Plan<'_>) -> Result<Vec<String>, Error> {
     ];
     let mut problems = Vec::new();
     for &keys in &args.keys {
+        let mut measured = Vec::new();
         for &share in &args.present {
+            // A share that rounds down to a count already measured for this size is that row.
             let present = keys * usize::from(share) / 100;
+            if measured.contains(&present) {
+                continue;
+            }
+            measured.push(present);
             let asks = row_asks(&files[..keys], present, &args.sample)?;
             let rounds = (args.warmup, args.rounds);
             let mut row = measure(&check, &asks, present, rounds, &now).await;
@@ -430,6 +436,13 @@ async fn bench(plan: &Plan<'_>) -> Result<Vec<String>, Error> {
     }
     if let (Some(lag), Some(store)) = (lag, lag_store) {
         let lag_check = presence(&args.filer, lag.root.clone(), plan.timeout)?;
+        // One untimed look first, so that no round's lag holds the opening of the
+        // connection; what it answers is not used.
+        let opening = lag.keys.iter().take(1).map(|key| Ask {
+            key: key.clone(),
+            size: 0,
+        });
+        let _ = lag_check.check(&opening.collect::<Vec<_>>()).await;
         let out = (&mut lines, &mut problems);
         lag_rounds(lag, args, (&store, &lag_check), &now, out).await;
     }
@@ -467,7 +480,10 @@ fn millis(time: Option<Duration>) -> String {
     )
 }
 
-fn table_line(row: &Row) -> String {
+/// The table line of `row`, whose times are sorted: its keys, present keys, timed checks,
+/// p50, p99 and max in milliseconds (`-` with no times), failed checks and wrong answers.
+#[must_use]
+pub fn table_line(row: &Row) -> String {
     let times = &row.times;
     format!(
         "| {} | {} | {} | {} | {} | {} | {} | {} |",
@@ -597,7 +613,8 @@ async fn lag_rounds(
     lags.sort_unstable();
     lines.push(format!(
         "lag (written through {}, seen by the filer at {}, a look every {} ms): {} of {} \
-         rounds seen, {polls} looks; p50 {} ms, p99 {} ms, max {} ms",
+         rounds seen, {polls} looks; p50 {} ms, p99 {} ms, max {} ms (nearest rank: under 100 \
+         rounds the p99 is the max)",
         lag.endpoint,
         args.filer,
         args.lag_poll_ms,

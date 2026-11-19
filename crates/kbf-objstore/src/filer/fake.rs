@@ -33,8 +33,9 @@ struct State {
     lookups: Vec<usize>,
     /// Every directory and name asked, in the order they were read.
     asked: Vec<(String, String)>,
-    /// The status every lookup call is refused with, when set.
-    fail: Option<(Code, String)>,
+    /// The status lookup calls are refused with, when set, and the number of names of the
+    /// calls refused (`None`: every call).
+    fail: Option<(Option<usize>, Code, String)>,
     /// Whether an answer leaves out its last result.
     drop_last: bool,
 }
@@ -113,7 +114,12 @@ impl FakeFiler {
 
     /// Refuses every lookup call from now on with `code` and `message`.
     pub fn fail_lookups(&self, code: Code, message: &str) {
-        self.state().fail = Some((code, message.to_owned()));
+        self.state().fail = Some((None, code, message.to_owned()));
+    }
+
+    /// Refuses, from now on, the lookup calls of exactly `names` names, and serves the others.
+    pub fn fail_lookups_of(&self, names: usize, code: Code, message: &str) {
+        self.state().fail = Some((Some(names), code, message.to_owned()));
     }
 
     /// Leaves the last result out of every answer from now on.
@@ -182,7 +188,9 @@ impl SeaweedFiler for Service {
         let request = request.into_inner();
         let mut state = lock(&self.0);
         state.lookups.push(request.requests.len());
-        if let Some((code, message)) = &state.fail {
+        if let Some((names, code, message)) = &state.fail
+            && names.is_none_or(|names| names == request.requests.len())
+        {
             return Err(Status::new(*code, message.clone()));
         }
         if let Some(refused) = refusal(&request) {
@@ -213,8 +221,9 @@ impl SeaweedFiler for Service {
     }
 
     /// The entries directly under the directory, by name, from `startFromFileName`
-    /// (included only when asked), at most `limit` of them (0: all), and only those whose
-    /// name begins with `prefix`.
+    /// (included only when asked), at most `limit` of them, and only those whose name begins
+    /// with `prefix`. A limit of 0 lists every entry here; the real filer then lists up to its
+    /// own `DirListingLimit`, so a caller that wants a bound gives one.
     async fn list_entries(
         &self,
         request: Request<ListEntriesRequest>,

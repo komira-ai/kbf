@@ -454,3 +454,116 @@ fn the_root_must_be_an_absolute_directory() {
     let root = FilerRoot::new("/buckets/kbf-cas").expect("root");
     assert_eq!(root.as_str(), "/buckets/kbf-cas");
 }
+
+/// Catches answers put back on the wrong asks when keys that are no filer path are skipped
+/// in a check that is split: 5,000 asks with every seventh one `a//<n>` are calls of 4,096
+/// and the rest of the good keys, and every ask gets its own answer.
+#[tokio::test]
+async fn skipped_keys_and_a_split_keep_every_answer_in_place() {
+    let filer = FakeFiler::start().await;
+    let mut asks = Vec::new();
+    for n in 0..5000u64 {
+        if n % 7 == 0 {
+            asks.push(ask(&format!("a//{n}"), 1));
+        } else {
+            filer.put_file(&format!("{ROOT}/cas/l/{n}"), n);
+            asks.push(ask(&format!("cas/l/{n}"), n));
+        }
+    }
+
+    let answers = client(&filer).check(&asks).await.expect("check");
+
+    for (n, answer) in (0..5000u64).zip(&answers) {
+        let want = match n % 7 {
+            0 => Presence::Unanswered(Unanswered::NotAPath),
+            _ => Presence::Present { size: n },
+        };
+        assert_eq!(*answer, want, "ask {n}");
+    }
+    let good = 5000 - 5000usize.div_ceil(7);
+    let mut lookups = filer.lookups();
+    lookups.sort_unstable();
+    assert_eq!(lookups, [good - MAX_NAMES_PER_CALL, MAX_NAMES_PER_CALL]);
+}
+
+/// Catches a partial answer taken for a whole one: when one of the calls of a split check
+/// fails and the other is served, the check fails.
+#[tokio::test]
+async fn one_failed_call_of_several_fails_the_check() {
+    let filer = FakeFiler::start().await;
+    filer.fail_lookups_of(
+        5000 - MAX_NAMES_PER_CALL,
+        Code::Internal,
+        "store read failed",
+    );
+    let asks: Vec<Ask> = (0..5000).map(|n| ask(&format!("cas/l/{n}"), 1)).collect();
+
+    let error = client(&filer).check(&asks).await.expect_err("refused");
+
+    let FilerError::Call { names, status, .. } = &error else {
+        panic!("not a call error: {error:?}");
+    };
+    assert_eq!(*names, 5000 - MAX_NAMES_PER_CALL);
+    assert_eq!(status.code(), Code::Internal);
+    let mut lookups = filer.lookups();
+    lookups.sort_unstable();
+    assert_eq!(lookups, [5000 - MAX_NAMES_PER_CALL, MAX_NAMES_PER_CALL]);
+}
+
+/// Catches a client with no limit on a call: a filer that accepts the connection and never
+/// answers fails the check once the client's timeout has passed, rather than holding it
+/// for ever. Nothing is asserted about how long that took.
+#[tokio::test]
+async fn a_filer_that_never_answers_fails_the_check() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address").to_string();
+    // Accept and hold every connection, reading nothing and writing nothing.
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let root = FilerRoot::new(ROOT).expect("root");
+    let presence =
+        FilerPresence::connect_lazy(&address, root, Duration::from_millis(50)).expect("client");
+
+    let error = presence
+        .check(&[ask("cas/l/a", 1)])
+        .await
+        .expect_err("silent filer");
+
+    assert!(
+        matches!(&error, FilerError::Call { names: 1, .. }),
+        "{error:?}"
+    );
+}
+
+/// Catches tonic's default limit of 4 MiB on an answer, under which a call of 4,096 entries
+/// with long chunk lists would fail on a real filer: an answer of more than 8 MiB is read.
+#[tokio::test]
+async fn an_answer_over_4_mib_is_read() {
+    let filer = FakeFiler::start().await;
+    let big = Entry {
+        attributes: Some(FuseAttributes {
+            file_size: 7,
+            ..FuseAttributes::default()
+        }),
+        chunks: vec![FileChunk {
+            e_tag: "e".repeat(8 << 20),
+            size: 7,
+            ..FileChunk::default()
+        }],
+        ..Entry::default()
+    };
+    filer.put_entry(&format!("{ROOT}/cas/l/big"), big);
+
+    let answers = client(&filer)
+        .check(&[ask("cas/l/big", 7)])
+        .await
+        .expect("check");
+
+    assert_eq!(answers, [Presence::Present { size: 7 }]);
+}

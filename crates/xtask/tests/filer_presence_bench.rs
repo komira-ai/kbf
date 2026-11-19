@@ -18,7 +18,7 @@ use kbf_testkit::dir::TestDir;
 use tonic::Code;
 use xtask::Error;
 use xtask::filer_presence_bench::{
-    Args, LAG_OBJECT_BYTES, Lag, LagError, Row, lag_once, measure, percentile, run,
+    Args, LAG_OBJECT_BYTES, Lag, LagError, Row, lag_once, measure, percentile, run, table_line,
 };
 
 const ROOT: &str = "/buckets/kbf-cas";
@@ -157,6 +157,50 @@ async fn every_answer_is_judged() {
 
     assert_eq!(row.wrong, 3 + 3);
     assert_eq!(row.times.len(), 2, "a wrong answer is still timed");
+
+    // Wrong answers in the warm-up count too: the warm-up call (call 0 of a new checker)
+    // answers both present keys absent, and the timed one leaves three keys out.
+    let again = scripted(
+        &clock,
+        1,
+        Box::new(|call, _| match call {
+            0 => Ok(vec![Presence::Absent; 4]),
+            _ => Ok(vec![Presence::Present { size: 1 }]),
+        }),
+    );
+    let row = measure(&again, &asks, 2, (1, 1), &clock.reader()).await;
+    assert_eq!((row.wrong, row.times.len()), (2 + 3, 1));
+}
+
+/// Catches a table whose numbers are not the row's: the full line of a row of 100 timed
+/// checks of 1 to 100 ms, and of a row with no times.
+#[test]
+fn a_row_prints_its_percentiles_in_milliseconds() {
+    let row = Row {
+        keys: 1000,
+        present: 500,
+        times: (1..=100).map(ms).collect(),
+        failed: 1,
+        wrong: 2,
+        first_failure: Some("refused".to_owned()),
+    };
+    assert_eq!(
+        table_line(&row),
+        "| 1000 | 500 | 100 | 50.000 | 99.000 | 100.000 | 1 | 2 |"
+    );
+    let empty = Row {
+        times: vec![],
+        ..row
+    };
+    assert_eq!(table_line(&empty), "| 1000 | 500 | 0 | - | - | - | 1 | 2 |");
+    let fraction = Row {
+        times: vec![Duration::from_micros(1500)],
+        ..empty
+    };
+    assert_eq!(
+        table_line(&fraction),
+        "| 1000 | 500 | 1 | 1.500 | 1.500 | 1.500 | 1 | 2 |"
+    );
 }
 
 /// Catches a percentile off by one rank, or read from no times: nearest rank, so the p50
@@ -205,18 +249,66 @@ fn futures_now<T>(future: impl Future<Output = T>) -> T {
     }
 }
 
+/// A store whose writes take 1000 ms on the clock: a lag counted from before the write was
+/// acknowledged would hold them.
+struct SlowWrites {
+    inner: Arc<MemoryStore>,
+    clock: Clock,
+}
+
+impl ObjectStore for SlowWrites {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn put_new(
+        &self,
+        key: &ObjectKey,
+        body: bytes::Bytes,
+        retain_until: Option<std::time::SystemTime>,
+    ) -> Result<(), kbf_objstore::ObjectStoreError> {
+        self.clock.advance(1000);
+        self.inner.put_new(key, body, retain_until).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        range: kbf_objstore::ByteRange,
+    ) -> Result<bytes::Bytes, kbf_objstore::ObjectStoreError> {
+        self.inner.get_range(key, range).await
+    }
+
+    async fn delete(&self, key: &ObjectKey) -> Result<(), kbf_objstore::ObjectStoreError> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &kbf_objstore::KeyPrefix,
+        after: Option<&kbf_objstore::ListToken>,
+        max_keys: kbf_objstore::PageSize,
+    ) -> Result<kbf_objstore::ListPage, kbf_objstore::ObjectStoreError> {
+        self.inner.list(prefix, after, max_keys).await
+    }
+}
+
 /// Catches a bench that reports a lag it did not measure: one counted from before the write
-/// was acknowledged, or that stops at a look that did not see the whole object. Two absent
-/// looks and a short one, 10 ms each on the clock, then the look that sees it: a lag of
-/// 40 ms over 4 looks, every look after the write.
+/// was acknowledged (the write takes 1000 ms on the clock), or that stops at a look that did
+/// not see the whole object. Two absent looks and a short one, 10 ms each on the clock, then
+/// the look that sees it: a lag of 40 ms over 4 looks, every look after the write.
 #[tokio::test]
 async fn the_bench_reports_a_lag_only_after_it_saw_the_key() {
     let clock = Clock::default();
     let store = Arc::new(MemoryStore::new(Capabilities::default()));
     let check = seen_after(&clock, Arc::clone(&store), 2);
     let ask = ask("kbf-bench/lag/n1/0", LAG_OBJECT_BYTES as u64);
+    let slow = SlowWrites {
+        inner: Arc::clone(&store),
+        clock: clock.clone(),
+    };
 
-    let lag = lag_once(&*store, &check, &ask, (Duration::ZERO, 10), &clock.reader()).await;
+    let lag = lag_once(&slow, &check, &ask, (Duration::ZERO, 10), &clock.reader()).await;
 
     let lag = lag.expect("seen");
     assert_eq!(
@@ -332,16 +424,16 @@ fn bench_line<'a>(filer: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
     line
 }
 
-/// The lag flags, with `extra` after them (a flag given twice keeps clap's refusal out
-/// of the way only for the ones that take a list, so `extra` names others).
-fn lag_flags<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+/// The lag flags, writing through `endpoint` with the key pair at `keys`, and `extra` after
+/// them (a bucket or nonce in `extra` takes the place of the default one).
+fn lag_flags<'a>(endpoint: &'a str, keys: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
     let mut line = vec![
         "--keys",
         "1",
         "--lag-store-endpoint",
-        "http://127.0.0.1:1",
+        endpoint,
         "--lag-store-credentials-file",
-        "/nonexistent/keys.json",
+        keys,
     ];
     for (flag, value) in [("--lag-store-bucket", "swfs-bench"), ("--lag-nonce", "n1")] {
         if !extra.contains(&flag) {
@@ -352,7 +444,7 @@ fn lag_flags<'a>(extra: &[&'a str]) -> Vec<&'a str> {
     line
 }
 
-/// Catches a verb that measures other keys than it says, skips a row, or reads the listing
+/// Catches a verb that measures other keys than it says, skips or repeats a row, or reads the listing
 /// wrongly (a directory taken for a file, a page that repeats or drops a name): over a
 /// fake filer of 12 files and a directory, every row is printed, every check asks every key
 /// of its row, and the present keys are the listed files and the rest the same names with
@@ -376,7 +468,8 @@ fn the_verb_prints_a_row_for_each_size_and_share() {
         "each row: 3 timed checks after 1 untimed; a check asks every key of the row, in calls \
          of at most 4096 names sent at once"
     );
-    assert_eq!(lines.len(), 4 + 9);
+    // 1 key at 50% is 0 present keys, the row of 0%: it is measured once.
+    assert_eq!(lines.len(), 4 + 8);
     let rows: Vec<String> = lines[4..]
         .iter()
         .map(|line| line.split(" | ").take(3).collect::<Vec<_>>().join(" | "))
@@ -385,7 +478,6 @@ fn the_verb_prints_a_row_for_each_size_and_share() {
         rows,
         [
             "| 1 | 1 | 3",
-            "| 1 | 0 | 3",
             "| 1 | 0 | 3",
             "| 5 | 5 | 3",
             "| 5 | 2 | 3",
@@ -401,7 +493,7 @@ fn the_verb_prints_a_row_for_each_size_and_share() {
     );
     assert_eq!(
         filer.lookups(),
-        [vec![1; 12], vec![5; 12], vec![12; 12]].concat()
+        [vec![1; 8], vec![5; 12], vec![12; 12]].concat()
     );
     let asked = filer.asked();
     assert!(
@@ -416,7 +508,7 @@ fn the_verb_prints_a_row_for_each_size_and_share() {
         names, want,
         "the listed files, f01-dir left out, taken absent"
     );
-    let first_check_of_12 = &asked[12 + 4 * 5 * 3..][..12];
+    let first_check_of_12 = &asked[8 + 4 * 5 * 3..][..12];
     let names: Vec<&str> = first_check_of_12
         .iter()
         .map(|(_, name)| name.as_str())
@@ -512,7 +604,11 @@ fn flags_that_do_not_fit_are_usage_errors() {
     let filer = filer_with(&rt, 1);
     let address = filer.address();
     let long_prefix = "p".repeat(1100);
-    let lag = lag_flags;
+    let dead = format!("http://{}", kbf_testkit::port::dead_addr());
+    let dir = scratch("usage");
+    let missing = dir.path().join("keys.json");
+    let missing = missing.to_str().expect("utf-8");
+    let lag = |extra: &[&'static str]| lag_flags(&dead, missing, extra);
     let cases: Vec<(Vec<&str>, String)> =
         vec![
         (
@@ -554,14 +650,14 @@ fn flags_that_do_not_fit_are_usage_errors() {
                 .to_owned(),
         ),
         (
-            lag(&["--lag-prefix", &long_prefix]),
+            lag_flags(&dead, missing, &["--lag-prefix", &long_prefix]),
             "--lag-prefix: object key has 1104 bytes; at most 1024 are allowed".to_owned(),
         ),
         (
             lag(&[]),
-            "--lag-store-credentials-file /nonexistent/keys.json: No such file or directory (os \
-             error 2)"
-                .to_owned(),
+            format!(
+                "--lag-store-credentials-file {missing}: No such file or directory (os error 2)"
+            ),
         ),
     ];
     for (extra, want) in cases {
@@ -680,6 +776,7 @@ fn the_lag_store_is_checked_before_anything_is_written() {
     let filer = filer_with(&rt, 1);
     let address = filer.address();
     let dir = scratch("checked");
+    let dead = format!("http://{}", kbf_testkit::port::dead_addr());
     let open = keys_file(
         dir.path(),
         "open.json",
@@ -717,28 +814,28 @@ fn the_lag_store_is_checked_before_anything_is_written() {
     };
 
     assert_eq!(
-        refuse("http://127.0.0.1:1", &open),
+        refuse(&dead, &open),
         format!(
             "--lag-store-credentials-file {}: mode 0640 lets others read a secret: use 0600",
             open.display()
         )
     );
     assert_eq!(
-        refuse("http://127.0.0.1:1", &junk),
+        refuse(&dead, &junk),
         format!(
             "--lag-store-credentials-file {}: not JSON with access_key_id and secret_access_key",
             junk.display()
         )
     );
     assert_eq!(
-        refuse("http://127.0.0.1:1", &no_secret),
+        refuse(&dead, &no_secret),
         format!(
             "--lag-store-credentials-file {}: not JSON with access_key_id and secret_access_key",
             no_secret.display()
         )
     );
     assert_eq!(
-        refuse("http://127.0.0.1:1", &not_a_file),
+        refuse(&dead, &not_a_file),
         format!(
             "--lag-store-credentials-file {}: Is a directory (os error 21)",
             not_a_file.display()
@@ -824,6 +921,11 @@ fn the_lag_rounds_write_look_and_delete() {
     assert_eq!(
         lag_names,
         [
+            // The untimed look that opens the connection, then one look a round.
+            (
+                "/buckets/swfs-bench/kbf-bench/lag/n1".to_owned(),
+                "0".to_owned()
+            ),
             (
                 "/buckets/swfs-bench/kbf-bench/lag/n1".to_owned(),
                 "0".to_owned()
