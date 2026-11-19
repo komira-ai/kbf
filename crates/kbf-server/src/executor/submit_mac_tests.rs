@@ -169,6 +169,7 @@ async fn a_mac_action_is_a_native_job_with_the_tree_and_the_put_directory_under_
     assert_eq!(spec.labels[FRONTEND_LABEL], "front");
     assert!(spec.labels.contains_key(INSTANCE_LABEL));
     assert_eq!(spec.labels["size-class"], "root.pkg.t.build");
+    assert_eq!(spec.labels["size-fallback"], "cc.build.kind");
     assert_eq!(
         spec.needs,
         Some(js_proto::v1::Needs::default()),

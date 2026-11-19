@@ -7,8 +7,8 @@ use kbf_types::OperationId;
 use ring::digest::{SHA256, digest};
 
 use super::{
-    Booking, FRONTEND_LABEL, INSTANCE_LABEL, Preparer, Settled, job_id, pinned, prepare, require,
-    wall_seconds,
+    Booking, FRONTEND_LABEL, INSTANCE_LABEL, Preparer, Settled, job_id, labels, pinned, prepare,
+    require, wall_seconds,
 };
 use crate::executor::metrics::Metrics;
 use crate::executor::outcome::{Verdict, judge};
@@ -342,10 +342,14 @@ async fn prepare_builds_the_job_the_service_is_asked_for() {
     assert_eq!(spec.constraints.as_ref(), Some(&cfg.constraints()));
     assert_eq!(spec.network(), NetworkLevel::None);
     assert!(spec.ports.is_empty());
-    assert_eq!(spec.labels.len(), 3);
+    assert_eq!(spec.labels.len(), 4);
     assert_eq!(
         spec.labels.get("size-class").map(String::as_str),
         Some("root.pkg.t.build")
+    );
+    assert_eq!(
+        spec.labels.get("size-fallback").map(String::as_str),
+        Some("cc.build.kind")
     );
     assert_eq!(
         spec.labels.get(FRONTEND_LABEL).map(String::as_str),
@@ -369,7 +373,7 @@ fn an_action_books_the_whole_host_only_for_a_whole_machine() {
 
 /// Catches a whole-host need the service would refuse, or one that is sized: it needs the whole
 /// host and nothing else (no CPU, memory, disk or GPU, which the service refuses beside
-/// `whole_host`) and carries no size class (it is never sized, and its runs would teach the
+/// `whole_host`) and carries no size class and no kind (it is never sized, and its runs would teach the
 /// class a whole host's use), where a share needs nothing named and carries its class.
 #[test]
 fn a_whole_host_needs_the_whole_host_alone_and_is_never_sized() {
@@ -384,6 +388,31 @@ fn a_whole_host_needs_the_whole_host_alone_and_is_never_sized() {
     assert_eq!(Booking::WholeHost.class(&class), None);
     assert_eq!(BOOKING.needs(), Needs::default());
     assert_eq!(BOOKING.class(&class), Some(&class));
+}
+
+/// Asserts the size labels of a job by its booking and its action: a share names its class and,
+/// as `size-fallback`, its kind; a whole host names neither (it is never sized, and its runs
+/// would teach the kind a whole host's use); an action with no program names its class and no
+/// kind. Catches a job that sends no kind, so a target with few runs is booked the cold size
+/// though its kind has an estimate, and a whole-host job teaching its kind.
+#[test]
+fn a_job_names_its_kind_beside_its_class_except_on_a_whole_host() {
+    let harness = Harness::new();
+    let ctx = harness.preparer();
+    let class = built_class();
+    let shared = labels(&ctx, BOOKING.class(&class));
+    assert_eq!(shared.len(), 4, "{shared:?}");
+    assert_eq!(shared["size-class"], "root.pkg.t.build");
+    assert_eq!(shared["size-fallback"], "cc.build.kind");
+    let whole = labels(&ctx, Booking::WholeHost.class(&class));
+    assert_eq!(whole.len(), 2, "{whole:?}");
+    assert!(!whole.contains_key("size-class") && !whole.contains_key("size-fallback"));
+    let out = "buck-out/v2/art/root/7a3c1e9f0b2d4c68/pkg/__t__/o".to_owned();
+    let bare = SizeClass::of_action(&crate::action_usage::Shape::of(&[], &[out]));
+    let no_kind = labels(&ctx, Some(&bare));
+    assert_eq!(no_kind.len(), 3, "{no_kind:?}");
+    assert_eq!(no_kind["size-class"], "root.pkg.t.build");
+    assert!(!no_kind.contains_key("size-fallback"));
 }
 
 /// An ingest whose mint fails as told.

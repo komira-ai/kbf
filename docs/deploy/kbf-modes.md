@@ -178,9 +178,13 @@ the job's arguments are the tool's flags and nothing is mounted into the contain
 cores and no memory: it carries a `size-class` label, the action's build target and whether it is
 a test run (`root//crates/kbf-server:kbf-server` built is `root.crates.kbf-server.kbf-server.build`,
 its test run `….test`; an action whose output paths name no target is `shape.` and its shape key),
-and the job service books it what the past runs of that class used, or, for a class with too few
-runs, its cold size (jobscheduler's `docs/design/sizing.md`, section 7.7). A Mac job names no
-cores or memory either, with the same label. A job needs a host of `os=linux` and
+and a `size-fallback` label, the action's kind: what runs, its program and a subcommand or flag
+of it, and whether it is a test run (`zig cc …` built is `zig.cc.build.kind`, `env bash
+<genrule.sh>` is `env.bash.build.kind`; an action with no arguments has none). The job service
+books it what the past runs of its class used; for a class with too few runs, what the runs of its
+kind used, which every target of the kind teaches; and for a kind with too few runs as well, its
+cold size (jobscheduler's `docs/design/sizing.md`, sections 7.7 and 7.8). A Mac job names no
+cores or memory either, with the same labels. A job needs a host of `os=linux` and
 `--executor-arch` (default `x86_64`) that runs containers, and a wall limit of the action's
 timeout plus the run margin. The Macs of the job service are used when `--executor-mac-task-bundle` is given (the release's `kbf-task`
 bundle by its manifest digest, the image of a Mac job; without it no macOS action is run),
