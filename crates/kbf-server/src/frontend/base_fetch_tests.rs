@@ -776,7 +776,7 @@ fn prune_passes_over_a_download_that_is_gone() {
 /// Catches a prune that removes the release another process serves from (an old frontend
 /// draining beside two newer ones, all over one cache): a release held under a shared lock is
 /// passed over, whatever `keep` says and however old it is, and removed by the first prune after
-/// it is let go.
+/// it is let go. A file that bears a commit's name is no release and is never removed.
 #[test]
 fn prune_passes_over_a_release_another_process_holds() {
     let dir = scratch_dir("base-fetch-prune-held");
@@ -788,6 +788,9 @@ fn prune_passes_over_a_release_another_process_holds() {
     }
     let holder = std::fs::File::open(dir.path().join(&held)).expect("opened");
     holder.lock_shared().expect("held");
+    // A file with a commit's name is no release, and is left.
+    let loose = dir.path().join("8".repeat(40));
+    std::fs::write(&loose, "a file").expect("a file");
 
     let removed = prune(dir.path(), COMMIT, 0, now, day).expect("pruned");
     assert_eq!(removed, [dir.path().join(&free)]);
@@ -799,6 +802,7 @@ fn prune_passes_over_a_release_another_process_holds() {
     drop(holder);
     let removed = prune(dir.path(), COMMIT, 0, now, day).expect("pruned");
     assert_eq!(removed, [dir.path().join(&held)]);
+    assert!(loose.is_file(), "a file named as a commit was removed");
 }
 
 /// Catches two updates within one drain removing the release of the frontend still draining:

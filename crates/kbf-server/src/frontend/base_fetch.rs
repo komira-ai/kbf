@@ -168,19 +168,17 @@ impl Cache {
         .map_err(io::Error::other)
         .and_then(std::convert::identity);
         let dir = match locked {
-            Ok(dir) => Some(dir),
+            Ok(dir) => dir,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
             Err(e) => {
                 tracing::warn!(dir = %release.display(), error = %e, "the base tree release could not be held: another frontend's prune may remove it");
-                None
+                return base_publish::is_staged(release, commit, platform);
             }
         };
         if !base_publish::is_staged(release, commit, platform) {
             return false;
         }
-        if let Some(dir) = dir {
-            let _ = self.held.set(dir);
-        }
+        let _ = self.held.set(dir);
         true
     }
 

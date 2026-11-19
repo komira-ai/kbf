@@ -167,3 +167,44 @@ async fn an_answer_the_store_refused_is_written_again_and_frees_the_action() {
         "the next Execute followed"
     );
 }
+
+/// Catches a follower that runs the action again, or answers otherwise, when the operation it
+/// follows fails for a reason other than a cancel: the follower's callers get that failure, and
+/// no job of its own is submitted.
+#[tokio::test(start_paused = true)]
+async fn a_follower_is_answered_with_the_failure_of_the_operation_it_follows() {
+    let rig = Rig::stored().await;
+    let theirs = rig.rows("p-other");
+    let action = digest_of(5);
+    let key = kbf_types::ActionKey {
+        instance: "main".to_owned(),
+        action,
+    };
+    let row = rows::OpRow {
+        owner: String::new(),
+        instance: "main".to_owned(),
+        hash: action.hash_hex(),
+        size: action.size_bytes,
+        attempt: 0,
+        job: "theirs".to_owned(),
+        key: Some("cas/b/1/aa".to_owned()),
+        whole_machine: false,
+    };
+    let other = kbf_types::OperationId(900_000);
+    assert_eq!(theirs.open_op(other, &row), Ok(rows::Opened::Ours));
+    let follower = rig.submit(5);
+    rig.advance(rig.cfg.poll).await;
+    assert!(follower.finished().is_none());
+
+    let failed = Finished::Failed(kbf_proto::google::rpc::Status {
+        code: Code::Internal as i32,
+        message: "the farm could not run it".to_owned(),
+        details: Vec::new(),
+    });
+    theirs
+        .finish(other, &key, &failed, std::time::Duration::from_secs(600))
+        .expect("their answer");
+    let answer = rig.until_done(&follower).await;
+    assert_eq!(answer, failed);
+    assert_eq!(rig.fake.jobs().len(), 0, "a job of the follower's own");
+}

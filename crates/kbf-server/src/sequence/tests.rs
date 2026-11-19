@@ -360,3 +360,22 @@ async fn a_deadline_passed_with_only_a_call_open_is_reported_and_the_drain_goes_
     rig.drain.sequence_finished().await;
     assert_eq!(rig.drain.phase(), Phase::Closing);
 }
+
+/// Catches a deadline that is reported with nothing open: a call that ended just before the
+/// deadline passed (by hand, before the wait looks again) leaves `deadline_passed` unset, and
+/// the drain ends.
+#[tokio::test(start_paused = true)]
+async fn a_deadline_passed_once_nothing_is_open_reports_nothing() {
+    let rig = Rig::new(timing(0, 86_400));
+    let write = rig.backend.metrics().execute.open_calls.raise();
+    assert!(rig.sequence.begin());
+    // Between two looks of the wait (every 50 ms), so the deadline is seen before the next one.
+    tokio::time::sleep(Duration::from_millis(1_025)).await;
+    assert_eq!(rig.drain.phase(), Phase::Draining);
+
+    drop(write);
+    rig.drain.pass_deadline();
+    rig.drain.sequence_finished().await;
+    assert!(!rig.drain.deadline_passed(), "reported with nothing open");
+    assert_eq!(rig.drain.phase(), Phase::Closing);
+}

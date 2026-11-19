@@ -162,11 +162,12 @@ impl Sequence {
                 // The deadline only stops the waiting and says so: nothing is closed or
                 // released over the open executions, which finish or are ended by a second
                 // signal or `--shutdown-timeout-secs`.
-                if self.stand.busy() {
+                let (open, calls) = (self.stand.open_executions(), self.stand.open_calls());
+                if open > 0 || calls > 0 {
                     drain.mark_deadline_passed();
                     tracing::warn!(
-                        open = self.stand.open_executions(),
-                        calls = self.stand.open_calls(),
+                        open,
+                        calls,
                         deadline = ?timing.deadline,
                         "the drain deadline passed with executions or calls open: still serving \
                          them, waiting for them to end"
