@@ -1221,7 +1221,25 @@ fn notes_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             output_is(release, job, "set-hash", step.id.as_deref().unwrap_or(""), "set-hash", out)?;
         }
     }
-    if let Some((at, _, words)) = run_of(job, &steps, "cargo xtask release notes ", out) {
+    // The release before is the one `release previous` chose from the published releases.
+    if let Some((_, _, words)) = run_of(job, &steps, "cargo xtask release previous ", out) {
+        flag_is(
+            &words,
+            "release previous",
+            "--repo",
+            "$GITHUB_REPOSITORY",
+            out,
+        );
+    }
+    if let Some((at, step, words)) = run_of(job, &steps, "cargo xtask release notes ", out) {
+        flag_is(&words, "release notes", "--previous", "$PREVIOUS", out);
+        env_is(
+            job,
+            step,
+            "PREVIOUS",
+            "${{ steps.previous.outputs.previous }}",
+            out,
+        );
         for (flag, var) in [("--tag", "$TAG"), ("--commit", "$COMMIT")] {
             flag_is(&words, "release notes", flag, var, out);
         }

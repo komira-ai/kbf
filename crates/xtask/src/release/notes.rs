@@ -23,31 +23,76 @@ const MAX_COMMITS: usize = 200;
 const FIRST_RELEASE_INSTALLER: &str = "Hosts running an untagged earlier build: upgrade \
     kbf-installer before staging (older installers may refuse this build's version output).";
 
-/// The `kbf --version --json` of the release being made and of the one before it, which
+/// The release before the one being made, and the `kbf --version --json` of both, which
 /// the caller ran from attested tarballs only.
 pub struct Identities<'a> {
+    /// The release before this one, as `release previous` named it (empty: none).
+    pub since: &'a str,
     /// This release's identity.
     pub current: &'a Path,
     /// The previous release's: required exactly when there is a previous release.
     pub previous: Option<&'a Path>,
 }
 
-/// The release before `tag`: the nearest earlier `v*` tag (in version order) that is
-/// stable (no `-` suffix) and an ancestor of `commit`. A release candidate, a withdrawn
-/// side branch and a tag that sorts before by name only are not "the release before".
-pub fn previous_release(repo: &Path, tag: &str, commit: &str) -> Result<Option<String>, Error> {
+/// The release tags before `tag` that could be the release before it, nearest first: each
+/// a `v*` tag earlier in version order, stable (no `-` suffix) and an ancestor of `commit`.
+/// A release candidate, a withdrawn side branch and a tag that sorts before by name only
+/// are not among them. A tag `v*` does not list has no place in the order: none are.
+fn candidates(repo: &Path, tag: &str, commit: &str) -> Result<Vec<String>, Error> {
     let tags = git::release_tags(repo)?;
-    // A tag `v*` does not list has no place in the order: a first release.
     let Some(at) = tags.iter().position(|t| t == tag) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let before = &tags[..at];
-    for t in before.iter().rev().filter(|t| !t.contains('-')) {
+    let mut found = Vec::new();
+    for t in tags[..at].iter().rev().filter(|t| !t.contains('-')) {
         if git::is_ancestor(repo, &format!("refs/tags/{t}"), commit)? {
-            return Ok(Some(t.clone()));
+            found.push(t.clone());
         }
     }
-    Ok(None)
+    Ok(found)
+}
+
+/// The release before `tag`, and the tags passed over to reach it (nearest first): the
+/// nearest candidate (see [`candidates`]) that `published` holds. A tag with no published
+/// release (a release run that failed after it tagged) has no files to download and no
+/// notes, so it is no release: its commits are in the notes of the next one that is.
+pub fn previous_release(
+    repo: &Path,
+    tag: &str,
+    commit: &str,
+    published: &BTreeSet<String>,
+) -> Result<(Option<String>, Vec<String>), Error> {
+    let mut passed = Vec::new();
+    for t in candidates(repo, tag, commit)? {
+        if published.contains(&t) {
+            return Ok((Some(t), passed));
+        }
+        passed.push(t);
+    }
+    Ok((None, passed))
+}
+
+/// `previous` as the release before `tag` that `release notes` is told of (empty: none):
+/// one of its [`candidates`], or refused. Which candidate is the nearest published one is
+/// `release previous`'s to say, and is not checked here: an older published candidate
+/// passes, so the workflow hands `release previous`'s answer on unchanged (its lint holds
+/// the wiring).
+fn checked_previous(
+    repo: &Path,
+    tag: &str,
+    commit: &str,
+    previous: &str,
+) -> Result<Option<String>, Error> {
+    if previous.is_empty() {
+        return Ok(None);
+    }
+    if candidates(repo, tag, commit)?.iter().any(|t| t == previous) {
+        return Ok(Some(previous.to_owned()));
+    }
+    Err(Error::Failed(format!(
+        "--previous {previous}: not a stable release tag before {tag} that is an ancestor of \
+         {commit}"
+    )))
 }
 
 /// The notes of `s`: refused, like `release verify`, when the tag or the commit is not the
@@ -55,7 +100,7 @@ pub fn previous_release(repo: &Path, tag: &str, commit: &str) -> Result<Option<S
 /// record is shown and never judged.
 pub fn notes(s: &Subject, ids: &Identities) -> Result<String, Error> {
     let verified = verify(s)?;
-    let since = previous_release(s.repo_dir, s.tag, s.commit)?;
+    let since = checked_previous(s.repo_dir, s.tag, s.commit, ids.since)?;
     let current = identity_of(ids.current, s.commit, "--version-json").map_err(Error::Failed)?;
     let previous = match (&since, ids.previous) {
         (None, None) => None,

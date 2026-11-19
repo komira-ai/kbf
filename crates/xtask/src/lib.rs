@@ -790,6 +790,10 @@ enum ReleaseVerb {
         /// `kbf --version --json` of this release's binary, run from an attested tarball.
         #[arg(long)]
         version_json: PathBuf,
+        /// The release before this one, as `release previous` printed it (`previous=`);
+        /// empty for a first release.
+        #[arg(long)]
+        previous: String,
         /// The same for the previous release (`release previous` names it); required
         /// exactly when there is one.
         #[arg(long)]
@@ -809,22 +813,10 @@ enum ReleaseVerb {
         #[arg(long)]
         out: PathBuf,
     },
-    /// The release before `--tag`, if any: prints `previous=<tag>` and
-    /// `previous-commit=<sha>` (both empty for a first release).
-    Previous {
-        /// A checkout that holds the tags and main's history.
-        #[arg(long, default_value = ".")]
-        repo_dir: PathBuf,
-        /// The release tag.
-        #[arg(long)]
-        tag: String,
-        /// The commit being released, a full SHA.
-        #[arg(long)]
-        commit: String,
-        /// Append the two lines to this file (on Actions, `GITHUB_OUTPUT`).
-        #[arg(long)]
-        output: Option<PathBuf>,
-    },
+    /// The release before `--tag`, if any: the nearest earlier stable tag on its history
+    /// with a published release. Prints `previous=<tag>` and `previous-commit=<sha>` (both
+    /// empty for a first release).
+    Previous(release::previous::PreviousArgs),
 }
 
 /// What `release verify` and `release notes` check a release against.
@@ -1356,40 +1348,11 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 out.display()
             )])
         }
-        Verb::Release(ReleaseVerb::Previous {
-            repo_dir,
-            tag,
-            commit,
-            output,
-        }) => {
-            build_commit::full_commit("--commit", &commit)?;
-            let found = release::notes::previous_release(&repo_dir, &tag, &commit)?;
-            let at = match &found {
-                Some(prev) => release::commit_of(&repo_dir, prev)?,
-                None => String::new(),
-            };
-            let lines = vec![
-                format!("previous={}", found.unwrap_or_default()),
-                format!("previous-commit={at}"),
-            ];
-            if let Some(output) = output {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&output)
-                    .and_then(|mut f| {
-                        std::io::Write::write_all(
-                            &mut f,
-                            format!("{}\n", lines.join("\n")).as_bytes(),
-                        )
-                    })
-                    .map_err(Error::spawn(format!("append to {}", output.display())))?;
-            }
-            Ok(lines)
-        }
+        Verb::Release(ReleaseVerb::Previous(args)) => release::previous::run(&args),
         Verb::Release(ReleaseVerb::Notes {
             subject,
             version_json,
+            previous: since,
             previous_version_json,
             out,
         }) => {
@@ -1397,6 +1360,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 .filter(|p| !p.is_empty())
                 .map(PathBuf::from);
             let ids = release::notes::Identities {
+                since: &since,
                 current: &version_json,
                 // The workflow passes an empty path when there is no previous release.
                 previous: previous.as_deref(),
