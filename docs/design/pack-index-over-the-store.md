@@ -55,9 +55,15 @@ The answers that use the rule:
 verification. The default is 5 min. It is one flag, and it may be set up to 1 h. That is the only window for a stale
 hit.
 
-**The worst case** for a client that asks again is a rebuild. A Buck2 daemon that already holds a deleted output's
-digest does not ask again, and Buck2 cannot recover from that by itself (section 6). For that case kbf's answer is a
-failed build that names its remedy: restart the daemon, and the next build reruns the producer.
+**An "exists" answer is a promise.** A client trusts it for its own window: Buck2 does for `cas_ttl_secs`. So the
+client's window is set equal to `VERIFIED_FOR` (6.2), and kbf itself deletes nothing in this design.
+
+**A deletion by the store inside that window fails a build. It is not a rebuild.** Buck2 does not recover from MISSING
+(section 6). The user reruns once the window has passed, which recovers an input the client still has (it uploads it
+again). For an output the daemon holds only by digest, the user runs `buck2 killall` and builds again, which reruns the
+producer.
+
+For a client that asks again, the worst case is a rebuild.
 
 Consequences:
 
@@ -328,23 +334,57 @@ is then deleted, and the same daemon builds B, which takes X as an input.
 - With the rule of section 1, that lookup is a miss, because X's pack is found missing. A runs again, X is recorded
   anew, and B builds.
 
+**Buck2's main branch (at `bd01284`) differs in how long it trusts an answer, not in the outcome.**
+
+- Outputs carry `cas_ttl_secs` as their TTL, instead of 0 (`remote_execution/oss/re_grpc/src/client.rs:774-779`).
+- The find-missing cache is cleared every `cas_ttl_secs`, instead of every 12 h (`client.rs:1028-1031`).
+- A presence check answers any digest whose recorded expiry is more than 45 min away (`HEADROOM`) from that record,
+  and asks about the rest (`app/buck2_execute/src/re/presence.rs:87`, `:171-205`).
+- A finished Execute is run again only on UNAVAILABLE, ABORTED, UNKNOWN or INTERNAL. FAILED_PRECONDITION is not one of
+  them (`client.rs:804`, held by a test in the same file).
+
+With `cas_ttl_secs` at 5 min, every expiry is inside the headroom, so a digest is asked about again once the cache is
+cleared, at most 5 min after the last answer. In the pinned release, the 12 h cache can answer "exists" for up to
+12 h, whatever `cas_ttl_secs` says.
+
 **So Buck2 does not recover by itself.** A live daemon that holds a deleted output's digest fails every build that needs
 it, until it is restarted. The farm test of phase 0 checks this reading at runtime.
 
 ### 6.2 What kbf does instead
 
-kbf cannot make a live Buck2 daemon rerun a producer. Two things can be done, and this design does both:
+kbf cannot make a live Buck2 daemon rerun a producer. So it does three things.
 
-1. **The failure is one build, and it names its remedy.**
-   - In the 5 h branch, Buck2's own message already says "buck2 killall".
-   - In the other branch, the failure carries kbf's MISSING answer. Buck2 keeps an error's message text when it reports
-     it (`app/buck2_execute/src/re/error.rs:97-118`). Phase 2 therefore makes the message of an Execute answered
-     MISSING name the blob and the remedy, for example: `1 input blob is not in the CAS (blobs/<hash>/<size>); if it
-     is an output this Buck2 daemon built earlier, the store deleted it: run "buck2 killall" and build again to
-     rebuild it`.
-   - The status and its one MISSING detail per blob are unchanged, so Bazel and other clients still re-upload.
-2. **The restart then rebuilds.** The fresh daemon's action-cache lookup of the producer is a miss (section 4), so the
-   producer runs again. That is the rule this design adds, and the farm test proves it.
+**1. Match the client's trust window to kbf's.**
+
+- kbf reports no TTL. FindMissingBlobs carries none, and kbf serves no `GetDigestsTtl` **[code]**. The OSS Buck2
+  client therefore makes up its own window from `cas_ttl_secs` (6.1).
+- Every committed Buck2 configuration that points at kbf sets `[buck2_re_client] cas_ttl_secs = 300`, equal to
+  `VERIFIED_FOR`. In this repository that is the gamma fixture's `.buckconfig`, the overlay `prove-farm` renders, and
+  the one `kbf-deploy pilot buckconfig` writes. The komira and buildrules repositories carry the same line, each in its
+  own pull request.
+- kbf pins a Buck2 release whose find-missing cache follows `cas_ttl_secs`, as main does. The pinned `2026-10-01`
+  keeps a fixed 12 h cache.
+- If `--pack-verified-for` is ever changed, the buckconfig line changes with it.
+
+With both windows at 5 min, a client trusts an "exists" no longer than kbf would itself answer it without asking the
+store.
+
+**2. Say plainly what a deletion inside the window does.** It fails the build that needs the blob. Then:
+
+- **An input the client still has** (a source): rerun after the window, 5 min. Buck2 asks again, is told missing,
+  uploads the input, and the build succeeds.
+- **An output the daemon holds only by digest:** run `buck2 killall` and build again. Buck2's own message already
+  says so when the producer is 5 h old or more. Otherwise the failure carries kbf's MISSING answer, whose message
+  Buck2 keeps when it reports it (`app/buck2_execute/src/re/error.rs:97-118`). Phase 2 makes that message say both,
+  for example: `1 input blob is not in the CAS (blobs/<hash>/<size>); the store deleted it. If you hold it, it is
+  uploaded again when you rerun after 5 min; if it is an output this Buck2 daemon built earlier, run "buck2 killall"
+  and build again`.
+- The status and its one MISSING detail per blob are unchanged, so Bazel and other clients still re-upload. An Execute
+  answered MISSING is still right: it fails fast, before any job, and it is true. It is just not a recovery path for
+  Buck2.
+
+**3. Make the restart rebuild.** The fresh daemon's action-cache lookup of the producer is a miss (section 4), so the
+producer runs again. That is the rule this design adds, and the farm test proves it.
 
 **What is not done.** kbf does not rerun producers itself. To keep a daemon in the 5 h branch from failing,
 FindMissingBlobs would have to answer "present" for bytes kbf no longer has, and rebuild them on demand. That breaks
@@ -381,10 +421,14 @@ The steps:
 7. The hybrid variant: steps 1 to 3 on a platform with local execution enabled. This records which error reaches the
    user, Buck2's `CasNotFoundError` or kbf's message. That decides whether kbf's message is seen at all.
 
+8. The window: on a Buck2 with main's cache and `cas_ttl_secs = 300`, delete the pack of a *source* input of `//:b`,
+   rows and object both. Build `//:b` at once. Expected: the build fails. Wait 5 min and build again. Expected: Buck2
+   uploads the source again, and the build succeeds.
+
 Each step's result, with Buck2's `Commands:` line and kbf's log for the action, is recorded in this document's
 section 8.
 
-- **If steps 3 to 7 match:** the design stands as written.
+- **If steps 3 to 8 match:** the design stands as written.
 - **If step 5 does not rebuild:** the remedy of 6.2 is wrong. Nothing else is built until this document says what kbf
   does instead.
 - **If step 3 recovers:** Buck2 reruns producers after all. Section 6.2's message change is then unnecessary, and is
@@ -438,6 +482,7 @@ Testing rules for every phase:
 | Phase | PR | Depends on | Adds |
 |---|---|---|---|
 | 0 | what Buck2 does with MISSING | none; **before any code** | section 6.1 (this PR), and the farm test of 6.3, whose results a doc PR records in section 8 |
+| 0b | the client's trust window | none | `cas_ttl_secs = 300` in kbf's committed Buck2 configurations (6.2), and the same line in the komira and buildrules repositories in their own PRs; the Buck2 pin moved to a release whose find-missing cache follows `cas_ttl_secs` |
 | 1a | the filer client and its measurement | 0's results matching 6.1, or this document revised for them | `FilerPresence` (vendored `filer.proto`) in `kbf-objstore`; `cargo xtask filer-presence-bench`; a doc PR with the numbers |
 | 1b | the clock and the check, on the path that already asks the store | 1a | migration 5 (`pack.verified_us`); the record sets it; the batch, the HEAD confirmation and the HEAD fallback; `--pack-store-filer`, `--pack-store-filer-root`, `--pack-verified-for`; the start-up check; the action tree's check switched from one HEAD per pack to one batch; metrics `kbf_pack_check_*` |
 | 2 | verify on every answer | 1b, and 1a's numbers meeting the gate of section 7 | the rule in FindMissingBlobs, GetActionResult, the Execute walk (files and Directories), job trees and memos, and `put_large`; the forget of 4.2; read and mount absences clearing the clock; the `LossGuard` timing retired; the MISSING message of 6.2 |
@@ -455,6 +500,14 @@ Section 6.1 is the source reading. The farm test of 6.3 checks it, and each of i
 - **Step 5** catches a remedy that does not rebuild: the action cache answering a stale hit after the restart.
 - **Step 6** catches the 5 h branch behaving differently from the source.
 - **Step 7** catches a remedy message the user never sees.
+- **Step 8** catches a client that trusts "exists" longer than kbf's window.
+
+### Phase 0b: the client's trust window
+
+- `the_committed_buckconfigs_trust_exists_for_verified_for`, a repository lint over the gamma fixture's `.buckconfig`,
+  the `prove-farm` overlay and the pilot overlay, comparing their `cas_ttl_secs` with the default of
+  `--pack-verified-for`: catches a client window that drifts from kbf's.
+- The `prove-farm` and pilot overlay tests assert the line: catches an overlay that drops it.
 
 ### Phase 1a: the filer client and its measurement
 
@@ -526,6 +579,9 @@ correctness. Two things will matter for it:
 - **It must judge by use, not age**, or it rebuilds every toolchain each retention. Each successful check and each
   PUT already move `verified_us`, so a collector can read use from that column. A pack used within `VERIFIED_FOR`
   updates nothing, so the column's precision is `VERIFIED_FOR`, which is enough against a retention measured in days.
+- **It must never delete a pack a client may still trust.** Every present answer is made within `VERIFIED_FOR` of the
+  pack's `verified_us`, and a client trusts it for `cas_ttl_secs` (equal to `VERIFIED_FOR`). Buck2 also allows its 45
+  min `HEADROOM`. So a pack whose `verified_us` is within 2 × `VERIFIED_FOR` + 45 min is never deleted.
 - **What 6.1 means for it.** Every pack it deletes may be an output some live Buck2 daemon holds. That costs that
   daemon a failed build and a restart (6.2). Its retention should be long against how long builders keep daemons.
 
