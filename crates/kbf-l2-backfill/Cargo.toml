@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The operator tool that gives the tree lists written before dual emission their L2 sidecar
+# The operator tool that gives the tree lists recorded unlisted their L2 sidecar
 # (`kbf_front::action_tree::Sidecars::backfill`), and that samples the pack index's live keys
 # for `tierstore store audit --keys`. It is a binary of its own and never part of `kbf`: it
 # does nothing unless an operator runs it, and a run is a dry run unless `--mode apply` is given.

@@ -1,5 +1,6 @@
 //! The backfill pass: the unlisted trees of the pack index, one at a time.
 
+use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -133,6 +134,12 @@ async fn handle(
         Err(ObjectStoreError::NotFound(_)) => return gone(mode, index, tree),
         Err(error) => return Outcome::Failed(format!("reading {key}: {error}")),
     };
+    // The sidecar's key and the row dropped are made from the bytes read: they must be the
+    // tree's, or another tree would get a sidecar and this one keep its row.
+    let read: [u8; 32] = Sha256::digest(&list).into();
+    if read != *tree {
+        return Outcome::Failed(format!("the bytes of {key} are not the tree it names"));
+    }
     match sidecars.backfill(&list).await {
         Ok(done) => Outcome::Written {
             objects: done.objects_read as u64,

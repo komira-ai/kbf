@@ -21,5 +21,11 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = File::create(&temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    std::fs::rename(&temp, path)
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    // The rename is durable once the directory that holds the name is.
+    let parent = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+    File::open(parent.unwrap_or(Path::new(".")))?.sync_all()
 }

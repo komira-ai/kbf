@@ -100,3 +100,27 @@ fn a_refusal_is_status_2_and_a_failure_status_1() {
     assert_eq!(io.code(), 1);
     assert_eq!(io.to_string(), "failed: disk");
 }
+
+/// Asserts that a file written whole lands under its name with nothing left beside it, and that
+/// a rename that fails (the name is a directory) leaves no temporary file behind.
+#[test]
+fn a_file_is_written_whole_and_a_failed_rename_leaves_no_temporary_file() {
+    let world = crate::support::World::new("units-atomic");
+    let path = world.path("report.json");
+
+    kbf_l2_backfill::files::write_atomic(&path, b"{}").expect("written");
+
+    assert_eq!(std::fs::read(&path).expect("read"), b"{}");
+    assert!(!world.path("report.json.tmp").exists());
+    let taken = world.path("taken");
+    std::fs::create_dir(&taken).expect("a directory");
+    std::fs::write(taken.join("inside"), b"x").expect("a file in it");
+
+    let failed = kbf_l2_backfill::files::write_atomic(&taken, b"{}");
+
+    assert!(failed.is_err());
+    assert!(
+        !world.path("taken.tmp").exists(),
+        "the temporary file is removed"
+    );
+}

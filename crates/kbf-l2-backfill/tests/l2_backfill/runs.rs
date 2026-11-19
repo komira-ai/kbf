@@ -247,6 +247,7 @@ fn a_drop_that_fails_and_a_list_that_is_not_one_are_failed() {
     assert_eq!(ran.code, 1);
     says(&ran.out, "failed 2");
     says(&ran.out, "dropping the unlisted row");
+    says(&ran.out, "are not the tree it names");
 }
 
 /// Asserts that an index that cannot list the unlisted trees ends the run with status 1, and

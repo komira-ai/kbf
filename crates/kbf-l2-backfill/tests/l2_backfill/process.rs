@@ -83,7 +83,8 @@ fn a_refusal_is_status_2_and_an_index_that_is_not_there_is_status_1() {
     let at = argv
         .iter()
         .position(|a| a == "postgres:///kbf?host=/run/postgresql");
-    argv[at.expect("the url")] = "postgres:///kbf?host=/nonexistent-socket-dir".into();
+    let no_server = world.path("no-server");
+    argv[at.expect("the url")] = format!("postgres:///kbf?host={}", no_server.display()).into();
     let failed = main_with(argv, &mut out, &mut err);
     assert_eq!(failed, 1);
     says(&String::from_utf8_lossy(&err), "kbf-l2-backfill: failed:");
@@ -95,9 +96,8 @@ fn a_refusal_is_status_2_and_an_index_that_is_not_there_is_status_1() {
 #[test]
 fn the_real_seams_open_a_store_and_refuse_a_missing_index() {
     let world = World::new("process-seams");
-    let config =
-        kbf_state::postgres::PostgresConfig::parse("postgres:///kbf?host=/nonexistent-socket-dir")
-            .expect("a config");
+    let url = format!("postgres:///kbf?host={}", world.path("no-server").display());
+    let config = kbf_state::postgres::PostgresConfig::parse(&url).expect("a config");
     assert!(open_postgres(&config).is_err());
 
     let args = <kbf_l2_backfill::Args as clap::Parser>::try_parse_from([

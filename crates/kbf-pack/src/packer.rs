@@ -242,8 +242,11 @@ impl<S: ObjectStore> Packer<S> {
             blobs,
         };
         let (size, blobs) = (pack.size, pack.blobs.len());
-        let recorded = self.record(pack).await?;
+        // The cells before the pack: once its blobs are locatable a tree list may name it, and
+        // its sidecar is made from recorded cells only. A row for a pack never recorded is
+        // harmless: the key is written once.
         self.record_cells(&key, &segment).await;
+        let recorded = self.record(pack).await?;
         Ok(StoredPack {
             key,
             size,
@@ -257,13 +260,17 @@ impl<S: ObjectStore> Packer<S> {
     /// hand: no read of the store. Best effort: an index that keeps no cells, or fails, leaves
     /// them to the backfill, which reads the pack once.
     async fn record_cells(&self, key: &str, segment: &Bytes) {
-        let hashed = tierstore_list::PackCells::of(segment);
-        let cells = ObjectCells {
-            size: hashed.size,
-            digests: hashed.digests,
-        };
-        let (index, owned) = (Arc::clone(&self.index), key.to_owned());
-        match offload(move || index.record_cells(&owned, &cells)).await {
+        let (index, owned, bytes) = (Arc::clone(&self.index), key.to_owned(), segment.clone());
+        // Hashing many MiB is blocking work too: it runs beside the index call, off the runtime.
+        let recorded = offload(move || {
+            let hashed = tierstore_list::PackCells::of(&bytes);
+            let cells = ObjectCells {
+                size: hashed.size,
+                digests: hashed.digests,
+            };
+            index.record_cells(&owned, &cells)
+        });
+        match recorded.await {
             Ok(_) | Err(PackIndexError::Unsupported) => {}
             Err(error) => {
                 tracing::warn!(pack = %key, %error, "the cells of a pack were not recorded: the backfill reads it");

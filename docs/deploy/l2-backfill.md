@@ -7,6 +7,10 @@ frontend writes a sidecar from cells the pack index already holds. When an objec
 has no recorded cells (it was written before cells were recorded), the sidecar is not written and
 the tree is recorded **unlisted** in the pack index.
 
+Only trees a frontend of this release wrote are recorded: a list written by an earlier release has
+no row, and gets its sidecar when a frontend writes its list again (the next run of its action
+after the tree memo lapses) or on the executor's miss path, when a host refuses it.
+
 `kbf-l2-backfill` gives those trees their sidecar, id-preserving: the list is not rewritten, and
 its id does not change. For each unlisted tree it reads the list, reads once each object the list
 names that has no recorded cells, records the cells in the pack index, writes the sidecar

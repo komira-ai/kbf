@@ -39,7 +39,7 @@ pub enum Mode {
     Apply,
 }
 
-/// Gives the tree lists written before dual emission their L2 sidecar, and samples the live keys
+/// Gives the tree lists recorded unlisted their L2 sidecar, and samples the live keys
 /// of the pack index for `tierstore store audit --keys`.
 ///
 /// The backfill takes the trees the pack index holds as unlisted (a list was written and its

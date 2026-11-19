@@ -1,5 +1,6 @@
-//! `kbf-l2-backfill`: the operator tool that gives the tree lists written before dual emission
-//! their L2 sidecar, and takes the live-key sample that `tierstore store audit --keys` reads
+//! `kbf-l2-backfill`: the operator tool that gives the tree lists recorded unlisted (a frontend
+//! stored them without an L2 sidecar: an object they name had no recorded cells) their sidecar,
+//! and takes the live-key sample that `tierstore store audit --keys` reads
 //! (tierstore's `docs/design/fetch-cache-serve.md`, 3.5 and 10.8; `docs/deploy/l2-backfill.md`
 //! is the runbook). It is a binary of its own and never part of `kbf`.
 //!

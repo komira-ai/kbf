@@ -181,7 +181,7 @@ pub(crate) async fn run(
     let metrics = Arc::clone(&inner.deps.metrics);
     let mut began = op.created;
     // The runs refused as not mountable that spent no attempt: counted here, from zero.
-    let mut refused = 0_u32;
+    let mut free_runs = 0_u32;
     let answer = loop {
         let run = RunId::new(op.id, attempt);
         let mut timeline = Timeline::default();
@@ -196,9 +196,9 @@ pub(crate) async fn run(
             Ended::HandedOver => break None,
             Ended::Again(settled, output) => {
                 metrics.run_ended(RunEnd::of(&settled));
-                let free = matches!(settled, Settled::ListRefused(_)) && refused < LIST_REFUSALS;
-                if free || (settled.retried() && attempt.saturating_sub(refused) < RESUBMITS) {
-                    refused += u32::from(free);
+                let free = matches!(settled, Settled::ListRefused(_)) && free_runs < LIST_REFUSALS;
+                if free || (settled.retried() && attempt.saturating_sub(free_runs) < RESUBMITS) {
+                    free_runs += u32::from(free);
                     tracing::warn!(operation = %op.id, %run, ?settled, free, "the run ended for a reason of the farm's: the operation runs again");
                     metrics.attempt_resubmitted();
                     if op.recorded {
