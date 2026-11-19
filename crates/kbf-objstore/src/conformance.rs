@@ -6,7 +6,8 @@
 //! paging (also past S3's 1000-key page), a listing that starts after a key or covers the whole bucket, and the footer
 //! reads a rebuild makes; the listing checks in `list` page through every page size, a
 //! prefix that matches nothing, nested keys, and keys written during a listing) and every claim in [`Capabilities`]: a store claiming conditional writes must
-//! refuse an overwrite, a store claiming Object Lock must refuse deleting a retained
+//! refuse an overwrite and never hold other bytes under a used key (of another length, or
+//! when writers race for it), a store claiming Object Lock must refuse deleting a retained
 //! object and keep it readable, and a store not claiming Object Lock must refuse a
 //! retention date rather than store the object unlocked.
 //!
@@ -100,6 +101,12 @@ pub enum Check {
     /// up with them, reads back whole; a body that fails, or ends short, stores
     /// nothing; with conditional writes, an existing key is refused and kept.
     StreamedPut,
+    /// With conditional writes, a key once written never holds other bytes: the same
+    /// bytes again are `Ok` or `AlreadyExists`; bytes of another length (shorter and
+    /// longer), by `put_new` and `put_stream`, are refused with `AlreadyExists`; of
+    /// several `put_new` calls racing for one fresh key exactly one is `Ok`; and the
+    /// key reads back the first bytes, byte for byte, every time.
+    UsedKeyKeepsItsBytes,
 }
 
 /// The outcome of one check.
@@ -234,6 +241,10 @@ pub async fn run<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Report {
         Check::StreamedPut,
         streamed_put(store, w, prefix, caps).await,
     );
+    record(
+        Check::UsedKeyKeepsItsBytes,
+        used_key::used_key_keeps_its_bytes(store, w, prefix, caps).await,
+    );
     // After every check, whatever they said: a failed check leaves objects too.
     let cleanup = cleanup::sweep(store, prefix, w).await;
     Report { results, cleanup }
@@ -251,6 +262,7 @@ macro_rules! ensure {
 
 mod cleanup;
 mod list;
+mod used_key;
 
 fn key(prefix: &KeyPrefix, name: &str) -> Result<ObjectKey, String> {
     prefix
