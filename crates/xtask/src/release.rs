@@ -39,12 +39,15 @@
 //! - `release identity <dir> --commit <sha> --out <file>` ([`identity`]): runs `kbf --version
 //!   --json` from `<dir>`'s linux-x86_64 tarball of that commit and writes what it prints. It
 //!   runs a binary: only after `check` and `verify-assets attestations` on `<dir>`.
-//! - `release previous --tag <tag> --commit <sha> [--repo-dir <checkout>] [--output
-//!   <file>]` ([`notes::previous_release`]): the nearest earlier stable `v*` tag that is
-//!   an ancestor of the commit; prints `previous=` and `previous-commit=` (empty for a
-//!   first release).
-//! - `release notes <dir> ... --version-json <file> [--previous-version-json <file>] --out
-//!   <file>` ([`notes`]): the same checks, then the release's notes: first "Before you
+//! - `release previous --repo <owner/repo> --tag <tag> --commit <sha> [--repo-dir
+//!   <checkout>] [--output <file>] [--gh <program>]` ([`previous`]): the nearest earlier
+//!   stable `v*` tag that is an ancestor of the commit and has a published release (a tag
+//!   without one is passed over, and named on stderr); prints `previous=` and
+//!   `previous-commit=` (empty for a first release).
+//! - `release notes <dir> ... --previous <tag> --version-json <file> [--previous-version-json
+//!   <file>] --out <file>` ([`notes`]): the same checks, and `--previous` (what `release
+//!   previous` printed, empty for none) must be a stable tag before this one on the commit's
+//!   history; then the release's notes: first "Before you
 //!   click" (what is not reversible, as `kbf_gate::reversible` and the `protocol` of the two
 //!   builds' `kbf --version --json` say and never from the record's own list, unknown counting as
 //!   not reversible; the waivers; the tag's Beta record in a line), then the commits since the
@@ -101,6 +104,7 @@ mod identity_file;
 pub mod image_digest;
 pub mod notes;
 pub mod plan;
+pub mod previous;
 pub mod tag;
 pub mod tags;
 pub mod verdict_write;
@@ -375,11 +379,6 @@ pub fn read_notes(path: &Path) -> Result<String, Error> {
         )));
     }
     Ok(text)
-}
-
-/// The commit tag `tag` names, in full.
-pub(crate) fn commit_of(repo: &Path, tag: &str) -> Result<String, Error> {
-    git::commit_of(repo, tag)
 }
 
 /// Which release `release publish` makes or completes.

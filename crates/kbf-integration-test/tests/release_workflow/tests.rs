@@ -1186,6 +1186,22 @@ fn a_binary_runs_only_after_its_files_are_attested() {
         ),
         "not given `--previous-version-json $PREVIOUS_IDENTITY`",
     );
+    red(
+        &plant("notes", " --previous \"$PREVIOUS\"", ""),
+        "not given `--previous $PREVIOUS`",
+    );
+    red(
+        &plant(
+            "notes",
+            "PREVIOUS: ${{ steps.previous.outputs.previous }}\n          PREVIOUS_IDENTITY",
+            "PREVIOUS: v0.0.1\n          PREVIOUS_IDENTITY",
+        ),
+        "does not set `PREVIOUS: ${{ steps.previous.outputs.previous }}`",
+    );
+    red(
+        &plant("notes", " --repo \"$GITHUB_REPOSITORY\" --tag", " --tag"),
+        "not given `--repo $GITHUB_REPOSITORY`",
+    );
 }
 
 #[test]

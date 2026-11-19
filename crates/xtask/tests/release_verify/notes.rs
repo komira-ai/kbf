@@ -1,4 +1,4 @@
-//! `cargo xtask release notes` and `release previous`: the notes show the Beta record the
+//! `cargo xtask release notes`: the notes show the Beta record the
 //! tag carries and never judge it; what is not reversible comes from the two builds.
 
 use std::path::PathBuf;
@@ -8,7 +8,7 @@ use kbf_gate::{CommitId, GateResult, Limit, ResultDoc, Sample, Status, Waiver};
 use crate::fixture::*;
 
 /// A release tag carrying a record `v0.10.0` and an older `v0.9.0` on the first commit.
-fn with_notes(name: &str, change: impl FnOnce(&mut ResultDoc)) -> Fx {
+pub fn with_notes(name: &str, change: impl FnOnce(&mut ResultDoc)) -> Fx {
     let fx = fx(name);
     fx.git(&["tag", "v0.9.0", &fx.first]);
     let mut d = good();
@@ -18,7 +18,7 @@ fn with_notes(name: &str, change: impl FnOnce(&mut ResultDoc)) -> Fx {
 }
 
 /// `kbf --version --json` of the build of `commit`, with the fields given.
-fn identity(commit: &str, meta_log: Option<u64>, protocol: Option<u64>) -> String {
+pub fn identity(commit: &str, meta_log: Option<u64>, protocol: Option<u64>) -> String {
     let mut v = serde_json::json!({"commit": &commit[..12], "profile": "release"});
     if let Some(m) = meta_log {
         v["meta_log"] = m.into();
@@ -464,81 +464,6 @@ fn a_previous_identity_for_a_first_release_is_a_usage_error() {
     );
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("there is no previous release"), "{err}");
-}
-
-/// A repository with `v0.8.0` (stable, on main), `v0.9.0-rc1` (a release candidate on
-/// main), `v0.9.5` (stable but on the side branch) and the release `v0.10.0`.
-fn with_tag_zoo(name: &str) -> Fx {
-    let fx = with_notes(name, |_| {});
-    fx.git(&["tag", "-d", "v0.9.0"]);
-    fx.git(&["tag", "v0.8.0", &fx.first]);
-    fx.git(&["tag", "v0.9.0-rc1", &fx.first]);
-    fx.git(&["tag", "v0.9.5", &fx.side]);
-    fx
-}
-
-#[test]
-fn the_previous_release_is_the_nearest_stable_ancestor() {
-    // Catches: the neighbour in the tag list taken as the previous release (here a
-    // release candidate, then a tag on a branch that is not main's history), either of
-    // which makes the commit list and the reversibility check about the wrong release.
-    let fx = with_tag_zoo("previous-zoo");
-    let cur = identity(RELEASE, Some(3), Some(1));
-    let prev = identity(&fx.first, Some(3), Some(1));
-    let ((code, o, err), out) = notes_run(&fx, &cur, Some(&prev));
-    assert_eq!(code, Some(0), "{o}{err}");
-    let notes = std::fs::read_to_string(out).unwrap();
-    assert!(notes.contains("## Commits since v0.8.0\n"), "{notes}");
-    let output = fx.root.join("out");
-    let (code, o, err) = xtask(&[
-        "release",
-        "previous",
-        "--repo-dir",
-        fx.repo().to_str().unwrap(),
-        "--tag",
-        TAG,
-        "--commit",
-        RELEASE,
-        "--output",
-        output.to_str().unwrap(),
-    ]);
-    assert_eq!(code, Some(0), "{err}");
-    let expected = format!("previous=v0.8.0\nprevious-commit={}\n", fx.first);
-    assert_eq!(o, expected);
-    assert_eq!(std::fs::read_to_string(output).unwrap(), expected);
-}
-
-#[test]
-fn a_first_release_has_no_previous_and_the_verb_says_so() {
-    // Catches: empty lines missing (the workflow's `if: previous != ''` then reads a
-    // stale output) and a tag of no place in `v*` taking another's.
-    let fx = fx("previous-none");
-    fx.git(&["tag", "v0.20.0", &fx.first]);
-    for tag in [TAG, "rc1"] {
-        let (code, o, err) = xtask(&[
-            "release",
-            "previous",
-            "--repo-dir",
-            fx.repo().to_str().unwrap(),
-            "--tag",
-            tag,
-            "--commit",
-            RELEASE,
-        ]);
-        assert_eq!(code, Some(0), "{err}");
-        assert_eq!(o, "previous=\nprevious-commit=\n", "{tag}");
-    }
-    let (code, _, err) = xtask(&[
-        "release",
-        "previous",
-        "--repo-dir",
-        fx.repo().to_str().unwrap(),
-        "--tag",
-        TAG,
-        "--commit",
-        "abc",
-    ]);
-    assert_eq!(code, Some(2), "{err}");
 }
 
 #[test]

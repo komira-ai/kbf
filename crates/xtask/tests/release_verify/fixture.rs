@@ -173,6 +173,8 @@ pub fn xtask(args: &[&str]) -> Ran {
     (out.status.code(), text(&out.stdout), text(&out.stderr))
 }
 
+/// `release notes` and `release verify` of `fx`. `notes` without `--previous` is given what
+/// `release previous` prints when every tag of `fx` has a published release.
 pub fn run(fx: &Fx, verb: &str, tag: &str, commit: &str, extra: &[&str]) -> Ran {
     let (dist, repo) = (fx.dist(), fx.repo());
     let mut args = vec![
@@ -188,8 +190,75 @@ pub fn run(fx: &Fx, verb: &str, tag: &str, commit: &str, extra: &[&str]) -> Ran 
         "--main-ref",
         "main",
     ];
+    let since;
+    if verb == "notes" && !extra.contains(&"--previous") {
+        let tags = fx.git(&["tag", "--list"]);
+        fake_gh(fx, &tags.lines().collect::<Vec<_>>(), &[]);
+        let (code, o, err) = previous(fx, tag, commit);
+        assert_eq!(code, Some(0), "release previous: {o}{err}");
+        since = o
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("previous=")
+            .unwrap()
+            .to_owned();
+        args.extend(["--previous", &since]);
+    }
     args.extend(extra);
     xtask(&args)
+}
+
+/// The repository the fake `gh` answers for.
+pub const GH_REPO: &str = "o/r";
+
+/// Makes `xtask-fake` the `gh` of `fx` (`<root>/gh/gh`, made once) and has it list the
+/// releases of `published` (not drafts) and `drafts`, on one page; returns its path.
+pub fn fake_gh(fx: &Fx, published: &[&str], drafts: &[&str]) -> PathBuf {
+    let releases: Vec<serde_json::Value> = published
+        .iter()
+        .map(|t| serde_json::json!({"tag_name": t, "draft": false}))
+        .chain(
+            drafts
+                .iter()
+                .map(|t| serde_json::json!({"tag_name": t, "draft": true})),
+        )
+        .collect();
+    fake_gh_api(fx, serde_json::json!({ RELEASES_PAGE_1: releases }))
+}
+
+/// The first page of the release list, as `release previous` asks for it.
+pub const RELEASES_PAGE_1: &str = "repos/o/r/releases?per_page=100&page=1";
+
+/// Makes `xtask-fake` the `gh` of `fx`, answering `gh api` with `api` (its `gh-api.json`).
+pub fn fake_gh_api(fx: &Fx, api: serde_json::Value) -> PathBuf {
+    let dir = fx.root.join("gh");
+    let gh = dir.join("gh");
+    if !gh.exists() {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::hard_link(env!("CARGO_BIN_EXE_xtask-fake"), &gh).unwrap();
+    }
+    std::fs::write(dir.join("gh-api.json"), api.to_string()).unwrap();
+    gh
+}
+
+/// `release previous` of `fx` for `tag` at `commit`, with the fake `gh` of `fx`.
+pub fn previous(fx: &Fx, tag: &str, commit: &str) -> Ran {
+    let (repo, gh) = (fx.repo(), fx.root.join("gh/gh"));
+    xtask(&[
+        "release",
+        "previous",
+        "--repo-dir",
+        repo.to_str().unwrap(),
+        "--repo",
+        GH_REPO,
+        "--gh",
+        gh.to_str().unwrap(),
+        "--tag",
+        tag,
+        "--commit",
+        commit,
+    ])
 }
 
 pub fn verify(fx: &Fx, tag: &str, commit: &str) -> Ran {
