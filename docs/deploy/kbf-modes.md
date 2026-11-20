@@ -271,8 +271,20 @@ default, writes the action tree as tierstore manifests and gives the job the hos
 the job tierstore's mount provider, which the host's agent asks for the tree as soon as the job is
 assigned (docs/design/actions-as-jobs.md, 4.7). `provider` needs `--task-out-mode put-dir` and a pool
 whose hosts serve the provider (`--mount-provider tierstore=<socket>` on their agents); a job no host
-can serve is refused by the job service and the farm sees an infrastructure failure. A Mac job always
-reads manifests.
+can serve is refused by the job service and the farm sees an infrastructure failure. A job whose
+tree list a host's tierstore refuses as not mountable (`tree list not supported: ...`, the list has no
+readable L2 sidecar) is not failed for it: the frontend writes that action's list again with its sidecar,
+and if the host refuses that too, gives the action's jobs its tree as manifests (`manifests` form, no
+mount provider). Neither run spends one of the operation's attempts
+(`kbf_executor_list_refused_total{step}` counts them). A Mac job always reads manifests.
+
+Beside each tree list the frontend stores its L2 sidecar (`cas/l2/<sha256>`, the same id: tierstore's
+`docs/design/fetch-cache-serve.md`, 3.5): the list's entries with the SHA-256 of every 1 MiB cell of
+each object it names, so a tierstore that reads only L2 lists verifies any cell on arrival. Older
+tierstores read the list and never the sidecar. The cells are recorded in the pack index as objects
+are written (each pack the frontend packs, each whole object the tree writer writes); a list that
+names an object with none recorded is stored without a sidecar and recorded unlisted, for
+`kbf-l2-backfill` (docs/deploy/l2-backfill.md). The miss path above reads each such object once.
 
 **Over a state store.** With `--state-store` the executor keeps the rows `exec/op/<operation>` (owner,
 action, attempt, job id), `exec/act/` (the open operation of each action, so an Execute of an action
@@ -688,6 +700,11 @@ What it does itself, with those three:
   not wait for; see `docs/design/metadata-in-postgres.md`. A database at migration 3 starts and
   every walk reads the blobs, logging a warning for each failed read, and for a failed record
   of the walk's rows.
+- **Cell rows and unlisted trees.** The pack index keeps the SHA-256 of each 1 MiB cell of an
+  object (`object_cells`) and the tree lists whose L2 sidecar is not written yet (`unlisted_tree`)
+  in two more tables of the state store, made by the installer's migration 5; see
+  `crates/kbf-pack-index/src/cells.rs` for the rules. A database at migration 4 opens for the pack
+  index, and each call on these tables fails `NotMigrated` until the installer has run.
 - **Readiness.** `GET /readyz` and `grpc.health.v1` fail when the state store does not answer a
   read and when the job service does not answer a read of a job (`executor` in the failing
   list). Nothing probes the object store or any storage node: an object store that is down is

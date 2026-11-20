@@ -140,10 +140,11 @@ fn a_database_at_the_action_cache_takes_the_directory_migration_alone() {
         .expect("the older release writes");
     let mut client = Client::connect(&db.url(), NoTls).expect("connects");
     let before = recorded(&mut client);
-    let out = state_schema::apply(&config, &schema::embedded(), schema::latest()).expect("applies");
+    let out = state_schema::apply(&config, &schema::embedded(), schema::DIRECTORY_VERSION)
+        .expect("applies");
     assert_eq!(
         (out.from, out.to, out.ran),
-        (Some(3), schema::latest(), vec![4])
+        (Some(3), schema::DIRECTORY_VERSION, vec![4])
     );
     let located = index.locate(&[blob]).expect("locates after the migration");
     assert_eq!(
@@ -159,4 +160,50 @@ fn a_database_at_the_action_cache_takes_the_directory_migration_alone() {
         .map(|(v, n, k, _)| (*v, n.as_str(), k.as_str()))
         .collect();
     assert_eq!(names[3..], [(4, "directory", "expand")]);
+}
+
+/// Asserts that a database at the Directory rows' migration (the release before the L2 cells) is
+/// brought to the release's latest by running the L2 cells' migration alone: the earlier rows
+/// are untouched, the new row is `l2_cells`, an expand step, the pack rows written before are
+/// still read, and the two new tables are empty and usable.
+#[test]
+fn a_database_at_the_directory_rows_takes_the_l2_cells_migration_alone() {
+    let (db, config) = a_database_the_old_runner_migrated();
+    state_schema::apply(&config, &schema::embedded(), schema::DIRECTORY_VERSION)
+        .expect("the release before the L2 cells");
+    let blob = BlobDigest {
+        hash: [9; 32],
+        size: 10,
+    };
+    let pack = NewPack {
+        key: "cas/f/fe/1/1".to_owned(),
+        writer: "f/fe".to_owned(),
+        size: 26,
+        blobs: vec![PackBlob {
+            digest: blob,
+            offset: 0,
+        }],
+    };
+    let index = PostgresPackIndex::open(&config).expect("opens at migration 4");
+    index.record_pack(&pack).expect("the older release writes");
+    let mut client = Client::connect(&db.url(), NoTls).expect("connects");
+    let before = recorded(&mut client);
+    let out = state_schema::apply(&config, &schema::embedded(), schema::latest()).expect("applies");
+    assert_eq!(
+        (out.from, out.to, out.ran),
+        (Some(4), schema::latest(), vec![5])
+    );
+    let live = index
+        .live_packs(None, 10)
+        .expect("reads after the migration");
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].key, "cas/f/fe/1/1");
+    assert!(!live[0].has_cells);
+    let after = recorded(&mut client);
+    assert_eq!(after[..4], before[..]);
+    let names: Vec<(i32, &str, &str)> = after
+        .iter()
+        .map(|(v, n, k, _)| (*v, n.as_str(), k.as_str()))
+        .collect();
+    assert_eq!(names[4..], [(5, "l2_cells", "expand")]);
 }

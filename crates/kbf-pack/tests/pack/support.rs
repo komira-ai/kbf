@@ -363,6 +363,8 @@ pub struct FlakyIndex {
     fail_unreferenced: AtomicU32,
     fail_drop: AtomicU32,
     fail_forget: AtomicU32,
+    fail_cells: AtomicU32,
+    no_cells: AtomicU32,
     held: Mutex<Vec<bool>>,
     finds: Mutex<Vec<usize>>,
     locates: Mutex<Vec<usize>>,
@@ -383,11 +385,29 @@ impl FlakyIndex {
             fail_unreferenced: AtomicU32::new(0),
             fail_drop: AtomicU32::new(0),
             fail_forget: AtomicU32::new(0),
+            fail_cells: AtomicU32::new(0),
+            no_cells: AtomicU32::new(0),
             held: Mutex::new(Vec::new()),
             finds: Mutex::new(Vec::new()),
             locates: Mutex::new(Vec::new()),
             touches: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The next `n` records of cells fail.
+    pub fn fail_cells(&self, n: u32) {
+        self.fail_cells.store(n, Ordering::SeqCst);
+    }
+
+    /// The next `n` records of cells answer that the index keeps no cells.
+    pub fn keep_no_cells(&self, n: u32) {
+        self.no_cells.store(n, Ordering::SeqCst);
+    }
+
+    /// The cells recorded under `key`.
+    pub fn cells_of(&self, key: &str) -> Option<kbf_pack_index::cells::ObjectCells> {
+        let rows = self.inner.object_cells(&[key.to_owned()]);
+        rows.expect("cells").pop().flatten()
     }
 
     /// The next `n` records fail.
@@ -527,6 +547,20 @@ impl PackIndex for FlakyIndex {
             return Err(PackIndexError::NotMigrated);
         }
         self.inner.forget_pack(pack_key, min_age)
+    }
+
+    fn record_cells(
+        &self,
+        key: &str,
+        cells: &kbf_pack_index::cells::ObjectCells,
+    ) -> Result<bool, PackIndexError> {
+        if fires(&self.fail_cells) {
+            return Err(PackIndexError::NotMigrated);
+        }
+        if fires(&self.no_cells) {
+            return Err(PackIndexError::Unsupported);
+        }
+        self.inner.record_cells(key, cells)
     }
 }
 

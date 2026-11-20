@@ -13,7 +13,8 @@
 //! A Linux run commits into a put directory (`--task-out-root`, [`Config::task_out`]) and is a
 //! job ([`put_dir_spec`]): no image, its root the action tree as its one layer (the host
 //! directory of its manifests, or with `--executor-input-tree provider` tierstore's mount
-//! provider naming its tree list, [`provider_layer`]), the task tool of the base tree as its
+//! provider naming its tree list, [`provider_layer`]; an action a host refused the tree list of
+//! as not mountable is taken to the host directory, [`Ingest::input_tree`]), the task tool of the base tree as its
 //! program, the put directory mounted read-write at `/out`, no network, no files and no secret.
 //! It names no CPU, memory or disk, so the job service books it what the history of its size
 //! class says, or, for an action whose platform asks for a whole machine
@@ -200,12 +201,16 @@ pub(super) async fn prepare(
          whole-host job no mount"
             .to_owned()
     })?;
-    let key = minted(ctx, run, action, wall, ctx.cfg.input_tree).await?;
+    // Asked once: the frontend's miss path may have taken the action to manifests, and the mint
+    // and the layer must agree on the form.
+    let form = ctx.ingest.input_tree(action, ctx.cfg.input_tree);
+    let key = minted(ctx, run, action, wall, form).await?;
     let tree = ctx.inputs.tree(run).await?;
     let job = PutDirJob {
         roots,
         dir: &key,
         tree: &tree,
+        form,
     };
     let spec = put_dir_spec(ctx, &job, run, action, (timeout, wall), (booking, class));
     Ok(Prepared { spec, key })
@@ -323,6 +328,8 @@ struct PutDirJob<'a> {
     roots: &'a PutDirRoots,
     dir: &'a PackKey,
     tree: &'a str,
+    /// The form `tree` was written in, which the layer names it by.
+    form: InputTree,
 }
 
 /// The job of `run` of `job`, with its booking and size class: the tree is the root,
@@ -349,7 +356,7 @@ fn put_dir_spec(
         network: NetworkLevel::None.into(),
         ports: Vec::new(),
         host_ports: Vec::new(),
-        layers: vec![match ctx.cfg.input_tree {
+        layers: vec![match job.form {
             InputTree::Manifests => job.roots.layer(job.tree),
             InputTree::Provider => provider_layer(job.tree),
         }],

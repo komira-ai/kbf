@@ -161,6 +161,55 @@ pub trait Ingest: Send + Sync {
     async fn lost(&self, action: &Digest, object: &LostObject) {
         let _ = (action, object);
     }
+
+    /// A job of `action` did not start because the host refused its tree list as not mountable
+    /// through tierstore (`ListVersionUnsupported`: the list has no readable L2 sidecar, tierstore's
+    /// `docs/design/fetch-cache-serve.md`, 3.5). The tree is not the action's fault and the job
+    /// is not failed for it: the frontend takes its miss path, remembered per action. The first
+    /// refusal drops the action's remembered trees so the next one is written again with its
+    /// sidecar republished ([`MissPath::Republish`]); the next gives the action's jobs the tree as
+    /// manifests, served by tierstore's file system with no mount provider
+    /// ([`MissPath::Manifests`], read back by [`Ingest::input_tree`]). Called before the
+    /// operation's next attempt is prepared. The default keeps no such state and answers
+    /// [`MissPath::Manifests`].
+    async fn list_refused(&self, action: &Digest) -> MissPath {
+        let _ = action;
+        MissPath::Manifests
+    }
+
+    /// The form the tree of the next run of `action` is written and mounted in: `configured`,
+    /// unless the frontend's miss path ([`Ingest::list_refused`]) has taken the action's jobs to
+    /// [`InputTree::Manifests`]. Asked once for a run, before [`Ingest::mint`]; the answer is
+    /// the `tree` that mint is given and the form of the job's layer. By default `configured`.
+    fn input_tree(&self, action: &Digest, configured: InputTree) -> InputTree {
+        let _ = action;
+        configured
+    }
+}
+
+/// What the frontend did for an action whose tree list a host refused as not mountable
+/// ([`Ingest::list_refused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissPath {
+    /// The action's tree is written again, checked against the store and with its L2 sidecar
+    /// republished: the first refusal.
+    Republish,
+    /// The action's jobs get its tree as manifests, with no mount provider: the second refusal,
+    /// and every one after.
+    Manifests,
+}
+
+impl MissPath {
+    /// Every step, in the order the metric lists them.
+    pub(crate) const ALL: [Self; 2] = [Self::Republish, Self::Manifests];
+
+    /// The `step` label of `kbf_executor_list_refused_total`.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Republish => "republish",
+            Self::Manifests => "manifests",
+        }
+    }
 }
 
 /// An object of a job's tree the store answered it does not have, as the job's start failure

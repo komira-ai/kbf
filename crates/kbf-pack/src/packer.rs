@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use kbf_objstore::{ObjectKey, ObjectStore, ObjectStoreError};
+use kbf_pack_index::cells::ObjectCells;
 use kbf_pack_index::{
     BlobDigest, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError, Recorded,
 };
@@ -241,6 +242,10 @@ impl<S: ObjectStore> Packer<S> {
             blobs,
         };
         let (size, blobs) = (pack.size, pack.blobs.len());
+        // The cells before the pack: once its blobs are locatable a tree list may name it, and
+        // its sidecar is made from recorded cells only. A row for a pack never recorded is
+        // harmless: the key is written once.
+        self.record_cells(&key, &segment).await;
         let recorded = self.record(pack).await?;
         Ok(StoredPack {
             key,
@@ -248,6 +253,29 @@ impl<S: ObjectStore> Packer<S> {
             blobs,
             indexed: recorded.indexed,
         })
+    }
+
+    /// Records the cells of the pack `key` whose bytes are `segment` (the SHA-256 of each 1 MiB,
+    /// which the L2 sidecar of a tree list naming the pack is made from), hashed from the bytes in
+    /// hand: no read of the store. Best effort: an index that keeps no cells, or fails, leaves
+    /// them to the backfill, which reads the pack once.
+    async fn record_cells(&self, key: &str, segment: &Bytes) {
+        let (index, owned, bytes) = (Arc::clone(&self.index), key.to_owned(), segment.clone());
+        // Hashing many MiB is blocking work too: it runs beside the index call, off the runtime.
+        let recorded = offload(move || {
+            let hashed = tierstore_list::PackCells::of(&bytes);
+            let cells = ObjectCells {
+                size: hashed.size,
+                digests: hashed.digests,
+            };
+            index.record_cells(&owned, &cells)
+        });
+        match recorded.await {
+            Ok(_) | Err(PackIndexError::Unsupported) => {}
+            Err(error) => {
+                tracing::warn!(pack = %key, %error, "the cells of a pack were not recorded: the backfill reads it");
+            }
+        }
     }
 
     /// Records `pack`, trying again as the config says, but not after a refusal. The index

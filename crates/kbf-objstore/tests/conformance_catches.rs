@@ -435,6 +435,7 @@ fn a_store_that_reads_short_fails() {
             Check::PutNewRefusesOverwrite,
             Check::ObjectLock,
             Check::StreamedPut,
+            Check::UsedKeyKeepsItsBytes,
         ],
     );
 }
@@ -607,7 +608,11 @@ fn a_store_that_claims_conditional_writes_but_overwrites_fails() {
     let report = run(Defect::Overwrites);
     assert_fails_only(
         &report,
-        &[Check::PutNewRefusesOverwrite, Check::StreamedPut],
+        &[
+            Check::PutNewRefusesOverwrite,
+            Check::StreamedPut,
+            Check::UsedKeyKeepsItsBytes,
+        ],
     );
 }
 
@@ -936,7 +941,7 @@ fn a_delete_of_a_retained_object_that_reports_success_fails_even_if_the_bytes_su
 #[test]
 fn a_store_that_refuses_streamed_writes_fails_naming_the_answer() {
     let report = run(Defect::RefusesStreamedWrites);
-    assert_fails_only(&report, &[Check::StreamedPut]);
+    assert_fails_only(&report, &[Check::StreamedPut, Check::UsedKeyKeepsItsBytes]);
     let Some(Outcome::Failed(why)) = report.outcome(Check::StreamedPut) else {
         unreachable!("checked above");
     };

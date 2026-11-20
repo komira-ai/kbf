@@ -194,6 +194,7 @@ mod tests {
     fn fake_without_capabilities_passes_conformance() {
         let report = run(Capabilities::default());
         assert!(report.passed(), "{report}");
-        assert_eq!(report.skipped().count(), 1, "{report}");
+        // The two checks of conditional writes.
+        assert_eq!(report.skipped().count(), 2, "{report}");
     }
 }

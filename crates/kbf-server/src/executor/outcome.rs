@@ -39,6 +39,7 @@
 //! | failed to start input-unavailable | `infra` | `UNAVAILABLE`: a host path the job named could not be read on its host, rerun |
 //! | failed to start host-unsafe | `infra` | `UNAVAILABLE`: rerun |
 //! | failed to start, any code, its detail naming an object of its tree the store answered 404 for | `infra` | `UNAVAILABLE`: the frontend drops what its memos say of the object and tells its packs of the absence, and the next attempt's tree is checked against the store, rerun |
+//! | failed to start, any code, its detail saying the host refused the job's tree list as not mountable (`tree list not supported: <reason>`) | `list-refused` | `UNAVAILABLE`: the frontend takes its miss path, and the next attempt's tree is written again (the first time) or as manifests (after); the run is rerun without spending an attempt, up to [`LIST_REFUSALS`] times in an operation |
 //! | failed to start egress-unchecked | `infra` | `UNAVAILABLE`: the host's agent could not check the limits of the job's network, rerun |
 //! | failed to start, any other code or detail | `infra` | `UNAVAILABLE`: rerun |
 //! | in a state this server does not know | `infra` | `UNAVAILABLE`: rerun |
@@ -52,7 +53,8 @@
 //!
 //! Every `infra` and `lost` row is run again, as the operation's next attempt, at most
 //! [`RESUBMITS`] times; then the callers are answered `UNAVAILABLE`. So is `out-of-memory`, and
-//! the callers are answered as the table says. A status names the code, never the job: a job
+//! the callers are answered as the table says. A `list-refused` row is run again too, but its
+//! first [`LIST_REFUSALS`] in an operation spend none of those attempts. A status names the code, never the job: a job
 //! carries the arguments and the mounts. The agent's detail of a start it refused is a
 //! code (`quota-unavailable`, ...) or text that can quote those: only the code is
 //! read, from the start of the detail, and only the detail's length is logged.
@@ -72,6 +74,22 @@
 //! the store, so a pack forgotten has its blobs reported missing ([`Settled::Missing`]), which
 //! the client uploads again.
 //!
+//! **A refused tree list.** A start that failed on any code is read for one more thing, before
+//! the lost object: the text `tree list not supported: ` anywhere in the detail
+//! ([`list_refused`]), which is the `Display` of tierstore's `ListVersionUnsupported`, said by a
+//! node whose reader refuses a version 2 tree list that has no readable L2 sidecar
+//! (`cas/l2/<id>`; the reason follows: `v1_list`, `missing_sidecar`, `unknown_cell_digest` or
+//! `unknown_version`; tierstore's `docs/design/fetch-cache-serve.md`, 3.5). The tree is not
+//! mountable through tierstore, which is not the action's fault and not the host's: the run is
+//! `list-refused` ([`Verdict::ListRefused`]) and the frontend takes its miss path
+//! ([`Ingest::list_refused`](super::Ingest::list_refused)): first it writes the action's tree
+//! list again with its sidecar republished, then it gives the action's jobs the tree as
+//! manifests, which tierstore's file system serves without the mount provider. Such a run does
+//! not spend an attempt of [`RESUBMITS`]; the operation has [`LIST_REFUSALS`] of them, and a
+//! refusal after those is run again as any `infra` ending. The text is read before
+//! [`lost_of`]: when a detail holds both, the tree list is what the host could not use, and the
+//! lost object, if there is one, is found again by the next attempt's refusal.
+//!
 //! What a job that did not end well wrote goes with the status as a detail, cut to a cap
 //! ([`output`](super::output)); the code and the message above are unchanged by it.
 //!
@@ -85,11 +103,18 @@ use kbf_proto::google::rpc::{self, ErrorInfo};
 use prost::Message;
 use tonic::Code;
 
-use super::traits::LostObject;
+use super::traits::{LostObject, MissPath};
 
 /// How many times an operation is submitted again after a run that ended for a reason of the
 /// farm's (`infra`, `lost`, `out-of-memory`): each is a new attempt, a new job and a new key.
 pub(crate) const RESUBMITS: u32 = 2;
+
+/// How many runs of one operation that ended in a refused tree list are run again without
+/// spending an attempt of [`RESUBMITS`]: the first has the frontend write the list again with its
+/// L2 sidecar, the second has it give the action's jobs the tree as manifests. A refusal after
+/// these is an ordinary `infra` ending. Counted by the operation's task, from zero: an operation
+/// taken up from the state store starts its count again.
+pub(crate) const LIST_REFUSALS: u32 = 2;
 
 /// The `ErrorInfo.reason` of an action killed at its memory limit at its last attempt.
 pub const OUT_OF_MEMORY_REASON: &str = "ACTION_OUT_OF_MEMORY";
@@ -111,6 +136,10 @@ pub(super) enum Verdict {
     Ingest,
     /// The job did not produce a result.
     Settled(Settled),
+    /// The job did not start because the host refused its tree list as not mountable through
+    /// tierstore: the frontend takes its miss path before the run ends as
+    /// [`Settled::ListRefused`].
+    ListRefused,
     /// The job did not start because the store does not have an object of its tree, `object`:
     /// the frontend's state is told before the run ends as `settled`.
     StoreLost {
@@ -140,6 +169,10 @@ pub(crate) enum Settled {
     /// Input blobs the store no longer has, which the index said it held: the frontend forgot
     /// them, and the client is to upload them again and execute again.
     Missing(Vec<kbf_types::Digest>),
+    /// The host refused the job's tree list as not mountable through tierstore, and the frontend
+    /// took `0` as its miss path: the action runs again, and the first
+    /// [`LIST_REFUSALS`] of these in an operation spend no attempt.
+    ListRefused(MissPath),
 }
 
 /// The codes an agent gives a start it refuses, as `js-agent-wire` spells them.
@@ -213,6 +246,16 @@ pub(super) fn source_missing(detail: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// What tierstore's `ListVersionUnsupported` writes before its reason: `tree list not
+/// supported: v1_list` (or `missing_sidecar`, `unknown_cell_digest`, `unknown_version`).
+pub(super) const LIST_NOT_SUPPORTED: &str = "tree list not supported: ";
+
+/// Whether a start failure's `detail` says a node refused the job's tree list as not mountable
+/// through tierstore: [`LIST_NOT_SUPPORTED`] anywhere in it. Nothing else of the detail is read.
+pub(super) fn list_refused(detail: &str) -> bool {
+    detail.contains(LIST_NOT_SUPPORTED)
 }
 
 /// The object a start failure's `detail` says the store does not have: a manifest
@@ -306,6 +349,11 @@ fn promote(job: &Job, result: &JobResult) -> Verdict {
 
 /// The verdict on a job that did not start.
 fn failed_to_start(job: &Job) -> Verdict {
+    if list_refused(&job.start_failure_detail) {
+        let detail_bytes = job.start_failure_detail.len();
+        tracing::warn!(job = %job.id, detail_bytes, "the job failed to start: the host refused its tree list as not mountable through tierstore");
+        return Verdict::ListRefused;
+    }
     if let Some(object) = lost_of(&job.start_failure_detail) {
         let detail_bytes = job.start_failure_detail.len();
         let object_named = match &object {
@@ -391,10 +439,13 @@ pub(super) fn refused(error: &Error) -> Option<Settled> {
 
 impl Settled {
     /// Whether the operation is submitted again, if it has an attempt left ([`RESUBMITS`]):
-    /// every ending of the farm's. The action's own timeout, an action that cannot run here and
+    /// every ending of the farm's, and a tree list the host refused. The action's own timeout, an action that cannot run here and
     /// inputs the client is to upload again are answered at once.
     pub(super) const fn retried(&self) -> bool {
-        matches!(self, Self::Infra(_) | Self::Lost(_) | Self::OutOfMemory)
+        matches!(
+            self,
+            Self::Infra(_) | Self::Lost(_) | Self::OutOfMemory | Self::ListRefused(_)
+        )
     }
 
     /// The status the callers are answered with when this is the operation's last run.
@@ -407,6 +458,19 @@ impl Settled {
         match self {
             Self::Infra(why) => status(Code::Unavailable, why),
             Self::Lost(why) => status(Code::Unavailable, why),
+            Self::ListRefused(path) => status(
+                Code::Unavailable,
+                match path {
+                    MissPath::Republish => {
+                        "the host refused the job's tree list as not mountable (the list was \
+                         written again with its sidecar)"
+                    }
+                    MissPath::Manifests => {
+                        "the host refused the job's tree list as not mountable (the tree is \
+                         given as manifests)"
+                    }
+                },
+            ),
             Self::Timeout => status(Code::DeadlineExceeded, "the action ran out of time"),
             Self::OutOfMemory => with_reason(
                 status(
@@ -442,3 +506,7 @@ fn with_reason(mut answer: rpc::Status, reason: &str) -> rpc::Status {
 #[cfg(test)]
 #[path = "outcome_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "outcome_list_tests.rs"]
+mod list_tests;

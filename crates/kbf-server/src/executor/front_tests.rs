@@ -791,6 +791,9 @@ mod stored;
 #[path = "front_lost_tests.rs"]
 mod lost;
 
+#[path = "front_miss_tests.rs"]
+mod miss;
+
 #[path = "front_walk_tests.rs"]
 mod walk;
 

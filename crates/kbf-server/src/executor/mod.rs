@@ -13,7 +13,11 @@
 //! Each operation is driven by a task of its own ([`run`]): the job is read back every
 //! [`Config::poll`] until it ends; an ending of the farm's (the host lost, the job service
 //! restarted, the job refused at its start) submits the operation again as its next attempt, a
-//! new job with a new key, at most [`outcome::RESUBMITS`] times; anything else, and the last
+//! new job with a new key, at most [`outcome::RESUBMITS`] times; a job whose tree list a host
+//! refused as not mountable through tierstore (`tree list not supported`) is run again too, its
+//! first [`outcome::LIST_REFUSALS`] of them in an operation without spending one of those
+//! attempts, after the frontend takes its miss path ([`Ingest::list_refused`]: the tree list
+//! written again with its sidecar, then the tree as manifests); anything else, and the last
 //! attempt, answers the operation's callers ([`outcome`]). A job that ended well has its pack
 //! read by the frontend ([`Ingest`]), which writes the action cache. `CancelOperation` cancels
 //! the job and answers the callers `CANCELLED` ([`kbf_front::Dispatch::cancel`]).
@@ -86,8 +90,8 @@ pub use size_class::SizeClass;
 pub use submit::job_id;
 pub use task::{PackKey, RunId, build_id};
 pub use traits::{
-    ActionFacts, Ingest, Ingested, Inputs, InputsError, LostObject, MintError, RejectReason,
-    UntrustedLimits,
+    ActionFacts, Ingest, Ingested, Inputs, InputsError, LostObject, MintError, MissPath,
+    RejectReason, UntrustedLimits,
 };
 
 /// The most operations the executor holds open at once: a guard on the memory they hold (a

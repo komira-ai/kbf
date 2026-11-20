@@ -515,6 +515,13 @@ instead of a host directory (jobscheduler's `docs/design/mount-providers.md`, ko
   entry, names and keys aside; a list that passes 256 MiB with its names and keys is refused too; a
   directory named at several paths of the input root is counted at each, before anything is looked up); `store` for a
   failed lookup or write, and for a base tree published without its listing.
+- **A list a host refuses** as not mountable (tierstore's `ListVersionUnsupported`, "tree list not supported: ...":
+  no readable L2 sidecar at `cas/l2/<id>`, tierstore's `fetch-cache-serve.md` 3.5) fails the job's start, and kbf
+  takes the design's miss path and does not fail the operation for it: the job's `start_failure_detail` is read for
+  the text, the action's first refusal has its next list written again, checked, with its sidecar republished, and
+  its second has its jobs read the tree as manifests (`--executor-input-tree manifests` for that action, for as long
+  as the frontend remembers it). The first two such runs of an operation spend none of its attempts;
+  `kbf_executor_list_refused_total{step}` counts the steps.
 - **macOS** keeps the manifests: the native runtime takes no provider yet (jobscheduler's design, Q4).
 
 The flag selects the path per frontend; the manifests' path is removed once the tree list is the default on the farm.

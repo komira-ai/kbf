@@ -333,6 +333,7 @@ impl Packs {
     /// Appends the pack families to `out` in the Prometheus text format.
     pub fn render_metrics(&self, out: &mut String) {
         self.metrics.render(out);
+        self.metrics.l2.render(out);
         self.store_metrics.render(out);
         self.waits.render(out);
     }
@@ -352,6 +353,15 @@ impl Packs {
         if let Some(packs) = packs {
             packs.render_metrics(out);
         }
+    }
+
+    /// The writer of the L2 sidecars of tree lists over these packs: their cells are recorded
+    /// in these packs' index and the sidecars written to their store, counted in their metrics.
+    #[must_use]
+    pub fn sidecars(&self) -> crate::action_tree::Sidecars {
+        let store: Arc<dyn LargeStore> = Arc::new(self.clone());
+        crate::action_tree::Sidecars::new(Arc::clone(&self.index), store)
+            .with_counters(Arc::clone(&self.metrics.l2))
     }
 
     /// Checks that the object store refuses to replace an object, as the write rule needs:
@@ -697,5 +707,19 @@ impl LargeStore for Packs {
         body: BodyStream,
     ) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
         self.store.put_stream(key, len, body)
+    }
+
+    fn read_range<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        offset: u64,
+        len: u64,
+    ) -> BoxFuture<'a, Result<Bytes, ObjectStoreError>> {
+        match ByteRange::new(offset, len) {
+            Some(range) => self.store.read_range(key, range),
+            None => Box::pin(std::future::ready(Err(ObjectStoreError::Unsupported(
+                "a read of no bytes",
+            )))),
+        }
     }
 }

@@ -75,6 +75,7 @@
 //!   revision, or `tierstore`, `objstore-s3` or `tierstore-trees-api` taken from elsewhere.
 
 mod job_client_layer;
+mod l2_backfill_layer;
 mod no_scheduler_package;
 mod scheduler_server_crates;
 mod step_runner_layer;

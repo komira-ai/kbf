@@ -88,6 +88,22 @@ pub trait LargeStore: Send + Sync {
         len: u64,
         body: BodyStream,
     ) -> BoxFuture<'a, Result<(), ObjectStoreError>>;
+
+    /// The bytes `[offset, offset + len)` of the object `key` (`len` above zero), as the store
+    /// answers: [`ObjectStoreError::NotFound`] when it has no such object. The cells of an object
+    /// whose cells are not recorded are read with it (the L2 sidecar's miss path and backfill).
+    /// The default answers [`ObjectStoreError::Unsupported`]: a store that cannot be read.
+    fn read_range<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        offset: u64,
+        len: u64,
+    ) -> BoxFuture<'a, Result<Bytes, ObjectStoreError>> {
+        let _ = (key, offset, len);
+        Box::pin(std::future::ready(Err(ObjectStoreError::Unsupported(
+            "a store the large objects are written to that is not read",
+        ))))
+    }
 }
 
 /// The key of the large blob `digest`: `cas/l/<hex>`.

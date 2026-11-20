@@ -1476,6 +1476,7 @@ dependencies = [
  "tar",
  "thiserror",
  "tierstore",
+ "tierstore-list",
  "tokio",
  "tonic",
  "tower-layer",
@@ -1721,6 +1722,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-l2-backfill"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures",
+ "kbf-front",
+ "kbf-objstore",
+ "kbf-pack-index",
+ "kbf-state",
+ "kbf-testkit",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tierstore",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "kbf-log"
 version = "0.1.0"
 dependencies = [
@@ -1835,6 +1857,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tierstore-list",
  "tokio",
  "tracing",
 ]
@@ -2060,6 +2083,7 @@ dependencies = [
  "subtle",
  "thiserror",
  "tierstore",
+ "tierstore-list",
  "time",
  "tokio",
  "tokio-rustls",
@@ -2818,7 +2842,7 @@ dependencies = [
 [[package]]
 name = "objstore-s3"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=e83fba50c60e4b2d9e710cc8ce8202af755bc87e#e83fba50c60e4b2d9e710cc8ce8202af755bc87e"
+source = "git+https://github.com/komira-ai/tierstore?rev=ad492f8121a0dd5ac0792d992c338b1aa85630e1#ad492f8121a0dd5ac0792d992c338b1aa85630e1"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3814,7 +3838,7 @@ dependencies = [
 [[package]]
 name = "tierstore"
 version = "0.3.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=e83fba50c60e4b2d9e710cc8ce8202af755bc87e#e83fba50c60e4b2d9e710cc8ce8202af755bc87e"
+source = "git+https://github.com/komira-ai/tierstore?rev=ad492f8121a0dd5ac0792d992c338b1aa85630e1#ad492f8121a0dd5ac0792d992c338b1aa85630e1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3881,7 +3905,7 @@ dependencies = [
 [[package]]
 name = "tierstore-fetch-api"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=e83fba50c60e4b2d9e710cc8ce8202af755bc87e#e83fba50c60e4b2d9e710cc8ce8202af755bc87e"
+source = "git+https://github.com/komira-ai/tierstore?rev=ad492f8121a0dd5ac0792d992c338b1aa85630e1#ad492f8121a0dd5ac0792d992c338b1aa85630e1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3893,7 +3917,7 @@ dependencies = [
 [[package]]
 name = "tierstore-format"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=e83fba50c60e4b2d9e710cc8ce8202af755bc87e#e83fba50c60e4b2d9e710cc8ce8202af755bc87e"
+source = "git+https://github.com/komira-ai/tierstore?rev=ad492f8121a0dd5ac0792d992c338b1aa85630e1#ad492f8121a0dd5ac0792d992c338b1aa85630e1"
 dependencies = [
  "blake3",
  "crc32c",
@@ -3902,9 +3926,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tierstore-list"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/tierstore?rev=ad492f8121a0dd5ac0792d992c338b1aa85630e1#ad492f8121a0dd5ac0792d992c338b1aa85630e1"
+dependencies = [
+ "crc32c",
+ "ring",
+ "thiserror",
+ "tierstore-fetch-api",
+]
+
+[[package]]
 name = "tierstore-trees-api"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/tierstore?rev=e83fba50c60e4b2d9e710cc8ce8202af755bc87e#e83fba50c60e4b2d9e710cc8ce8202af755bc87e"
+source = "git+https://github.com/komira-ai/tierstore?rev=ad492f8121a0dd5ac0792d992c338b1aa85630e1#ad492f8121a0dd5ac0792d992c338b1aa85630e1"
 dependencies = [
  "prost",
  "protox 0.10.0",

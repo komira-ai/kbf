@@ -1,0 +1,47 @@
+[package]
+name = "kbf-l2-backfill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The operator tool that gives the tree lists recorded unlisted their L2 sidecar
+# (`kbf_front::action_tree::Sidecars::backfill`), and that samples the pack index's live keys
+# for `tierstore store audit --keys`. It is a binary of its own and never part of `kbf`: it
+# does nothing unless an operator runs it, and a run is a dry run unless `--mode apply` is given.
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+futures.workspace = true
+# `Sidecars`, the engine for one tree, and `LargeStore`, the calls it needs of the store.
+kbf-front.workspace = true
+# `S3Store`, the client of the bucket the frontends write their packs and lists to.
+kbf-objstore.workspace = true
+# `PostgresPackIndex`: the pack index is in the Postgres state store.
+kbf-pack-index = { workspace = true, features = ["postgres"] }
+# `PostgresConfig`.
+kbf-state = { workspace = true, features = ["postgres"] }
+# The credentials file and the report are JSON.
+serde.workspace = true
+serde_json.workspace = true
+# The rank of a key in the audit sample.
+sha2.workspace = true
+thiserror.workspace = true
+# `rt` and `time`: the current-thread runtime the run is on, and the pacing sleep.
+tokio = { workspace = true, features = ["rt", "time"] }
+# The credentials file is read into memory that is overwritten when it is dropped.
+zeroize.workspace = true
+
+[dev-dependencies]
+# The version 2 tree lists the tests write.
+tierstore.workspace = true
+# The in-memory pack index and its clock.
+kbf-pack-index = { workspace = true, features = ["test-support"] }
+kbf-state = { workspace = true, features = ["test-support"] }
+# `TestDir`.
+kbf-testkit.workspace = true
+
+[lints]
+workspace = true
