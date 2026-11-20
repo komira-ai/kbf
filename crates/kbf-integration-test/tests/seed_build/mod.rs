@@ -188,8 +188,9 @@ pub const FARM_ROUTES: &[&str] = &[
 
 /// The context of [`STORED_CONTEXTS`] the scalar `s` reads, if any: the word, in any case,
 /// after nothing that makes it a property or a variable (`.`, `$`, a letter, a digit, `_`,
-/// `-`) and before `.name`, `[` or `)`, as an expression reads it (`vars.X`,
-/// `secrets['X']`, `toJSON(secrets)`). The whole scalar is read, inside `${{ }}` or not: a
+/// `-`) and before `.name`, or before `[`, `)`, `,` or `}` after any spaces, as an
+/// expression reads it (`vars.X`, `secrets['X']`, `toJSON( secrets )`, `${{ vars }}`). The
+/// whole scalar is read, inside `${{ }}` or not: a
 /// condition is an expression without one, and quotes hide nothing, since a `run:` line is
 /// substituted before its shell reads it.
 pub fn stored_context(s: &str) -> Option<&'static str> {
@@ -201,9 +202,10 @@ pub fn stored_context(s: &str) -> Option<&'static str> {
             let before = at.checked_sub(1).map(|i| b[i]);
             let after = &b[at + ctx.len()..];
             let free = !before.is_some_and(|c| word(c) || c == b'.' || c == b'$');
-            let read = match after {
-                [b'.', c, ..] => word(*c),
-                [b'[' | b')', ..] => true,
+            let spaced = after.trim_ascii_start();
+            let read = match (after, spaced) {
+                ([b'.', c, ..], _) => word(*c),
+                (_, [b'[' | b')' | b',' | b'}', ..]) => true,
                 _ => false,
             };
             free && read

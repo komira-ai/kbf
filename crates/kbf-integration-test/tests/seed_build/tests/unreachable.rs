@@ -123,12 +123,16 @@ fn every_stored_context_is_refused_alone() {
 fn a_context_read_is_told_from_words_like_it() {
     // Catches: the context check refusing an innocent scalar (a property or a variable named
     // like a context, prose ending a sentence with the word), or missing a read at either
-    // end of the scalar.
+    // end of the scalar or one with spaces before its closing bracket.
     for s in [
         "${{ vars.FARM }}",
         "vars.FARM",
         "x ${{ secrets[format('{0}', 'K')] }}",
         "toJSON(secrets)",
+        "toJSON( secrets )",
+        "${{ secrets }}",
+        "${{ format('{0}', vars) }}",
+        "contains(vars , 'X')",
         "SECRETS.K",
     ] {
         assert!(stored_context(s).is_some(), "`{s}` reads a stored context");
