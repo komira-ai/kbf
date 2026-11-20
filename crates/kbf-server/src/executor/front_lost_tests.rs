@@ -49,6 +49,9 @@ async fn mint_tree(rig: &Rig, action: &Digest) -> Result<String, MintError> {
     rig.front
         .mint(lease(), action, WALL, InputTree::Manifests)
         .await?;
+    // The tree is remembered once its writes end, as the executor waits for them before a
+    // submit; the answer is the mint's, which is what these tests assert.
+    let _writes = rig.front.stored(lease()).await;
     Ok(rig.front.tree(lease()).await.expect("a tree"))
 }
 
@@ -320,6 +323,7 @@ async fn a_lost_tree_list_has_the_next_list_written_checked_once() {
             .mint(lease(), &action, WALL, InputTree::Provider)
             .await
             .expect("a dir");
+        let _writes = rig.front.stored(lease()).await;
         rig.front.tree(lease()).await.expect("a list")
     };
     let key = mint().await;
