@@ -4,12 +4,15 @@
 //! A `Directory` is named by the digest of its bytes, so what is kept under a digest is never
 //! stale: there is nothing to expire and nothing to invalidate. The cache says nothing about
 //! whether a blob is still held. The walk still asks the store (`FindMissing`) about the
-//! Command and every file of the tree, as it does without a cache; what the cache saves is the
-//! read and the decode of each `Directory`.
+//! Command and every file of the tree, as it does without a cache, unless the Execute that
+//! started the run has just asked (`closure`); what the cache saves is the read and the decode
+//! of each `Directory`.
 //!
 //! - **Memory.** The decoded [`KeptDirectory`] of each digest, bounded by bytes (a cost worked
 //!   out from the names, the digests and a fixed overhead per `Directory` and per node), the
-//!   least recently used out first. A `Directory` costing more than the bound is not kept.
+//!   least recently used out first. A `Directory` costing more than the bound is not kept. The
+//!   closure walk fills it, and so does the input check of every Execute over the preparer's
+//!   backend (`input_walk`), with each `Directory` it reads; those go to memory only.
 //! - **Disk (optional).** The `Directory` blob as the store gave it, in a
 //!   [`kbf_pack::ReadCache`] directory bounded by bytes, so a restarted frontend finds the
 //!   trees it had. A blob is written only after it decoded, and the cache checks its SHA-256 on
