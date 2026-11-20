@@ -113,6 +113,7 @@ async fn service() -> FakeJobServer {
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
             exec: js_proto::v1::ExecMode::Container,
+            xcodes: Vec::new(),
         },
     );
     server

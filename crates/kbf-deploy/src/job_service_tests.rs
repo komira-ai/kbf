@@ -117,6 +117,7 @@ fn host_and_job() -> (Machine, JobSpec) {
         os: "linux".to_owned(),
         arch: "x86_64".to_owned(),
         exec: ExecMode::Container,
+        xcodes: Vec::new(),
     };
     let spec = JobSpec {
         job_id: "check-1".to_owned(),

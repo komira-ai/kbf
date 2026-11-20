@@ -72,6 +72,13 @@ daemon may carry `xcode` entries and `action_slots`, which the server still read
 caps a node that reports `action_slots` at that many concurrent Action leases
 (`Resources::leases`); a node that reports none has no cap.
 
+**`xcode` today.** A Mac action names its Xcode by build in the platform property `xcode`
+(`16C5032a`), read as the membership key of the request (`kbf_caps::XCODE`). kbf no longer matches
+it against a node report: the executor puts the build in the Mac job's `Constraints.xcode`, and the
+job service places the job only on a Mac whose js-agent reports that build among its installed
+Xcodes (its capability `xcode`, the `caps.xcode` of js-agent's wire, one build per installed Xcode).
+A Mac action that names none is refused ([platform-properties.md](../platform-properties.md#macos)).
+
 A daemon runs one driver today, so `drivers` has one value. Placement reads it
 (`kbf_types::LeaseKind::drivers`): a lease goes only to a worker that lists a driver
 serving its kind, by the table below, and a worker that lists none serves nothing. The

@@ -1,5 +1,6 @@
 //! An Execute end to end over the executor and a fake job service: a miss runs as one job and
-//! its result is cached; a server with no executor refuses it.
+//! its result is cached, under a key that two actions differing only in their Xcode build do not
+//! share; a server with no executor refuses it.
 
 mod support;
 
@@ -33,6 +34,43 @@ async fn an_execute_that_misses_the_cache_runs_as_one_job_and_its_result_is_cach
     assert!(hit.cached_result, "answered from the action cache");
     assert_eq!(hit.result.map(support::unstamped), Some(result));
     assert_eq!(cell.direct.submitted_jobs(), 1);
+}
+
+/// Asserts that two Mac actions that differ only in the Xcode build their platform names
+/// (`xcode`) have different action keys: the result of the one built with `16C5032a`, cached, is
+/// not served for the one that names `17A324`, which misses the cache and runs as a job of its
+/// own, its result cached under its own key. Catches a result built with one Xcode served for
+/// another.
+#[tokio::test]
+async fn two_actions_that_differ_only_in_their_xcode_build_have_different_action_keys() {
+    let cell = Cell::start().await;
+    let old = Job::new("/bin/run", &[("OSFamily", "macos"), ("xcode", "16C5032a")]);
+    let new = Job::new("/bin/run", &[("OSFamily", "macos"), ("xcode", "17A324")]);
+    assert_eq!(old.command.proto, new.command.proto, "one Command");
+    assert_eq!(old.root.proto, new.root.proto, "one input root");
+    assert_ne!(old.action.proto, new.action.proto, "two action keys");
+    cell.upload(&old.blobs()).await;
+    cell.upload(&new.blobs()).await;
+    cell.direct
+        .will_run(&old.action, Ran::writes("out", "built with 16C5032a"));
+    cell.direct
+        .will_run(&new.action, Ran::writes("out", "built with 17A324"));
+
+    let mut ops = cell.execute(&old.action).await;
+    cell.direct.complete(&old.action).await;
+    let first = response(&done(&mut ops).await).result.expect("a result");
+    assert_eq!(cell.cached(&old.action).await.expect("cached"), first);
+    assert_eq!(cell.cached(&new.action).await, Err(Code::NotFound));
+
+    let mut ops = cell.execute(&new.action).await;
+    cell.direct.complete(&new.action).await;
+    let answer = response(&done(&mut ops).await);
+    assert!(!answer.cached_result, "not answered from the other's entry");
+    let second = answer.result.expect("a result");
+    assert_ne!(second, first);
+    assert_eq!(cell.direct.jobs_of(&new.action).len(), 1);
+    assert_eq!(cell.direct.submitted_jobs(), 2);
+    assert_eq!(cell.cached(&old.action).await.expect("still cached"), first);
 }
 
 #[tokio::test]

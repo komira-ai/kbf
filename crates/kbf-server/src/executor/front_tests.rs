@@ -21,7 +21,7 @@ use kbf_state::ManualClock;
 use kbf_storage::Storage;
 use kbf_types::{DigestFunction, OperationId};
 
-use crate::executor::RunId;
+use crate::executor::{RunId, XcodeBuild};
 
 use super::*;
 
@@ -801,20 +801,26 @@ fn props(pairs: &[(&str, &str)]) -> Platform {
     }
 }
 
-/// Asserts the action's system is read where the farm reads it: an Action's macOS platform, a
-/// Command's behind an Action platform that names nothing (the farm skips an empty one), and a
-/// Linux Action's over a Command's macOS; and that a platform the farm refuses is invalid.
-/// Catches a Mac action the farm placed on a Mac worker that the executor runs on Linux.
+/// Asserts the action's system is read where the farm reads it: an Action's macOS platform with
+/// its version and Xcode build, a Command's behind an Action platform that names nothing (the
+/// farm skips an empty one), and a Linux Action's over a Command's macOS; and that a platform the
+/// farm refuses is invalid. Catches a Mac action the farm placed on a Mac worker that the
+/// executor runs on Linux, and a Mac action's Xcode left unread.
 #[tokio::test]
 #[allow(deprecated)] // The Command's platform, which older clients send.
 async fn the_actions_system_is_read_as_the_farm_reads_it() {
     let rig = Rig::new();
     let mac = System::Macos {
         os_version: Some(26),
+        xcode: Some(XcodeBuild::parse("16C5032a").expect("a build")),
     };
-    let named = props(&[("OSFamily", "macos"), ("os_version", "26")]);
+    let named = props(&[
+        ("OSFamily", "macos"),
+        ("os_version", "26"),
+        ("xcode", "16C5032a"),
+    ]);
     let cases = [
-        (Some(named.clone()), None, mac),
+        (Some(named.clone()), None, mac.clone()),
         (Some(Platform::default()), Some(named.clone()), mac),
         (
             Some(props(&[("OSFamily", "linux")])),

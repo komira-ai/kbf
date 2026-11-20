@@ -26,7 +26,8 @@
 //! An action whose platform asks for a Mac is a Mac job ([`crate::executor::mac`]): the
 //! release's `kbf-task` bundle, the tree and the put directory mounted under `/work`, no layer, of
 //! a Mac in the native runtime, with no CPU or memory and the class's labels. It is refused as
-//! the caller's on an executor with no Macs, and as for Linux for a whole machine.
+//! the caller's on an executor with no Macs, when it names no Xcode ([`Settled::NoXcode`]), and
+//! as for Linux for a whole machine.
 //!
 //! A [`JobSpec`] is sent and kept, and never logged.
 
@@ -40,7 +41,7 @@ use ring::digest::{SHA256, digest};
 use tokio::time::Instant;
 
 use crate::executor::config::{Config, InputTree};
-use crate::executor::mac::{MacJob, System, check_version, mac_argv, mac_spec};
+use crate::executor::mac::{MacJob, System, XcodeBuild, check_version, mac_argv, mac_spec};
 use crate::executor::metrics::Metrics;
 use crate::executor::out::{PutDirRoots, TASK_IN_TREE, provider_layer};
 use crate::executor::outcome::Settled;
@@ -186,9 +187,10 @@ pub(super) async fn prepare(
     })?;
     pinned(&facts.image)?;
     let wall = ctx.cfg.wall(timeout);
-    if let System::Macos { os_version } = facts.system {
+    if let System::Macos { os_version, xcode } = facts.system {
         let times = (timeout, wall);
-        return prepare_mac(ctx, run, action, booking, times, os_version, class).await;
+        let asks = MacAsks { os_version, xcode };
+        return prepare_mac(ctx, run, action, booking, times, asks, class).await;
     }
     let Some(roots) = &ctx.cfg.task_out else {
         return Err(no_roots("a Linux action"));
@@ -216,17 +218,24 @@ fn no_roots(what: &str) -> Settled {
     ))
 }
 
+/// What a Mac action asks of its Mac: the least macOS and the Xcode it names.
+struct MacAsks {
+    os_version: Option<u32>,
+    xcode: Option<XcodeBuild>,
+}
+
 /// The Mac job of `run`, which runs `action` with `booking` for `times` (the timeout and the
-/// wall limit), labelled with `class`: refused as the caller's when this executor has no Macs,
-/// when the action asks for a newer macOS than they run, when it asks for a whole machine, or
-/// when its outputs do not go into a put directory.
+/// wall limit) on a Mac with what it `asks`, labelled with `class`: refused as the caller's when
+/// this executor has no Macs, when the action names no Xcode, when it asks for a newer macOS
+/// than they run, when it asks for a whole machine, or when its outputs do not go into a put
+/// directory.
 async fn prepare_mac(
     ctx: &Preparer<'_>,
     run: RunId,
     action: &Digest,
     booking: Booking,
     (timeout, wall): (Duration, Duration),
-    os_version: Option<u32>,
+    asks: MacAsks,
     class: &SizeClass,
 ) -> Result<Prepared, Settled> {
     let Some(pool) = &ctx.cfg.mac else {
@@ -235,7 +244,11 @@ async fn prepare_mac(
                 .to_owned(),
         ));
     };
-    check_version(os_version, pool).map_err(Settled::Invalid)?;
+    // Before anything is minted or submitted: the action runs nowhere without its Xcode.
+    let Some(xcode) = &asks.xcode else {
+        return Err(Settled::NoXcode);
+    };
+    check_version(asks.os_version, pool).map_err(Settled::Invalid)?;
     if booking == Booking::WholeHost {
         return Err(Settled::Invalid(
             "a whole_machine action cannot run on a Mac of the job service: it commits into a \
@@ -252,6 +265,7 @@ async fn prepare_mac(
     let spec = mac_spec(MacJob {
         job_id: job_id(&ctx.cfg.frontend, run),
         pool,
+        xcode,
         roots: pool.roots(linux),
         dir: key.as_str(),
         tree: &tree,

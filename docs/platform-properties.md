@@ -14,6 +14,7 @@ are the ones kbf reads when it makes that job:
 | `kbf-lease` | `action`, `whole_machine` | `action` | `whole_machine` makes the job ask for a whole host, with nothing beside it (see [`kbf-lease`](#kbf-lease)). |
 | `OSFamily`, `os` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | `linux` | A macOS value makes the job a Mac job (see [macOS](#macos)). |
 | `os_version` | a version such as `26` or `26.1` | any | The least macOS a Mac action takes; read only for a Mac action. |
+| `xcode` | an Xcode build id such as `16C5032a` | none: a Mac action that names none is refused | The Xcode a Mac action runs with; required on a Mac action, read only for one (see [macOS](#macos)). |
 | `container-image` | the executor's base image, by digest | the base image | The base environment the Command sees. |
 | `kbf-network` | `allow` | absent: no network | Lets the action's Command use the network (see [`kbf-network`](#kbf-network)). |
 
@@ -89,8 +90,33 @@ An action whose platform names `OSFamily` (or `os`) `macos`, `darwin`, `macosx` 
 js-agent job on a Mac of the job service ([actions-as-jobs.md](design/actions-as-jobs.md)
 section 14), when the executor is given the release's macOS `kbf-task` bundle
 (`--executor-mac-task-bundle`); without it the action is refused. `os_version=26` means macOS 26
-or newer, held against `--executor-mac-os-version`. kbf reads no `xcode`, `vm.image`, `ios.device`
-or simulator property: they are accepted and do nothing.
+or newer, held against `--executor-mac-os-version`. kbf reads no `vm.image`, `ios.device` or
+simulator property: they are accepted and do nothing.
+
+A Mac action must name the Xcode it runs with, by build: `xcode=16C5032a`, the Xcode's
+`ProductBuildVersion` (`xcodebuild -version` prints it as `Build version`). The name is read in any
+case; the value is 1 to 32 letters, digits, `.`, `_` and `-`, starting with a letter or a digit,
+and it is given once. The job asks the job service for that build: it is placed only on a Mac
+whose agent reports that Xcode installed, and runs with that Xcode's developer directory, never the
+one `xcode-select` has selected on the Mac. An action that names a build no Mac has is refused as
+one no host can run.
+
+A Mac action that names no `xcode` is refused at once, before any job is made: `INVALID_ARGUMENT`
+with an `ErrorInfo` of domain `kbf` and reason `MAC_ACTION_NAMES_NO_XCODE`, a request error the
+caller fixes by adding the property. Without it the action would run against whichever Xcode the
+Mac has selected, which an update of the Mac can move, and its cached result would then be served
+across the change. Since `xcode` is part of the action digest, the same action naming two builds is
+two cache entries, so a result built with one Xcode is never served for another. A value that is
+not a build id, or `xcode` given twice (in any two spellings), is refused as malformed. A Linux
+action's `xcode` is not read.
+
+```starlark
+# Bazel: a platform for actions that run with Xcode 16.2 (build 16C5032a) on the Macs
+platform(
+    name = "macos_arm64_xcode_16c5032a",
+    exec_properties = {"OSFamily": "Darwin", "xcode": "16C5032a"},
+)
+```
 
 ## `kbf-network`
 
