@@ -224,6 +224,8 @@ struct Setup {
     state: Option<Arc<StateHandle>>,
     /// Whether the server has an executor (`Listeners::executor`).
     executor: bool,
+    /// The executor's liveness (`--executor-live-secs`), when not the default.
+    live: Option<Duration>,
 }
 
 /// A state store a cell is started over, which every restart of the cell opens again.
@@ -338,6 +340,7 @@ impl Setup {
             streams: StreamLimits::DEFAULT,
             state: None,
             executor: true,
+            live: None,
         }
     }
 }
@@ -456,6 +459,34 @@ impl Cell {
         Self::serve(cache, store, self.direct.clone(), setup).await
     }
 
+    /// [`Cell::restart`] over `state` (a handle of its own on this cell's state store, as a
+    /// second process has), the new server's executor alive for `live`
+    /// (`--executor-live-secs`): it looks for the operations of gone frontends every half of it.
+    pub async fn restart_over(&self, state: Arc<StateHandle>, live: Duration) -> Self {
+        let (cache, store) = (Arc::clone(&self.cache), self.store.clone());
+        let setup = Setup {
+            state: Some(state),
+            live: Some(live),
+            ..self.setup.clone()
+        };
+        Self::serve(cache, store, self.direct.clone(), setup).await
+    }
+
+    /// Stops this server as its stop signal does and waits until its runtime and every task on
+    /// it are gone, leaving its job service and state store to the cells that share them.
+    pub async fn stop(mut self) {
+        let stop = self.stop.take().expect("the server is running");
+        let stopped = self.stopped.take().expect("the server is running");
+        drop(self);
+        // A server whose drain was closed ([`kbf_server::Drain::close`]) may have stopped on its
+        // own already, its stop signal's receiver with it: it is waited for all the same.
+        let _ = stop.send(());
+        timeout(PROMPT * 4, stopped)
+            .await
+            .expect("the old server stops in time")
+            .expect("the old server stops cleanly");
+    }
+
     /// Stops this server, waits until its runtime and every task on it are gone (each
     /// connection and stream of it ends, as when the process exits), and starts a new
     /// one over the same bucket and the same job service, as a restart of the `kbf-server`
@@ -555,6 +586,7 @@ impl Cell {
                             Arc::clone(&server_cache),
                             rows,
                             server_setup.retention,
+                            server_setup.live,
                         )
                     });
                     let listeners = Listeners {

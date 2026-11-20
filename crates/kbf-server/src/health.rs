@@ -3,6 +3,12 @@
 //!
 //! - `/healthz`: the process is alive and its API answers. It reads nothing and
 //!   always answers 200 while the server runs, while it stops too.
+//! - `/startedz`: the process has been ready once. 503, with `/readyz`'s failing checks,
+//!   until `/readyz`'s checks first all pass; 200 from then on, while it stops and while a
+//!   dependency is down too. It is the check a container orchestrator that starts the new
+//!   process beside the old one asks before it stops the old one (Swarm's health check with
+//!   `start-first`): a process that cannot serve yet does not pass it, and one that has
+//!   served is not restarted for an outage of its state store or job service.
 //! - `/readyz`: the server is ready to serve. 200 only when every check passes; else
 //!   503 with the failing checks and why. The checks:
 //!   - `stopping`: no stop signal has been received ([`Readiness::stop`]);
@@ -173,6 +179,15 @@ struct ReadyBody {
     failing: Vec<Failing>,
 }
 
+/// The body of `/startedz`.
+#[derive(Serialize)]
+struct StartedBody {
+    started: bool,
+    version: &'static str,
+    commit: &'static str,
+    failing: Vec<Failing>,
+}
+
 /// The body of `/healthz`.
 #[derive(Serialize)]
 struct AliveBody {
@@ -228,6 +243,8 @@ pub struct Checks {
     /// Whether [`Checks::begin`] has run: the probes are then read from their last answers,
     /// not asked.
     background: AtomicBool,
+    /// Whether [`Checks::failing`] has once found nothing failing (`/startedz`).
+    started: AtomicBool,
 }
 
 impl Checks {
@@ -238,6 +255,7 @@ impl Checks {
             readiness,
             probes: Vec::new(),
             background: AtomicBool::new(false),
+            started: AtomicBool::new(false),
         }
     }
 
@@ -296,7 +314,17 @@ impl Checks {
     /// server is ready. Asks each probe once, or, after [`Checks::begin`], reads the last
     /// answer of each and waits for none.
     pub async fn failing(&self) -> Vec<Failing> {
-        self.failing_except(&[]).await
+        let failing = self.failing_except(&[]).await;
+        if failing.is_empty() {
+            self.started.store(true, Ordering::SeqCst);
+        }
+        failing
+    }
+
+    /// Whether [`Checks::failing`] has once found nothing failing: the server has been ready.
+    #[must_use]
+    pub fn has_started(&self) -> bool {
+        self.started.load(Ordering::SeqCst)
     }
 
     /// [`Checks::failing`] without asking the probes named in `skip`: what a caller that
@@ -518,10 +546,14 @@ struct ReapiReady {
 /// The check `/readyz/reapi` adds to `/readyz`'s.
 const NO_EXECUTOR: &str = "no_executor";
 
-/// The `/healthz` and `/readyz` routes over `checks`.
+/// The path of `GET /startedz`.
+pub const STARTEDZ: &str = "/startedz";
+
+/// The `/healthz`, `/startedz` and `/readyz` routes over `checks`.
 pub fn router_of(checks: Arc<Checks>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route(STARTEDZ, get(startedz))
         .route("/readyz", get(readyz))
         .with_state(checks)
 }
@@ -533,6 +565,28 @@ async fn healthz() -> Response {
         commit: BUILD_COMMIT,
     };
     json(StatusCode::OK, &body)
+}
+
+/// 200 once the server has been ready; until then `/readyz`'s answer, asked now.
+async fn startedz(State(checks): State<Arc<Checks>>) -> Response {
+    let failing = if checks.has_started() {
+        Vec::new()
+    } else {
+        checks.failing().await
+    };
+    let started = failing.is_empty();
+    let code = if started {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let body = StartedBody {
+        started,
+        version: SERVER_VERSION,
+        commit: BUILD_COMMIT,
+        failing,
+    };
+    json(code, &body)
 }
 
 async fn readyz(State(checks): State<Arc<Checks>>) -> Response {

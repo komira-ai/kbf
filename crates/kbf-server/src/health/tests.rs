@@ -333,3 +333,77 @@ async fn readyz_reapi_follows_the_stop_signal_with_an_executor() {
     assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["failing"][0]["check"], "stopping");
 }
+
+/// What `GET /startedz` answers now: its status and its body.
+async fn started(checks: &Arc<Checks>) -> (StatusCode, serde_json::Value) {
+    let answer = startedz(State(Arc::clone(checks))).await;
+    let code = answer.status();
+    let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
+        .await
+        .expect("the body");
+    (code, serde_json::from_slice(&bytes).expect("JSON"))
+}
+
+/// Catches `/startedz` answering as `/healthz` (200 before the process can serve, so Swarm
+/// stops the old task too early) or as `/readyz` (503 again once a dependency is down or a
+/// drain begins, so Swarm kills a process that has served): 503 with the failing check until
+/// the checks first pass, then 200 through a dependency outage and a stop signal, asking no
+/// probe once started.
+#[tokio::test]
+async fn startedz_fails_until_the_first_ready_and_passes_from_then_on() {
+    let rig = rig(DOWN);
+    let (code, body) = started(&rig.checks).await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "started": false,
+            "version": SERVER_VERSION,
+            "commit": BUILD_COMMIT,
+            "failing": [{"check": "dependency", "reason": "it is down"}],
+        })
+    );
+    assert!(!rig.checks.has_started());
+
+    rig.mode.store(UP, Ordering::SeqCst);
+    let (code, body) = started(&rig.checks).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body["started"], true);
+    assert_eq!(body["failing"], serde_json::json!([]));
+    let asked = rig.asked.load(Ordering::SeqCst);
+
+    rig.mode.store(DOWN, Ordering::SeqCst);
+    assert!(rig.readiness.stop());
+    assert_eq!(rig.checks.failing().await.len(), 2, "/readyz fails");
+    let asked = asked + 1;
+    let (code, body) = started(&rig.checks).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(
+        rig.asked.load(Ordering::SeqCst),
+        asked,
+        "a started check asked a probe"
+    );
+}
+
+/// Catches a process that is told to stop before it has ever been ready passing
+/// `/startedz`: it never served, so it is not started, and the stop is named.
+#[tokio::test]
+async fn startedz_of_a_process_stopped_before_it_was_ready_fails() {
+    let rig = rig(UP);
+    assert!(rig.readiness.stop());
+    let (code, body) = started(&rig.checks).await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["failing"][0]["check"], "stopping");
+    assert!(!rig.checks.has_started());
+}
+
+/// Catches `/readyz` passing without marking the process started: a ready answer from
+/// `/readyz` (the load balancer's) is enough for `/startedz` to answer 200 without asking.
+#[tokio::test]
+async fn a_ready_answer_of_readyz_starts_the_process() {
+    let rig = rig(UP);
+    assert!(rig.checks.failing().await.is_empty());
+    assert!(rig.checks.has_started());
+    rig.mode.store(DOWN, Ordering::SeqCst);
+    assert_eq!(started(&rig.checks).await.0, StatusCode::OK);
+}

@@ -74,7 +74,7 @@ pub struct DrainStatus {
     /// Always 0: kbf queues no operation, every one is a job of the job service at once.
     /// Kept so a reader of an earlier release's document finds the field.
     pub queued_operations: u64,
-    /// The configured `--drain-deadline` has passed with executions open: the drain has
+    /// The configured `--drain-deadline` has passed with executions or calls open: the drain has
     /// stopped waiting on a clock and reported, and goes on serving them until they end.
     /// Left out of the answer until then.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -246,14 +246,14 @@ impl Drain {
     }
 
     /// Passes the deadline of the drain sequence now, as `--drain-deadline` running out
-    /// does: with executions open the sequence logs a WARN with their count and sets
+    /// does: with executions or calls open the sequence logs a WARN with their count and sets
     /// `deadline_passed` in the status, and goes on waiting for them; nothing is ended.
     /// Given before the sequence reaches its wait, it takes effect there.
     pub fn pass_deadline(&self) {
         self.deadline_over.fire();
     }
 
-    /// Whether the deadline has passed with executions open and the sequence is still
+    /// Whether the deadline has passed with executions or calls open and the sequence is still
     /// waiting for them.
     #[must_use]
     pub fn deadline_passed(&self) -> bool {

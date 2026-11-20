@@ -160,18 +160,30 @@ async fn a_row_that_cannot_be_written_does_not_stop_the_run() {
     assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));
 }
 
-/// An answer that cannot be written to the store still answers the callers of this process.
+/// An answer the store refuses still answers the callers of this process at once, and is
+/// written again until the store takes it, so other frontends answer it by name too.
 #[tokio::test(start_paused = true)]
-async fn an_answer_that_cannot_be_written_still_answers_the_callers_here() {
+async fn an_answer_that_cannot_be_written_answers_the_callers_here_and_is_written_again() {
     let rig = Rig::stored().await;
     // The id block, the row, and then the answer.
     rig.store.as_ref().expect("store").fail_nth_write(3);
     let caller = rig.submit(1);
     let job = rig.submitted(&caller, 0).await;
     rig.host_finishes(&job, 0);
-    assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));
-    assert_eq!(rig.rows("reader").done(caller.operation()), Ok(None));
+    let answer = rig.until_done(&caller).await;
+    assert!(matches!(answer, Finished::Ran(_)));
     assert!(rig.exec.wait(&caller.name).is_some(), "kept in memory");
+    rig.until("the answer is written again", || {
+        rig.rows("reader")
+            .done(caller.operation())
+            .is_ok_and(|done| done.is_some())
+    })
+    .await;
+    let written = rig.rows("reader").done(caller.operation());
+    assert_eq!(
+        written.expect("a read").map(|(_, answer)| answer),
+        Some(answer)
+    );
 }
 
 /// Catches two writers of one answer: when another process wrote it first, that answer is

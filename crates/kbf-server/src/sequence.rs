@@ -13,11 +13,13 @@
 //! 3. It refuses new Execute calls UNAVAILABLE ([`Drain::begin`]) and sends GOAWAY on every
 //!    listener: REAPI, worker and operator API. The REAPI and worker listeners stop
 //!    accepting; the operator API goes on answering so that the drain can be read.
-//! 4. It waits until no execution is open, however long that takes: every operation this
-//!    frontend runs goes on until its job ends and its callers are answered
-//!    ([`crate::executor`]). A [`DrainTiming::deadline`] (`--drain-deadline`, none by default)
-//!    that passes with executions open does not end the wait or any stream: it logs a WARN
-//!    with the count and sets `deadline_passed` in the drain status, and the wait goes on.
+//! 4. It waits until no execution is open and no call is being answered, however long that
+//!    takes: every operation this frontend runs goes on until its job ends and its callers
+//!    are answered ([`crate::executor`]), and a ByteStream write or read, a cache call or an
+//!    Execute still being prepared (`kbf_front_open_calls`) is answered, not cut by the
+//!    exit. A [`DrainTiming::deadline`] (`--drain-deadline`, none by default)
+//!    that passes with executions or calls open does not end the wait or any stream: it logs a
+//!    WARN with the counts and sets `deadline_passed` in the drain status, and the wait goes on.
 //! 5. It stands down as a retire does ([`Stand::release`]), closes the client streams that are
 //!    left ([`Drain::close`]) and, after a short grace for the clients to take their status
 //!    when there was a stream to close, ends the drain ([`Drain::sequence_ended`]); the serving
@@ -48,7 +50,7 @@ use crate::serve::{CLOSE_GRACE, drain_and_stop};
 use crate::stand::Stand;
 use crate::stop::Stop;
 
-/// How often step 4 looks at the executions that are open.
+/// How often step 4 looks at the executions and calls that are open.
 const OPEN_LOOK: Duration = Duration::from_millis(50);
 
 /// The two waits of a frontend's drain (`--drain-lb-wait` and `--drain-deadline`).
@@ -59,8 +61,8 @@ pub struct DrainTiming {
     /// interval times its unhealthy threshold, and the time its routes take to change. 0
     /// goes on at once.
     pub lb_wait: Duration,
-    /// When set, how long after the drain refuses new executions it reports the ones still
-    /// open (a WARN, and `deadline_passed` in the drain status). It only stops the waiting
+    /// When set, how long after the drain refuses new executions it reports the executions and
+    /// calls still open (a WARN, and `deadline_passed` in the drain status). It only stops the waiting
     /// there: nothing is ended, and the drain goes on until they are done. `None`, the
     /// default, reports nothing.
     pub deadline: Option<Duration>,
@@ -160,14 +162,15 @@ impl Sequence {
                 // The deadline only stops the waiting and says so: nothing is closed or
                 // released over the open executions, which finish or are ended by a second
                 // signal or `--shutdown-timeout-secs`.
-                let open = self.stand.open_executions();
-                if open > 0 {
+                let (open, calls) = (self.stand.open_executions(), self.stand.open_calls());
+                if open > 0 || calls > 0 {
                     drain.mark_deadline_passed();
                     tracing::warn!(
                         open,
+                        calls,
                         deadline = ?timing.deadline,
-                        "the drain deadline passed with executions open: still serving them, \
-                         waiting for them to end"
+                        "the drain deadline passed with executions or calls open: still serving \
+                         them, waiting for them to end"
                     );
                 }
                 idle.await;
@@ -185,9 +188,11 @@ impl Sequence {
         }
     }
 
-    /// Completes once no execution is open.
+    /// Completes once no execution is open and no call is being answered: a ByteStream
+    /// write or a cache call in flight is answered before the frontend stands down, and is
+    /// not cut when the process exits.
     async fn until_idle(&self) {
-        while self.stand.open_executions() > 0 {
+        while self.stand.busy() {
             tokio::time::sleep(OPEN_LOOK).await;
         }
     }

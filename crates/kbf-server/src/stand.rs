@@ -37,6 +37,18 @@ impl Stand {
     pub fn open_executions(&self) -> u64 {
         self.backend.metrics().execute.open_executions.get()
     }
+
+    /// The REAPI calls being answered now, open streams among them.
+    pub fn open_calls(&self) -> u64 {
+        self.backend.metrics().execute.open_calls.get()
+    }
+
+    /// Whether the REAPI front still answers anything: an open Execute or WaitExecution
+    /// stream, or any call (a ByteStream write or read, a cache call, an Execute still being
+    /// prepared) whose answer has not been sent.
+    pub fn busy(&self) -> bool {
+        self.open_executions() > 0 || self.open_calls() > 0
+    }
 }
 
 #[cfg(test)]

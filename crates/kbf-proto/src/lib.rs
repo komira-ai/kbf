@@ -2,7 +2,8 @@
 //! server-worker protocol, the `kbf.log.v1` replicated-log entries, the `kbf.map.v1`
 //! storage map (with its conversions to `kbf_map` types: `MapDecodeError`), the `kbf.enroll.v1`
 //! enrollment protocol, the `kbf.update.v1` self-update messages and release fetch, and the gRPC health
-//! checking protocol (`grpc.health.v1`), compiled from `.proto` files by `build.rs`.
+//! checking protocol (`grpc.health.v1`), and SeaweedFS's filer protocol (`filer_pb`, the
+//! client of `kbf_objstore::filer`), compiled from `.proto` files by `build.rs`.
 //!
 //! Modules mirror the proto packages, because generated code names other packages by
 //! relative paths (`super::super::...`). The vendored files, their licences and the
@@ -91,6 +92,11 @@ pub mod kbf {
             tonic::include_proto!("kbf.worker.v1");
         }
     }
+}
+
+/// `filer_pb`: SeaweedFS's filer protocol, as release 4.54 ships it (`weed/pb/filer.proto`).
+pub mod filer_pb {
+    tonic::include_proto!("filer_pb");
 }
 
 /// The Remote Execution API v2, under a short name.

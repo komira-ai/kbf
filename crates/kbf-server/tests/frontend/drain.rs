@@ -286,3 +286,94 @@ async fn every_listener_is_sent_goaway_when_the_wait_ends() {
     drop(client);
     pair.stop().await;
 }
+
+/// The value of the gauge `name` on the `/metrics` page of the operator API at `api`.
+async fn gauge(api: SocketAddr, name: &str) -> u64 {
+    let (code, page) = get_text(api, "/metrics").await;
+    assert_eq!(code, 200, "{page}");
+    let prefix = format!("{name} ");
+    page.lines()
+        .find_map(|line| {
+            line.strip_prefix(&prefix)
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or_else(|| panic!("no gauge {name} on the page"))
+}
+
+/// Catches a frontend whose REAPI calls are not counted for the drain to wait on (the count
+/// that `kbf_server::sequence`'s own tests drive by hand): a ByteStream write with its first
+/// half sent, on a frontend started as `kbf frontend` starts, is in `kbf_front_open_calls`; a
+/// drain begun and past its wait leaves it open; the rest of the write is then taken and
+/// answered whole, the drain goes on to close and the frontend exits, and the blob is readable
+/// through the other frontend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upload_in_flight_is_counted_for_the_drain_and_lands_whole() {
+    use futures::SinkExt as _;
+    use kbf_proto::google::bytestream::WriteRequest;
+    use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+
+    let pair = Pair::start_with("drain-upload", &HELD).await;
+    let a = &pair.a;
+    let client = a.client().await;
+    assert_eq!(gauge(a.api, "kbf_front_open_calls").await, 0);
+    let upload = support::Blob::new(vec![7_u8; 64 << 10]);
+    let blob = &upload.data;
+    let resource = format!(
+        "uploads/u/blobs/{}/{}",
+        upload.digest.hash_hex(),
+        blob.len()
+    );
+    let (mut chunks, sent) = futures::channel::mpsc::channel::<WriteRequest>(2);
+    let mut bytestream = ByteStreamClient::new(client.channel());
+    let writing = tokio::spawn(async move { bytestream.write(sent).await });
+    let half = blob.len() / 2;
+    chunks
+        .send(WriteRequest {
+            resource_name: resource.clone(),
+            data: blob[..half].to_vec(),
+            ..Default::default()
+        })
+        .await
+        .expect("the first half is sent");
+    let counted = async {
+        while gauge(a.api, "kbf_front_open_calls").await == 0 {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(SAFETY, counted)
+        .await
+        .expect("the write is counted");
+
+    begin_drain(a.api).await;
+    a.drain.end_lb_wait();
+    leaves_the_wait(a).await;
+    assert_eq!(
+        a.drain.phase(),
+        Phase::Draining,
+        "stood down over an upload"
+    );
+
+    chunks
+        .send(WriteRequest {
+            write_offset: i64::try_from(half).expect("a size"),
+            data: blob[half..].to_vec(),
+            finish_write: true,
+            ..Default::default()
+        })
+        .await
+        .expect("the second half is sent");
+    drop(chunks);
+    let written = writing.await.expect("the write's task");
+    let committed = written.expect("the upload is answered").into_inner();
+    assert_eq!(
+        committed.committed_size,
+        i64::try_from(blob.len()).expect("a size")
+    );
+    reaches(a, Phase::Closing).await;
+    a.exits().await;
+
+    let other = pair.b.client().await;
+    assert!(other.holds(&upload).await, "the upload did not land");
+    drop((client, other));
+    pair.stop().await;
+}

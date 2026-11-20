@@ -137,6 +137,7 @@ default, `--ui=false` turns them off. Open: no gate, whatever the REAPI policy s
 | Verb | Method and route | Status | Gate |
 |---|---|---|---|
 | liveness | `GET /healthz` | [F] | none |
+| started: ready once, and still alive (a start-first orchestrator's health check) | `GET /startedz` | [F] | none |
 | readiness | `GET /readyz` | [F] | none |
 | readiness for REAPI calls (`/readyz`, and the frontend has an executor: check `no_executor`) | `GET /readyz/reapi` | [F] | none |
 | farm summary (ready, failing checks, storage) | `GET /v1/health` | [F] | open |

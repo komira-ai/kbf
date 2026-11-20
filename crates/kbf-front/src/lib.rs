@@ -67,6 +67,7 @@ mod backend;
 pub mod base_publish;
 mod bytestream;
 mod cache;
+mod calls;
 mod capabilities;
 mod cas;
 mod closure;
@@ -107,6 +108,8 @@ use kbf_proto::reapi::capabilities_server::CapabilitiesServer;
 use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorageServer;
 use kbf_proto::reapi::execution_server::ExecutionServer;
 use tonic::service::Routes;
+
+use crate::calls::CallsLayer;
 
 pub use crate::action_cache::ActionCacheService;
 pub use crate::backend::Backend;
@@ -378,6 +381,8 @@ where
     D: Dispatch,
 {
     let OpenStreams { closing, progress } = streams;
+    let backend = backend.into();
+    let calls = CallsLayer::new(Arc::clone(&backend.metrics().execute));
     let operations = OperationsService::new(Arc::clone(&dispatch), Arc::clone(&authorizers));
     let service =
         ExecutionService::with_authorizers(backend, dispatch, closing, Arc::clone(&authorizers))
@@ -387,9 +392,11 @@ where
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let capabilities = CapabilitiesService::new(true, authorizers);
-    base.add_service(CapabilitiesServer::new(capabilities))
+    let routes = base
+        .add_service(CapabilitiesServer::new(capabilities))
         .add_service(execution)
-        .add_service(OperationsServer::new(operations))
+        .add_service(OperationsServer::new(operations));
+    Routes::from(routes.into_axum_router().layer(calls))
 }
 
 fn cache_routes<M, O>(

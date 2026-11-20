@@ -127,6 +127,7 @@ fn start(dir: &Path, packs: Packs, state: Option<Arc<dyn Store>>) -> Start {
             keep: 1,
             timeout: Duration::from_secs(5),
             instance: "test".to_owned(),
+            held: Arc::default(),
         },
         platform: "linux-x86_64".to_owned(),
         packs,

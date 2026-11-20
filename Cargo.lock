@@ -1789,6 +1789,7 @@ dependencies = [
  "futures",
  "hex",
  "kbf-objstore",
+ "kbf-proto",
  "kbf-segments",
  "kbf-testkit",
  "kbf-threads",
@@ -1797,6 +1798,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -4766,13 +4768,16 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "bytes",
  "clap",
  "flate2",
  "hex",
  "kbf-gate",
  "kbf-host",
  "kbf-installer",
+ "kbf-objstore",
  "kbf-package-hook",
+ "kbf-proto",
  "kbf-testkit",
  "kbf-tree-bundle",
  "kbf-types",
@@ -4788,8 +4793,11 @@ dependencies = [
  "tar",
  "thiserror",
  "tierstore",
+ "tokio",
  "toml",
+ "tonic",
  "ureq",
+ "zeroize",
  "zip",
 ]
 

@@ -32,6 +32,11 @@
 //!   --project <dir> --nonce <text>` ([`prove_farm`]): after the deploy, build a small Buck2 project against the
 //!   farm, remote only, and exit 1 unless some action ran remotely and none locally. An empty `--address` prints a
 //!   notice and exits 0.
+//! - `filer-presence-bench --filer <host:port> --filer-root </buckets/bucket> [--sample cas/l] [--keys
+//!   1,10,...] [--present 100,50,0] [--rounds 200] [--lag-store-endpoint <url> ...]`
+//!   ([`filer_presence_bench`]): by hand, against a real SeaweedFS filer: the p50 and p99 of its
+//!   batch lookup through kbf's client, for batches of present and absent keys, and, with the
+//!   lag flags, how long an object written through one node takes to be seen by the filer.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
 //!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
@@ -155,6 +160,7 @@ pub mod deploy_farm;
 pub mod entitlements;
 pub mod fetch;
 pub mod fetch_attested;
+pub mod filer_presence_bench;
 pub mod installer_tarball;
 pub mod js_pin;
 pub mod merge_profiles;
@@ -259,6 +265,8 @@ enum Verb {
     DeployFarm(deploy_farm::Command),
     /// Prove the farm after a deploy with a remote-only Buck2 build of a small project.
     ProveFarm(prove_farm::Args),
+    /// Time a SeaweedFS filer's batch lookup of present and absent keys, and the replication lag.
+    FilerPresenceBench(filer_presence_bench::Args),
     /// Check that the runner's disk has the room the coverage run needs.
     RunnerDisk(runner_disk::Args),
     /// Make a directory hold exactly the pinned Debian packages of this host's architecture.
@@ -1038,6 +1046,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::MergeProfiles(args) => merge_profiles::run(&args, &root),
         Verb::DeployFarm(command) => deploy_farm::run_command(&command),
         Verb::ProveFarm(args) => prove_farm::run(&args),
+        Verb::FilerPresenceBench(args) => filer_presence_bench::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
         Verb::Debs(args) => Ok(debs::run(&args)?),
         Verb::StaticElf(args) => static_elf::run(&args),
