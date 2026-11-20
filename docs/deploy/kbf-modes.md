@@ -397,7 +397,9 @@ is absent, never zero. The buckets start at 1 ms. Where `prepare` and `start` go
 `kbf_executor_step_seconds{step=...}`, each step timed around its one wait: `facts`, `put_dir` (with the closure's
 `action`, `walk` and `held`), `tree` (to the action tree's name), `row`, `rpc` (each `SubmitJob` call), `backoff`
 (the wait before a submit is sent again) and `tree_wait` (a run waiting for its tree's writes, before its submit,
-while its row is written). [api.md](../api.md) lists them. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
+while its row is written), and the stages of those writes, timed on the task that writes the tree from its name on, so
+overlapping `tree_wait`: `tree_blobs` (the blobs that were nowhere, written whole), `tree_manifests` (the input root's
+manifests and `.kbf`, written together) and `tree_root` (the root, written last). [api.md](../api.md) lists them. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
 in the result's execution metadata as the `input_fetch`, `execution` and `output_upload` start and
 completed times, marked as a task's claim, and the run record and the read API say so with
 `phase_times: "task_claim"` (a run recorded by an earlier release is `measured`, and so is a record written before the

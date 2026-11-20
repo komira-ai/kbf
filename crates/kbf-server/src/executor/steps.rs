@@ -25,10 +25,18 @@
 //!   and its manifests or tree list built; the writes of the tree are not in it;
 //! - `tree_wait`: the run waiting for its tree's writes, before its submit, while its row is
 //!   written;
+//! - `tree_blobs`, `tree_manifests` and `tree_root`: the stages of the tree's writes as
+//!   manifests, timed on the task that writes it, which begins when the tree is named, before
+//!   `tree_wait`: the blobs that were nowhere, written whole (a tree with none has no
+//!   `tree_blobs`); the input root's manifests the memo did not have and `.kbf`, written
+//!   together; and the root, written once both are stored. A tree list is one write and has
+//!   none of them;
 //! - `row`: the operation's row written to the state store, while the tree's writes end and
 //!   before the submit;
 //! - `rpc`: one `SubmitJob` call, from the call to its answer or to the end of its limit;
 //! - `backoff`: the wait before a submit whose answer was lost is sent again.
+
+use kbf_front::action_tree::WriteStage;
 
 use crate::executor::histogram::{Histograms, Series};
 
@@ -49,6 +57,12 @@ pub(crate) enum Step {
     Tree,
     /// The wait for the tree's writes.
     TreeWait,
+    /// The tree's blobs that were nowhere, written whole.
+    TreeBlobs,
+    /// The tree's input manifests and `.kbf`, written together.
+    TreeManifests,
+    /// The tree's root manifest.
+    TreeRoot,
     /// The operation's row in the state store.
     Row,
     /// One `SubmitJob` call.
@@ -59,7 +73,7 @@ pub(crate) enum Step {
 
 impl Step {
     /// Every step, in the order the metric lists them.
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 13] = [
         Self::Facts,
         Self::PutDir,
         Self::Action,
@@ -67,6 +81,9 @@ impl Step {
         Self::Held,
         Self::Tree,
         Self::TreeWait,
+        Self::TreeBlobs,
+        Self::TreeManifests,
+        Self::TreeRoot,
         Self::Row,
         Self::Rpc,
         Self::Backoff,
@@ -82,9 +99,21 @@ impl Step {
             Self::Held => "held",
             Self::Tree => "tree",
             Self::TreeWait => "tree_wait",
+            Self::TreeBlobs => "tree_blobs",
+            Self::TreeManifests => "tree_manifests",
+            Self::TreeRoot => "tree_root",
             Self::Row => "row",
             Self::Rpc => "rpc",
             Self::Backoff => "backoff",
+        }
+    }
+
+    /// The step a stage of an action tree's writes is timed as.
+    pub(crate) const fn of_write(stage: WriteStage) -> Self {
+        match stage {
+            WriteStage::Blobs => Self::TreeBlobs,
+            WriteStage::Manifests => Self::TreeManifests,
+            WriteStage::Root => Self::TreeRoot,
         }
     }
 }

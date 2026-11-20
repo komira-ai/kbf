@@ -39,10 +39,15 @@ async fn a_tree_is_named_before_its_first_write_and_is_the_tree_written() {
     let into = Arc::clone(&at_name);
     let farm = Arc::clone(&rig.farm);
     let written = (rig.writer)
-        .write_named(&kept, &rig.base.tree, move |tree| {
-            let puts = farm.puts().len();
-            *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, puts));
-        })
+        .write_named(
+            &kept,
+            &rig.base.tree,
+            move |tree| {
+                let puts = farm.puts().len();
+                *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, puts));
+            },
+            |_, _| (),
+        )
         .await
         .expect("a tree");
     let (named, puts) = take(&at_name).expect("the tree was named");
@@ -69,9 +74,14 @@ async fn a_tree_whose_lookups_fail_is_never_named() {
     let at_name = seen::<ActionTree>();
     let into = Arc::clone(&at_name);
     let refused = (rig.writer)
-        .write_named(&kept, &rig.base.tree, move |tree| {
-            *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, 0));
-        })
+        .write_named(
+            &kept,
+            &rig.base.tree,
+            move |tree| {
+                *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, 0));
+            },
+            |_, _| (),
+        )
         .await
         .expect_err("no tree");
     assert!(matches!(refused, NoTree::Lookup { .. }), "{refused:?}");
@@ -93,9 +103,14 @@ async fn a_named_tree_whose_write_fails_is_not_written() {
     let at_name = seen::<ActionTree>();
     let into = Arc::clone(&at_name);
     let refused = (rig.writer)
-        .write_named(&kept, &rig.base.tree, move |tree| {
-            *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, 0));
-        })
+        .write_named(
+            &kept,
+            &rig.base.tree,
+            move |tree| {
+                *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, 0));
+            },
+            |_, _| (),
+        )
         .await
         .expect_err("no tree");
     assert!(
@@ -188,10 +203,15 @@ async fn a_checked_tree_and_list_are_named_before_their_first_write() {
     let into = Arc::clone(&at_name);
     let farm = Arc::clone(&rig.farm);
     let written = (rig.writer)
-        .write_checked_named(&kept, &rig.base.tree, move |tree| {
-            let puts = farm.puts().len();
-            *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, puts));
-        })
+        .write_checked_named(
+            &kept,
+            &rig.base.tree,
+            move |tree| {
+                let puts = farm.puts().len();
+                *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, puts));
+            },
+            |_, _| (),
+        )
         .await
         .expect("a tree");
     assert_eq!(take(&at_name), Some((written, 0)));

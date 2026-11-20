@@ -52,6 +52,8 @@ mod named;
 mod places;
 #[path = "action_tree/retry.rs"]
 mod retry;
+#[path = "action_tree/stages.rs"]
+mod stages;
 #[path = "action_tree/store.rs"]
 mod store;
 #[path = "action_tree/whiteout.rs"]
@@ -92,6 +94,8 @@ struct Faults {
     held: Option<String>,
     /// Every write waits, once recorded, until the test opens [`Farm::gate`].
     hold_all: bool,
+    /// Every write waits this long on tokio's clock, once recorded, before it is made.
+    delay: Option<Duration>,
     /// The checks of a pack against the store.
     check: Fault,
 }
@@ -470,12 +474,13 @@ impl LargeStore for Farm {
         Box::pin(async move {
             let _open = Open::enter(self);
             let name = key.as_str().to_owned();
-            let (held, refused) = {
+            let (held, refused, delay) = {
                 let mut state = self.state();
                 state.puts.push(name.clone());
                 let faults = &state.faults;
                 let held = faults.hold_all || faults.held.as_deref() == Some(name.as_str());
-                (held, faults.put.as_deref() == Some(name.as_str()))
+                let refused = faults.put.as_deref() == Some(name.as_str());
+                (held, refused, faults.delay)
             };
             if held {
                 self.gate
@@ -483,6 +488,9 @@ impl LargeStore for Farm {
                     .await
                     .expect("the gate is never closed")
                     .forget();
+            }
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
             }
             if refused {
                 return Err(ObjectStoreError::Unsupported("writes to this key"));
