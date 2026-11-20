@@ -207,3 +207,31 @@ async fn a_mint_times_its_put_dir_and_its_tree_into_the_executor_metrics() {
         .await
         .expect("nothing pending for a refused tree");
 }
+
+/// Catches the stages of a tree's writes not timed into the executor's steps, timed twice, or
+/// timed for a tree list: a tree written as manifests, whose blobs the rig keeps only in its
+/// CAS, counts one `tree_blobs`, one `tree_manifests` and one `tree_root` once it is stored; a
+/// tree list, one write with no stages, counts none of them.
+#[tokio::test]
+async fn the_stages_of_a_trees_writes_are_timed_into_the_executor_metrics() {
+    let stages = ["tree_blobs", "tree_manifests", "tree_root"];
+    for (form, base, counts) in [
+        (InputTree::Manifests, super::put_dir::base(), "1"),
+        (InputTree::Provider, super::put_dir::listed_base(), "0"),
+    ] {
+        let prep = DirPrep::new(None, 7_200);
+        let rig = super::put_dir::rig_over(prep, Some(base));
+        let action = action_with_input(&rig, "input").await;
+        let metrics = Arc::new(Metrics::default());
+        let front = rig.front.with_metrics(Arc::clone(&metrics));
+        front
+            .mint(run(1), &action, WALL, form)
+            .await
+            .expect("a dir");
+        front.stored(run(1)).await.expect("stored");
+        assert_eq!(counted(&metrics, "tree"), "1", "{form:?}");
+        for stage in stages {
+            assert_eq!(counted(&metrics, stage), counts, "{form:?}: {stage}");
+        }
+    }
+}

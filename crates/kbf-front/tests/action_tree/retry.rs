@@ -311,8 +311,8 @@ async fn a_slow_down_is_waited_out_past_the_total() {
 }
 
 /// Catches: a `SlowDown` that a total of zero (which never retries a 503) turns into a failure,
-/// and a manifest's write that gives up on it: with no total, a manifest answered `SlowDown`
-/// twice is waited out and the tree is made.
+/// and a manifest's write that gives up on it: with no total, the input root's manifest
+/// answered `SlowDown` twice is waited out and the tree is made.
 #[tokio::test]
 async fn a_slow_down_is_waited_out_with_a_zero_total() {
     let (rig, sleeps) = rig(Duration::ZERO).await;
@@ -320,11 +320,14 @@ async fn a_slow_down_is_waited_out_with_a_zero_total() {
     let root = rig
         .store(&directory(vec![file("p", &packed, false)], vec![], vec![]))
         .await;
-    rig.farm
-        .state()
-        .faults
-        .any
-        .extend([slow_down(), slow_down()]);
+    // Scripted on the one manifest: `.kbf` is written beside it, so an answer for any key
+    // could go to either write.
+    let manifest = format!(
+        r#"{{"v":1,"children":[{{"name":"p","kind":"file","sha256":"{}","size":6,"exec":false,"source":{{"key":"cas/f/w/p0","offset":0}}}}]}}"#,
+        packed.hash_hex()
+    );
+    let key = whole_key(&TreeDigest::of(manifest.as_bytes()).to_string());
+    script(&rig, &key, vec![slow_down(), slow_down()]);
     let tree = rig.write(&root).await.expect("a tree");
     rig.farm.flatten(&tree).expect("every manifest is stored");
     assert_eq!(sleeps.waits(), [FIRST_WAIT, FIRST_WAIT * 2]);
