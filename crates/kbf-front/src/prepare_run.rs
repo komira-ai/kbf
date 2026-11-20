@@ -52,7 +52,9 @@
 //! [`PutDirPrep::with_directories`] has the closure walk read its `Directory` messages through a
 //! [`DirectoryCache`], keyed by digest, so a tree walked before is not read from the store again.
 //! The cache serves the closure walk of the put-directory preparation only; [`RunPrep`] reads no
-//! cache.
+//! cache. It is also given to the preparer's [`Backend`]: an Execute's input check over that
+//! backend keeps every `Directory` it reads in it, with its names, so the run the Execute starts
+//! reads none of them again.
 //!
 //! **Writes the run does not wait for.** The closure walk records the `Directory` bodies it read
 //! from blobs as rows of the pack index and keeps them on the cache's disk half, in tasks that
@@ -702,9 +704,11 @@ impl PutDirPrep {
         }
     }
 
-    /// This preparer, its closure walk reading each `Directory` through `cache` first.
+    /// This preparer, its closure walk reading each `Directory` through `cache` first; the input
+    /// check of an Execute over the same backend keeps every `Directory` it reads in `cache` too.
     #[must_use]
     pub fn with_directories(mut self, cache: Arc<DirectoryCache>) -> Self {
+        self.backend.keep_directories(Arc::clone(&cache));
         self.directories = Some(cache);
         self
     }

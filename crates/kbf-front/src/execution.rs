@@ -654,7 +654,7 @@ impl<D> ExecutionService<D> {
         let command_digest = required(decoded.command_digest.as_ref(), "command_digest")?;
         let root = required(decoded.input_root_digest.as_ref(), "input_root_digest")?;
 
-        let mut absent = Vec::new();
+        let (mut absent, reading) = (Vec::new(), Instant::now());
         let command = match self.read_input(&command_digest).await? {
             Some(bytes) => Some(Command::decode(bytes).map_err(|e| {
                 Status::invalid_argument(format!("command {command_digest} does not decode: {e}"))
@@ -702,7 +702,10 @@ impl<D> ExecutionService<D> {
             );
             return Err(missing(&absent));
         }
-
+        // The Command and every input held: the run's preparation need not ask again.
+        if let Some(at) = walked.held_since {
+            self.cache.vouch(action, at.min(reading));
+        }
         let submission = Submission {
             key: ActionKey { instance, action },
             whole_machine,
