@@ -29,6 +29,12 @@
 //!   (Buck2 or Bazel, a remote-execution or remote-cache flag, a gRPC farm address, another
 //!   rustc or a wrapper of it). Cargo's own configuration files are not read: a change there
 //!   is a change to every build of the repository, reviewed as such.
+//! - **No farm reaches it.** No scalar of a seed job, nor of the workflow's own `env:`, reads
+//!   a context of what the repository's settings store ([`STORED_CONTEXTS`]: its variables
+//!   and secrets, where a farm address or a network key would be kept) or names a way onto a
+//!   private network ([`FARM_ROUTES`]). So a seed job runs the same with or without a farm,
+//!   and a run of it in the repository shows what a run in a fork would: a release ships
+//!   with the farm unreachable (docs/artifacts.md, "The seed drill").
 //! - **The published files are theirs.** Each seed job uploads its packaged files (`dist`,
 //!   with `if-no-files-found: error`) as the artifact `assets-<job>`, spelled exactly (the
 //!   readers' selectors are case-sensitive), in an unconditional step, and no other job of `artifacts.yml`, of
@@ -162,6 +168,49 @@ pub const NOT_PLAIN: &[&str] = &[
     "target-dir",
 ];
 
+/// The expression contexts no scalar of a seed job, nor the workflow's `env:`, may read: the
+/// repository's (or its organization's or environment's) variables and secrets. A farm's
+/// address or a key to the network it is on would be kept there, and a fork has neither, so
+/// a seed job that reads neither builds the same in the repository as in a fork.
+pub const STORED_CONTEXTS: &[&str] = &["vars", "secrets"];
+
+/// What no scalar of a seed job, nor the workflow's `env:`, may name, compared ignoring ASCII
+/// case: a way onto a private network (an action or a command of one of these), the only
+/// route a hosted runner has to a farm.
+pub const FARM_ROUTES: &[&str] = &[
+    "tailscale",
+    "headscale",
+    "wireguard",
+    "wg-quick",
+    "openvpn",
+    "zerotier",
+];
+
+/// The context of [`STORED_CONTEXTS`] the scalar `s` reads, if any: the word, in any case,
+/// after nothing that makes it a property or a variable (`.`, `$`, a letter, a digit, `_`,
+/// `-`) and before `.name`, `[` or `)`, as an expression reads it (`vars.X`,
+/// `secrets['X']`, `toJSON(secrets)`). The whole scalar is read, inside `${{ }}` or not: a
+/// condition is an expression without one, and quotes hide nothing, since a `run:` line is
+/// substituted before its shell reads it.
+pub fn stored_context(s: &str) -> Option<&'static str> {
+    let lower = s.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+    STORED_CONTEXTS.iter().copied().find(|ctx| {
+        lower.match_indices(ctx).any(|(at, _)| {
+            let before = at.checked_sub(1).map(|i| b[i]);
+            let after = &b[at + ctx.len()..];
+            let free = !before.is_some_and(|c| word(c) || c == b'.' || c == b'$');
+            let read = match after {
+                [b'.', c, ..] => word(*c),
+                [b'[' | b')', ..] => true,
+                _ => false,
+            };
+            free && read
+        })
+    })
+}
+
 /// The directory a seed job packages its release files into (`cargo xtask package dist ...`,
 /// `release_artifacts`' rules), as its upload may name it, and the one the attest jobs and the
 /// release's verify extract them into and check.
@@ -250,6 +299,16 @@ fn seed_job(text: &str, job: &str, out: &mut Vec<String>) -> Result<(), String> 
             out.push(format!(
                 "the seed job `{job}` names `{}` (in `{s}`): the seed build is plain cargo, with no other build system, farm or remote execution",
                 word.trim()
+            ));
+        }
+        if let Some(route) = FARM_ROUTES.iter().find(|w| lower.contains(*w)) {
+            out.push(format!(
+                "the seed job `{job}` names `{route}` (in `{s}`): a seed job joins no private network, so no farm is reachable from it"
+            ));
+        }
+        if let Some(ctx) = stored_context(s) {
+            out.push(format!(
+                "the seed job `{job}` reads the `{ctx}` context (in `{s}`): a seed job takes nothing the repository's settings store, so no farm address or network key reaches it"
             ));
         }
     }
@@ -688,7 +747,8 @@ fn the_release_is_built_by_plain_cargo_on_hosted_runners() {
 #[test]
 fn the_docs_say_why_the_seed_build_stays() {
     // Catches: docs/artifacts.md losing the section that says the seed build is how a broken
-    // kbf is rebuilt without kbf, and that a build on kbf runs beside it, never instead.
+    // kbf is rebuilt without kbf, that a build on kbf runs beside it, never instead, that a
+    // seed job reaches no farm, and how the drill shows it.
     let doc = std::fs::read_to_string(super::repo_root().join("docs/artifacts.md"))
         .expect("docs/artifacts.md");
     let doc = doc.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -697,6 +757,8 @@ fn the_docs_say_why_the_seed_build_stays() {
         "rebuilt without kbf",
         "beside the seed build, never instead of it",
         "crates/kbf-integration-test/tests/seed_build",
+        "### The seed drill",
+        "a seed job reaches no farm",
     ] {
         assert!(
             doc.contains(want),

@@ -7,6 +7,7 @@ use super::*;
 
 mod builds;
 mod published;
+mod unreachable;
 
 const ARTIFACTS: &str = ".github/workflows/artifacts.yml";
 const PIPELINE: &str = ".github/workflows/pipeline.yml";

@@ -944,7 +944,22 @@ fails when a seed job is removed, moved to a runner that is not GitHub-hosted, g
 a farm address, a remote-execution flag or a cargo build that is not plain, or no longer
 builds each binary its platform ships with plain cargo in a step that always runs, when another
 job of the pipeline's run uploads an assets artifact, or when the release's verify and
-publish stop needing the seed jobs.
+publish stop needing the seed jobs. It also fails when a seed job, or the workflow's `env:`,
+reads the repository's variables or secrets (the `vars` and `secrets` contexts, where a farm
+address or a network key would be kept) or names a way onto a private network (Tailscale,
+WireGuard and the like): a seed job reaches no farm.
+
+### The seed drill
+
+The drill shows that a release's files are built with the farm unreachable. Add the label
+`needs-artifacts` to a pull request: the three seed jobs build, package and check every file
+of the release on GitHub-hosted runners, and nothing is attested or published (a pull request
+runs neither). It passes when the three jobs are green, each platform's
+`kbf-<commit>-<platform>.version.json` names the commit built (on a pull request, its merge
+commit), and no line of the run's logs names a farm address or a private-network address.
+Because the lint above keeps the repository's settings and every network route out of the
+seed jobs, a run in this repository shows what a run in a fork would. A fork runs no
+workflow until Actions is enabled in its Actions tab.
 
 ## How a node's deployment verifies an asset (planned)
 
