@@ -132,7 +132,11 @@ async fn no_manifest_is_written_while_a_blob_that_was_nowhere_is() {
     let kept = rig.kept(&root).await;
     let mut writing = pin!(rig.writer.write(&kept, &rig.base.tree));
     assert!(poll!(writing.as_mut()).is_pending());
-    assert_eq!(rig.farm.puts(), [blob_key.clone()], "only the blob");
+    assert_eq!(
+        rig.farm.puts(),
+        std::slice::from_ref(&blob_key),
+        "only the blob"
+    );
     rig.farm.gate.add_permits(1);
     let tree = writing.await.expect("a tree");
     let puts = rig.farm.puts();
