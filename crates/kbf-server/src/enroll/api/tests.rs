@@ -204,7 +204,7 @@ fn enroll_csr(
     let id = TokenId::parse(&created.info.id).expect("id");
     let node_id = node(name);
     let seed = name.bytes().fold(0u8, u8::wrapping_add);
-    let now = store.now().as_duration().as_secs();
+    let now = store.now().expect("time").as_duration().as_secs();
     let mut sign = || {
         Ok(vec![IssuedRole {
             role: Role::Daemon,

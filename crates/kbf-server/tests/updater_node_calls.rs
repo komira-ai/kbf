@@ -456,7 +456,7 @@ fn enroll(store: &dyn Store, n: u8, name: &str, roles: &[Role], advertise: &str)
     create_token(store, &token, &secret, &spec).expect("token");
     let node: NodeId = name.parse().expect("a node id");
     let csrs: Vec<(Role, &[u8])> = roles.iter().map(|r| (*r, b"csr".as_slice())).collect();
-    let now = store.now().as_duration().as_secs();
+    let now = store.now().expect("time").as_duration().as_secs();
     let request = EnrollRequest {
         token_id: &token,
         secret: &[n; 32],

@@ -394,7 +394,7 @@ pub fn enroll(store: &dyn Store, name: &str) {
     };
     create_token(store, &token, &secret, &spec).expect("token");
     let node: NodeId = name.parse().expect("a node id");
-    let now = store.now().as_duration().as_secs();
+    let now = store.now().expect("time").as_duration().as_secs();
     let mut sign = || {
         Ok(vec![IssuedRole {
             role: Role::Daemon,

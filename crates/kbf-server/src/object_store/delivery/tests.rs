@@ -217,7 +217,7 @@ impl Store for Interleaved {
     fn commit_stats(&self) -> CommitStats {
         self.inner.commit_stats()
     }
-    fn now(&self) -> StoreTime {
+    fn now(&self) -> Result<StoreTime, StoreError> {
         self.inner.now()
     }
 }

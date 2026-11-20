@@ -206,11 +206,14 @@ impl Config {
             os: "linux".to_owned(),
             arch: self.arch.clone(),
             exec: ExecMode::Container.into(),
-            // No ISA level, no accelerator, and confinement left unspecified (contained):
-            // the request's bytes stay those an older job service also reads.
+            // No ISA level, no accelerator, confinement left unspecified (contained), no least
+            // system version and no Xcode: the request's bytes stay those an older job service
+            // also reads.
             isa_level: String::new(),
             accelerator: None,
             isolation: Isolation::Unspecified.into(),
+            os_version: String::new(),
+            xcode: String::new(),
         }
     }
 
