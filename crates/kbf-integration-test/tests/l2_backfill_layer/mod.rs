@@ -86,7 +86,10 @@ fn no_crate_depends_on_the_l2_backfill_tool() {
         "kbf-l2-backfill is a workspace member"
     );
     let found = dependents(packages);
-    assert!(found.is_empty(), "a crate depends on kbf-l2-backfill: {found:?}");
+    assert!(
+        found.is_empty(),
+        "a crate depends on kbf-l2-backfill: {found:?}"
+    );
 }
 
 /// Asserts that a dependency on the tool is named whatever its kind, and that packages with
@@ -104,7 +107,11 @@ fn a_crate_that_depends_on_the_l2_backfill_tool_is_named() {
     .expect("the fixture is JSON");
     assert_eq!(
         dependents(&packages),
-        ["kbf-cli (normal)", "kbf-server (dev)", "kbf-installer (build)"]
+        [
+            "kbf-cli (normal)",
+            "kbf-server (dev)",
+            "kbf-installer (build)"
+        ]
     );
     assert!(dependents(&packages[..1]).is_empty());
 }
@@ -116,7 +123,10 @@ fn graph(names: &[(&str, &str)], edges: &[(&str, &[&str])]) -> Graph {
             .iter()
             .map(|(id, name)| ((*id).to_owned(), (*name).to_owned()))
             .collect(),
-        sources: names.iter().map(|(id, _)| ((*id).to_owned(), None)).collect(),
+        sources: names
+            .iter()
+            .map(|(id, _)| ((*id).to_owned(), None))
+            .collect(),
         normal: edges
             .iter()
             .map(|(id, deps)| {

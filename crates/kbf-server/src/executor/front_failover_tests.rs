@@ -35,6 +35,9 @@ async fn a_run_is_prepared_and_ingested_through_a_failover_of_30_seconds() {
         .await
         .expect("a dir");
     let tree = rig.front.tree(lease()).await.expect("a tree");
+    // The tree is named before its writes end, as the executor has it: it waits for them
+    // before the job is submitted, and so does this test before it reads the store.
+    rig.front.stored(lease()).await.expect("stored");
 
     let manifest = ObjectKey::new(format!("cas/l/{tree}")).expect("a key");
     assert!(
