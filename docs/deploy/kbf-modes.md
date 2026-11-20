@@ -190,8 +190,8 @@ timeout plus the run margin. The Macs of the job service are used when `--execut
 bundle by its manifest digest, the image of a Mac job; without it no macOS action is run),
 `--executor-mac-os-version` (the least macOS the Macs run, 26 by default; an
 action's `os_version` above it is refused) and `--executor-mac-task-out-root` (the tier store's
-put directory on the Macs, `--task-out-root` by default); a macOS action becomes a job of a
-Mac's native runtime (docs/design/actions-as-jobs.md, section 14), which the job service at
+put directory on the Macs, `--task-out-root` by default); a macOS action must name its Xcode build (`xcode`, docs/platform-properties.md) and becomes a
+job of a Mac's native runtime with that Xcode (docs/design/actions-as-jobs.md, section 14), which the job service at
 kbf's pin cannot run yet. It books no disk: the
 job carries no `disk_bytes`, so the job service places it on a host whatever scratch disk that
 host reports, and the job writes to its host's scratch with no quota. The kbf image is built from

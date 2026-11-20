@@ -131,7 +131,7 @@ impl Store for Refusing {
         self.0.commit_stats()
     }
 
-    fn now(&self) -> StoreTime {
+    fn now(&self) -> Result<StoreTime, StoreError> {
         self.0.now()
     }
 }
@@ -185,7 +185,7 @@ impl Store for Panicking {
         self.0.commit_stats()
     }
 
-    fn now(&self) -> StoreTime {
+    fn now(&self) -> Result<StoreTime, StoreError> {
         self.0.now()
     }
 }

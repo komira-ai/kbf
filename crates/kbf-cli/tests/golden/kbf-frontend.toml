@@ -103,7 +103,7 @@ executor-live-secs = 20
 # Retired: no longer read, every Execute is a job of the job service
 # (not in --help)
 # executor-mac-hosts = "WORKERS"
-# The least major macOS every Mac of the job service runs. An action's `os_version` is the least it takes (`26` means 26 or newer), and one that asks for a newer macOS than this is refused, naming both: the job service cannot be asked for a version. Used only with `--executor-mac-task-bundle`
+# The least major macOS every Mac of the job service runs. An action's `os_version` is the least it takes (`26` means 26 or newer), and one that asks for a newer macOS than this is refused, naming both: the executor holds this rule itself and asks the job service for no version. Used only with `--executor-mac-task-bundle`
 executor-mac-os-version = 26
 # The release's macOS `kbf-task` bundle, by its manifest digest (the one entry of the `index.json` of `kbf-task-bundle-<commit>-darwin-arm64.tar.gz`): the image of a Mac job, whose entrypoint `kbf-task` runs. It enables the Macs: without it no action whose platform asks for macOS is run, and `--executor-mac-os-version` and `--executor-mac-task-out-root` are refused. Used only with `--executor js-agent`
 # executor-mac-task-bundle = "NAME@sha256:HEX"

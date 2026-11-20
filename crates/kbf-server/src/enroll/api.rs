@@ -138,6 +138,7 @@ impl From<RegistryError> for Failure {
             RegistryError::Store(
                 StoreError::Failed(_)
                 | StoreError::Disconnected(_)
+                | StoreError::Unavailable(_)
                 | StoreError::StaleCursor { .. },
             ) => Self::new(StatusCode::SERVICE_UNAVAILABLE, "the state store failed"),
         }

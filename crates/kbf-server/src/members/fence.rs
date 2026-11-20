@@ -118,7 +118,7 @@ impl Members {
             };
             let (epoch, epoch_cond) = self.epoch_cond()?;
             let rows = self.read_rows()?;
-            let after = self.fence_step(id, &before, &map, &rows, self.store.now(), epoch);
+            let after = self.fence_step(id, &before, &map, &rows, self.store.now()?, epoch);
             if after == before {
                 return Ok(());
             }

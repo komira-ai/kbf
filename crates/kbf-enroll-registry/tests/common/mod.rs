@@ -31,7 +31,7 @@ impl Env {
     }
 
     pub fn now(&self) -> u64 {
-        self.store.now().as_duration().as_secs()
+        self.store.now().expect("time").as_duration().as_secs()
     }
 }
 
@@ -319,7 +319,7 @@ impl Store for Wrap {
         self.inner.commit_stats()
     }
 
-    fn now(&self) -> StoreTime {
+    fn now(&self) -> Result<StoreTime, StoreError> {
         self.inner.now()
     }
 }

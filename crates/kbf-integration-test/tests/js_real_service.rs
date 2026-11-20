@@ -242,6 +242,7 @@ async fn fake_like_the_pool() -> FakeJobServer {
         os: "linux".to_owned(),
         arch: "x86_64".to_owned(),
         exec: ExecMode::Container,
+        xcodes: Vec::new(),
     });
     fake.advance(Duration::from_secs(1));
     fake

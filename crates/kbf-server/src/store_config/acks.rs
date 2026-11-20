@@ -175,7 +175,7 @@ impl Acks {
             let row = Row {
                 boot,
                 report: Report::of(beat),
-                at: self.store.now().as_duration().as_secs(),
+                at: self.store.now()?.as_duration().as_secs(),
             };
             let cond = read.map_or(Cond::Absent, |v| Cond::Version(v.version));
             let txn = Txn::new().put_ttl(&key, row.encode(), ACK_TTL, cond);
@@ -203,7 +203,7 @@ impl Acks {
     /// # Errors
     /// The store failing.
     pub fn convergence(&self, map: &Map, generation: u64) -> Result<Convergence, StoreError> {
-        let now = self.store.now().as_duration().as_secs();
+        let now = self.store.now()?.as_duration().as_secs();
         let rows: std::collections::BTreeMap<String, Row> = self
             .store
             .scan_prefix(PREFIX)?

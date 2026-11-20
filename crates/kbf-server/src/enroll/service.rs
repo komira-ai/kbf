@@ -265,7 +265,7 @@ impl EnrollService {
             },
             &mut sign,
         )?;
-        let now = core.now();
+        let now = core.now()?;
         Ok(pb::EnrollResponse {
             certs: certs_of(&enrolled.certs),
             ca_bundle_pem: core.ca.bundle_pem().into_bytes(),
@@ -303,8 +303,15 @@ pub(super) fn renew_after(now: i64, certs: &[StoredCert]) -> i64 {
 impl Core {
     /// The store's clock in unix seconds: the one the registry judges expiry by, and the
     /// one certificates are issued at.
-    pub(super) fn now(&self) -> i64 {
-        i64::try_from(self.store.now().as_duration().as_secs()).unwrap_or(i64::MAX)
+    ///
+    /// # Errors
+    /// [`RefusalReason::StoreUnavailable`] when the store cannot tell its time.
+    pub(super) fn now(&self) -> Result<i64, RefusalReason> {
+        let now = self
+            .store
+            .now()
+            .map_err(|_| RefusalReason::StoreUnavailable)?;
+        Ok(i64::try_from(now.as_duration().as_secs()).unwrap_or(i64::MAX))
     }
 
     /// The registered cold store, as a storage node is told it. Read before a call changes
@@ -365,7 +372,7 @@ impl Core {
                     key,
                     advertise,
                 },
-                self.now(),
+                self.now()?,
                 &mut SystemEntropy,
             )
             .map_err(|e| ca_reason(&e))?;
@@ -388,7 +395,7 @@ impl Core {
                     host_role,
                     key,
                 },
-                self.now(),
+                self.now()?,
                 &mut SystemEntropy,
             )
             .map_err(|e| ca_reason(&e))?;

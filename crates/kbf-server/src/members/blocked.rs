@@ -47,7 +47,7 @@ impl Members {
             return Ok(blocked);
         };
         let rows = self.read_rows()?;
-        let now = self.store.now();
+        let now = self.store.now()?;
         for (key, mark) in self.store.scan_prefix(UNFILLED)? {
             let Some(id) = key
                 .strip_prefix(UNFILLED)

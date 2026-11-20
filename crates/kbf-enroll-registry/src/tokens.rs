@@ -147,7 +147,7 @@ pub fn create_token(
             "expires_in must be at least a second and at most 30 days",
         ));
     }
-    let now = rows::seconds(store.now());
+    let now = rows::seconds(store.now()?);
     let row = TokenRow {
         secret_sha256: secret_digest(secret.as_bytes()).to_vec(),
         roles: spec.roles.iter().map(|r| r.name().to_owned()).collect(),
@@ -243,7 +243,7 @@ pub fn revoke_token(store: &dyn Store, id: &TokenId) -> Result<(), RegistryError
         if row.revoked_at.is_some() {
             return Ok(());
         }
-        row.revoked_at = Some(rows::seconds(store.now()));
+        row.revoked_at = Some(rows::seconds(store.now()?));
         let txn = Txn::new().put(&key, row.encode_to_vec(), Cond::Version(stored.version));
         if store.txn(txn)?.is_ok() {
             return Ok(());

@@ -93,7 +93,7 @@ impl Store for Holding {
         self.fake.commit_stats()
     }
 
-    fn now(&self) -> StoreTime {
+    fn now(&self) -> Result<StoreTime, StoreError> {
         self.fake.now()
     }
 }

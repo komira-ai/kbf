@@ -10,6 +10,8 @@ type Change = fn(&mut JobSpec);
 const IMAGE: &str =
     "registry.example/app@sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const GIB: u64 = 1 << 30;
+/// The one Xcode build the test machine has.
+const XCODE: &str = "16C5032a";
 
 fn machine() -> Machine {
     Machine {
@@ -23,6 +25,7 @@ fn machine() -> Machine {
         os: "linux".to_owned(),
         arch: "x86_64".to_owned(),
         exec: ExecMode::Container,
+        xcodes: vec![XCODE.to_owned()],
     }
 }
 
@@ -56,9 +59,9 @@ fn refusal(answer: Result<Job, Status>) -> Option<RefusalCode> {
 
 /// Asserts each rule of fit on its own: a job is refused `no-capable-host` when one need or
 /// constraint alone is past the only host (CPU, memory, disk, disk on a host that reports
-/// none, GPUs, GPU class, OS, architecture, exec mode), and admitted when each is at the
-/// host's own value or left empty. Catches a rule dropped from the fit, compared the wrong
-/// way, or an empty constraint that matches nothing.
+/// none, GPUs, GPU class, OS, architecture, exec mode, Xcode build), and admitted when each
+/// is at the host's own value or left empty. Catches a rule dropped from the fit, compared
+/// the wrong way, or an empty constraint that matches nothing.
 #[test]
 fn each_rule_of_fit_refuses_on_its_own() {
     let at_edge = JobSpec {
@@ -74,12 +77,13 @@ fn each_rule_of_fit_refuses_on_its_own() {
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
             exec: ExecMode::Container.into(),
+            xcode: XCODE.to_owned(),
             ..Constraints::default()
         }),
         ..spec("edge")
     };
     assert!(state().submit(at_edge.clone()).is_ok());
-    let past: [(&str, Change); 8] = [
+    let past: [(&str, Change); 9] = [
         ("cpu", |s| s.needs.as_mut().unwrap().cpu_millis += 1),
         ("memory", |s| s.needs.as_mut().unwrap().memory_bytes += 1),
         ("disk", |s| {
@@ -97,6 +101,9 @@ fn each_rule_of_fit_refuses_on_its_own() {
         }),
         ("exec", |s| {
             s.constraints.as_mut().unwrap().exec = ExecMode::SandboxExec.into()
+        }),
+        ("xcode", |s| {
+            s.constraints.as_mut().unwrap().xcode = "17A324".to_owned()
         }),
     ];
     for (rule, change) in past {
