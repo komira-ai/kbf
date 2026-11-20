@@ -1,6 +1,6 @@
 //! An Execute end to end over the executor and a fake job service: a miss runs as one job and
-//! its result is cached, under a key that two actions differing only in their Xcode build do not
-//! share; a server with no executor refuses it.
+//! its result is cached, under the whole Action digest (so two actions differing only in their
+//! `xcode` property are two entries); a server with no executor refuses it.
 
 mod support;
 
@@ -36,11 +36,13 @@ async fn an_execute_that_misses_the_cache_runs_as_one_job_and_its_result_is_cach
     assert_eq!(cell.direct.submitted_jobs(), 1);
 }
 
-/// Asserts that two Mac actions that differ only in the Xcode build their platform names
-/// (`xcode`) have different action keys: the result of the one built with `16C5032a`, cached, is
-/// not served for the one that names `17A324`, which misses the cache and runs as a job of its
-/// own, its result cached under its own key. Catches a result built with one Xcode served for
-/// another.
+/// Asserts that two actions whose Action differs only in the `xcode` platform property they
+/// name have different action keys: the result of the one naming `16C5032a`, cached, is not
+/// served for the one naming `17A324`, which misses the cache and runs as a job of its own, its
+/// result cached under its own key. This harness's executor reads its facts from fakes and runs
+/// both as Linux jobs; what is under test is the cache's key, the whole Action digest, platform
+/// included (the Mac job's Xcode is asserted in `tests/executor/mac.rs`). Catches a cache key
+/// that leaves the platform out, which would serve a result built with one Xcode for another.
 #[tokio::test]
 async fn two_actions_that_differ_only_in_their_xcode_build_have_different_action_keys() {
     let cell = Cell::start().await;

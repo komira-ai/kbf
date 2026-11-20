@@ -52,12 +52,14 @@ fn no_store(mut answer: Response) -> Response {
 }
 
 /// The status and fixed text a failed store read answers with: never a stored row or the
-/// store's own message.
+/// store's own message. A store that failed, lost its connection or was too busy to take the
+/// read is 503, which a caller retries; a row that does not read is 500.
 fn store_failure(e: &MembershipError) -> (StatusCode, &'static str) {
     match e {
-        MembershipError::Store(StoreError::Failed(_)) | MembershipError::Contended => {
-            (StatusCode::SERVICE_UNAVAILABLE, "the state store failed")
-        }
+        MembershipError::Store(
+            StoreError::Failed(_) | StoreError::Disconnected(_) | StoreError::Unavailable(_),
+        )
+        | MembershipError::Contended => (StatusCode::SERVICE_UNAVAILABLE, "the state store failed"),
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "a stored row is unreadable",
@@ -105,6 +107,41 @@ async fn list_denied(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
+    use kbf_state::StoreError;
+
+    use crate::members::MembershipError;
+
+    /// Asserts that a store that failed, lost its connection or was too busy is answered 503
+    /// "the state store failed", which a caller retries, and that a row that does not read is
+    /// 500. Catches a busy store (a pool with no free connection, a statement past its lock
+    /// limit) answered as a permanent 500 that blames a stored row.
+    #[test]
+    fn a_busy_or_lost_store_is_503_and_a_bad_row_is_500() {
+        for e in [
+            StoreError::Failed("down".to_owned()),
+            StoreError::Disconnected("reset".to_owned()),
+            StoreError::Unavailable("busy".to_owned()),
+        ] {
+            assert_eq!(
+                super::store_failure(&MembershipError::Store(e.clone())),
+                (StatusCode::SERVICE_UNAVAILABLE, "the state store failed"),
+                "{e:?}"
+            );
+        }
+        assert_eq!(
+            super::store_failure(&MembershipError::Contended),
+            (StatusCode::SERVICE_UNAVAILABLE, "the state store failed")
+        );
+        assert_eq!(
+            super::store_failure(&MembershipError::Corrupt("deny row".to_owned())),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a stored row is unreadable"
+            )
+        );
+    }
+
     /// Catches the two spellings of the path drifting apart: the POST and DELETE of
     /// `crate::api::DENIED` and this GET must merge into one route.
     #[test]

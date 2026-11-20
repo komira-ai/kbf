@@ -30,7 +30,9 @@
 //! it: it would run with whichever Xcode the Mac has selected, which an update of the Mac can
 //! change, and its cached result would then be served across that change. A value that is not a
 //! build id (1 to 32 letters, digits, `.`, `_` and `-`, starting with a letter or a digit) is
-//! refused as malformed. A Linux action's `xcode` is not read.
+//! refused as malformed. A Linux action's `xcode` is neither required nor checked as a build id
+//! nor sent, but like every capability key it is read with the platform: one that is empty or
+//! given twice is refused as malformed, for any system.
 //!
 //! # The job
 //!
@@ -245,7 +247,8 @@ fn pinned(image: &str) -> bool {
 }
 
 /// Refuses a Mac action that asks for a newer macOS than the least the pool runs: no Mac of the
-/// pool is sure to run it, and the job service cannot be asked for a version.
+/// pool is sure to run it. The executor holds this rule itself: the job is sent with no least
+/// version (`Constraints.os_version` is left empty).
 ///
 /// # Errors
 /// The refusal, naming both versions.

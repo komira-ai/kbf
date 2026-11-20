@@ -112,7 +112,9 @@ fn a_mac_actions_os_version_is_its_least_major_version() {
 
 /// Asserts a Mac action's `xcode` is the build it names, under any case of the name, beside an
 /// `os_version` or not; that a build of 1 and of 32 bytes of every allowed kind is taken; and
-/// that a Linux action's `xcode` is not read, even one that is no build. Catches a Mac job whose
+/// that a Linux action's `xcode` is not checked as a build, even one that is no build id (an
+/// empty or repeated one is the reader's refusal, for any system:
+/// [`a_platform_the_farm_refuses_is_refused`]). Catches a Mac job whose
 /// Xcode is dropped, a name read in one case only, and a Linux action refused for a property it
 /// does not use.
 #[test]
