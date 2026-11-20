@@ -11,10 +11,28 @@
 //! it has none, or when it asks for a whole machine: a put-directory job cannot be one.
 //!
 //! `os_version` is read too, by the platform-tags rule: `os_version=26` means macOS 26 or
-//! newer. The job service has no constraint on a host's system version, so the executor holds
-//! the rule itself against the least major version every Mac of the pool runs
-//! (`--executor-mac-os-version`, 26 by default): an action that asks for a newer one is refused
-//! as the caller's, naming both ([`check_version`]). A Linux action's `os_version` is not read.
+//! newer. The executor holds the rule itself against the least major version every Mac of the
+//! pool runs (`--executor-mac-os-version`, 26 by default): an action that asks for a newer one
+//! is refused as the caller's, naming both ([`check_version`]). A Linux action's `os_version` is
+//! not read.
+//!
+//! # The Xcode
+//!
+//! A Mac action names the Xcode it runs with by build, `xcode=16C5032a` (the Xcode's
+//! `ProductBuildVersion`), read in any case as every capability key ([`XcodeBuild`]). The job
+//! asks for that build (`Constraints.xcode`): the job service places it only on a Mac whose
+//! agent reports that Xcode installed, and the agent runs it with that Xcode's developer
+//! directory, never the Mac's selected one. Since the property is part of the action digest, a
+//! result built with one Xcode is never served for the same action naming another.
+//!
+//! A Mac action that names no `xcode` is refused as the caller's, `INVALID_ARGUMENT` with the
+//! reason [`NO_XCODE_REASON`](crate::executor::outcome::NO_XCODE_REASON), and no job is made for
+//! it: it would run with whichever Xcode the Mac has selected, which an update of the Mac can
+//! change, and its cached result would then be served across that change. A value that is not a
+//! build id (1 to 32 letters, digits, `.`, `_` and `-`, starting with a letter or a digit) is
+//! refused as malformed. A Linux action's `xcode` is neither required nor checked as a build id
+//! nor sent, but like every capability key it is read with the platform: one that is empty or
+//! given twice is refused as malformed, for any system.
 //!
 //! # The job
 //!
@@ -34,8 +52,8 @@
 //!   allows), runs the Command there, and commits its one object into the put directory, as a
 //!   Linux job does. `<mp>` is the Macs' own (`--executor-mac-task-out-root`, by default
 //!   `--task-out-root`).
-//! - `os=macos`, `arch=arm64`, `exec=sandbox-exec`, no CPU and no memory (the job service sizes
-//!   it from its class's history), no network, no file and no secret.
+//! - `os=macos`, `arch=arm64`, `exec=sandbox-exec`, the action's `xcode`, no CPU and no memory
+//!   (the job service sizes it from its class's history), no network, no file and no secret.
 //!
 //! The job service at kbf's pin does not yet run such a job on a Mac (it takes no native start
 //! from the job API, and its Macs do not take mounts); a pool of no Macs, the default, sends
@@ -69,28 +87,75 @@ pub const MAC_OUT_TARGET: &str = "/work/.kbf-out";
 pub const DEFAULT_MAC_OS_VERSION: u32 = 26;
 
 /// The system an action asks for.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum System {
     /// Linux: every action that does not ask for a Mac.
     #[default]
     Linux,
-    /// macOS, at least `os_version` (a major version) when the action names one.
+    /// macOS, at least `os_version` (a major version) when the action names one, with the Xcode
+    /// the action names.
     Macos {
         /// The least major version the action takes.
         os_version: Option<u32>,
+        /// The Xcode the action runs with; `None` when it names none, which is refused before
+        /// a job is made.
+        xcode: Option<XcodeBuild>,
     },
+}
+
+/// An Xcode, by its build id (`16C5032a`, its `ProductBuildVersion`), as a Mac action names it
+/// in the platform property `xcode` and the job service takes it in `Constraints.xcode`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XcodeBuild(String);
+
+impl XcodeBuild {
+    /// The most bytes of a build id the job service takes.
+    const MAX: usize = 32;
+
+    /// `value` as a build id.
+    ///
+    /// # Errors
+    /// A value that is not 1 to 32 bytes of ASCII letters, digits, `.`, `_` and `-` starting
+    /// with a letter or a digit, as the job service checks a build id.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let allowed = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-');
+        let first = value.bytes().next();
+        match first.is_some_and(|b| b.is_ascii_alphanumeric())
+            && value.len() <= Self::MAX
+            && value.bytes().all(allowed)
+        {
+            true => Ok(Self(value.to_owned())),
+            false => Err(format!(
+                "the action's {XCODE} {value:?} is not an Xcode build id such as 16C5032a: 1 to \
+                 {} letters, digits, '.', '_' and '-', starting with a letter or a digit",
+                Self::MAX
+            )),
+        }
+    }
+
+    /// The build id.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The platform property of the least system version.
 const OS_VERSION: &str = "os_version";
 
+/// The platform property that names a Mac action's Xcode, by build: the capability key a Mac's
+/// agent reports its installed Xcodes under.
+pub const XCODE: &str = kbf_caps::XCODE;
+
 impl System {
     /// The system `platform` (the Action's, or else the Command's) asks for: macOS when it names
-    /// `os=macos`, else Linux.
+    /// `os=macos`, with its `os_version` and `xcode`, else Linux.
     ///
     /// # Errors
-    /// A platform that does not parse, or an `os_version` of a Mac action that is not a version
-    /// (`<major>[.<minor>[.<patch>]]`, digits).
+    /// A platform that does not parse (`xcode` given twice, in any two spellings, or empty
+    /// among them), an `os_version` of a Mac action that is not a version
+    /// (`<major>[.<minor>[.<patch>]]`, digits), or an `xcode` of a Mac action that is not a
+    /// build id ([`XcodeBuild::parse`]).
     pub fn of(platform: Option<&Platform>) -> Result<Self, String> {
         let properties = platform.map_or(&[][..], |p| p.properties.as_slice());
         let pairs = properties
@@ -104,7 +169,12 @@ impl System {
             .iter()
             .find(|p| p.name.eq_ignore_ascii_case(OS_VERSION));
         let os_version = named.map(|p| major(&p.value)).transpose()?;
-        Ok(Self::Macos { os_version })
+        let properties = request.properties();
+        let xcode = properties.iter().find(|(key, _)| *key == XCODE);
+        let xcode = xcode
+            .map(|(_, build)| XcodeBuild::parse(build))
+            .transpose()?;
+        Ok(Self::Macos { os_version, xcode })
     }
 }
 
@@ -177,7 +247,8 @@ fn pinned(image: &str) -> bool {
 }
 
 /// Refuses a Mac action that asks for a newer macOS than the least the pool runs: no Mac of the
-/// pool is sure to run it, and the job service cannot be asked for a version.
+/// pool is sure to run it. The executor holds this rule itself: the job is sent with no least
+/// version (`Constraints.os_version` is left empty).
 ///
 /// # Errors
 /// The refusal, naming both versions.
@@ -193,9 +264,9 @@ pub(super) fn check_version(asked: Option<u32>, pool: &MacPool) -> Result<(), St
 }
 
 /// What a Mac job asks of its host beside resources: a Mac, its architecture, the native
-/// runtime.
+/// runtime, and the Xcode `xcode` installed.
 #[must_use]
-pub(super) fn mac_constraints() -> Constraints {
+pub(super) fn mac_constraints(xcode: &XcodeBuild) -> Constraints {
     Constraints {
         os: MAC_OS.to_owned(),
         arch: MAC_ARCH.to_owned(),
@@ -203,6 +274,9 @@ pub(super) fn mac_constraints() -> Constraints {
         isa_level: String::new(),
         accelerator: None,
         isolation: Isolation::Unspecified.into(),
+        // The least version is held by the executor (`check_version`), not asked for.
+        os_version: String::new(),
+        xcode: xcode.as_str().to_owned(),
     }
 }
 
@@ -247,6 +321,8 @@ pub(super) struct MacJob<'a> {
     pub(super) job_id: String,
     /// The pool.
     pub(super) pool: &'a MacPool,
+    /// The Xcode the action names.
+    pub(super) xcode: &'a XcodeBuild,
     /// The tier store's roots on the Macs.
     pub(super) roots: &'a PutDirRoots,
     /// The run's put directory, `cas/b/<run>/<nonce>`.
@@ -264,7 +340,7 @@ pub(super) struct MacJob<'a> {
 }
 
 /// The Mac job of `job`: the pool's task bundle, whose entrypoint runs, the tree and the put
-/// directory mounted under `/work`, no layer, no network.
+/// directory mounted under `/work`, no layer, no network, of a Mac with the action's Xcode.
 pub(super) fn mac_spec(job: MacJob<'_>) -> JobSpec {
     JobSpec {
         job_id: job.job_id,
@@ -274,7 +350,7 @@ pub(super) fn mac_spec(job: MacJob<'_>) -> JobSpec {
         args: job.args,
         env: BTreeMap::new(),
         needs: Some(job.needs),
-        constraints: Some(mac_constraints()),
+        constraints: Some(mac_constraints(job.xcode)),
         wall_limit_seconds: Some(job.wall_seconds),
         // The inputs are the tree and the outputs the mount: the job reaches nothing.
         network: NetworkLevel::None.into(),

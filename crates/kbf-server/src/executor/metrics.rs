@@ -70,7 +70,7 @@ impl RunEnd {
             Settled::Timeout => Self::Timeout,
             Settled::OutOfMemory => Self::OutOfMemory,
             Settled::Lost(_) => Self::Lost,
-            Settled::Invalid(_) => Self::Invalid,
+            Settled::Invalid(_) | Settled::NoXcode => Self::Invalid,
             Settled::Missing(_) => Self::Missing,
             Settled::ListRefused(_) => Self::ListRefused,
         }

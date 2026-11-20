@@ -81,10 +81,11 @@ pub use front::{
 };
 pub use mac::{
     DEFAULT_MAC_OS_VERSION, MAC_OS, MAC_OUT_TARGET, MacPool, MacPoolError, System, TREE_TARGET,
+    XCODE, XcodeBuild,
 };
 pub use metrics::Metrics;
 pub use out::{MAX_ROOT_BYTES, OUT_TARGET, PutDirRoots, RootError, TASK_IN_TREE};
-pub use outcome::OUT_OF_MEMORY_REASON;
+pub use outcome::{NO_XCODE_REASON, OUT_OF_MEMORY_REASON};
 pub use size_class::SizeClass;
 pub use submit::job_id;
 pub use task::{PackKey, RunId, build_id};

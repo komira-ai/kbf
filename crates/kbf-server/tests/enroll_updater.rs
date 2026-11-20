@@ -95,7 +95,7 @@ async fn start(name: &str) -> Farm {
 
 impl Farm {
     fn now(&self) -> i64 {
-        i64::try_from(self.store.now().as_duration().as_secs()).expect("time")
+        i64::try_from(self.store.now().expect("time").as_duration().as_secs()).expect("time")
     }
 
     fn advance(&self, secs: u64) {

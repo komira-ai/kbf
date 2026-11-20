@@ -11,6 +11,14 @@ written around (the VM driver and VM images, the bare-metal whole-machine runtim
 `kbf-mac-session` and `kbf-mac-provision`) is removed, so sections 9 and 10 are deleted, and
 what the rest says about those is the removed design and stays only as history.
 
+**The Xcodes on a Mac today.** kbf installs, selects and removes no Xcode on any host: the tool
+that did (`kbf-mac-provision`, whose Mac profile carried the `xcode` and `default_developer_dir`
+items) went with that path, so the Xcodes on a host have one owner, the host's own update service
+(hostkeeper on the hosts it manages). What kbf does is on the action's side: a Mac action must name
+its Xcode by build (`xcode=16C5032a`), the job asks the job service for that build, and an action
+that names none is refused ([platform-properties.md](../platform-properties.md#macos)). Section 6's
+"pinned work routes exactly" is therefore the only way a Mac action routes on an Xcode.
+
 Everything here is **planned**. Nothing in this document exists in the code today
 except where a section says "today". It builds on
 [capabilities.md](capabilities.md), [worker-protocol.md](worker-protocol.md) and

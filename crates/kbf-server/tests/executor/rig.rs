@@ -306,6 +306,7 @@ pub fn machine(gib: u64, arch: &str) -> Machine {
         os: "linux".to_owned(),
         arch: arch.to_owned(),
         exec: ExecMode::Container,
+        xcodes: Vec::new(),
     }
 }
 

@@ -326,7 +326,7 @@ fn decide_and_commit(
     csr_hash: &[u8; 32],
     sign: &mut dyn FnMut() -> Result<Vec<IssuedRole>, RefusalReason>,
 ) -> Result<Option<Enrolled>, Fail> {
-    let now = rows::seconds(store.now());
+    let now = rows::seconds(store.now()?);
     let token = rows::fetch::<TokenRow>(store, &rows::token_key(req.token_id), "token")?;
     let token = verify_secret(token, req.secret)?;
     if let Some(done) = replay(store, req, roles, csr_hash, now)? {

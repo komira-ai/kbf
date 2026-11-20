@@ -1,5 +1,6 @@
 //! An Execute end to end over the executor and a fake job service: a miss runs as one job and
-//! its result is cached; a server with no executor refuses it.
+//! its result is cached, under the whole Action digest (so two actions differing only in their
+//! `xcode` property are two entries); a server with no executor refuses it.
 
 mod support;
 
@@ -33,6 +34,45 @@ async fn an_execute_that_misses_the_cache_runs_as_one_job_and_its_result_is_cach
     assert!(hit.cached_result, "answered from the action cache");
     assert_eq!(hit.result.map(support::unstamped), Some(result));
     assert_eq!(cell.direct.submitted_jobs(), 1);
+}
+
+/// Asserts that two actions whose Action differs only in the `xcode` platform property they
+/// name have different action keys: the result of the one naming `16C5032a`, cached, is not
+/// served for the one naming `17A324`, which misses the cache and runs as a job of its own, its
+/// result cached under its own key. This harness's executor reads its facts from fakes and runs
+/// both as Linux jobs; what is under test is the cache's key, the whole Action digest, platform
+/// included (the Mac job's Xcode is asserted in `tests/executor/mac.rs`). Catches a cache key
+/// that leaves the platform out, which would serve a result built with one Xcode for another.
+#[tokio::test]
+async fn two_actions_that_differ_only_in_their_xcode_build_have_different_action_keys() {
+    let cell = Cell::start().await;
+    let old = Job::new("/bin/run", &[("OSFamily", "macos"), ("xcode", "16C5032a")]);
+    let new = Job::new("/bin/run", &[("OSFamily", "macos"), ("xcode", "17A324")]);
+    assert_eq!(old.command.proto, new.command.proto, "one Command");
+    assert_eq!(old.root.proto, new.root.proto, "one input root");
+    assert_ne!(old.action.proto, new.action.proto, "two action keys");
+    cell.upload(&old.blobs()).await;
+    cell.upload(&new.blobs()).await;
+    cell.direct
+        .will_run(&old.action, Ran::writes("out", "built with 16C5032a"));
+    cell.direct
+        .will_run(&new.action, Ran::writes("out", "built with 17A324"));
+
+    let mut ops = cell.execute(&old.action).await;
+    cell.direct.complete(&old.action).await;
+    let first = response(&done(&mut ops).await).result.expect("a result");
+    assert_eq!(cell.cached(&old.action).await.expect("cached"), first);
+    assert_eq!(cell.cached(&new.action).await, Err(Code::NotFound));
+
+    let mut ops = cell.execute(&new.action).await;
+    cell.direct.complete(&new.action).await;
+    let answer = response(&done(&mut ops).await);
+    assert!(!answer.cached_result, "not answered from the other's entry");
+    let second = answer.result.expect("a result");
+    assert_ne!(second, first);
+    assert_eq!(cell.direct.jobs_of(&new.action).len(), 1);
+    assert_eq!(cell.direct.submitted_jobs(), 2);
+    assert_eq!(cell.cached(&old.action).await.expect("still cached"), first);
 }
 
 #[tokio::test]

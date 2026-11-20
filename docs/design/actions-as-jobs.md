@@ -1150,11 +1150,13 @@ copies the inputs out of the tree instead of running on it.
 - **Routing** (`crates/kbf-server/src/executor/mac.rs`). An action whose platform asks for macOS, as the farm reads
   it (`OSFamily` `macos`/`darwin`/`macosx`/`osx`, or `os=macos`), is placed only on the executor's Mac workers,
   `js-mac:<frontend>-<n>` (`--executor-mac-hosts`, 0 by default, so nothing changes until it is set), which report
-  `os=macos`, `arch=arm64` and the one driver `native`. `os_version=26` means 26 or newer: the job service has no
-  version constraint, so the executor refuses an action that asks for more than `--executor-mac-os-version` (26).
+  `os=macos`, `arch=arm64` and the one driver `native`. `os_version=26` means 26 or newer: the executor refuses an
+  action that asks for more than `--executor-mac-os-version` (26). The action must name its Xcode by build
+  (`xcode=16C5032a`); one that names none is refused as the caller's, reason `MAC_ACTION_NAMES_NO_XCODE`, and no job
+  is made ([platform-properties.md](../platform-properties.md#macos)).
 - **The job**: the release's `kbf-task` bundle by its darwin manifest digest as the image
-  (`--executor-mac-task-bundle`; its entrypoint runs), no layer, `os=macos`, `arch=arm64`, `exec=sandbox-exec`, no
-  network; the action tree read-only at `/work/.kbf-tree` and the put directory read-write at `/work/.kbf-out`, both
+  (`--executor-mac-task-bundle`; its entrypoint runs), no layer, `os=macos`, `arch=arm64`, `exec=sandbox-exec`, the
+  action's `xcode` (the job service places it only on a Mac that has that Xcode), no network; the action tree read-only at `/work/.kbf-tree` and the put directory read-write at `/work/.kbf-out`, both
   `no_exec`, which a Mac's agent makes `exec/.kbf-tree` and `exec/.kbf-out`.
 - **The task** (`kbf-task --materialize-work=.kbf-tree`, `crates/kbf-task/src/materialize.rs`): reads `.kbf/action`
   and `.kbf/command` from the tree as a tree job does, copies `kbf-work` into `exec/kbf-work` (`std::fs::copy`: an APFS clone

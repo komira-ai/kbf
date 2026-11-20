@@ -915,7 +915,8 @@ impl Members {
     /// # Errors
     /// The store failing; a stored row not decoding.
     pub fn planned_down(&self, id: MemberId) -> Result<bool, MembershipError> {
-        Ok(self.planned(id)?.in_force(self.store.now()))
+        let planned = self.planned(id)?;
+        Ok(planned.in_force(self.store.now()?))
     }
 
     /// `row`'s plan, or the mark's when the member has no live row (it stopped).
@@ -955,6 +956,7 @@ impl Members {
                 return Err(MembershipError::NotHolder(id));
             }
             let before = live.member.state;
+            let now = self.store.now()?;
             let mut step = promote::Step::none();
             let ttl = match how {
                 Touch::Beat(boot, _, _, _, _) if boot != live.boot => {
@@ -965,10 +967,7 @@ impl Members {
                     });
                 }
                 Touch::Beat(_, progress, said, fill, facts) => {
-                    live.report = Some(Report {
-                        said,
-                        at: self.store.now(),
-                    });
+                    live.report = Some(Report { said, at: now });
                     live.fill = fill;
                     live.facts = live.facts.after_beat(facts);
                     if before == MemberState::Joining {
@@ -986,7 +985,7 @@ impl Members {
                     if before == MemberState::Down
                         && live
                             .planned_until
-                            .is_some_and(|until| !Planned::Until(until).in_force(self.store.now()))
+                            .is_some_and(|until| !Planned::Until(until).in_force(now))
                     {
                         live.member.state = MemberState::Active;
                         live.planned_until = None;
@@ -998,7 +997,7 @@ impl Members {
                     live.planned_until = None;
                     stored
                         .expires_at
-                        .map_or(self.config.ttl, |at| at.since(self.store.now()))
+                        .map_or(self.config.ttl, |at| at.since(now))
                 }
                 // `Down` on a live row is a plan (nothing else makes one), so a repeat is
                 // taken; so is one whose end an older frontend dropped.
@@ -1017,14 +1016,14 @@ impl Members {
                     live.planned_until = None;
                     stored
                         .expires_at
-                        .map_or(self.config.ttl, |at| at.since(self.store.now()))
+                        .map_or(self.config.ttl, |at| at.since(now))
                 }
                 Touch::PlanDown(for_) => {
                     live.member.state = MemberState::Down;
-                    live.planned_until = Some(self.store.now().saturating_add(for_));
+                    live.planned_until = Some(now.saturating_add(for_));
                     stored
                         .expires_at
-                        .map_or(self.config.ttl, |at| at.since(self.store.now()))
+                        .map_or(self.config.ttl, |at| at.since(now))
                 }
             };
             let mut put = Txn::new().put_ttl(
@@ -1111,7 +1110,7 @@ impl Members {
         }
         let row = DenyRow {
             reason: reason.to_owned(),
-            at_ms: u64::try_from(self.store.now().as_duration().as_millis()).unwrap_or(u64::MAX),
+            at_ms: u64::try_from(self.store.now()?.as_duration().as_millis()).unwrap_or(u64::MAX),
         };
         // A conflict is another writer's row for this very entry: denied, as asked.
         let _won =
@@ -1317,7 +1316,7 @@ impl Members {
                 member.planned = self.planned_of(member.id, rows.get(&member.id))?;
             }
         }
-        let now = self.store.now();
+        let now = self.store.now()?;
         Ok((members.into_values().collect(), now))
     }
 

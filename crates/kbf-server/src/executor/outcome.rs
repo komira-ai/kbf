@@ -119,6 +119,16 @@ pub(crate) const LIST_REFUSALS: u32 = 2;
 /// The `ErrorInfo.reason` of an action killed at its memory limit at its last attempt.
 pub const OUT_OF_MEMORY_REASON: &str = "ACTION_OUT_OF_MEMORY";
 
+/// The `ErrorInfo.reason` of a Mac action refused for naming no Xcode (`xcode`): a request
+/// error, the caller's to fix.
+pub const NO_XCODE_REASON: &str = "MAC_ACTION_NAMES_NO_XCODE";
+
+/// What the callers of a Mac action that names no Xcode are told.
+pub(crate) const NO_XCODE_MESSAGE: &str = "a Mac action must name the Xcode it runs with: give \
+     the platform property xcode=<build>, such as xcode=16C5032a (the Xcode's \
+     ProductBuildVersion); with none it would run with whichever Xcode the Mac has selected, \
+     which an update of the Mac can change";
+
 /// What an ended job comes to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Verdict {
@@ -153,6 +163,9 @@ pub(crate) enum Settled {
     Lost(&'static str),
     /// The action cannot run here: the caller's to fix.
     Invalid(String),
+    /// A Mac action that names no Xcode: the caller's to fix, as [`Self::Invalid`], with its
+    /// own reason ([`NO_XCODE_REASON`]).
+    NoXcode,
     /// Input blobs the store no longer has, which the index said it held: the frontend forgot
     /// them, and the client is to upload them again and execute again.
     Missing(Vec<kbf_types::Digest>),
@@ -459,26 +472,35 @@ impl Settled {
                 },
             ),
             Self::Timeout => status(Code::DeadlineExceeded, "the action ran out of time"),
-            Self::OutOfMemory => {
-                let mut answer = status(
+            Self::OutOfMemory => with_reason(
+                status(
                     Code::FailedPrecondition,
                     "the action passed its memory limit at every attempt",
-                );
-                let info = ErrorInfo {
-                    reason: OUT_OF_MEMORY_REASON.to_owned(),
-                    domain: ERROR_DOMAIN.to_owned(),
-                    metadata: Default::default(),
-                };
-                answer.details.push(prost_types::Any {
-                    type_url: super::output::ERROR_INFO.to_owned(),
-                    value: info.encode_to_vec(),
-                });
-                answer
-            }
+                ),
+                OUT_OF_MEMORY_REASON,
+            ),
             Self::Invalid(why) => status(Code::InvalidArgument, why),
+            Self::NoXcode => with_reason(
+                status(Code::InvalidArgument, NO_XCODE_MESSAGE),
+                NO_XCODE_REASON,
+            ),
             Self::Missing(digests) => kbf_front::missing_status(digests),
         }
     }
+}
+
+/// `answer` with an `ErrorInfo` of kbf's domain and `reason` among its details.
+fn with_reason(mut answer: rpc::Status, reason: &str) -> rpc::Status {
+    let info = ErrorInfo {
+        reason: reason.to_owned(),
+        domain: ERROR_DOMAIN.to_owned(),
+        metadata: Default::default(),
+    };
+    answer.details.push(prost_types::Any {
+        type_url: super::output::ERROR_INFO.to_owned(),
+        value: info.encode_to_vec(),
+    });
+    answer
 }
 
 #[cfg(test)]

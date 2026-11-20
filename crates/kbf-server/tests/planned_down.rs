@@ -592,19 +592,19 @@ fn beat_at_the_end_plus(offset_ns: i64) -> Option<MemberState> {
         panic!("a plan with an end");
     };
     // Keep both rows alive up to the last 20 s.
-    while end.since(farm.store.now()) > SECOND * 20 {
+    while end.since(farm.store.now().expect("time")) > SECOND * 20 {
         farm.store.clock.advance(SECOND * 10);
         farm.beat(0);
         farm.beat(1);
     }
-    let left = end.since(farm.store.now());
+    let left = end.since(farm.store.now().expect("time"));
     farm.store
         .clock
         .advance(left.saturating_sub(Duration::from_nanos(1)));
     if offset_ns >= 0 {
         farm.store.clock.advance(Duration::from_nanos(1));
     }
-    let on = farm.store.now();
+    let on = farm.store.now().expect("time");
     assert_eq!(
         on == end,
         offset_ns >= 0,

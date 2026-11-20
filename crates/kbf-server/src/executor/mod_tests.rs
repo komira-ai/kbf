@@ -320,7 +320,7 @@ impl Store for Faulty {
         self.inner.commit_stats()
     }
 
-    fn now(&self) -> StoreTime {
+    fn now(&self) -> Result<StoreTime, StoreError> {
         self.inner.now()
     }
 }
@@ -485,6 +485,7 @@ impl Rig {
                 os: "linux".to_owned(),
                 arch: "x86_64".to_owned(),
                 exec: ExecMode::Container,
+                xcodes: Vec::new(),
             },
         );
         let mut cfg = Config::new("front-1");

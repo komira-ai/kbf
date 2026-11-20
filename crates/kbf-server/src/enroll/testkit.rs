@@ -142,7 +142,7 @@ impl Farm {
 
     /// The store's time in unix seconds.
     pub fn now(&self) -> i64 {
-        i64::try_from(self.store.now().as_duration().as_secs()).expect("time")
+        i64::try_from(self.store.now().expect("time").as_duration().as_secs()).expect("time")
     }
 }
 

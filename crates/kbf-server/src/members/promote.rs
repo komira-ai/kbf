@@ -111,7 +111,7 @@ impl Members {
         let map = decode_map(&stored)?;
         let blocks = self.beat_blocks(&body, live, progress, &map);
         let guards = Some((mark.version, stored.version));
-        let now = self.store.now();
+        let now = self.store.now()?;
         let rewrite = |settled_nanos| {
             let mut next = body.clone();
             next.settled_nanos = settled_nanos;

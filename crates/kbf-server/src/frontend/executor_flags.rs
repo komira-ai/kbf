@@ -427,8 +427,9 @@ pub(super) fn args() -> Vec<Arg> {
             .help(
                 "The least major macOS every Mac of the job service runs. An action's \
                  `os_version` is the least it takes (`26` means 26 or newer), and one that asks \
-                 for a newer macOS than this is refused, naming both: the job service cannot be \
-                 asked for a version. Used only with `--executor-mac-task-bundle`",
+                 for a newer macOS than this is refused, naming both: the executor holds this rule \
+                 itself and asks the job service for no version. Used only with \
+                 `--executor-mac-task-bundle`",
             ),
         text(
             MAC_OUT_ROOT,

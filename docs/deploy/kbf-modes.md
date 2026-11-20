@@ -190,8 +190,8 @@ timeout plus the run margin. The Macs of the job service are used when `--execut
 bundle by its manifest digest, the image of a Mac job; without it no macOS action is run),
 `--executor-mac-os-version` (the least macOS the Macs run, 26 by default; an
 action's `os_version` above it is refused) and `--executor-mac-task-out-root` (the tier store's
-put directory on the Macs, `--task-out-root` by default); a macOS action becomes a job of a
-Mac's native runtime (docs/design/actions-as-jobs.md, section 14), which the job service at
+put directory on the Macs, `--task-out-root` by default); a macOS action must name its Xcode build (`xcode`, docs/platform-properties.md) and becomes a
+job of a Mac's native runtime with that Xcode (docs/design/actions-as-jobs.md, section 14), which the job service at
 kbf's pin cannot run yet. It books no disk: the
 job carries no `disk_bytes`, so the job service places it on a host whatever scratch disk that
 host reports, and the job writes to its host's scratch with no quota. The kbf image is built from
@@ -409,7 +409,9 @@ is absent, never zero. The buckets start at 1 ms. Where `prepare` and `start` go
 `kbf_executor_step_seconds{step=...}`, each step timed around its one wait: `facts`, `put_dir` (with the closure's
 `action`, `walk` and `held`), `tree` (to the action tree's name), `row`, `rpc` (each `SubmitJob` call), `backoff`
 (the wait before a submit is sent again) and `tree_wait` (a run waiting for its tree's writes, before its submit,
-while its row is written). [api.md](../api.md) lists them. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
+while its row is written), and the stages of those writes, timed on the task that writes the tree from its name on, so
+overlapping `tree_wait`: `tree_blobs` (the blobs that were nowhere, written whole), `tree_manifests` (the input root's
+manifests and `.kbf`, written together) and `tree_root` (the root, written last). [api.md](../api.md) lists them. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
 in the result's execution metadata as the `input_fetch`, `execution` and `output_upload` start and
 completed times, marked as a task's claim, and the run record and the read API say so with
 `phase_times: "task_claim"` (a run recorded by an earlier release is `measured`, and so is a record written before the

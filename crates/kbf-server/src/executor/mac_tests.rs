@@ -8,7 +8,7 @@ use kbf_types::OperationId;
 
 use super::{
     DEFAULT_MAC_OS_VERSION, MAC_ARCH, MAC_OS, MAC_OUT_TARGET, MacPool, MacPoolError, RunId, System,
-    TREE_TARGET, check_version, mac_argv, mac_constraints,
+    TREE_TARGET, XcodeBuild, check_version, mac_argv, mac_constraints,
 };
 use crate::executor::PutDirRoots;
 
@@ -43,7 +43,10 @@ fn pool() -> MacPool {
 /// Linux.
 #[test]
 fn an_action_asks_for_a_mac_as_kbf_caps_reads_its_platform() {
-    let mac = System::Macos { os_version: None };
+    let mac = System::Macos {
+        os_version: None,
+        xcode: None,
+    };
     for spelling in [
         &[("OSFamily", "macos")][..],
         &[("OSFamily", "Darwin")],
@@ -52,7 +55,7 @@ fn an_action_asks_for_a_mac_as_kbf_caps_reads_its_platform() {
         &[("os", "macos")],
         &[("OSFamily", "macos"), ("container-image", "docker://x")],
     ] {
-        assert_eq!(of(spelling), Ok(mac), "{spelling:?}");
+        assert_eq!(of(spelling), Ok(mac.clone()), "{spelling:?}");
     }
     assert_eq!(System::of(None), Ok(System::Linux));
     assert_eq!(of(&[]), Ok(System::Linux));
@@ -70,7 +73,8 @@ fn a_mac_actions_os_version_is_its_least_major_version() {
         assert_eq!(
             of(&[("OSFamily", "macos"), ("os_version", value)]),
             Ok(System::Macos {
-                os_version: Some(major)
+                os_version: Some(major),
+                xcode: None,
             }),
             "{value}"
         );
@@ -78,7 +82,8 @@ fn a_mac_actions_os_version_is_its_least_major_version() {
     assert_eq!(
         of(&[("OSFamily", "macos"), ("OS_Version", "27")]),
         Ok(System::Macos {
-            os_version: Some(27)
+            os_version: Some(27),
+            xcode: None,
         })
     );
     assert_eq!(
@@ -105,13 +110,90 @@ fn a_mac_actions_os_version_is_its_least_major_version() {
     }
 }
 
+/// Asserts a Mac action's `xcode` is the build it names, under any case of the name, beside an
+/// `os_version` or not; that a build of 1 and of 32 bytes of every allowed kind is taken; and
+/// that a Linux action's `xcode` is not checked as a build, even one that is no build id (an
+/// empty or repeated one is the reader's refusal, for any system:
+/// [`a_platform_the_farm_refuses_is_refused`]). Catches a Mac job whose
+/// Xcode is dropped, a name read in one case only, and a Linux action refused for a property it
+/// does not use.
+#[test]
+fn a_mac_actions_xcode_is_the_build_it_names_in_any_case_of_the_name() {
+    let build = |id: &str| Some(XcodeBuild::parse(id).expect("a build"));
+    for name in ["xcode", "XCODE", "Xcode"] {
+        assert_eq!(
+            of(&[("OSFamily", "macos"), (name, "16C5032a")]),
+            Ok(System::Macos {
+                os_version: None,
+                xcode: build("16C5032a"),
+            }),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        of(&[("os", "macos"), ("os_version", "26"), ("xcode", "17A324")]),
+        Ok(System::Macos {
+            os_version: Some(26),
+            xcode: build("17A324"),
+        })
+    );
+    let longest = format!("Z9{}yz", "a._-".repeat(7));
+    assert_eq!(longest.len(), 32);
+    for id in ["7", "17E5179g", "16.4_beta-2", longest.as_str()] {
+        assert_eq!(build(id).expect("taken").as_str(), id);
+    }
+    for value in ["16C5032a", "not a build"] {
+        assert_eq!(
+            of(&[("OSFamily", "linux"), ("xcode", value)]),
+            Ok(System::Linux),
+            "{value}"
+        );
+        assert_eq!(of(&[("xcode", value)]), Ok(System::Linux), "{value}");
+    }
+}
+
+/// Asserts a Mac action whose `xcode` is no build id is refused, naming the value: one that
+/// starts with a punctuation mark, holds a space, a slash, a colon or a byte past ASCII, or is
+/// 33 bytes long. Catches a value the job service would refuse at submit, or one that names a
+/// path, passed on as a build.
+#[test]
+fn a_mac_actions_xcode_that_is_no_build_id_is_refused() {
+    let long = "a".repeat(33);
+    for bad in [
+        "-16C5032a",
+        ".16C5032a",
+        "_x",
+        "16C 5032a",
+        "16C5032a/..",
+        "Xcode:16",
+        "16C5032\u{e9}",
+        long.as_str(),
+    ] {
+        assert_eq!(
+            of(&[("OSFamily", "macos"), ("xcode", bad)]),
+            Err(format!(
+                "the action's xcode {bad:?} is not an Xcode build id such as 16C5032a: 1 to 32 \
+                 letters, digits, '.', '_' and '-', starting with a letter or a digit"
+            )),
+            "{bad:?}"
+        );
+    }
+}
+
 /// Asserts that a platform the reader refuses is refused here with the reader's reason: an `os` no
-/// worker runs, and `OSFamily` beside `os`.
+/// worker runs, `OSFamily` beside `os`, `xcode` under two spellings of its name, and an empty
+/// `xcode`.
 #[test]
 fn a_platform_the_farm_refuses_is_refused() {
     for bad in [
         &[("os", "windows")][..],
         &[("OSFamily", "macos"), ("os", "macos")],
+        &[
+            ("OSFamily", "macos"),
+            ("xcode", "16C5032a"),
+            ("XCODE", "17A324"),
+        ],
+        &[("OSFamily", "macos"), ("xcode", "")],
     ] {
         let reader = kbf_caps::Request::from_platform(bad.iter().copied())
             .expect_err("the reader refuses it")
@@ -181,16 +263,20 @@ fn an_action_that_asks_for_a_newer_macos_than_the_pool_runs_is_refused() {
     );
 }
 
-/// Asserts what a Mac job asks of its host: `os=macos`, `arch=arm64`, the native runtime, and
-/// nothing else.
+/// Asserts what a Mac job asks of its host: `os=macos`, `arch=arm64`, the native runtime, the
+/// action's Xcode build, and nothing else (no least version: the executor holds that one).
+/// Catches a Mac job placed on any Mac whatever Xcodes it has.
 #[test]
-fn a_mac_job_asks_for_a_mac_in_the_native_runtime() {
-    let constraints = mac_constraints();
+fn a_mac_job_asks_for_a_mac_in_the_native_runtime_with_the_actions_xcode() {
+    let xcode = XcodeBuild::parse("16C5032a").expect("a build");
+    let constraints = mac_constraints(&xcode);
     assert_eq!(constraints.os, MAC_OS);
     assert_eq!(constraints.arch, MAC_ARCH);
     assert_eq!(constraints.exec(), ExecMode::SandboxExec);
+    assert_eq!(constraints.xcode, "16C5032a");
     assert_eq!(constraints.isolation(), Isolation::Unspecified);
     assert!(constraints.isa_level.is_empty() && constraints.accelerator.is_none());
+    assert!(constraints.os_version.is_empty());
 }
 
 /// Asserts the task tool's flags of a Mac job: the tree and the put directory by their paths in

@@ -264,7 +264,7 @@ impl Store for Hooked {
         self.fake.commit_stats()
     }
 
-    fn now(&self) -> StoreTime {
+    fn now(&self) -> Result<StoreTime, StoreError> {
         self.fake.now()
     }
 }

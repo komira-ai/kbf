@@ -589,8 +589,8 @@ impl Store for PlantedStore {
         CommitStats::default()
     }
 
-    fn now(&self) -> StoreTime {
-        StoreTime::ZERO
+    fn now(&self) -> Result<StoreTime, StoreError> {
+        Ok(StoreTime::ZERO)
     }
 }
 
