@@ -18,7 +18,9 @@
 //!   parts), or the directory alone when it is;
 //! - `action`: the closure's read of the Action;
 //! - `walk`: the closure's walk of the input root's `Directory` messages;
-//! - `held`: the closure's check that the store holds every blob of the closure;
+//! - `held`: the closure's check that the store holds every blob of the closure, next to zero
+//!   when the Execute that started the run found them all held moments before and the store is
+//!   not asked again (`kbf_prepare_held_vouched_total` counts those);
 //! - `tree`: the action tree, from the collected closure to the tree's name, its blobs located
 //!   and its manifests or tree list built; the writes of the tree are not in it;
 //! - `tree_wait`: the run waiting for its tree's writes, before its submit, while its row is
