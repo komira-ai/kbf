@@ -71,7 +71,7 @@ fn attempt(
     let pairs: Vec<(Role, &[u8])> = req.csrs.iter().map(|c| (c.role, c.csr_der)).collect();
     let csr_hash = request_hash(&pairs);
     for _ in 0..ATTEMPTS {
-        let now = rows::seconds(store.now());
+        let now = rows::seconds(store.now()?);
         let key = rows::row_key(asked, req.node_id);
         let node =
             rows::fetch::<NodeRow>(store, &key, "node")?.ok_or(RefusalReason::UnknownNode)?;

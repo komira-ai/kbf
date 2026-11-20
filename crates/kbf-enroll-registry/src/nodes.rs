@@ -153,7 +153,7 @@ pub fn adopt_node(
             token_id: ADOPTED.to_owned(),
             token_label: ADOPTED.to_owned(),
             state: STATE_ACTIVE,
-            created_at: rows::seconds(store.now()),
+            created_at: rows::seconds(store.now()?),
             certs: roles.iter().map(|r| placeholder_cert(r.name())).collect(),
             ..NodeRow::default()
         };
@@ -277,7 +277,7 @@ pub fn revoke_node(
         if node.is_none() && updater.is_none() {
             return Err(RegistryError::NotFound);
         }
-        let now = rows::seconds(store.now());
+        let now = rows::seconds(store.now()?);
         let mut txn = Txn::new();
         let mut keys = Vec::new();
         for (key, read, with_node) in [(&node_key, node, true), (&updater_key, updater, false)] {

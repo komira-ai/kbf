@@ -53,7 +53,7 @@ impl Members {
     pub fn look(&self) -> Result<MembersLook, MembershipError> {
         let map = self.current_map()?;
         let rows = self.read_rows()?;
-        let now = self.store.now();
+        let now = self.store.now()?;
         let mut known: BTreeMap<MemberId, Member> = BTreeMap::new();
         for member in map.as_ref().map_or(&[][..], Map::members) {
             known.insert(member.id, member.clone());

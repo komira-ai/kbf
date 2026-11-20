@@ -16,7 +16,9 @@
 //! between Executes. Over a map the same walk reads each Directory from its owners, and
 //! remembers the subtrees it found held for a short time, under the map's epoch, so the
 //! actions of one build, which share most of their inputs, read a shared subtree once
-//! (`input_walk` says what bounds the memory and how a loss invalidates it).
+//! (`input_walk` says what bounds the memory and how a loss invalidates it). Over either, the
+//! check leaves the run it starts what it read and found (`handoff`), so the executor's
+//! preparation does not walk and ask again.
 //!
 //! **The action-cache write over a map.** A node checks an entry against the blobs it
 //! holds itself, and a result's blobs are on the owners of their own digests. The first
@@ -37,6 +39,7 @@
 //! Without packs the nodes check the entry alone, as they always did.
 
 mod closed;
+mod handoff;
 mod layered;
 mod stored;
 
@@ -141,6 +144,11 @@ trait Plane: Send + Sync {
     fn metrics(&self) -> &CacheMetrics;
     fn render_metrics(&self) -> String;
     fn leadership(&self) -> Option<Leadership>;
+    /// The memory of [`Plane::walk_inputs`], for a plane whose walk is over a store
+    /// (`input_walk`); the cache in this process keeps its own, and hands nothing on.
+    fn trees(&self) -> Option<&Trees> {
+        None
+    }
 }
 
 type Answer<T> = Result<T, StorageError>;
@@ -687,6 +695,10 @@ impl Plane for Remote {
     fn leadership(&self) -> Option<Leadership> {
         None
     }
+
+    fn trees(&self) -> Option<&Trees> {
+        Some(&self.trees)
+    }
 }
 
 /// The storage nodes of a map, or the one node `--storage` names until the map has two
@@ -863,6 +875,10 @@ impl Plane for RoutedPlane {
 
     fn leadership(&self) -> Option<Leadership> {
         None
+    }
+
+    fn trees(&self) -> Option<&Trees> {
+        Some(&self.trees)
     }
 }
 

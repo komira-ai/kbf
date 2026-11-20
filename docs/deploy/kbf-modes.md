@@ -190,8 +190,8 @@ timeout plus the run margin. The Macs of the job service are used when `--execut
 bundle by its manifest digest, the image of a Mac job; without it no macOS action is run),
 `--executor-mac-os-version` (the least macOS the Macs run, 26 by default; an
 action's `os_version` above it is refused) and `--executor-mac-task-out-root` (the tier store's
-put directory on the Macs, `--task-out-root` by default); a macOS action becomes a job of a
-Mac's native runtime (docs/design/actions-as-jobs.md, section 14), which the job service at
+put directory on the Macs, `--task-out-root` by default); a macOS action must name its Xcode build (`xcode`, docs/platform-properties.md) and becomes a
+job of a Mac's native runtime with that Xcode (docs/design/actions-as-jobs.md, section 14), which the job service at
 kbf's pin cannot run yet. It books no disk: the
 job carries no `disk_bytes`, so the job service places it on a host whatever scratch disk that
 host reports, and the job writes to its host's scratch with no quota. The kbf image is built from
@@ -271,8 +271,20 @@ default, writes the action tree as tierstore manifests and gives the job the hos
 the job tierstore's mount provider, which the host's agent asks for the tree as soon as the job is
 assigned (docs/design/actions-as-jobs.md, 4.7). `provider` needs `--task-out-mode put-dir` and a pool
 whose hosts serve the provider (`--mount-provider tierstore=<socket>` on their agents); a job no host
-can serve is refused by the job service and the farm sees an infrastructure failure. A Mac job always
-reads manifests.
+can serve is refused by the job service and the farm sees an infrastructure failure. A job whose
+tree list a host's tierstore refuses as not mountable (`tree list not supported: ...`, the list has no
+readable L2 sidecar) is not failed for it: the frontend writes that action's list again with its sidecar,
+and if the host refuses that too, gives the action's jobs its tree as manifests (`manifests` form, no
+mount provider). Neither run spends one of the operation's attempts
+(`kbf_executor_list_refused_total{step}` counts them). A Mac job always reads manifests.
+
+Beside each tree list the frontend stores its L2 sidecar (`cas/l2/<sha256>`, the same id: tierstore's
+`docs/design/fetch-cache-serve.md`, 3.5): the list's entries with the SHA-256 of every 1 MiB cell of
+each object it names, so a tierstore that reads only L2 lists verifies any cell on arrival. Older
+tierstores read the list and never the sidecar. The cells are recorded in the pack index as objects
+are written (each pack the frontend packs, each whole object the tree writer writes); a list that
+names an object with none recorded is stored without a sidecar and recorded unlisted, for
+`kbf-l2-backfill` (docs/deploy/l2-backfill.md). The miss path above reads each such object once.
 
 **Over a state store.** With `--state-store` the executor keeps the rows `exec/op/<operation>` (owner,
 action, attempt, job id), `exec/act/` (the open operation of each action, so an Execute of an action
@@ -397,7 +409,9 @@ is absent, never zero. The buckets start at 1 ms. Where `prepare` and `start` go
 `kbf_executor_step_seconds{step=...}`, each step timed around its one wait: `facts`, `put_dir` (with the closure's
 `action`, `walk` and `held`), `tree` (to the action tree's name), `row`, `rpc` (each `SubmitJob` call), `backoff`
 (the wait before a submit is sent again) and `tree_wait` (a run waiting for its tree's writes, before its submit,
-while its row is written). [api.md](../api.md) lists them. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
+while its row is written), and the stages of those writes, timed on the task that writes the tree from its name on, so
+overlapping `tree_wait`: `tree_blobs` (the blobs that were nowhere, written whole), `tree_manifests` (the input root's
+manifests and `.kbf`, written together) and `tree_root` (the root, written last). [api.md](../api.md) lists them. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
 in the result's execution metadata as the `input_fetch`, `execution` and `output_upload` start and
 completed times, marked as a task's claim, and the run record and the read API say so with
 `phase_times: "task_claim"` (a run recorded by an earlier release is `measured`, and so is a record written before the
@@ -686,6 +700,11 @@ What it does itself, with those three:
   not wait for; see `docs/design/metadata-in-postgres.md`. A database at migration 3 starts and
   every walk reads the blobs, logging a warning for each failed read, and for a failed record
   of the walk's rows.
+- **Cell rows and unlisted trees.** The pack index keeps the SHA-256 of each 1 MiB cell of an
+  object (`object_cells`) and the tree lists whose L2 sidecar is not written yet (`unlisted_tree`)
+  in two more tables of the state store, made by the installer's migration 5; see
+  `crates/kbf-pack-index/src/cells.rs` for the rules. A database at migration 4 opens for the pack
+  index, and each call on these tables fails `NotMigrated` until the installer has run.
 - **Readiness.** `GET /readyz` and `grpc.health.v1` fail when the state store does not answer a
   read and when the job service does not answer a read of a job (`executor` in the failing
   list). Nothing probes the object store or any storage node: an object store that is down is

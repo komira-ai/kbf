@@ -48,6 +48,9 @@ subtle.workspace = true
 thiserror.workspace = true
 # `server::presign_put`, the signer of the one presigned write of a task's pack (`prepare_run`).
 tierstore = { workspace = true, features = ["server"] }
+# The L2 sidecar of each tree list it writes (`cas/l2/<id>`, `sidecar_from_v2`) and the cell digests
+# of the objects a list names (`CellHasher`, as `place::write_whole` streams a blob).
+tierstore-list.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tonic.workspace = true
 tower-layer.workspace = true

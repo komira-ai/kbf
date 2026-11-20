@@ -20,8 +20,8 @@
 //!   the timeout. The image a run is launched from is the kbf image, built from that base and
 //!   set by the operator: it keeps its `ENTRYPOINT` (the task tool), so no action's image is
 //!   launched and no entrypoint is looked for. The platform's system is read too (`OSFamily`
-//!   or `os`, and a Mac's `os_version`), as `kbf-front` reads it: a Mac action becomes a Mac job
-//!   ([`crate::executor::mac`]).
+//!   or `os`, and a Mac's `os_version` and `xcode`), as `kbf-front` reads it: a Mac action
+//!   becomes a Mac job ([`crate::executor::mac`]).
 //! - **Two caches, by digest**, so that a warm prepare does no store call (`front_cache.rs`).
 //!   Each is bounded by its entries, the oldest going first. Both live and die with the `Front`
 //!   and the base and kbf images it is pinned to. The action trees remembered are those of an
@@ -35,7 +35,9 @@
 //!   never expire: the Action, the Command and the platform they name are named by their
 //!   digests, so what they say cannot change. Only a read that succeeded is remembered.
 //! - **The steps of a mint are timed** into the executor's `kbf_executor_step_seconds`
-//!   ([`Front::with_metrics`]): the put directory, the closure's parts and the tree's name.
+//!   ([`Front::with_metrics`]): the put directory, the closure's parts and the tree's name;
+//!   and the stages of a tree's writes as manifests ([`kbf_front::action_tree::WriteStage`]),
+//!   on the task that writes it.
 //! - **An object the store lost** ([`Ingest::lost`]): a job that did not start because the store
 //!   does not have an object of its tree. The store is general-purpose, and its objects can
 //!   vanish while the frontend's state names them, and a store can answer "not found" for a while
@@ -49,6 +51,12 @@
 //!   yet confirmed lost is named again. An object neither memo nor
 //!   the action's tree names is taken for one of the kbf base tree's, whose objects the frontend
 //!   publishes again ([`PutDirParts::with_republish`]), one publish at a time.
+//! - **A tree list a host refused** ([`Ingest::list_refused`], `front_miss.rs`): a job that did
+//!   not start because the host's tierstore found no readable L2 sidecar for its tree list. The
+//!   first time for an action, its remembered trees are dropped and its next tree list is written
+//!   checked and with its sidecar republished ([`kbf_front::action_tree::ListingWrite`]); the
+//!   second time, [`Ingest::input_tree`] gives the action's jobs [`InputTree::Manifests`], for as
+//!   long as the memo keeps the action (bounded as the trees are).
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -57,7 +65,9 @@ use futures::future::BoxFuture;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_front::action_tree::NoTree;
-use kbf_front::action_tree::{ActionTree, BaseTree, Listing, MEMO_TTL, PutRetry, TreeWriter};
+use kbf_front::action_tree::{
+    ActionTree, BaseTree, Listing, ListingWrite, MEMO_TTL, PutRetry, TreeWriter, WriteStage,
+};
 use kbf_front::prepare_run::{
     ClosureError, KeptClosure, PrepareError as RunPrepError, PrepareFault, PrepareTook, PutDirPrep,
     PutDirRun,
@@ -79,9 +89,13 @@ use crate::executor::size_class::SizeClass;
 use crate::executor::steps::Step;
 use crate::executor::task::{PackKey, RunId, build_id};
 use crate::executor::traits::{
-    ActionFacts, Ingest, Ingested, Inputs, InputsError, LostObject, MintError, RejectReason,
-    UntrustedLimits,
+    ActionFacts, Ingest, Ingested, Inputs, InputsError, LostObject, MintError, MissPath,
+    RejectReason, UntrustedLimits,
 };
+
+#[path = "front_miss.rs"]
+mod miss;
+use miss::Misses;
 
 /// The most action trees [`Front`] remembers.
 const TREE_ENTRIES: usize = 100_000;
@@ -309,7 +323,8 @@ impl PutDirParts {
     pub fn new(packs: &Packs, backend: &Backend, base: Arc<OnceLock<BaseTree>>) -> Self {
         let clock: kbf_front::Clock = Arc::new(SystemTime::now);
         Self {
-            writer: TreeWriter::new(Arc::new(backend.clone()), Arc::new(packs.clone()), clock),
+            writer: TreeWriter::new(Arc::new(backend.clone()), Arc::new(packs.clone()), clock)
+                .with_sidecars(Arc::new(packs.sidecars())),
             base,
             republish: Arc::default(),
         }
@@ -380,6 +395,9 @@ pub struct Front {
     /// not start for an object the store lost. Shared with the tasks that write the trees, which
     /// clear an action once its checked tree is stored.
     checked: Arc<Mutex<Bounded<kbf_types::Digest, ()>>>,
+    /// The step of the miss path an action is on, after a host refused its tree list as not
+    /// mountable ([`Ingest::list_refused`]).
+    misses: Misses,
     /// Held while the base tree is published again: one publish at a time.
     republishing: tokio::sync::Mutex<()>,
     /// What publishes the base tree again.
@@ -429,6 +447,7 @@ impl Front {
             facts: Mutex::new(Bounded::new(FACTS_ENTRIES)),
             metrics: Arc::new(Metrics::default()),
             checked: Arc::new(Mutex::new(Bounded::new(TREE_ENTRIES))),
+            misses: Mutex::new(Bounded::new(TREE_ENTRIES)),
             republishing: tokio::sync::Mutex::new(()),
             republish,
         }
@@ -613,6 +632,21 @@ impl Ingest for Front {
             self.republish_base().await;
         }
     }
+
+    async fn list_refused(&self, action: &Digest) -> MissPath {
+        // A digest the mint took is a digest here; one that is not has no tree of ours to redo.
+        let Ok(action) = cas_digest(action) else {
+            return MissPath::Manifests;
+        };
+        self.miss_step(&action)
+    }
+
+    fn input_tree(&self, action: &Digest, configured: InputTree) -> InputTree {
+        match cas_digest(action) {
+            Ok(action) => self.form_of(&action, configured),
+            Err(_) => configured,
+        }
+    }
 }
 
 /// The put directory the frontend issued, from its text `cas/b/<build>/<nonce>`.
@@ -712,15 +746,18 @@ impl Front {
         checked: bool,
     ) -> Result<(String, JoinHandle<Result<(), MintError>>), MintError> {
         let started = Instant::now();
-        let (writer, base, trees, checks) = (
+        let (writer, base, trees, checks, metrics) = (
             Arc::clone(&self.writer),
             Arc::clone(&self.base),
             Arc::clone(&self.trees),
             Arc::clone(&self.checked),
+            Arc::clone(&self.metrics),
         );
         let (named, name) = oneshot::channel::<String>();
+        let how = self.listing_write(&action, form, checked);
         let writes = tokio::spawn(async move {
-            let tree = write_named(&writer, &base, &kept, (form, checked), named).await?;
+            let timed = |stage, took| metrics.step_took(Step::of_write(stage), took);
+            let tree = write_named(&writer, &base, &kept, (form, how), named, timed).await?;
             if checked {
                 lock_checked(&checks).remove(&action);
             }
@@ -758,15 +795,18 @@ fn broke() -> MintError {
 }
 
 /// Writes the action tree of `kept` over the base tree `base` holds as `form` says, `checked`
-/// against the store when a job of the action did not start for an object the store lost, and
-/// sends its name (its root manifest's digest in hex, or its tree list's key) to `named` as soon
-/// as the writer has it, before any write. Returns the name once every write succeeded.
+/// against the store when a job of the action did not start for an object the store lost (and
+/// a tree list with its sidecar republished, as `how` says), and sends its name (its root
+/// manifest's digest in hex, or its tree list's key) to `named` as soon as the writer has it,
+/// before any write. The stages of a tree's writes as manifests are told to `timed`; a tree list
+/// is one write, and has none. Returns the name once every write succeeded.
 async fn write_named(
     writer: &TreeWriter,
     base: &OnceLock<BaseTree>,
     kept: &KeptClosure,
-    (form, checked): (InputTree, bool),
+    (form, how): (InputTree, ListingWrite),
     named: oneshot::Sender<String>,
+    timed: impl Fn(WriteStage, Duration) + Send + Sync,
 ) -> Result<String, MintError> {
     // The mint checked the base before it collected the closure, and a base once set stays.
     let Some(base) = base.get() else {
@@ -777,9 +817,9 @@ async fn write_named(
             let of_tree = move |tree: &ActionTree| {
                 let _ = named.send(tree.digest().to_string());
             };
-            let tree = match checked {
-                true => writer.write_checked_named(kept, base, of_tree).await,
-                false => writer.write_named(kept, base, of_tree).await,
+            let tree = match how.checked {
+                true => writer.write_checked_named(kept, base, of_tree, timed).await,
+                false => writer.write_named(kept, base, of_tree, timed).await,
             };
             tree.map(|tree| tree.digest().to_string())
         }
@@ -787,14 +827,7 @@ async fn write_named(
             let of_list = move |listing: &Listing| {
                 let _ = named.send(listing.key().to_owned());
             };
-            let listing = match checked {
-                true => {
-                    writer
-                        .write_listing_checked_named(kept, base, of_list)
-                        .await
-                }
-                false => writer.write_listing_named(kept, base, of_list).await,
-            };
+            let listing = writer.write_listing_with(kept, base, how, of_list).await;
             listing.map(|listing| listing.key().to_owned())
         }
     };

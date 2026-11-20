@@ -432,7 +432,7 @@ fn enroll(store: &dyn Store, name: &str) {
     };
     create_token(store, &token, &secret, &spec).expect("token");
     let node: NodeId = name.parse().expect("a node id");
-    let now = store.now().as_duration().as_secs();
+    let now = store.now().expect("time").as_duration().as_secs();
     let mut sign = || {
         Ok(vec![IssuedRole {
             role: Role::Daemon,
@@ -599,10 +599,15 @@ fn a_row_this_build_cannot_read_is_pending_not_an_error() {
     assert!(!got.converged);
 
     // Four numbers, the third a status this build does not name: also no report.
-    let newer: Vec<u8> = [1u64, 3, 9, store.now().as_duration().as_secs()]
-        .iter()
-        .flat_map(|n| n.to_be_bytes())
-        .collect();
+    let newer: Vec<u8> = [
+        1u64,
+        3,
+        9,
+        store.now().expect("time").as_duration().as_secs(),
+    ]
+    .iter()
+    .flat_map(|n| n.to_be_bytes())
+    .collect();
     store
         .txn(kbf_state::Txn::new().put("objstore/ack/1", newer, kbf_state::Cond::Any))
         .expect("write")

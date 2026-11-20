@@ -110,6 +110,9 @@ kbf-segments.workspace = true
 # The tree list a provider run parks, read back by tierstore's own reader
 # (src/executor/front_put_dir_tests.rs).
 tierstore.workspace = true
+# The refusal a node's reader makes of a tree list with no L2 sidecar, built for real so that the
+# text the executor detects is held to tierstore's own (src/executor/outcome_list_tests.rs).
+tierstore-list.workspace = true
 # The deterministic simulation kernel's seeded random stream (src/machine.rs, tests/invocations_paging.rs).
 kbf-sim.workspace = true
 # An in-process job service on loopback (src/executor, tests/executor).

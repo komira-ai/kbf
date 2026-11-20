@@ -85,13 +85,14 @@ impl From<RefusalReason> for Fail {
     }
 }
 
-/// Every store failure (a failed call, a lost connection, a trimmed change feed) is the
+/// Every store failure (a failed call, a lost connection, a store too busy, a trimmed change feed) is the
 /// store being unavailable.
 impl From<StoreError> for Fail {
     fn from(e: StoreError) -> Self {
         match e {
             StoreError::Failed(_)
             | StoreError::Disconnected(_)
+            | StoreError::Unavailable(_)
             | StoreError::StaleCursor { .. } => Self(RefusalReason::StoreUnavailable),
         }
     }
@@ -110,8 +111,8 @@ mod tests {
     use super::*;
     use kbf_state::Revision;
 
-    /// Every store failure, the two the store gained with the connection loss and the
-    /// trimmed feed included, is answered StoreUnavailable.
+    /// Every store failure, the ones the store gained with the connection loss, the busy
+    /// store and the trimmed feed included, is answered StoreUnavailable.
     #[test]
     fn each_store_error_maps_to_its_refusal() {
         let cases = [
@@ -121,6 +122,10 @@ mod tests {
             ),
             (
                 StoreError::Disconnected("reset".to_owned()),
+                RefusalReason::StoreUnavailable,
+            ),
+            (
+                StoreError::Unavailable("busy".to_owned()),
                 RefusalReason::StoreUnavailable,
             ),
             (

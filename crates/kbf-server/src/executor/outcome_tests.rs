@@ -10,7 +10,9 @@ use kbf_proto::google::rpc::ErrorInfo;
 use prost::Message;
 use tonic::Code;
 
-use super::{OUT_OF_MEMORY_REASON, RESUBMITS, Settled, Verdict, forgotten, judge, refused};
+use super::{
+    NO_XCODE_REASON, OUT_OF_MEMORY_REASON, RESUBMITS, Settled, Verdict, forgotten, judge, refused,
+};
 use crate::executor::LostObject;
 
 /// What a test's log holds, as text.
@@ -259,6 +261,17 @@ fn cases() -> Vec<(&'static str, Case)> {
             ),
         ),
         (
+            "failed to start, any code, its detail saying the host refused the job's tree list as not mountable (`tree list not supported: <reason>`)",
+            judged(
+                job(
+                    JobState::FailedToStart,
+                    StartFailureCode::InputUnavailable,
+                    "tree list not supported: missing_sidecar",
+                ),
+                none.clone(),
+            ),
+        ),
+        (
             "failed to start, any other code or detail",
             judged(refused_to_start("scratch-failed"), none.clone()),
         ),
@@ -316,13 +329,15 @@ fn answer(case: &Case) -> Verdict {
 fn class_of(verdict: &Verdict) -> &'static str {
     match verdict {
         Verdict::Ingest => "ingest",
+        Verdict::ListRefused => "list-refused",
         Verdict::Settled(settled) | Verdict::StoreLost { settled, .. } => match settled {
             Settled::Infra(_) => "infra",
             Settled::Timeout => "timeout",
             Settled::OutOfMemory => "out-of-memory",
             Settled::Lost(_) => "lost",
-            Settled::Invalid(_) => "invalid",
+            Settled::Invalid(_) | Settled::NoXcode => "invalid",
             Settled::Missing(_) => "missing",
+            Settled::ListRefused(_) => "list-refused",
         },
     }
 }
@@ -596,8 +611,8 @@ fn a_result_that_is_not_clean_is_named_in_full() {
 }
 
 /// Catches a class answered as another: the status code and message of each way a run is
-/// settled, whether it is run again, and, for the memory kill at the last attempt, the
-/// `ErrorInfo` detail a client tells it by.
+/// settled, whether it is run again, and, for the memory kill at the last attempt and a Mac
+/// action that names no Xcode, the `ErrorInfo` detail a client tells it by.
 #[test]
 fn a_settled_run_becomes_the_status_the_callers_are_answered_with() {
     let infra = Settled::Infra("disk".to_owned());
@@ -626,6 +641,24 @@ fn a_settled_run_becomes_the_status_the_callers_are_answered_with() {
     let info = ErrorInfo::decode(detail.value.as_slice()).expect("an ErrorInfo");
     assert_eq!(info.reason, OUT_OF_MEMORY_REASON);
     assert_eq!(info.domain, ERROR_DOMAIN);
+
+    let no_xcode = Settled::NoXcode.status();
+    assert_eq!(no_xcode.code, Code::InvalidArgument as i32);
+    assert_eq!(
+        no_xcode.message,
+        "a Mac action must name the Xcode it runs with: give the platform property \
+         xcode=<build>, such as xcode=16C5032a (the Xcode's ProductBuildVersion); with none it \
+         would run with whichever Xcode the Mac has selected, which an update of the Mac can \
+         change"
+    );
+    let [detail] = no_xcode.details.as_slice() else {
+        panic!("one detail: {:?}", no_xcode.details);
+    };
+    let info = ErrorInfo::decode(detail.value.as_slice()).expect("an ErrorInfo");
+    assert_eq!(info.reason, NO_XCODE_REASON);
+    assert_eq!(info.reason, "MAC_ACTION_NAMES_NO_XCODE");
+    assert_eq!(info.domain, ERROR_DOMAIN);
+    assert!(info.metadata.is_empty());
 }
 
 /// Catches an ending run again that should be answered at once, or the reverse: the farm's
@@ -639,6 +672,7 @@ fn only_an_ending_of_the_farms_is_run_again() {
     assert!(Settled::OutOfMemory.retried());
     assert!(!Settled::Timeout.retried());
     assert!(!Settled::Invalid(String::new()).retried());
+    assert!(!Settled::NoXcode.retried());
     assert_eq!(RESUBMITS, 2);
 }
 

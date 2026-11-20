@@ -121,7 +121,7 @@ impl EnrollService {
             },
             &mut sign,
         )?;
-        let now = core.now();
+        let now = core.now()?;
         Ok(pb::RenewResponse {
             certs: certs_of(&renewed.certs),
             ca_bundle_pem: core.ca.bundle_pem().into_bytes(),

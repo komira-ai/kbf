@@ -44,9 +44,25 @@
 //!
 //! The walk may read its `Directory` messages through a [`DirectoryCache`]: a `Directory` the
 //! cache holds (in memory, or as a verified blob on its disk) is not read from the store, and one
-//! it does not hold is read from the store, decoded and then kept in the cache. The files and the
-//! Command are asked of the store (`FindMissing`) either way, so a cache never makes a closure
-//! complete that the store cannot serve.
+//! it does not hold is read from the store, decoded and then kept in the cache. The Execute's own
+//! input check over the same backend fills the cache too, with every `Directory` it reads, once
+//! a preparer is given it ([`crate::prepare_run::PutDirPrep::with_directories`]). The files and
+//! the Command are asked of the store (`FindMissing`) either way, so a cache never makes a
+//! closure complete that the store cannot serve.
+//!
+//! **Once per Execute.** The Execute that started the run has just asked the store the same
+//! question: it read the Command and asked FindMissing about every file of the same tree. When
+//! it found them all held, it left that finding in the backend, by the Action's digest, with the
+//! time its check began; the walk takes it (once) and does not ask again if it is younger than
+//! the time a check is believed for (`input_walk`'s `VERIFIED_TTL`, 45 seconds). A walk with no
+//! such finding (a later attempt, an operation another frontend began, a backend whose check is
+//! the in-process cache's) asks as before. Either way the walk counts it
+//! (`kbf_prepare_held_checked_total`, `kbf_prepare_held_vouched_total`), and counts the
+//! Directories it took from the cache and those it read (`kbf_prepare_dirs_cached_total`,
+//! `kbf_prepare_dirs_read_total`). A `Directory` the Execute's check put in the cache is a hit
+//! here, so this walk does not record it as a row or keep its blob on the cache's disk half:
+//! those speed up a walk that finds the cache cold (a restarted frontend, an operation another
+//! frontend began), and the Execute's check of the next action fills the memory again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -147,7 +163,8 @@ pub struct PrepareTook {
     /// last level: the cache, the rows, the blob reads and the parse of every `Directory`.
     pub walk: Duration,
     /// The presence check of the Command and every file of the tree (`FindMissing`, in calls of
-    /// at most a batch), from its start until the last answer is in.
+    /// at most a batch), from its start until the last answer is in; next to nothing when the
+    /// Execute's own check of the same inputs stood in for it (see the module).
     pub held: Duration,
 }
 
@@ -587,7 +604,13 @@ async fn walk_tree(
     }
     let walk_took = walking.elapsed();
     let checking = Instant::now();
-    require_held(backend, &command, files).await?;
+    match backend.vouched(action) {
+        true => backend.metrics().prepare_held_vouched.add(1),
+        false => {
+            backend.metrics().prepare_held_checked.add(1);
+            require_held(backend, &command, files).await?;
+        }
+    }
     let held = checking.elapsed();
     let closure = InputClosure {
         action: *action,
@@ -652,6 +675,15 @@ async fn read_level(
         .filter(|(_, held)| held.is_none())
         .map(|(digest, _)| *digest)
         .collect();
+    let metrics = backend.metrics();
+    metrics
+        .prepare_dirs_cached
+        .add((level.len() - misses.len()) as u64);
+    let reads = misses
+        .iter()
+        .filter(|digest| !is_empty_blob(digest))
+        .count();
+    metrics.prepare_dirs_read.add(reads as u64);
     let rows = match misses.is_empty() {
         true => Vec::new(),
         false => match backend.directories(&misses).await {

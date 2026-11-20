@@ -408,7 +408,9 @@ normalisation between kbf and a store can turn one key into another.
 
 **Conformance suite.** `kbf_objstore::conformance::run` checks a store's base contract
 (round trip, ranged reads at the boundaries, a missing key, idempotent delete, list
-paging) and every capability it claims. A backend is trusted only once it passes. CI
+paging) and every capability it claims (a store claiming conditional writes must also
+never hold other bytes under a used key: bytes of another length, by `put_new` and
+`put_stream`, and writers racing for one fresh key, leave the first bytes). A backend is trusted only once it passes. CI
 runs the suite against the in-memory store, the local-directory store, and MinIO and
 RustFS containers, each with a plain bucket and an Object Lock bucket.
 

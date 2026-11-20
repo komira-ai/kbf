@@ -35,6 +35,9 @@ pub struct Machine {
     pub arch: String,
     /// The mode it runs jobs in.
     pub exec: ExecMode,
+    /// The builds of the Xcodes it has (`16C5032a`), as a Mac's agent reports them: a job
+    /// that names an Xcode fits only a machine that lists that build.
+    pub xcodes: Vec<String>,
 }
 
 impl Machine {
@@ -58,6 +61,7 @@ impl Machine {
             any_or_same(&wants.os, &self.os),
             any_or_same(&wants.arch, &self.arch),
             any_exec | (wants.exec() == self.exec),
+            wants.xcode.is_empty() | self.xcodes.contains(&wants.xcode),
         ]
         .iter()
         .all(|rule| *rule)

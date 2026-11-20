@@ -221,6 +221,7 @@ async fn a_run_gets_its_dir_and_its_tree_once() {
     let digest = cas_digest(&action).expect("a digest");
     assert_eq!(rig.mint.verify_put_dir(&dir, &digest), Ok(clock()));
 
+    rig.front.stored(lease()).await.expect("stored");
     let tree = rig.front.tree(lease()).await.expect("a tree");
     assert_eq!(tree.len(), 64, "{tree}");
     let manifest = ObjectKey::new(format!("cas/l/{tree}")).expect("a key");
@@ -412,6 +413,7 @@ async fn a_provider_run_gets_the_key_of_a_stored_tree_list_once() {
         .await
         .expect("a dir");
 
+    rig.front.stored(lease()).await.expect("stored");
     let key = rig.front.tree(lease()).await.expect("a tree");
     let hex = key.strip_prefix("cas/l/").expect("a tree list's key");
     assert!(

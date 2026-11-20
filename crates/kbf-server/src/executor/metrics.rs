@@ -15,6 +15,7 @@ use crate::executor::RejectReason;
 use crate::executor::outcome::Settled;
 use crate::executor::phases::{Phase, PhaseHistograms};
 use crate::executor::steps::{Step, StepHistograms};
+use crate::executor::traits::MissPath;
 
 /// How a run ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,10 +34,12 @@ pub(crate) enum RunEnd {
     Invalid,
     /// Inputs the store lost: the client uploads them again.
     Missing,
+    /// A host refused the job's tree list as not mountable through tierstore.
+    ListRefused,
 }
 
 impl RunEnd {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Ran,
         Self::Infra,
         Self::Timeout,
@@ -44,6 +47,7 @@ impl RunEnd {
         Self::Lost,
         Self::Invalid,
         Self::Missing,
+        Self::ListRefused,
     ];
 
     const fn label(self) -> &'static str {
@@ -55,6 +59,7 @@ impl RunEnd {
             Self::Lost => "lost",
             Self::Invalid => "invalid",
             Self::Missing => "missing",
+            Self::ListRefused => "list_refused",
         }
     }
 
@@ -65,8 +70,9 @@ impl RunEnd {
             Settled::Timeout => Self::Timeout,
             Settled::OutOfMemory => Self::OutOfMemory,
             Settled::Lost(_) => Self::Lost,
-            Settled::Invalid(_) => Self::Invalid,
+            Settled::Invalid(_) | Settled::NoXcode => Self::Invalid,
             Settled::Missing(_) => Self::Missing,
+            Settled::ListRefused(_) => Self::ListRefused,
         }
     }
 }
@@ -128,6 +134,8 @@ pub struct Metrics {
     reattached: AtomicU64,
     joined: AtomicU64,
     host_silence_seen: AtomicU64,
+    /// Refused tree lists, by the step of the miss path taken ([`MissPath`]).
+    list_refused: [AtomicU64; MissPath::ALL.len()],
     phases: PhaseHistograms,
     steps: StepHistograms,
 }
@@ -192,6 +200,15 @@ impl Metrics {
         self.host_silence_seen.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The frontend took `step` of its miss path for an action whose tree list a host refused.
+    pub(crate) fn list_refused(&self, step: MissPath) {
+        let at = MissPath::ALL
+            .iter()
+            .position(|s| *s == step)
+            .unwrap_or_default();
+        self.list_refused[at].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Appends the families to `out`, in the Prometheus text format.
     pub fn render(&self, out: &mut String) {
         let _ = writeln!(
@@ -216,6 +233,19 @@ impl Metrics {
             let _ = writeln!(
                 out,
                 "kbf_executor_ingests_total{{result=\"{label}\"}} {}",
+                count.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP kbf_executor_list_refused_total Tree lists a host refused as not mountable through tierstore, by the step of the miss path the frontend took\n\
+             # TYPE kbf_executor_list_refused_total counter"
+        );
+        for (step, count) in MissPath::ALL.iter().zip(&self.list_refused) {
+            let _ = writeln!(
+                out,
+                "kbf_executor_list_refused_total{{step=\"{}\"}} {}",
+                step.label(),
                 count.load(Ordering::Relaxed)
             );
         }

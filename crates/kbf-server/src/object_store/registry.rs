@@ -738,7 +738,7 @@ impl Registry {
             audit_seq: seq,
         };
         let audit_row = AuditRow {
-            at: self.store.now().as_duration().as_secs(),
+            at: self.store.now()?.as_duration().as_secs(),
             action: action_code(audit.action),
             subject: audit.subject,
             outcome: outcome_code(audit.outcome),

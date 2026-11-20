@@ -417,11 +417,11 @@ fn the_planned_end_is_field_five_of_the_stored_row_as_a_plain_varint() {
     frontend.register(&speaking(1, 3)).expect("a");
     let b = frontend.register(&speaking(2, 2)).expect("b");
     let key = format!("member/{}", b.id.0);
-    let t0 = fake.now().as_duration().as_nanos();
+    let t0 = fake.now().expect("time").as_duration().as_nanos();
     frontend
         .plan_down(b.id, Duration::from_secs(600))
         .expect("plan");
-    let t1 = fake.now().as_duration().as_nanos();
+    let t1 = fake.now().expect("time").as_duration().as_nanos();
 
     let row = fake.get(&key).expect("store").expect("a live row");
     let decoded = RowBeforeProtocol::decode(row.value.as_slice()).expect("a row");

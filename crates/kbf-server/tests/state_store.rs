@@ -212,7 +212,7 @@ impl Store for Flaky {
         self.inner.store().commit_stats()
     }
 
-    fn now(&self) -> StoreTime {
+    fn now(&self) -> Result<StoreTime, StoreError> {
         self.inner.store().now()
     }
 }

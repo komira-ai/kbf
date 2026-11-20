@@ -18,6 +18,10 @@
 //!
 //! Each manifest is stored with a create-only write to `cas/l/<sha256>`; an existing key is
 //! success, since the key is content-bound. The root's digest names the tree ([`ActionTree`]).
+//! The writes come in three stages ([`WriteStage`]), each begun when the one before has ended:
+//! the blobs that are nowhere yet; then the input root's manifests and `.kbf` together, since
+//! neither names the other and every blob either names is written by then; then the root, which
+//! names both, so a reader that finds the root finds every manifest and blob below it.
 //!
 //! **Every blob is made locatable** ([`place`]): the pack index is asked in chunks, `cas/l/`
 //! is checked for the rest, and a blob that is in neither is read from the frontend's CAS and
@@ -86,6 +90,9 @@ mod memo;
 mod place;
 mod places;
 mod retry;
+mod sidecar;
+#[cfg(test)]
+mod sidecar_tests;
 mod tstree;
 #[cfg(test)]
 mod tstree_tests;
@@ -97,13 +104,17 @@ use std::time::{Duration, SystemTime};
 use futures::stream::{self, StreamExt as _};
 use kbf_types::Digest;
 use tierstore::{MAX_DEPTH, MAX_ENTRIES, TreeDigest, TreeError};
+use tokio::time::Instant;
 
 pub use self::base::{BaseFacts, BaseTree, BaseTreeError, INPUT_ROOT, RESERVED_NAMES};
-pub use self::listing::Listing;
+pub use self::listing::{Listing, ListingWrite};
 pub use self::place::{HEADS_IN_FLIGHT, LOCATE_CHUNK, LOOKUP_DEADLINE};
 pub use self::places::PLACE_ENTRIES;
 pub use self::retry::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, PutRetry, Sleeper};
 pub(crate) use self::retry::{is_slow_down, tokio_sleeper};
+pub use self::sidecar::{
+    Backfilled, Emitted, READ_WINDOW, SidecarCounters, SidecarError, Sidecars, read_cells,
+};
 
 use self::encode::{Child, Manifest};
 use self::flight::Flights;
@@ -299,6 +310,21 @@ impl ActionTree {
     }
 }
 
+/// A stage of an action tree's writes, in the order they are made: each begins when the one
+/// before it has ended. [`TreeWriter::write_named`] times each stage it makes, a failed one
+/// included, on tokio's clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteStage {
+    /// The blobs that were nowhere, written whole to `cas/l/`; a tree with none has no such
+    /// stage.
+    Blobs,
+    /// The manifests of the input root's `Directory` messages the memo did not have, and
+    /// `.kbf`, written together.
+    Manifests,
+    /// The root manifest, which names the tree.
+    Root,
+}
+
 /// The manifest writer. Shared by every preparation: the manifest memo, the place memo and the
 /// manifest writes in flight are the only state it holds.
 pub struct TreeWriter {
@@ -314,6 +340,8 @@ pub struct TreeWriter {
     flights: Flights,
     /// The most entries a tree list holds ([`MAX_ENTRIES`] unless a test lowers it).
     list_entries: u64,
+    /// Where each tree list's L2 sidecar is written ([`sidecar`]); none without a pack index.
+    sidecars: Option<Arc<Sidecars>>,
 }
 
 /// What a write takes on trust: the memos, or nothing but the store.
@@ -359,6 +387,7 @@ impl TreeWriter {
             places: Mutex::new(Places::new(PLACE_ENTRIES)),
             flights: Flights::new(MANIFEST_WRITES),
             list_entries: MAX_ENTRIES,
+            sidecars: None,
         }
     }
 
@@ -386,6 +415,14 @@ impl TreeWriter {
         self
     }
 
+    /// This writer, writing the L2 sidecar of each tree list it stores with `sidecars` and
+    /// recording there the cells of each whole object it writes.
+    #[must_use]
+    pub fn with_sidecars(mut self, sidecars: Arc<Sidecars>) -> Self {
+        self.sidecars = Some(sidecars);
+        self
+    }
+
     /// This writer, repeating a write the store answered 503 or a dead connection by `retry`.
     #[must_use]
     pub fn with_put_retry(mut self, retry: PutRetry) -> Self {
@@ -400,16 +437,20 @@ impl TreeWriter {
     /// manifests written before a failure stay: each is content-bound, and nothing names them
     /// until a tree is returned.
     pub async fn write(&self, kept: &KeptClosure, base: &BaseTree) -> Result<ActionTree, NoTree> {
-        self.write_as(kept, base, Trust::Memos, |_| ()).await
+        self.write_as(kept, base, Trust::Memos, |_| (), |_, _| ())
+            .await
     }
 
     /// As [`TreeWriter::write`], and calls `named` with the tree's name as soon as it is known:
     /// after the blobs are located and every manifest is built and checked, before the first
     /// blob or manifest is written. A tree that is refused, or whose lookups fail, is never
     /// named. A name handed to `named` is not yet a stored tree: the writes that follow it may
-    /// still fail, and only the tree this returns is in the store. The writes keep their order,
-    /// blobs first and the root last, so a reader that finds the root finds every manifest and
-    /// blob below it.
+    /// still fail, and only the tree this returns is in the store. The writes keep their
+    /// stages ([`WriteStage`]): blobs first, then the input root's manifests and `.kbf`
+    /// together, and the root last, so a reader that finds the root finds every manifest and
+    /// blob below it. `timed` is called with each stage the writes make and how long it took,
+    /// once it ended, stored or failed; a stage cut off part way (the write was dropped) is
+    /// not timed.
     ///
     /// # Errors
     /// As [`TreeWriter::write`], except that a write that fails after `named` ran leaves the
@@ -420,8 +461,9 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
         named: impl FnOnce(&ActionTree) + Send,
+        timed: impl Fn(WriteStage, Duration) + Send + Sync,
     ) -> Result<ActionTree, NoTree> {
-        self.write_as(kept, base, Trust::Memos, named).await
+        self.write_as(kept, base, Trust::Memos, named, timed).await
     }
 
     /// [`TreeWriter::write`] for a tree whose last job found a manifest lost: nothing is taken
@@ -436,12 +478,13 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
     ) -> Result<ActionTree, NoTree> {
-        self.write_as(kept, base, Trust::Store, |_| ()).await
+        self.write_as(kept, base, Trust::Store, |_| (), |_, _| ())
+            .await
     }
 
-    /// [`TreeWriter::write_checked`], naming the tree as [`TreeWriter::write_named`] does: a
-    /// pack the store lost is found before the tree is named, so a tree that is
-    /// [`NoTree::Lost`] is never named.
+    /// [`TreeWriter::write_checked`], naming the tree and timing its stages as
+    /// [`TreeWriter::write_named`] does: a pack the store lost is found before the tree is
+    /// named, so a tree that is [`NoTree::Lost`] is never named.
     ///
     /// # Errors
     /// As [`TreeWriter::write_checked`] and [`TreeWriter::write_named`].
@@ -450,8 +493,9 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
         named: impl FnOnce(&ActionTree) + Send,
+        timed: impl Fn(WriteStage, Duration) + Send + Sync,
     ) -> Result<ActionTree, NoTree> {
-        self.write_as(kept, base, Trust::Store, named).await
+        self.write_as(kept, base, Trust::Store, named, timed).await
     }
 
     /// Drops what the memos say of the pack `key`, which the store answered a job absent for:
@@ -480,6 +524,7 @@ impl TreeWriter {
         base: &BaseTree,
         trust: Trust,
         named: impl FnOnce(&ActionTree) + Send,
+        timed: impl Fn(WriteStage, Duration) + Send + Sync,
     ) -> Result<ActionTree, NoTree> {
         reserved_input(kept)?;
         let now = (self.clock)();
@@ -537,16 +582,33 @@ impl TreeWriter {
         let root = top(children)?;
         let tree = ActionTree { digest: root.tree };
         named(&tree);
-        self.write_whole(unlocated, now).await?;
-        self.store_built(&plan, &built, &measures, &manifests, &places)
-            .await?;
+        if !unlocated.is_empty() {
+            let started = Instant::now();
+            let written = self.write_whole(unlocated, now).await;
+            timed(WriteStage::Blobs, started.elapsed());
+            written?;
+        }
+        // Every blob is locatable now, the Action and the Command among them, so `.kbf` is
+        // written beside the input root's manifests: neither names the other. A failure of
+        // either ends the stage, and the other's writes are dropped with it: a directory is
+        // remembered only once its write was seen stored, so one stored but not yet seen is
+        // written again by the next tree, which its create-only write takes as success.
         let flights = &self.flights;
-        flights
-            .write(&self.store, &self.retry, kbf.digest, kbf.bytes)
-            .await?;
-        flights
+        let started = Instant::now();
+        let written = futures::future::try_join(
+            self.store_built(&plan, &built, &measures, &manifests, &places),
+            flights.write(&self.store, &self.retry, kbf.digest, kbf.bytes),
+        )
+        .await;
+        timed(WriteStage::Manifests, started.elapsed());
+        written?;
+        // The root names `kbf-work` and `.kbf`: it is written only once both are stored.
+        let started = Instant::now();
+        let written = flights
             .write(&self.store, &self.retry, root.digest, root.bytes)
-            .await?;
+            .await;
+        timed(WriteStage::Root, started.elapsed());
+        written?;
         Ok(tree)
     }
 
@@ -653,7 +715,8 @@ impl TreeWriter {
     /// whole once every write has succeeded: a write that failed is asked about again.
     async fn write_whole(&self, unlocated: Vec<Digest>, now: SystemTime) -> Result<(), NoTree> {
         let written = unlocated.clone();
-        place::write_whole(&*self.source, &*self.store, &self.retry, unlocated).await?;
+        let (stores, sidecars) = ((&*self.source, &*self.store), self.sidecars.as_deref());
+        place::write_whole(stores, &self.retry, unlocated, sidecars).await?;
         let whole = written.into_iter().map(|digest| (digest, Place::Whole));
         self.remembered().remember(whole, now);
         Ok(())

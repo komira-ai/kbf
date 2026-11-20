@@ -73,22 +73,26 @@ hyper-util = { version = "0.1.21", default-features = false }
 # (a lease id, say) is the same type in every kbf crate; a test in kbf-integration-test
 # reads Cargo.lock and refuses a second source. The revision is raised by a commit of its
 # own, holding only the raise and the fixes it forces, and the whole CI runs on it.
-js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
-js-proto = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
-js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
-js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
-js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
-js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
-js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
-js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "03e0582c3e25c02575831270e3478624f31ba918" }
+js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "efdf43752d47190219abb7c9d6b3fe00e29487b9" }
+js-proto = { git = "https://github.com/komira-ai/jobscheduler", rev = "efdf43752d47190219abb7c9d6b3fe00e29487b9" }
+js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "efdf43752d47190219abb7c9d6b3fe00e29487b9" }
+js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "efdf43752d47190219abb7c9d6b3fe00e29487b9" }
+js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "efdf43752d47190219abb7c9d6b3fe00e29487b9" }
+js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "efdf43752d47190219abb7c9d6b3fe00e29487b9" }
+js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "efdf43752d47190219abb7c9d6b3fe00e29487b9" }
+js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "efdf43752d47190219abb7c9d6b3fe00e29487b9" }
 # tierstore and objstore-s3 moved to the tierstore repository (https://github.com/komira-ai/tierstore).
 # Both are taken from it at this one revision. The revision is raised by a pull request of
 # its own that runs the whole CI, never along with other changes.
-objstore-s3 = { git = "https://github.com/komira-ai/tierstore", rev = "e83fba50c60e4b2d9e710cc8ce8202af755bc87e" } # entry names beginning .wh. (komira-ai/tierstore#348; main at komira-ai/tierstore#378)
-tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "e83fba50c60e4b2d9e710cc8ce8202af755bc87e" } # entry names beginning .wh. (komira-ai/tierstore#348; main at komira-ai/tierstore#378)
+objstore-s3 = { git = "https://github.com/komira-ai/tierstore", rev = "ad492f8121a0dd5ac0792d992c338b1aa85630e1" } # tierstore-list, the L2 tree list (komira-ai/tierstore#383; main at komira-ai/tierstore#390)
+tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "ad492f8121a0dd5ac0792d992c338b1aa85630e1" } # tierstore-list, the L2 tree list (komira-ai/tierstore#383; main at komira-ai/tierstore#390)
 # The trees API's wire contract (TreesService: its proto and generated stubs), at the same
 # revision; members take its `client` feature, and kbf-trees-client's fake the `server` one.
-tierstore-trees-api = { git = "https://github.com/komira-ai/tierstore", rev = "e83fba50c60e4b2d9e710cc8ce8202af755bc87e" } # entry names beginning .wh. (komira-ai/tierstore#348; main at komira-ai/tierstore#378)
+tierstore-trees-api = { git = "https://github.com/komira-ai/tierstore", rev = "ad492f8121a0dd5ac0792d992c338b1aa85630e1" } # tierstore-list, the L2 tree list (komira-ai/tierstore#383; main at komira-ai/tierstore#390)
+# The L2 tree list (tierstore's docs/design/fetch-cache-serve.md, section 3): the cell digests a
+# pack's bytes are hashed into as they are written, and the L2 sidecar of a version 2 tree list
+# (`cas/l2/<id>`), at the same revision.
+tierstore-list = { git = "https://github.com/komira-ai/tierstore", rev = "ad492f8121a0dd5ac0792d992c338b1aa85630e1" } # tierstore-list, the L2 tree list (komira-ai/tierstore#383; main at komira-ai/tierstore#390)
 # The enrollment profile kbf-deploy writes (`mdm push-cert`), an XML property list.
 # No default features: the profile is built as a value, not through serde.
 plist = { version = "1.10.1", default-features = false }
