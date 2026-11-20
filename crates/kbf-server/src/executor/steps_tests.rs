@@ -38,6 +38,9 @@ fn the_step_family_renders_every_step_label_once() {
             "held",
             "tree",
             "tree_wait",
+            "tree_blobs",
+            "tree_manifests",
+            "tree_root",
             "row",
             "rpc",
             "backoff"

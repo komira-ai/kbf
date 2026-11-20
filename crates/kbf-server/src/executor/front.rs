@@ -35,7 +35,9 @@
 //!   never expire: the Action, the Command and the platform they name are named by their
 //!   digests, so what they say cannot change. Only a read that succeeded is remembered.
 //! - **The steps of a mint are timed** into the executor's `kbf_executor_step_seconds`
-//!   ([`Front::with_metrics`]): the put directory, the closure's parts and the tree's name.
+//!   ([`Front::with_metrics`]): the put directory, the closure's parts and the tree's name;
+//!   and the stages of a tree's writes as manifests ([`kbf_front::action_tree::WriteStage`]),
+//!   on the task that writes it.
 //! - **An object the store lost** ([`Ingest::lost`]): a job that did not start because the store
 //!   does not have an object of its tree. The store is general-purpose, and its objects can
 //!   vanish while the frontend's state names them, and a store can answer "not found" for a while
@@ -57,7 +59,9 @@ use futures::future::BoxFuture;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_front::action_tree::NoTree;
-use kbf_front::action_tree::{ActionTree, BaseTree, Listing, MEMO_TTL, PutRetry, TreeWriter};
+use kbf_front::action_tree::{
+    ActionTree, BaseTree, Listing, MEMO_TTL, PutRetry, TreeWriter, WriteStage,
+};
 use kbf_front::prepare_run::{
     ClosureError, KeptClosure, PrepareError as RunPrepError, PrepareFault, PrepareTook, PutDirPrep,
     PutDirRun,
@@ -712,15 +716,17 @@ impl Front {
         checked: bool,
     ) -> Result<(String, JoinHandle<Result<(), MintError>>), MintError> {
         let started = Instant::now();
-        let (writer, base, trees, checks) = (
+        let (writer, base, trees, checks, metrics) = (
             Arc::clone(&self.writer),
             Arc::clone(&self.base),
             Arc::clone(&self.trees),
             Arc::clone(&self.checked),
+            Arc::clone(&self.metrics),
         );
         let (named, name) = oneshot::channel::<String>();
         let writes = tokio::spawn(async move {
-            let tree = write_named(&writer, &base, &kept, (form, checked), named).await?;
+            let timed = |stage, took| metrics.step_took(Step::of_write(stage), took);
+            let tree = write_named(&writer, &base, &kept, (form, checked), named, timed).await?;
             if checked {
                 lock_checked(&checks).remove(&action);
             }
@@ -760,13 +766,16 @@ fn broke() -> MintError {
 /// Writes the action tree of `kept` over the base tree `base` holds as `form` says, `checked`
 /// against the store when a job of the action did not start for an object the store lost, and
 /// sends its name (its root manifest's digest in hex, or its tree list's key) to `named` as soon
-/// as the writer has it, before any write. Returns the name once every write succeeded.
+/// as the writer has it, before any write. The stages of a tree's writes as manifests are told
+/// to `timed`; a tree list is one write, and has none. Returns the name once every write
+/// succeeded.
 async fn write_named(
     writer: &TreeWriter,
     base: &OnceLock<BaseTree>,
     kept: &KeptClosure,
     (form, checked): (InputTree, bool),
     named: oneshot::Sender<String>,
+    timed: impl Fn(WriteStage, Duration) + Send + Sync,
 ) -> Result<String, MintError> {
     // The mint checked the base before it collected the closure, and a base once set stays.
     let Some(base) = base.get() else {
@@ -778,8 +787,8 @@ async fn write_named(
                 let _ = named.send(tree.digest().to_string());
             };
             let tree = match checked {
-                true => writer.write_checked_named(kept, base, of_tree).await,
-                false => writer.write_named(kept, base, of_tree).await,
+                true => writer.write_checked_named(kept, base, of_tree, timed).await,
+                false => writer.write_named(kept, base, of_tree, timed).await,
             };
             tree.map(|tree| tree.digest().to_string())
         }
