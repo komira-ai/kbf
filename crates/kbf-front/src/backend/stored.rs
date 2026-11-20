@@ -208,6 +208,10 @@ impl Plane for StoredPlane {
     fn leadership(&self) -> Option<Leadership> {
         None
     }
+
+    fn trees(&self) -> Option<&Trees> {
+        Some(&self.trees)
+    }
 }
 
 #[cfg(test)]

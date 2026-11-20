@@ -794,6 +794,9 @@ mod lost;
 #[path = "front_miss_tests.rs"]
 mod miss;
 
+#[path = "front_walk_tests.rs"]
+mod walk;
+
 fn props(pairs: &[(&str, &str)]) -> Platform {
     let property = |(name, value): &(&str, &str)| Property {
         name: (*name).to_owned(),

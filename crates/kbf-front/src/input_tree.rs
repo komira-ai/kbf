@@ -398,6 +398,10 @@ pub(crate) struct Walked {
     /// Directory, or it is a walk that totals nothing (the in-process cache's).
     pub(crate) input_bytes: Option<u64>,
     pub(crate) input_files: Option<u64>,
+    /// Of a walk over a store that found nothing absent: a time no later than the start of
+    /// any read or FindMissing its answer rests on (the oldest verification among the
+    /// subtrees it skipped as remembered, else its own start). `None` for any other walk.
+    pub(crate) held_since: Option<tokio::time::Instant>,
 }
 
 /// The check of `digest` for this request: the request's own earlier start of it, a
