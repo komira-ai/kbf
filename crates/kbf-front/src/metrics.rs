@@ -472,6 +472,14 @@ pub struct CacheMetrics {
     /// Directories the input check found already being checked for another request and
     /// waited for instead of checking again.
     pub input_dirs_joined: Counter,
+    /// Of the closure walk of a run's preparation (`prepare_run::closure`): Directories taken
+    /// from its cache of named Directories, and read from the store (a row or a blob); walks
+    /// that asked the store whether the Command and every file are held, and walks that took
+    /// the Execute's own finding instead.
+    pub(crate) prepare_dirs_cached: Counter,
+    pub(crate) prepare_dirs_read: Counter,
+    pub(crate) prepare_held_checked: Counter,
+    pub(crate) prepare_held_vouched: Counter,
     /// Execute and WaitExecution, where the Execution service is served from this
     /// cache. Shared with the streams it counts, which outlive their handler.
     pub execute: Arc<ExecuteMetrics>,
@@ -523,6 +531,10 @@ impl Default for CacheMetrics {
             input_dirs_cached: Counter::default(),
             input_dirs_skipped: Counter::default(),
             input_dirs_joined: Counter::default(),
+            prepare_dirs_cached: Counter::default(),
+            prepare_dirs_read: Counter::default(),
+            prepare_held_checked: Counter::default(),
+            prepare_held_vouched: Counter::default(),
             execute: Arc::default(),
         }
     }
@@ -744,6 +756,31 @@ impl CacheMetrics {
                 "Directories an input check found being checked for another request and \
                  waited for",
                 &self.input_dirs_joined,
+            ),
+            (
+                "kbf_prepare_dirs_cached_total",
+                "Directories a run preparation's closure walk took from its cache of named \
+                 Directories, which the Execute's input check also fills, reading nothing",
+                &self.prepare_dirs_cached,
+            ),
+            (
+                "kbf_prepare_dirs_read_total",
+                "Directories a run preparation's closure walk read from the store, from a row \
+                 or a blob",
+                &self.prepare_dirs_read,
+            ),
+            (
+                "kbf_prepare_held_checked_total",
+                "Run preparations whose closure walk asked the store whether the Command and \
+                 every file are held",
+                &self.prepare_held_checked,
+            ),
+            (
+                "kbf_prepare_held_vouched_total",
+                "Run preparations whose closure walk did not ask the store whether the inputs \
+                 are held: the Execute that started the run found them all held within the \
+                 last 45 seconds",
+                &self.prepare_held_vouched,
             ),
         ] {
             out.counter(name, help, counter.get());

@@ -27,6 +27,8 @@ use tierstore::server::{PresignRequest, presign_put};
 
 #[path = "prepare_run/directories.rs"]
 mod directories;
+#[path = "prepare_run/execute.rs"]
+mod execute;
 #[path = "prepare_run/faults.rs"]
 mod faults;
 #[path = "prepare_run/keyset.rs"]
