@@ -72,8 +72,10 @@ arch = "x86_64"
 /// runner offers (a job of the executor names no CPU and no memory, and no disk: the service
 /// sizes it from the history of its size class). Its capabilities are what the scheduler holds
 /// a host to when it admits a job: a job of the executor runs in a container (`exec`) with an
-/// allow-listed network (`egress`), a job that asks for disk (none here does) needs `disk-gib`
-/// (a whole GiB at least), and a host joins only if it reports them.
+/// allow-listed network (`egress`), its root a layer and its output a mount (`layered-rootfs`:
+/// the service places a job with layers or mounts only on a host that has it, and a host of this
+/// pool is held to the pool's capabilities, not its hello's), a job that asks for disk (none here
+/// does) needs `disk-gib` (a whole GiB at least), and a host joins only if it reports them.
 pub const AGENT_POOL: &str = r#"name = "kbf-tests"
 class = "linux-host"
 max_machines = 2
@@ -91,6 +93,7 @@ arch = "x86_64"
 exec = "container"
 disk-gib = "1"
 egress = "allow-list"
+layered-rootfs = "true"
 "#;
 
 /// The pool's join token (at least 32 bytes), which the hello of [`HOST`] and of every agent
