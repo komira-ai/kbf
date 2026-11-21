@@ -102,8 +102,8 @@ release waits for either.
 The pipeline's jobs are `ci` (`ci.yml` again, on the merged commit), `artifacts` (stage
 `build`: the seed build, plain `cargo build --locked --release` on GitHub-hosted runners),
 `artifacts-sign` (stage `sign`: the attestations, after `ci` and `artifacts`), `smoke`
-(after `artifacts`, so beside `artifacts-sign`: the end-to-end smoke on this run's files), `watch` (cancels the
-run when any job fails) and `passed` (needs `ci`, `artifacts`, `artifacts-sign` and
+(after `artifacts`, so beside `artifacts-sign`: the end-to-end smoke on this run's files), `cancel-after-ci` and `cancel-after-build` (cancel the
+run when the stage they wait for has failed) and `passed` (needs `ci`, `artifacts`, `artifacts-sign` and
 `smoke`).
 
 `beta.yml` is not in the pipeline. `suites.yml` calls it on every push to `main` (the full test run
