@@ -500,6 +500,7 @@ where
         self.cache.metrics().execute.started.add(1);
         let caller = kbf_auth::metadata(&request);
         let call = crate::request_metadata::call_metadata(&request);
+        open.build(call.invocation_id.clone());
         let request = request.into_inner();
         let instance = request.instance_name.as_str();
         authorize(&*self.authorizers.execute, &caller, EXECUTE, instance)
@@ -535,6 +536,7 @@ where
         request: GrpcRequest<WaitExecutionRequest>,
     ) -> Result<Response<OperationStream>, Status> {
         let caller = kbf_auth::metadata(&request);
+        let call = crate::request_metadata::call_metadata(&request);
         let name = request.into_inner().name;
         let asked = name.clone();
         let Some(ticket) = on_dispatch(&self.dispatch, move |d| d.wait(&asked)).await? else {
@@ -545,7 +547,8 @@ where
         };
         let execute = &*self.authorizers.execute;
         authorize(execute, &caller, WAIT_EXECUTION, &ticket.instance).await?;
-        let open = self.cache.metrics().execute.wait();
+        let mut open = self.cache.metrics().execute.wait();
+        open.build(call.invocation_id.clone());
         Ok(Response::new(operations(
             ticket,
             self.closing.clone(),
