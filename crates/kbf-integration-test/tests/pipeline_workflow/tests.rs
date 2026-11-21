@@ -159,8 +159,8 @@ fn the_builds_start_with_ci_signing_needs_ci_and_the_build_and_smoke_needs_only_
     red(
         &plant(
             "pipeline.yml",
-            "  watch:\n",
-            "  extra:\n    needs: [ci]\n    runs-on: ubuntu-24.04\n    steps: []\n\n  watch:\n",
+            "  cancel-after-ci:\n",
+            "  extra:\n    needs: [ci]\n    runs-on: ubuntu-24.04\n    steps: []\n\n  cancel-after-ci:\n",
         ),
         "the pipeline's jobs are",
     );
@@ -440,7 +440,7 @@ fn the_run_is_green_only_when_every_stage_is() {
         &plant(
             "pipeline.yml",
             "    needs: [ci, artifacts, artifacts-sign, smoke]\n",
-            "    needs: [ci, artifacts, smoke, watch]\n",
+            "    needs: [ci, artifacts, smoke, cancel-after-ci]\n",
         ),
         "the job `passed` needs",
     );
@@ -454,77 +454,182 @@ fn the_run_is_green_only_when_every_stage_is() {
     );
 }
 
+const CANCEL_RUN: &str = "gh run cancel \"$GITHUB_RUN_ID\" --repo \"$GITHUB_REPOSITORY\"";
+const TOKEN_ENV: &str = "          GH_TOKEN: ${{ github.token }}\n";
+const CANCEL_IF_LINE: &str =
+    "    if: ${{ failure() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n";
+
 #[test]
-fn the_watch_cancels_the_run_from_its_last_step_alone_and_only_for_a_push_to_main() {
-    // Catches: no fail-fast (a watch that is gone or runs another command or another closing
-    // job), a watch that waits for the stages it is to cancel, one that can run for a pull request
-    // (the lint lets `actions: write` into no other job), a token in a step that runs before the
-    // cancel (a build script would run beside it), a build after the token, a step after the
-    // cancel, and scopes beyond `contents: read` and `actions: write`.
+fn each_cancel_job_waits_for_its_one_stage_and_runs_only_when_it_failed() {
+    // Catches: a cancel job that runs beside the stages instead of after one (it would hold a
+    // runner for the whole run, as the old polling job did), one that waits for the wrong
+    // stage, and one that waits for more than one (it would cancel late).
     red(
-        &plant("pipeline.yml", "  watch:\n", "  watch:\n    needs: [ci]\n"),
-        "the job `watch` needs",
+        &plant(
+            "pipeline.yml",
+            "  cancel-after-ci:\n    needs: [ci]\n",
+            "  cancel-after-ci:\n",
+        ),
+        "the job `cancel-after-ci` needs",
     );
     red(
         &plant(
             "pipeline.yml",
-            "  watch:\n    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
-            "  watch:\n    if: ${{ always() }}\n",
+            "  cancel-after-ci:\n    needs: [ci]\n",
+            "  cancel-after-ci:\n    needs: [ci, artifacts]\n",
         ),
-        "the job `watch` has `if:",
-    );
-    red(
-        &plant("pipeline.yml", "--last-job passed", "--last-job ci"),
-        "the job `watch` does not run",
+        "the job `cancel-after-ci` needs",
     );
     red(
         &plant(
             "pipeline.yml",
-            "      - run: cargo build -p xtask --locked\n",
-            "      - run: cargo build -p xtask --locked\n        env:\n          GH_TOKEN: ${{ github.token }}\n",
+            "  cancel-after-build:\n    needs: [artifacts]\n",
+            "  cancel-after-build:\n    needs: [ci]\n",
         ),
-        "other than the one that cancels holds a token",
+        "the job `cancel-after-build` needs",
     );
+}
+
+#[test]
+fn a_cancel_job_runs_only_for_a_failed_stage_of_a_push_to_main() {
+    // Catches: no condition (the job would be skipped on a red stage only by luck, and run on a
+    // pull request's workflow edit), the plain push-to-main condition (it would cancel every
+    // green push), `always()` and `cancelled()` in its place, a condition that does not name
+    // `main` or the push event, and a `failure()` used in any other job of the pipeline, where
+    // it would let a stage run after a red one.
+    for to in [
+        "",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ failure() }}\n",
+        "    if: ${{ failure() && github.event_name == 'push' }}\n",
+        "    if: ${{ failure() && github.ref == 'refs/heads/main' }}\n",
+    ] {
+        red(
+            &plant_nth("pipeline.yml", CANCEL_IF_LINE, to, 0),
+            "the job `cancel-after-ci` has `if:",
+        );
+        red(
+            &plant_nth("pipeline.yml", CANCEL_IF_LINE, to, 1),
+            "the job `cancel-after-build` has `if:",
+        );
+    }
     red(
         &plant(
             "pipeline.yml",
-            "          GH_TOKEN: ${{ github.token }}\n",
-            "          GH_TOKEN: ${{ github.token }}\n          OTHER: 1\n",
+            "  smoke:\n    needs: [artifacts]\n",
+            "  smoke:\n    needs: [artifacts]\n    if: ${{ failure() }}\n",
         ),
-        "does not have exactly `GH_TOKEN",
+        "uses `failure()`",
     );
-    red(
-        &plant(
-            "pipeline.yml",
-            "--last-job passed\n",
-            "--last-job passed\n      - run: cargo build -p xtask --locked\n",
-        ),
-        "builds after the step that holds the token",
-    );
-    red(
-        &plant(
-            "pipeline.yml",
-            "--last-job passed\n",
-            "--last-job passed\n      - run: echo done\n",
-        ),
-        "is not its last",
-    );
-    red(
-        &plant(
-            "pipeline.yml",
-            "      actions: write\n",
-            "      actions: read\n",
-        ),
-        "the job `watch` grants the scopes",
-    );
-    red(
-        &plant(
-            "pipeline.yml",
-            "      actions: write\n",
-            "      actions: write\n      packages: write\n",
-        ),
-        "the job `watch` grants the scopes",
-    );
+}
+
+#[test]
+fn a_cancel_job_cancels_this_run_from_one_step_that_holds_the_token_and_checks_out_nothing() {
+    // Catches: a cancel job that runs another command (so nothing cancels), one that cancels
+    // another run, one with a checkout or any second step (repository code would run beside the
+    // token), a step that is an action instead of a command, and a token or any other variable
+    // in the step beyond `GH_TOKEN`.
+    for nth in [0, 1] {
+        let job = if nth == 0 {
+            "cancel-after-ci"
+        } else {
+            "cancel-after-build"
+        };
+        red(
+            &plant_nth(
+                "pipeline.yml",
+                CANCEL_RUN,
+                "gh run rerun \"$GITHUB_RUN_ID\" --repo \"$GITHUB_REPOSITORY\"",
+                nth,
+            ),
+            &format!("the job `{job}` does not run exactly"),
+        );
+        red(
+            &plant_nth(
+                "pipeline.yml",
+                CANCEL_RUN,
+                "gh run cancel 1 --repo \"$GITHUB_REPOSITORY\"",
+                nth,
+            ),
+            &format!("the job `{job}` does not run exactly"),
+        );
+        red(
+            &plant_nth(
+                "pipeline.yml",
+                CANCEL_RUN,
+                &format!("{CANCEL_RUN}\n      - run: echo done"),
+                nth,
+            ),
+            &format!("the job `{job}` has 2 steps"),
+        );
+        red(
+            &plant_nth(
+                "pipeline.yml",
+                "    steps:\n      - name: Cancel the run",
+                "    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n      - name: Cancel the run",
+                nth,
+            ),
+            &format!("the job `{job}` has 2 steps"),
+        );
+        red(
+            &plant_nth(
+                "pipeline.yml",
+                TOKEN_ENV,
+                &format!("{TOKEN_ENV}          OTHER: 1\n"),
+                nth,
+            ),
+            &format!("the step of `{job}` does not have exactly `GH_TOKEN"),
+        );
+        red(
+            &plant_nth("pipeline.yml", TOKEN_ENV, "", nth),
+            &format!("the step of `{job}` does not have exactly `GH_TOKEN"),
+        );
+    }
+}
+
+#[test]
+fn the_cancel_jobs_hold_actions_write_and_nothing_else_and_ci_holds_actions_read() {
+    // Catches: scopes beyond `actions: write` on a cancel job (a `contents: read` it does not
+    // need, a write scope it must never hold), `actions: write` weakened to read (nothing
+    // cancels), and the `actions: read` of `ci` (its `test` job waits for the coverage shards)
+    // dropped or widened.
+    for nth in [0, 1] {
+        let job = if nth == 0 {
+            "cancel-after-ci"
+        } else {
+            "cancel-after-build"
+        };
+        let want = format!("the job `{job}` grants the scopes");
+        red(
+            &plant_nth(
+                "pipeline.yml",
+                "      actions: write\n",
+                "      actions: read\n",
+                nth,
+            ),
+            &want,
+        );
+        red(
+            &plant_nth(
+                "pipeline.yml",
+                "      actions: write\n",
+                "      actions: write\n      contents: read\n",
+                nth,
+            ),
+            &want,
+        );
+        red(
+            &plant_nth(
+                "pipeline.yml",
+                "      actions: write\n",
+                "      actions: write\n      packages: write\n",
+                nth,
+            ),
+            &want,
+        );
+    }
     red(
         &plant(
             "pipeline.yml",

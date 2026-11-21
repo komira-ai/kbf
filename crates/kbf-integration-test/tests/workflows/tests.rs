@@ -514,13 +514,22 @@ fn a_main_push_job_still_gets_no_other_write_scope() {
 #[test]
 fn actions_write_needs_a_job_that_runs_only_for_a_push_to_main() {
     // Catches: `actions: write` (cancel or re-run any run of the repository) allowed in a job a
-    // pull request or the merge queue runs, or refused where the pipeline's watch job needs it;
-    // and the same exception read as unlocking another scope or a level other than `write`.
+    // pull request or the merge queue runs, or refused where the pipeline's cancel jobs need it;
+    // the plain push-to-main condition or any loosened `failure()`
+    // spelling accepted; and the same exception read as unlocking another scope or a level other
+    // than `write`.
     clean(&workflow(&format!(
-        "    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {{contents: read, actions: write}}\n"
+        "    runs-on: ubuntu-latest\n    if: {CANCEL_ON_RED}\n    permissions: {{contents: read, actions: write}}\n"
     )));
     for cond in [
         "",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ failure() }}\n",
+        "    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ failure() && github.event_name == 'push' }}\n",
+        "    if: ${{ failure() && github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ failure() && github.event_name == 'push' && github.ref == 'refs/heads/main' || true }}\n",
         "    if: ${{ github.event_name == 'push' }}\n",
         "    if: ${{ github.ref == 'refs/heads/main' }}\n",
         "    if: ${{ github.event_name != 'pull_request' }}\n",
@@ -531,7 +540,7 @@ fn actions_write_needs_a_job_that_runs_only_for_a_push_to_main() {
         assert_eq!(
             scan(&workflow(&body)),
             vec![format!(
-                "line {}: `actions: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}` or exactly `{RERUN_ONLY}`",
+                "line {}: `actions: write` is allowed only in a job whose `if:` is exactly `{CANCEL_ON_RED}` or exactly `{RERUN_ONLY}`",
                 if cond.is_empty() { 7 } else { 8 }
             )],
             "{body}"
@@ -539,7 +548,7 @@ fn actions_write_needs_a_job_that_runs_only_for_a_push_to_main() {
     }
     for p in ["{Actions: write}", "{actions: admin}", "write-all"] {
         refused(
-            &format!("    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {p}\n"),
+            &format!("    runs-on: ubuntu-latest\n    if: {CANCEL_ON_RED}\n    permissions: {p}\n"),
             "a job's `permissions`",
         );
     }
@@ -551,7 +560,7 @@ const SIGNING_STAGE_IF: &str = "    if: ${{ github.event_name == 'push' && githu
 #[test]
 fn signing_scopes_are_also_allowed_in_the_sign_stage_of_a_push_to_main_and_nothing_wider() {
     // Catches: the sign-stage `if:` refused where artifacts.yml's attest jobs need it; the
-    // exception taken for `actions: write` (the watch job's scope stays on the plain push
+    // exception taken for `actions: write` (the cancel jobs' scope stays on the `failure()` push
     // condition); and a loosened spelling accepted: the stage test alone, the stage test with
     // another ref or event, a different stage, `!=` for `==`, or a trailing `|| true`.
     let signing = "{contents: read, id-token: write, attestations: write}";
@@ -586,7 +595,7 @@ fn signing_scopes_are_also_allowed_in_the_sign_stage_of_a_push_to_main_and_nothi
             "    runs-on: ubuntu-latest\n{SIGNING_STAGE_IF}    permissions: {{actions: write}}\n"
         ),
         &format!(
-            "`actions: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`"
+            "`actions: write` is allowed only in a job whose `if:` is exactly `{CANCEL_ON_RED}`"
         ),
     );
     refused(
@@ -696,10 +705,10 @@ fn a_release_tag_job_gets_no_other_write_scope() {
             "a job's `permissions`",
         );
     }
-    // `actions: write` is the watch job's scope, gated on a push to main, not on a release.
+    // `actions: write` is the cancel jobs' scope, gated on a failed stage of a push to main, not on a release.
     refused(
         &format!("    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{actions: write}}\n"),
-        &format!("is exactly `{SIGNING_PUSH_ONLY}`"),
+        &format!("is exactly `{CANCEL_ON_RED}`"),
     );
 }
 

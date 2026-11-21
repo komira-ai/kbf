@@ -16,8 +16,8 @@
 # workflow's success and from nothing else. Each stage is a called workflow (`workflow_call`), so
 # the pull request and the merge queue keep running ci.yml and artifacts.yml as before and a push
 # to main runs each check exactly once: none of the three has a push trigger of its own. `passed`
-# needs every stage (the two artifacts calls included), and does nothing else: it is the end of
-# the run for `watch`, and a skipped stage skips it.
+# needs every stage (the two artifacts calls included), and does nothing else: a skipped stage
+# skips it.
 #
 # The source suite (beta.yml: the whole nextest run, the Arm run, Postgres, S3 stores, the
 # mixed-version farm, macOS, the packages; about an hour) is not a stage of this pipeline. It is
@@ -28,15 +28,19 @@
 # Fail fast. GitHub cancels the rest of a run for a failed job only inside one matrix, never
 # across the jobs of a workflow, and a failed job does not stop the jobs that do not need it:
 # a red job would leave the builds and tests beside it running in a lane the next push waits
-# for. `watch` runs beside the stages and, as soon as any job has failed or timed out, cancels
-# this run (`cargo xtask pipeline-watch`; the job that failed keeps its conclusion, the run
-# ends cancelled and starts no release). The other way to do it, a step in every job that cancels
-# the run when the job fails, would put a token that can cancel into every job and a step
-# into each new one; here one job holds it, under the lint's exact push-to-main condition. `watch`
-# never makes a run red itself: a job list it cannot read, or the end of its polls, ends it with
-# a notice and the run goes on as it did before (without fail-fast).
+# for. `cancel-after-ci` and `cancel-after-build` end the run for it: each needs one of the two
+# stages that start the run and, when that stage has failed, cancels the run (`gh run cancel`;
+# the job that failed keeps its conclusion, the run ends cancelled and starts no release). They
+# are jobs that wait for a stage, not a job that polls beside it, so a green push pays for none
+# (a skipped job holds no runner) and a red one for a few seconds. A job needs its stage to have
+# ended, and a stage ends when its last job has, so a red job cancels the run when its stage is
+# over, not at the moment it fails: the build stage is the one that matters (the four builds end
+# in 12 to 15 minutes, `ci` runs longer), and a failure of `ci` still skips the signing and the
+# release. Neither job checks out or runs the repository's code: the one step holds the token
+# and runs `gh`, which is the only thing that may hold `actions: write` here, under the lint's
+# exact `failure()` and push-to-main condition.
 #
-# Queueing. A pipeline that has started always finishes (or is cancelled by `watch`, never by a
+# Queueing. A pipeline that has started always finishes (or is cancelled by a cancel job, never by a
 # push): a busy main cannot starve it. Pushes that arrive meanwhile wait in the group, and GitHub
 # keeps only the newest waiting run (a pending run is replaced by a newer one). Nothing is lost by
 # that: `release plan` measures from the highest release tag, not from the push, so the code of a
@@ -51,9 +55,9 @@
 # artifacts.yml carry (their own adds the sign stage), and those jobs alone use them: they are
 # skipped in the build call, which runs beside ci and so cannot sign (the build call has the grant
 # because a called workflow is checked against it statically; tests/pipeline_workflow requires
-# every signing job of artifacts.yml to be in the sign stage). `watch` alone holds `actions: write`, to
-# cancel this run, under the same exact `if:`, and its token is in the environment of the one step
-# that cancels, after everything it builds (the workflow lint, tests/workflows and
+# every signing job of artifacts.yml to be in the sign stage). The two cancel jobs alone hold
+# `actions: write`, to cancel this run, and nothing else, under the exact `if:` above, and the
+# token is in the environment of the one step they have (the workflow lint, tests/workflows and
 # tests/pipeline_workflow).
 name: pipeline
 
@@ -117,46 +121,37 @@ jobs:
     permissions:
       contents: read
 
-  # The fail-fast: cancels this run when any of its jobs has failed (see "Fail fast").
-  watch:
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+  # The fail-fast (see "Fail fast"): each of the two stages that start the run, when it ends red,
+  # cancels the run. A job that needs a stage runs only when the stage has ended, so these cost
+  # nothing on a green push (skipped) and a few seconds on a red one.
+  cancel-after-ci:
+    needs: [ci]
+    if: ${{ failure() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 5
     permissions:
-      contents: read
       actions: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: cargo-cache
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      # Built before any step holds the token, so no build script runs beside it.
-      - run: cargo build -p xtask --locked
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
-      # Until `passed` has completed: the end of the run, whatever it concluded.
-      - name: Cancel the run when a job fails
+      - name: Cancel the run, ci failed
         env:
           GH_TOKEN: ${{ github.token }}
-        run: cargo xtask pipeline-watch --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --last-job passed
+        run: gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY"
 
-  # Needs every stage and does nothing: the pipeline is green when this ran, and `watch` stops
-  # when it has completed (a stage that failed or was cancelled skips it).
+  cancel-after-build:
+    needs: [artifacts]
+    if: ${{ failure() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the run, the build failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY"
+
+  # Needs every stage and does nothing: the pipeline is green when this ran (a stage that failed
+  # or was cancelled skips it).
   passed:
     needs: [ci, artifacts, artifacts-sign, smoke]
     runs-on: ubuntu-24.04

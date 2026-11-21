@@ -560,7 +560,7 @@ A push to `main` runs one pipeline, `pipeline.yml`:
  push to main -+-> ci ---------------------------------------------+
   (pipeline)   +-> artifacts (build) -+-> artifacts-sign (needs ci) +-> passed -> release
                |                      +-> smoke ------------------- +      (release.yml)
-               +-> watch (cancels the run when a job fails)
+               +-> cancel-after-ci, cancel-after-build (cancel the run when that stage has failed)
 
  push to main --> suites: beta (beta.yml) -> release-red (the main-red issue)
 ```
@@ -603,16 +603,22 @@ A push to `main` runs one pipeline, `pipeline.yml`:
   with a token that can write issues, built before the step that holds it. It keeps one open issue labelled `main-red`, titled `RELEASE-RED: kbf <first failing job>`;
   its body lines are `Run:`, `Head:`, `Last green:`, `Culprits:`, `Failing:` (one line per failing job, up to five) and `Log:` (up to two). A later red run adds a comment with the same lines;
   a green run comments `Fixed: <workflow> is green at <sha> (<run url>)` and closes the issue. The group of `suites` is `suites-<ref>` and never cancels a run.
-- **A red or cancelled stage stops the rest, and a red job stops the run.** `artifacts-sign` needs `ci` and `artifacts`, and `smoke` needs
+- **A red or cancelled stage stops the rest, and a red stage stops the run.** `artifacts-sign` needs `ci` and `artifacts`, and `smoke` needs
   `artifacts`; none can be skipped, and the workflow has no `always()` or `continue-on-error`. `passed` needs `ci`, `artifacts`, `artifacts-sign` and `smoke` and does nothing else, so the run succeeds, and the release follows, only when every job of every stage passed. GitHub
-  cancels the rest of a run for a failed job only inside a matrix, so `watch` (`cargo xtask pipeline-watch`) polls the
-  run's jobs and cancels the run as soon as one has failed or timed out; the run then ends cancelled and starts no
-  release, and the failed job keeps its own conclusion. It ends when `passed` has completed, ends with a notice when it
-  cannot read the jobs, and never makes a run red itself.
-  **One rerun for a flake of an artifact job.** A job cannot be rerun while its run is in progress and `watch` keeps the run
-  open, so the rerun is made after it, by `pipeline-rerun.yml`: it starts when a pipeline run completes (`workflow_run`, the
+  cancels the rest of a run for a failed job only inside a matrix, so two jobs end the run for it: `cancel-after-ci` needs `ci`
+  and `cancel-after-build` needs `artifacts`, each runs only when its stage has failed (`failure()`, for a push to `main`),
+  and each has one step, `gh run cancel` for this run, with the token in its environment. They check out and build nothing,
+  so no repository code runs beside the token, and a job that waits for a stage is skipped on a green push, so it holds no
+  runner (the job this replaced polled the run's jobs beside the stages and held a runner for the whole run, 41 of 182
+  job-minutes of a push). The price is the granularity: a job that needs a stage runs when the stage has ended, so a red job
+  cancels the run when its stage is over, not at the moment it fails. That is the build stage in the case that matters (the
+  builds end in 12 to 15 minutes, while `ci` runs longer); a red job of `ci` stops the signing and the release as before
+  (`artifacts-sign` and `passed` need it) but not the build and smoke jobs that run beside it. The run ends cancelled and
+  starts no release, and the failed job keeps its own conclusion.
+  **One rerun for a flake of an artifact job.** A job cannot be rerun while its run is in progress,
+  so the rerun is made after it, by `pipeline-rerun.yml`: it starts when a pipeline run completes (`workflow_run`, the
   second workflow the lint lets follow the pipeline, beside `release.yml`) and runs `cargo xtask pipeline-rerun`, which calls
-  `POST /actions/runs/<id>/rerun-failed-jobs` once, only for a push to `main` that failed (or ended cancelled, as `watch` ends
+  `POST /actions/runs/<id>/rerun-failed-jobs` once, only for a push to `main` that failed (or ended cancelled, as a cancel job ends
   it), only in its first attempt (the rerun completes as attempt 2 and is ignored, so there is no loop), and only when EVERY
   failed job builds or moves artifacts: the three builds, `sums*`, `attest*` and `verify*` of `artifacts.yml`, by exact name
   (`RERUNNABLE`). A failed test, lint or smoke job, or a job nobody listed, means nothing is rerun and the pipeline stays failed,
@@ -628,8 +634,8 @@ A push to `main` runs one pipeline, `pipeline.yml`:
   (a pending run is replaced by a newer one; the release plan measures from the highest tag, so the code of a replaced
   or failed run ships in the next release). Nothing that releases is a job of this run: it holds no tag, no
   release, no push to another repository, no environment and no secret. The only write scopes it grants are the signing
-  scopes of the two `artifacts.yml` calls (only the sign call runs a job that uses them) and `actions: write` of the `watch` job (to cancel this run), both under the exact `if:`
-  of a push to `main` (the `beta` call, in `suites.yml`, grants `attestations: read`
+  scopes of the two `artifacts.yml` calls (only the sign call runs a job that uses them) and `actions: write` of the two cancel jobs (to cancel this run, and nothing else), the signing scopes under the exact `if:`
+  of a push to `main` and the cancel jobs under that push with `failure()` (the `beta` call, in `suites.yml`, grants `attestations: read`
   for its `mixed-version` and `js-real-service` jobs); a called workflow gets at most what the caller grants, and GitHub refuses the whole
   workflow at startup when one asks for more, so the workflow lint compares every job of each called workflow with its
   caller's grant. No stage call passes `secrets:`.

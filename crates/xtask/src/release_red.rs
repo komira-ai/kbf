@@ -49,7 +49,7 @@ use serde_json::{Value, json};
 use crate::Error;
 use crate::advisories::{Call, Process, Tools, check_repo};
 use crate::pages::{PER_PAGE, Pages};
-use crate::pipeline_watch::jobs_path;
+use crate::pipeline_rerun::jobs_path;
 
 /// The label of the issue.
 pub const LABEL: &str = "main-red";
