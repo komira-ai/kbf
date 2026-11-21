@@ -48,8 +48,9 @@ sequenceDiagram
 - **Watching.** The pinned job service has no watch call; each operation's task reads its job every `--executor-poll-ms`
   (250 ms by default) until it ends, then reads its result once. While the service is busy or cannot be reached (no answer
   within the call timeout, a reset connection, `RESOURCE_EXHAUSTED` and the other codes of its load), every operation waits
-  longer between its calls, from the poll doubling to 10 s, one level for the whole frontend; no busy answer ends a run or
-  spends an attempt, and a submit it did not take is sent again under the same id (`executor/busy.rs`).
+  longer between its calls, from the poll doubling to 40 polls (10 s at the default), one level for the whole frontend; no
+  busy answer ends a run or spends an attempt, and a submit it did not take is sent again under the same id
+  (`executor/busy.rs`).
 
 ## 2. Endings, retries and cancel
 

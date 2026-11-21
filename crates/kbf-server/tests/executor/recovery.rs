@@ -47,18 +47,18 @@ async fn a_post_whose_answer_was_lost_is_submitted_again_with_the_same_id_and_ma
     assert_eq!(rig.ingest.keys_read().len(), 1);
 }
 
-/// Catches a submit the job service refuses for its own sake (it did not take the job, and
-/// says nothing about the job being wrong) being the action's failure or being sent again
-/// unchanged: it is infrastructure, so the operation runs again as its next attempt, a new
-/// job id, and the refused submit made no job.
+/// Catches a submit the job service refuses for its own sake (it did not take the job, says
+/// nothing about the job being wrong, and is not busy) being the action's failure or being
+/// sent again unchanged: it is infrastructure, so the operation runs again as its next attempt,
+/// a new job id, and the refused submit made no job.
 #[tokio::test]
 async fn a_refused_submit_is_run_again_as_the_next_attempt() {
     let rig = Rig::start(&[HOST], |_| {}).await;
     rig.fake.inject_on(
         "SubmitJob",
         Fault::Status {
-            code: Code::ResourceExhausted,
-            message: "busy".to_owned(),
+            code: Code::FailedPrecondition,
+            message: "not now".to_owned(),
         },
     );
     let mut caller = rig.submit(1);
@@ -69,6 +69,39 @@ async fn a_refused_submit_is_run_again_as_the_next_attempt() {
     assert_eq!(rig.counter("kbf_executor_runs_total{outcome=\"infra\"}"), 1);
     rig.host_finishes(jobs[0].id(), HOST, 0);
     assert!(matches!(caller.done().await, Finished::Ran(_)));
+}
+
+/// Catches a busy job service failing the action: submits answered `RESOURCE_EXHAUSTED` (how a
+/// GOAWAY `ENHANCE_YOUR_CALM` reads) and `UNAVAILABLE`, more of them than the operation has
+/// attempts, decide nothing: the same submit is sent until the service takes it, as attempt 0,
+/// and no run ends as `infra`.
+#[tokio::test]
+async fn a_busy_service_that_does_not_take_a_submit_spends_no_attempt() {
+    let rig = Rig::start(&[HOST], |_| {}).await;
+    for at in 0..6 {
+        let code = if at % 2 == 0 {
+            Code::ResourceExhausted
+        } else {
+            Code::Unavailable
+        };
+        rig.fake.inject_on(
+            "SubmitJob",
+            Fault::Status {
+                code,
+                message: "busy".to_owned(),
+            },
+        );
+    }
+    let mut caller = rig.submit(1);
+    let job = rig.first_job(1).await;
+    assert!(job.id().ends_with("-0"), "{}", job.id());
+    let sent = submits(&rig.fake.calls());
+    assert_eq!(sent.len(), 7, "{sent:?}");
+    assert!(sent.iter().all(|spec| spec.job_id == sent[0].job_id));
+    rig.host_finishes(job.id(), HOST, 0);
+    assert!(matches!(caller.done().await, Finished::Ran(_)));
+    assert_eq!(rig.jobs_of(1).len(), 1, "a second job was made");
+    assert_eq!(rig.counter("kbf_executor_runs_total{outcome=\"infra\"}"), 0);
 }
 
 /// Catches a job service that stops answering for a while ending the operation, or making a

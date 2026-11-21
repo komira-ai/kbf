@@ -7,7 +7,7 @@ use js_proto::v1::{Refusal, RefusalCode};
 use kbf_job_client::{BadId, Broken, Error, Stuck, Undecodable, Unsent};
 use tonic::{Code, Status};
 
-use super::{Busy, MAX_WAIT, Seen, busy};
+use super::{Busy, MAX_POLLS, Seen, busy};
 
 const POLL: Duration = Duration::from_millis(250);
 
@@ -84,7 +84,7 @@ fn a_busy_service_is_told_from_an_answer_about_the_call() {
 
 /// Catches a wait that does not back off, or never comes back: the poll while the service
 /// answers; one poll at the first busy answer, doubling at each busy answer one wait later, held
-/// at [`MAX_WAIT`]; and the poll again at the first answer.
+/// at [`MAX_POLLS`] polls (10 s); and the poll again at the first answer.
 #[tokio::test(start_paused = true)]
 async fn the_wait_doubles_to_its_cap_and_an_answer_ends_it() {
     let level = Busy::new(POLL, no_jitter);
@@ -107,9 +107,9 @@ async fn the_wait_doubles_to_its_cap_and_an_answer_ends_it() {
             ms(2000),
             ms(4000),
             ms(8000),
-            MAX_WAIT,
-            MAX_WAIT,
-            MAX_WAIT
+            POLL * MAX_POLLS,
+            ms(10_000),
+            ms(10_000)
         ]
     );
     let definite = level.saw("a call", &Err::<(), _>(status(Code::NotFound)));

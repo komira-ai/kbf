@@ -13,7 +13,7 @@
 //! same level, so a thousand operations that poll their jobs slow down together, and the
 //! service that stalled is not sent a thousand calls each poll. The first busy answer makes the
 //! wait one poll; each busy answer after the current wait has half passed doubles it, up to
-//! [`MAX_WAIT`]; an answer of the service ends it once a whole wait has passed with no busy
+//! [`MAX_POLLS`] polls (10 s at the default poll); an answer of the service ends it once a whole wait has passed with no busy
 //! answer of any call, and the operations poll at the poll again. A service that answers some
 //! calls and not others (reads of jobs, but not of results) so stays busy, and its waits go on
 //! doubling, rather than ending and starting again at every answer.
@@ -30,8 +30,9 @@ use tonic::Code;
 
 use crate::join::jittered;
 
-/// The longest wait between calls while the job service is busy.
-pub(crate) const MAX_WAIT: Duration = Duration::from_secs(10);
+/// The longest wait between calls while the job service is busy, in polls: 10 s at the default
+/// poll of 250 ms.
+pub(crate) const MAX_POLLS: u32 = 40;
 
 /// Whether `error` says the job service is busy or cannot be reached, and says nothing of the
 /// call: no answer came (the call's deadline passed, the connection broke or reset), no
@@ -108,7 +109,7 @@ impl Seen {
     }
 }
 
-/// The highest level counted: past it the wait is [`MAX_WAIT`] in any case.
+/// The highest level counted: past it the wait is [`MAX_POLLS`] polls in any case.
 const TOP_LEVEL: u32 = 32;
 
 impl Busy {
@@ -125,18 +126,16 @@ impl Busy {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The wait at `level`: `base` doubling, at most [`MAX_WAIT`] (and never under `base`).
+    /// The wait at `level`: `base` doubling, at most [`MAX_POLLS`] of it.
     fn step(&self, level: u32) -> Duration {
         let doubled = 1_u32
             .checked_shl(level.saturating_sub(1))
             .unwrap_or(u32::MAX);
-        self.base
-            .saturating_mul(doubled)
-            .min(MAX_WAIT.max(self.base))
+        self.base.saturating_mul(doubled.min(MAX_POLLS))
     }
 
     /// Takes in what a call of `what` was answered: a busy error ([`busy`]) raises the level,
-    /// anything else ends it. The caller logs the errors that were not busy
+    /// and anything else ends it once a whole wait has passed since the last busy one. The caller logs the errors that were not busy
     /// ([`Seen::busy`]); this logs the turns.
     pub(crate) fn saw<T>(&self, what: &str, answer: &Result<T, Error>) -> Seen {
         match answer {
@@ -154,7 +153,8 @@ impl Busy {
             state.raised = Some(now);
             state.since = Some(now);
             drop(state);
-            tracing::warn!(%error, "the job service is busy or cannot be reached ({what} failed): its calls wait and are sent again, backing off up to {MAX_WAIT:?}; no run ends for it");
+            let most = self.step(TOP_LEVEL);
+            tracing::warn!(%error, "the job service is busy or cannot be reached ({what} failed): its calls wait and are sent again, backing off up to {most:?}; no run ends for it");
             return Seen::TurnedBusy;
         };
         // Every operation sees the same busy answer: the level goes up once a wait.

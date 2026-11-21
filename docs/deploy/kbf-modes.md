@@ -237,9 +237,9 @@ call timeout, a broken or reset connection, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`)
 action and spends no attempt: a submit it did not take is sent again, the same spec under the same
 id, until it takes it or the caller cancels, and the reads of a job are repeated. While it stays
 busy every operation of the frontend waits longer between its calls, from the poll doubling to
-10 s, so a stalled service is not sent a call per operation per poll; the frontend logs once when
-the service turns busy and once when it answers again. `CancelOperation` is a cancel of the job,
-sent again until the service answers it. How a job ends is mapped to
+40 polls (10 s at the default `--executor-poll-ms`), so a stalled service is not sent a call per
+operation per poll; the frontend logs once when the service turns busy and once when it answers
+again. `CancelOperation` is a cancel of the job, sent again until the service answers it. How a job ends is mapped to
 failure classes as the table in `crates/kbf-server/src/executor/outcome.rs` says: a job
 stopped at its wall limit is the action's own timeout, answered `DEADLINE_EXCEEDED` at once; one
 killed for memory, a lost job (the host's fault) and any other ending of the farm's are submitted again as
