@@ -1,16 +1,16 @@
 //! `pipeline-rerun`: the one rerun of a pipeline run whose only failures are artifact jobs.
 //!
 //! A flaky download or upload of an artifact fails one job of the push pipeline
-//! (`.github/workflows/pipeline.yml`), and its fail-fast (`pipeline-watch`) cancels the rest: an
-//! hour of work lost for a flake. GitHub refuses to rerun a job while its run is in progress, and
-//! the watch keeps the run open, so the rerun cannot be made from inside the run. It is made after
-//! it: `.github/workflows/pipeline-rerun.yml` starts when a pipeline run completes and runs this.
+//! (`.github/workflows/pipeline.yml`), and its fail-fast (the cancel jobs) cancels the rest: an
+//! hour of work lost for a flake. GitHub refuses to rerun a job while its run is in progress, so
+//! the rerun cannot be made from inside the run. It is made after it:
+//! `.github/workflows/pipeline-rerun.yml` starts when a pipeline run completes and runs this.
 //!
 //! It reads the run and its jobs and acts only when all of this holds:
 //! - the run is the first attempt (`run_attempt` 1), so it never loops: the completion of the
 //!   rerun is attempt 2 and is ignored;
 //! - the run is a push to `main` that did not succeed (`failure`, or `cancelled`, which is how a
-//!   run ends when the watch cancels it for a failed job);
+//!   run ends when a cancel job cancels it for a failed job);
 //! - at least one job failed or timed out, and EVERY one of them is on [`RERUNNABLE`]: the jobs
 //!   that build or move artifacts, by exact name (`<caller job> / <job>`). A failed test, lint
 //!   or smoke job, or any job nobody listed, means nothing is rerun and the pipeline stays failed,

@@ -14,8 +14,8 @@
 //!   label, such as `ubuntu-gpu`) or a second label could select a non-hosted runner,
 //!   so each is refused because the lint cannot tell where it lands;
 //! - a job's `permissions` grants anything but `read` or `none`, except `actions` ([`ACTIONS_SCOPES`]: the
-//!   pipeline's watch job cancels its own run, and the rerun of its failed jobs), which may be `write` only in a job whose `if:` is exactly
-//!   [`SIGNING_PUSH_ONLY`] or exactly [`RERUN_ONLY`], and the two scopes
+//!   pipeline's cancel jobs cancel their own run, and the rerun of its failed jobs), which may be `write` only in a job whose `if:` is exactly
+//!   [`CANCEL_ON_RED`] or exactly [`RERUN_ONLY`], and the two scopes
 //!   that sign build provenance ([`SIGNING_SCOPES`]: `id-token` and `attestations`),
 //!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`] or exactly
 //!   [`SIGNING_STAGE_ONLY`] (the same push to main, and the called artifacts workflow's `sign`
@@ -200,12 +200,18 @@ const RELEASE_PUSH_ONLY: &str = "${{ github.event.workflow_run.conclusion == 'su
 const ISSUE_SCOPES: &[&str] = &["issues"];
 
 /// Token scopes a job may set to `write` when it runs only for a push to `main`: the Actions API,
-/// which the pipeline's watch job uses to cancel its own run when another job has failed.
+/// which the pipeline's cancel jobs use to cancel their own run when a stage has failed.
 const ACTIONS_SCOPES: &[&str] = &["actions"];
+
+/// The `if:` spelling under which a job may hold [`ACTIONS_SCOPES`] for writing (and only those)
+/// in the pipeline itself: a job that needs a stage runs only for a push to `main`, and only when
+/// a stage it needs has failed (`failure()`), so it cancels a run that is already red.
+const CANCEL_ON_RED: &str =
+    "${{ failure() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
 
 /// The second `if:` spelling under which a job may hold [`ACTIONS_SCOPES`] for writing (and only
 /// those): the completed pipeline run of a push to `main` of this repository that failed or was
-/// cancelled (the watch cancels a run for a failed job), in its first attempt. `pipeline-rerun.yml`
+/// cancelled (a cancel job cancels a run for a failed stage), in its first attempt. `pipeline-rerun.yml`
 /// reruns the failed jobs of that run once; the attempt test is what stops it looping.
 const RERUN_ONLY: &str = "${{ (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.head_repository.full_name == github.repository }}";
 
@@ -734,7 +740,7 @@ impl Lint<'_> {
             } else if RELEASE_SCOPES.contains(&name) {
                 &[RELEASE_PUSH_ONLY]
             } else if ACTIONS_SCOPES.contains(&name) {
-                &[SIGNING_PUSH_ONLY, RERUN_ONLY]
+                &[CANCEL_ON_RED, RERUN_ONLY]
             } else if ISSUE_SCOPES.contains(&name) {
                 &[ISSUES_MAIN_ONLY, ISSUES_RELEASE_RED]
             } else {

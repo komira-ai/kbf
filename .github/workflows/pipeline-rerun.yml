@@ -1,19 +1,19 @@
 # The one rerun of a pipeline run whose failed jobs all build or move artifacts (pipeline.yml).
 #
-# A flaky download or upload of an artifact fails one job, and the pipeline's fail-fast (`watch`)
-# cancels the rest: an hour lost for a flake. A job cannot be rerun while its run is in progress,
-# and `watch` keeps the run open, so the rerun is made after the run: this workflow starts when a
+# A flaky download or upload of an artifact fails one job, and the pipeline's fail-fast (its
+# cancel jobs) cancels the rest: an hour lost for a flake. A job cannot be rerun while its run is
+# in progress, so the rerun is made after the run: this workflow starts when a
 # pipeline run completes (`workflow_run`) and runs `cargo xtask pipeline-rerun`, which asks GitHub
 # to rerun the failed jobs of the run once, only when
-#   - the run is a push to main that failed, or was cancelled by `watch` for a failed job,
+#   - the run is a push to main that failed, or was cancelled by a cancel job for a failed job,
 #   - it is the first attempt (a rerun completes as attempt 2 and is ignored: no loop), and
 #   - EVERY failed job builds or moves artifacts (the exact names of RERUNNABLE in
 #     crates/xtask/src/pipeline_rerun.rs). A failed test, lint or smoke job, or a job nobody
 #     listed, means nothing is rerun and the pipeline stays failed, so a flaky test still fails
 #     loudly and gets fixed.
 # Each rerun is a line in this run's summary with the jobs and the logs of their first failure,
-# so flakes stay visible and countable. The rerun reruns every job that did not pass, the ones
-# `watch` cancelled included, so a rerun costs the rest of the pipeline again.
+# so flakes stay visible and countable. The rerun reruns every job that did not pass, the
+# cancelled ones included, so a rerun costs the rest of the pipeline again.
 #
 # `workflow_run` runs this file as it is on main, with this repository's token, whatever commit the
 # pipeline run was for, so the job NEVER checks out or runs the code of the run's head commit: it

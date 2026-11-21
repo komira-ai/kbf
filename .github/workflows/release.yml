@@ -18,7 +18,7 @@
 # job carries, and the chain below.
 #
 # Why a second workflow. A pipeline run is cancelled whole when one of its jobs fails (its
-# `watch` job, pipeline.yml), and a release is the one part that must never be stopped half way,
+# cancel jobs, pipeline.yml), and a release is the one part that must never be stopped half way,
 # so it is not a job of that run: this workflow has its own concurrency group that never
 # cancels, and nothing but the success of a pipeline run starts it. A pipeline run cancelled at
 # any point starts no release; a release run that has started is never cancelled by a push. `workflow_run` runs the copy of this file on main and holds this

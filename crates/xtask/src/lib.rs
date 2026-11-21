@@ -120,10 +120,6 @@
 //!   with its line in `SHA256SUMS.<platform>`. The release set holds it for every `kbf`
 //!   tarball (`verify-assets sums`, `release check`), because only a runner of a platform
 //!   can run its binary.
-//! - `pipeline-watch --repo <owner/repo> --run-id <id> --last-job <name> [--interval-secs 30] [--max-polls 300]`
-//!   ([`pipeline_watch`]): the fail-fast of the push pipeline: cancel the run as soon as one of its jobs
-//!   has failed, and stop when the job `--last-job` has completed. Exit 0 whatever it saw; 1 only when
-//!   GitHub refuses the cancel.
 //! - `pipeline-rerun --repo <owner/repo> --run-id <id>` ([`pipeline_rerun`]): after a pipeline run has
 //!   completed, rerun its failed jobs once (first attempt only) when every failed job builds or moves
 //!   artifacts; a failed test or lint job, or an unknown one, means nothing is rerun. Exit 1 only
@@ -167,7 +163,6 @@ pub mod merge_profiles;
 pub mod package;
 pub mod pages;
 pub mod pipeline_rerun;
-pub mod pipeline_watch;
 pub mod pkg_asset;
 pub mod pkg_image_asset;
 pub mod pkg_image_sbom;
@@ -274,8 +269,6 @@ enum Verb {
     /// Refuse a binary that has a dynamic loader (`PT_INTERP`) or a needed shared library
     /// (`DT_NEEDED`).
     StaticElf(static_elf::Args),
-    /// Cancel the pipeline run when one of its jobs has failed, so its other jobs stop.
-    PipelineWatch(pipeline_watch::Args),
     /// Rerun the failed jobs of a completed pipeline run once, when all of them build or move artifacts.
     PipelineRerun(pipeline_rerun::Args),
     /// Keep one `RELEASE-RED` issue for a run on main: open it or comment when the run is red, close it when green.
@@ -1050,7 +1043,6 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::RunnerDisk(args) => runner_disk::run(&args),
         Verb::Debs(args) => Ok(debs::run(&args)?),
         Verb::StaticElf(args) => static_elf::run(&args),
-        Verb::PipelineWatch(args) => pipeline_watch::run(&args),
         Verb::PipelineRerun(args) => pipeline_rerun::run(&args),
         Verb::ReleaseRed(args) => release_red::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),

@@ -47,8 +47,8 @@
 //!   or a workflow that enables the test-only feature `unconfined-for-tests` of `kbf-task` (`no_darwin_task.rs`);
 //! - the push-to-main pipeline drifting from its shape (`ci` and the `artifacts` build together, signing
 //!   after `ci` and the build, `smoke` on the built artifacts beside the signing, `passed` needing all
-//!   four, no call of the source suite `beta.yml`, and the `watch` job that
-//!   cancels the run when a job fails), a called workflow gaining a push
+//!   four, no call of the source suite `beta.yml`, and the two cancel jobs
+//!   that cancel the run when the stage they wait for has failed), a called workflow gaining a push
 //!   trigger of its own or losing its pull-request triggers, a second call of a check, the
 //!   pipeline cancelling a running predecessor or holding anything that releases, or the release
 //!   not following the pipeline's success in a group that never cancels (modules

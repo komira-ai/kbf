@@ -19,8 +19,9 @@ stages:
   # alone, so it runs beside the signing. The release (prod) is a workflow of its own started
   # by the pipeline's success, which needs ci, build and the smoke stage (`after: [beta]`, which
   # follows build, which follows ci), and does not wait for the suite. The pipeline's own jobs
-  # are the callers of the stage workflows, `watch` (the fail-fast: it cancels the run when a job
-  # has failed, so it belongs to the stage the run starts with, and its trigger is `push`) and
+  # are the callers of the stage workflows, `cancel-after-ci` and `cancel-after-build` (the
+  # fail-fast: each waits for one of the two stages the run starts with and cancels the run when it
+  # has failed, so they belong to the stage the run starts with, and their trigger is `push`) and
   # `passed` (needs every stage and does nothing else), which leaves the commit the push replaced
   # for the release run. The suite is the job of another workflow, suites.yml, started by the
   # same push beside the pipeline.
@@ -97,7 +98,9 @@ jobs:
     signing: true
   - job: pipeline.yml#smoke
     stage: beta
-  - job: pipeline.yml#watch
+  - job: pipeline.yml#cancel-after-ci
+    stage: ci
+  - job: pipeline.yml#cancel-after-build
     stage: ci
   - job: pipeline.yml#passed
     stage: beta

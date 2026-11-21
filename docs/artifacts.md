@@ -837,7 +837,7 @@ it (the facts and the base tree bundles have none: the attestation of `SHA256SUM
 
 One run of `release.yml` cuts a release; nobody tags. A push to `main` runs one sequential pipeline
 (`pipeline.yml`, [design](design/kbf-cicd.md), section 8.0): `ci` and `artifacts` (the builds) together, `artifacts-sign` (the attestations) after `ci` and `artifacts`, and `smoke`, which installs and
-tests the `kbf` of the files `artifacts` built in that same run, after `artifacts` and beside `artifacts-sign`. The full suite (`beta.yml`) is not part of the pipeline: `suites.yml` calls it on every push to `main`, beside the pipeline, it never gates a release, and a red run opens or updates the one issue labelled `main-red` (`RELEASE-RED: kbf <job>`, `cargo xtask release-red`). The run fails fast (its `watch` job cancels it when a job has failed). `release.yml`
+tests the `kbf` of the files `artifacts` built in that same run, after `artifacts` and beside `artifacts-sign`. The full suite (`beta.yml`) is not part of the pipeline: `suites.yml` calls it on every push to `main`, beside the pipeline, it never gates a release, and a red run opens or updates the one issue labelled `main-red` (`RELEASE-RED: kbf <job>`, `cargo xtask release-red`). The run fails fast (its `cancel-after-ci` and `cancel-after-build` jobs cancel it when the stage they wait for has failed). `release.yml`
 is started by the completion of a pipeline run (`workflow_run`, `branches: [main]`) and acts only when that run
 succeeded for a push to `main`; it reads the files from that run's artifacts by the run's id and publishes those same
 files. It is a workflow of its own so that nothing a push does can cancel a

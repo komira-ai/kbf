@@ -24,11 +24,13 @@
 //!   needs only jobs under it (a skipped `need` would skip it and let an unsigned commit pass).
 //! - **Everything must pass.** `passed` needs every stage and has no `if:`, so the run is green
 //!   only when each stage is, and the release (which follows the run's success) is made only
-//!   then. It is also the end of the run for `watch`.
-//! - **Fail fast.** `watch` needs nothing, runs only for a push to main (the one condition the
-//!   workflow lint lets hold `actions: write`), builds xtask before any step holds a token and
-//!   ends with the one step that does: `cargo xtask pipeline-watch`, which cancels the run as soon
-//!   as a job has failed.
+//!   then.
+//! - **Fail fast.** [`CANCELS`] are two jobs, `cancel-after-ci` and `cancel-after-build`, each
+//!   needing exactly one of the two stages that start the run. Each runs only when that stage has
+//!   failed, for a push to main (the one condition, [`CANCEL_IF`], the workflow lint lets hold
+//!   `actions: write`), holds exactly `actions: write`, and has one step: `gh run cancel` for this
+//!   run with the token in its environment. It checks out and builds nothing, so no repository code
+//!   runs beside the token. A skipped job holds no runner, so a green push pays for neither.
 //! - **Each check once.** The four called workflows have a `workflow_call` trigger and no
 //!   `push` trigger; `ci.yml` and `artifacts.yml` keep `pull_request` and `merge_group`;
 //!   `beta.yml` and `smoke.yml` have `workflow_call` alone. The jobs that call them are one
@@ -51,7 +53,7 @@
 //!   scopes of the two calls of `artifacts.yml` (the build call has them only because a called
 //!   workflow is checked against its caller's grant statically; its signing jobs are skipped),
 //!   the `actions: read` of `ci` (its `test` job waits for the coverage shards' artifacts) and
-//!   the `actions: write` of `watch`; a called workflow gets at most what its caller job grants
+//!   the `actions: write` of the two cancel jobs, which hold nothing else; a called workflow gets at most what its caller job grants
 //!   (`beta.yml`'s jobs are checked against the grant of `suites.yml#beta`).
 
 use super::workflows;
@@ -60,12 +62,13 @@ use super::workflows;
 const NAME: &str = "pipeline";
 
 /// The jobs, in file order.
-const JOBS: [&str; 6] = [
+const JOBS: [&str; 7] = [
     "ci",
     "artifacts",
     "artifacts-sign",
     "smoke",
-    "watch",
+    "cancel-after-ci",
+    "cancel-after-build",
     "passed",
 ];
 
@@ -122,7 +125,7 @@ fn sign_with() -> Vec<(String, String)> {
     with
 }
 
-/// The `if:` of the two calls and of `watch`: a push to `main`, the exact spelling the signing
+/// The `if:` of the two calls: a push to `main`, the exact spelling the signing
 /// scopes need (`workflows`; a caller job has no `inputs`, so this is not the stage spelling).
 pub const SIGNING_IF: &str =
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
@@ -134,16 +137,25 @@ const SIGNING_STAGE_IF: &str = "${{ github.event_name == 'push' && github.ref ==
 /// What every other job of `artifacts.yml` must say in its `if:`, so the sign call runs none of them.
 const NOT_SIGN_STAGE: &str = "inputs.stage != 'sign'";
 
-/// The fail-fast job: it cancels the run when another job has failed, and is the one job that
-/// holds a write scope besides the signing ones (`actions: write`, to cancel this run).
-const WATCH: &str = "watch";
+/// The fail-fast jobs, `(job, the stage it needs)`: each cancels the run when its stage has
+/// failed, and is a job that holds a write scope besides the signing ones (`actions: write`, to
+/// cancel this run).
+const CANCELS: [(&str, &str); 2] = [
+    ("cancel-after-ci", "ci"),
+    ("cancel-after-build", "artifacts"),
+];
+
+/// The `if:` of a cancel job: a stage it needs has failed, in a push to `main`. The one spelling
+/// under which the workflow lint lets a job of the pipeline hold `actions: write`.
+pub const CANCEL_IF: &str =
+    "${{ failure() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
 
 /// The closing job: it needs every stage and does nothing else, so it completes (skipped, when a
-/// stage did not pass) only when the run is over. The watch ends when it has.
+/// stage did not pass) only when the run is over.
 const PASSED: &str = "passed";
 
-/// The command of the watch's only step that holds a token.
-const WATCH_COMMAND: &str = "cargo xtask pipeline-watch --repo \"$GITHUB_REPOSITORY\" --run-id \"$GITHUB_RUN_ID\" --last-job passed";
+/// The command of the one step of a cancel job: it cancels this run.
+const CANCEL_COMMAND: &str = "gh run cancel \"$GITHUB_RUN_ID\" --repo \"$GITHUB_REPOSITORY\"";
 
 /// The group and the cancel of the pipeline: a newer push to the ref replaces the run.
 const GROUP: &str = "pipeline-${{ github.ref }}";
@@ -208,7 +220,7 @@ pub fn problems(files: &Files) -> Result<Vec<String>, String> {
     each_check_once(files, &mut out)?;
     beta_needs_nothing_of_the_run(&files.beta, &mut out);
     smoke_consumes_the_run(&files.smoke, &mut out)?;
-    watcher(&files.pipeline, &mut out)?;
+    fail_fast(&files.pipeline, &mut out)?;
     release_follows(files, &mut out)?;
     Ok(out)
 }
@@ -293,7 +305,8 @@ fn pipeline(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
     permissions(text, out)?;
     callee_scopes(files, out)?;
     no_secrets_passed(text, out)?;
-    let all = code(text);
+    // `failure()` is allowed in the one condition of the cancel jobs, which `fail_fast` pins.
+    let all = code(text).replace(CANCEL_IF, "");
     for word in CONTINUING {
         if all.contains(word) {
             out.push(format!(
@@ -330,7 +343,7 @@ fn permissions(text: &str, out: &mut Vec<String>) -> Result<(), String> {
             ],
             // The `test` job of ci.yml lists the run's jobs and artifacts, to wait for the shards.
             "ci" => vec![("contents", "read"), ("actions", "read")],
-            WATCH => vec![("contents", "read"), ("actions", "write")],
+            "cancel-after-ci" | "cancel-after-build" => vec![("actions", "write")],
             _ => vec![("contents", "read")],
         };
         let mut got: Vec<String> = have.iter().map(|(s, l)| format!("{s}: {l}")).collect();
@@ -725,9 +738,9 @@ fn beta_needs_nothing_of_the_run(beta: &str, out: &mut Vec<String>) {
     }
 }
 
-/// The fail-fast and the end of the run: `passed` needs every stage, `watch` cancels the run
-/// from a token it holds in its last step alone, under the push-to-main condition.
-fn watcher(text: &str, out: &mut Vec<String>) -> Result<(), String> {
+/// The fail-fast and the end of the run: `passed` needs every stage, and each cancel job needs
+/// its one stage, runs only when it failed, and cancels the run from its one step.
+fn fail_fast(text: &str, out: &mut Vec<String>) -> Result<(), String> {
     let stages: Vec<String> = STAGES.iter().map(|(job, _, _)| (*job).to_owned()).collect();
     let needs = workflows::job_needs(text, PASSED)?;
     if needs != stages {
@@ -740,57 +753,38 @@ fn watcher(text: &str, out: &mut Vec<String>) -> Result<(), String> {
             "the job `{PASSED}` has `if: {condition}`: a skipped closing job would let the run succeed without a stage"
         ));
     }
-    let needs = workflows::job_needs(text, WATCH)?;
-    if !needs.is_empty() {
-        out.push(format!(
-            "the job `{WATCH}` needs {needs:?}: it must run beside the stages to cancel them"
-        ));
-    }
-    let condition = workflows::job_condition(text, WATCH)?;
-    if condition.as_deref() != Some(SIGNING_IF) {
-        out.push(format!(
-            "the job `{WATCH}` has `if: {}`, not exactly `{SIGNING_IF}`: the lint lets only that condition hold `actions: write`",
-            condition.as_deref().unwrap_or("(none)")
-        ));
-    }
-    let steps = workflows::job_steps(text, WATCH)?;
-    let at = steps
-        .iter()
-        .position(|s| s.run.as_deref() == Some(WATCH_COMMAND));
-    let Some(at) = at else {
-        out.push(format!(
-            "the job `{WATCH}` does not run `{WATCH_COMMAND}`: nothing cancels the run when a job fails"
-        ));
-        return Ok(());
-    };
-    if steps[at].env != [("GH_TOKEN".to_owned(), "${{ github.token }}".to_owned())] {
-        out.push(format!(
-            "the step of `{WATCH}` that cancels does not have exactly `GH_TOKEN: ${{{{ github.token }}}}` as its environment"
-        ));
-    }
-    for (i, step) in steps.iter().enumerate() {
-        let token = step.env.iter().any(|(_, v)| v.contains("token"))
-            || step.with.iter().any(|(_, v)| v.contains("token"));
-        if i != at && token {
+    for (job, stage) in CANCELS {
+        let needs = workflows::job_needs(text, job)?;
+        if needs != [stage] {
             out.push(format!(
-                "a step of `{WATCH}` other than the one that cancels holds a token: the build of xtask must run before any step holds one"
+                "the job `{job}` needs {needs:?}, not [{stage:?}]: it must wait for its stage, not run beside it, so a green push pays for it never"
             ));
         }
-        if step
-            .run
-            .as_deref()
-            .is_some_and(|r| r.starts_with("cargo build"))
-            && i > at
-        {
+        let condition = workflows::job_condition(text, job)?;
+        if condition.as_deref() != Some(CANCEL_IF) {
             out.push(format!(
-                "the job `{WATCH}` builds after the step that holds the token: no build script may run beside it"
+                "the job `{job}` has `if: {}`, not exactly `{CANCEL_IF}`: the lint lets only that condition hold `actions: write`",
+                condition.as_deref().unwrap_or("(none)")
             ));
         }
-    }
-    if at + 1 != steps.len() {
-        out.push(format!(
-            "the step of `{WATCH}` that cancels is not its last: a step after it would run beside the token"
-        ));
+        let steps = workflows::job_steps(text, job)?;
+        let [step] = steps.as_slice() else {
+            out.push(format!(
+                "the job `{job}` has {} steps, not the one that cancels: a checkout or a build would run repository code beside the token",
+                steps.len()
+            ));
+            continue;
+        };
+        if step.run.as_deref() != Some(CANCEL_COMMAND) || step.uses.is_some() {
+            out.push(format!(
+                "the job `{job}` does not run exactly `{CANCEL_COMMAND}`: nothing cancels the run when its stage fails"
+            ));
+        }
+        if step.env != [("GH_TOKEN".to_owned(), "${{ github.token }}".to_owned())] {
+            out.push(format!(
+                "the step of `{job}` does not have exactly `GH_TOKEN: ${{{{ github.token }}}}` as its environment"
+            ));
+        }
     }
     Ok(())
 }
@@ -815,5 +809,7 @@ fn release_follows(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
+mod cancel_tests;
 #[cfg(test)]
 mod tests;
