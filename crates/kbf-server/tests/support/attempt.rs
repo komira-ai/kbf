@@ -98,7 +98,7 @@ pub async fn connect(limit: Duration, endpoint: Endpoint) -> Option<Channel> {
 /// again when the client has let go of the socket. The client lets go once it has seen
 /// the end (its connection task finishes, which drops the socket and, in the same poll,
 /// the channel to it), so a call made after [`Closing::let_go`] finds a closed
-/// connection, without a sleep. The connection is counted before it is closed, so the
+/// connection, on a current-thread runtime, without a sleep. The connection is counted before it is closed, so the
 /// count is exact when the attempt ends.
 pub struct Closing {
     pub addr: SocketAddr,

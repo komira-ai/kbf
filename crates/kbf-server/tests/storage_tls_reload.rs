@@ -324,7 +324,7 @@ async fn the_client_ca_bundle_is_reloaded() {
 ///
 /// Kills: a client helper over `Endpoint::connect()`, whose channel dials again for as
 /// long as each new connection closes the same way (a refused attempt that never ends,
-/// and the test with it); a call with no deadline.
+/// and the test with it).
 #[tokio::test]
 async fn a_refused_attempt_is_one_connection_and_its_call_ends() {
     const ATTEMPTS: usize = 3;
