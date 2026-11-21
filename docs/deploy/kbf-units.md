@@ -290,7 +290,9 @@ it out on its own health check and its connections' GOAWAY (the order and each p
    operation up ([direct-js.md](../design/direct-js.md) section 3).
 5. The worker streams that are left end `UNAVAILABLE` (storage nodes register with another
    frontend through the load balancer), and the process exits 0. Only a forced stop
-   (below) leaves client streams open at this step, and ends them `UNAVAILABLE`. It is not undone: what starts in its place is a new process.
+   (below) leaves client streams open at this step, and ends them `UNAVAILABLE`; it logs a
+   WARN with how many streams of how many builds it cut, and how many other calls. The
+   stand-down's INFO line says `nothing is left to answer` or `ended by force`. It is not undone: what starts in its place is a new process.
 
 No build is cut by the drain: an action that runs for hours is waited for, and the frontend
 stays up until it ends. The way to force a stop, which fails the builds still open (Buck2

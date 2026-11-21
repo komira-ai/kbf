@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 
 use kbf_meta::Command;
 
+mod builds;
+pub use builds::StreamCensus;
 mod execute;
 pub use execute::{ErrorCause, ErrorCounts, ExecuteMetrics, OpenExecute};
 mod tier;

@@ -694,6 +694,7 @@ where
     let (closer, closing) = kbf_front::closing();
     let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
     let drain = Arc::new(drain);
+    drain.counts_with(Arc::clone(&cache.metrics().execute));
     let checks = Checks::of_cache(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
     let checks = Arc::new(crate::deny_rows::probing(checks, &peers));
     let reads = crate::ui_mount::Reads {

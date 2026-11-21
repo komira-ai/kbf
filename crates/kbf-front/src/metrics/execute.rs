@@ -10,7 +10,9 @@
 //! update is one number, [`ExecuteMetrics::total`].
 //!
 //! Recording takes no lock and allocates nothing: a stream holds one `Arc` of these
-//! metrics and each observation is a few relaxed atomic adds, like the CAS metrics.
+//! metrics and each observation is a few relaxed atomic adds, like the CAS metrics. The one
+//! exception is the tally of open streams by build ([`ExecuteMetrics::open_streams`]), which
+//! takes a lock, and copies the build's id, when a stream begins and when it ends.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -18,7 +20,9 @@ use std::time::Instant;
 
 use kbf_tls::Liveness;
 
+use super::builds::{Builds, StreamCensus};
 use super::{Counter, Families, Gauge, Histogram, Unit};
+use crate::request_metadata::InvocationId;
 
 /// Why an Execute ended without its done operation. Every end that is not an answer has
 /// exactly one.
@@ -134,6 +138,8 @@ pub struct ExecuteMetrics {
     /// An Execute from its arrival to its last response (or its error, or its caller
     /// leaving). Cache hits are in it.
     pub total: Histogram,
+    /// The streams of `open_executions` by the build each belongs to.
+    builds: Builds,
 }
 
 impl Default for ExecuteMetrics {
@@ -150,11 +156,19 @@ impl Default for ExecuteMetrics {
             dispatch: Histogram::new(Unit::Seconds),
             queued_seconds: Histogram::new(Unit::Seconds),
             total: Histogram::new(Unit::Seconds),
+            builds: Builds::default(),
         }
     }
 }
 
 impl ExecuteMetrics {
+    /// The streams of `open_executions` now, and how many builds they belong to: what a stop
+    /// that ends the open streams cuts.
+    #[must_use]
+    pub fn open_streams(&self) -> StreamCensus {
+        self.builds.census()
+    }
+
     /// Starts timing an Execute. It counts as an error unless [`OpenExecute::ok`] is
     /// called before the guard is dropped.
     #[must_use]
@@ -171,6 +185,7 @@ impl ExecuteMetrics {
             connection: None,
             queued: false,
             streaming: false,
+            build: None,
         }
     }
 
@@ -190,6 +205,7 @@ impl ExecuteMetrics {
             connection: None,
             queued: false,
             streaming: false,
+            build: None,
         }
     }
 
@@ -275,6 +291,8 @@ pub struct OpenExecute {
     queued: bool,
     /// Whether this stream is in the `open_executions` gauge.
     streaming: bool,
+    /// The build the call belongs to, when it named one ([`Self::build`]).
+    build: Option<InvocationId>,
 }
 
 impl OpenExecute {
@@ -322,6 +340,16 @@ impl OpenExecute {
         if !self.streaming {
             self.streaming = true;
             self.metrics.open_executions.add_one();
+            self.metrics.builds.open(self.build.as_ref());
+        }
+    }
+
+    /// Names the build the call belongs to (its `tool_invocation_id`), which
+    /// [`ExecuteMetrics::open_streams`] counts its stream under. Called before
+    /// [`Self::streaming`]; once the call is a stream, it changes nothing.
+    pub fn build(&mut self, build: Option<InvocationId>) {
+        if !self.streaming {
+            self.build = build;
         }
     }
 
@@ -362,6 +390,7 @@ impl Drop for OpenExecute {
         }
         if self.streaming {
             self.metrics.open_executions.sub_one();
+            self.metrics.builds.close(self.build.as_ref());
         }
         self.metrics.in_flight.sub_one();
         if self.counted {

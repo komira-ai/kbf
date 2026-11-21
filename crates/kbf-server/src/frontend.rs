@@ -984,6 +984,7 @@ impl<'a> Prepared<'a> {
         let (closer, closing) = kbf_front::closing();
         let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
         let drain = Arc::new(drain);
+        drain.counts_with(Arc::clone(&backend.metrics().execute));
         let worker_stop = Stop::new();
         // Sends the operator API's connections GOAWAY when the drain sequence refuses new
         // work; the listener goes on accepting ([`serve_api_goaway`]).
