@@ -8,10 +8,16 @@
 //! scratch root owned by root under directories only root can write, and (where the kernel
 //! restricts unprivileged user namespaces) an AppArmor profile that names its `crun`. So a
 //! [`Node`] is two directories: one under `CARGO_TARGET_TMPDIR` (the stand-in links, their
-//! directory, the state root, the join token) and one under `/run` (the scratch root, the image
-//! store beside it, and the run-files root, which must be on a tmpfs; the node mounts a tmpfs there
-//! that allows programs to run, for a host that mounts `/run` `noexec`); both are removed when
-//! the node drops. The agent is started by `systemd-run --scope -p Delegate=yes` in a scope of
+//! directory, the state root, the join token, and the mount point of the agent's mount roots)
+//! and one under `/run` (the scratch root, the image store beside it, and the run-files root,
+//! which must be on a tmpfs; the node mounts a tmpfs there that allows programs to run, for a
+//! host that mounts `/run` `noexec`); both are removed when the node drops. The agent refuses a
+//! state root on the file system of a mount root or the scratch root (a job could fill it, and
+//! then the taint marker could not be written), so the mount point is a tmpfs of its own, as on
+//! a host the tier store mounts its own file system there: the state root is on the disk of
+//! `CARGO_TARGET_TMPDIR`, the scratch root on the `/run` tmpfs, and the mount roots on a third.
+//! The node unmounts both tmpfs when it drops. The agent is started by
+//! `systemd-run --scope -p Delegate=yes` in a scope of
 //! its own, which it delegates to itself, and the scope's processes are killed when the agent
 //! drops. The profile, when the kernel needs one, names the stand-in `crun` only, and is
 //! unloaded when the node drops. The job user is the user who ran `sudo` (`SUDO_USER`,
@@ -133,6 +139,21 @@ fn must(program: &str, args: &[&std::ffi::OsStr]) {
     );
 }
 
+/// Mounts a tmpfs of its own, which allows programs to run, at the directory `at`.
+fn mount_tmpfs(at: &Path) {
+    must(
+        "/usr/bin/mount",
+        &[
+            "-t".as_ref(),
+            "tmpfs".as_ref(),
+            "-o".as_ref(),
+            "exec,nosuid,nodev,mode=755".as_ref(),
+            "tmpfs".as_ref(),
+            at.as_os_str(),
+        ],
+    );
+}
+
 /// The files and processes one agent runs over.
 pub struct Node {
     /// The agent's host id, the node's name.
@@ -145,7 +166,8 @@ pub struct Node {
     pub state_root: PathBuf,
     /// The directory the agent's `--mount-root put=` (`put`, read-write) and
     /// `--mount-root-ro trees=` (`trees`, read-only) name beside each other, as a put-directory
-    /// job's host-path mount and layer are admitted only beneath such roots.
+    /// job's host-path mount and layer are admitted only beneath such roots: a tmpfs of its own,
+    /// so on another file system than the state root and the scratch root.
     pub mount_point: PathBuf,
     pub scratch_root: PathBuf,
     pub run_files: PathBuf,
@@ -163,11 +185,13 @@ pub struct Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.accepting.abort();
-        // Lazy: the agent's processes may not have left the directory yet.
-        let _ = Command::new("/usr/bin/umount")
-            .arg("-l")
-            .arg(self._run.path())
-            .output();
+        // Lazy: the agent's processes may not have left the directories yet.
+        for mounted in [&self.mount_point, self._run.path()] {
+            let _ = Command::new("/usr/bin/umount")
+                .arg("-l")
+                .arg(mounted)
+                .output();
+        }
         if let Some(profile) = &self.profile {
             let _ = Command::new("/usr/sbin/apparmor_parser")
                 .arg("-R")
@@ -194,17 +218,7 @@ impl Node {
         // `noexec` (the hosted ubuntu-24.04 image 20261111.127.1 does: every job then fails
         // with "start crun: Permission denied"), so the directory is a tmpfs of its own that
         // allows them; `Drop for Node` unmounts it.
-        must(
-            "/usr/bin/mount",
-            &[
-                "-t".as_ref(),
-                "tmpfs".as_ref(),
-                "-o".as_ref(),
-                "exec,nosuid,nodev,mode=755".as_ref(),
-                "tmpfs".as_ref(),
-                run.path().as_os_str(),
-            ],
-        );
+        mount_tmpfs(run.path());
 
         let bin = mkdir(&test.path().join("bin"), 0o755);
         let stand_in_exe = Path::new(env!("CARGO_BIN_EXE_kbf-js-stand-in"));
@@ -224,7 +238,11 @@ impl Node {
         std::fs::set_permissions(&calls, std::fs::Permissions::from_mode(0o666)).expect("chmod");
 
         let state_root = mkdir(&test.path().join("state"), 0o700);
+        // The agent refuses a state root on the file system of a mount root (a job writing
+        // there could fill it): on a host the tier store mounts its own file system here, in a
+        // test a tmpfs does; `Drop for Node` unmounts it.
         let mount_point = mkdir(&test.path().join("mount-point"), 0o755);
+        mount_tmpfs(&mount_point);
         mkdir(&mount_point.join("put"), 0o755);
         mkdir(&mount_point.join("trees"), 0o755);
         let join = test.path().join("join");
