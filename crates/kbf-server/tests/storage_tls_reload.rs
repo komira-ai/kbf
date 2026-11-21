@@ -3,12 +3,22 @@
 //! `StorageFlags::listener`, the real listener, and tonic clients that do real TLS
 //! handshakes. The reload engine's own cases are in `kbf-tls`; these show the storage
 //! node is wired to it, and that the role check still reads the caller's certificate.
+//!
+//! No test here awaits without a deadline: every connection, call and wait for a reload a
+//! test awaits is bounded by [`within`], and fails naming what it waited for. A client
+//! attempt dials once ([`connect`]), so one that is refused is one connection that ended,
+//! not a channel that dials again for as long as the node refuses it.
+
+#[path = "support/attempt.rs"]
+mod attempt;
 
 use std::future::pending;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use attempt::{Closing, connect, within};
 
 use kbf_front::{Cache, CacheStorage, SegmentsConfig};
 use kbf_server::storage_node::{command, parse};
@@ -21,7 +31,15 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
 };
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+
+/// How long one step of a client attempt (the connection and its handshake, a call) may
+/// take on loopback before the test fails naming it.
+const STEP: Duration = Duration::from_secs(10);
+
+/// How long the node may take to look at replaced files again (its interval is one second
+/// here) before the test fails naming what it waited for.
+const RELOAD: Duration = Duration::from_secs(30);
 
 struct Ca(CertifiedIssuer<'static, KeyPair>);
 
@@ -104,6 +122,22 @@ fn argv(dir: &Path, interval: &str) -> Vec<String> {
     ]
 }
 
+/// A client of the node at `addr` that trusts only `trust`'s certificates and presents
+/// `identity`, over one connection ([`connect`]); `None` if the connection or the
+/// handshake fails.
+async fn attempt(addr: SocketAddr, trust: &Ca, identity: &Pair) -> Option<RemoteStorage> {
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(trust.pem()))
+        .domain_name("localhost")
+        .identity(Identity::from_pem(&identity.cert, &identity.key));
+    let endpoint = Endpoint::from_shared(format!("https://{addr}"))
+        .expect("endpoint")
+        .tls_config(tls)
+        .expect("TLS");
+    let channel = connect(STEP, endpoint).await?;
+    Some(RemoteStorage::new(channel, 0))
+}
+
 /// A running storage node over the listener its flags make.
 struct Node {
     addr: SocketAddr,
@@ -135,18 +169,7 @@ impl Node {
 
     /// A client that trusts only `trust`'s certificates and presents `identity`.
     async fn client(&self, trust: &Ca, identity: &Pair) -> Option<RemoteStorage> {
-        let tls = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(trust.pem()))
-            .domain_name("localhost")
-            .identity(Identity::from_pem(&identity.cert, &identity.key));
-        let channel = Channel::from_shared(format!("https://{}", self.addr))
-            .expect("endpoint")
-            .tls_config(tls)
-            .expect("TLS")
-            .connect()
-            .await
-            .ok()?;
-        Some(RemoteStorage::new(channel, 0))
+        attempt(self.addr, trust, identity).await
     }
 
     /// Whether a new client is answered: the server's certificate verified by `trust`,
@@ -158,18 +181,26 @@ impl Node {
         }
     }
 
+    /// Polls the node's reload counters every 100 ms until `done` holds, and fails naming
+    /// `what` if it has not within [`RELOAD`].
     async fn until_reloads(&self, what: &str, done: impl Fn(&kbf_tls::Reloads) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !done(&self.tls.reloads()) {
-            assert!(Instant::now() < deadline, "timed out: {what}");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let polling = async {
+            while !done(&self.tls.reloads()) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        within(RELOAD, what, polling).await;
     }
 }
 
+/// Whether `client`'s `FindMissing` is answered; a call that does not end within [`STEP`]
+/// fails the test.
 async fn answered(client: &RemoteStorage) -> bool {
-    let digest = Digest::new(DigestFunction::Sha256, [4; 32], 1);
-    client.find_missing(&[digest]).await.is_ok()
+    let digests = [Digest::new(DigestFunction::Sha256, [4; 32], 1)];
+    let call = client.find_missing(&digests);
+    within(STEP, "the answer to FindMissing", call)
+        .await
+        .is_ok()
 }
 
 /// A certificate renewed by replacing the files: a connection open at the time keeps
@@ -283,6 +314,37 @@ async fn the_client_ca_bundle_is_reloaded() {
     node.until_reloads("the empty bundle refused", |r| r.rejected == 1)
         .await;
     assert!(node.answers(&issuer, &from_second).await);
+}
+
+/// A client attempt of this file is one connection, even when its connection closes
+/// before its call goes out, which is how the node refuses a client certificate under
+/// TLS 1.3: a server that completes each handshake and then ends the session
+/// ([`Closing`]) counts one connection per attempt, and each attempt's call ends,
+/// unanswered.
+///
+/// Kills: a client helper over `Endpoint::connect()`, whose channel dials again for as
+/// long as each new connection closes the same way (a refused attempt that never ends,
+/// and the test with it).
+#[tokio::test]
+async fn a_refused_attempt_is_one_connection_and_its_call_ends() {
+    const ATTEMPTS: usize = 3;
+    let (issuer, clients) = (ca("issuer"), ca("clients"));
+    let server = issuer.server();
+    let closing = Closing::start(&server.cert, &server.key);
+    let frontend = clients.client("frontend");
+
+    for n in 1..=ATTEMPTS {
+        let client = attempt(closing.addr, &issuer, &frontend).await;
+        closing.let_go(STEP, n).await;
+        if let Some(client) = client {
+            assert!(!answered(&client).await, "a closed session answered");
+        }
+    }
+    assert_eq!(
+        closing.accepted(),
+        ATTEMPTS,
+        "an attempt dialed more than once"
+    );
 }
 
 /// The flags: the files must make a configuration at start (a certificate that is not
