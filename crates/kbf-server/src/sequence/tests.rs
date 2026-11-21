@@ -11,6 +11,8 @@ use super::*;
 use crate::drain::Phase;
 use crate::health::Readiness;
 
+mod stand_down;
+
 /// The two waits, in seconds.
 fn timing(lb_wait: u64, deadline: u64) -> DrainTiming {
     DrainTiming {
@@ -51,6 +53,7 @@ impl Rig {
         let readiness = Arc::new(Readiness::default());
         let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
         let drain = Arc::new(drain);
+        drain.counts_with(Arc::clone(&backend.metrics().execute));
         let (sweeper, sweeping) = AbortHandle::new_pair();
         let (worker, api) = (Stop::new(), Stop::new());
         let stand = Stand {

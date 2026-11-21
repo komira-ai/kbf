@@ -152,6 +152,17 @@ impl Farm {
             .await
     }
 
+    /// The cache services and `Execution` over `dispatch` (streams never closed), every call
+    /// read by `layer` first, as kbf-server reads its REAPI listener's calls.
+    pub async fn with_execution_and_request_metadata<D: Dispatch>(
+        dispatch: Arc<D>,
+        layer: RequestMetadataLayer,
+    ) -> Self {
+        let (_, closing) = kbf_front::closing();
+        let routes = |cache| kbf_front::routes_with_execution(cache, dispatch, closing);
+        Self::serve(|cache| Routes::from(routes(cache).into_axum_router().layer(layer))).await
+    }
+
     async fn serve(routes: impl FnOnce(Arc<TestCache>) -> Routes) -> Self {
         Self::serve_with(routes, None).await
     }

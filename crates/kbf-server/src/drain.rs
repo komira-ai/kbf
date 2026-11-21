@@ -22,7 +22,9 @@
 //! The second and later calls change nothing, so a signal that arrives after the
 //! endpoint (or the endpoint called twice) is a no-op. [`Drain::close`] is the
 //! escalation: it ends every stream that is not done UNAVAILABLE, and is what the
-//! shutdown timeout and a second signal call.
+//! shutdown timeout and a second signal call. The first close that finds streams or calls
+//! open says what it cuts, in one WARN: how many streams of how many builds, and how many
+//! other calls ([`Drain::counts_with`] gives it the counts).
 //!
 //! A frontend over a state store does not call [`Drain::begin`] at once: it runs the drain
 //! as a sequence ([`crate::sequence`]), which [`Drain::announce`]s first, waits for the load
@@ -33,9 +35,10 @@
 //! the sequence by events and not by seconds.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use kbf_front::Closer;
+use kbf_front::metrics::ExecuteMetrics;
 use serde::Serialize;
 use tokio::sync::{oneshot, watch};
 
@@ -114,6 +117,10 @@ pub struct Drain {
     deadline_over: Stop,
     /// The sequence reported open executions at the deadline ([`Drain::deadline_passed`]).
     deadline_reported: AtomicBool,
+    /// Where the open streams and calls are counted ([`Drain::counts_with`]).
+    counts: OnceLock<Arc<ExecuteMetrics>>,
+    /// A close has said what it cuts.
+    cut_told: AtomicBool,
 }
 
 impl Drain {
@@ -142,8 +149,17 @@ impl Drain {
             lb_wait_over: Stop::new(),
             deadline_over: Stop::new(),
             deadline_reported: AtomicBool::new(false),
+            counts: OnceLock::new(),
+            cut_told: AtomicBool::new(false),
         };
         (drain, begun)
+    }
+
+    /// Counts the open streams and calls with `metrics` (the REAPI front's), so that the first
+    /// [`Drain::close`] that cuts any says how many streams of how many builds, and how many
+    /// other calls. The first call sets it; a later one changes nothing.
+    pub(crate) fn counts_with(&self, metrics: Arc<ExecuteMetrics>) {
+        let _ = self.counts.set(metrics);
     }
 
     fn stages(&self) -> std::sync::MutexGuard<'_, Stages> {
@@ -349,12 +365,43 @@ impl Drain {
 
     /// Ends every open stream that is not done UNAVAILABLE, and every one opened from
     /// now on after its first operation. Begins the drain if it has not begun. Safe to
-    /// call any number of times.
+    /// call any number of times. The first call that finds streams or calls open logs a WARN
+    /// with how many streams of how many builds it cuts ([`Drain::counts_with`]).
     pub fn close(&self) {
         self.begin();
+        self.tell_cut();
         self.closer.close();
         self.closed.send_replace(true);
         self.publish();
+    }
+
+    /// Whether [`Drain::close`] has been called: the drain was ended by force.
+    pub(crate) fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
+    /// Says, once, what the first close cuts: the streams still open (each ends UNAVAILABLE,
+    /// and Buck2 fails its action), the builds they belong to, and the other calls, which the
+    /// exit cuts. Nothing when nothing is open, or when no counts were given.
+    fn tell_cut(&self) {
+        let Some(metrics) = self.counts.get() else {
+            return;
+        };
+        let open = metrics.open_streams();
+        let calls = metrics.open_calls.get().saturating_sub(open.streams);
+        if (open.streams == 0 && calls == 0) || self.cut_told.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (streams, builds, unnamed) = (open.streams, open.builds, open.unnamed);
+        tracing::warn!(
+            streams,
+            builds,
+            unnamed,
+            calls,
+            "the drain is ended by force: it cuts {streams} open Execute or WaitExecution \
+             stream(s) of {builds} build(s), which end UNAVAILABLE and fail their actions \
+             ({unnamed} of the streams named no build), and {calls} other call(s)"
+        );
     }
 
     /// Completes once [`Drain::close`] has been called.

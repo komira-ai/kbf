@@ -529,7 +529,10 @@ over a state store (`kbf frontend` requires one):
    stops, so each storage node dials another frontend through the load balancer. No Execute or WaitExecution stream is open by now unless a
    second signal or `--shutdown-timeout-secs` forced the stop; the ones that are end
    `UNAVAILABLE` (an action that was still running fails, as Buck2 does not recover a
-   stream). Phase `closing`, a few seconds long, and the process exits 0. For a worker
+   stream), and a WARN says how many streams of how many builds were cut (a build is a
+   `RequestMetadata` `tool_invocation_id`) and how many other calls. The INFO line of the
+   stand-down says why: `nothing is left to answer`, or `ended by force`. Phase `closing`, a
+   few seconds long, and the process exits 0. For a worker
    listener behind a load balancer that passes TCP through, GOAWAY reaches the storage node's
    connection and nothing else: this is the step that closes it.
 

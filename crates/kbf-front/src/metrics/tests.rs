@@ -384,6 +384,37 @@ fn open_executions_is_raised_once_per_guard_and_only_by_a_streaming_one() {
     assert_eq!(metrics.open_executions.get(), 0);
 }
 
+/// Catches a stream counted under the wrong build in `open_streams`: under the build it named
+/// before it streamed, not one named after (its stream is already counted), none for a guard
+/// that never streamed, and gone once the guard is dropped.
+#[test]
+fn open_streams_counts_each_stream_under_the_build_it_named_before_it_streamed() {
+    use crate::request_metadata::InvocationId;
+
+    let id = |text: &str| InvocationId::parse(text).expect("an id kbf accepts");
+    let metrics = Arc::new(ExecuteMetrics::default());
+    let mut first = metrics.execute();
+    first.build(Some(id("build-a")));
+    first.streaming();
+    first.build(Some(id("build-b")));
+    let mut second = metrics.execute();
+    second.build(Some(id("build-a")));
+    second.streaming();
+    let mut unnamed = metrics.wait();
+    unnamed.streaming();
+    let mut never = metrics.execute();
+    never.build(Some(id("build-c")));
+    let open = metrics.open_streams();
+    assert_eq!((open.streams, open.builds, open.unnamed), (3, 1, 1));
+
+    drop((first, never));
+    let open = metrics.open_streams();
+    assert_eq!((open.streams, open.builds, open.unnamed), (2, 1, 1));
+    drop((second, unnamed));
+    let open = metrics.open_streams();
+    assert_eq!((open.streams, open.builds, open.unnamed), (0, 0, 0));
+}
+
 /// Asserts that each cause of an Execute's end bumps its own series and no other: an
 /// error status (also when the connection is gone), a stream dropped on a connection that
 /// is still there, one dropped on a lost connection, and one dropped with no connection

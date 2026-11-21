@@ -23,7 +23,9 @@
 //! 5. It stands down as a retire does ([`Stand::release`]), closes the client streams that are
 //!    left ([`Drain::close`]) and, after a short grace for the clients to take their status
 //!    when there was a stream to close, ends the drain ([`Drain::sequence_ended`]); the serving
-//!    future returns and the process exits 0.
+//!    future returns and the process exits 0. Its log line says why it stands down: nothing
+//!    was left to answer, or the drain was ended by force; in that case [`Drain::close`] has
+//!    said in a WARN how many streams of how many builds it cut.
 //!
 //! A second stop signal ([`Drain::close`]) skips the waits of steps 2 and 4, as does
 //! `--shutdown-timeout-secs` running out on a stop signal (default none): these are the
@@ -165,8 +167,10 @@ impl Sequence {
                 let (open, calls) = (self.stand.open_executions(), self.stand.open_calls());
                 if open > 0 || calls > 0 {
                     drain.mark_deadline_passed();
+                    let builds = self.stand.backend.metrics().execute.open_streams().builds;
                     tracing::warn!(
                         open,
+                        builds,
                         calls,
                         deadline = ?timing.deadline,
                         "the drain deadline passed with executions or calls open: still serving \
@@ -177,7 +181,11 @@ impl Sequence {
             }
         }
 
-        tracing::info!("draining: standing down, closing the streams that are left");
+        if drain.is_closed() {
+            tracing::info!("draining: ended by force, standing down");
+        } else {
+            tracing::info!("draining: nothing is left to answer, standing down");
+        }
         let streams = self.stand.open_executions();
         self.stand.release().await;
         drain.close();
