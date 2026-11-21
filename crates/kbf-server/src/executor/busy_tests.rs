@@ -134,6 +134,37 @@ async fn busy_answers_within_one_wait_raise_the_level_once() {
     assert_eq!(level.pause(), POLL * 2);
 }
 
+/// Catches a service that answers some calls and not others taken for one that answers: an
+/// answer within a wait of a busy answer leaves the level where it is, so busy answers in
+/// between go on doubling the wait, and nothing turns; once a whole wait passes with no busy
+/// answer, an answer ends it.
+#[tokio::test(start_paused = true)]
+async fn answers_between_busy_answers_do_not_end_the_level() {
+    let level = Busy::new(POLL, no_jitter);
+    let mut seen = Vec::new();
+    let mut waits = Vec::new();
+    for _ in 0..4 {
+        seen.push(level.saw("reading the result of a job", &busy_answer()));
+        tokio::time::advance(level.pause() / 2).await;
+        seen.push(level.saw("reading a job", &Ok::<(), Error>(())));
+        waits.push(level.pause());
+        tokio::time::advance(level.pause() / 2).await;
+    }
+    let ms = |ms| Duration::from_millis(ms);
+    assert_eq!(waits, [ms(250), ms(500), ms(1000), ms(2000)]);
+    let mut expected = vec![Seen::TurnedBusy, Seen::Answered];
+    for _ in 0..3 {
+        expected.extend([Seen::StillBusy, Seen::Answered]);
+    }
+    assert_eq!(seen, expected);
+    tokio::time::advance(level.pause()).await;
+    assert_eq!(
+        level.saw("reading a job", &Ok::<(), Error>(())),
+        Seen::AnsweredAgain
+    );
+    assert_eq!(level.pause(), POLL);
+}
+
 /// Catches a jitter that lengthens a wait or cuts it to nothing: it takes off at most half.
 #[tokio::test(start_paused = true)]
 async fn a_wait_is_jittered_down_by_at_most_half() {
@@ -145,8 +176,9 @@ async fn a_wait_is_jittered_down_by_at_most_half() {
 }
 
 /// Catches a busy service logged at every failed call: the first busy answer turns the
-/// service busy, the next ones are still busy, and the first answer after them is the one that
-/// says it answers again; an answer after that is plain.
+/// service busy, the next ones are still busy, and the first answer a wait later is the one
+/// that says it answers again; an answer after that is plain, and a busy answer after the turn
+/// back turns it busy again.
 #[tokio::test(start_paused = true)]
 async fn a_busy_service_turns_once_and_answers_again_once() {
     let level = Busy::new(POLL, no_jitter);
@@ -154,11 +186,13 @@ async fn a_busy_service_turns_once_and_answers_again_once() {
     for _ in 0..49 {
         seen.push(level.saw("reading a job", &busy_answer()));
     }
+    tokio::time::advance(level.pause()).await;
     seen.push(level.saw("reading a job", &Ok::<(), Error>(())));
     seen.push(level.saw("reading a job", &Ok::<(), Error>(())));
+    seen.push(level.saw("reading a job", &busy_answer()));
     let mut expected = vec![Seen::TurnedBusy];
     expected.extend([Seen::StillBusy; 49]);
-    expected.extend([Seen::AnsweredAgain, Seen::Answered]);
+    expected.extend([Seen::AnsweredAgain, Seen::Answered, Seen::TurnedBusy]);
     assert_eq!(seen, expected);
 }
 

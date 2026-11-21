@@ -200,6 +200,31 @@ async fn a_busy_service_that_does_not_take_a_submit_spends_no_attempt() {
     );
 }
 
+/// Catches a submit status that is not the service's load waited on as a busy one: a submit
+/// refused `PERMISSION_DENIED` ends the run as `infra`, and the operation's next attempt, under
+/// a new id, runs the action.
+#[tokio::test(start_paused = true)]
+async fn a_submit_refused_for_a_reason_that_is_not_load_runs_the_next_attempt() {
+    let rig = Rig::start().await;
+    rig.fake.inject_on(
+        "SubmitJob",
+        Fault::Status {
+            code: Code::PermissionDenied,
+            message: "no".to_owned(),
+        },
+    );
+    let caller = rig.submit(1);
+    let second = rig.submitted(&caller, 1).await;
+    assert!(rig.fake.submitted(&rig.job_of(&caller, 0)).is_none());
+    rig.host_finishes(&second, 0);
+    assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));
+    assert_eq!(
+        rig.counted("kbf_executor_runs_total{outcome=\"infra\"} "),
+        1
+    );
+    assert_eq!(rig.counted("kbf_executor_attempts_resubmitted_total "), 1);
+}
+
 /// Catches a submit that is resent at every poll while the service stays busy: the waits
 /// between the resends double (no jitter in the rig), so in the time eight polls take the
 /// service is sent four submits, and after it takes one the next call waits a poll again.
@@ -602,6 +627,10 @@ async fn a_cancel_on_a_busy_service_is_sent_again_until_it_is_answered() {
     assert_eq!(
         code_of(&rig.until_done(&caller).await),
         Code::Cancelled as i32
+    );
+    assert!(
+        rig.calls_of("CancelJob") < 7,
+        "the callers are answered before the cancel is"
     );
     rig.until("the cancel is answered", || rig.calls_of("CancelJob") == 7)
         .await;

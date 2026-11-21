@@ -13,7 +13,10 @@
 //! same level, so a thousand operations that poll their jobs slow down together, and the
 //! service that stalled is not sent a thousand calls each poll. The first busy answer makes the
 //! wait one poll; each busy answer after the current wait has half passed doubles it, up to
-//! [`MAX_WAIT`]; any answer of the service ends it, and the operations poll at the poll again.
+//! [`MAX_WAIT`]; an answer of the service ends it once a whole wait has passed with no busy
+//! answer of any call, and the operations poll at the poll again. A service that answers some
+//! calls and not others (reads of jobs, but not of results) so stays busy, and its waits go on
+//! doubling, rather than ending and starting again at every answer.
 //! Each wait is jittered down by up to half ([`crate::join::jittered`]), so operations that wait
 //! together do not call together. The executor logs once when the service turns busy, at WARN,
 //! and once when it answers again, and not for each busy answer between.
@@ -75,6 +78,8 @@ struct State {
     level: u32,
     /// When the level last went up.
     raised: Option<Instant>,
+    /// When the last busy answer came.
+    last: Option<Instant>,
     /// When the service turned busy.
     since: Option<Instant>,
     /// The busy answers since then.
@@ -84,9 +89,11 @@ struct State {
 /// What one answer of the service was to the level, and what was logged of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Seen {
-    /// An answer while the service answers: nothing logged.
+    /// An answer while the service answers, or one within a wait of a busy answer (the level
+    /// stays): nothing logged.
     Answered,
-    /// The first answer after busy ones: logged at INFO.
+    /// The first answer a whole wait after the last busy one: logged at INFO, and the level
+    /// ends.
     AnsweredAgain,
     /// The first busy answer: logged at WARN.
     TurnedBusy,
@@ -134,13 +141,14 @@ impl Busy {
     pub(crate) fn saw<T>(&self, what: &str, answer: &Result<T, Error>) -> Seen {
         match answer {
             Err(error) if busy(error) => self.failed(what, error, Instant::now()),
-            _ => self.answered(),
+            _ => self.answered(Instant::now()),
         }
     }
 
     fn failed(&self, what: &str, error: &Error, now: Instant) -> Seen {
         let mut state = self.state();
         state.calls += 1;
+        state.last = Some(now);
         let Some(raised) = state.raised else {
             state.level = 1;
             state.raised = Some(now);
@@ -159,9 +167,12 @@ impl Busy {
         Seen::StillBusy
     }
 
-    fn answered(&self) -> Seen {
+    fn answered(&self, now: Instant) -> Seen {
         let mut state = self.state();
-        if state.level == 0 {
+        let quiet = state
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= self.step(state.level));
+        if state.level == 0 || !quiet {
             return Seen::Answered;
         }
         let since = state.since.map(|since| since.elapsed());
