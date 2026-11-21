@@ -36,10 +36,12 @@ pub(crate) enum RunEnd {
     Missing,
     /// A host refused the job's tree list as not mountable through tierstore.
     ListRefused,
+    /// The job's host could not provide or read its inputs.
+    InputFailed,
 }
 
 impl RunEnd {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Ran,
         Self::Infra,
         Self::Timeout,
@@ -48,6 +50,7 @@ impl RunEnd {
         Self::Invalid,
         Self::Missing,
         Self::ListRefused,
+        Self::InputFailed,
     ];
 
     const fn label(self) -> &'static str {
@@ -60,6 +63,7 @@ impl RunEnd {
             Self::Invalid => "invalid",
             Self::Missing => "missing",
             Self::ListRefused => "list_refused",
+            Self::InputFailed => "input_failed",
         }
     }
 
@@ -73,6 +77,7 @@ impl RunEnd {
             Settled::Invalid(_) | Settled::NoXcode => Self::Invalid,
             Settled::Missing(_) => Self::Missing,
             Settled::ListRefused(_) => Self::ListRefused,
+            Settled::InputFailed(_) => Self::InputFailed,
         }
     }
 }

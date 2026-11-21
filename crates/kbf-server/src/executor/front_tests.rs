@@ -853,3 +853,39 @@ async fn the_actions_system_is_read_as_the_farm_reads_it() {
 
 #[path = "front_class_tests.rs"]
 mod class;
+
+/// Catches the frontend not reading an action's standard error against its input root, or
+/// taking a digest that is not one: a nonzero exit whose standard error is the compiler's
+/// could-not-open line with EIO for a file of the root names it; an action digest of a negative
+/// size names nothing.
+#[tokio::test]
+async fn an_unreadable_declared_input_is_named_by_the_front() {
+    let rig = Rig::new();
+    let root = rig
+        .store(&Directory {
+            files: vec![FileNode {
+                name: "a.h".to_owned(),
+                ..FileNode::default()
+            }],
+            ..Directory::default()
+        })
+        .await;
+    let digest = rig
+        .action(
+            |action| action.input_root_digest = Some(wire(&root)),
+            |_| {},
+        )
+        .await;
+    let result = reapi::ActionResult {
+        exit_code: 1,
+        stderr_raw: b"fatal error: cannot open file 'a.h': I/O error\n".to_vec(),
+        ..reapi::ActionResult::default()
+    };
+    let named = rig.front.unreadable_input(&digest, &result).await;
+    assert_eq!(named.as_deref(), Some("a.h"));
+    let negative = Digest {
+        size_bytes: -1,
+        ..digest
+    };
+    assert_eq!(rig.front.unreadable_input(&negative, &result).await, None);
+}

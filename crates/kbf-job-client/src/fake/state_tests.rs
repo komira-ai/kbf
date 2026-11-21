@@ -524,6 +524,9 @@ fn finish(s: &mut State) -> bool {
 fn finish_failing(s: &mut State) -> bool {
     s.finish("j", 1)
 }
+fn fail_inputs(s: &mut State) -> bool {
+    s.fail_inputs("j", 0, "input-unreadable")
+}
 fn fail_to_start(s: &mut State) -> bool {
     s.fail_to_start("j", StartFailureCode::NoCapacity)
 }
@@ -561,7 +564,7 @@ fn job_in(want: JobState) -> State {
 }
 
 /// Asserts every step against every state: `place` is taken from Queued; `start` from
-/// Placed; `run` from Starting; `write_logs` and `finish` from Running; `fail_to_start` from
+/// Placed; `run` from Starting; `write_logs`, `finish` and `fail_inputs` from Running; `fail_to_start` from
 /// Queued, Placed and Starting; `lose` from Placed, Starting and Running; `host_stopped` from
 /// those three only when a cancel was asked. Each step a state refuses answers false and
 /// leaves the whole job and its logs as they were; each step on an unknown id is false.
@@ -571,12 +574,13 @@ fn job_in(want: JobState) -> State {
 fn every_step_is_allowed_from_exactly_its_states() {
     use JobState::{Cancelled, Failed, FailedToStart, Lost, Placed, Queued, Running};
     use JobState::{Starting, Succeeded};
-    let steps: [(&str, Step, &[JobState]); 9] = [
+    let steps: [(&str, Step, &[JobState]); 10] = [
         ("place", place, &[Queued]),
         ("start", start, &[Placed]),
         ("run", run, &[Starting]),
         ("write_logs", write_logs, &[Running]),
         ("finish", finish, &[Running]),
+        ("fail_inputs", fail_inputs, &[Running]),
         ("fail_to_start", fail_to_start, &[Queued, Placed, Starting]),
         ("lose", lose, &[Placed, Starting, Running]),
         ("host_stopped", host_stopped, &[]),
@@ -619,6 +623,7 @@ fn every_step_is_allowed_from_exactly_its_states() {
     assert!(!s.run("missing"));
     assert!(!s.write_logs("missing", b"", b""));
     assert!(!s.finish("missing", 0));
+    assert!(!s.fail_inputs("missing", 0, "input-unreadable"));
     assert!(!s.fail_to_start("missing", StartFailureCode::NoCapacity));
     assert!(!s.lose("missing"));
     assert!(!s.host_stopped("missing"));
@@ -719,4 +724,37 @@ fn a_job_with_no_image_needs_a_layer_and_an_absolute_command() {
         .submit(imageless("layered", "/bin/tool", vec![tree]))
         .expect("taken");
     assert_eq!(taken.spec.expect("the spec").image, "");
+}
+
+/// Asserts the result of a job whose host's input failed, as the agent reports it: failed, for
+/// reason input-failed, with the agent's code and the job's own exit code kept (0 here, which
+/// the service still reports as failed), on its host; a job that finished by itself has no
+/// input failure. Catches a fake whose input failure reads as the job's own exit or loses its
+/// code.
+#[test]
+fn a_job_whose_input_failed_is_failed_with_the_agents_code() {
+    let mut s = job_in(JobState::Running);
+    assert!(s.fail_inputs("j", 0, "input-unreadable"));
+    let job = s.get("j").unwrap();
+    assert_eq!((job.state(), job.host_id.as_str()), (JobState::Failed, "h"));
+    let result = s.result("j").unwrap();
+    assert_eq!(
+        (
+            result.state(),
+            result.reason(),
+            result.exit_code,
+            result.input_failure.as_deref()
+        ),
+        (
+            JobState::Failed,
+            ResultReason::InputFailed,
+            Some(0),
+            Some("input-unreadable")
+        )
+    );
+    let result = job_in(JobState::Failed).result("j").unwrap();
+    assert_eq!(
+        (result.reason(), result.input_failure),
+        (ResultReason::Exit, None)
+    );
 }

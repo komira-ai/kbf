@@ -8,6 +8,7 @@
 
 mod classes;
 mod driver;
+mod inputs;
 mod jobs;
 mod keys;
 mod mac;

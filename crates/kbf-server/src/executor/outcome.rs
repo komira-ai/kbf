@@ -18,7 +18,9 @@
 //!
 //! | the job | class | what follows |
 //! |---|---|---|
-//! | succeeded, its result succeeded, reason exit, exit code 0 | `ingest` | whatever the frontend's ingest of the pack says |
+//! | succeeded, its result succeeded, reason exit, exit code 0 | `ingest` | whatever the frontend's ingest of the pack says, and an action that exited nonzero because its host could not read a declared input is run again ([`InputFailure`]) |
+//! | any state but failed to start, its result naming an input failure (`input_failure`, or reason input-failed) | `input-failed` | `UNAVAILABLE` naming the host and the agent's code: the host could not provide or read the job's inputs, rerun |
+//! | failed to start, its result naming an input failure | `input-failed` | `UNAVAILABLE` naming the host and the agent's code: the host could not provide the job's inputs, rerun |
 //! | succeeded with a nonzero exit code | `infra` | `UNAVAILABLE`: infrastructure, rerun |
 //! | succeeded with no exit code | `infra` | `UNAVAILABLE`: not a clean result, rerun |
 //! | succeeded for a reason other than exit | `infra` | `UNAVAILABLE`: not a clean result, rerun |
@@ -57,7 +59,7 @@
 //! submit is sent again, under the same id, until the service answers or a caller cancels; it
 //! spends no attempt.
 //!
-//! Every `infra` and `lost` row is run again, as the operation's next attempt, at most
+//! Every `infra`, `input-failed` and `lost` row is run again, as the operation's next attempt, at most
 //! [`RESUBMITS`] times; then the callers are answered `UNAVAILABLE`. So is `out-of-memory`, and
 //! the callers are answered as the table says. A `list-refused` row is run again too, but its
 //! first [`LIST_REFUSALS`] in an operation spend none of those attempts. A status names the code, never the job: a job
@@ -95,6 +97,25 @@
 //! refusal after those is run again as any `infra` ending. The text is read before
 //! [`lost_of`]: when a detail holds both, the tree list is what the host could not use, and the
 //! lost object, if there is one, is found again by the next attempt's refusal.
+//!
+//! **An input the host could not read.** A job service result says the job's inputs failed on its
+//! host with `input_failure` (the agent's code: `input-unreadable`, `host-port-lost`), its reason
+//! then being input-failed. That is the host's failure whatever the job's exit, so it is read
+//! before anything else of the result ([`input_failed`]), and the run is `input-failed`
+//! ([`Settled::InputFailed`]): run again as an `infra` ending is, and at the last attempt
+//! answered `UNAVAILABLE` with a message that names the host and the code. Only the code's leading
+//! run of lower-case letters, digits and dashes is taken. A start that failed is read for the
+//! refused tree list and the lost object first, which the frontend acts on. The job service at
+//! this revision cannot be asked to place the next attempt away from the host, so the next job
+//! goes where the service places it.
+//!
+//! The agent sets `input_failure` only on a job that did not succeed, and the task tool exits 0
+//! whenever the action ran, so an action whose compiler could not read a declared input because
+//! the host's tree answered EIO comes back as a clean result with the action's exit code 1.
+//! Until the host reports that itself, the frontend's ingest is asked about such a result too
+//! ([`Ingest::unreadable_input`](super::Ingest::unreadable_input)): when the action's standard
+//! error holds the compiler's own could-not-open line for one of its declared input files with
+//! the text of EIO, the run is `input-failed` as above, naming that file and the host.
 //!
 //! What a job that did not end well wrote goes with the status as a detail, cut to a cap
 //! ([`output`](super::output)); the code and the message above are unchanged by it.
@@ -180,6 +201,53 @@ pub(crate) enum Settled {
     /// took `0` as its miss path: the action runs again, and the first
     /// [`LIST_REFUSALS`] of these in an operation spend no attempt.
     ListRefused(MissPath),
+    /// The job's host could not provide or read its inputs: the farm's failure, never the
+    /// action's, and the action runs again.
+    InputFailed(InputFailure),
+}
+
+/// An input a job's host could not provide or read, and the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InputFailure {
+    /// The job's host, as the job service names it; empty when it named none.
+    pub(crate) host: String,
+    /// What failed.
+    pub(crate) input: FailedInput,
+}
+
+/// What a host could not provide or read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FailedInput {
+    /// The job service's result says so, with the agent's code (`input-unreadable`), cut to its
+    /// leading code ([`agent_code`]); empty when the result named none.
+    Reported(String),
+    /// The action's own standard error says it could not open this declared input file, with
+    /// the text of EIO: the path as the action named it.
+    Unread(String),
+}
+
+impl InputFailure {
+    /// What the callers are told: the input, the host, and that the farm failed.
+    fn message(&self) -> String {
+        let host = match self.host.as_str() {
+            "" => "its host".to_owned(),
+            host => format!("host {host}"),
+        };
+        match &self.input {
+            FailedInput::Reported(code) if code.is_empty() => format!(
+                "the farm could not provide the job's inputs on {host}: the job service \
+                 reported an input failure (not the action's own failure)"
+            ),
+            FailedInput::Reported(code) => format!(
+                "the farm could not provide the job's inputs on {host}: the job service \
+                 reported {code} (not the action's own failure)"
+            ),
+            FailedInput::Unread(path) => format!(
+                "the farm could not read the action's input {path:?} on {host}: opening it \
+                 answered an I/O error (not the action's own failure)"
+            ),
+        }
+    }
 }
 
 /// The codes an agent gives a start it refuses, as `js-agent-wire` spells them.
@@ -300,8 +368,29 @@ fn infra(job: &Job, what: &str) -> Verdict {
     Verdict::Settled(Settled::Infra(what.to_owned()))
 }
 
+/// The verdict on a job whose `result` says its inputs failed on its host (`input_failure`, or
+/// reason input-failed), or `None`.
+fn input_failed(job: &Job, result: &JobResult) -> Option<Verdict> {
+    let named = result.input_failure.as_deref();
+    if named.is_none() && result.reason() != ResultReason::InputFailed {
+        return None;
+    }
+    let code = agent_code(named.unwrap_or_default()).to_owned();
+    tracing::warn!(job = %job.id, host = %job.host_id, code = %code, "the host could not provide or read the job's inputs");
+    Some(Verdict::Settled(Settled::InputFailed(InputFailure {
+        host: job.host_id.clone(),
+        input: FailedInput::Reported(code),
+    })))
+}
+
 /// The verdict on `job`, which has ended, with its `result`.
 pub(super) fn judge(job: &Job, result: &JobResult) -> Verdict {
+    if job.state() == JobState::FailedToStart {
+        return failed_to_start(job, result);
+    }
+    if let Some(verdict) = input_failed(job, result) {
+        return verdict;
+    }
     match job.state() {
         JobState::Succeeded => promote(job, result),
         JobState::Failed => match result.reason() {
@@ -321,7 +410,6 @@ pub(super) fn judge(job: &Job, result: &JobResult) -> Verdict {
             tracing::warn!(job = %job.id, "the job was lost with its host");
             Verdict::Settled(Settled::Lost("the job was lost with its host"))
         }
-        JobState::FailedToStart => failed_to_start(job),
         _ => infra(job, "the job ended in a state this server does not know"),
     }
 }
@@ -354,8 +442,8 @@ fn promote(job: &Job, result: &JobResult) -> Verdict {
     }
 }
 
-/// The verdict on a job that did not start.
-fn failed_to_start(job: &Job) -> Verdict {
+/// The verdict on a job that did not start, with its `result`.
+fn failed_to_start(job: &Job, result: &JobResult) -> Verdict {
     if list_refused(&job.start_failure_detail) {
         let detail_bytes = job.start_failure_detail.len();
         tracing::warn!(job = %job.id, detail_bytes, "the job failed to start: the host refused its tree list as not mountable through tierstore");
@@ -373,6 +461,9 @@ fn failed_to_start(job: &Job) -> Verdict {
             object,
             settled: Settled::Infra(why.to_owned()),
         };
+    }
+    if let Some(verdict) = input_failed(job, result) {
+        return verdict;
     }
     match job.start_failure() {
         StartFailureCode::NoCapacity => infra(job, "the job failed to start: no-capacity"),
@@ -453,7 +544,11 @@ impl Settled {
     pub(super) const fn retried(&self) -> bool {
         matches!(
             self,
-            Self::Infra(_) | Self::Lost(_) | Self::OutOfMemory | Self::ListRefused(_)
+            Self::Infra(_)
+                | Self::Lost(_)
+                | Self::OutOfMemory
+                | Self::ListRefused(_)
+                | Self::InputFailed(_)
         )
     }
 
@@ -467,6 +562,7 @@ impl Settled {
         match self {
             Self::Infra(why) => status(Code::Unavailable, why),
             Self::Lost(why) => status(Code::Unavailable, why),
+            Self::InputFailed(failure) => status(Code::Unavailable, &failure.message()),
             Self::ListRefused(path) => status(
                 Code::Unavailable,
                 match path {
@@ -519,3 +615,7 @@ mod tests;
 #[cfg(test)]
 #[path = "outcome_list_tests.rs"]
 mod list_tests;
+
+#[cfg(test)]
+#[path = "outcome_input_tests.rs"]
+mod input_tests;

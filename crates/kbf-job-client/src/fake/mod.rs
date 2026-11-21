@@ -310,6 +310,14 @@ impl FakeJobServer {
         self.shared.state().finish(job, exit_code)
     }
 
+    /// A running job ends because an input its host provides failed while it ran, as the
+    /// service's agent reports it: failed, for reason input-failed, with the agent's `code`
+    /// (such as `input-unreadable`) as the result's `input_failure`, and its own `exit_code`
+    /// kept, 0 included.
+    pub fn fail_inputs(&self, job: &str, exit_code: i32, code: &str) -> bool {
+        self.shared.state().fail_inputs(job, exit_code, code)
+    }
+
     /// A queued, placed or starting job fails to start with `code`.
     pub fn fail_to_start(&self, job: &str, code: StartFailureCode) -> bool {
         self.shared.state().fail_to_start(job, code)

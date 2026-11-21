@@ -54,7 +54,7 @@ pub fn built_class() -> SizeClass {
 
 pub const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -117,6 +117,11 @@ pub struct FakeIngest {
     /// The mints and the reports of lost objects, in the order they were called: `"mint"` or
     /// `"lost"`.
     pub calls_in_order: Mutex<Vec<&'static str>>,
+    /// The answers to the questions whether a result says the action could not read a declared
+    /// input, in order; `None` once they run out.
+    pub unreadable: Mutex<VecDeque<String>>,
+    /// The exit code of each result asked about, in order.
+    pub asked_unreadable: Mutex<Vec<i32>>,
 }
 
 impl FakeIngest {
@@ -132,6 +137,8 @@ impl FakeIngest {
             walls: Mutex::new(Vec::new()),
             lost: Mutex::new(Vec::new()),
             calls_in_order: Mutex::new(Vec::new()),
+            unreadable: Mutex::new(VecDeque::new()),
+            asked_unreadable: Mutex::new(Vec::new()),
         }
     }
 
@@ -187,6 +194,11 @@ impl Ingest for FakeIngest {
         locked(&self.script)
             .pop_front()
             .unwrap_or_else(|| Self::ran(0))
+    }
+
+    async fn unreadable_input(&self, _action: &Digest, result: &ActionResult) -> Option<String> {
+        locked(&self.asked_unreadable).push(result.exit_code);
+        locked(&self.unreadable).pop_front()
     }
 
     async fn lost(&self, action: &Digest, object: &LostObject) {
