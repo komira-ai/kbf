@@ -810,4 +810,6 @@ fn release_follows(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
 }
 
 #[cfg(test)]
+mod cancel_tests;
+#[cfg(test)]
 mod tests;
