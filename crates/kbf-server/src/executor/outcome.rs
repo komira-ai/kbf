@@ -51,6 +51,12 @@
 //! | refused at submit with a code this server does not know | `infra` | `UNAVAILABLE`: rerun |
 //! | refused at submit otherwise | `infra` | `UNAVAILABLE`: rerun |
 //!
+//! A submit the job service did not take because it is busy or cannot be reached (no answer
+//! within the call's limit, a broken or reset connection, `RESOURCE_EXHAUSTED` or another status
+//! of its load: [`busy`](super::busy)) is not in the table: it decides nothing, and the same
+//! submit is sent again, under the same id, until the service answers or a caller cancels; it
+//! spends no attempt.
+//!
 //! Every `infra` and `lost` row is run again, as the operation's next attempt, at most
 //! [`RESUBMITS`] times; then the callers are answered `UNAVAILABLE`. So is `out-of-memory`, and
 //! the callers are answered as the table says. A `list-refused` row is run again too, but its
@@ -103,6 +109,7 @@ use kbf_proto::google::rpc::{self, ErrorInfo};
 use prost::Message;
 use tonic::Code;
 
+use super::busy::busy;
 use super::traits::{LostObject, MissPath};
 
 /// How many times an operation is submitted again after a run that ended for a reason of the
@@ -403,9 +410,11 @@ pub(super) fn forgotten() -> Settled {
 }
 
 /// What a submit that failed with `error` comes to; `None` when nothing is decided, because
-/// nothing was sent or the answer was lost, and the same submit is sent again.
+/// nothing was sent, the answer was lost, or the service is busy ([`busy`]: a
+/// `RESOURCE_EXHAUSTED` among them), and the same submit is sent again.
 pub(super) fn refused(error: &Error) -> Option<Settled> {
     match error {
+        error if busy(error) => None,
         Error::Unreachable(_) | Error::Transport(_) | Error::Decode(_) => None,
         Error::Refused(refusal) => Some(match refusal.code() {
             RefusalCode::JobIdConflict => Settled::Infra(
