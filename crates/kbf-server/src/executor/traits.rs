@@ -152,6 +152,18 @@ pub trait Ingest: Send + Sync {
         limits: &UntrustedLimits,
     ) -> Ingested;
 
+    /// The declared input of `action` that `result`, the result a run of it rebuilt with a nonzero
+    /// exit code, says the action could not read because its host's file of it answered EIO: the
+    /// path as the action's standard error names it, or `None`. A stopgap until the host reports
+    /// such a failure itself (`input_failure`): the action's standard error must hold the
+    /// compiler's own could-not-open line with the text of EIO for a path that is a file of the
+    /// action's input root, and anything not read or not exactly so answers `None`. The default
+    /// answers `None`.
+    async fn unreadable_input(&self, action: &Digest, result: &ActionResult) -> Option<String> {
+        let _ = (action, result);
+        None
+    }
+
     /// A job of `action` did not start because the store answered that it does not have
     /// `object`, an object of its tree: what the frontend's memos say of that object is dropped,
     /// the absence is told to the frontend's packs (which forget a pack only once the absence is

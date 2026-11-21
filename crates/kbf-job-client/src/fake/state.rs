@@ -99,6 +99,8 @@ struct Record {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     truncated: bool,
+    /// The agent's code of an input that failed on the host while the job ran; `None` otherwise.
+    input_failure: Option<String>,
 }
 
 /// Whether a job in `state` holds a host: placed, starting or running.
@@ -396,6 +398,7 @@ impl State {
             stdout: Vec::new(),
             stderr: Vec::new(),
             truncated: false,
+            input_failure: None,
         };
         let job = view(&record, &self.hosts);
         self.jobs.insert(id, record);
@@ -501,7 +504,7 @@ impl State {
             truncated: record.truncated,
             times: Some(record.times),
             usage: None,
-            input_failure: None,
+            input_failure: record.input_failure.clone(),
         })
     }
 
@@ -609,6 +612,21 @@ impl State {
                 record.exit_code = Some(exit_code);
                 record.reason = ResultReason::Exit;
                 end(record, state, now);
+            },
+        )
+    }
+
+    /// A running job whose host's input failed while it ran: failed, for reason input-failed,
+    /// with the agent's `code`, whatever its own `exit_code`, which is kept.
+    pub(super) fn fail_inputs(&mut self, id: &str, exit_code: i32, code: &str) -> bool {
+        self.step(
+            id,
+            |record| record.state == JobState::Running,
+            |record, now| {
+                record.exit_code = Some(exit_code);
+                record.reason = ResultReason::InputFailed;
+                record.input_failure = Some(code.to_owned());
+                end(record, JobState::Failed, now);
             },
         )
     }

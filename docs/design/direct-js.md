@@ -63,6 +63,15 @@ ingest refuses, killed at its memory limit) runs the operation again as its next
 `MAC_ACTION_NAMES_NO_XCODE`). Each attempt writes under its own create-only key, so a zombie of an earlier one never writes into
 a later one's result.
 
+A job whose inputs its host could not provide or read is the farm's too, never the action's: a result that names an input
+failure (`input_failure`, reason input-failed) whatever the job's state and exit, and, as a stopgap, a clean result whose
+action exited nonzero with the compiler's own `fatal error: cannot open file '<path>': I/O error` (or `Input/output
+error`) for a file of the action's input root (`executor/front_unreadable.rs`; the agent sets `input_failure` only on a job
+that did not succeed, and the task tool exits 0 whenever the action ran). It is run again as above, counted
+`kbf_executor_runs_total{outcome="input_failed"}`, and at the last attempt answered `UNAVAILABLE` with a message that names
+the input (the agent's code or the path) and the host. The service at the pin cannot be asked to avoid a host, so the next
+job goes where it places it.
+
 `CancelOperation` cancels the job (`CancelJob`) and answers the callers `CANCELLED`. A stream that ends does not cancel.
 
 ## 3. Over a state store: answers by name, restarts and N frontends

@@ -73,7 +73,7 @@ use kbf_front::prepare_run::{
     PutDirRun,
 };
 use kbf_front::{Backend, Described, IssuedPutDir, PackKeyMint, Packs};
-use kbf_proto::reapi::{self, Action, Command, Digest};
+use kbf_proto::reapi::{self, Action, ActionResult, Command, Digest};
 use kbf_types::{DigestFunction, ImageRef};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -95,6 +95,8 @@ use crate::executor::traits::{
 
 #[path = "front_miss.rs"]
 mod miss;
+#[path = "front_unreadable.rs"]
+mod unreadable;
 use miss::Misses;
 
 /// The most action trees [`Front`] remembers.
@@ -603,6 +605,11 @@ impl Ingest for Front {
             kbf_front::Ingested::Reject(why) => Ingested::Reject(reason(why)),
             kbf_front::Ingested::Unavailable(why) => Ingested::Unavailable(why.to_string()),
         }
+    }
+
+    async fn unreadable_input(&self, action: &Digest, result: &ActionResult) -> Option<String> {
+        let action = cas_digest(action).ok()?;
+        unreadable::unreadable_input(&self.backend, &action, result).await
     }
 
     async fn lost(&self, action: &Digest, object: &LostObject) {

@@ -13,7 +13,10 @@
 //! placed and a tree not yet in the store fails the job's start; a failed write ends the run
 //! with no job submitted, and a cancel then ends it with nothing to withdraw. The job is then read
 //! back every poll until it ends ([`outcome::judge`](super::outcome)): a job that ended well has
-//! its pack ingested and answers the callers with the result; an ending of the farm's submits the
+//! its pack ingested and answers the callers with the result, unless the action exited nonzero
+//! because its host could not read a declared input
+//! ([`Ingest::unreadable_input`](super::Ingest::unreadable_input)), which is an ending of the
+//! farm's; an ending of the farm's submits the
 //! operation's next attempt, while it has one ([`RESUBMITS`]); a job whose tree list a host refused
 //! as not mountable also runs again, the first [`LIST_REFUSALS`] times in an operation without
 //! spending an attempt (a resumed operation counts them from zero), after the frontend takes its
@@ -39,10 +42,10 @@
 use std::future::pending;
 use std::sync::Arc;
 
-use js_proto::v1::{JobResult, JobSpec, JobState};
+use js_proto::v1::{Job, JobResult, JobSpec, JobState};
 use kbf_front::{Finished, Stage};
 use kbf_proto::google::rpc;
-use kbf_proto::reapi;
+use kbf_proto::reapi::{self, ActionResult};
 use kbf_types::{ActionKey, OperationId};
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep, timeout};
@@ -51,7 +54,10 @@ use tonic::Code;
 use super::Inner;
 use super::api::{answered, not_found, note};
 use super::metrics::{IngestEnd, RunEnd};
-use super::outcome::{LIST_REFUSALS, RESUBMITS, Settled, Verdict, forgotten, judge, refused};
+use super::outcome::{
+    FailedInput, InputFailure, LIST_REFUSALS, RESUBMITS, Settled, Verdict, forgotten, judge,
+    refused,
+};
 use super::output::{Output, Tail};
 use super::phases::{Mark, Phase, Timeline};
 use super::record;
@@ -626,8 +632,13 @@ async fn watch_job(
             match ingested {
                 Ingested::Ran { result, .. } => {
                     metrics.ingested(IngestEnd::Ok);
-                    metrics.run_ended(RunEnd::Ran);
-                    Ended::Answer(Finished::Ran(result))
+                    match unreadable(inner, op, run, &read, &result).await {
+                        Some(failure) => Ended::Again(Settled::InputFailed(failure), None),
+                        None => {
+                            metrics.run_ended(RunEnd::Ran);
+                            Ended::Answer(Finished::Ran(result))
+                        }
+                    }
                 }
                 Ingested::Reject(why) => {
                     metrics.ingested(IngestEnd::Rejected(why));
@@ -641,6 +652,28 @@ async fn watch_job(
             }
         }
     }
+}
+
+/// The input the host of `job` could not read, when the action's `result` (an exit code other
+/// than 0) says so ([`Ingest::unreadable_input`](super::Ingest::unreadable_input)), or
+/// `None`: the result is then the answer.
+async fn unreadable(
+    inner: &Inner,
+    op: &Op,
+    run: RunId,
+    job: &Job,
+    result: &ActionResult,
+) -> Option<InputFailure> {
+    if result.exit_code == 0 {
+        return None;
+    }
+    let action = reapi_digest(&op.key.action);
+    let path = inner.deps.ingest.unreadable_input(&action, result).await?;
+    tracing::warn!(operation = %op.id, %run, job = %job.id, host = %job.host_id, input = ?path, "the action could not read a declared input on its host: the run is the farm's failure");
+    Some(InputFailure {
+        host: job.host_id.clone(),
+        input: FailedInput::Unread(path),
+    })
 }
 
 /// The frontend's read of the pack `key` of `run` of `action`.

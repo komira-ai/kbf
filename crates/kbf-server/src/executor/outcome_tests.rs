@@ -199,6 +199,26 @@ fn cases() -> Vec<(&'static str, Case)> {
             ),
         ),
         (
+            "any state but failed to start, its result naming an input failure (`input_failure`, or reason input-failed)",
+            judged(
+                ended(JobState::Failed),
+                JobResult {
+                    input_failure: Some("input-unreadable".to_owned()),
+                    ..result(ResultReason::InputFailed, Some(1))
+                },
+            ),
+        ),
+        (
+            "failed to start, its result naming an input failure",
+            judged(
+                failed_to_start(StartFailureCode::InputUnavailable),
+                JobResult {
+                    input_failure: Some("tree-prefetch-failed".to_owned()),
+                    ..none.clone()
+                },
+            ),
+        ),
+        (
             "cancelled by anyone else",
             judged(ended(JobState::Cancelled), none.clone()),
         ),
@@ -338,6 +358,7 @@ fn class_of(verdict: &Verdict) -> &'static str {
             Settled::Invalid(_) | Settled::NoXcode => "invalid",
             Settled::Missing(_) => "missing",
             Settled::ListRefused(_) => "list-refused",
+            Settled::InputFailed(_) => "input-failed",
         },
     }
 }
@@ -395,7 +416,7 @@ fn each_job_end_maps_to_one_failure_class() {
             continue;
         };
         let (code, retried) = match class {
-            "infra" | "lost" => (Code::Unavailable, true),
+            "infra" | "lost" | "input-failed" => (Code::Unavailable, true),
             "timeout" => (Code::DeadlineExceeded, false),
             "out-of-memory" => (Code::FailedPrecondition, true),
             "invalid" => (Code::InvalidArgument, false),
