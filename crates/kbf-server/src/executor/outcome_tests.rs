@@ -407,14 +407,19 @@ fn each_job_end_maps_to_one_failure_class() {
 }
 
 /// Catches the answers a submit has when nothing is decided being settled: a request that was
-/// never sent, and one whose answer was lost, are sent again (`None`), whatever else the
-/// service might have done.
+/// never sent, one whose answer was lost, and one a busy service did not take
+/// (`RESOURCE_EXHAUSTED`, how a GOAWAY `ENHANCE_YOUR_CALM` reads) are sent again (`None`),
+/// whatever else the service might have done.
 #[test]
 fn a_submit_whose_answer_is_not_known_decides_nothing() {
     let unsent = Error::Unreachable(Unsent::TooLarge { len: 2, cap: 1 });
     let lost = Error::Transport(Broken::Deadline(std::time::Duration::from_secs(1)));
     let undecodable = Error::Decode(Undecodable::Missing("job"));
-    for error in [unsent, lost, undecodable] {
+    let busy = Error::Status {
+        code: Code::ResourceExhausted,
+        message: "too_many_resets".to_owned(),
+    };
+    for error in [unsent, lost, undecodable, busy] {
         assert_eq!(refused(&error), None, "{error}");
     }
     let listing = [Error::TooMany(3), Error::Stuck(Stuck::EmptyPages(1))];

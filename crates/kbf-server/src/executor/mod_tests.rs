@@ -519,7 +519,7 @@ impl Rig {
         });
         let metrics = Arc::new(Metrics::default());
         let mut rig = Self {
-            exec: Executor::new(
+            exec: Executor::with_jitter(
                 cfg.clone(),
                 Deps {
                     client: fake.client().expect("a client"),
@@ -529,6 +529,7 @@ impl Rig {
                     store: store.clone().map(|s| s as Arc<dyn Store>),
                     recorder: recorder.clone(),
                 },
+                no_jitter,
             )
             .expect("a valid config"),
             fake,
@@ -562,7 +563,7 @@ impl Rig {
     pub(crate) fn executor(&self, instance: &str) -> Executor {
         let mut cfg = self.cfg.clone();
         cfg.instance = instance.to_owned();
-        Executor::new(cfg, self.deps()).expect("a valid config")
+        Executor::with_jitter(cfg, self.deps(), no_jitter).expect("a valid config")
     }
 
     /// The rows of the process `instance` over this rig's store.
@@ -712,4 +713,10 @@ pub(crate) fn error_info(
         let info = kbf_proto::google::rpc::ErrorInfo::decode(any.value.as_slice()).ok()?;
         (info.reason == reason).then_some(info)
     })
+}
+
+/// No jitter: a wait on a busy job service is its level's whole wait, so a test's paused clock
+/// reaches each call at the step it is due.
+pub(crate) const fn no_jitter() -> f64 {
+    0.0
 }

@@ -45,6 +45,8 @@ tonic.workspace = true
 tonic-prost.workspace = true
 
 [dev-dependencies]
+# A server that closes its connection with GOAWAY ENHANCE_YOUR_CALM (tests/goaway.rs).
+h2.workspace = true
 kbf-job-client = { workspace = true, features = ["fake"] }
 kbf-testkit.workspace = true
 prost-types.workspace = true

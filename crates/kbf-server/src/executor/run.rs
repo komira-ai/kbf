@@ -2,8 +2,10 @@
 //!
 //! A run is prepared (the action read, its key minted and, for a put directory, its tree
 //! named), its row written to the state store when there is one, and its job submitted; a
-//! submit whose answer was lost is sent again, the same spec under the same id, every
-//! [`Config::poll`](super::Config::poll), so the service makes one job.
+//! submit whose answer was lost, or that a busy job service did not take, is sent again, the
+//! same spec under the same id, after a [`Config::poll`](super::Config::poll) (longer while the
+//! service stays busy: [`busy`](super::busy)), so the service makes one job, and no attempt is
+//! spent on it.
 //!
 //! The tree's writes go on while the row is written ([`Ingest::stored`](super::Ingest::stored)):
 //! its name is a digest of what it holds, known before any write. Every attempt waits for the
@@ -399,9 +401,12 @@ async fn fresh(
     watch_job(inner, op, run, &submitted, cancel, timeline).await
 }
 
-/// Submits `spec` until the job service answers with the job, sending it again every poll
-/// while the answer is lost: the same spec under the same id, so the service makes one job.
-/// Each call is timed as [`Step::Rpc`] and each wait as [`Step::Backoff`].
+/// Submits `spec` until the job service answers with the job, sending it again while the answer
+/// is lost or the service is busy: the same spec under the same id, so the service makes one
+/// job. It waits a poll before each resend, and longer while the service stays busy
+/// ([`Busy::pause`](super::busy::Busy::pause)), for as long as that lasts: only a caller's
+/// cancel, which the caller selects on, ends the wait. Each call is timed as [`Step::Rpc`] and
+/// each wait as [`Step::Backoff`].
 ///
 /// # Errors
 /// What the service's refusal of the job settles the run as.
@@ -411,16 +416,19 @@ async fn submit_job(inner: &Inner, spec: &JobSpec) -> Result<(), Settled> {
         let started = Instant::now();
         let answer = api.submit_job(spec.clone()).await;
         metrics.step_took(Step::Rpc, started.elapsed());
+        let busy = inner.busy.saw("submitting a job", &answer).busy();
         let Err(error) = answer else {
             return Ok(());
         };
         if let Some(settled) = refused(&error) {
             return Err(settled);
         }
-        note("submitting a job", &Err::<(), _>(error));
+        if !busy {
+            tracing::warn!(%error, "submitting a job failed");
+        }
         metrics.job_resubmitted();
         let started = Instant::now();
-        sleep(inner.cfg.poll).await;
+        sleep(inner.busy.pause()).await;
         metrics.step_took(Step::Backoff, started.elapsed());
     }
 }
@@ -476,21 +484,48 @@ async fn resume(
     watch_job(inner, op, run, &submitted, cancel, timeline).await
 }
 
-/// Cancels `job` for its operation's callers, a few times while the service does not answer.
-async fn withdraw(inner: &Inner, job: &str) {
-    for _ in 0..3 {
-        let answer = inner.api().cancel_job(job).await;
-        note("cancelling a job", &answer);
-        if answer.is_ok() {
-            inner.deps.metrics.job_cancelled();
-        }
-        if answered(&answer) {
-            return;
-        }
+/// How many cancels of a job that failed for a reason other than a busy service are sent.
+const CANCEL_TRIES: u32 = 3;
+
+/// Cancels `job` for its operation's callers. The first cancel is sent at once; a cancel the
+/// service did not answer is sent again after the same wait as any call
+/// ([`Busy::pause`](super::busy::Busy::pause)), on a task of its own so the callers are answered
+/// at once: while the service is busy, until it answers, and for any other error, up to
+/// [`CANCEL_TRIES`] cancels in all.
+async fn withdraw(inner: &Arc<Inner>, job: &str) {
+    let mut left = CANCEL_TRIES;
+    if cancel_once(inner, job, &mut left).await {
+        return;
     }
+    let (inner, job) = (Arc::clone(inner), job.to_owned());
+    tokio::spawn(async move {
+        loop {
+            sleep(inner.busy.pause()).await;
+            if cancel_once(&inner, &job, &mut left).await {
+                return;
+            }
+        }
+    });
 }
 
-/// Reads the job back every poll until it ends, and makes what it ended as of it.
+/// One cancel of `job`: whether no other is to be sent, because the service answered or `left`,
+/// the tries for errors other than a busy service, ran out.
+async fn cancel_once(inner: &Inner, job: &str, left: &mut u32) -> bool {
+    let answer = inner.api().cancel_job(job).await;
+    if answer.is_ok() {
+        inner.deps.metrics.job_cancelled();
+    }
+    let busy = inner.busy.saw("cancelling a job", &answer).busy();
+    if !busy {
+        note("cancelling a job", &answer);
+        *left = left.saturating_sub(1);
+    }
+    answered(&answer) || *left == 0
+}
+
+/// Reads the job back every poll until it ends, and makes what it ended as of it. While the job
+/// service is busy the reads wait longer ([`Busy::pause`](super::busy::Busy::pause)) and decide
+/// nothing; only a job the service says it no longer knows ends the run.
 async fn watch_job(
     inner: &Arc<Inner>,
     op: &Op,
@@ -509,16 +544,21 @@ async fn watch_job(
                 withdraw(inner, job).await;
                 return Ended::Cancelled;
             }
-            () = sleep(inner.cfg.poll) => {}
+            () = sleep(inner.busy.pause()) => {}
         }
-        let read = match inner.api().get_job(job).await {
+        let read = inner.api().get_job(job).await;
+        let busy = inner.busy.saw("reading a job", &read).busy();
+        let read = match read {
             Ok(read) => read,
             Err(error) if not_found(&error) => {
                 tracing::warn!(operation = %op.id, %run, %job, "the job service no longer knows the job");
                 return Ended::Again(forgotten(), None);
             }
+            // Read again after the wait; a busy service is logged once, not at every read.
             Err(error) => {
-                tracing::warn!(operation = %op.id, %run, %error, "reading the job failed");
+                if !busy {
+                    tracing::warn!(operation = %op.id, %run, %error, "reading the job failed");
+                }
                 continue;
             }
         };
@@ -541,15 +581,22 @@ async fn watch_job(
             // A state this server does not know may be live or ended: the result says which.
             _ => {}
         }
-        match inner.api().get_result(job).await {
+        let result = inner.api().get_result(job).await;
+        let busy = inner
+            .busy
+            .saw("reading the result of a job", &result)
+            .busy();
+        match result {
             Ok(result) => break (read, result),
             Err(error) if not_found(&error) => {
                 let output = output(inner, run, job, None).await;
                 return Ended::Again(forgotten(), Some(output));
             }
-            // Asked again at the next poll.
+            // Asked again after the wait.
             Err(error) => {
-                tracing::warn!(operation = %op.id, %run, %error, "reading the result of a job failed");
+                if !busy {
+                    tracing::warn!(operation = %op.id, %run, %error, "reading the result of a job failed");
+                }
             }
         }
     };

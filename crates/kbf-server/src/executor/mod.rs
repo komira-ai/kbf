@@ -11,7 +11,8 @@
 //! open operations hold ([`MAX_OPEN`]).
 //!
 //! Each operation is driven by a task of its own ([`run`]): the job is read back every
-//! [`Config::poll`] until it ends; an ending of the farm's (the host lost, the job service
+//! [`Config::poll`] until it ends (and less often while the job service is busy or cannot be
+//! reached, which never ends a run: [`busy`]); an ending of the farm's (the host lost, the job service
 //! restarted, the job refused at its start) submits the operation again as its next attempt, a
 //! new job with a new key, at most [`outcome::RESUBMITS`] times; a job whose tree list a host
 //! refused as not mountable through tierstore (`tree list not supported`) is run again too, its
@@ -37,6 +38,7 @@
 //! every Execute that is not a cache hit `FAILED_PRECONDITION`.
 
 mod api;
+mod busy;
 mod config;
 mod driver;
 mod front;
@@ -143,6 +145,8 @@ pub(crate) struct Inner {
     pub(crate) deps: Deps,
     pub(crate) rows: Option<Rows>,
     pub(crate) ops: Mutex<Ops>,
+    /// Whether the job service is busy, and how long the operations wait for it ([`busy`]).
+    pub(crate) busy: busy::Busy,
 }
 
 impl Inner {
@@ -171,18 +175,30 @@ impl Executor {
     /// # Errors
     /// `cfg` breaks a rule of [`Config::validate`].
     pub fn new(cfg: Config, deps: Deps) -> Result<Self, ConfigError> {
+        Self::with_jitter(cfg, deps, crate::join::unit_random)
+    }
+
+    /// [`Executor::new`], with `unit` as the source of the jitter of the waits on a busy job
+    /// service ([`busy`]).
+    pub(crate) fn with_jitter(
+        cfg: Config,
+        deps: Deps,
+        unit: fn() -> f64,
+    ) -> Result<Self, ConfigError> {
         cfg.validate()?;
         let rows = deps
             .store
             .as_ref()
             .map(|store| Rows::new(Arc::clone(store), &cfg.instance));
         let ops = Ops::new(rows.is_none().then(process_base));
+        let busy = busy::Busy::new(cfg.poll, unit);
         Ok(Self {
             inner: Arc::new(Inner {
                 cfg,
                 deps,
                 rows,
                 ops: Mutex::new(ops),
+                busy,
             }),
         })
     }
