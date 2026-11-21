@@ -8,26 +8,23 @@
 //! accept loops of the fixture servers are tasks no test awaits.) A client attempt dials
 //! once ([`DialOnce`]), so one that is refused is one connection that ended.
 
+#[path = "support/attempt.rs"]
+mod attempt;
+
 use std::future::{Future, pending};
-use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
+use attempt::{Closing, DialOnce, connect, within};
 use clap::Parser;
-use futures::StreamExt;
-use hyper_util::rt::TokioIo;
 use kbf_front::Cache;
 use kbf_proto::kbf::map::v1::RegisterRequest;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_proto::reapi::GetCapabilitiesRequest;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
 use kbf_server::{Api, Args, bind_server_with_api};
-use kbf_tls::{Incoming, TlsSource};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
@@ -36,7 +33,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tonic::codegen::Service;
 use tonic::codegen::http::Uri;
-use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 /// How long one step of a client attempt (the connection and its handshake, a call, the
@@ -120,14 +116,6 @@ fn path(dir: &Path, file: &str) -> String {
     dir.join(file).to_str().expect("UTF-8 path").to_owned()
 }
 
-/// `future`'s output, or a panic naming `what` if it is not ready within `limit`.
-async fn within<T>(limit: Duration, what: &str, future: impl Future<Output = T>) -> T {
-    match tokio::time::timeout(limit, future).await {
-        Ok(output) => output,
-        Err(_) => panic!("timed out after {limit:?} waiting for {what}"),
-    }
-}
-
 /// A loopback listener on a port of its choosing.
 async fn bound() -> TcpListener {
     within(
@@ -137,50 +125,6 @@ async fn bound() -> TcpListener {
     )
     .await
     .expect("bind")
-}
-
-/// A connector that dials once, for a client attempt.
-///
-/// A tonic `Channel` dials again, at once, whenever its connection has closed before a
-/// request was sent on it, inside `connect()` and the call waiting behind it. A worker
-/// listener refusing a client certificate closes the connection that way: TLS 1.3
-/// finishes the client's handshake before the server judges the certificate, so the
-/// connection looks open until the server's alert ends it, and whether the client's
-/// HTTP/2 task or that alert is first is a race, so a refused attempt can open a second
-/// connection. Here the second dial fails, and an attempt is one connection: one that is
-/// refused is one that ended.
-#[derive(Default)]
-struct DialOnce {
-    dialed: bool,
-}
-
-impl Service<Uri> for DialOnce {
-    type Response = TokioIo<TcpStream>;
-    type Error = io::Error;
-    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, uri: Uri) -> Self::Future {
-        let first = !std::mem::replace(&mut self.dialed, true);
-        Box::pin(async move {
-            if !first {
-                return Err(io::Error::other(
-                    "the connection closed, and this client dials once",
-                ));
-            }
-            let authority = uri
-                .authority()
-                .ok_or_else(|| io::Error::other("the address has no host and port"))?;
-            let stream = TcpStream::connect(authority.as_str()).await?;
-            // As tonic's own connector does: without it a small call waits out the delayed
-            // acknowledgement of the one before.
-            stream.set_nodelay(true)?;
-            Ok(TokioIo::new(stream))
-        })
-    }
 }
 
 fn client(addr: SocketAddr, trust: &str, identity: Option<Identity>) -> Endpoint {
@@ -194,16 +138,6 @@ fn client(addr: SocketAddr, trust: &str, identity: Option<Identity>) -> Endpoint
         .expect("endpoint")
         .tls_config(tls)
         .expect("tls")
-}
-
-/// The channel over one connection to `endpoint`, once its TLS handshake is done within
-/// `limit`; `None` if the connection or the handshake fails (a refused server
-/// certificate, say).
-async fn connect(limit: Duration, endpoint: Endpoint) -> Option<Channel> {
-    let connecting = endpoint.connect_with_connector(DialOnce::default());
-    within(limit, "the connection and TLS handshake", connecting)
-        .await
-        .ok()
 }
 
 async fn capabilities(channel: Channel) -> bool {
@@ -497,17 +431,9 @@ async fn the_connector_of_an_attempt_dials_once() {
 }
 
 /// Attempts through [`connect`] on a server that completes the TLS handshake and then
-/// ends the session are one connection each, counted on the server: a `Channel` from
-/// `Endpoint::connect()` dials again when its connection has closed before a request
-/// went out on it, and this makes that the case every time.
-///
-/// The server is kbf-tls's own `Incoming`, so a connection it yields is one whose
-/// handshake it finished. It counts the connection, ends the TLS session, and counts
-/// again when the client has let go of the socket. The client lets go once it has seen
-/// the end (its connection task finishes, which drops the socket and, in the same poll,
-/// the channel to it), so the call that follows finds a closed connection, on this
-/// current-thread runtime, without a sleep. The connection is counted before it is
-/// closed, so the count is exact when the attempt ends.
+/// ends the session ([`Closing`]) are one connection each, counted on the server: a
+/// `Channel` from `Endpoint::connect()` dials again when its connection has closed before
+/// a request went out on it, and this makes that the case every time.
 ///
 /// Kills: `connect` going back to `Endpoint::connect()`, or any client helper that dials
 /// without [`DialOnce`].
@@ -516,52 +442,18 @@ async fn attempts_through_connect_are_one_connection_each() {
     const ATTEMPTS: usize = 5;
     let issuer = ca("issuer");
     let server = issuer.server();
-    let source = TlsSource::fixed(
-        "closing",
-        server.cert.as_bytes(),
-        server.key.as_bytes(),
-        None,
-    )
-    .expect("a TLS configuration");
-    let tcp = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
-    let addr = tcp.local_addr().expect("address");
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let let_go = Arc::new(AtomicUsize::new(0));
-    let (counted, counted_let_go) = (Arc::clone(&accepted), Arc::clone(&let_go));
-    tokio::spawn(async move {
-        let mut incoming = Incoming::new(tcp, Some(source));
-        while let Some(Ok(mut conn)) = incoming.next().await {
-            counted.fetch_add(1, Ordering::SeqCst);
-            let counted_let_go = Arc::clone(&counted_let_go);
-            tokio::spawn(async move {
-                let _ = conn.shutdown().await;
-                // Ends when the client closes its end, cleanly or not.
-                let _ = conn.read_to_end(&mut Vec::new()).await;
-                counted_let_go.fetch_add(1, Ordering::SeqCst);
-            });
-        }
-    });
+    let closing = Closing::start(&server.cert, &server.key);
 
     for attempt in 1..=ATTEMPTS {
-        let channel = connect(STEP, client(addr, &issuer.pem(), None)).await;
-        let letting_go = async {
-            while let_go.load(Ordering::SeqCst) < attempt {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        };
-        within(
-            STEP,
-            "the client to let go of a closed connection",
-            letting_go,
-        )
-        .await;
+        let channel = connect(STEP, client(closing.addr, &issuer.pem(), None)).await;
+        closing.let_go(STEP, attempt).await;
         // What the call ends with does not matter, only how many connections it made.
         if let Some(channel) = channel {
             let _ = capabilities(channel).await;
         }
     }
     assert_eq!(
-        accepted.load(Ordering::SeqCst),
+        closing.accepted(),
         ATTEMPTS,
         "an attempt dialed more than once"
     );
