@@ -63,18 +63,21 @@ pub(super) fn named(stderr: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// The path of `line` when it is the compiler's could-not-open line with the text of EIO.
+/// The path of `line` when it is the compiler's could-not-open line with the text of EIO: the
+/// first place in it where [`CANNOT_OPEN`] follows nothing or `: ` and is followed by a path, `': `
+/// and the text of EIO to the end of the line.
 fn cannot_open(line: &str) -> Option<&str> {
-    let at = line.find(CANNOT_OPEN)?;
-    let before = &line[..at];
-    if !(before.is_empty() || before.ends_with(": ")) {
-        return None;
-    }
-    let rest = &line[at + CANNOT_OPEN.len()..];
-    let path = EIO_TEXTS
-        .iter()
-        .find_map(|text| rest.strip_suffix(text)?.strip_suffix("': "))?;
-    (!path.is_empty()).then_some(path)
+    line.match_indices(CANNOT_OPEN).find_map(|(at, _)| {
+        let before = &line[..at];
+        if !(before.is_empty() || before.ends_with(": ")) {
+            return None;
+        }
+        let rest = &line[at + CANNOT_OPEN.len()..];
+        let path = EIO_TEXTS
+            .iter()
+            .find_map(|text| rest.strip_suffix(text)?.strip_suffix("': "))?;
+        (!path.is_empty()).then_some(path)
+    })
 }
 
 /// The components of `path`, as the action named it from `working_directory`, below the input

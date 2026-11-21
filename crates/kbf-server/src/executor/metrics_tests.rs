@@ -1,8 +1,8 @@
 use super::*;
-use crate::executor::outcome::Settled;
+use crate::executor::outcome::{FailedInput, InputFailure, Settled};
 
 /// Catches a run counted under an ending it did not have: each way a run is settled has its
-/// own label, and the labels are the six of `RunEnd::ALL`, each once.
+/// own label, and the labels are those of `RunEnd::ALL`, each once.
 #[test]
 fn each_settled_run_is_counted_under_its_own_ending() {
     let ends = [
@@ -11,6 +11,10 @@ fn each_settled_run_is_counted_under_its_own_ending() {
         RunEnd::of(&Settled::OutOfMemory),
         RunEnd::of(&Settled::Lost("gone")),
         RunEnd::of(&Settled::Invalid("x".to_owned())),
+        RunEnd::of(&Settled::InputFailed(InputFailure {
+            host: "h".to_owned(),
+            input: FailedInput::Reported("input-unreadable".to_owned()),
+        })),
     ];
     assert_eq!(
         ends,
@@ -19,13 +23,15 @@ fn each_settled_run_is_counted_under_its_own_ending() {
             RunEnd::Timeout,
             RunEnd::OutOfMemory,
             RunEnd::Lost,
-            RunEnd::Invalid
+            RunEnd::Invalid,
+            RunEnd::InputFailed,
         ]
     );
     let labels: std::collections::BTreeSet<&str> =
         RunEnd::ALL.iter().map(|end| end.label()).collect();
     assert_eq!(labels.len(), RunEnd::ALL.len());
     assert!(labels.contains("ran"));
+    assert!(labels.contains("input_failed"));
 }
 
 /// Catches a counter that lands in another's row: every ending and every ingest result has a

@@ -17,7 +17,8 @@ const HEADER: &str = "buck-out/zig/include/__assert";
 /// Catches a line that is not exactly the compiler's could-not-open line with the text of EIO
 /// being read as one, or one that is being missed: both spellings of EIO, after nothing or a
 /// location, with a carriage return; never another error text, another diagnostic, text after
-/// the error, an empty path, or a line that is not UTF-8.
+/// the error, an empty path, or a line that is not UTF-8; a later place on a line is read when
+/// an earlier one is not the line's.
 #[test]
 fn only_the_compilers_could_not_open_line_with_eio_names_a_path() {
     let stderr = [
@@ -32,11 +33,12 @@ fn only_the_compilers_could_not_open_line_with_eio_names_a_path() {
         "fatal error: cannot open file '': I/O error",
         "fatal error: cannot open file 'h.h' I/O error",
         "In file included from x.cc:1: something else",
+        "xfatal error: cannot open file 'j.h': I/O error: fatal error: cannot open file 'k.h': I/O error",
     ]
     .join("\n");
     let mut bytes = stderr.into_bytes();
     bytes.extend_from_slice(b"\n\xff fatal error: cannot open file 'i.h': I/O error\n");
-    assert_eq!(named(&bytes), vec![HEADER, "inc/b.h", "it's.h"]);
+    assert_eq!(named(&bytes), vec![HEADER, "inc/b.h", "it's.h", "k.h"]);
     assert!(named(b"").is_empty());
 }
 

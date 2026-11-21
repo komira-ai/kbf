@@ -100,8 +100,9 @@
 //!
 //! **An input the host could not read.** A job service result says the job's inputs failed on its
 //! host with `input_failure` (the agent's code: `input-unreadable`, `host-port-lost`), its reason
-//! then being input-failed. That is the host's failure whatever the job's exit, so it is read
-//! before anything else of the result ([`input_failed`]), and the run is `input-failed`
+//! then being input-failed. That is the host's failure whatever the job's state, reason and exit,
+//! so it is read before anything else of the result ([`input_failed`]): it is read before a wall
+//! limit, a memory kill or a cancel by another client too, and the run is `input-failed`
 //! ([`Settled::InputFailed`]): run again as an `infra` ending is, and at the last attempt
 //! answered `UNAVAILABLE` with a message that names the host and the code. Only the code's leading
 //! run of lower-case letters, digits and dashes is taken. A start that failed is read for the
