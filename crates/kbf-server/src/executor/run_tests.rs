@@ -135,27 +135,227 @@ async fn a_submit_whose_answer_was_lost_is_resent_with_the_same_spec_and_counted
     assert_eq!(step("count", "row"), "0", "no state store");
 }
 
-/// A submit the job service refuses for a reason of its own (not the job's) runs the
-/// operation's next attempt, under a new id.
+/// The faults of a busy job service: `RESOURCE_EXHAUSTED` (how a GOAWAY `ENHANCE_YOUR_CALM`
+/// reads) and `UNAVAILABLE`, in turn, `n` of them.
+fn busy_faults(n: usize) -> impl Iterator<Item = Fault> {
+    (0..n).map(|at| Fault::Status {
+        code: if at % 2 == 0 {
+            Code::ResourceExhausted
+        } else {
+            Code::Unavailable
+        },
+        message: "busy".to_owned(),
+    })
+}
+
+/// The job ids of the cancels the fake was sent, in order.
+fn cancels_of(rig: &Rig) -> Vec<String> {
+    rig.fake
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::CancelJob(request) => Some(request.job_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Catches a busy job service failing a build: more submits than an operation has attempts
+/// answered `RESOURCE_EXHAUSTED` or `UNAVAILABLE` end no run and spend no attempt. The same spec
+/// is sent again under the same id until the service takes it, as attempt 0, and the action
+/// runs.
 #[tokio::test(start_paused = true)]
-async fn a_submit_the_service_did_not_take_runs_the_next_attempt() {
+async fn a_busy_service_that_does_not_take_a_submit_spends_no_attempt() {
+    let rig = Rig::start().await;
+    let refusals = usize::try_from(RESUBMITS).expect("small") + 4;
+    for fault in busy_faults(refusals) {
+        rig.fake.inject_on("SubmitJob", fault);
+    }
+    let caller = rig.submit(1);
+    let job = rig.submitted(&caller, 0).await;
+    assert_eq!(job, rig.job_of(&caller, 0));
+    assert_eq!(rig.calls_of("SubmitJob"), refusals + 1);
+    let submits: Vec<_> = rig
+        .fake
+        .calls()
+        .into_iter()
+        .filter(|call| matches!(call, Call::SubmitJob(_)))
+        .collect();
+    assert!(
+        submits.iter().all(|submit| *submit == submits[0]),
+        "the same spec under the same id"
+    );
+    rig.host_finishes(&job, 0);
+    assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));
+    assert_eq!(rig.fake.jobs().len(), 1);
+    assert!(rig.fake.submitted(&rig.job_of(&caller, 1)).is_none());
+    assert_eq!(
+        rig.counted("kbf_executor_runs_total{outcome=\"infra\"} "),
+        0
+    );
+    assert_eq!(rig.counted("kbf_executor_attempts_resubmitted_total "), 0);
+    assert_eq!(
+        rig.counted("kbf_executor_jobs_resubmitted_after_lost_answer_total "),
+        u64::try_from(refusals).expect("small")
+    );
+}
+
+/// Catches a submit that is resent at every poll while the service stays busy: the waits
+/// between the resends double (no jitter in the rig), so in the time eight polls take the
+/// service is sent four submits, and after it takes one the next call waits a poll again.
+#[tokio::test(start_paused = true)]
+async fn the_resends_of_a_submit_back_off_while_the_service_stays_busy() {
+    let rig = Rig::start().await;
+    for fault in busy_faults(10) {
+        rig.fake.inject_on("SubmitJob", fault);
+    }
+    let caller = rig.submit(1);
+    rig.until("the first submit", || rig.calls_of("SubmitJob") == 1)
+        .await;
+    // Waits of 1, 2 and 4 polls: the fourth submit is sent at poll 7, the fifth not before 15.
+    for _ in 0..8 {
+        rig.advance(rig.cfg.poll).await;
+    }
+    assert_eq!(rig.calls_of("SubmitJob"), 4);
+    assert!(rig.exec.cancel(&caller.name));
+    assert_eq!(
+        code_of(&rig.until_done(&caller).await),
+        Code::Cancelled as i32
+    );
+}
+
+/// Catches a cancel that is not heard while a submit waits on a busy service, or a cancel that
+/// leaves the job the service may have taken: the callers are answered CANCELLED, the job is
+/// cancelled, and no submit follows.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_while_the_service_is_busy_answers_cancelled_and_cancels_the_job() {
+    let rig = Rig::start().await;
+    for fault in busy_faults(50) {
+        rig.fake.inject_on("SubmitJob", fault);
+    }
+    let caller = rig.submit(1);
+    rig.until("the submit is sent again", || {
+        rig.calls_of("SubmitJob") >= 3
+    })
+    .await;
+    assert!(rig.exec.cancel(&caller.name));
+    assert_eq!(
+        code_of(&rig.until_done(&caller).await),
+        Code::Cancelled as i32
+    );
+    assert_eq!(cancels_of(&rig), [rig.job_of(&caller, 0)]);
+    let submits = rig.calls_of("SubmitJob");
+    rig.advance(Duration::from_secs(60)).await;
+    assert_eq!(
+        rig.calls_of("SubmitJob"),
+        submits,
+        "no submit after the cancel"
+    );
+    assert_eq!(
+        rig.counted("kbf_executor_runs_total{outcome=\"infra\"} "),
+        0
+    );
+}
+
+/// Catches reads of a job on a busy service that end the run or spend an attempt: reads that
+/// hang past the call's limit and reads answered `RESOURCE_EXHAUSTED` or `UNAVAILABLE` are read
+/// again, and the job's own ending answers the callers.
+#[tokio::test(start_paused = true)]
+async fn reads_of_a_job_on_a_busy_service_spend_no_attempt() {
+    let rig = Rig::start().await;
+    let caller = rig.submit(1);
+    let job = rig.submitted(&caller, 0).await;
+    rig.host_runs(&job);
+    let reads = rig.calls_of("GetJob");
+    rig.fake.inject_on("GetJob", Fault::Hang);
+    rig.fake.inject_on("GetJob", Fault::Hang);
+    for fault in busy_faults(8) {
+        rig.fake.inject_on("GetJob", fault);
+    }
+    rig.until("the faults are spent", || {
+        rig.calls_of("GetJob") >= reads + 11
+    })
+    .await;
+    assert!(rig.fake.finish(&job, 0));
+    assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));
+    assert_eq!(rig.fake.jobs().len(), 1);
+    assert_eq!(rig.counted("kbf_executor_attempts_resubmitted_total "), 0);
+    for outcome in ["infra", "lost"] {
+        let line = format!("kbf_executor_runs_total{{outcome=\"{outcome}\"}} ");
+        assert_eq!(rig.counted(&line), 0, "{outcome}");
+    }
+}
+
+/// Catches operations that keep polling a busy service at the poll: the level is the
+/// executor's, so while reads are answered `RESOURCE_EXHAUSTED` every operation reads its job
+/// less often. At the poll, two operations would be sent twelve busy answers in six polls;
+/// backing off together, they take more than three times as long. When the service answers,
+/// they read at the poll again.
+#[tokio::test(start_paused = true)]
+async fn every_operation_reads_less_often_while_the_service_is_busy() {
+    let rig = Rig::start().await;
+    let (one, two) = (rig.submit(1), rig.submit(2));
+    let first = rig.submitted(&one, 0).await;
+    let second = rig.submitted(&two, 0).await;
+    rig.host_runs(&first);
+    rig.host_runs(&second);
+    let faults = 12;
+    for fault in busy_faults(faults) {
+        rig.fake.inject_on("GetJob", fault);
+    }
+    let before = rig.calls_of("GetJob");
+    let mut polls = 0;
+    while rig.calls_of("GetJob") < before + faults {
+        rig.advance(rig.cfg.poll).await;
+        polls += 1;
+        assert!(polls < 400, "the faults were never spent");
+    }
+    assert!(polls > 18, "twelve busy answers in {polls} polls");
+    rig.until("both read at the poll again", || {
+        rig.calls_of("GetJob") >= before + faults + 2
+    })
+    .await;
+    let settled = rig.calls_of("GetJob");
+    rig.advance(rig.cfg.poll).await;
+    assert_eq!(rig.calls_of("GetJob"), settled + 2, "one read each a poll");
+    assert!(rig.fake.finish(&first, 0));
+    assert!(rig.fake.finish(&second, 0));
+    assert!(matches!(rig.until_done(&one).await, Finished::Ran(_)));
+    assert!(matches!(rig.until_done(&two).await, Finished::Ran(_)));
+}
+
+/// Catches an error that is not the service's load either ending the run or taken for a busy
+/// service: a submit answered with a body that cannot be decoded is sent again under the same
+/// id, and reads of the job and of its result answered `PERMISSION_DENIED` are read again; the
+/// one job runs, and no attempt is spent.
+#[tokio::test(start_paused = true)]
+async fn errors_that_are_not_the_services_load_are_repeated_and_spend_no_attempt() {
     let rig = Rig::start().await;
     rig.fake.inject_on(
         "SubmitJob",
-        Fault::Status {
-            code: Code::ResourceExhausted,
-            message: "full".to_owned(),
-        },
+        Fault::Answer(bytes::Bytes::from_static(b"\xff\xff")),
     );
+    let denied = || Fault::Status {
+        code: Code::PermissionDenied,
+        message: "no".to_owned(),
+    };
+    rig.fake.inject_on("GetJob", denied());
+    rig.fake.inject_on("GetJob", denied());
+    rig.fake.inject_on("GetResult", denied());
     let caller = rig.submit(1);
-    let second = rig.submitted(&caller, 1).await;
-    assert!(rig.fake.submitted(&rig.job_of(&caller, 0)).is_none());
-    rig.host_finishes(&second, 0);
+    let job = rig.submitted(&caller, 0).await;
+    rig.until("the submit is sent again", || {
+        rig.calls_of("SubmitJob") == 2
+    })
+    .await;
+    rig.until("the reads were refused", || rig.calls_of("GetJob") >= 3)
+        .await;
+    rig.host_finishes(&job, 0);
     assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));
-    assert_eq!(
-        rig.counted("kbf_executor_runs_total{outcome=\"infra\"} "),
-        1
-    );
+    assert_eq!(rig.calls_of("GetResult"), 2, "refused once, then read");
+    assert_eq!(rig.fake.jobs().len(), 1);
+    assert_eq!(rig.calls_of("SubmitJob"), 2);
+    assert_eq!(rig.counted("kbf_executor_attempts_resubmitted_total "), 0);
 }
 
 /// Catches a host's silence counted at every poll: it is counted once for a job.
@@ -384,28 +584,61 @@ async fn a_cancel_while_a_submit_is_unanswered_cancels_the_job_it_may_have_taken
     assert_eq!(cancelled, [job]);
 }
 
-/// A cancel whose answer is lost is sent again, at most three times.
+/// Catches a cancel given up while the service is busy, which leaves its job running: a
+/// cancel whose answer is lost, or that the service answers `RESOURCE_EXHAUSTED`, is sent again
+/// until it is answered, past three tries, and the callers are answered CANCELLED meanwhile.
 #[tokio::test(start_paused = true)]
-async fn a_cancel_is_repeated_while_its_answer_is_lost_up_to_three_times() {
+async fn a_cancel_on_a_busy_service_is_sent_again_until_it_is_answered() {
     let rig = Rig::start().await;
-    let (one, two) = (rig.submit(1), rig.submit(2));
-    rig.submitted(&one, 0).await;
-    rig.submitted(&two, 0).await;
-    rig.fake.inject_on("CancelJob", Fault::LoseAnswer);
-    assert!(rig.exec.cancel(&one.name));
-    rig.until_done(&one).await;
-    assert_eq!(rig.calls_of("CancelJob"), 2, "once lost, once answered");
-    for _ in 0..5 {
+    let caller = rig.submit(1);
+    let job = rig.submitted(&caller, 0).await;
+    for _ in 0..3 {
         rig.fake.inject_on("CancelJob", Fault::LoseAnswer);
     }
-    assert!(rig.exec.cancel(&two.name));
-    rig.until_done(&two).await;
+    for fault in busy_faults(3) {
+        rig.fake.inject_on("CancelJob", fault);
+    }
+    assert!(rig.exec.cancel(&caller.name));
     assert_eq!(
-        rig.calls_of("CancelJob"),
-        5,
-        "three more, and then it gives up"
+        code_of(&rig.until_done(&caller).await),
+        Code::Cancelled as i32
     );
+    rig.until("the cancel is answered", || rig.calls_of("CancelJob") == 7)
+        .await;
+    assert_eq!(cancels_of(&rig), vec![job.clone(); 7]);
+    assert_eq!(rig.fake.jobs()[0].state(), JobState::Cancelled);
     assert_eq!(rig.counted("kbf_executor_jobs_cancelled_total "), 1);
+    rig.advance(Duration::from_secs(60)).await;
+    assert_eq!(rig.calls_of("CancelJob"), 7, "none after the answer");
+}
+
+/// Catches a cancel sent for ever when the service will not take it from this client: a cancel
+/// refused `PERMISSION_DENIED` is sent three times in all, and the callers are answered
+/// CANCELLED.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_the_service_refuses_is_sent_three_times() {
+    let rig = Rig::start().await;
+    let caller = rig.submit(1);
+    rig.submitted(&caller, 0).await;
+    for _ in 0..5 {
+        rig.fake.inject_on(
+            "CancelJob",
+            Fault::Status {
+                code: Code::PermissionDenied,
+                message: "no".to_owned(),
+            },
+        );
+    }
+    assert!(rig.exec.cancel(&caller.name));
+    assert_eq!(
+        code_of(&rig.until_done(&caller).await),
+        Code::Cancelled as i32
+    );
+    rig.until("three cancels", || rig.calls_of("CancelJob") == 3)
+        .await;
+    rig.advance(Duration::from_secs(60)).await;
+    assert_eq!(rig.calls_of("CancelJob"), 3, "then it gives up");
+    assert_eq!(rig.counted("kbf_executor_jobs_cancelled_total "), 0);
 }
 
 // ---- the record

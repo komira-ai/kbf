@@ -232,7 +232,14 @@ a start that is given one logs a single warning. They are `--executor-hosts`, `-
 Each attempt of an operation is one job, whose id is made from the frontend id, the operation and
 the attempt (`k<8 hex digits of the sha256 of the frontend id>-<operation>-<attempt>`): a submit sent again after its
 answer was lost, and a frontend that takes the operation up, name the job already made, so no
-action is submitted twice. `CancelOperation` is a cancel of the job. How a job ends is mapped to
+action is submitted twice. A job service that is busy or cannot be reached (no answer within the
+call timeout, a broken or reset connection, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`) never fails an
+action and spends no attempt: a submit it did not take is sent again, the same spec under the same
+id, until it takes it or the caller cancels, and the reads of a job are repeated. While it stays
+busy every operation of the frontend waits longer between its calls, from the poll doubling to
+10 s, so a stalled service is not sent a call per operation per poll; the frontend logs once when
+the service turns busy and once when it answers again. `CancelOperation` is a cancel of the job,
+sent again until the service answers it. How a job ends is mapped to
 failure classes as the table in `crates/kbf-server/src/executor/outcome.rs` says: a job
 stopped at its wall limit is the action's own timeout, answered `DEADLINE_EXCEEDED` at once; one
 killed for memory, a lost job (the host's fault) and any other ending of the farm's are submitted again as
