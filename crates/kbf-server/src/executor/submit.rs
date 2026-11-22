@@ -84,6 +84,9 @@ pub fn job_id(frontend: &str, run: RunId) -> String {
 pub(super) struct Prepared {
     pub(super) spec: JobSpec,
     pub(super) key: PackKey,
+    /// The action's timeout, or the executor's default when it names none: the deadline a
+    /// refused start is placed again within ([`super::refused`]).
+    pub(super) timeout: Duration,
 }
 
 impl From<InputsError> for Settled {
@@ -214,7 +217,7 @@ pub(super) async fn prepare(
         form,
     };
     let spec = put_dir_spec(ctx, &job, run, action, (timeout, wall), (booking, class));
-    Ok(Prepared { spec, key })
+    Ok(Prepared { spec, key, timeout })
 }
 
 /// The refusal of a run of `what` when the executor was given no roots for the put directories.
@@ -281,7 +284,7 @@ async fn prepare_mac(
         wall_seconds: wall_seconds(wall),
         labels: labels(ctx, Some(class)),
     });
-    Ok(Prepared { spec, key })
+    Ok(Prepared { spec, key, timeout })
 }
 
 /// The put directory of `run`, from the frontend's ingest, its input tree written as `tree` says.

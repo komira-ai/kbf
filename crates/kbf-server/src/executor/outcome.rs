@@ -35,7 +35,12 @@
 //! | failed to start quota-unavailable | `lost` | the host's scratch quota is out of order: rerun |
 //! | failed to start files-unsupported | `infra` | `UNAVAILABLE`: the host cannot write the files of a job, rerun |
 //! | failed to start invalid-file | `invalid` | `INVALID_ARGUMENT`: a file of the job is ours to fix |
-//! | failed to start no-capacity | `infra` | `UNAVAILABLE`: rerun |
+//! | failed to start no-capacity (the job service's code: no room within the pool's queue wait) | `infra` | `UNAVAILABLE`: the job service waited for room already, rerun |
+//! | failed to start, its detail the agent's code no-capacity alone (the job does not fit what is free on the host) | `refused` | placed again, spending no attempt, within the action's deadline ([`refused`](super::refused)) |
+//! | failed to start, its detail host-held alone (the host is drained for an update, or its update halted) | `refused` | placed again, spending no attempt, within the action's deadline |
+//! | failed to start host-tainted | `refused` | placed again, spending no attempt, within the action's deadline |
+//! | failed to start, its detail no-capacity or host-held followed by the hosts that refused it (the job service placed it again itself and gave up) | `infra` | `UNAVAILABLE`: the job service retried it, rerun as the next attempt |
+//! | failed to start platform-mismatch | `invalid` | `INVALID_ARGUMENT`: the job's image is not built for the platform the job names, so no host can ever run it |
 //! | failed to start start-timeout | `infra` | `UNAVAILABLE`: rerun |
 //! | failed to start exclusive-not-ready | `infra` | `UNAVAILABLE`: rerun |
 //! | failed to start input-unavailable | `infra` | `UNAVAILABLE`: a host path the job named could not be read on its host, rerun |
@@ -62,7 +67,15 @@
 //! Every `infra`, `input-failed` and `lost` row is run again, as the operation's next attempt, at most
 //! [`RESUBMITS`] times; then the callers are answered `UNAVAILABLE`. So is `out-of-memory`, and
 //! the callers are answered as the table says. A `list-refused` row is run again too, but its
-//! first [`LIST_REFUSALS`] in an operation spend none of those attempts. A status names the code, never the job: a job
+//! first [`LIST_REFUSALS`] in an operation spend none of those attempts. A `refused` row (a host
+//! that would not start the job now: no room, or held for an update, or tainted, given as the
+//! agent's bare code, which a job service passes on without placing the job again) is not the
+//! action's failure and spends no attempt: the operation places its job again, with a wait
+//! between, while the next job would be submitted before the action's own deadline and at most
+//! [`REFUSED_STARTS`](super::refused::REFUSED_STARTS) times; then the callers are answered
+//! `UNAVAILABLE` naming every refusal ([`refused`](super::refused)). A refusal that says no host
+//! can ever run the job (`no-capable-host` at submit, `platform-mismatch` at start) is answered
+//! `INVALID_ARGUMENT` at once, naming it. A status names the code, never the job: a job
 //! carries the arguments and the mounts. The agent's detail of a start it refused is a
 //! code (`quota-unavailable`, ...) or text that can quote those: only the code is
 //! read, from the start of the detail, and only the detail's length is logged.
@@ -132,6 +145,7 @@ use prost::Message;
 use tonic::Code;
 
 use super::busy::busy;
+use super::refused::Refusal;
 use super::traits::{LostObject, MissPath};
 
 /// How many times an operation is submitted again after a run that ended for a reason of the
@@ -169,6 +183,9 @@ pub(super) enum Verdict {
     /// tierstore: the frontend takes its miss path before the run ends as
     /// [`Settled::ListRefused`].
     ListRefused,
+    /// The job did not start because its host would not start it now, for `0`: not the
+    /// action's failure, and the operation places its job again ([`super::refused`]).
+    Refused(Refusal),
     /// The job did not start because the store does not have an object of its tree, `object`:
     /// the frontend's state is told before the run ends as `settled`.
     StoreLost {
@@ -255,6 +272,15 @@ impl InputFailure {
 const QUOTA_UNAVAILABLE: &str = "quota-unavailable";
 const FILES_UNSUPPORTED: &str = "files-unsupported";
 const INVALID_FILE: &str = "invalid-file";
+/// The job does not fit what is free on the host.
+const NO_CAPACITY: &str = "no-capacity";
+/// The host is held: drained for an update, or its update halted. Nothing was created.
+const HOST_HELD: &str = "host-held";
+/// The host is tainted, and refuses every start until its taint is cleared.
+const HOST_TAINTED: &str = "host-tainted";
+/// The start's platform is not the one its image is built for, or not one a start can name:
+/// the agent's own word is that retrying cannot change it.
+const PLATFORM_MISMATCH: &str = "platform-mismatch";
 /// The agent could not check that the network the job would get is limited as it was told
 /// (its firewall or its job network is missing or changed), and created nothing. The proto has
 /// no start-failure code of its own for it: it is a detail of `AGENT_REFUSED`.
@@ -484,6 +510,17 @@ fn failed_to_start(job: &Job, result: &JobResult) -> Verdict {
             INVALID_FILE => Verdict::Settled(Settled::Invalid(
                 "the host refused a file of the job".to_owned(),
             )),
+            code @ (NO_CAPACITY | HOST_HELD) if code != job.start_failure_detail => {
+                retried_by_the_service(job, code)
+            }
+            NO_CAPACITY => not_now(job, Refusal::NoCapacity),
+            HOST_HELD => not_now(job, Refusal::HostHeld),
+            HOST_TAINTED => not_now(job, Refusal::HostTainted),
+            PLATFORM_MISMATCH => Verdict::Settled(Settled::Invalid(
+                "the host refused to start the job: platform-mismatch (the job's image is not \
+                 built for the platform the job names, so no host can ever run it)"
+                    .to_owned(),
+            )),
             "host-unsafe" => infra(job, "the job failed to start: host-unsafe"),
             EGRESS_UNCHECKED => infra(
                 job,
@@ -494,6 +531,27 @@ fn failed_to_start(job: &Job, result: &JobResult) -> Verdict {
         },
         StartFailureCode::Unspecified => infra(job, "the job failed to start"),
     }
+}
+
+/// The verdict on `job`, refused `code` (`no-capacity`, `host-held`) with more after the code:
+/// the hosts that refused it, which is how a job service that places such a start again itself
+/// ends the job once it gives up. The job service has retried it, so it is an ordinary `infra`
+/// ending (the operation's attempts bound it), not a refusal placed again for free: placing it
+/// again here would retry it twice over. The hosts are not read.
+fn retried_by_the_service(job: &Job, code: &str) -> Verdict {
+    infra(
+        job,
+        &format!(
+            "the host refused to start the job ({code}), and the job service placed it again \
+             until it gave up"
+        ),
+    )
+}
+
+/// The verdict on `job`, whose host would not start it now, for `refusal`.
+fn not_now(job: &Job, refusal: Refusal) -> Verdict {
+    tracing::warn!(job = %job.id, host = %job.host_id, code = refusal.code(), "the host would not start the job now: it is placed again");
+    Verdict::Refused(refusal)
 }
 
 /// The ending of a job the service no longer knows, after it was seen.
@@ -620,3 +678,7 @@ mod list_tests;
 #[cfg(test)]
 #[path = "outcome_input_tests.rs"]
 mod input_tests;
+
+#[cfg(test)]
+#[path = "outcome_refused_tests.rs"]
+mod refused_tests;

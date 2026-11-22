@@ -237,8 +237,31 @@ fn cases() -> Vec<(&'static str, Case)> {
             judged(refused_to_start("invalid-file"), none.clone()),
         ),
         (
-            "failed to start no-capacity",
+            "failed to start no-capacity (the job service's code: no room within the pool's queue wait)",
             judged(failed_to_start(StartFailureCode::NoCapacity), none.clone()),
+        ),
+        (
+            "failed to start, its detail the agent's code no-capacity alone (the job does not fit what is free on the host)",
+            judged(refused_to_start("no-capacity"), none.clone()),
+        ),
+        (
+            "failed to start, its detail host-held alone (the host is drained for an update, or its update halted)",
+            judged(refused_to_start("host-held"), none.clone()),
+        ),
+        (
+            "failed to start, its detail no-capacity or host-held followed by the hosts that refused it (the job service placed it again itself and gave up)",
+            judged(
+                refused_to_start("no-capacity: host-a, host-b"),
+                none.clone(),
+            ),
+        ),
+        (
+            "failed to start host-tainted",
+            judged(refused_to_start("host-tainted"), none.clone()),
+        ),
+        (
+            "failed to start platform-mismatch",
+            judged(refused_to_start("platform-mismatch"), none.clone()),
         ),
         (
             "failed to start start-timeout",
@@ -350,6 +373,7 @@ fn class_of(verdict: &Verdict) -> &'static str {
     match verdict {
         Verdict::Ingest => "ingest",
         Verdict::ListRefused => "list-refused",
+        Verdict::Refused(_) => "refused",
         Verdict::Settled(settled) | Verdict::StoreLost { settled, .. } => match settled {
             Settled::Infra(_) => "infra",
             Settled::Timeout => "timeout",

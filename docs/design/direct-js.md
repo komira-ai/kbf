@@ -55,12 +55,19 @@ sequenceDiagram
 ## 2. Endings, retries and cancel
 
 `executor/outcome.rs` keeps the table of how a job ends. A clean result (succeeded, exit 0) is ingested and answers the callers.
-An ending of the farm's (the host lost, the job unknown to the service, refused at its start, the task tool failing, a pack the
+An ending of the farm's (the host lost, the job unknown to the service, failed at its start, the task tool failing, a pack the
 ingest refuses, killed at its memory limit) runs the operation again as its next attempt, a new job and a new key, at most
 **2** times (`RESUBMITS`); then the callers are answered `UNAVAILABLE` (or, for memory, `FAILED_PRECONDITION` with
 `ACTION_OUT_OF_MEMORY`). The action's own timeout is `DEADLINE_EXCEEDED`, and an action that cannot run here
 `INVALID_ARGUMENT`, at once (a Mac action that names no `xcode` is one, with the `ErrorInfo` reason
-`MAC_ACTION_NAMES_NO_XCODE`). Each attempt writes under its own create-only key, so a zombie of an earlier one never writes into
+`MAC_ACTION_NAMES_NO_XCODE`). A start its host would not make now (`no-capacity`, `host-held` while the host is drained for
+an update, `host-tainted`) spends no attempt: the job is submitted again after a wait (the poll, doubling up to 30 s) while
+the next job would be submitted before the action's deadline (its timeout, from when it was asked for) and at most 100 times
+(`executor/refused.rs`), then the callers are answered `UNAVAILABLE` naming every refusal. That holds for the agent's
+bare code, which a job service passes on without placing the job again; the code followed by the hosts that refused it
+(the job service placed the job again itself and gave up) and the job service's own `no-capacity` are ordinary infrastructure
+endings, so a start is never retried twice over. A refusal that says no host can
+ever run the job (`no-capable-host` at submit, `platform-mismatch` at start) is `INVALID_ARGUMENT` at once. Each attempt writes under its own create-only key, so a zombie of an earlier one never writes into
 a later one's result.
 
 A job whose inputs its host could not provide or read is the farm's too, never the action's: a result that names an input
