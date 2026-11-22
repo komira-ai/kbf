@@ -1576,3 +1576,4 @@ fn the_rehearsal_names_the_token_file_in_the_channel_the_helper_reads() {
 mod apt_tests;
 mod deploy_tests;
 mod gamma_tests;
+mod task_bundle_tests;

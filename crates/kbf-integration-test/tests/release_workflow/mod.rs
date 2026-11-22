@@ -11,7 +11,8 @@
 //!   `success`, its event `push`, its branch `main` and its repository this one ([`PLAN_IF`]).
 //! - **The graph.** The jobs of [`jobs`], in that order, each with exactly the `needs`, token
 //!   scopes, `if:` and `environment` of [`rules`]; the jobs that write need `plan` and `verify`,
-//!   directly or through another. Only `publish` holds a write scope (`contents`), `id-token` is
+//!   directly or through another. Only `publish` holds a write scope (`contents`) but for
+//!   `task-bundle`, which holds `packages: write` alone ([`task_bundle`]); `id-token` is
 //!   held by `gamma`, the apt read and write jobs and `deploy` alone ([`may_hold_id_token`]), and the
 //!   jobs that tag, publish, bump, run the gamma stage or build the tool of the apt jobs only
 //!   under [`RELEASE_IF`]: a successful pipeline run for a push to `main` of code, a change to
@@ -61,6 +62,7 @@ use super::workflows;
 mod apt;
 mod deploy;
 mod gamma;
+mod task_bundle;
 
 /// The job that holds the write scope and creates the GitHub release.
 const PUBLISH: &str = "publish";
@@ -73,7 +75,7 @@ const REHEARSE: &str = "rehearse";
 const REHEARSE_AGENT: &str = "rehearse-agent";
 
 /// The jobs the release had before the apt jobs, in file order.
-const CORE_JOBS: [&str; 11] = [
+const CORE_JOBS: [&str; 12] = [
     "plan",
     "verify",
     "tag",
@@ -84,6 +86,7 @@ const CORE_JOBS: [&str; 11] = [
     REHEARSE_AGENT,
     deploy::DIGEST,
     deploy::DEPLOY,
+    task_bundle::JOB,
     GAMMA,
 ];
 
@@ -140,7 +143,7 @@ fn may_hold_id_token(job: &str) -> bool {
 }
 
 /// The `(job, scope)` pairs that may be `write`.
-const WRITERS: &[(&str, &str)] = &[(PUBLISH, "contents")];
+const WRITERS: &[(&str, &str)] = &[(PUBLISH, "contents"), (task_bundle::JOB, "packages")];
 
 /// What a job must be.
 pub struct Rule {
@@ -225,6 +228,7 @@ fn rules() -> Vec<Rule> {
         ),
     ];
     all.extend(deploy::rules());
+    all.push(task_bundle::rule());
     all.push(rule(
         GAMMA,
         &["plan", PUBLISH, REHEARSE, REHEARSE_AGENT],
@@ -243,7 +247,15 @@ const APP_TOKEN: &str = "actions/create-github-app-token@";
 /// The jobs that write must (transitively) need these.
 const GATING: &[&str] = &["plan", "verify"];
 /// The jobs that write, or hold a token that can.
-const WRITING: &[&str] = &["tag", "notes", PUBLISH, "bump", GAMMA, deploy::DEPLOY];
+const WRITING: &[&str] = &[
+    "tag",
+    "notes",
+    PUBLISH,
+    "bump",
+    GAMMA,
+    deploy::DEPLOY,
+    task_bundle::JOB,
+];
 
 /// The jobs that write, or hold a token, a key or a role that can: [`WRITING`] and the apt jobs
 /// that hold the role or the key.
@@ -385,6 +397,7 @@ pub fn problems(release: &str) -> Result<Vec<String>, String> {
     apt::problems(release, &mut out)?;
     apt::package_version(release, &mut out)?;
     deploy::problems(release, &mut out)?;
+    task_bundle::problems(release, &mut out)?;
     // The shared rules, as the workflow lint reads them (pins, runners, permissions).
     out.extend(
         workflows::scan(release, &workflows::Repo::default())

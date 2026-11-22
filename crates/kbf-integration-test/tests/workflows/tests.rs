@@ -498,17 +498,18 @@ fn signing_scopes_need_a_job_that_runs_only_for_a_push() {
 fn a_main_push_job_still_gets_no_other_write_scope() {
     // Catches: the main-push exception read as "any write scope", or a signing scope
     // matched loosely (another case, or a level other than `write`).
-    for p in [
-        "{packages: write}",
-        "{ID-Token: write}",
-        "{id-token: admin}",
-        "write-all",
-    ] {
+    for p in ["{ID-Token: write}", "{id-token: admin}", "write-all"] {
         refused(
             &format!("    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {p}\n"),
             "a job's `permissions`",
         );
     }
+    refused(
+        &format!(
+            "    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {{packages: write}}\n"
+        ),
+        "`packages: write` is allowed only in a job whose `if:` is exactly",
+    );
 }
 
 #[test]
@@ -652,14 +653,17 @@ fn signing_scopes_are_allowed_for_a_push_to_main_only() {
 const TAG_PUSH_IF: &str = "    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' }}\n";
 
 #[test]
-fn contents_write_needs_a_job_that_runs_only_for_a_release_push_to_main() {
-    // Catches: `contents: write` (create a release, push a branch or a tag) allowed in a
-    // job a pull request, the merge queue, a tag, a dispatch or a push that releases nothing runs; and
-    // the exception refused where the release workflow needs it.
-    clean(&workflow(&format!(
-        "    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{contents: write, actions: read}}\n"
-    )));
-    for cond in [
+fn release_scopes_need_a_job_that_runs_only_for_a_release_push_to_main() {
+    // Catches: `contents: write` (create a release, push a branch or a tag) or `packages: write`
+    // (push to the organisation's registry) allowed in a job a pull request, the merge queue, a
+    // tag, a dispatch or a push that releases nothing runs; and either exception refused where
+    // the release workflow needs it.
+    for scope in ["contents", "packages"] {
+        clean(&workflow(&format!(
+            "    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{{scope}: write, actions: read}}\n"
+        )));
+    }
+    for (scope, cond) in ["contents", "packages"].into_iter().flat_map(|scope| [
         "",
         SIGNING_PUSH_IF,
         "    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true'\n",
@@ -670,13 +674,13 @@ fn contents_write_needs_a_job_that_runs_only_for_a_release_push_to_main() {
         "    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' || true }}\n",
         "    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}\n",
         "    if: ${{ github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' }}\n",
-    ] {
+    ].map(|cond| (scope, cond))) {
         let body =
-            format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{contents: write}}\n");
+            format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{{scope}: write}}\n");
         assert_eq!(
             scan(&workflow(&body)),
             vec![format!(
-                "line {}: `contents: write` is allowed only in a job whose `if:` is exactly `{RELEASE_PUSH_ONLY}`",
+                "line {}: `{scope}: write` is allowed only in a job whose `if:` is exactly `{RELEASE_PUSH_ONLY}`",
                 if cond.is_empty() { 7 } else { 8 }
             )],
             "{body}"
@@ -687,7 +691,7 @@ fn contents_write_needs_a_job_that_runs_only_for_a_release_push_to_main() {
 #[test]
 fn a_release_tag_job_gets_no_other_write_scope() {
     // Catches: the tag-push exception read as "any write scope" (signing provenance
-    // from a tag, or writing packages or workflow runs), or `contents` matched loosely.
+    // from a tag, or writing workflow runs), or `contents` or `packages` matched loosely.
     refused(
         &format!(
             "    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{attestations: write}}\n"
@@ -695,7 +699,8 @@ fn a_release_tag_job_gets_no_other_write_scope() {
         &format!("is exactly `{SIGNING_PUSH_ONLY}`"),
     );
     for p in [
-        "{packages: write}",
+        "{Packages: write}",
+        "{packages: admin}",
         "{Contents: write}",
         "{contents: admin}",
         "write-all",
@@ -784,7 +789,6 @@ fn an_issues_job_gets_no_other_write_scope() {
     // (another case, a level other than `write`), or the main-ref `if:` unlocking the
     // signing and release scopes.
     for p in [
-        "{packages: write}",
         "{pull-requests: write}",
         "{Issues: write}",
         "{issues: admin}",
@@ -795,7 +799,7 @@ fn an_issues_job_gets_no_other_write_scope() {
             "a job's `permissions`",
         );
     }
-    for scope in ["id-token", "attestations", "contents"] {
+    for scope in ["id-token", "attestations", "contents", "packages"] {
         refused(
             &format!(
                 "    runs-on: ubuntu-latest\n{MAIN_REF_IF}    permissions: {{{scope}: write}}\n"

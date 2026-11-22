@@ -38,7 +38,13 @@ fn the_release_red_condition_unlocks_no_other_write_scope() {
     // Catches: the suites exception read as a wider grant: with the release-red `if:`, `contents`,
     // the signing scopes, `packages` and `actions` still may not be `write`, and `issues` may not
     // be another level.
-    for scope in ["id-token", "attestations", "contents", "actions"] {
+    for scope in [
+        "id-token",
+        "attestations",
+        "contents",
+        "packages",
+        "actions",
+    ] {
         refused(
             &format!(
                 "    runs-on: ubuntu-latest\n{RELEASE_RED_IF}    permissions: {{{scope}: write}}\n"
@@ -46,7 +52,7 @@ fn the_release_red_condition_unlocks_no_other_write_scope() {
             &format!("`{scope}: write` is allowed only in a job whose `if:` is exactly"),
         );
     }
-    for p in ["{packages: write}", "{issues: admin}", "write-all"] {
+    for p in ["{issues: admin}", "write-all"] {
         refused(
             &format!("    runs-on: ubuntu-latest\n{RELEASE_RED_IF}    permissions: {p}\n"),
             "a job's `permissions`",
