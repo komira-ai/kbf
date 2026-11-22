@@ -12,7 +12,9 @@
 //! 2. The config and the layer, each: `HEAD` its blob; present means skipped, else `POST` an upload
 //!    and `PUT` the bytes with their digest.
 //! 3. The manifest, as the layout holds it, `PUT` under the tag, then under its digest, and a `HEAD`
-//!    of the digest. A `Docker-Content-Digest` that is not the layout's digest is refused.
+//!    of the digest with `Accept` naming the manifest's media type (a registry such as ghcr.io
+//!    answers 404 for an OCI manifest a request does not accept). A `Docker-Content-Digest` that is
+//!    not the layout's digest is refused.
 //!
 //! A re-run sends the same bytes and succeeds. The line to print is `<repository>@sha256:<hex>`, the
 //! value of the frontend's `--executor-mac-task-bundle`; it is also appended to `--summary`. The
@@ -293,8 +295,11 @@ impl Session<'_> {
         self.reply(step, url, request.call())
     }
 
-    fn head(&self, step: &str, url: &str) -> Result<Reply, Error> {
+    fn head(&self, step: &str, url: &str, accept: Option<&str>) -> Result<Reply, Error> {
         let mut request = self.agent.head(url);
+        if let Some(media_type) = accept {
+            request = request.header("Accept", media_type);
+        }
         if let Some(value) = &self.authorization {
             request = request.header("Authorization", value);
         }
@@ -417,7 +422,7 @@ fn send_blob(session: &Session<'_>, target: &Target, blob: &Blob<'_>) -> Result<
     let base = &target.base;
     let repo = format!("{base}/v2/{}", target.path);
     let url = format!("{repo}/blobs/sha256:{}", blob.hex);
-    if session.head("look for a blob", &url)?.status == 200 {
+    if session.head("look for a blob", &url, None)?.status == 200 {
         return Ok(());
     }
     let start = format!("{repo}/blobs/uploads/");
@@ -484,7 +489,7 @@ pub fn push(
         }
     }
     let url = format!("{repo}/manifests/{digest}");
-    let reply = session.head("check the manifest", &url)?;
+    let reply = session.head("check the manifest", &url, Some(&plan.media_type))?;
     if reply.status != 200 {
         return Err(unexpected(
             "check the manifest",
