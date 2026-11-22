@@ -1143,7 +1143,7 @@ kbf relies on the manifest format of ts 6.1 as merged, `cas/l/<sha256>` for mani
 **macOS** runs as jobs too, built in kbf and waiting on jobscheduler. The Macs run no `kbf-daemon`, and the farm
 gives a daemon that reports `os=macos` no lease under any executor
 (`crates/kbf-server/src/farm/linux_daemons.rs`); they run js-agent, whose macOS
-native runtime runs a job as a user of its pool under its `sandbox-exec` profile, in the run
+native runtime runs a job as its own slot user under a Seatbelt profile, in the run
 directory `exec/` (the job's `/work`). macOS has no overlayfs and no bind mounts, so 3.1 does not carry over: the task
 copies the inputs out of the tree instead of running on it.
 
@@ -1151,29 +1151,38 @@ copies the inputs out of the tree instead of running on it.
   it (`OSFamily` `macos`/`darwin`/`macosx`/`osx`, or `os=macos`), becomes a job of the job service's Macs when the
   executor is given the Macs' task bundle (`--executor-mac-task-bundle`, none by default, so nothing changes until it
   is set), and is refused as the caller's otherwise. `os_version=26` means 26 or newer: the executor refuses an
-  action that asks for more than `--executor-mac-os-version` (26). The action must name its Xcode by build
-  (`xcode=16C5032a`); one that names none is refused as the caller's, reason `MAC_ACTION_NAMES_NO_XCODE`, and no job
-  is made ([platform-properties.md](../platform-properties.md#macos)).
+  action that asks for more than `--executor-mac-os-version` (26). Nothing else of the platform is read: an `xcode`
+  property is neither required nor sent (the Macs have only the Command Line Tools), and like every property it stays
+  part of the action digest ([platform-properties.md](../platform-properties.md#macos)).
 - **The job**: the release's `kbf-task` bundle by its darwin manifest digest as the image
-  (`--executor-mac-task-bundle`; its entrypoint runs), no layer, `os=macos`, `arch=arm64`, `exec=sandbox-exec`, the
-  action's `xcode` (the job service places it only on a Mac that has that Xcode), no network; the action tree read-only at `/work/.kbf-tree` and the put directory read-write at `/work/.kbf-out`, both
-  `no_exec`, which a Mac's agent makes `exec/.kbf-tree` and `exec/.kbf-out`. The tree is a mount from tierstore's
-  mount provider (`provider: tierstore`, `ref`: the key of the tree's tree list, as a Linux job's provider layer
-  names it), which on a Mac answers with a directory of the Mac's own disk holding the whole tree; the put directory
-  is the host path `<mp>/put/cas/b/<build>/<nonce>` under `--executor-mac-task-out-root`.
-- **The pack**: on a Mac the put directory is a plain directory, so the commit's rename stores nothing. The Mac's
-  tier store stores the finished `pack` under the same key, `cas/b/<build>/<nonce>/pack`, after the job ended, and
-  the frontend reads it with the Linux ingest. While the store has no object under the key, the frontend reads it
-  again every poll, for up to 30 minutes (`PACK_WAIT`); a pack still absent then fails the run as the farm's.
+  (`--executor-mac-task-bundle`; its entrypoint runs), no layer, constraints of only `os=macos` and `arch=arm64` (no
+  `exec`, no `xcode`: the job service runs a macOS job that names an image natively, komira-ai/jobscheduler#1022), no
+  network, a wall limit of the action's timeout plus the run margin (3300 s with the defaults); the action tree
+  read-only at `/work/.kbf-tree` and the put mount read-write at `/work/.kbf-out`, both `no_exec`. The tree is a
+  mount from tierstore's mount provider (`provider: tierstore`, `ref`: the key of the tree's tree list, as a Linux
+  job's provider layer names it), which on a Mac answers with the tree on tierstore's NFS loopback mount, made
+  `exec/.kbf-tree`; the put mount's source is the host path `<mp>/put/cas/b/<build>/<nonce>` under
+  `--executor-mac-task-out-root`.
+- **The pack**: the job never holds a writable put directory. The put mount is the put target the Mac's agent reads:
+  the task writes its one object as the file `exec/.kbf-out/pack`, in the job's own folder, and once the job has
+  ended and its processes are swept the agent commits that one file, as it is, to tierstore's put directory
+  `<mp>/put/cas/b/<build>/<nonce>/`, which stores it under `cas/b/<build>/<nonce>/pack`. The frontend minted that
+  key and reads it with the Linux ingest. While the store has no object under the key, the frontend reads it again
+  every poll, for up to 30 minutes (`PACK_WAIT`); a pack still absent then fails the run as the farm's, so a commit
+  that never arrives costs up to 30 minutes before the action runs again.
 - **The task** (`kbf-task --materialize-work=.kbf-tree`, `crates/kbf-task/src/materialize.rs`): reads `.kbf/action`
-  and `.kbf/command` from the tree as a tree job does, copies `kbf-work` into `exec/kbf-work` (`std::fs::copy`: an APFS clone
-  where the source and `exec/` share a volume, a byte copy otherwise; every copy private, so an output may name an
-  input), runs the Command there, and commits its one object into `exec/.kbf-out` (`--out-dir .kbf-out`) as 5.2
-  says. The Command is started directly: the agent's sandbox is its sandbox, and no `sandbox-exec` is nested.
-- **What the other side does**: the Mac's agent takes the read-only provider mount and the read-write put directory
-  (komira-ai/jobscheduler#888 lists what it needed), tierstore on the Mac writes a tree whole to local disk when its
-  provider is asked for it, and stores a finished pack it finds in a put directory. kbf names the tree and reads the
-  pack as above, and holds no Mac-only protocol of its own.
+  and `.kbf/command` from the tree as a tree job does, makes `exec/.kbf-out` (mode 0700, one level; an existing
+  directory or a link to one is used as it is), copies `kbf-work` into `exec/kbf-work` (`std::fs::copy`: an APFS
+  clone where the source and `exec/` share a volume, a byte copy otherwise; every copy private, so an output may name
+  an input), runs the Command there, and writes its one object into `exec/.kbf-out` (`--out-dir .kbf-out`) by the
+  renames of 5.2, which in a plain directory store nothing: exit 0 means `pack` is written, and a run that fails
+  leaves no `pack`. The Command is started directly: the agent's sandbox is its sandbox, and no `sandbox-exec` is
+  nested.
+- **What the other side does**: the Mac's agent takes the read-only provider mount and the read-write put mount
+  (komira-ai/jobscheduler#888 lists what it needed); tierstore on the Mac answers the provider with the tree on its
+  NFS loopback mount; the agent commits `exec/.kbf-out/pack` into the put directory the put mount names, and the
+  store stores it. kbf names the tree and the put target and reads the pack as above, and holds no Mac-only protocol
+  of its own. The first real Mac run, which this repository's tests cannot make, proves the whole path.
 - **`kbf-daemon` is deleted.** Its Mac path went first: the Mac daemon driver (`native` and `native-whole-machine` on a Mac, Xcode,
   simulator, iOS device and VM leases on a daemon), the Mac session and lease-user pool, the Mac provisioning tool and the
   VM crates were deleted, and then `kbf-daemon` itself, with the Linux daemons and the `--executor kbf-daemon` choice. A macOS action has one runner, the job

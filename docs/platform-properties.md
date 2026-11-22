@@ -13,8 +13,8 @@ are the ones kbf reads when it makes that job:
 |---|---|---|---|
 | `kbf-lease` | `action`, `whole_machine` | `action` | `whole_machine` makes the job ask for a whole host, with nothing beside it (see [`kbf-lease`](#kbf-lease)). |
 | `OSFamily`, `os` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | `linux` | A macOS value makes the job a Mac job (see [macOS](#macos)). |
-| `os_version` | a version such as `26` or `26.1` | any | The least macOS a Mac action takes; read only for a Mac action. |
-| `xcode` | an Xcode build id such as `16C5032a` | none: a Mac action that names none is refused | The Xcode a Mac action runs with; required on a Mac action, and used only for one (see [macOS](#macos)). |
+| `os_version` | a version such as `26` or `26.1` | any | The least macOS a Mac action takes; read only for a Mac action (a value that is no version is refused for any action). |
+| `xcode` | any | none | Not read and not sent: part of the action digest only, so actions that differ by it are cached apart (see [macOS](#macos)). |
 | `container-image` | the executor's base image, by digest | the base image | The base environment the Command sees. |
 | `kbf-network` | `allow` | absent: no network | Lets the action's Command use the network (see [`kbf-network`](#kbf-network)). |
 
@@ -93,29 +93,23 @@ section 14), when the executor is given the release's macOS `kbf-task` bundle
 or newer, held against `--executor-mac-os-version`. kbf reads no `vm.image`, `ios.device` or
 simulator property: they are accepted and do nothing.
 
-A Mac action must name the Xcode it runs with, by build: `xcode=16C5032a`, the Xcode's
-`ProductBuildVersion` (`xcodebuild -version` prints it as `Build version`). The name is read in any
-case; the value is 1 to 32 letters, digits, `.`, `_` and `-`, starting with a letter or a digit,
-and it is given once. The job asks the job service for that build: it is placed only on a Mac
-whose agent reports that Xcode installed, and runs with that Xcode's developer directory, never the
-one `xcode-select` has selected on the Mac. An action that names a build no Mac has is refused as
-one no host can run.
+A Mac job asks the job service for `os=macos` and `arch=arm64` and nothing else: no Xcode, no
+runtime and no least version (the executor holds `os_version` itself). It runs on any Mac of the
+job service, whose agent runs it natively as the job's own slot user under a Seatbelt profile. The
+Macs have only the Command Line Tools, so an action that needs Xcode itself does not run there.
 
-A Mac action that names no `xcode` is refused at once, before any job is made: `INVALID_ARGUMENT`
-with an `ErrorInfo` of domain `kbf` and reason `MAC_ACTION_NAMES_NO_XCODE`, a request error the
-caller fixes by adding the property. Without it the action would run against whichever Xcode the
-Mac has selected, which an update of the Mac can move, and its cached result would then be served
-across the change. Since `xcode` is part of the action digest, the same action naming two builds is
-two cache entries, so a result built with one Xcode is never served for another. A value that is
-not a build id, or `xcode` given twice (in any two spellings), is refused as malformed. A Linux
-action's `xcode` is neither required nor checked as a build id nor sent to the job service; like
-every capability key, though, an empty `xcode` or one given twice is refused for any action.
+`xcode` is not read and not sent: an action may name it or not, with any value, and its job is the
+same. Like every property it is part of the action digest, so the same action naming two builds
+is two cache entries. Like every capability key it is read with the platform, though: an empty
+`xcode` or one given twice (in any two spellings) is refused as malformed, for any action. So is
+an `os_version` that is no version, for any action (the job service's reader parses it as a
+least version); a Mac action's must also be `<major>[.<minor>[.<patch>]]` of digits.
 
 ```starlark
-# Bazel: a platform for actions that run with Xcode 16.2 (build 16C5032a) on the Macs
+# Bazel: a platform for actions that run on the Macs
 platform(
-    name = "macos_arm64_xcode_16c5032a",
-    exec_properties = {"OSFamily": "Darwin", "xcode": "16C5032a"},
+    name = "macos_arm64",
+    exec_properties = {"OSFamily": "Darwin"},
 )
 ```
 

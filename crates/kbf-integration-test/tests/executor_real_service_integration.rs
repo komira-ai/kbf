@@ -30,6 +30,13 @@
 //!   commit into a put directory (the service gives a whole-host job no mount), so the executor
 //!   answers it as the caller's and makes no job.
 //!
+//! No case here runs a Mac job, and none can: the pinned release (`kbf-js-version.toml`, 0.1.247)
+//! is from before komira-ai/jobscheduler#1022, so its service starts a job natively only when it
+//! asks for `exec=sandbox-exec`, which kbf's Mac job no longer sends; and its agent is the Linux
+//! `x86_64-unknown-linux-musl` one, which reports `os=linux`, so no host of these tests is a Mac.
+//! The Mac job's shape is held by the fake service (`kbf-server/tests/executor/mac.rs`); the
+//! first real Mac run proves it against a real one.
+//!
 //! One test runs everywhere, as a pull request's tests do:
 //! `the_stand_in_answers_as_the_program_it_is_linked_as`, the built stand-in under the names
 //! the agent runs it by.

@@ -59,8 +59,7 @@ An ending of the farm's (the host lost, the job unknown to the service, failed a
 ingest refuses, killed at its memory limit) runs the operation again as its next attempt, a new job and a new key, at most
 **2** times (`RESUBMITS`); then the callers are answered `UNAVAILABLE` (or, for memory, `FAILED_PRECONDITION` with
 `ACTION_OUT_OF_MEMORY`). The action's own timeout is `DEADLINE_EXCEEDED`, and an action that cannot run here
-`INVALID_ARGUMENT`, at once (a Mac action that names no `xcode` is one, with the `ErrorInfo` reason
-`MAC_ACTION_NAMES_NO_XCODE`). A start its host would not make now (`no-capacity`, `host-held` while the host is drained for
+`INVALID_ARGUMENT`, at once (a Mac action on an executor with no Macs is one). A start its host would not make now (`no-capacity`, `host-held` while the host is drained for
 an update, `host-tainted`) spends no attempt: the job is submitted again after a wait (the poll, doubling up to 30 s) while
 the next job would be submitted before the action's deadline (its timeout, from when it was asked for) and at most 100 times
 (`executor/refused.rs`), then the callers are answered `UNAVAILABLE` naming every refusal. That holds for the agent's
