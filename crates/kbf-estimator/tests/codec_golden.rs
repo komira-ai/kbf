@@ -52,7 +52,9 @@ fn run(outcome: Outcome, peak: u64) -> Run {
         limit_hits: 0,
         swap_peak_bytes: 0,
         cpu_usage_us: 0,
+        cpu_peak_millis: None,
         node_cpu_pressure_permille: None,
+        cpu_held: false,
     }
 }
 

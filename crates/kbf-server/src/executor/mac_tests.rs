@@ -67,8 +67,11 @@ fn an_action_asks_for_a_mac_as_kbf_caps_reads_its_platform() {
 }
 
 /// Asserts the `os_version` of a Mac action is its least major version, whatever the minor and
-/// patch and the case of the name; that a Linux action's is not read, even one that is no
-/// version; and that a Mac action's that is no version is refused, naming it.
+/// patch and the case of the name. A value that is no version is refused by the platform's
+/// reader for any system (since `os_version` became a capability the reader parses, as `26` or
+/// `26.1`), with the reader's reason; a Linux action's that the reader takes is not read. A
+/// Mac action's that the reader takes but that is still no `<major>[.<minor>[.<patch>]]` of
+/// digits is refused here, naming it.
 #[test]
 fn a_mac_actions_os_version_is_its_least_major_version() {
     for (value, major) in [("26", 26), ("26.1", 26), ("15.0.1", 15), ("0", 0)] {
@@ -89,19 +92,25 @@ fn a_mac_actions_os_version_is_its_least_major_version() {
         })
     );
     assert_eq!(
-        of(&[("OSFamily", "linux"), ("os_version", "jammy")]),
+        of(&[("OSFamily", "linux"), ("os_version", "26.")]),
         Ok(System::Linux)
     );
-    for bad in [
-        "",
-        "x",
-        "26.",
-        ".1",
-        "26.1.2.999",
-        "26-beta",
-        "+26",
-        "99999999999",
-    ] {
+    let reader = |pairs: &[(&str, &str)]| {
+        kbf_caps::Request::from_platform(pairs.iter().copied())
+            .expect_err("the reader refuses it")
+            .to_string()
+    };
+    for bad in ["", "x", ".1", "26-beta", "99999999999"] {
+        for os in ["macos", "linux"] {
+            let pairs = [("OSFamily", os), ("os_version", bad)];
+            assert_eq!(of(&pairs), Err(reader(&pairs)), "{os} {bad:?}");
+        }
+    }
+    assert_eq!(
+        reader(&[("os_version", "jammy")]),
+        "invalid value \"jammy\" for capability key \"os_version\""
+    );
+    for bad in ["26.", "26.1.2.999", "+26"] {
         assert_eq!(
             of(&[("OSFamily", "macos"), ("os_version", bad)]),
             Err(format!(
