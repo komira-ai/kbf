@@ -232,6 +232,40 @@ async fn a_run_gets_its_dir_and_its_tree_once() {
     ));
 }
 
+/// Asserts the shape of the put directory a Mac run is minted (its tree as a tree list, as
+/// every Mac run's is), by the rule a Mac's agent holds a put mount's source to: four parts
+/// `cas/b/<build>/<nonce>`, none empty and none starting with `.`, the build the run's
+/// `<operation>-<attempt>`, the nonce 40 lowercase hex digits. Catches a key the agent would
+/// refuse as a put target, so a Mac job whose pack is never committed.
+#[tokio::test]
+async fn a_mac_runs_put_directory_has_the_shape_the_agent_takes() {
+    let rig = rig_over(DirPrep::new(None, 7_200), Some(listed_base()));
+    let action = action_with_input(&rig, "input").await;
+    let key = rig
+        .front
+        .mint(lease(), &action, WALL, InputTree::Provider)
+        .await
+        .expect("a dir");
+    let parts: Vec<&str> = key.as_str().split('/').collect();
+    assert_eq!(parts.len(), 4, "{key}");
+    assert!(
+        parts
+            .iter()
+            .all(|part| !part.is_empty() && !part.starts_with('.')),
+        "{key}"
+    );
+    assert_eq!(parts[..3], ["cas", "b", "7-3"], "{key}");
+    assert_eq!(parts[2], crate::executor::build_id(lease()));
+    let nonce = parts[3];
+    assert_eq!(nonce.len(), 40, "{key}");
+    assert!(
+        nonce
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{key}"
+    );
+}
+
 /// Asserts that before the base tree is published no tree can be written: the farm's to retry.
 #[tokio::test]
 async fn before_the_base_tree_is_published_a_run_is_unavailable() {

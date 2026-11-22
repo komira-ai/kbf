@@ -26,10 +26,11 @@
 //!
 //! An action whose platform asks for a Mac is a Mac job ([`crate::executor::mac`]): the
 //! release's `kbf-task` bundle, the tree (always its tree list, from tierstore's mount provider)
-//! and the put directory mounted under `/work`, no layer, of a Mac in the native runtime, with no
-//! CPU or memory and the class's labels. It is refused as
-//! the caller's on an executor with no Macs, when it names no Xcode ([`Settled::NoXcode`]), and
-//! as for Linux for a whole machine.
+//! and the put target mounted under `/work`, no layer, of any Mac (`os=macos`, `arch=arm64`, no
+//! `exec`), with no CPU or memory and the class's labels; the job writes its pack in its own
+//! folder and the Mac's agent commits it under the minted key. It is refused as the caller's on
+//! an executor with no Macs, when it asks for a newer macOS than they run, and as for Linux for
+//! a whole machine or with no roots.
 //!
 //! A [`JobSpec`] is sent and kept, and never logged.
 
@@ -43,7 +44,7 @@ use ring::digest::{SHA256, digest};
 use tokio::time::Instant;
 
 use crate::executor::config::{Config, InputTree};
-use crate::executor::mac::{MacJob, System, XcodeBuild, check_version, mac_argv, mac_spec};
+use crate::executor::mac::{MacJob, System, check_version, mac_argv, mac_spec};
 use crate::executor::metrics::Metrics;
 use crate::executor::out::{PutDirRoots, TASK_IN_TREE, provider_layer};
 use crate::executor::outcome::Settled;
@@ -192,10 +193,9 @@ pub(super) async fn prepare(
     })?;
     pinned(&facts.image)?;
     let wall = ctx.cfg.wall(timeout);
-    if let System::Macos { os_version, xcode } = facts.system {
+    if let System::Macos { os_version } = facts.system {
         let times = (timeout, wall);
-        let asks = MacAsks { os_version, xcode };
-        return prepare_mac(ctx, run, action, booking, times, asks, class).await;
+        return prepare_mac(ctx, run, action, booking, times, os_version, class).await;
     }
     let Some(roots) = &ctx.cfg.task_out else {
         return Err(no_roots("a Linux action"));
@@ -227,24 +227,18 @@ fn no_roots(what: &str) -> Settled {
     ))
 }
 
-/// What a Mac action asks of its Mac: the least macOS and the Xcode it names.
-struct MacAsks {
-    os_version: Option<u32>,
-    xcode: Option<XcodeBuild>,
-}
-
 /// The Mac job of `run`, which runs `action` with `booking` for `times` (the timeout and the
-/// wall limit) on a Mac with what it `asks`, labelled with `class`: refused as the caller's when
-/// this executor has no Macs, when the action names no Xcode, when it asks for a newer macOS
-/// than they run, when it asks for a whole machine, or when its outputs do not go into a put
-/// directory.
+/// wall limit) on a Mac of at least `os_version` when it names one, labelled with `class`:
+/// refused as the caller's when this executor has no Macs, when the action asks for a newer
+/// macOS than they run, when it asks for a whole machine, or when the executor has no roots for
+/// its put directory. Nothing else of the action's platform (an `xcode`, say) is read or sent.
 async fn prepare_mac(
     ctx: &Preparer<'_>,
     run: RunId,
     action: &Digest,
     booking: Booking,
     (timeout, wall): (Duration, Duration),
-    asks: MacAsks,
+    os_version: Option<u32>,
     class: &SizeClass,
 ) -> Result<Prepared, Settled> {
     let Some(pool) = &ctx.cfg.mac else {
@@ -253,11 +247,7 @@ async fn prepare_mac(
                 .to_owned(),
         ));
     };
-    // Before anything is minted or submitted: the action runs nowhere without its Xcode.
-    let Some(xcode) = &asks.xcode else {
-        return Err(Settled::NoXcode);
-    };
-    check_version(asks.os_version, pool).map_err(Settled::Invalid)?;
+    check_version(os_version, pool).map_err(Settled::Invalid)?;
     if booking == Booking::WholeHost {
         return Err(Settled::Invalid(
             "a whole_machine action cannot run on a Mac of the job service: it commits into a \
@@ -269,13 +259,12 @@ async fn prepare_mac(
         return Err(no_roots("a Mac action"));
     };
     // A Mac has no host directory of manifests: its tree is always its tree list, which
-    // tierstore's provider writes whole to the Mac's disk.
+    // tierstore's provider answers with the tree on its NFS loopback mount.
     let key = minted(ctx, run, action, wall, InputTree::Provider).await?;
     let tree = ctx.inputs.tree(run).await?;
     let spec = mac_spec(MacJob {
         job_id: job_id(&ctx.cfg.frontend, run),
         pool,
-        xcode,
         roots: pool.roots(linux),
         dir: key.as_str(),
         tree: &tree,

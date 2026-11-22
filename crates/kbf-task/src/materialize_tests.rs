@@ -12,7 +12,7 @@ use prost::Message as _;
 
 use super::*;
 use crate::digest;
-use crate::task::{EXIT_FETCH, EXIT_RUN, EXIT_SETUP};
+use crate::task::{EXIT_FETCH, EXIT_PUT, EXIT_RUN, EXIT_SETUP};
 use crate::tree::tests::{command, out_dir::read_one_pass, scratch};
 use crate::tree::{ACTION_FILE, COMMAND_FILE, RUN_DIR};
 
@@ -345,6 +345,165 @@ async fn a_bad_put_directory_or_lease_is_exit_14_before_anything_is_read() {
     cli.lease = "not/a/build".to_owned();
     assert_eq!(finish(&cli, tree, &root).await, ExitCode::from(EXIT_SETUP));
     assert!(!root.join("kbf-work").exists());
+}
+
+/// The job's flags with `--out-dir` set to `out_dir`, as given (relative to the job root, as a
+/// Mac job passes `.kbf-out`, or absolute).
+fn with_out_dir(job: &Job, out_dir: &Path) -> Cli {
+    let mut cli = job.cli();
+    cli.out_dir = Some(out_dir.to_path_buf());
+    cli
+}
+
+/// The names in the directory `dir`, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Proves the Mac job's out directory is the task's own: with `--out-dir .kbf-out` and nothing
+/// there, the run makes `<root>/.kbf-out` (a directory, mode 0700), commits into it, exits 0,
+/// and leaves exactly one file in it, `pack`, which holds the run's object. Catches the task
+/// refusing the shape a Mac's agent now gives it (no put directory linked into the job), which
+/// fails every Mac action at setup with exit 14 and nothing run.
+#[tokio::test]
+async fn a_missing_out_dir_is_made_private_and_ends_with_exactly_the_pack() {
+    let job = self::job("made", &command(&["true"], "", &[]));
+    let cli = with_out_dir(&job, Path::new(".kbf-out"));
+    assert_eq!(finish(&cli, &job.tree, &job.root).await, ExitCode::SUCCESS);
+    let out = job.root.join(".kbf-out");
+    let meta = std::fs::symlink_metadata(&out).expect("made");
+    assert!(meta.is_dir(), "{meta:?}");
+    assert_eq!(mode_of(&out), 0o700);
+    assert_eq!(names_in(&out), ["pack"]);
+    let manifest = committed(&out);
+    assert_eq!(manifest.exit_code, 0);
+    assert_eq!(std::fs::read_dir(&*job.put).expect("put").count(), 0);
+}
+
+/// Proves that an out directory already there is used as it is: an existing directory keeps its
+/// own mode and ends with exactly `pack`; a symlink to a directory (an agent that still links
+/// the put directory into the job) is followed, stays a symlink, and the object lands in the
+/// directory it names. Catches a task that replaces, re-modes or refuses what the agent made.
+#[tokio::test]
+async fn an_existing_out_dir_or_a_symlink_to_one_is_used_as_it_is() {
+    let job = self::job("existing", &command(&["true"], "", &[]));
+    let out = job.root.join(".kbf-out");
+    std::fs::create_dir(&out).expect("dir");
+    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    let cli = with_out_dir(&job, Path::new(".kbf-out"));
+    assert_eq!(finish(&cli, &job.tree, &job.root).await, ExitCode::SUCCESS);
+    assert_eq!(mode_of(&out), 0o755);
+    assert_eq!(names_in(&out), ["pack"]);
+
+    let linked = self::job("linked", &command(&["true"], "", &[]));
+    let link = linked.root.join(".kbf-out");
+    std::os::unix::fs::symlink(&*linked.put, &link).expect("symlink");
+    let cli = with_out_dir(&linked, Path::new(".kbf-out"));
+    assert_eq!(
+        finish(&cli, &linked.tree, &linked.root).await,
+        ExitCode::SUCCESS
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("link")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(names_in(&linked.put), ["pack"]);
+    assert_eq!(committed(&linked.put).exit_code, 0);
+}
+
+/// Proves an out directory that cannot be had is exit 14 before anything is read (the tree here
+/// does not exist, which would be exit 10 if it were read), and that nothing is made for it: a
+/// path whose parent is missing (one level only is made, so a mistyped deep path is refused, not
+/// built), a regular file there, and a symlink that names nothing. The missing parent's message
+/// is the whole setup line. Catches a deep path built with `create_dir_all`, and a file or a
+/// dangling link taken for a directory.
+#[tokio::test]
+async fn an_out_dir_that_cannot_be_had_is_exit_14_and_nothing_is_made() {
+    let root = scratch("mat-unmade-root");
+    let action = sha256(b"a");
+    let cli = |out_dir: &str| {
+        Cli::try_parse_from([
+            "kbf-task".to_owned(),
+            "--materialize-work=/nonexistent-tree".to_owned(),
+            "--stage-and-commit".to_owned(),
+            format!("--out-dir={out_dir}"),
+            "--lease=lease-1".to_owned(),
+            format!("--action={action}"),
+        ])
+        .expect("flags")
+    };
+    let tree = Path::new("/nonexistent-tree");
+
+    let deep = root.join("typo/.kbf-out");
+    let refused = OutDir::open_or_create(&deep).err().expect("refused");
+    assert_eq!(refused.exit_code(), EXIT_SETUP);
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "setup: --out-dir {}: cannot make it: {}",
+            deep.display(),
+            std::io::Error::from_raw_os_error(libc::ENOENT)
+        )
+    );
+    assert_eq!(
+        finish(&cli("typo/.kbf-out"), tree, &root).await,
+        ExitCode::from(EXIT_SETUP)
+    );
+    assert!(!root.join("typo").exists());
+
+    std::fs::write(root.join("file"), b"").expect("file");
+    assert_eq!(
+        finish(&cli("file"), tree, &root).await,
+        ExitCode::from(EXIT_SETUP)
+    );
+    std::os::unix::fs::symlink(root.join("nothing"), root.join("dangling")).expect("symlink");
+    assert_eq!(
+        finish(&cli("dangling"), tree, &root).await,
+        ExitCode::from(EXIT_SETUP)
+    );
+    assert!(!root.join("nothing").exists());
+    assert_eq!(names_in(&root), ["dangling", "file"]);
+}
+
+/// Proves a run that fails leaves no `pack` in the out directory it made: one whose tree cannot
+/// be read (exit 10) leaves the directory empty, and one whose commit fails (exit 13, the
+/// store's `EEXIST`) has its `.part` files removed, so the directory is empty too. Catches a
+/// half-written object left under the name `pack`, which the Mac's agent would commit.
+#[tokio::test]
+async fn a_run_that_fails_leaves_no_pack_in_the_out_dir_it_made() {
+    let first = job("failed", &command(&["true"], "", &[]));
+    std::fs::remove_dir(first.tree.join("kbf-work")).expect("remove");
+    let cli = with_out_dir(&first, Path::new(".kbf-out"));
+    assert_eq!(
+        finish(&cli, &first.tree, &first.root).await,
+        ExitCode::from(EXIT_FETCH)
+    );
+    assert!(names_in(&first.root.join(".kbf-out")).is_empty());
+
+    let second = job("uncommitted", &command(&["true"], "", &[]));
+    let out_path = second.root.join(".kbf-out");
+    let out = OutDir::open_or_create(&out_path)
+        .expect("made")
+        .with_rename(|_, _| Err(std::io::Error::from_raw_os_error(libc::EEXIST)));
+    let failure = execute(&second.cli(), &second.tree, &second.root, &out)
+        .await
+        .expect_err("refused");
+    assert_eq!(failure.exit_code(), EXIT_PUT, "{failure}");
+    drop(out);
+    assert!(names_in(&out_path).is_empty(), "{:?}", names_in(&out_path));
 }
 
 /// Proves the exit code of a run through `finish`: 0 when the object is committed, and 10 for a

@@ -1,5 +1,6 @@
-//! The pack of a Mac job: its Mac's tier store stores it only after the job ended, so the
-//! frontend reads it again while the store has none, for a Mac job and only for one.
+//! The pack of a Mac job: the Mac's agent commits it to the tier store only after the job ended
+//! and its processes are swept, so the frontend reads it again while the store has none, for a
+//! Mac job and only for one.
 
 use std::time::Duration;
 
@@ -10,17 +11,15 @@ use tonic::Code;
 
 use super::*;
 use crate::executor::tests::{Caller, IMAGE, Rig};
-use crate::executor::{ActionFacts, MacPool, RejectReason, System, XcodeBuild};
-
-/// The Xcode the Mac has and the action names.
-const XCODE: &str = "16C5032a";
+use crate::executor::{ActionFacts, MacPool, RejectReason, System};
 
 /// The macOS `kbf-task` bundle of a release, by its manifest digest.
 const BUNDLE: &str =
     "kbf-task@sha256:9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a";
 
-/// A rig whose executor has Macs and whose job service has one, `mac-1`, with [`XCODE`]; its
-/// actions ask for a Mac when `mac`.
+/// A rig whose executor has Macs and whose job service has one, `mac-1`, as a Mac's agent reports
+/// itself (`os=macos`, `arch=arm64`, the native runtime) with no Xcode; its actions ask for a Mac
+/// when `mac`. The Mac job, which names no `exec` and no Xcode, is placed on it.
 async fn rig(mac: bool) -> Rig {
     let rig = Rig::with(|cfg| {
         cfg.mac = Some(MacPool {
@@ -43,7 +42,7 @@ async fn rig(mac: bool) -> Rig {
             os: "macos".to_owned(),
             arch: "arm64".to_owned(),
             exec: ExecMode::SandboxExec,
-            xcodes: vec![XCODE.to_owned()],
+            xcodes: Vec::new(),
         },
     );
     if mac {
@@ -52,10 +51,7 @@ async fn rig(mac: bool) -> Rig {
         *facts = Ok(ActionFacts {
             image: IMAGE.to_owned(),
             timeout: Some(Duration::from_secs(60)),
-            system: System::Macos {
-                os_version: None,
-                xcode: Some(XcodeBuild::parse(XCODE).expect("a build")),
-            },
+            system: System::Macos { os_version: None },
             size_class: crate::executor::size_class::SizeClass::of_action(&shape),
         });
     }

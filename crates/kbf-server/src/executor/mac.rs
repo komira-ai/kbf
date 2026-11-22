@@ -1,6 +1,6 @@
 //! The Macs: an action whose platform names `os=macos` becomes a job of the job service's
-//! macOS hosts, run by their agent's native runtime (a user of the agent's pool, under its
-//! `sandbox-exec` profile), (docs/design/actions-as-jobs.md, section 14).
+//! macOS hosts, which their agent runs natively, as the job's own slot user under a Seatbelt
+//! profile (docs/design/actions-as-jobs.md, section 14).
 //!
 //! # Which actions
 //!
@@ -16,23 +16,10 @@
 //! is refused as the caller's, naming both ([`check_version`]). A Linux action's `os_version` is
 //! not read.
 //!
-//! # The Xcode
-//!
-//! A Mac action names the Xcode it runs with by build, `xcode=16C5032a` (the Xcode's
-//! `ProductBuildVersion`), read in any case as every capability key ([`XcodeBuild`]). The job
-//! asks for that build (`Constraints.xcode`): the job service places it only on a Mac whose
-//! agent reports that Xcode installed, and the agent runs it with that Xcode's developer
-//! directory, never the Mac's selected one. Since the property is part of the action digest, a
-//! result built with one Xcode is never served for the same action naming another.
-//!
-//! A Mac action that names no `xcode` is refused as the caller's, `INVALID_ARGUMENT` with the
-//! reason [`NO_XCODE_REASON`](crate::executor::outcome::NO_XCODE_REASON), and no job is made for
-//! it: it would run with whichever Xcode the Mac has selected, which an update of the Mac can
-//! change, and its cached result would then be served across that change. A value that is not a
-//! build id (1 to 32 letters, digits, `.`, `_` and `-`, starting with a letter or a digit) is
-//! refused as malformed. A Linux action's `xcode` is neither required nor checked as a build id
-//! nor sent, but like every capability key it is read with the platform: one that is empty or
-//! given twice is refused as malformed, for any system.
+//! Nothing else of the platform is read for a Mac. An `xcode` property, like every property,
+//! is part of the action digest, so actions that differ by it are cached apart; it is not
+//! checked, not required and not sent to the job service. Like every capability key it is read
+//! with the platform: one that is empty or given twice is refused as malformed, for any system.
 //!
 //! # The job
 //!
@@ -45,30 +32,41 @@
 //!   macOS kbf-task bundle"), and the command is left empty, so the bundle's entrypoint,
 //!   `kbf-task`, runs, told `--materialize-work=.kbf-tree` ([`mac_argv`]). A job with no layer
 //!   must name an image, and a Mac's agent runs only a bundle's program.
-//! - **Two mounts**, each at `/work/<name>`, which a Mac's agent makes `exec/<name>`: the action
-//!   tree read-only at [`TREE_TARGET`], from tierstore's mount provider ([`PROVIDER`]) given the
-//!   key of the tree's tree list, as a Linux job's layer is with `--executor-input-tree
-//!   provider` ([`provider_layer`](crate::executor::out::provider_layer)); and the put directory
+//! - **Two mounts**, each at `/work/<name>`: the action tree read-only at [`TREE_TARGET`], from
+//!   tierstore's mount provider ([`PROVIDER`]) given the key of the tree's tree list, as a Linux
+//!   job's layer is with `--executor-input-tree provider`
+//!   ([`provider_layer`](crate::executor::out::provider_layer)); and the put directory
 //!   `<mp>/put/cas/b/<run>/<nonce>` read-write at [`MAC_OUT_TARGET`]. On a Mac the provider
-//!   answers the mount with a directory of the Mac's own disk holding the whole tree. Both
-//!   `no_exec`: the task copies the inputs out of the tree into `exec/kbf-work` (APFS clones
-//!   where the volume allows), runs the Command there, and commits its one object into the put
-//!   directory, as a Linux job does. `<mp>/put` is the Macs' own (`--executor-mac-task-out-root`,
-//!   by default `--task-out-root`). A Mac's tree is always its tree list, whatever
-//!   `--executor-input-tree` says: a Mac has no host directory of manifests. So on a host's
-//!   refusal of the list the miss path's first step (the list written again, checked) helps a
-//!   Mac job, and its second (manifests) does not: the next run mounts the list again.
-//! - `os=macos`, `arch=arm64`, `exec=sandbox-exec`, the action's `xcode`, no CPU and no memory
-//!   (the job service sizes it from its class's history), no network, no file and no secret.
+//!   answers the tree's mount with the tree on tierstore's NFS loopback mount, which the agent
+//!   makes `exec/.kbf-tree`. The put mount is not given to the job: it names where the job's
+//!   object goes (see "The pack"). Both `no_exec`: the task copies the inputs out of the tree
+//!   into `exec/kbf-work` (APFS clones where the volume allows), runs the Command there, and
+//!   writes its one object, `pack`, into `exec/.kbf-out`, a directory of the job's own folder
+//!   that it makes. `<mp>/put` is the Macs' own (`--executor-mac-task-out-root`, by default
+//!   `--task-out-root`). A Mac's tree is always its tree list, whatever `--executor-input-tree`
+//!   says: a Mac has no host directory of manifests. So on a host's refusal of the list the miss
+//!   path's first step (the list written again, checked) helps a Mac job, and its second
+//!   (manifests) does not: the next run mounts the list again.
+//! - `os=macos` and `arch=arm64`, and nothing else of [`Constraints`]: no `exec` (the job service
+//!   runs a macOS job that names an image natively), no Xcode, no least version, no CPU and no
+//!   memory (the job service sizes it from its class's history), no network, no file and no
+//!   secret ([`mac_constraints`]).
+//! - A wall limit of the action's timeout plus the run margin (`--executor-run-margin-secs`), 3300 s
+//!   with the defaults, as a Linux job's.
 //!
 //! # The pack
 //!
-//! On a Mac the put directory is a plain directory: the commit's rename makes no object of the
-//! store. The Mac's tier store stores the object, under the same key `cas/b/<run>/<nonce>/pack`,
-//! once the job has ended, and the frontend reads it from the store as it reads a Linux job's.
-//! So a Mac job that ended well has its pack read again every poll while the store has no object
-//! under its key, for up to [`PACK_WAIT`] ([`is_mac`]); a pack still absent then fails the run as
-//! the farm's, and the action runs again.
+//! The job never holds a writable put directory. The put mount, read-write at
+//! [`MAC_OUT_TARGET`], is the put target the Mac's agent reads: once the job has ended and its
+//! processes are swept, the agent commits the one file `exec/.kbf-out/pack`, as it is, into the
+//! tier store's put directory `<mp>/put/cas/b/<run>/<nonce>`, and the store stores it under the
+//! key `cas/b/<run>/<nonce>/pack`. A job that left no `pack` (one that failed or was killed
+//! leaves only `.part` files) has nothing committed. The frontend minted that key and reads the
+//! object from the store as it reads a Linux job's, hashing every record itself. Since the store
+//! has the object only after the job ended, a Mac job that ended well has its pack read again
+//! every poll while the store has no object under its key, for up to [`PACK_WAIT`] ([`is_mac`]);
+//! a pack still absent then fails the run as the farm's, and the action runs again. So a pack
+//! that never arrives (the agent's commit failed) costs up to 30 minutes before that.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -91,12 +89,13 @@ pub(super) const MAC_ARCH: &str = "arm64";
 /// Where a Mac job's action tree is mounted, read-only: `exec/.kbf-tree` on the Mac.
 pub const TREE_TARGET: &str = "/work/.kbf-tree";
 
-/// Where a Mac job's put directory is mounted, read-write: `exec/.kbf-out` on the Mac.
+/// The target of a Mac job's put mount, read-write: `exec/.kbf-out` on the Mac, the directory of
+/// the job's own folder the task writes `pack` into and the agent commits it from.
 pub const MAC_OUT_TARGET: &str = "/work/.kbf-out";
 
-/// The longest the frontend waits, after a Mac job ended well, for the Mac's tier store to
-/// store its pack: the store stores it only after the job ended, and a large pack takes a
-/// while to send.
+/// The longest the frontend waits, after a Mac job ended well, for the tier store to have its
+/// pack: the agent commits it only after the job ended and its processes are swept, and a large
+/// pack takes a while to send.
 pub(super) const PACK_WAIT: Duration = Duration::from_secs(30 * 60);
 
 /// The least macOS a Mac of the pool runs when `--executor-mac-os-version` is left out.
@@ -108,70 +107,24 @@ pub enum System {
     /// Linux: every action that does not ask for a Mac.
     #[default]
     Linux,
-    /// macOS, at least `os_version` (a major version) when the action names one, with the Xcode
-    /// the action names.
+    /// macOS, at least `os_version` (a major version) when the action names one.
     Macos {
         /// The least major version the action takes.
         os_version: Option<u32>,
-        /// The Xcode the action runs with; `None` when it names none, which is refused before
-        /// a job is made.
-        xcode: Option<XcodeBuild>,
     },
-}
-
-/// An Xcode, by its build id (`16C5032a`, its `ProductBuildVersion`), as a Mac action names it
-/// in the platform property `xcode` and the job service takes it in `Constraints.xcode`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct XcodeBuild(String);
-
-impl XcodeBuild {
-    /// The most bytes of a build id the job service takes.
-    const MAX: usize = 32;
-
-    /// `value` as a build id.
-    ///
-    /// # Errors
-    /// A value that is not 1 to 32 bytes of ASCII letters, digits, `.`, `_` and `-` starting
-    /// with a letter or a digit, as the job service checks a build id.
-    pub fn parse(value: &str) -> Result<Self, String> {
-        let allowed = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-');
-        let first = value.bytes().next();
-        match first.is_some_and(|b| b.is_ascii_alphanumeric())
-            && value.len() <= Self::MAX
-            && value.bytes().all(allowed)
-        {
-            true => Ok(Self(value.to_owned())),
-            false => Err(format!(
-                "the action's {XCODE} {value:?} is not an Xcode build id such as 16C5032a: 1 to \
-                 {} letters, digits, '.', '_' and '-', starting with a letter or a digit",
-                Self::MAX
-            )),
-        }
-    }
-
-    /// The build id.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 /// The platform property of the least system version.
 const OS_VERSION: &str = "os_version";
 
-/// The platform property that names a Mac action's Xcode, by build: the capability key a Mac's
-/// agent reports its installed Xcodes under.
-pub const XCODE: &str = kbf_caps::XCODE;
-
 impl System {
     /// The system `platform` (the Action's, or else the Command's) asks for: macOS when it names
-    /// `os=macos`, with its `os_version` and `xcode`, else Linux.
+    /// `os=macos`, with its `os_version`, else Linux. No other property is read for a Mac.
     ///
     /// # Errors
-    /// A platform that does not parse (`xcode` given twice, in any two spellings, or empty
-    /// among them), an `os_version` of a Mac action that is not a version
-    /// (`<major>[.<minor>[.<patch>]]`, digits), or an `xcode` of a Mac action that is not a
-    /// build id ([`XcodeBuild::parse`]).
+    /// A platform that does not parse (a capability key such as `xcode` given twice, in any two
+    /// spellings, or empty among them), or an `os_version` of a Mac action that is not a
+    /// version (`<major>[.<minor>[.<patch>]]`, digits).
     pub fn of(platform: Option<&Platform>) -> Result<Self, String> {
         let properties = platform.map_or(&[][..], |p| p.properties.as_slice());
         let pairs = properties
@@ -185,12 +138,7 @@ impl System {
             .iter()
             .find(|p| p.name.eq_ignore_ascii_case(OS_VERSION));
         let os_version = named.map(|p| major(&p.value)).transpose()?;
-        let properties = request.properties();
-        let xcode = properties.iter().find(|(key, _)| *key == XCODE);
-        let xcode = xcode
-            .map(|(_, build)| XcodeBuild::parse(build))
-            .transpose()?;
-        Ok(Self::Macos { os_version, xcode })
+        Ok(Self::Macos { os_version })
     }
 }
 
@@ -279,27 +227,29 @@ pub(super) fn check_version(asked: Option<u32>, pool: &MacPool) -> Result<(), St
     }
 }
 
-/// What a Mac job asks of its host beside resources: a Mac, its architecture, the native
-/// runtime, and the Xcode `xcode` installed.
+/// What a Mac job asks of its host beside resources: a Mac and its architecture, and nothing
+/// else. `exec` is left unspecified: the job service runs a macOS job that names an image
+/// natively (komira-ai/jobscheduler#1022).
 #[must_use]
-pub(super) fn mac_constraints(xcode: &XcodeBuild) -> Constraints {
+pub(super) fn mac_constraints() -> Constraints {
     Constraints {
         os: MAC_OS.to_owned(),
         arch: MAC_ARCH.to_owned(),
-        exec: ExecMode::SandboxExec.into(),
+        exec: ExecMode::Unspecified.into(),
         isa_level: String::new(),
         accelerator: None,
         isolation: Isolation::Unspecified.into(),
         // The least version is held by the executor (`check_version`), not asked for.
         os_version: String::new(),
-        xcode: xcode.as_str().to_owned(),
+        xcode: String::new(),
     }
 }
 
 /// The flags of the task tool for the Mac run of `action` on `run`: the inputs are copied out
-/// of the tree at `exec/.kbf-tree` (`--materialize-work`), the object is committed into
-/// `exec/.kbf-out`, and the action may run for `deadline`. Both paths are relative to the
-/// task's working directory, `exec/`.
+/// of the tree at `exec/.kbf-tree` (`--materialize-work`), the object is written as `pack` into
+/// `exec/.kbf-out`, which the task makes, and the action may run for `deadline`. Both paths are
+/// relative to the task's working directory, `exec/`, and both come from the mounts' targets, so
+/// the file the task writes is the one the agent reads below the put mount's target.
 #[must_use]
 pub(super) fn mac_argv(action: &Digest, run: RunId, deadline: Duration) -> Vec<String> {
     let in_exec = |target: &str| target.trim_start_matches("/work/").to_owned();
@@ -354,8 +304,6 @@ pub(super) struct MacJob<'a> {
     pub(super) job_id: String,
     /// The pool.
     pub(super) pool: &'a MacPool,
-    /// The Xcode the action names.
-    pub(super) xcode: &'a XcodeBuild,
     /// The tier store's roots on the Macs.
     pub(super) roots: &'a PutDirRoots,
     /// The run's put directory, `cas/b/<run>/<nonce>`.
@@ -373,8 +321,8 @@ pub(super) struct MacJob<'a> {
 }
 
 /// The Mac job of `job`: the pool's task bundle, whose entrypoint runs, the tree (from
-/// tierstore's provider) and the put directory mounted under `/work`, no layer, no network, of
-/// a Mac with the action's Xcode.
+/// tierstore's provider) and the put target mounted under `/work`, no layer, no network, of
+/// any Mac of the job service.
 pub(super) fn mac_spec(job: MacJob<'_>) -> JobSpec {
     JobSpec {
         job_id: job.job_id,
@@ -384,9 +332,9 @@ pub(super) fn mac_spec(job: MacJob<'_>) -> JobSpec {
         args: job.args,
         env: BTreeMap::new(),
         needs: Some(job.needs),
-        constraints: Some(mac_constraints(job.xcode)),
+        constraints: Some(mac_constraints()),
         wall_limit_seconds: Some(job.wall_seconds),
-        // The inputs are the tree and the outputs the mount: the job reaches nothing.
+        // The inputs are the tree and the output the agent commits: the job reaches nothing.
         network: NetworkLevel::None.into(),
         ports: Vec::new(),
         host_ports: Vec::new(),
