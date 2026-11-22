@@ -330,8 +330,8 @@ What this design adds to an action with about 5 outputs and about 200 KB, compar
   `process-exec` is denied because the mount sets `no_exec`, as on Linux (job-rootfs 5.2 and 5.4; designed in
   jobscheduler, not built there). Both names are beside `exec/kbf-work`, not in the input root, so no input name is
   reserved for them.
-- NFS has no open handle count. The commit therefore requires the expected digest in the source name. kbf-task always
-  supplies it. A short or unflushed file fails with EBADMSG instead of being published.
+- NFS has no open handle count. The commit therefore requires the expected digest in the source name. On Linux
+  kbf-task supplies it; on a Mac the agent's commit does (`pack.part`, `pack.sha256-<hex>.part`, `pack`). A short or unflushed file fails with EBADMSG instead of being published.
 - Unmeasured: whether close(2) flushes writes synchronously, whether a killed process's writes are flushed, and
   loopback write throughput. The commit-deadline default must be checked against the NFS retransmit limit.
 - Out-of-order writes defeat the inline hash. The digest is then computed at commit, about 0.5 s/GB per core.
