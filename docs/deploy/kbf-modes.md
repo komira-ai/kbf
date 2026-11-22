@@ -247,8 +247,15 @@ failure classes as the table in `crates/kbf-server/src/executor/outcome.rs` says
 stopped at its wall limit is the action's own timeout, answered `DEADLINE_EXCEEDED` at once; one
 killed for memory, a lost job (the host's fault) and any other ending of the farm's are submitted again as
 the next attempt, a new job and a new key, at most 2 times, after which the callers are answered
-`UNAVAILABLE` (`FAILED_PRECONDITION` with reason `ACTION_OUT_OF_MEMORY` for memory); and a submit the service refuses because no
-host could ever run it ends the action as invalid at once. A job's pack is read, and its outputs
+`UNAVAILABLE` (`FAILED_PRECONDITION` with reason `ACTION_OUT_OF_MEMORY` for memory). A job its
+host would not start now (no room, `no-capacity`; the host held while it is drained for an update,
+`host-held`; or tainted, `host-tainted`) is not the action's failure: it is submitted again after a
+wait (the poll, doubling up to 30 s) and spends none of those attempts, while the next job would be
+submitted before the action's deadline (its timeout, from when it was asked for) and at most 100
+times in an operation; past that the callers are answered `UNAVAILABLE` naming every refusal and how
+many times it came. A submit the service refuses because no host could ever run it
+(`no-capable-host`), and a start a host refuses as `platform-mismatch`, end the action as invalid at
+once, naming the refusal. A job's pack is read, and its outputs
 promoted, only from a clean result: the job and its result both say succeeded, the result's
 reason is the job's exit and its exit code is 0. Any other ending, a result that leaves out its
 exit code included, leaves the pack unread however complete it is, and the action runs

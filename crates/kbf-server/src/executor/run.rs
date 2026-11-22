@@ -17,7 +17,11 @@
 //! because its host could not read a declared input
 //! ([`Ingest::unreadable_input`](super::Ingest::unreadable_input)), which is an ending of the
 //! farm's; an ending of the farm's submits the
-//! operation's next attempt, while it has one ([`RESUBMITS`]); a job whose tree list a host refused
+//! operation's next attempt, while it has one ([`RESUBMITS`]); a job its host would not start now
+//! (no room, the host held for an update, or tainted) is submitted again as the next attempt
+//! after a wait, spending none of those attempts, while the next job would be submitted before
+//! the action's deadline and at most [`REFUSED_STARTS`](super::refused::REFUSED_STARTS) times in
+//! an operation ([`super::refused`]: a resumed operation counts them from zero); a job whose tree list a host refused
 //! as not mountable also runs again, the first [`LIST_REFUSALS`] times in an operation without
 //! spending an attempt (a resumed operation counts them from zero), after the frontend takes its
 //! miss path ([`Ingest::list_refused`](super::Ingest::list_refused)); any other ending, and the last
@@ -41,6 +45,7 @@
 
 use std::future::pending;
 use std::sync::Arc;
+use std::time::Duration;
 
 use js_proto::v1::{Job, JobResult, JobSpec, JobState};
 use kbf_front::{Finished, Stage};
@@ -62,6 +67,7 @@ use super::outcome::{
 use super::output::{Output, Tail};
 use super::phases::{Mark, Phase, Timeline};
 use super::record;
+use super::refused::{Refusal, Refusals};
 use super::rows::{Look, OpRow, Opened, Rows, RowsError};
 use super::steps::Step;
 use super::submit::{Booking, Preparer, not_minted, prepare};
@@ -112,6 +118,8 @@ struct Submitted {
     job: String,
     /// The put directory its pack is committed into.
     key: PackKey,
+    /// The action's timeout: the deadline a refused start is placed again within.
+    timeout: Duration,
 }
 
 /// How one run ended.
@@ -121,6 +129,9 @@ enum Ended {
     /// It produced no result: what decides whether another attempt follows, and the job's output
     /// for the callers if none does.
     Again(Settled, Option<Output>),
+    /// Its host would not start it now, for `0`: the job is placed again while the action's
+    /// timeout `1` allows ([`super::refused`]), and the job's output is for the callers if not.
+    Refused(Refusal, Duration, Option<Output>),
     /// A caller cancelled it.
     Cancelled,
     /// Another process runs the operation now.
@@ -225,6 +236,8 @@ pub(crate) async fn run(
     let mut began = op.created;
     // The runs refused as not mountable that spent no attempt: counted here, from zero.
     let mut free_runs = 0_u32;
+    // The starts hosts refused for now, each placed again with no attempt spent: from zero too.
+    let mut refusals = Refusals::default();
     let answer = loop {
         let run = RunId::new(op.id, attempt);
         let mut timeline = Timeline::default();
@@ -249,10 +262,40 @@ pub(crate) async fn run(
                     }
                 }
             }
+            Ended::Refused(refusal, timeout, output) => {
+                metrics.run_ended(RunEnd::Refused);
+                let deadline = op.created + timeout;
+                match refusals.add(refusal, inner.cfg.poll, Instant::now(), deadline) {
+                    Ok(wait) => {
+                        tracing::warn!(operation = %op.id, %run, code = refusal.code(), ?wait, "the host would not start the job now: it is placed again, spending no attempt");
+                        metrics.attempt_resubmitted();
+                        if op.recorded {
+                            record::requeued(&inner.deps.recorder, run);
+                        }
+                        tokio::select! {
+                            biased;
+                            () = cancel_asked(&mut cancel) => break Some((run, cancelled())),
+                            () = sleep(wait) => {}
+                        }
+                        attempt += 1;
+                        began = Instant::now();
+                        continue;
+                    }
+                    Err(stop) => {
+                        let mut status = refusals.status(stop, timeout);
+                        if let Some(output) = output {
+                            output.attach(&mut status);
+                        }
+                        tracing::warn!(operation = %op.id, %run, ?stop, message = %status.message, "the operation finished failed: its job was refused a start until it stopped placing it");
+                        break Some((run, Finished::Failed(status)));
+                    }
+                }
+            }
             Ended::Again(settled, output) => {
                 metrics.run_ended(RunEnd::of(&settled));
                 let free = matches!(settled, Settled::ListRefused(_)) && free_runs < LIST_REFUSALS;
-                if free || (settled.retried() && attempt.saturating_sub(free_runs) < RESUBMITS) {
+                let spent = attempt.saturating_sub(free_runs + refusals.placed_again());
+                if free || (settled.retried() && spent < RESUBMITS) {
                     free_runs += u32::from(free);
                     tracing::warn!(operation = %op.id, %run, ?settled, free, "the run ended for a reason of the farm's: the operation runs again");
                     metrics.attempt_resubmitted();
@@ -404,6 +447,7 @@ async fn fresh(
     let submitted = Submitted {
         job,
         key: prepared.key,
+        timeout: prepared.timeout,
     };
     watch_job(inner, op, run, &submitted, cancel, timeline).await
 }
@@ -487,6 +531,7 @@ async fn resume(
     let submitted = Submitted {
         job: row.job,
         key: PackKey::new(key),
+        timeout: inner.cfg.default_timeout,
     };
     watch_job(inner, op, run, &submitted, cancel, timeline).await
 }
@@ -619,6 +664,10 @@ async fn watch_job(
             let path = inner.deps.ingest.list_refused(&action).await;
             let output = output(inner, run, job, Some(&result)).await;
             Ended::Again(Settled::ListRefused(path), Some(output))
+        }
+        Verdict::Refused(refusal) => {
+            let output = output(inner, run, job, Some(&result)).await;
+            Ended::Refused(refusal, submitted.timeout, Some(output))
         }
         Verdict::StoreLost { object, settled } => {
             // Before the next attempt is prepared: its tree is then written checked.
@@ -838,6 +887,9 @@ mod list_tests;
 #[cfg(test)]
 #[path = "run_mac_tests.rs"]
 mod mac_tests;
+#[cfg(test)]
+#[path = "run_refused_tests.rs"]
+mod refused_tests;
 #[cfg(test)]
 #[path = "run_store_tests.rs"]
 mod store_tests;

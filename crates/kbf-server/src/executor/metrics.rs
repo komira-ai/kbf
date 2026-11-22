@@ -38,10 +38,13 @@ pub(crate) enum RunEnd {
     ListRefused,
     /// The job's host could not provide or read its inputs.
     InputFailed,
+    /// The job's host would not start it now (no room, held for an update, tainted): placed
+    /// again, spending no attempt.
+    Refused,
 }
 
 impl RunEnd {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Ran,
         Self::Infra,
         Self::Timeout,
@@ -51,6 +54,7 @@ impl RunEnd {
         Self::Missing,
         Self::ListRefused,
         Self::InputFailed,
+        Self::Refused,
     ];
 
     const fn label(self) -> &'static str {
@@ -64,6 +68,7 @@ impl RunEnd {
             Self::Missing => "missing",
             Self::ListRefused => "list_refused",
             Self::InputFailed => "input_failed",
+            Self::Refused => "refused",
         }
     }
 
@@ -267,7 +272,7 @@ impl Metrics {
             ),
             (
                 "kbf_executor_attempts_resubmitted_total",
-                "Operations run again as a new attempt after a run that ended for an infrastructure reason",
+                "Operations run again as a new job after a run that ended for a reason of the farm's, a refused start among them",
                 &self.attempts,
             ),
             (

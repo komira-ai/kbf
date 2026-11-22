@@ -277,3 +277,60 @@ async fn a_liveness_row_that_cannot_be_deleted_expires_on_its_own() {
         "and the row expires after its time to live"
     );
 }
+
+/// Asserts a job of a gone process's operation that its host would not start now: the
+/// operation taken up places it again, spending no attempt. Its row holds no timeout of the
+/// action, so its first refusal is held to the executor's default; its later jobs are prepared
+/// again and read the action's, which names none here, so the default (20 s) again, counted from
+/// when it was taken up: refused at every start, it is answered `UNAVAILABLE` naming that
+/// deadline and every refusal.
+#[tokio::test(start_paused = true)]
+async fn a_taken_up_operation_places_a_refused_start_again_within_the_default_timeout() {
+    let setup = crate::executor::tests::Setup {
+        store: true,
+        record: false,
+    };
+    let rig = Rig::build(setup, |cfg| cfg.default_timeout = Duration::from_secs(20)).await;
+    if let Ok(facts) = rig.inputs.facts.lock().unwrap().as_mut() {
+        facts.timeout = None;
+    }
+    let job = gone_job(&rig, 50, 0);
+    rig.rows("gone")
+        .put_op(OperationId(50), &row(1, &job, Some("cas/b/50-0/aa")))
+        .expect("row");
+    let running = Running::spawn(&rig.exec);
+    settle().await;
+    let ticket = rig
+        .exec
+        .wait(&stored_name(OperationId(50)))
+        .expect("open here");
+    let caller = crate::executor::tests::Caller::of(ticket);
+    let job_of = |attempt| job_id(&rig.cfg.frontend, RunId::new(OperationId(50), attempt));
+    let mut attempt = 0;
+    loop {
+        assert!(rig.fake.refuse_start(&job_of(attempt), "host-held"));
+        attempt += 1;
+        let next = job_of(attempt);
+        rig.until("the next job or the answer", || {
+            caller.finished().is_some() || rig.fake.submitted(&next).is_some()
+        })
+        .await;
+        if caller.finished().is_some() {
+            break;
+        }
+    }
+    let Some(Finished::Failed(status)) = caller.finished() else {
+        panic!("not a failure: {:?}", caller.finished());
+    };
+    assert!(attempt > 1, "placed again before the deadline");
+    assert_eq!(status.code, tonic::Code::Unavailable as i32);
+    assert_eq!(
+        status.message,
+        format!(
+            "the farm's hosts refused to start the job {attempt} times and the next placement \
+             would come after the action's deadline (20s from when it was asked for): \
+             host-held {attempt} (not the action's own failure)"
+        )
+    );
+    running.stop().await;
+}

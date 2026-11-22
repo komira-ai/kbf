@@ -13,8 +13,11 @@
 //! Each operation is driven by a task of its own ([`run`]): the job is read back every
 //! [`Config::poll`] until it ends (and less often while the job service is busy or cannot be
 //! reached, which never ends a run: [`busy`]); an ending of the farm's (the host lost, the job service
-//! restarted, the job refused at its start) submits the operation again as its next attempt, a
-//! new job with a new key, at most [`outcome::RESUBMITS`] times; a job whose tree list a host
+//! restarted, the job failed at its start) submits the operation again as its next attempt, a
+//! new job with a new key, at most [`outcome::RESUBMITS`] times; a job a host would not start now
+//! (no room, or the host held for an update, or tainted) is submitted again too, spending none of
+//! those attempts, while the next job would be submitted before the action's deadline and at
+//! most [`refused::REFUSED_STARTS`] times ([`refused`]); a job whose tree list a host
 //! refused as not mountable through tierstore (`tree list not supported`) is run again too, its
 //! first [`outcome::LIST_REFUSALS`] of them in an operation without spending one of those
 //! attempts, after the frontend takes its miss path ([`Ingest::list_refused`]: the tree list
@@ -53,6 +56,7 @@ mod output;
 mod phases;
 mod probe;
 mod record;
+mod refused;
 pub mod rows;
 mod run;
 mod size_class;
