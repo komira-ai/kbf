@@ -53,6 +53,7 @@ use tonic::Code;
 
 use super::Inner;
 use super::api::{answered, not_found, note};
+use super::mac::{PACK_WAIT, is_mac};
 use super::metrics::{IngestEnd, RunEnd};
 use super::outcome::{
     FailedInput, InputFailure, LIST_REFUSALS, RESUBMITS, Settled, Verdict, forgotten, judge,
@@ -65,7 +66,7 @@ use super::rows::{Look, OpRow, Opened, Rows, RowsError};
 use super::steps::Step;
 use super::submit::{Booking, Preparer, not_minted, prepare};
 use super::task::{PackKey, RunId};
-use super::traits::{Ingested, UntrustedLimits};
+use super::traits::{Ingested, RejectReason, UntrustedLimits};
 
 /// An operation, as its task holds it.
 pub(crate) struct Op {
@@ -627,7 +628,10 @@ async fn watch_job(
             Ended::Again(settled, Some(output))
         }
         Verdict::Ingest => {
-            let ingested = ingest(inner, run, &op.key, &submitted.key).await;
+            let ingested = ingest_ended(inner, run, &op.key, (&read, &submitted.key), cancel);
+            let Some(ingested) = ingested.await else {
+                return Ended::Cancelled;
+            };
             timeline.stamp(Mark::Done, Instant::now(), metrics);
             match ingested {
                 Ingested::Ran { result, .. } => {
@@ -674,6 +678,34 @@ async fn unreadable(
         host: job.host_id.clone(),
         input: FailedInput::Unread(path),
     })
+}
+
+/// The frontend's read of the pack `key` of `job`, the job of `run` of `action`, which ended
+/// well. A Mac job's pack is stored by its Mac's tier store only after the job ended
+/// ([`crate::executor::mac`], "The pack"): while the store has no object under its key it is
+/// read again every poll, for up to [`PACK_WAIT`]. `None` when a caller cancels the operation
+/// first: the job has ended, so there is nothing to withdraw.
+async fn ingest_ended(
+    inner: &Inner,
+    run: RunId,
+    action: &ActionKey,
+    (job, key): (&Job, &PackKey),
+    cancel: &mut watch::Receiver<bool>,
+) -> Option<Ingested> {
+    let mac = is_mac(job.spec.as_ref());
+    let until = Instant::now() + PACK_WAIT;
+    loop {
+        let ingested = ingest(inner, run, action, key).await;
+        let absent = matches!(ingested, Ingested::Reject(RejectReason::Missing));
+        if !(mac && absent && Instant::now() < until) {
+            return Some(ingested);
+        }
+        tokio::select! {
+            biased;
+            () = cancel_asked(cancel) => return None,
+            () = sleep(inner.cfg.poll) => {}
+        }
+    }
 }
 
 /// The frontend's read of the pack `key` of `run` of `action`.
@@ -802,6 +834,10 @@ mod end_tests;
 #[cfg(test)]
 #[path = "run_list_tests.rs"]
 mod list_tests;
+
+#[cfg(test)]
+#[path = "run_mac_tests.rs"]
+mod mac_tests;
 #[cfg(test)]
 #[path = "run_store_tests.rs"]
 mod store_tests;

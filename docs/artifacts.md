@@ -762,7 +762,7 @@ The frontend publishes the bundle of its release at its start under `--executor 
 
 ## The macOS kbf-task bundle
 
-The bundle is built and released, and it is the image of a Mac job: `kbf-server`'s executor sends an action that asks for macOS to a Mac worker (`--executor-mac-hosts`, none by default) and submits it with this bundle's manifest digest as the job's image (`--executor-mac-task-bundle`), its entrypoint `kbf-task` run as `--materialize-work=.kbf-tree --stage-and-commit --out-dir .kbf-out` (`crates/kbf-server/src/executor/mac.rs`, `crates/kbf-task/src/materialize.rs`; `docs/design/actions-as-jobs.md`, section 14). No Mac runs one yet: the job service at kbf's pin takes no native job start from the job API and no mount on a Mac (section 14 says what it lacks). It is placed by digest, not as a layer of the toolchain bundle. The `darwin-arm64` job makes that bundle, and no other job does:
+The bundle is built and released, and it is the image of a Mac job: `kbf-server`'s executor sends an action that asks for macOS to the job service's Macs when it is given this bundle's manifest digest (`--executor-mac-task-bundle`, none by default), as the job's image, its entrypoint `kbf-task` run as `--materialize-work=.kbf-tree --stage-and-commit --out-dir .kbf-out` (`crates/kbf-server/src/executor/mac.rs`, `crates/kbf-task/src/materialize.rs`; `docs/design/actions-as-jobs.md`, section 14). The job's action tree comes from tierstore's mount provider, written whole to the Mac's own disk, and its pack is read back from the store once the Mac's tier store has stored it after the job ended. It is placed by digest, not as a layer of the toolchain bundle. The `darwin-arm64` job makes that bundle, and no other job does:
 
 | Asset | What it is |
 |---|---|

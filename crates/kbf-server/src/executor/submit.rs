@@ -25,8 +25,9 @@
 //! every run as the caller's, naming `--task-out-root`.
 //!
 //! An action whose platform asks for a Mac is a Mac job ([`crate::executor::mac`]): the
-//! release's `kbf-task` bundle, the tree and the put directory mounted under `/work`, no layer, of
-//! a Mac in the native runtime, with no CPU or memory and the class's labels. It is refused as
+//! release's `kbf-task` bundle, the tree (always its tree list, from tierstore's mount provider)
+//! and the put directory mounted under `/work`, no layer, of a Mac in the native runtime, with no
+//! CPU or memory and the class's labels. It is refused as
 //! the caller's on an executor with no Macs, when it names no Xcode ([`Settled::NoXcode`]), and
 //! as for Linux for a whole machine.
 //!
@@ -264,8 +265,9 @@ async fn prepare_mac(
     let Some(linux) = &ctx.cfg.task_out else {
         return Err(no_roots("a Mac action"));
     };
-    // The native runtime takes no mount provider: a Mac job's tree is always its manifests.
-    let key = minted(ctx, run, action, wall, InputTree::Manifests).await?;
+    // A Mac has no host directory of manifests: its tree is always its tree list, which
+    // tierstore's provider writes whole to the Mac's disk.
+    let key = minted(ctx, run, action, wall, InputTree::Provider).await?;
     let tree = ctx.inputs.tree(run).await?;
     let spec = mac_spec(MacJob {
         job_id: job_id(&ctx.cfg.frontend, run),

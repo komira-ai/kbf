@@ -46,29 +46,40 @@
 //!   `kbf-task`, runs, told `--materialize-work=.kbf-tree` ([`mac_argv`]). A job with no layer
 //!   must name an image, and a Mac's agent runs only a bundle's program.
 //! - **Two mounts**, each at `/work/<name>`, which a Mac's agent makes `exec/<name>`: the action
-//!   tree `<mp>/trees/<digest>` read-only at [`TREE_TARGET`], and the put directory
-//!   `<mp>/put/cas/b/<run>/<nonce>` read-write at [`MAC_OUT_TARGET`]. Both `no_exec`: the
-//!   task copies the inputs out of the tree into `exec/kbf-work` (APFS clones where the volume
-//!   allows), runs the Command there, and commits its one object into the put directory, as a
-//!   Linux job does. `<mp>` is the Macs' own (`--executor-mac-task-out-root`, by default
-//!   `--task-out-root`).
+//!   tree read-only at [`TREE_TARGET`], from tierstore's mount provider ([`PROVIDER`]) given the
+//!   key of the tree's tree list, as a Linux job's layer is with `--executor-input-tree
+//!   provider` ([`provider_layer`](crate::executor::out::provider_layer)); and the put directory
+//!   `<mp>/put/cas/b/<run>/<nonce>` read-write at [`MAC_OUT_TARGET`]. On a Mac the provider
+//!   answers the mount with a directory of the Mac's own disk holding the whole tree. Both
+//!   `no_exec`: the task copies the inputs out of the tree into `exec/kbf-work` (APFS clones
+//!   where the volume allows), runs the Command there, and commits its one object into the put
+//!   directory, as a Linux job does. `<mp>/put` is the Macs' own (`--executor-mac-task-out-root`,
+//!   by default `--task-out-root`). A Mac's tree is always its tree list, whatever
+//!   `--executor-input-tree` says: a Mac has no host directory of manifests. So on a host's
+//!   refusal of the list the miss path's first step (the list written again, checked) helps a
+//!   Mac job, and its second (manifests) does not: the next run mounts the list again.
 //! - `os=macos`, `arch=arm64`, `exec=sandbox-exec`, the action's `xcode`, no CPU and no memory
 //!   (the job service sizes it from its class's history), no network, no file and no secret.
 //!
-//! The job service at kbf's pin does not yet run such a job on a Mac (it takes no native start
-//! from the job API, and its Macs do not take mounts); a pool of no Macs, the default, sends
-//! none.
+//! # The pack
+//!
+//! On a Mac the put directory is a plain directory: the commit's rename makes no object of the
+//! store. The Mac's tier store stores the object, under the same key `cas/b/<run>/<nonce>/pack`,
+//! once the job has ended, and the frontend reads it from the store as it reads a Linux job's.
+//! So a Mac job that ended well has its pack read again every poll while the store has no object
+//! under its key, for up to [`PACK_WAIT`] ([`is_mac`]); a pack still absent then fails the run as
+//! the farm's, and the action runs again.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use js_proto::v1::{
     Constraints, ExecMode, Isolation, JobSpec, Mount, MountMode, MountPropagation, Needs,
-    NetworkLevel, mount,
+    NetworkLevel, ProviderSource, mount,
 };
 use kbf_proto::reapi::{Digest, Platform};
 
-use crate::executor::out::PutDirRoots;
+use crate::executor::out::{PROVIDER, PutDirRoots};
 use crate::executor::task::{RunId, build_id};
 
 /// The `os` of a Mac, as the job service spells it.
@@ -82,6 +93,11 @@ pub const TREE_TARGET: &str = "/work/.kbf-tree";
 
 /// Where a Mac job's put directory is mounted, read-write: `exec/.kbf-out` on the Mac.
 pub const MAC_OUT_TARGET: &str = "/work/.kbf-out";
+
+/// The longest the frontend waits, after a Mac job ended well, for the Mac's tier store to
+/// store its pack: the store stores it only after the job ended, and a large pack takes a
+/// while to send.
+pub(super) const PACK_WAIT: Duration = Duration::from_secs(30 * 60);
 
 /// The least macOS a Mac of the pool runs when `--executor-mac-os-version` is left out.
 pub const DEFAULT_MAC_OS_VERSION: u32 = 26;
@@ -303,16 +319,33 @@ pub(super) fn mac_argv(action: &Digest, run: RunId, deadline: Duration) -> Vec<S
     ]
 }
 
-/// The mount of `host_path` at `target`, `no_exec`, private; read-write or read-only.
-fn mount_at(host_path: String, target: &str, mode: MountMode) -> Mount {
+/// The mount of `source` at `target`, `no_exec`, private; read-write or read-only.
+fn mount_at(source: mount::Source, target: &str, mode: MountMode) -> Mount {
     Mount {
-        source: Some(mount::Source::HostPath(host_path)),
+        source: Some(source),
         target: target.to_owned(),
         mode: mode.into(),
         sub_path: String::new(),
         no_exec: true,
         propagation: MountPropagation::Private.into(),
     }
+}
+
+/// The source of a Mac job's tree: tierstore's mount provider, given `key`, the key of the
+/// tree's tree list.
+fn tree_source(key: &str) -> mount::Source {
+    mount::Source::Provider(ProviderSource {
+        provider: PROVIDER.to_owned(),
+        r#ref: key.to_owned(),
+    })
+}
+
+/// Whether `spec` is a Mac job's: one that asks for `os=macos`. Read from the job the service
+/// answers, so a job a gone process submitted is known as one too.
+#[must_use]
+pub(super) fn is_mac(spec: Option<&JobSpec>) -> bool {
+    let constraints = spec.and_then(|spec| spec.constraints.as_ref());
+    constraints.is_some_and(|c| c.os == MAC_OS)
 }
 
 /// What a Mac job is made of, beside what every job carries.
@@ -327,7 +360,7 @@ pub(super) struct MacJob<'a> {
     pub(super) roots: &'a PutDirRoots,
     /// The run's put directory, `cas/b/<run>/<nonce>`.
     pub(super) dir: &'a str,
-    /// The run's action tree, its digest in hex.
+    /// The key of the run's tree list, which tierstore's provider is asked for.
     pub(super) tree: &'a str,
     /// The task tool's flags.
     pub(super) args: Vec<String>,
@@ -339,8 +372,9 @@ pub(super) struct MacJob<'a> {
     pub(super) labels: BTreeMap<String, String>,
 }
 
-/// The Mac job of `job`: the pool's task bundle, whose entrypoint runs, the tree and the put
-/// directory mounted under `/work`, no layer, no network, of a Mac with the action's Xcode.
+/// The Mac job of `job`: the pool's task bundle, whose entrypoint runs, the tree (from
+/// tierstore's provider) and the put directory mounted under `/work`, no layer, no network, of
+/// a Mac with the action's Xcode.
 pub(super) fn mac_spec(job: MacJob<'_>) -> JobSpec {
     JobSpec {
         job_id: job.job_id,
@@ -358,13 +392,9 @@ pub(super) fn mac_spec(job: MacJob<'_>) -> JobSpec {
         host_ports: Vec::new(),
         layers: Vec::new(),
         mounts: vec![
+            mount_at(tree_source(job.tree), TREE_TARGET, MountMode::ReadOnly),
             mount_at(
-                format!("{}/{}", job.roots.trees(), job.tree),
-                TREE_TARGET,
-                MountMode::ReadOnly,
-            ),
-            mount_at(
-                format!("{}/{}", job.roots.put(), job.dir),
+                mount::Source::HostPath(format!("{}/{}", job.roots.put(), job.dir)),
                 MAC_OUT_TARGET,
                 MountMode::ReadWrite,
             ),

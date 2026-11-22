@@ -191,8 +191,11 @@ bundle by its manifest digest, the image of a Mac job; without it no macOS actio
 `--executor-mac-os-version` (the least macOS the Macs run, 26 by default; an
 action's `os_version` above it is refused) and `--executor-mac-task-out-root` (the tier store's
 put directory on the Macs, `--task-out-root` by default); a macOS action must name its Xcode build (`xcode`, docs/platform-properties.md) and becomes a
-job of a Mac's native runtime with that Xcode (docs/design/actions-as-jobs.md, section 14), which the job service at
-kbf's pin cannot run yet. It books no disk: the
+job of a Mac's native runtime with that Xcode (docs/design/actions-as-jobs.md, section 14). A Mac job's tree is
+always its tree list, mounted read-only from tierstore's mount provider (which writes it whole to the Mac's disk),
+whatever `--executor-input-tree` says; the Mac's tier store stores the job's pack after the job ended, and the
+frontend reads the pack again every poll while the store does not have it, for up to 30 minutes, before it runs the
+action again. It books no disk: the
 job carries no `disk_bytes`, so the job service places it on a host whatever scratch disk that
 host reports, and the job writes to its host's scratch with no quota. The kbf image is built from
 the base environment the actions' Commands see (`--executor-base-image`); both are named by
@@ -283,7 +286,7 @@ tree list a host's tierstore refuses as not mountable (`tree list not supported:
 readable L2 sidecar) is not failed for it: the frontend writes that action's list again with its sidecar,
 and if the host refuses that too, gives the action's jobs its tree as manifests (`manifests` form, no
 mount provider). Neither run spends one of the operation's attempts
-(`kbf_executor_list_refused_total{step}` counts them). A Mac job always reads manifests.
+(`kbf_executor_list_refused_total{step}` counts them). A Mac job always reads its tree list from the mount provider, whatever this flag says: a Mac has no manifests to fall back to, so its first refusal has the list written again, and its second runs the same list again.
 
 Beside each tree list the frontend stores its L2 sidecar (`cas/l2/<sha256>`, the same id: tierstore's
 `docs/design/fetch-cache-serve.md`, 3.5): the list's entries with the SHA-256 of every 1 MiB cell of

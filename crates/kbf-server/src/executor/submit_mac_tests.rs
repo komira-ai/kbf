@@ -16,7 +16,8 @@ use crate::executor::{
     System, TREE_TARGET, XcodeBuild,
 };
 
-const TREE: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+/// The key of the run's tree list, as [`Inputs::tree`] hands it out for a Mac run.
+const TREE: &str = "cas/l/efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 fn action() -> Digest {
     Digest {
@@ -122,15 +123,18 @@ async fn prepared(case: Case) -> Result<super::Prepared, Settled> {
     prepare(&ctx, RUN, &action(), case.booking).await
 }
 
-fn host_path(mount: &js_proto::v1::Mount) -> &str {
+/// Where a mount comes from: a host path, or `<provider>:<ref>` for a provider's tree.
+fn source(mount: &js_proto::v1::Mount) -> String {
     match &mount.source {
-        Some(mount::Source::HostPath(path)) => path,
-        other => panic!("not a host path: {other:?}"),
+        Some(mount::Source::HostPath(path)) => path.clone(),
+        Some(mount::Source::Provider(p)) => format!("{}:{}", p.provider, p.r#ref),
+        None => panic!("no source"),
     }
 }
 
 /// Asserts the job of a Mac action: the release's task bundle as its image, its entrypoint
-/// run (no command), no layer, the Mac flags, the tree read-only at `/work/.kbf-tree` and the run's put directory read-write at
+/// run (no command), no layer, the Mac flags, the tree read-only at `/work/.kbf-tree` from
+/// tierstore's provider given the tree list's key, and the run's put directory read-write at
 /// `/work/.kbf-out` under the Linux roots, `os=macos`, `arch=arm64` in the native runtime with
 /// the action's Xcode build, the share booked (no CPU, memory or disk named: the service sizes the job from its class), no
 /// network, no file, the wall limit and the labels of any job, the size class
@@ -152,20 +156,27 @@ async fn a_mac_action_is_a_native_job_with_the_tree_and_the_put_directory_under_
     assert!(spec.layers.is_empty());
     assert_eq!(spec.command, "");
     assert_eq!(spec.args, mac_argv(&action(), RUN, Duration::from_secs(20)));
-    let targets: Vec<(&str, &str, MountMode)> = spec
+    let targets: Vec<(String, &str, MountMode)> = spec
         .mounts
         .iter()
-        .map(|m| (host_path(m), m.target.as_str(), m.mode()))
+        .map(|m| (source(m), m.target.as_str(), m.mode()))
         .collect();
-    let tree = format!("/mnt/ts/trees/{TREE}");
-    let put = format!("/mnt/ts/put/{dir}");
     assert_eq!(
         targets,
         [
-            (tree.as_str(), TREE_TARGET, MountMode::ReadOnly),
-            (put.as_str(), MAC_OUT_TARGET, MountMode::ReadWrite),
+            (
+                format!("tierstore:{TREE}"),
+                TREE_TARGET,
+                MountMode::ReadOnly
+            ),
+            (
+                format!("/mnt/ts/put/{dir}"),
+                MAC_OUT_TARGET,
+                MountMode::ReadWrite
+            ),
         ]
     );
+    assert!(spec.mounts.iter().all(|m| m.no_exec));
     let constraints = spec.constraints.as_ref().expect("constraints");
     assert_eq!(
         (constraints.os.as_str(), constraints.arch.as_str()),
@@ -188,8 +199,8 @@ async fn a_mac_action_is_a_native_job_with_the_tree_and_the_put_directory_under_
     );
 }
 
-/// Asserts that a pool that names its own roots mounts the tree and the put directory under
-/// them, not under `--task-out-root`'s.
+/// Asserts that a pool that names its own roots mounts the put directory under them, not under
+/// `--task-out-root`'s, and the tree from the provider all the same.
 #[tokio::test(start_paused = true)]
 async fn a_pool_with_its_own_roots_mounts_under_them() {
     let prepared = prepared(Case {
@@ -198,11 +209,11 @@ async fn a_pool_with_its_own_roots_mounts_under_them() {
     })
     .await
     .expect("prepared");
-    let paths: Vec<&str> = prepared.spec.mounts.iter().map(host_path).collect();
+    let paths: Vec<String> = prepared.spec.mounts.iter().map(source).collect();
     assert_eq!(
         paths,
         [
-            format!("/Volumes/ts/trees/{TREE}"),
+            format!("tierstore:{TREE}"),
             "/Volumes/ts/put/cas/b/7-8/aa-0".to_owned()
         ]
     );
