@@ -107,6 +107,8 @@ struct State {
     manifests: BTreeMap<String, (String, Vec<u8>)>,
     log: Vec<String>,
     basic_ok: bool,
+    /// The `Accept` of each manifest `HEAD`, in order (empty when there is none).
+    manifest_accepts: Vec<String>,
 }
 
 struct Fake {
@@ -274,10 +276,17 @@ fn serve(state: &Mutex<State>, quirks: &Quirks, base: &str, req: &Request, out: 
                 .insert(reference.to_owned(), (content_type, req.body.clone()));
             return respond(out, 201, &[("Docker-Content-Digest", said)], b"");
         }
-        let present = if st.manifests.contains_key(reference) {
-            200
-        } else {
-            404
+        // As ghcr.io does: a manifest is found only by a request whose `Accept` names its type.
+        let accept = req.headers.get("accept").cloned().unwrap_or_default();
+        st.manifest_accepts.push(accept.clone());
+        let accepted = |media: &str| {
+            accept
+                .split(',')
+                .any(|a| a.split(';').next().unwrap_or_default().trim() == media)
+        };
+        let present = match st.manifests.get(reference) {
+            Some((media, _)) if accepted(media) => 200,
+            _ => 404,
         };
         return respond(
             out,
@@ -372,6 +381,33 @@ fn push_puts_the_manifest_under_the_media_type_it_names() {
     let fake = fake(Quirks::default());
     fake.push(&layout(b"layer", Some(media))).expect("push");
     assert_eq!(fake.state.lock().expect("state").manifests["v1"].0, media);
+}
+
+#[test]
+fn the_manifest_check_accepts_exactly_the_media_type_the_manifest_is_put_under() {
+    let oci = "application/vnd.oci.image.manifest.v1+json";
+    let docker = "application/vnd.docker.distribution.manifest.v2+json";
+    for (files, media) in [(good(), oci), (layout(b"layer", Some(docker)), docker)] {
+        let fake = fake(Quirks::default());
+        let hex = manifest_hex(&files);
+        assert_eq!(
+            fake.push(&files),
+            Ok(format!("{REPOSITORY}@sha256:{hex}")),
+            "{media}"
+        );
+        let state = fake.state.lock().expect("state");
+        assert_eq!(state.manifest_accepts, vec![media.to_owned()], "{media}");
+        let heads: Vec<&String> = state
+            .log
+            .iter()
+            .filter(|l| l.starts_with("HEAD ") && l.contains("/manifests/"))
+            .collect();
+        assert_eq!(
+            heads,
+            vec![&format!("HEAD /v2/{PATH}/manifests/sha256:{hex}")],
+            "{media}"
+        );
+    }
 }
 
 #[test]
