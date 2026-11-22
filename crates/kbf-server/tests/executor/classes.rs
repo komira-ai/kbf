@@ -78,9 +78,7 @@ enum Ending {
 
 /// Catches an ending that says the infrastructure failed (the task tool exited nonzero, the
 /// job did not start, the job was cancelled by someone else) being answered as the action's
-/// failure. Each is run again as a new job (a start the job service ended for no room,
-/// `NO_CAPACITY`, as a refused start that spends no attempt, the others as the next attempt),
-/// and the second job's OK is the caller's answer: the
+/// failure. Each is run again as a new job, and the second job's OK is the caller's answer: the
 /// failed attempts leave no pack read behind, so one digest never shows a pass and a failure (a
 /// flake) for an infrastructure fault.
 #[tokio::test]

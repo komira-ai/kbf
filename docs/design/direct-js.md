@@ -63,7 +63,10 @@ ingest refuses, killed at its memory limit) runs the operation again as its next
 `MAC_ACTION_NAMES_NO_XCODE`). A start its host would not make now (`no-capacity`, `host-held` while the host is drained for
 an update, `host-tainted`) spends no attempt: the job is submitted again after a wait (the poll, doubling up to 30 s) while
 the next job would be submitted before the action's deadline (its timeout, from when it was asked for) and at most 100 times
-(`executor/refused.rs`), then the callers are answered `UNAVAILABLE` naming every refusal. A refusal that says no host can
+(`executor/refused.rs`), then the callers are answered `UNAVAILABLE` naming every refusal. That holds for the agent's
+bare code, which a job service passes on without placing the job again; the code followed by the hosts that refused it
+(the job service placed the job again itself and gave up) and the job service's own `no-capacity` are ordinary infrastructure
+endings, so a start is never retried twice over. A refusal that says no host can
 ever run the job (`no-capable-host` at submit, `platform-mismatch` at start) is `INVALID_ARGUMENT` at once. Each attempt writes under its own create-only key, so a zombie of an earlier one never writes into
 a later one's result.
 

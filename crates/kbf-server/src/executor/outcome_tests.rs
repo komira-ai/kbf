@@ -241,12 +241,19 @@ fn cases() -> Vec<(&'static str, Case)> {
             judged(failed_to_start(StartFailureCode::NoCapacity), none.clone()),
         ),
         (
-            "failed to start, its agent's code no-capacity (the job does not fit what is free on the host)",
+            "failed to start, its detail the agent's code no-capacity alone (the job does not fit what is free on the host)",
             judged(refused_to_start("no-capacity"), none.clone()),
         ),
         (
-            "failed to start host-held (the host is drained for an update, or its update halted)",
+            "failed to start, its detail host-held alone (the host is drained for an update, or its update halted)",
             judged(refused_to_start("host-held"), none.clone()),
+        ),
+        (
+            "failed to start, its detail no-capacity or host-held followed by the hosts that refused it (the job service placed it again itself and gave up)",
+            judged(
+                refused_to_start("no-capacity: host-a, host-b"),
+                none.clone(),
+            ),
         ),
         (
             "failed to start host-tainted",

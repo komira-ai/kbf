@@ -253,7 +253,11 @@ host would not start now (no room, `no-capacity`; the host held while it is drai
 wait (the poll, doubling up to 30 s) and spends none of those attempts, while the next job would be
 submitted before the action's deadline (its timeout, from when it was asked for) and at most 100
 times in an operation; past that the callers are answered `UNAVAILABLE` naming every refusal and how
-many times it came. A submit the service refuses because no host could ever run it
+many times it came. That is the agent's bare code, which a job service passes on without placing
+the job again; a code followed by the hosts that refused it means the job service placed the job
+again itself until it gave up, and, like its own `no-capacity` (its queue wait ran out), it is an
+ordinary infrastructure ending that spends an attempt, so a start is not retried twice over. A
+submit the service refuses because no host could ever run it
 (`no-capable-host`), and a start a host refuses as `platform-mismatch`, end the action as invalid at
 once, naming the refusal. A job's pack is read, and its outputs
 promoted, only from a clean result: the job and its result both say succeeded, the result's

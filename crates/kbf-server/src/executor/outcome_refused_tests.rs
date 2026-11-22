@@ -15,10 +15,10 @@ fn failed_to_start(code: StartFailureCode, detail: &str) -> Job {
     }
 }
 
-/// Asserts each code a host or the job service refuses a start with for now is read as its own
-/// refusal: the job service's `NO_CAPACITY`, and the agent's `no-capacity`, `host-held` and
-/// `host-tainted`, also with text after the code; and that a refusal that names no room but
-/// also a refused tree list is read as the tree list, which the frontend acts on.
+/// Asserts each bare code an agent refuses a start with for now, as a job service that does
+/// not place it again passes it on, is read as its own refusal: `no-capacity`, `host-held` and
+/// `host-tainted`; and that a detail that names no room but also a refused tree list is read as
+/// the tree list, which the frontend acts on.
 #[test]
 fn each_code_of_a_start_refused_for_now_is_its_own_refusal() {
     let agent = |detail: &str| {
@@ -27,21 +27,9 @@ fn each_code_of_a_start_refused_for_now_is_its_own_refusal() {
             &JobResult::default(),
         )
     };
-    assert_eq!(
-        judge(
-            &failed_to_start(StartFailureCode::NoCapacity, ""),
-            &JobResult::default()
-        ),
-        Verdict::Refused(Refusal::NoCapacity)
-    );
     for (detail, refusal) in [
         ("no-capacity", Refusal::NoCapacity),
-        (
-            "no-capacity: the job does not fit what is free",
-            Refusal::NoCapacity,
-        ),
         ("host-held", Refusal::HostHeld),
-        ("host-held: draining for an update", Refusal::HostHeld),
         ("host-tainted", Refusal::HostTainted),
     ] {
         assert_eq!(agent(detail), Verdict::Refused(refusal), "{detail}");
@@ -81,4 +69,40 @@ fn a_platform_mismatch_is_invalid_and_its_lookalikes_are_not() {
         agent("platform-mismatch-ish"),
         Verdict::Settled(Settled::Infra(_))
     ));
+}
+
+/// Asserts that a start the job service placed again itself and then gave up on is not placed
+/// again for free, which would retry it twice over: its own `NO_CAPACITY` (the queue wait ran
+/// out), and the agent's `no-capacity` or `host-held` followed by the hosts that refused it, are
+/// ordinary `infra` endings, run again as the operation's next attempt, and the hosts' names
+/// never reach the answer.
+#[test]
+fn a_start_the_job_service_already_retried_is_an_ordinary_infra_ending() {
+    let judged = |code: StartFailureCode, detail: &str| {
+        judge(&failed_to_start(code, detail), &JobResult::default())
+    };
+    let infra = |verdict: Verdict| match verdict {
+        Verdict::Settled(settled @ Settled::Infra(_)) => {
+            assert!(settled.retried());
+            settled.status().message
+        }
+        other => panic!("not infra: {other:?}"),
+    };
+    assert_eq!(
+        infra(judged(StartFailureCode::NoCapacity, "")),
+        "the job failed to start: no-capacity"
+    );
+    for (detail, code) in [
+        ("no-capacity: host-a, host-b", "no-capacity"),
+        ("host-held: host-a", "host-held"),
+    ] {
+        assert_eq!(
+            infra(judged(StartFailureCode::AgentRefused, detail)),
+            format!(
+                "the host refused to start the job ({code}), and the job service placed it \
+                 again until it gave up"
+            ),
+            "{detail}"
+        );
+    }
 }

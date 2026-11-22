@@ -5,7 +5,6 @@
 
 use std::time::Duration;
 
-use js_proto::v1::StartFailureCode;
 use kbf_front::{Dispatch, Finished};
 use kbf_proto::google::rpc;
 use tonic::Code;
@@ -56,8 +55,8 @@ async fn a_start_refused_once_for_capacity_is_placed_again_and_the_action_runs()
 }
 
 /// Asserts that refused starts spend none of the operation's attempts: two lost jobs use up the
-/// [`RESUBMITS`] it has, and three refusals between them (the agent's `host-held` and
-/// `host-tainted`, the job service's `NO_CAPACITY`) still leave it the run that answers.
+/// [`RESUBMITS`] it has, and three refusals between them (the agent's `host-held`,
+/// `no-capacity` and `host-tainted`) still leave it the run that answers.
 #[tokio::test(start_paused = true)]
 async fn refused_starts_spend_no_attempt() {
     assert_eq!(RESUBMITS, 2);
@@ -72,10 +71,10 @@ async fn refused_starts_spend_no_attempt() {
         rig.fake
             .refuse_start(&rig.submitted(&caller, 1).await, "host-held")
     );
-    assert!(rig.fake.fail_to_start(
-        &rig.submitted(&caller, 2).await,
-        StartFailureCode::NoCapacity
-    ));
+    assert!(
+        rig.fake
+            .refuse_start(&rig.submitted(&caller, 2).await, "no-capacity")
+    );
     lose(&rig.submitted(&caller, 3).await);
     assert!(
         rig.fake
@@ -277,4 +276,35 @@ async fn the_attempts_still_run_out_after_refused_starts() {
         1
     );
     assert_eq!(rig.counted("kbf_executor_runs_total{outcome=\"lost\"} "), 3);
+}
+
+/// Asserts that a start the job service placed again itself until it gave up (`no-capacity`
+/// followed by the hosts that refused it) spends one of the operation's attempts like any
+/// infrastructure ending: after it, two lost jobs end the operation `UNAVAILABLE`, with no
+/// fourth job and no run counted `refused`.
+#[tokio::test(start_paused = true)]
+async fn a_start_the_job_service_already_retried_spends_an_attempt() {
+    let rig = Rig::start().await;
+    let caller = rig.submit(1);
+    let first = rig.submitted(&caller, 0).await;
+    assert!(rig.fake.refuse_start(&first, "no-capacity: host-a, host-b"));
+    for attempt in 1..=RESUBMITS {
+        let job = rig.submitted(&caller, attempt).await;
+        rig.host_runs(&job);
+        assert!(rig.fake.lose(&job));
+    }
+
+    let status = status_of(rig.until_done(&caller).await);
+    assert_eq!(status.code, Code::Unavailable as i32);
+    assert_eq!(status.message, "the job was lost with its host");
+    rig.advance(Duration::from_secs(60)).await;
+    assert_eq!(rig.fake.jobs().len(), 3);
+    assert_eq!(
+        rig.counted("kbf_executor_runs_total{outcome=\"refused\"} "),
+        0
+    );
+    assert_eq!(
+        rig.counted("kbf_executor_runs_total{outcome=\"infra\"} "),
+        1
+    );
 }
