@@ -230,6 +230,9 @@ jobs:
     signing: true
   # Reads the published release only: the frontend image's digest and the addresses the deploy
   # below is given.
+  # Pushes the release's macOS kbf-task bundle to the registry (`packages: write`); signs nothing.
+  - job: release.yml#task-bundle
+    stage: prod
   - job: release.yml#deploy-digest
     stage: prod
   # Calls docker-swarm-updater's deploy workflow, which presents the run's OIDC token to the

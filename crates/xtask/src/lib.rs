@@ -67,6 +67,10 @@
 //!   a tarball of that layout that is the same bytes on every runner, and the SBOM of the binary,
 //!   with their lines in `SHA256SUMS.darwin-arm64`. Refused unless the layout is one bundle of
 //!   `kbf-task` for darwin arm64.
+//! - `push-task-bundle --asset <tarball> --repository <host>/<path> --tag <tag> --summary <file>`
+//!   ([`push_bundle`]): the bundle tarball's OCI layout pushed to the registry by digest with the token
+//!   in `GH_TOKEN` (blobs the registry has are skipped), and its pull reference `<repository>@sha256:<hex>`
+//!   printed and appended to the summary.
 //! - `installer-tarball --binary <path> --platform <platform> --commit <sha> --units
 //!   <dir> --trust <dir> --sysusers <file> --tmpfiles <file> --needrestart <file> --out <dir>`
 //!   ([`installer_tarball`]): the files the Debian package ships, at the same paths and
@@ -175,6 +179,7 @@ pub mod pkg_upgrade;
 pub mod pkg_version;
 pub mod profiles_complete;
 pub mod prove_farm;
+pub mod push_bundle;
 pub mod release;
 pub mod release_red;
 pub mod runner_disk;
@@ -388,6 +393,9 @@ enum Verb {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Push the released macOS `kbf-task` bundle (the tarball of an OCI image layout) to an OCI
+    /// registry by digest, with the token in `GH_TOKEN`, and print its pull reference.
+    PushTaskBundle(push_bundle::Args),
     /// Write the payload `packaging/install.sh` places (installer, unit files, trust
     /// files) as a tarball in `--out`.
     InstallerTarball {
@@ -1103,6 +1111,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             out,
         } => task_bundle::package_task_bundle(&layout, &sbom, &commit, &out),
+        Verb::PushTaskBundle(args) => push_bundle::run(&args),
         Verb::InstallerTarball {
             binary,
             platform,

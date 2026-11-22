@@ -22,7 +22,7 @@
 //!   stage; a caller job has no `inputs`, so it keeps [`SIGNING_PUSH_ONLY`]) (`id-token`
 //!   also in a job whose `if:` is exactly [`RELEASE_PUSH_ONLY`] or [`called::DEPLOY_ONLY`], for
 //!   the release's deploy steps, [`DEPLOY_SCOPE`]), and
-//!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
+//!   `contents` and `packages` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
 //!   exactly [`RELEASE_PUSH_ONLY`]. So no pull request or merge-queue run holds a
 //!   token that can sign an attestation, every attestation this repository signs names
 //!   `refs/heads/main`, and only the successful pipeline run of a push to `main` of code runs a job that can create a release
@@ -186,8 +186,10 @@ const SIGNING_STAGE_ONLY: &str = "${{ github.event_name == 'push' && github.ref 
 const DEPLOY_SCOPE: &str = "id-token";
 
 /// Token scopes a job may set to `write` when it runs only for a push to `main` that releases:
-/// the repository's contents, which creating a release and uploading its assets need.
-const RELEASE_SCOPES: &[&str] = &["contents"];
+/// the repository's contents, which creating a release and uploading its assets need, and its
+/// packages, which pushing the release's macOS `kbf-task` bundle to the registry needs (the
+/// lint of `release.yml` holds each to its one job).
+const RELEASE_SCOPES: &[&str] = &["contents", "packages"];
 
 /// The one `if:` spelling under which a job may hold [`RELEASE_SCOPES`] for writing: the
 /// successful run of the pipeline for a push to `main` of this repository (never a pull

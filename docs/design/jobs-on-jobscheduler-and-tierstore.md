@@ -317,8 +317,14 @@ What this design adds to an action with about 5 outputs and about 200 KB, compar
   source and `exec/` share a volume and a byte copy otherwise. This replaces the earlier design of one symlink per
   input file into the tree: every copy is private, so an action may open an input for writing and an output may name
   an input path. The cost is the copy of the input tree, not about 40 us per file.
+- Inputs, as built: the tree is a provider mount (`provider: tierstore`, `ref`: the tree list's key), not a host
+  path under `trees/`: tierstore on the Mac answers it with a directory of the Mac's own disk that holds the whole
+  tree, read-only.
 - Outputs: the host path `<mp>/put/cas/b/<build>/<nonce>` is mounted at `/work/.kbf-out` (`exec/.kbf-out`, as the
-  agent makes a mount, with a Seatbelt write grant) and kbf-task commits into it (`--out-dir .kbf-out`).
+  agent makes a mount, with a Seatbelt write grant) and kbf-task commits into it (`--out-dir .kbf-out`). As built,
+  the directory is a plain one on the Mac's disk: tierstore stores the finished `pack` as the object
+  `cas/b/<build>/<nonce>/pack` after the job ended, and the frontend reads it again every poll until it is there, for
+  up to 30 minutes.
   `process-exec` is denied because the mount sets `no_exec`, as on Linux (job-rootfs 5.2 and 5.4; designed in
   jobscheduler, not built there). Both names are beside `exec/kbf-work`, not in the input root, so no input name is
   reserved for them.

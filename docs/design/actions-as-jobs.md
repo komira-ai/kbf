@@ -522,7 +522,7 @@ instead of a host directory (jobscheduler's `docs/design/mount-providers.md`, ko
   its second has its jobs read the tree as manifests (`--executor-input-tree manifests` for that action, for as long
   as the frontend remembers it). The first two such runs of an operation spend none of its attempts;
   `kbf_executor_list_refused_total{step}` counts the steps.
-- **macOS** keeps the manifests: the native runtime takes no provider yet (jobscheduler's design, Q4).
+- **macOS** always takes the tree list, as a read-only provider mount (section 14), whatever the flag says: a Mac has no manifests to fall back to, so the miss path's second step runs the same list again.
 
 The flag selects the path per frontend; the manifests' path is removed once the tree list is the default on the farm.
 
@@ -1148,26 +1148,32 @@ directory `exec/` (the job's `/work`). macOS has no overlayfs and no bind mounts
 copies the inputs out of the tree instead of running on it.
 
 - **Routing** (`crates/kbf-server/src/executor/mac.rs`). An action whose platform asks for macOS, as the farm reads
-  it (`OSFamily` `macos`/`darwin`/`macosx`/`osx`, or `os=macos`), is placed only on the executor's Mac workers,
-  `js-mac:<frontend>-<n>` (`--executor-mac-hosts`, 0 by default, so nothing changes until it is set), which report
-  `os=macos`, `arch=arm64` and the one driver `native`. `os_version=26` means 26 or newer: the executor refuses an
+  it (`OSFamily` `macos`/`darwin`/`macosx`/`osx`, or `os=macos`), becomes a job of the job service's Macs when the
+  executor is given the Macs' task bundle (`--executor-mac-task-bundle`, none by default, so nothing changes until it
+  is set), and is refused as the caller's otherwise. `os_version=26` means 26 or newer: the executor refuses an
   action that asks for more than `--executor-mac-os-version` (26). The action must name its Xcode by build
   (`xcode=16C5032a`); one that names none is refused as the caller's, reason `MAC_ACTION_NAMES_NO_XCODE`, and no job
   is made ([platform-properties.md](../platform-properties.md#macos)).
 - **The job**: the release's `kbf-task` bundle by its darwin manifest digest as the image
   (`--executor-mac-task-bundle`; its entrypoint runs), no layer, `os=macos`, `arch=arm64`, `exec=sandbox-exec`, the
   action's `xcode` (the job service places it only on a Mac that has that Xcode), no network; the action tree read-only at `/work/.kbf-tree` and the put directory read-write at `/work/.kbf-out`, both
-  `no_exec`, which a Mac's agent makes `exec/.kbf-tree` and `exec/.kbf-out`.
+  `no_exec`, which a Mac's agent makes `exec/.kbf-tree` and `exec/.kbf-out`. The tree is a mount from tierstore's
+  mount provider (`provider: tierstore`, `ref`: the key of the tree's tree list, as a Linux job's provider layer
+  names it), which on a Mac answers with a directory of the Mac's own disk holding the whole tree; the put directory
+  is the host path `<mp>/put/cas/b/<build>/<nonce>` under `--executor-mac-task-out-root`.
+- **The pack**: on a Mac the put directory is a plain directory, so the commit's rename stores nothing. The Mac's
+  tier store stores the finished `pack` under the same key, `cas/b/<build>/<nonce>/pack`, after the job ended, and
+  the frontend reads it with the Linux ingest. While the store has no object under the key, the frontend reads it
+  again every poll, for up to 30 minutes (`PACK_WAIT`); a pack still absent then fails the run as the farm's.
 - **The task** (`kbf-task --materialize-work=.kbf-tree`, `crates/kbf-task/src/materialize.rs`): reads `.kbf/action`
   and `.kbf/command` from the tree as a tree job does, copies `kbf-work` into `exec/kbf-work` (`std::fs::copy`: an APFS clone
   where the source and `exec/` share a volume, a byte copy otherwise; every copy private, so an output may name an
   input), runs the Command there, and commits its one object into `exec/.kbf-out` (`--out-dir .kbf-out`) as 5.2
   says. The Command is started directly: the agent's sandbox is its sandbox, and no `sandbox-exec` is nested.
-- **What jobscheduler must still do** before a Mac runs one (none of it is in kbf's pin or its `main`): take a native
-  start from the job API (the server's job start has no `run`, and a Mac agent reports no `per-job`), take mounts on a
-  Mac (its `docs/design/job-rootfs.md` item 7; a job with mounts asks for `layered-rootfs`, which no Mac reports),
-  and serve the tierstore trees and put directories on the Macs. Until then no Mac runs a kbf action, as none runs
-  a daemon (komira-ai/jobscheduler#888 lists the four items).
+- **What the other side does**: the Mac's agent takes the read-only provider mount and the read-write put directory
+  (komira-ai/jobscheduler#888 lists what it needed), tierstore on the Mac writes a tree whole to local disk when its
+  provider is asked for it, and stores a finished pack it finds in a put directory. kbf names the tree and reads the
+  pack as above, and holds no Mac-only protocol of its own.
 - **`kbf-daemon` is deleted.** Its Mac path went first: the Mac daemon driver (`native` and `native-whole-machine` on a Mac, Xcode,
   simulator, iOS device and VM leases on a daemon), the Mac session and lease-user pool, the Mac provisioning tool and the
   VM crates were deleted, and then `kbf-daemon` itself, with the Linux daemons and the `--executor kbf-daemon` choice. A macOS action has one runner, the job

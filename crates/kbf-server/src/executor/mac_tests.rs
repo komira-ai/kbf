@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use js_proto::v1::{ExecMode, Isolation, MountMode, MountPropagation, mount};
+use js_proto::v1::{
+    Constraints, ExecMode, Isolation, JobSpec, MountMode, MountPropagation, ProviderSource, mount,
+};
 use kbf_proto::reapi::{Digest, Platform, platform::Property};
 use kbf_types::OperationId;
 
@@ -314,17 +316,52 @@ fn a_mac_task_is_told_the_tree_and_the_put_directory_in_exec() {
     assert_eq!(MAC_OUT_TARGET, "/work/.kbf-out");
 }
 
-/// Asserts the two mounts a Mac job is given: the tree read-only and the put directory
-/// read-write, each at its target, `no_exec` and private.
+/// Asserts the two mounts a Mac job is given: the tree read-only from tierstore's provider,
+/// asked for the tree list's key untouched, and the put directory read-write, each at its
+/// target, `no_exec` and private. Catches a Mac tree mounted from a host directory nothing on a
+/// Mac fills.
 #[test]
-fn a_mac_jobs_mounts_are_the_tree_and_the_put_directory() {
-    let read = super::mount_at("/t".to_owned(), TREE_TARGET, MountMode::ReadOnly);
-    assert_eq!(read.source, Some(mount::Source::HostPath("/t".to_owned())));
+fn a_mac_jobs_mounts_are_the_tree_from_the_provider_and_the_put_directory() {
+    let key = "cas/l/abababababababababababababababababababababababababababababababab";
+    let read = super::mount_at(super::tree_source(key), TREE_TARGET, MountMode::ReadOnly);
+    assert_eq!(
+        read.source,
+        Some(mount::Source::Provider(ProviderSource {
+            provider: "tierstore".to_owned(),
+            r#ref: key.to_owned(),
+        }))
+    );
     assert_eq!(read.target, TREE_TARGET);
     assert_eq!(read.mode(), MountMode::ReadOnly);
     assert!(read.no_exec && read.sub_path.is_empty());
     assert_eq!(read.propagation(), MountPropagation::Private);
-    let write = super::mount_at("/p".to_owned(), MAC_OUT_TARGET, MountMode::ReadWrite);
+    let put = mount::Source::HostPath("/p".to_owned());
+    let write = super::mount_at(put.clone(), MAC_OUT_TARGET, MountMode::ReadWrite);
+    assert_eq!(write.source, Some(put));
     assert_eq!(write.mode(), MountMode::ReadWrite);
     assert!(write.no_exec);
+    assert_eq!(write.propagation(), MountPropagation::Private);
+}
+
+/// Asserts which jobs are a Mac's: one whose constraints ask for `os=macos`, and no other (a
+/// Linux job, a job with no constraints, a job read back with no spec). Catches the wait for a
+/// Mac's pack applied to a Linux job, or a Mac job read back from a gone process missed.
+#[test]
+fn a_job_is_a_macs_when_it_asks_for_macos() {
+    let xcode = XcodeBuild::parse("16C5032a").expect("a build");
+    let mac = JobSpec {
+        constraints: Some(mac_constraints(&xcode)),
+        ..JobSpec::default()
+    };
+    assert!(super::is_mac(Some(&mac)));
+    let linux = JobSpec {
+        constraints: Some(Constraints {
+            os: "linux".to_owned(),
+            ..Constraints::default()
+        }),
+        ..JobSpec::default()
+    };
+    assert!(!super::is_mac(Some(&linux)));
+    assert!(!super::is_mac(Some(&JobSpec::default())));
+    assert!(!super::is_mac(None));
 }

@@ -303,35 +303,39 @@ async fn a_linux_run_with_no_task_out_root_is_refused_naming_the_flag() {
     assert!(asked.is_empty(), "{asked:?}");
 }
 
-/// Asserts that a Mac job asks the mint for `InputTree::Manifests` when the config says
-/// provider, and mounts the tree as the host directory of its manifests: the native runtime
-/// takes no provider. Catches: a Mac job given a provider layer its runtime cannot read.
+/// Asserts that a Mac job asks the mint for `InputTree::Provider` whatever the config says, and
+/// mounts the tree from tierstore's provider given the tree list's key: a Mac has no host
+/// directory of manifests. Catches a Mac job given a host path of a tree nothing on a Mac
+/// writes.
 #[tokio::test(start_paused = true)]
-async fn a_mac_job_asks_for_manifests_even_when_the_config_says_provider() {
-    let (job, asked) = prepared_as(Case {
-        tree: InputTree::Provider,
-        macs: true,
-        inputs: Some(Arc::new(Treed {
-            tree: TREE,
-            mac: true,
-        })),
-        ..Case::new(None, SHARE)
-    })
-    .await;
-    let job = job.expect("prepared");
-    assert_eq!(asked, [InputTree::Manifests]);
-    assert!(job.spec.layers.is_empty());
-    let trees: Vec<&str> = job
-        .spec
-        .mounts
-        .iter()
-        .filter_map(|m| match &m.source {
-            Some(js_proto::v1::mount::Source::HostPath(path)) => Some(path.as_str()),
-            _ => None,
+async fn a_mac_job_asks_for_the_tree_list_whatever_the_config_says() {
+    for configured in [InputTree::Manifests, InputTree::Provider] {
+        let (job, asked) = prepared_as(Case {
+            tree: configured,
+            macs: true,
+            inputs: Some(Arc::new(Treed {
+                tree: LIST_KEY,
+                mac: true,
+            })),
+            ..Case::new(None, SHARE)
         })
-        .filter(|path| path.contains("/trees/"))
-        .collect();
-    assert_eq!(trees, [format!("/mnt/ts/trees/{TREE}")]);
+        .await;
+        let job = job.expect("prepared");
+        assert_eq!(asked, [InputTree::Provider], "{configured:?}");
+        assert!(job.spec.layers.is_empty());
+        let provided: Vec<(&str, &str)> = job
+            .spec
+            .mounts
+            .iter()
+            .filter_map(|m| match &m.source {
+                Some(js_proto::v1::mount::Source::Provider(p)) => {
+                    Some((p.provider.as_str(), p.r#ref.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(provided, [("tierstore", LIST_KEY)], "{configured:?}");
+    }
 }
 
 /// Asserts that a Linux put-directory job on the manifests asks the mint for

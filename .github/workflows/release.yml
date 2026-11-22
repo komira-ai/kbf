@@ -59,6 +59,12 @@
 #          the real coordinator of this commit, `cargo xtask deploy-farm`, and the real agent and
 #          frontend of the release before this one
 #          (crates/kbf-host-install/tests/update_rehearsal_agent.rs). gamma needs it. Read-only.
+# task-bundle
+#          pushes the release's macOS kbf-task bundle (the OCI layout of the asset
+#          kbf-task-bundle-<commit>-darwin-arm64.tar.gz, checked against SHA256SUMS) to the
+#          organisation's public container registry, by tag and by digest, and writes the pull
+#          reference a frontend's --executor-mac-task-bundle takes into the run's summary
+#          (cargo xtask push-task-bundle). The one job that holds `packages: write`, and nothing else.
 # gamma    the gamma stage. The farm's Linux nodes are deployed by hostkeeper, which
 #          hostkeeper-desired.yml tells after this workflow when the repository variable
 #          KBF_SETS_DESIRED is `true`, so this job no longer sets kbf's update coordinator: its
@@ -587,6 +593,40 @@ jobs:
       tailscale-oauth-client-id: ${{ vars.CP_DEPLOY_TAILSCALE_CLIENT_ID }}
       tailscale-audience: ${{ vars.CP_DEPLOY_TAILSCALE_AUDIENCE }}
       tailscale-tags: ${{ vars.CP_DEPLOY_TAILSCALE_TAGS }}
+
+  # The macOS kbf-task bundle on the registry: a Mac's agent pulls a bundle by its digest from a
+  # registry (a bare name would resolve to another registry), so the release pushes the bundle it
+  # just published, from the files `verify` checked, to `ghcr.io/<owner>/kbf-task`, tagged with the
+  # release's tag and put by its manifest digest. The job's token writes packages and nothing else;
+  # the pull is anonymous once the package is public.
+  task-bundle:
+    needs: [plan, verify, publish]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - run: rustup toolchain install
+      # Built before any step holds the token, so no build script runs beside it.
+      - run: cargo build -p xtask --locked
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+      - name: Check the files against SHA256SUMS
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: Push the macOS kbf-task bundle to the registry by digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: cargo xtask push-task-bundle --asset "dist/kbf-task-bundle-$COMMIT-darwin-arm64.tar.gz" --repository "ghcr.io/$GITHUB_REPOSITORY_OWNER/kbf-task" --tag "$TAG" --summary "$GITHUB_STEP_SUMMARY"
 
   # The gamma stage, the last step of a release. The farm's Linux nodes are deployed by
   # hostkeeper, which hostkeeper-desired.yml tells after this workflow (it is on when the

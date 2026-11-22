@@ -395,8 +395,8 @@ pub(super) fn args() -> Vec<Arg> {
                  the action tree's manifests, the job's layer `<mp>/trees/<digest>`. \
                  `provider`: one tree list of the tree, the job's layer tierstore's mount \
                  provider, which fetches the tree's files while the job's sandbox is made. \
-                 `provider` needs `--task-out-mode put-dir`. A Mac job's root is always \
-                 `manifests`. Used only with `--executor js-agent`",
+                 `provider` needs `--task-out-mode put-dir`. A Mac job's tree is always \
+                 its tree list, from tierstore's mount provider. Used only with `--executor js-agent`",
             ),
         number(
             LIVE,
@@ -436,9 +436,8 @@ pub(super) fn args() -> Vec<Arg> {
             "executor-mac-task-out-root",
             "PATH",
             "The tier store's put directory on the Macs, if it is not `--task-out-root`: a Mac \
-             job mounts its put directory under it and its action tree from the `trees` \
-             directory beside it. Used only with `--executor-mac-task-bundle`, refused without \
-             it",
+             job mounts its put directory under it (its action tree comes from tierstore's mount \
+             provider). Used only with `--executor-mac-task-bundle`, refused without it",
         ),
     ];
     args.extend(RETIRED.into_iter().map(|(id, long, value)| {

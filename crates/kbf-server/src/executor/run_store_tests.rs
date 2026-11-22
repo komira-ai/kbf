@@ -269,15 +269,22 @@ async fn a_follower_asks_again_while_the_store_fails_and_is_answered_if_its_read
             Duration::from_secs(600),
         )
         .expect("answer");
-    rig.advance(rig.cfg.poll).await;
-    assert!(matches!(&*a.stage.borrow(), Stage::Done(_)));
+    rig.until(
+        "the follower is answered once the store reads again",
+        || matches!(&*a.stage.borrow(), Stage::Done(_)),
+    )
+    .await;
     let b = rig
         .exec
         .wait(&stored_name(OperationId(21)))
         .expect("followed");
     crate::executor::tests::settle().await;
     store.reads_panic.store(true, Ordering::SeqCst);
-    rig.advance(rig.cfg.poll).await;
+    // The read runs on a blocking thread: wait for its panic, not for a number of polls.
+    rig.until("the follower's read panicked", || {
+        store.panicked.load(Ordering::SeqCst) > 0
+    })
+    .await;
     store.reads_panic.store(false, Ordering::SeqCst);
     theirs
         .finish(
@@ -287,7 +294,10 @@ async fn a_follower_asks_again_while_the_store_fails_and_is_answered_if_its_read
             Duration::from_secs(600),
         )
         .expect("answer");
-    rig.advance(rig.cfg.poll).await;
+    rig.until("the follower whose read broke is answered", || {
+        matches!(&*b.stage.borrow(), Stage::Done(_))
+    })
+    .await;
     let Stage::Done(Finished::Failed(status)) = &*b.stage.borrow() else {
         panic!("a follower whose read broke is answered");
     };

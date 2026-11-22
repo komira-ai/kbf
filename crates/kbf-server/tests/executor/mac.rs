@@ -2,13 +2,13 @@
 //! asked to run, what an executor with no Macs answers, and what a Mac action that names no Xcode,
 //! or one no Mac has, is answered.
 
-use js_proto::v1::{ExecMode, MountMode, mount};
+use js_proto::v1::{ExecMode, MountMode, ProviderSource, mount};
 use kbf_front::Finished;
 use kbf_job_client::fake::Machine;
 use kbf_proto::google::rpc::ErrorInfo;
 use kbf_server::executor::{
-    ActionFacts, DEFAULT_MAC_OS_VERSION, MAC_OUT_TARGET, MacPool, NO_XCODE_REASON, PutDirRoots,
-    System, TREE_TARGET, XcodeBuild,
+    ActionFacts, DEFAULT_MAC_OS_VERSION, InputTree, MAC_OUT_TARGET, MacPool, NO_XCODE_REASON,
+    PutDirRoots, System, TREE_TARGET, XcodeBuild,
 };
 use prost::Message;
 use tonic::Code;
@@ -59,7 +59,8 @@ async fn rig(macs: bool, xcode: Option<&str>) -> Rig {
 }
 
 /// Asserts that a Mac action is submitted as a Mac job: the release's task bundle as its
-/// image, no command or layer, the tree and the put directory under `/work`, `os=macos`,
+/// image, no command or layer, the tree (from tierstore's provider, the mint asked for the tree
+/// list) and the put directory under `/work`, `os=macos`,
 /// `arch=arm64`, in the native runtime, asking for the Xcode build the action names; and that the
 /// job service places it on the Mac that has that Xcode. Catches a Mac action that becomes a
 /// Linux container job, and one placed whatever Xcodes its Mac has.
@@ -78,27 +79,33 @@ async fn a_mac_action_is_submitted_as_a_native_mac_job() {
         Some("--materialize-work=.kbf-tree")
     );
     assert_eq!(jobs[0].arg("--out-dir"), Some(".kbf-out"));
-    let mounts: Vec<(String, &str, MountMode)> = spec
-        .mounts
-        .iter()
-        .map(|m| match &m.source {
-            Some(mount::Source::HostPath(path)) => (path.clone(), m.target.as_str(), m.mode()),
-            other => panic!("not a host path: {other:?}"),
-        })
-        .collect();
+    let [tree, put] = spec.mounts.as_slice() else {
+        panic!("two mounts: {:?}", spec.mounts);
+    };
     assert_eq!(
-        mounts[0],
-        (
-            format!("/mnt/ts/trees/{TREE}"),
-            TREE_TARGET,
-            MountMode::ReadOnly
-        )
+        tree.source,
+        Some(mount::Source::Provider(ProviderSource {
+            provider: "tierstore".to_owned(),
+            r#ref: TREE.to_owned(),
+        }))
     );
     assert_eq!(
-        (mounts[1].1, mounts[1].2),
+        (tree.target.as_str(), tree.mode()),
+        (TREE_TARGET, MountMode::ReadOnly)
+    );
+    assert_eq!(
+        (put.target.as_str(), put.mode()),
         (MAC_OUT_TARGET, MountMode::ReadWrite)
     );
-    assert!(mounts[1].0.starts_with("/mnt/ts/put/cas/b/"), "{mounts:?}");
+    let Some(mount::Source::HostPath(dir)) = &put.source else {
+        panic!("the put directory is not a host path: {put:?}");
+    };
+    assert!(dir.starts_with("/mnt/ts/put/cas/b/"), "{dir}");
+    assert!(tree.no_exec && put.no_exec);
+    assert_eq!(
+        *rig.ingest.forms.lock().expect("forms"),
+        [InputTree::Provider]
+    );
     let constraints = spec.constraints.as_ref().expect("constraints");
     assert_eq!(
         (constraints.os.as_str(), constraints.arch.as_str()),
