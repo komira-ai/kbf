@@ -200,6 +200,9 @@ pub(crate) struct Faulty {
     pub before_read: Mutex<Option<(String, BeforeRead)>>,
     /// How many reads of one key were made.
     pub reads: AtomicU64,
+    /// How many reads panicked ([`Faulty::reads_panic`]): a read runs on a blocking thread, so a
+    /// test waits for this rather than for a number of polls.
+    pub panicked: AtomicU64,
     /// How many batches of writes were made.
     pub batches: AtomicU64,
 }
@@ -220,12 +223,16 @@ impl Faulty {
             race: Mutex::new(None),
             before_read: Mutex::new(None),
             reads: AtomicU64::new(0),
+            panicked: AtomicU64::new(0),
             batches: AtomicU64::new(0),
         }
     }
 
     fn read_fault(&self) -> Result<(), StoreError> {
-        assert!(!self.reads_panic.load(Ordering::SeqCst), "the store broke");
+        if self.reads_panic.load(Ordering::SeqCst) {
+            self.panicked.fetch_add(1, Ordering::SeqCst);
+            panic!("the store broke");
+        }
         let left = self.fail_read.load(Ordering::SeqCst);
         if left == 1 {
             self.fail_read.store(0, Ordering::SeqCst);
