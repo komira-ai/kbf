@@ -23,14 +23,14 @@
 //!    ([`BaseTreeError::Reserved`]) is never written, and a bundle with no such object is
 //!    refused. The tree is named by the root alone, so none of the objects written before it
 //!    is reachable from anything;
-//! 5. **lists the tree** when it is asked to (`list`, for the tree lists of jobs,
-//!    `--executor-input-tree provider`; [`BaseTree::listed`]): every object that begins as a
-//!    tree manifest does (`{"v":1,`) and is no longer than a manifest may be
-//!    ([`MAX_MANIFEST_BYTES`]) is kept while the bundle is read, and the tree is flattened from
-//!    them once the root is read; they are dropped then. A file whose bytes begin the same way is
-//!    kept too, up to that length: the bundle does not say which objects are manifests. A tree
-//!    that cannot be listed is refused before its root is written. Not asked, nothing is kept
-//!    and the base tree is not listed.
+//! 5. **lists the tree** when it is asked to (`list`, for the tree lists of jobs:
+//!    `--executor-input-tree provider`, or a frontend with Macs; [`BaseTree::listed`]): every
+//!    object that begins as a tree manifest does (`{"v":1,`) and is no longer than a manifest
+//!    may be ([`MAX_MANIFEST_BYTES`]) is kept while the bundle is read, and the tree is
+//!    flattened from them once the root is read; they are dropped then. A file whose bytes begin
+//!    the same way is kept too, up to that length: the bundle does not say which objects are
+//!    manifests. A tree that cannot be listed is refused before its root is written. Not asked,
+//!    nothing is kept and the base tree is not listed.
 //!
 //! A second release on the same pin writes only its `kbf-task`, its `.kbf-tools` manifest and
 //! its root: every other object costs one length check.

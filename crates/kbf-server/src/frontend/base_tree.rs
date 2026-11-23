@@ -46,7 +46,7 @@ pub(super) struct Start {
     /// Where the published base is set for the executor.
     slot: Arc<OnceLock<BaseTree>>,
     /// Whether the base is listed: the executor writes tree lists
-    /// (`--executor-input-tree provider`).
+    /// (`--executor-input-tree provider`, or Macs: a Mac job's tree is always a tree list).
     list: bool,
     /// Where the publish again is set for the executor.
     republish: Arc<OnceLock<Republish>>,
@@ -69,7 +69,9 @@ impl Start {
             packs,
             state,
             slot: Arc::clone(&js.published),
-            list: js.config.input_tree == InputTree::Provider,
+            // A Mac job's tree is always a tree list (`executor::mac`), whatever
+            // `--executor-input-tree` says, so a frontend with Macs lists its base too.
+            list: js.config.input_tree == InputTree::Provider || js.config.mac.is_some(),
             republish: Arc::clone(&js.republish),
         }
     }
