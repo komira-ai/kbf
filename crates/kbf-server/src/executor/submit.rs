@@ -5,7 +5,7 @@
 //! answer was lost, names the job already made, and the service answers from it; and a frontend
 //! that takes up an unfinished operation from the state store computes the same id. Two labels
 //! name the frontends and the process; a third, `size-class`, names the action's class
-//! ([`crate::executor::size_class`]), its target and whether it is a test, and a fourth,
+//! ([`crate::executor::size_class`]), its target, what runs and whether it is a test, and a fourth,
 //! `size-fallback`, the class of its kind (what runs), whose history sizes the job while its
 //! own class has too few runs; a whole-host job, which books a whole host and so is never
 //! sized, has neither, and an action with no program has no kind.

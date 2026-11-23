@@ -199,7 +199,7 @@ async fn a_put_dir_job_is_the_tree_the_tool_and_the_dir_at_out() {
     assert_eq!(spec.wall_limit_seconds, Some(20 + 300));
     assert_eq!(spec.labels[FRONTEND_LABEL], "front");
     assert!(spec.labels.contains_key(INSTANCE_LABEL));
-    assert_eq!(spec.labels["size-class"], "root.pkg.t.build");
+    assert_eq!(spec.labels["size-class"], "root.pkg.t.cc.build");
     assert_eq!(spec.labels["size-fallback"], "cc.build.kind");
     assert_eq!(spec.needs, Some(js_proto::v1::Needs::default()));
 }

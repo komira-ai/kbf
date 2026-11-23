@@ -273,8 +273,9 @@ start is a question for jobscheduler (section 13).
 
 `cpu_millis` and `memory_bytes` are 0: the job service books each job what the past runs of its class used
 (jobscheduler's `docs/design/sizing.md`, section 7.7). The class, the job's `size-class` label, is the action's build
-target, read from its own `buck-out` paths, and its kind, a test run or a build: `<target> build` or `<target> test`
-written as a label value (`crates/kbf-server/src/executor/size_class.rs`), or `shape.<key>` for an action whose paths
+target, read from its own `buck-out` paths, the words of its kind (what runs: the program and a subcommand or flag of
+it) and its mode, a test run or a build: `<target> <kind words> build` or `<target> <kind words> test` (`<target> build`
+or `<target> test` for an action with no program) written as a label value (`crates/kbf-server/src/executor/size_class.rs`), or `shape.<key>` for an action whose paths
 name no target. A `whole_machine` job books a whole host and carries no class. A Mac job names the farm's booking (the
 hard cap a daemon would set) beside its class: the cold size of a class is taken from the largest host the job service
 knows. `disk_bytes` is dropped (D4): O4, and while kbf books

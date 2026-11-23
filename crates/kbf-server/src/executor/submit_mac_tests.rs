@@ -212,7 +212,7 @@ async fn a_komira_darwin_action_is_a_job_of_os_and_arch_only_with_the_tree_and_t
     assert_eq!(spec.wall_limit_seconds, Some(20 + 300));
     assert_eq!(spec.labels[FRONTEND_LABEL], "front");
     assert!(spec.labels.contains_key(INSTANCE_LABEL));
-    assert_eq!(spec.labels["size-class"], "root.pkg.t.build");
+    assert_eq!(spec.labels["size-class"], "root.pkg.t.cc.build");
     assert_eq!(spec.labels["size-fallback"], "cc.build.kind");
     assert_eq!(
         spec.needs,

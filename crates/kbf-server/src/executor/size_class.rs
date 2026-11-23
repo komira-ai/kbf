@@ -4,13 +4,27 @@
 //! must name one class, and no other work may share it.
 //!
 //! The work is the build target the action belongs to, read from the action's own `buck-out`
-//! paths ([`Shape::target`]: buck2 sends no target with the call), and what the action does to
-//! it: a test run ([`Shape::test`]) is one mode and anything else, a compile or a link, the
-//! other. One target's compile and its test are two classes, `<target> build` and
-//! `<target> test`, so a test that needs much more memory than its compile does not book that
-//! for the compile, nor the compile's size for the test. The words are written as a label
-//! value as jobscheduler writes a target's name: `root//crates/kbf-server:kbf-server` built is
-//! `root.crates.kbf-server.kbf-server.build`.
+//! paths ([`Shape::target`]: buck2 sends no target with the call), what runs on it (the words
+//! of its kind, below) and what the action does to it: a test run ([`Shape::test`]) is one
+//! mode and anything else, a compile or a link, the other. The class is
+//! `<target> <kind words> build` or `<target> <kind words> test`, so one target's actions of
+//! different kinds are different classes: a gate or a coverage run that needs a few hundred
+//! MiB does not book the memory of its target's largest compile, a compile does not book its
+//! test's, and a test not its compile's. An action whose program gives no kind words is
+//! `<target> build` or `<target> test`. The words are written as a label value as jobscheduler
+//! writes a target's name: `rustc` building `root//crates/kbf-server:kbf-server` is
+//! `root.crates.kbf-server.kbf-server.rustc.build`. Every word of the class is free of
+//! configuration and content hashes, so one action of one target names one class in every
+//! build. A class longer than 63 bytes is cut (see `written`): it keeps its last words, the kind
+//! words and the mode, and the hash of the whole name stands for the rest. A test run whose
+//! program is the test binary its target built has that binary's `buck-out` pattern as its
+//! kind words, which repeat the target, so its class is nearly always cut
+//! (`crates.kbf-server.__kbf-server__.test.test-<16 hex>`).
+//!
+//! The words are joined as written, so a target whose name ends in what reads as a kind word
+//! (`root//a:b.cc` built by a program with no kind words) writes the class of another target's
+//! kind (`root//a:b` built by `cc`); the same holds of target names alone (`cell//a:b` and
+//! `cell//:a.b`) under jobscheduler's rule. Such targets share a history.
 //!
 //! An action whose paths name no target has the class of its shape's key
 //! ([`crate::action_usage::ShapeKey`], `shape.<16 hex digits>`): what stays the same across builds of one action, so its runs
@@ -34,7 +48,8 @@
 //! `out` of `cc -o out a.c` is kept, and makes a kind of its own), then the test-or-build word of the class: `zig cc build kind` is `zig.cc.build.kind`.
 //! A shape's program holds a second word only after a bare-name first one, so a tool built
 //! under `buck-out` is its own kind, with every subcommand of it. An action with no program
-//! (no arguments) has no kind, and its job names no fallback. A kind's class ends in `.kind`
+//! (no arguments) has no kind, and its job names no fallback. The same words, without
+//! `kind`, are the kind words of the target's class above. A kind's class ends in `.kind`
 //! (or, cut, in `-` and 16 hex digits of a name that ends in `.kind`), so it never meets a
 //! target's or a shape's class.
 //!
@@ -69,7 +84,7 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// and ends with a letter or a digit.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SizeClass {
-    /// The class: the target and whether it is a test, or the shape's key.
+    /// The class: the target, the kind's words and whether it is a test, or the shape's key.
     class: String,
     /// The kind: what runs, and whether it is a test; `None` for an action with no program.
     kind: Option<String>,
@@ -80,14 +95,16 @@ impl SizeClass {
     #[must_use]
     pub fn of_action(shape: &Shape) -> Self {
         let test = if shape.test { "test" } else { "build" };
-        let class = match &shape.target {
+        let words = kind_words(&shape.program);
+        let class = match (&shape.target, &words) {
             // Never empty: the test-or-build word is a word.
-            Some(target) => written(&format!("{} {test}", target.label)),
-            None => format!("shape.{}", shape.key),
+            (Some(target), Some(words)) => written(&format!("{} {words} {test}", target.label)),
+            (Some(target), None) => written(&format!("{} {test}", target.label)),
+            (None, _) => format!("shape.{}", shape.key),
         };
         Self {
             class,
-            kind: kind_of(&shape.program, test),
+            kind: words.map(|words| written(&format!("{words} {test} kind"))),
         }
     }
 
@@ -104,17 +121,16 @@ impl SizeClass {
     }
 }
 
-/// The kind of an action whose shape's program words are `program`, a test or a build as `test`
-/// says (see the module docs): `None` when the program is no word with a letter or a digit
-/// (no arguments, whose program is `-`).
-fn kind_of(program: &[String], test: &str) -> Option<String> {
+/// The words that name the kind of an action whose shape's program words are `program` (see
+/// the module docs), before the test-or-build word: `None` when the program is no word with a
+/// letter or a digit (no arguments, whose program is `-`).
+fn kind_words(program: &[String]) -> Option<String> {
     let first = program.first().filter(|first| !written(first).is_empty())?;
     let second = program.get(1).filter(|word| {
         word.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
     });
-    let words = second.map_or_else(|| first.clone(), |second| format!("{first} {second}"));
-    Some(written(&format!("{words} {test} kind")))
+    Some(second.map_or_else(|| first.clone(), |second| format!("{first} {second}")))
 }
 
 /// `name` written as a class, as `js_types::SizeClass::of_target` writes a build target's

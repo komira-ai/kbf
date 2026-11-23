@@ -44,8 +44,8 @@ pub const POLL: Duration = Duration::from_millis(5);
 /// The one Linux host of a rig that has any.
 pub const HOST: &str = "host-1";
 
-/// The class of a build of `root//pkg:t`, which every action of the fake inputs is:
-/// `root.pkg.t.build`.
+/// The class of a `cc` build of `root//pkg:t`, which every action of the fake inputs is:
+/// `root.pkg.t.cc.build`.
 pub fn built_class() -> SizeClass {
     let out = "buck-out/v2/art/root/7a3c1e9f0b2d4c68/pkg/__t__/o".to_owned();
     let shape = kbf_server::action_usage::Shape::of(&["cc".to_owned()], &[out]);

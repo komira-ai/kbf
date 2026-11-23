@@ -114,11 +114,11 @@ fn the_hash_is_fnv1a_64() {
     assert_eq!(fnv1a(b"foobar"), 0x8594_4171_f739_67e8);
 }
 
-/// Asserts that a compile of a target is the class `<target> build` and a test run of the same
-/// target is `<target> test`, whatever configuration or content hash its paths carry, and that
-/// two builds of the target (other inputs, other configuration) are one class. Catches a test
-/// sharing its compile's history, or a class that changes from build to build (and so never
-/// learns), such as one that holds the configuration hash.
+/// Asserts that a compile of a target is the class `<target> <kind words> build` and a test run
+/// of the same target is `<target> <kind words> test`, whatever configuration or content hash
+/// its paths carry, and that two builds of the target (other inputs, other configuration) are
+/// one class. Catches a test sharing its compile's history, or a class that changes from build
+/// to build (and so never learns), such as one that holds the configuration hash.
 #[test]
 fn a_targets_compile_and_its_test_are_two_classes_stable_across_builds() {
     let compile = |cfg: &str, input: &str| {
@@ -126,15 +126,55 @@ fn a_targets_compile_and_its_test_are_two_classes_stable_across_builds() {
         SizeClass::of_action(&shape(&["rustc", input, "-o", &out], &[&out]))
     };
     let built = compile(CFG, "src/lib.rs");
-    assert_eq!(built.as_str(), "root.crates.kbf-server.kbf-server.build");
+    assert_eq!(
+        built.as_str(),
+        "root.crates.kbf-server.kbf-server.rustc.build"
+    );
     assert_eq!(compile("0123456789abcdef", "src/other.rs"), built);
     let binary = format!("buck-out/v2/art/root/{CFG}/crates/kbf-server/__kbf-server__/test");
     let run = SizeClass::of_action(&shape(
         &[&binary, "--test-threads=1"],
         &["buck-out/v2/test/execution/root/0123456789abcdef/fedcba9876543210/default/o"],
     ));
-    assert_eq!(run.as_str(), "root.crates.kbf-server.kbf-server.test");
+    assert_eq!(
+        run.as_str(),
+        "crates.kbf-server.__kbf-server__.test.test-6c30c2187d34bac5"
+    );
     assert_ne!(run, built);
+}
+
+/// Asserts that two actions of one target with different kinds, a Mojo compile of the
+/// library and a `run __gate__` writing under the same target, are two classes, each its
+/// kind's fallback, and that each keeps its class across two builds (other configuration,
+/// other inputs). Catches a class keyed by the target and the test-or-build word alone, which
+/// books every gate at the memory of its target's largest compile, and a class that holds a
+/// configuration hash or an input path, so never gathers a history.
+#[test]
+fn a_targets_actions_of_two_kinds_are_two_classes_stable_across_builds() {
+    let dir = |cfg: &str| format!("buck-out/v2/art/komira/{cfg}/src/sql/__sql.build__");
+    let compile = |cfg: &str, input: &str| {
+        let out = format!("{}/sql.mojoc", dir(cfg));
+        SizeClass::of_action(&shape(&["mojo_compile", input, "-o", &out], &[&out]))
+    };
+    let gate = |cfg: &str, input: &str| {
+        let out = format!("{}/gate.ok", dir(cfg));
+        SizeClass::of_action(&shape(&["run", "__gate__", input, &out], &[&out]))
+    };
+    let compiled = compile(CFG, "src/sql/plan.mojo");
+    let gated = gate(CFG, "src/sql/plan.mojo");
+    assert_eq!(
+        compiled.as_str(),
+        "komira.src.sql.sql.build.mojo_compile.build"
+    );
+    assert_eq!(compiled.kind(), Some("mojo_compile.build.kind"));
+    assert_eq!(
+        gated.as_str(),
+        "komira.src.sql.sql.build.run.__gate__.build"
+    );
+    assert_eq!(gated.kind(), Some("run.__gate__.build.kind"));
+    assert_ne!(compiled.as_str(), gated.as_str());
+    assert_eq!(compile("0123456789abcdef", "src/sql/other.mojo"), compiled);
+    assert_eq!(gate("0123456789abcdef", "src/sql/other.mojo"), gated);
 }
 
 /// Asserts that an action whose paths name no target is the class of its shape's key, the same
@@ -156,32 +196,57 @@ fn an_action_with_no_target_is_the_class_of_its_shape() {
     assert_ne!(other, class);
     let out = format!("buck-out/v2/art/shape/{CFG}/pkg/__t__/o");
     let named = SizeClass::of_action(&shape(&["cc"], &[&out]));
-    assert_eq!(named.as_str(), "shape.pkg.t.build");
+    assert_eq!(named.as_str(), "shape.pkg.t.cc.build");
 }
 
 /// Asserts that a target whose class is long enough to be cut is still a label value, keeps the
-/// end of the target's package, its own name and its kind, and differs between its compile and its test. Catches a long
-/// class the job service refuses, or a cut that drops the kind so that the two kinds meet.
+/// end of the target's package, its own name, its kind's words and its test-or-build word,
+/// then `-` and 16 hex digits; that two kinds of the long target (`cc` and `ld`) and its test
+/// binary run as a test and as a build stay four classes; and that none of them is its kind's
+/// class or a shape's. Catches a long class the job service refuses, a cut that drops the kind
+/// or the test-or-build word so that two of the target's classes meet, and a cut class that
+/// lands on a kind's or a shape's history.
 #[test]
 fn a_long_targets_classes_are_label_values_and_stay_apart() {
     let pkg = "very_long_package_name/".repeat(3);
     let out = format!("buck-out/v2/art/root/{CFG}/komira/crates/{pkg}__integration__/o");
     let built = SizeClass::of_action(&shape(&["cc"], &[&out]));
+    let linked = SizeClass::of_action(&shape(&["ld"], &[&out]));
     let binary = format!("buck-out/v2/art/root/{CFG}/komira/crates/{pkg}__integration__/t");
     let run = SizeClass::of_action(&shape(
         &[&binary],
         &["buck-out/v2/test/execution/root/0123456789abcdef/fedcba9876543210/default/o"],
     ));
-    for class in [&built, &run] {
+    let run_built = SizeClass::of_action(&shape(&[&binary], &[&out]));
+    let classes = [&built, &linked, &run, &run_built];
+    for class in classes {
         assert!(is_label_value(class.as_str()), "{class:?}");
-    }
-    let hashed = |class: &SizeClass, kept: &str| {
-        let (head, hash) = class.as_str().rsplit_once('-').expect("a hash");
-        assert_eq!(head, kept, "{class:?}");
+        assert_ne!(class.kind(), Some(class.as_str()), "{class:?}");
+        assert!(!class.as_str().starts_with("shape."), "{class:?}");
+        let (_, hash) = class.as_str().rsplit_once('-').expect("a hash");
         assert_eq!(hash.len(), 16, "{class:?}");
+        assert!(
+            hash.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "{class:?}"
+        );
+    }
+    for (i, one) in classes.iter().enumerate() {
+        for other in &classes[i + 1..] {
+            assert_ne!(one.as_str(), other.as_str());
+        }
+    }
+    let kept = |class: &SizeClass| {
+        class
+            .as_str()
+            .rsplit_once('-')
+            .expect("a hash")
+            .0
+            .to_owned()
     };
-    hashed(&built, "very_long_package_name.integration.build");
-    hashed(&run, "very_long_package_name.integration.test");
+    assert_eq!(kept(&built), "very_long_package_name.integration.cc.build");
+    assert_eq!(kept(&linked), "very_long_package_name.integration.ld.build");
+    assert_eq!(kept(&run), "very_long_package_name.__integration__.t.test");
 }
 
 /// Asserts that one kind of work is one kind across targets and builds: `zig cc` writing two
@@ -273,15 +338,20 @@ fn an_action_with_no_program_has_no_kind() {
 }
 
 /// Asserts that a kind's class never meets a target's or a shape's: the target `zig//:cc`
-/// built is `zig.cc.build` where `zig cc` is `zig.cc.build.kind`, a program named `shape` is
-/// not a shape's class, and a kind long enough to be cut is a label value whose kept part ends
-/// in `.kind`, then a hash. Catches a kind whose history merges with a target's or a
-/// shape's, which would size the one from the other's runs.
+/// built by `zig cc` is `zig.cc.zig.cc.build`, and by an action with no program
+/// `zig.cc.build`, where `zig cc` is `zig.cc.build.kind`; a program named `shape` is not a
+/// shape's class; and a kind long enough to be cut is a label value whose kept part ends in
+/// `.kind`, then a hash. Catches a kind whose history merges with a target's or a shape's,
+/// which would size the one from the other's runs, and a target's action with no program
+/// given a class with an empty kind word.
 #[test]
 fn a_kind_never_meets_a_targets_or_a_shapes_class() {
     let out = format!("buck-out/v2/art/zig/{CFG}/__cc__/o");
+    let bare = SizeClass::of_action(&shape(&[], &[&out]));
+    assert_eq!(bare.as_str(), "zig.cc.build");
+    assert_eq!(bare.kind(), None);
     let target = SizeClass::of_action(&shape(&["zig", "cc"], &[&out]));
-    assert_eq!(target.as_str(), "zig.cc.build");
+    assert_eq!(target.as_str(), "zig.cc.zig.cc.build");
     assert_eq!(target.kind(), Some("zig.cc.build.kind"));
     let named = SizeClass::of_action(&shape(&["shape"], &["out/o"]));
     assert_eq!(named.kind(), Some("shape.build.kind"));
