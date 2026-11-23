@@ -15,11 +15,12 @@ async fn class_of(command: impl FnOnce(&mut kbf_proto::reapi::Command)) -> Strin
 }
 
 /// Asserts that an action's class is read from the Command the farm stored for it: a compile
-/// whose output paths are under its target's `buck-out` directory is `<target> build`, and a
-/// test run of that target (its program the test binary buck2 built, its outputs under
-/// `test/execution`) is `<target> test`. Catches a class taken from anything but the Command
-/// (the action digest, the image, the client's metadata), the two kinds sharing one class, and
-/// an action of a target sized by a class of no target.
+/// whose output paths are under its target's `buck-out` directory is
+/// `<target> <kind words> build`, and a test run of that target (its program the test binary
+/// buck2 built, its outputs under `test/execution`) is `<target> <kind words> test`, cut and
+/// hashed here since the binary's path repeats the target. Catches a class taken from anything
+/// but the Command (the action digest, the image, the client's metadata), the two kinds
+/// sharing one class, and an action of a target sized by a class of no target.
 #[tokio::test]
 async fn a_compile_and_a_test_run_of_a_target_are_its_build_and_test_classes() {
     let dir = format!("buck-out/v2/art/root/{CFG}/crates/kbf-server/__kbf-server__");
@@ -29,7 +30,7 @@ async fn a_compile_and_a_test_run_of_a_target_are_its_build_and_test_classes() {
         command.output_paths = vec![out];
     })
     .await;
-    assert_eq!(built, "root.crates.kbf-server.kbf-server.build");
+    assert_eq!(built, "root.crates.kbf-server.kbf-server.rustc.build");
     let binary = format!("{dir}/kbf-server-test");
     let run = class_of(|command| {
         command.arguments = vec![binary];
@@ -39,7 +40,10 @@ async fn a_compile_and_a_test_run_of_a_target_are_its_build_and_test_classes() {
         ];
     })
     .await;
-    assert_eq!(run, "root.crates.kbf-server.kbf-server.test");
+    assert_eq!(
+        run,
+        "kbf-server.__kbf-server__.kbf-server-test.test-88750cb432b5d1f5"
+    );
 }
 
 /// Asserts that a client older than REAPI 2.1, which names its outputs only in `output_files`
@@ -65,7 +69,7 @@ async fn outputs_named_the_old_way_give_the_same_class() {
         command.output_directories = vec![out.clone()];
     })
     .await;
-    assert_eq!(new, "root.pkg.t.build");
+    assert_eq!(new, "root.pkg.t.cc.build");
     assert_eq!(
         (files.as_str(), dirs.as_str()),
         (new.as_str(), new.as_str())

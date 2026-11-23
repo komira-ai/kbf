@@ -19,7 +19,7 @@ use crate::executor::{
     RunId, UntrustedLimits, build_id,
 };
 
-/// The class of a build of `root//pkg:t`: `root.pkg.t.build`.
+/// The class of a `cc` build of `root//pkg:t`: `root.pkg.t.cc.build`.
 pub(super) fn built_class() -> SizeClass {
     let out = "buck-out/v2/art/root/7a3c1e9f0b2d4c68/pkg/__t__/o".to_owned();
     SizeClass::of_action(&crate::action_usage::Shape::of(&["cc".to_owned()], &[out]))
@@ -345,7 +345,7 @@ async fn prepare_builds_the_job_the_service_is_asked_for() {
     assert_eq!(spec.labels.len(), 4);
     assert_eq!(
         spec.labels.get("size-class").map(String::as_str),
-        Some("root.pkg.t.build")
+        Some("root.pkg.t.cc.build")
     );
     assert_eq!(
         spec.labels.get("size-fallback").map(String::as_str),
@@ -402,7 +402,7 @@ fn a_job_names_its_kind_beside_its_class_except_on_a_whole_host() {
     let class = built_class();
     let shared = labels(&ctx, BOOKING.class(&class));
     assert_eq!(shared.len(), 4, "{shared:?}");
-    assert_eq!(shared["size-class"], "root.pkg.t.build");
+    assert_eq!(shared["size-class"], "root.pkg.t.cc.build");
     assert_eq!(shared["size-fallback"], "cc.build.kind");
     let whole = labels(&ctx, Booking::WholeHost.class(&class));
     assert_eq!(whole.len(), 2, "{whole:?}");

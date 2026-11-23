@@ -65,7 +65,7 @@ async fn a_job_holds_no_image_port_file_network_or_secret() {
     assert_eq!(labels.len(), 4, "{labels:?}");
     assert_eq!(
         labels.get("size-class").map(String::as_str),
-        Some("root.pkg.t.build")
+        Some("root.pkg.t.cc.build")
     );
     assert_eq!(
         labels.get("size-fallback").map(String::as_str),
