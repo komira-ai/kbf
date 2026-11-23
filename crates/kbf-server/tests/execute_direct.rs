@@ -41,7 +41,7 @@ async fn an_execute_that_misses_the_cache_runs_as_one_job_and_its_result_is_cach
 /// served for the one naming `17A324`, which misses the cache and runs as a job of its own, its
 /// result cached under its own key. This harness's executor reads its facts from fakes and runs
 /// both as Linux jobs; what is under test is the cache's key, the whole Action digest, platform
-/// included (the Mac job's Xcode is asserted in `tests/executor/mac.rs`). Catches a cache key
+/// included (a Mac job no longer carries the property: `tests/executor/mac.rs`). Catches a cache key
 /// that leaves the platform out, which would serve a result built with one Xcode for another.
 #[tokio::test]
 async fn two_actions_that_differ_only_in_their_xcode_build_have_different_action_keys() {

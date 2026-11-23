@@ -843,12 +843,11 @@ as a shell would; a spec departure, section 5); an absolute path outside it,
 missing on this node while peers of the same platform have it, is environment drift,
 so Farm.
 
-**Done for a Mac action that names no Xcode** (under [direct-js.md](direct-js.md)): it is
-Request, `INVALID_ARGUMENT` with the `ErrorInfo` reason `MAC_ACTION_NAMES_NO_XCODE` (domain `kbf`),
-answered before any job is made and never run again. The action is malformed for a Mac (the
-property `xcode` is required there), and without it the farm would pick the Xcode, which is the
-farm's environment drift of class 6 (section 2) made silent. The message names the property and an
-example build.
+**A Mac action that names no Xcode is no longer refused.** A Mac job asks only for `os=macos` and
+`arch=arm64`, and the Macs have only the Command Line Tools: `xcode` is not read, and the reason
+`MAC_ACTION_NAMES_NO_XCODE` is no longer sent ([platform-properties.md](../platform-properties.md#macos)).
+The property stays part of the action digest, so an action keyed on the Xcode it was built with is
+still cached apart from one keyed on another.
 
 **Done for program not found** (#275, both drivers). Container: the image is pinned by
 digest and the environment is the Command's alone, so when crun reports it cannot find

@@ -19,8 +19,16 @@
 //!    relative to `kbf-work`). Every copy is private: the Command may write an input, and an output
 //!    may name an input path, without touching the tree. These failures are exit 10;
 //! 2. makes the run directory `<root>/.kbf-run` as a tree job does (exit 11);
-//! 3. runs the Command in `<root>/kbf-work`, collects its outputs and commits the one object into
-//!    the put directory, exactly as [`crate::tree::execute_out_dir`] does.
+//! 3. runs the Command in `<root>/kbf-work`, collects its outputs and writes the one object,
+//!    `pack`, into `--out-dir`, exactly as [`crate::tree::execute_out_dir`] does.
+//!
+//! `--out-dir` (`.kbf-out` in a Mac job) is relative to the job root. Before anything is read
+//! (after the lease is checked) it is made, mode 0700, when nothing is there, one level only
+//! ([`OutDir::open_or_create`]); a directory there, or a symlink to one, is used as it is, and
+//! anything else is exit 14. It is not tierstore's put directory: the job never holds that. The
+//! `.part` and rename protocol is the Linux job's, so the directory ends with exactly one file,
+//! `pack`, when the run is committed (exit 0), and none of that name otherwise; the Mac's agent
+//! commits `pack` to the store after the job ended and its processes are swept.
 //!
 //! The root is a parameter of every function here (the binary passes the current directory), so
 //! tests never change directory. The manifest's advisory `inputs` is `from: fetch` (no new
@@ -158,11 +166,12 @@ pub async fn execute(
     Ok(manifest)
 }
 
-/// The end of [`crate::task::main_with`] for `--materialize-work`: checks the lease and that
-/// `--out-dir` is a directory before anything is read, runs the job and turns the outcome into
-/// the exit code.
+/// The end of [`crate::task::main_with`] for `--materialize-work`: checks the lease, then makes
+/// `--out-dir` (relative to the job root `root`) when it is not there and checks it is a
+/// directory, before anything is read; runs the job and turns the outcome into the exit code.
 pub(crate) async fn finish(cli: &Cli, tree: &Path, root: &Path) -> ExitCode {
-    let out = check_lease(cli).and_then(|()| OutDir::open(cli.out_dir()));
+    let out_dir = root.join(cli.out_dir());
+    let out = check_lease(cli).and_then(|()| OutDir::open_or_create(&out_dir));
     let outcome = match out {
         Ok(out) => execute(cli, tree, root, &out).await,
         Err(failure) => Err(failure),

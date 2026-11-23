@@ -190,12 +190,13 @@ timeout plus the run margin. The Macs of the job service are used when `--execut
 bundle by its manifest digest, the image of a Mac job; without it no macOS action is run),
 `--executor-mac-os-version` (the least macOS the Macs run, 26 by default; an
 action's `os_version` above it is refused) and `--executor-mac-task-out-root` (the tier store's
-put directory on the Macs, `--task-out-root` by default); a macOS action must name its Xcode build (`xcode`, docs/platform-properties.md) and becomes a
-job of a Mac's native runtime with that Xcode (docs/design/actions-as-jobs.md, section 14). A Mac job's tree is
-always its tree list, mounted read-only from tierstore's mount provider (which writes it whole to the Mac's disk),
-whatever `--executor-input-tree` says; the Mac's tier store stores the job's pack after the job ended, and the
-frontend reads the pack again every poll while the store does not have it, for up to 30 minutes, before it runs the
-action again. It books no disk: the
+put directory on the Macs, `--task-out-root` by default, which must equal the Mac agents' `--native-put-root`); a
+macOS action becomes a job of a Mac's native runtime that asks for `os=macos` and `arch=arm64` only (no Xcode: an
+`xcode` property is not read, docs/platform-properties.md; docs/design/actions-as-jobs.md, section 14). A Mac job's
+tree is always its tree list, mounted read-only from tierstore's mount provider (which answers with the tree on its
+NFS loopback mount), whatever `--executor-input-tree` says; the job writes its pack in its own folder, the Mac's
+agent commits it to the tier store after the job ended, and the frontend reads the pack again every poll while the
+store does not have it, for up to 30 minutes, before it runs the action again. It books no disk: the
 job carries no `disk_bytes`, so the job service places it on a host whatever scratch disk that
 host reports, and the job writes to its host's scratch with no quota. The kbf image is built from
 the base environment the actions' Commands see (`--executor-base-image`); both are named by

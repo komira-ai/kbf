@@ -1,10 +1,14 @@
 //! The put directory: the run's one object is written as a file into `--out-dir` and committed by
 //! `rename`.
 //!
-//! In a job the directory is a mount of tierstore's put directory: a file written there and
-//! renamed to a name without `.part` becomes an object under the key prefix the frontend chose,
-//! and the `rename` returns only once the store has it. kbf-task does not know the key or the
-//! store; it knows the name, `pack`.
+//! In a Linux job (`--tree`) the directory is a mount of tierstore's put directory, which must
+//! exist ([`OutDir::open`]): a file written there and renamed to a name without `.part` becomes
+//! an object under the key prefix the frontend chose, and the `rename` returns only once the
+//! store has it. In a Mac job (`--materialize-work`) it is a plain directory of the job's own
+//! folder, which the task makes when it is not there ([`OutDir::open_or_create`]): the renames
+//! store nothing, so exit 0 means `pack` is written, not stored. The Mac's agent commits that
+//! file to the store after the job ended. kbf-task does not know the key or the store; it knows
+//! the name, `pack`.
 //!
 //! [`OutDir::object`] creates `pack.part`, new (`O_EXCL`), and returns the [`ObjectRun`] the
 //! outputs are written through as they are collected, read once, in one pass (the object's format
@@ -26,6 +30,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -142,7 +147,8 @@ fn create_new(path: &Path) -> io::Result<Box<dyn Write + Send>> {
 }
 
 /// The real rename: the file system's, which in tierstore's put directory, for a name without
-/// `.part`, returns once the store has the object.
+/// `.part`, returns once the store has the object (in a plain directory, once the name is
+/// changed).
 fn rename(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
@@ -174,6 +180,29 @@ impl OutDir {
             Ok(_) => Err(setup("not a directory".to_owned())),
             Err(e) => Err(setup(e.to_string())),
         }
+    }
+
+    /// The directory at `dir`, made first, mode 0700, as this process's user, when nothing is
+    /// there: one level only, so its parent must exist. Anything already at `dir` is taken as
+    /// [`OutDir::open`] takes it: a directory, or a symlink to one, is used as it is, and
+    /// anything else is refused.
+    ///
+    /// # Errors
+    /// [`Failure::Setup`] when `dir` cannot be made (its parent is missing, say), or when what is
+    /// there is not a directory or cannot be looked at.
+    pub fn open_or_create(dir: &Path) -> Result<Self, Failure> {
+        let setup = |why: String| Failure::Setup(format!("--out-dir {}: {why}", dir.display()));
+        let made = std::fs::DirBuilder::new().mode(0o700).create(dir);
+        match made {
+            Ok(()) => {
+                // The mode is set again after the umask has had its say.
+                let private = std::fs::Permissions::from_mode(0o700);
+                std::fs::set_permissions(dir, private).map_err(|e| setup(e.to_string()))?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(setup(format!("cannot make it: {e}"))),
+        }
+        Self::open(dir)
     }
 
     /// The same directory, creating its files through `create`.

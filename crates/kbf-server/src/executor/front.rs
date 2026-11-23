@@ -20,7 +20,7 @@
 //!   the timeout. The image a run is launched from is the kbf image, built from that base and
 //!   set by the operator: it keeps its `ENTRYPOINT` (the task tool), so no action's image is
 //!   launched and no entrypoint is looked for. The platform's system is read too (`OSFamily`
-//!   or `os`, and a Mac's `os_version` and `xcode`), as `kbf-front` reads it: a Mac action
+//!   or `os`, and a Mac's `os_version`), as `kbf-front` reads it: a Mac action
 //!   becomes a Mac job ([`crate::executor::mac`]).
 //! - **Two caches, by digest**, so that a warm prepare does no store call (`front_cache.rs`).
 //!   Each is bounded by its entries, the oldest going first. Both live and die with the `Front`

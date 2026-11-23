@@ -13,8 +13,7 @@ use crate::executor::out::provider_layer;
 use crate::executor::traits::InputsError;
 use crate::executor::{
     ActionFacts, DEFAULT_MAC_OS_VERSION, Ingest, Ingested, InputTree, Inputs, MacPool, MintError,
-    OUT_TARGET, PackKey, PutDirRoots, RunId, System, TASK_IN_TREE, UntrustedLimits, XcodeBuild,
-    build_id,
+    OUT_TARGET, PackKey, PutDirRoots, RunId, System, TASK_IN_TREE, UntrustedLimits, build_id,
 };
 
 const TREE: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -93,10 +92,7 @@ impl Inputs for Treed {
             image: format!("registry.test/kbf@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
             system: match self.mac {
-                true => System::Macos {
-                    os_version: None,
-                    xcode: Some(XcodeBuild::parse("16C5032a").expect("a build")),
-                },
+                true => System::Macos { os_version: None },
                 false => System::Linux,
             },
             size_class: built_class(),

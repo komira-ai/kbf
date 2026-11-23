@@ -37,6 +37,12 @@
 //! docs/design/one-pass-task-object.md). The exit code is 0 only when the commit `rename`
 //! returned 0, whatever the Command's own exit code; a failed write or commit is exit 13.
 //!
+//! In a Linux job `--out-dir` is tierstore's put directory, which the commit stores into. In a Mac
+//! job it is `.kbf-out`, a directory of the job's own folder that the tool makes when it is not
+//! there ([`materialize`]): the job never holds tierstore's put directory, the renames store
+//! nothing, and the Mac's agent commits the one file `.kbf-out/pack` to the store after the job
+//! ended. So on a Mac exit 0 means the object is written, not stored.
+//!
 //! The tool returns nothing but an exit code, so the manifest travels inside the object, and the
 //! exit code says only whether the farm did its part: 0 when the action ran and its object was
 //! committed (whatever the action's own exit code, which is in the manifest), nonzero when

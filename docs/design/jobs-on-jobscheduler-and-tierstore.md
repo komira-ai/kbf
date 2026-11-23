@@ -53,7 +53,8 @@ repository is named with that repository.
      job's writable scratch, so the tree's `kbf-work` is `/kbf-work` and its `.kbf` is `/.kbf`, where `kbf-task --tree /`
      reads them (`crates/kbf-task/src/tree.rs`; actions-as-jobs 3.1). The output mount is
      `<mp>/put/cas/b/<build>/<nonce>` at `/out`, READ_WRITE, `no_exec`.
-   - Mac: `/work` is built by kbf-task (section 6). The output mount is the same host path at `/work/.kbf-out`.
+   - Mac: `/work` is built by kbf-task (section 6). The output mount is the same host path at `/work/.kbf-out`, as the
+     put target the Mac's agent commits the job's `pack` into after the job ended; the job never holds it (section 6).
 
 **Placement.** The first GetJob answer naming `host_id` triggers `POST /_tierstore/v1/hydrate` (hold = job id). The
 endpoint is tierstore's as it is (body `{"hold", "expires_ms", "trees"}`, tierstore
@@ -180,7 +181,7 @@ Requirement for job-rootfs build item 8 (an end-to-end run on one Linux node, a 
 ### kbf
 
 - kbf-task:
-  - `--out-dir <path>` (default `/out`; the Mac platform profile sets `/work/.kbf-out`).
+  - `--out-dir <path>` (default `/out`; a Mac job passes `.kbf-out`, relative to its job root, which kbf-task makes).
   - `--stage-and-commit`: the two-step rename above.
   - Phase timings in the TaskManifest: `walk`, `hash`, `write`, `commit`, beside today's advisory `fetch_ms`,
     `run_ms` and `pack_ms` (`crates/kbf-task-pack/src/task_manifest.rs`).
@@ -318,18 +319,19 @@ What this design adds to an action with about 5 outputs and about 200 KB, compar
   input file into the tree: every copy is private, so an action may open an input for writing and an output may name
   an input path. The cost is the copy of the input tree, not about 40 us per file.
 - Inputs, as built: the tree is a provider mount (`provider: tierstore`, `ref`: the tree list's key), not a host
-  path under `trees/`: tierstore on the Mac answers it with a directory of the Mac's own disk that holds the whole
-  tree, read-only.
-- Outputs: the host path `<mp>/put/cas/b/<build>/<nonce>` is mounted at `/work/.kbf-out` (`exec/.kbf-out`, as the
-  agent makes a mount, with a Seatbelt write grant) and kbf-task commits into it (`--out-dir .kbf-out`). As built,
-  the directory is a plain one on the Mac's disk: tierstore stores the finished `pack` as the object
-  `cas/b/<build>/<nonce>/pack` after the job ended, and the frontend reads it again every poll until it is there, for
-  up to 30 minutes.
+  path under `trees/`: tierstore on the Mac answers it with the tree on its one NFS loopback mount, read-only.
+- Outputs, as built: the job never holds a writable put directory. The host path `<mp>/put/cas/b/<build>/<nonce>` is
+  the source of a read-write mount at `/work/.kbf-out` that the Mac's agent reads as the put target: it does not link
+  it into the job and grants the job nothing on it. kbf-task makes `exec/.kbf-out` in the job's own folder (mode
+  0700) and writes `pack` there by the renames above (`--out-dir .kbf-out`), which in a plain directory store nothing.
+  Once the job has ended and its processes are swept, the agent commits that one file, as it is, into the put
+  directory, and tierstore stores it as the object `cas/b/<build>/<nonce>/pack`; the frontend reads it again every
+  poll until it is there, for up to 30 minutes.
   `process-exec` is denied because the mount sets `no_exec`, as on Linux (job-rootfs 5.2 and 5.4; designed in
   jobscheduler, not built there). Both names are beside `exec/kbf-work`, not in the input root, so no input name is
   reserved for them.
-- NFS has no open handle count. The commit therefore requires the expected digest in the source name. kbf-task always
-  supplies it. A short or unflushed file fails with EBADMSG instead of being published.
+- NFS has no open handle count. The commit therefore requires the expected digest in the source name. On Linux
+  kbf-task supplies it; on a Mac the agent's commit does (`pack.part`, `pack.sha256-<hex>.part`, `pack`). A short or unflushed file fails with EBADMSG instead of being published.
 - Unmeasured: whether close(2) flushes writes synchronously, whether a killed process's writes are flushed, and
   loopback write throughput. The commit-deadline default must be checked against the NFS retransmit limit.
 - Out-of-order writes defeat the inline hash. The digest is then computed at commit, about 0.5 s/GB per core.
