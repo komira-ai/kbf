@@ -1,0 +1,69 @@
+# The macOS crates' tests that need neither a socket nor a sandbox of their own, on a Mac of the
+# build farm instead of a GitHub-hosted macOS runner, after the merge
+# (docs/design/mac-ci-on-the-farm.md): kbf-outputs (which beta.yml's `native-macos` no longer
+# runs), kbf-seatbelt and kbf-update.
+#
+# The job runs on a hosted Linux runner. `cargo xtask mac-farm` sends each Cargo command to the
+# farm as one remote action on its Mac platform, with the checkout, the crates of Cargo.lock for
+# aarch64-apple-darwin and the pinned Rust toolchain as the action's inputs (a farm Mac has no
+# Rust, and an action no network), and prints the command's output and ends with its result.
+#
+# The farm is reachable only on its Tailscale network, which the job joins after the xtask build
+# (its build scripts never see that network) as an ephemeral node with the run's OIDC token, as
+# `tag:ci` (workload identity federation: no stored secret). That token is why the job runs for a
+# push to main only: the workflow lint lets `id-token: write` be held under exactly that `if:`, so
+# that no pull request or merge-queue run holds a token that can sign. The farm's address,
+# instance, TLS and Mac platform are the organisation variables FARM_*; with FARM_ADDRESS unset
+# (a fork) the verb prints a notice and passes. The verb masks the address in the log before it
+# prints anything else.
+name: macos-farm
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+# One run per ref at a time, never cancelled: each push to main reports.
+concurrency:
+  group: macos-farm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-farm:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      # For the tailnet join alone: the OIDC token the farm's network trusts.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo build -p xtask --locked
+      - name: Join the farm's Tailscale network
+        if: ${{ vars.TS_CLIENT_ID != '' && vars.FARM_ADDRESS != '' }}
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        with:
+          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+          tags: tag:ci
+      - name: kbf-outputs' tests on a farm Mac
+        timeout-minutes: 50
+        env:
+          FARM_ADDRESS: ${{ vars.FARM_ADDRESS }}
+          FARM_INSTANCE: ${{ vars.FARM_INSTANCE }}
+          FARM_TLS: ${{ vars.FARM_TLS || 'false' }}
+          FARM_PROPERTIES: ${{ vars.FARM_DARWIN_ARM64_PROPERTIES }}
+        run: cargo xtask mac-farm --address "$FARM_ADDRESS" --instance "$FARM_INSTANCE" --tls "$FARM_TLS" --properties "$FARM_PROPERTIES" --scratch "$RUNNER_TEMP/mac-farm" -- test -p kbf-outputs --locked
+      - name: kbf-seatbelt's and kbf-update's tests on a farm Mac
+        timeout-minutes: 50
+        env:
+          FARM_ADDRESS: ${{ vars.FARM_ADDRESS }}
+          FARM_INSTANCE: ${{ vars.FARM_INSTANCE }}
+          FARM_TLS: ${{ vars.FARM_TLS || 'false' }}
+          FARM_PROPERTIES: ${{ vars.FARM_DARWIN_ARM64_PROPERTIES }}
+        run: cargo xtask mac-farm --address "$FARM_ADDRESS" --instance "$FARM_INSTANCE" --tls "$FARM_TLS" --properties "$FARM_PROPERTIES" --scratch "$RUNNER_TEMP/mac-farm" -- test --locked --no-fail-fast -p kbf-seatbelt -p kbf-update

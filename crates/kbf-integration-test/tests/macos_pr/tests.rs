@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// The step of `update-register`'s Mac tests, in beta.yml's `native-macos` and macos-pr.yml's
+/// `macos-test` alike.
+const UPDATE_REGISTER: &str = "      - run: cargo test -p update-register --locked -- --exact tests::a_listener_whose_backlog_is_full_is_refused_at_once tests::the_deadline_left_after_the_connect_is_all_that_follows_gets tests::a_socket_left_by_a_listener_that_is_gone_is_refused tests::a_missing_socket_names_its_path tests::a_deadline_already_passed_does_not_connect\n";
+
 /// The problems of the real workflows with the first `from` in the workflow `file` replaced by
 /// `to`. The change must alter the text.
 fn changed_to(file: &str, from: &str, to: &str) -> Vec<String> {
@@ -384,21 +388,23 @@ fn a_step_of_the_after_merge_mac_jobs_that_no_pull_request_runs_is_refused() {
     // its `if:`) and not here, a step dropped here, and a job env the device steps need.
     let found = changed_to(
         "beta.yml",
-        "      - run: cargo test -p kbf-outputs --locked\n",
-        "      - run: cargo test -p kbf-outputs --locked\n      - run: cargo test -p kbf-new --locked\n",
+        UPDATE_REGISTER,
+        &format!("{UPDATE_REGISTER}      - run: cargo test -p kbf-new --locked\n"),
     );
     has(
         &found,
         "beta.yml#native-macos runs `cargo test -p kbf-new --locked` and no step of macos-pr.yml's macOS jobs is that step",
     );
-    let found = changed_to(
-        MACOS_PR,
-        "      - run: cargo test -p kbf-outputs --locked\n",
-        "",
-    );
+    let found = changed_to(MACOS_PR, UPDATE_REGISTER, "");
     has(
         &found,
-        "beta.yml#native-macos runs `cargo test -p kbf-outputs --locked` and no step of macos-pr.yml's macOS jobs is that step",
+        &format!(
+            "beta.yml#native-macos runs `{}` and no step of macos-pr.yml's macOS jobs is that step",
+            UPDATE_REGISTER
+                .trim_start()
+                .trim_start_matches("- run: ")
+                .trim_end()
+        ),
     );
     let found = changed_to(
         MACOS_PR,

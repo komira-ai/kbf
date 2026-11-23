@@ -163,6 +163,7 @@ pub mod fetch_attested;
 pub mod filer_presence_bench;
 pub mod installer_tarball;
 pub mod js_pin;
+pub mod mac_farm;
 pub mod merge_profiles;
 pub mod package;
 pub mod pages;
@@ -265,6 +266,8 @@ enum Verb {
     DeployFarm(deploy_farm::Command),
     /// Prove the farm after a deploy with a remote-only Buck2 build of a small project.
     ProveFarm(prove_farm::Args),
+    /// Run one Cargo command of this workspace on a Mac of the build farm, as one remote action.
+    MacFarm(mac_farm::Args),
     /// Time a SeaweedFS filer's batch lookup of present and absent keys, and the replication lag.
     FilerPresenceBench(filer_presence_bench::Args),
     /// Check that the runner's disk has the room the coverage run needs.
@@ -1047,6 +1050,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::MergeProfiles(args) => merge_profiles::run(&args, &root),
         Verb::DeployFarm(command) => deploy_farm::run_command(&command),
         Verb::ProveFarm(args) => prove_farm::run(&args),
+        Verb::MacFarm(args) => mac_farm::run(&args),
         Verb::FilerPresenceBench(args) => filer_presence_bench::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
         Verb::Debs(args) => Ok(debs::run(&args)?),

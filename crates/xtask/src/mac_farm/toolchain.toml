@@ -1,0 +1,27 @@
+# The Rust toolchain `cargo xtask mac-farm` sends to a farm Mac with the action: a Mac of the
+# build farm has the Command Line Tools and no Rust, and its action has no network, so the
+# compiler, Cargo and the standard library are inputs of the action like the source.
+#
+# `rust` is the release rust-toolchain.toml pins (a test holds the two equal). Each component is
+# the release's aarch64-apple-darwin tarball, by URL and SHA-256 (the `xz_hash` of the release's
+# channel manifest, channel-rust-<rust>.toml); `dir` is the component's directory in the tarball,
+# under its top directory. Only the component's `bin`, `lib` and `libexec` are sent.
+rust = "1.95.0"
+
+[[component]]
+name = "rustc"
+url = "https://static.rust-lang.org/dist/rustc-1.95.0-aarch64-apple-darwin.tar.xz"
+sha256 = "149e85a285b6eba58eb6c8bdf7deb1b93763890598e62cb635a712e3a8454f04"
+dir = "rustc"
+
+[[component]]
+name = "cargo"
+url = "https://static.rust-lang.org/dist/cargo-1.95.0-aarch64-apple-darwin.tar.xz"
+sha256 = "6c2ffed8e1ac9cf4dc9e80f282a869a6b237a153e7c55cca039d33de29d80aaf"
+dir = "cargo"
+
+[[component]]
+name = "rust-std"
+url = "https://static.rust-lang.org/dist/rust-std-1.95.0-aarch64-apple-darwin.tar.xz"
+sha256 = "9b30089b0f767cb91b2190ffec55a9beeb2a21a1405d8da0f664d7e09d08e6d8"
+dir = "rust-std-aarch64-apple-darwin"

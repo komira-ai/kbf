@@ -345,7 +345,7 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
-      - run: cargo test -p kbf-outputs --locked
+      # kbf-outputs' tests run on a farm Mac instead (macos-farm.yml).
       # The registration client's connect on a Mac, where it is std's after a check of the deadline:
       # a full backlog is refused at once, a connect that succeeds leaves the rest only what is left,
       # and a missing or stale socket is a connect error (crates/update-register/src/tests.rs).
