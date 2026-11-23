@@ -5,9 +5,12 @@
 //! program is started with the inherited environment cleared, standard input closed, and standard
 //! output and error written to files. Its environment is the run's own `HOME`, `TMPDIR`,
 //! `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH` ([`private_vars`]), naming directories made
-//! new for the run (an existing private directory is refused), then the Command's
+//! new for the run (an existing private directory is refused), and on macOS `xcrun_db`, a file in
+//! the run's private `tmp` where `xcrun` keeps its cache; then the Command's
 //! variables: a variable the Command sets itself is the Command's. A program name with
-//! a slash is resolved from the working directory, a bare name from the Command's own `PATH`.
+//! a slash is resolved from the working directory (as an absolute path, so a run whose root is
+//! named relatively, as a Mac job's `.` is, starts the same program), a bare name from the
+//! Command's own `PATH`.
 //!
 //! Unless the action asked for it (`kbf-network=allow`, [`network`]), the program and everything it
 //! starts can make no socket but a Unix one.
@@ -200,12 +203,18 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
         }
         check_relative("output path", path)?;
     }
-    let work_dir = real_dirs(run.root, &command.working_directory).await?;
+    // A root, and its private directory, named relatively (a Mac job's root is `.`) are made
+    // absolute once. The Command starts in its work directory, where a relative program path,
+    // `HOME`, `TMPDIR` or `xcrun_db` would name another path (`./kbf-work/x` would be looked up as
+    // `kbf-work/kbf-work/x`).
+    let root = std::path::absolute(run.root).map_err(io(run.root))?;
+    let private_dir = std::path::absolute(run.private).map_err(io(run.private))?;
+    let work_dir = real_dirs(&root, &command.working_directory).await?;
     for output in &outputs {
         let parent = output.rsplit_once('/').map_or("", |(parent, _)| parent);
         real_dirs(&work_dir, parent).await?;
     }
-    let private = private_vars(run.private).await?;
+    let private = private_vars(&private_dir).await?;
     let stdout = create(run.stdout)?;
     let stderr = create(run.stderr)?;
     let program = if program.contains('/') {
@@ -539,6 +548,17 @@ const PRIVATE_VARS: [(&str, &str); 4] = [
     ("CLANG_MODULE_CACHE_PATH", "cache/clang/ModuleCache"),
 ];
 
+/// The variables a system's own tools need besides those, each naming a FILE under the run's
+/// private directories. On macOS, `xcrun` (and every tool reached through its shims: `cc`, `ld`,
+/// the SDK lookups) keeps its cache at `xcrun_db`, else in the user's own temporary directory
+/// under `/var/folders`, which a job may not write: `ld -v` then prints an error in place of its
+/// version. The file is made by `xcrun`; only its directory, `tmp`, is made here.
+const PLATFORM_VARS: &[(&str, &str)] = if cfg!(target_os = "macos") {
+    &[("xcrun_db", "tmp/xcrun_db")]
+} else {
+    &[]
+};
+
 /// Makes `private` and the run's home, temporary and cache directories under it, new for this
 /// run and each readable by this user alone (mode 0700), and returns the variables that name
 /// them. Nothing is created recursively, so a `private` that already exists (a directory with
@@ -558,6 +578,7 @@ async fn private_vars(private: &Path) -> Result<Vec<(&'static str, OsString)>, R
     }
     Ok(PRIVATE_VARS
         .iter()
+        .chain(PLATFORM_VARS)
         .map(|(name, sub)| (*name, private.join(sub).into_os_string()))
         .collect())
 }
@@ -852,7 +873,8 @@ mod tests {
             "{out}"
         );
         assert!(!names.contains(&"KBF_TASK_ONLY_MINE"), "{out}");
-        // Only the run's own four are added to the Command's.
+        // Only the run's own four, and the system's own (none on Linux, xcrun_db on macOS), are
+        // added to the Command's.
         for name in [
             "HOME",
             "TMPDIR",
@@ -861,7 +883,10 @@ mod tests {
         ] {
             assert!(names.contains(&name), "{name}: {out}");
         }
-        assert_eq!(names.len(), 5, "{out}");
+        for (name, _) in PLATFORM_VARS {
+            assert!(names.contains(name), "{name}: {out}");
+        }
+        assert_eq!(names.len(), 5 + PLATFORM_VARS.len(), "{out}");
     }
 
     /// Prints the run's environment as a map.
@@ -1375,4 +1400,7 @@ mod tests {
             "{error}"
         );
     }
+
+    // The Mac job's start: a relative root, and xcrun's cache (kept apart: this file is long).
+    mod mac;
 }

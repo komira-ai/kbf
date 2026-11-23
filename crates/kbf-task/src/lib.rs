@@ -12,7 +12,9 @@
 //!    `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`, which name fresh directories
 //!    `private/{home,tmp,cache}` (the last holding `clang/ModuleCache`) under the task's run
 //!    directory `.kbf-run`, mode 0700, made new for the run (an existing run directory is
-//!    refused), beside the input root and not in it. A job's image root is read-only and its
+//!    refused), beside the input root and not in it; on macOS also `xcrun_db`, a file in that
+//!    `tmp`, where `xcrun` and the tools behind its shims keep their cache instead of the user's
+//!    `/var/folders`, which a job may not write. A job's image root is read-only and its
 //!    `/tmp` is a small `noexec` tmpfs, so a compiler that writes under `~` or the temporary
 //!    directory would otherwise fail; and since outputs are collected relative to the input
 //!    root, nothing written there is packed. The job is the Command's sandbox ([`run::Job`]): it
