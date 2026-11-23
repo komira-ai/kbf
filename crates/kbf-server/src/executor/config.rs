@@ -36,7 +36,8 @@ pub enum InputTree {
     /// The action tree written as one tierstore tree list, the job's layer tierstore's
     /// mount provider with the list's key: the host's agent asks the provider for the tree
     /// as soon as the job is placed, and its files are fetched while the sandbox is made. A Mac
-    /// job's tree is always [`InputTree::Manifests`]: its runtime takes no provider yet.
+    /// job's tree is always this, whatever `--executor-input-tree` says, so a frontend with Macs
+    /// publishes its base listed.
     Provider,
 }
 

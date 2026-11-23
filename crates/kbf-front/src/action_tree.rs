@@ -72,7 +72,7 @@
 //! ([`BaseTree::listed`]), a file with bytes naming its pack span or whole object and its SHA-256,
 //! and a table of the pack ranges the tree reads; stored create-only at
 //! `cas/l/<sha256 of the list>`. tierstore's mount provider makes a job's tree from it
-//! (`--executor-input-tree provider`).
+//! (`--executor-input-tree provider`, and every Mac job's).
 //!
 //! The executor's runs that commit into a put directory call it (`--task-out-mode put-dir`),
 //! each run's action tree written over the published base tree, as manifests or as a tree list.

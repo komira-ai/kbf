@@ -435,18 +435,28 @@ fn a_start_downloads_under_the_executors_instance_id() {
     assert_eq!(start.cache.instance, "fe-a");
 }
 
-/// Asserts that a start lists the base tree exactly when the executor writes tree lists
-/// (`--executor-input-tree provider`), and not with the default manifests. Catches: a frontend
-/// of the manifests' path that keeps and flattens every manifest of the base for nothing, or a
-/// provider frontend whose base is never listed, so every run is unavailable.
+/// Asserts that a start lists the base tree exactly when the executor writes tree lists: with
+/// `--executor-input-tree provider`, or with Macs (`--executor-mac-task-bundle`), whose jobs'
+/// trees are always tree lists; and not with the default manifests and no Macs. Catches: a
+/// frontend of the manifests' path that keeps and flattens every manifest of the base for
+/// nothing; a provider frontend whose base is never listed, so every run is unavailable; and a
+/// frontend with Macs on the default manifests, which refuses every Mac action before a job is
+/// made ("the kbf base tree is not listed: no tree list can be written").
 #[test]
 fn a_start_lists_the_base_only_for_tree_lists() {
     let manifests = crate::executor::Config::new("front-1");
     let mut provider = manifests.clone();
     provider.input_tree = crate::executor::InputTree::Provider;
+    let mut macs = manifests.clone();
+    macs.mac = Some(crate::executor::MacPool {
+        bundle: format!("registry.test/kbf-task@sha256:{}", "cd".repeat(32)),
+        os_version: 26,
+        roots: None,
+    });
 
     assert!(!Start::new(&js_flags(manifests), packs().0, None).list);
     assert!(Start::new(&js_flags(provider), packs().0, None).list);
+    assert!(Start::new(&js_flags(macs), packs().0, None).list);
 }
 
 /// Asserts that a start told to list publishes a listed base into the slot, and one not told
