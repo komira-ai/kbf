@@ -12,9 +12,10 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::executor::RejectReason;
+use crate::executor::config::InputTree;
 use crate::executor::outcome::Settled;
 use crate::executor::phases::{Phase, PhaseHistograms};
-use crate::executor::steps::{Step, StepHistograms};
+use crate::executor::steps::{Step, StepHistograms, StepOf};
 use crate::executor::traits::MissPath;
 
 /// How a run ended.
@@ -168,9 +169,15 @@ impl Metrics {
         self.phases.observe(phase, took);
     }
 
-    /// One `step` of a run's preparation or submit took `took`.
-    pub(crate) fn step_took(&self, step: Step, took: std::time::Duration) {
-        self.steps.observe(step, took);
+    /// One `step` of a run's preparation or submit, for an action tree of `form`, took `took`
+    /// ([`Step::Facts`] is counted with no form, whatever `form` says).
+    pub(crate) fn step_took(&self, step: Step, form: InputTree, took: std::time::Duration) {
+        self.steps.observe(StepOf { step, form }, took);
+    }
+
+    /// The `facts` step of a run took `took`: before the run's form is chosen.
+    pub(crate) fn facts_took(&self, took: std::time::Duration) {
+        self.step_took(Step::Facts, InputTree::default(), took);
     }
 
     /// The job service answered a submit with the job.

@@ -119,7 +119,7 @@ fn puts(rig: &Rig) -> usize {
 
 /// Mints the run of `lease` for `action` in `form` and takes its tree: its directory and tree.
 async fn run(rig: &Rig, lease: RunId, action: &Digest, form: InputTree) -> (PackKey, String) {
-    let dir = rig.front.mint(lease, action, WALL, form).await;
+    let dir = rig.front.mint(lease, action, WALL, form, None).await;
     let dir = dir.expect("a dir");
     let tree = rig.front.tree(lease).await.expect("a tree");
     // As the executor does before it submits the job: the tree's writes are done.
@@ -233,7 +233,7 @@ async fn a_tree_that_could_not_be_written_is_not_remembered() {
     for lease in [lease(), second()] {
         let refused = rig
             .front
-            .mint(lease, &reserved, WALL, InputTree::Manifests)
+            .mint(lease, &reserved, WALL, InputTree::Manifests, None)
             .await;
         assert!(
             matches!(&refused, Err(MintError::Refused(why)) if why.contains(".kbf-out")),
@@ -247,7 +247,7 @@ async fn a_tree_that_could_not_be_written_is_not_remembered() {
     rig.store.fail_reads.store(true, Ordering::SeqCst);
     let down = rig
         .front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
         .await;
     assert!(matches!(down, Err(MintError::Unavailable(_))), "{down:?}");
     rig.store.fail_reads.store(false, Ordering::SeqCst);
@@ -280,13 +280,13 @@ async fn a_hit_whose_dir_is_refused_settles_as_a_miss_does_and_forgets_nothing()
     prep.refuses_mints(Some(PrepareError::Refused("over budget".to_owned())));
     let refused = rig
         .front
-        .mint(second(), &action, WALL, InputTree::Manifests)
+        .mint(second(), &action, WALL, InputTree::Manifests, None)
         .await;
     assert_eq!(refused, Err(MintError::Refused("over budget".to_owned())));
     prep.refuses_mints(Some(PrepareError::Unavailable("the store".to_owned())));
     let down = rig
         .front
-        .mint(second(), &action, WALL, InputTree::Manifests)
+        .mint(second(), &action, WALL, InputTree::Manifests, None)
         .await;
     assert_eq!(down, Err(MintError::Unavailable("the store".to_owned())));
     assert!(rig.front.tree(second()).await.is_err(), "nothing is parked");
@@ -313,7 +313,7 @@ async fn a_hit_whose_dir_ends_before_the_run_does_is_refused() {
     prep.mints_good_for(WALL.as_secs() - 1);
     let refused = rig
         .front
-        .mint(second(), &action, WALL, InputTree::Manifests)
+        .mint(second(), &action, WALL, InputTree::Manifests, None)
         .await;
     assert_eq!(
         refused,
@@ -340,7 +340,7 @@ async fn an_action_digest_that_is_not_one_is_refused_and_not_prepared() {
     };
     let refused = rig
         .front
-        .mint(lease(), &not_a_digest, WALL, InputTree::Manifests)
+        .mint(lease(), &not_a_digest, WALL, InputTree::Manifests, None)
         .await;
     assert!(matches!(refused, Err(MintError::Refused(_))), "{refused:?}");
     assert_eq!((prep.prepared(), prep.minted()), (0, 0));
@@ -374,10 +374,10 @@ async fn at_the_bound_the_oldest_tree_is_dropped() {
 async fn the_facts_of_an_action_are_read_once() {
     let (rig, reads) = counting_rig();
     let action = rig.action(|_| {}, |_| {}).await;
-    let first = rig.front.action(&action).await.expect("facts");
+    let first = rig.front.action(&action, None).await.expect("facts");
     let after_first = read_count(&reads);
     assert!(after_first > 0, "the first question reads the CAS");
-    let again = rig.front.action(&action).await.expect("facts");
+    let again = rig.front.action(&action, None).await.expect("facts");
     assert_eq!(again, first);
     assert_eq!(read_count(&reads), after_first);
 }
@@ -387,11 +387,11 @@ async fn the_facts_of_an_action_are_read_once() {
 #[tokio::test]
 async fn a_failed_read_of_an_action_is_read_again() {
     let (rig, reads) = counting_rig();
-    let unheld = rig.front.action(&action_digest()).await;
+    let unheld = rig.front.action(&action_digest(), None).await;
     assert!(matches!(unheld, Err(InputsError::Unavailable(_))));
     let after_first = read_count(&reads);
     assert!(after_first > 0);
-    let unheld = rig.front.action(&action_digest()).await;
+    let unheld = rig.front.action(&action_digest(), None).await;
     assert!(matches!(unheld, Err(InputsError::Unavailable(_))));
     assert!(
         read_count(&reads) > after_first,
@@ -410,12 +410,12 @@ async fn at_the_bound_the_oldest_facts_are_dropped() {
     };
     let a = rig.action(|a| a.timeout = Some(seconds(1)), |_| {}).await;
     let b = rig.action(|a| a.timeout = Some(seconds(2)), |_| {}).await;
-    rig.front.action(&a).await.expect("facts");
-    rig.front.action(&b).await.expect("facts");
+    rig.front.action(&a, None).await.expect("facts");
+    rig.front.action(&b, None).await.expect("facts");
     let before = read_count(&reads);
-    rig.front.action(&b).await.expect("facts");
+    rig.front.action(&b, None).await.expect("facts");
     assert_eq!(read_count(&reads), before, "b is remembered");
-    rig.front.action(&a).await.expect("facts");
+    rig.front.action(&a, None).await.expect("facts");
     assert!(read_count(&reads) > before, "a was dropped");
 }
 

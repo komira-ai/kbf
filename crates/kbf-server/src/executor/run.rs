@@ -55,7 +55,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use js_proto::v1::{Job, JobResult, JobSpec, JobState};
-use kbf_front::{Finished, Stage};
+use kbf_front::{DecodedAction, Finished, Stage};
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::{self, ActionResult};
 use kbf_types::{ActionKey, OperationId};
@@ -64,6 +64,7 @@ use tokio::time::{Instant, sleep, timeout};
 use tonic::Code;
 
 use super::Inner;
+use super::InputTree;
 use super::api::{answered, not_found, note};
 use super::mac::{PACK_WAIT, is_mac};
 use super::metrics::{IngestEnd, RunEnd};
@@ -87,6 +88,9 @@ pub(crate) struct Op {
     id: OperationId,
     key: ActionKey,
     whole_machine: bool,
+    /// The Action and Command the Execute that opened it decoded; none for an operation taken
+    /// up from the state store, whose runs read them from the CAS.
+    decoded: Option<Arc<DecodedAction>>,
     /// Whether a recorded call waits on it.
     recorded: bool,
     /// When the Execute that opened it came.
@@ -102,13 +106,14 @@ impl Op {
     pub(crate) fn new(
         id: OperationId,
         key: ActionKey,
-        whole_machine: bool,
+        (whole_machine, decoded): (bool, Option<Arc<DecodedAction>>),
         recorded: bool,
     ) -> Self {
         Self {
             id,
             key,
             whole_machine,
+            decoded,
             recorded,
             created: Instant::now(),
             arrived: SystemTime::now(),
@@ -387,7 +392,7 @@ async fn fresh(
     let prepared = tokio::select! {
         biased;
         () = cancel_asked(cancel) => return Ended::Cancelled,
-        prepared = timeout(inner.cfg.prepare_limit, prepare(&preparer, run, &action, booking)) => prepared,
+        prepared = timeout(inner.cfg.prepare_limit, prepare(&preparer, run, (&action, op.decoded.as_deref()), booking)) => prepared,
     };
     let prepared = match prepared {
         Ok(Ok(prepared)) => prepared,
@@ -399,7 +404,7 @@ async fn fresh(
     };
     let ready = Instant::now();
     timeline.stamp(Mark::Prepared, ready, metrics);
-    let job = prepared.spec.job_id.clone();
+    let (job, form) = (prepared.spec.job_id.clone(), prepared.form);
     let row = OpRow {
         owner: String::new(),
         instance: op.key.instance.clone(),
@@ -423,13 +428,13 @@ async fn fresh(
         })
         .await;
         if written.is_some() {
-            metrics.step_took(Step::Row, started.elapsed());
+            metrics.step_took(Step::Row, form, started.elapsed());
         }
         written
     };
     // The row is written while the tree's writes end; the job is submitted only once the tree
     // is stored, so its host never opens a tree the store does not have yet.
-    let (tree, written) = tokio::join!(tree_written(inner, run, cancel), put_row);
+    let (tree, written) = tokio::join!(tree_written(inner, run, form, cancel), put_row);
     match written {
         Some(Err(RowsError::Conflict { .. })) => return Ended::HandedOver,
         Some(Err(error)) => {
@@ -448,7 +453,7 @@ async fn fresh(
             withdraw(inner, &job).await;
             return Ended::Cancelled;
         }
-        answer = submit_job(inner, &prepared.spec) => answer,
+        answer = submit_job(inner, &prepared.spec, form) => answer,
     };
     if let Err(settled) = answer {
         return Ended::Again(settled, None);
@@ -503,16 +508,16 @@ fn log_submitted(op: &Op, run: RunId, job: &str, at: [Instant; 3]) {
 /// job. It waits a poll before each resend, and longer while the service stays busy
 /// ([`Busy::pause`](super::busy::Busy::pause)), for as long as that lasts: only a caller's
 /// cancel, which the caller selects on, ends the wait. Each call is timed as [`Step::Rpc`] and
-/// each wait as [`Step::Backoff`].
+/// each wait as [`Step::Backoff`], for a job whose action tree is of `form`.
 ///
 /// # Errors
 /// What the service's refusal of the job settles the run as.
-async fn submit_job(inner: &Inner, spec: &JobSpec) -> Result<(), Settled> {
+async fn submit_job(inner: &Inner, spec: &JobSpec, form: InputTree) -> Result<(), Settled> {
     let (api, metrics) = (inner.api(), &inner.deps.metrics);
     loop {
         let started = Instant::now();
         let answer = api.submit_job(spec.clone()).await;
-        metrics.step_took(Step::Rpc, started.elapsed());
+        metrics.step_took(Step::Rpc, form, started.elapsed());
         let busy = inner.busy.saw("submitting a job", &answer).busy();
         let Err(error) = answer else {
             return Ok(());
@@ -526,16 +531,17 @@ async fn submit_job(inner: &Inner, spec: &JobSpec) -> Result<(), Settled> {
         metrics.job_resubmitted();
         let started = Instant::now();
         sleep(inner.busy.pause()).await;
-        metrics.step_took(Step::Backoff, started.elapsed());
+        metrics.step_took(Step::Backoff, form, started.elapsed());
     }
 }
 
-/// Waits for the writes of `run`'s action tree ([`Ingest::stored`](super::Ingest::stored)),
+/// Waits for the writes of `run`'s action tree, of `form` ([`Ingest::stored`](super::Ingest::stored)),
 /// timed as [`Step::TreeWait`] and held to the run's preparation limit. A failed write ends the
 /// run as the mint's failure would have; a caller's cancel ends it cancelled.
 async fn tree_written(
     inner: &Arc<Inner>,
     run: RunId,
+    form: InputTree,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<(), Ended> {
     let started = Instant::now();
@@ -548,7 +554,7 @@ async fn tree_written(
     inner
         .deps
         .metrics
-        .step_took(Step::TreeWait, started.elapsed());
+        .step_took(Step::TreeWait, form, started.elapsed());
     let settled = match stored {
         Ok(Ok(())) => return Ok(()),
         Ok(Err(error)) => not_minted(error),

@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use js_proto::v1::{ExecMode, Shape};
-use kbf_front::{ActionLabel, Described, Finished, Recorder, Stage, Submission, Ticket};
+use kbf_front::{
+    ActionLabel, DecodedAction, Described, Finished, Recorder, Stage, Submission, Ticket,
+};
 use kbf_job_client::fake::{Call, FakeJobServer, Machine};
 use kbf_proto::reapi::ActionResult;
 use kbf_state::fake::{Fake, Flaw};
@@ -25,7 +27,7 @@ use crate::executor::task::{RunId, build_id};
 pub(crate) const IMAGE: &str =
     "registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -39,6 +41,8 @@ pub(crate) struct FakeInputs {
     pub panics: AtomicBool,
     /// How many actions were read.
     pub looked_up: AtomicU64,
+    /// The decode each read of an action was given, in order.
+    pub decoded: Mutex<Vec<Option<DecodedAction>>>,
 }
 
 impl FakeInputs {
@@ -58,14 +62,20 @@ impl FakeInputs {
             hang: AtomicBool::new(false),
             panics: AtomicBool::new(false),
             looked_up: AtomicU64::new(0),
+            decoded: Mutex::new(Vec::new()),
         }
     }
 }
 
 #[tonic::async_trait]
 impl Inputs for FakeInputs {
-    async fn action(&self, _action: &kbf_proto::reapi::Digest) -> Result<ActionFacts, InputsError> {
+    async fn action(
+        &self,
+        _action: &kbf_proto::reapi::Digest,
+        decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError> {
         self.looked_up.fetch_add(1, Ordering::SeqCst);
+        locked(&self.decoded).push(decoded.cloned());
         if self.hang.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
@@ -102,6 +112,8 @@ pub(crate) struct FakeIngest {
     pub stored_done: Mutex<Vec<RunId>>,
     /// The form of the tree each mint was asked for, in order.
     pub minted_as: Mutex<Vec<InputTree>>,
+    /// The decode each mint was given, in order.
+    pub minted_decoded: Mutex<Vec<Option<DecodedAction>>>,
     /// Every action a host refused the tree list of ([`Ingest::list_refused`]), in order; the
     /// first is answered `Republish`, the others `Manifests`, and from the second on the form of
     /// an action's tree is manifests.
@@ -128,8 +140,10 @@ impl Ingest for FakeIngest {
         _action: &kbf_proto::reapi::Digest,
         _wall: Duration,
         tree: InputTree,
+        decoded: Option<&DecodedAction>,
     ) -> Result<PackKey, MintError> {
         locked(&self.minted_as).push(tree);
+        locked(&self.minted_decoded).push(decoded.cloned());
         if let Some(why) = locked(&self.mint_fails).pop_front() {
             return Err(why);
         }
@@ -435,6 +449,7 @@ pub(crate) fn submission_of(action: Digest) -> Submission {
             label: ActionLabel::default(),
         },
         evidence: kbf_invocation::Evidence::default(),
+        decoded: None,
     }
 }
 
@@ -521,6 +536,7 @@ impl Rig {
             stored_asked: Mutex::new(Vec::new()),
             stored_done: Mutex::new(Vec::new()),
             minted_as: Mutex::new(Vec::new()),
+            minted_decoded: Mutex::new(Vec::new()),
             list_refused: Mutex::new(Vec::new()),
         });
         let metrics = Arc::new(Metrics::default());

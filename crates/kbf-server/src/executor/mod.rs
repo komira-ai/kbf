@@ -275,6 +275,7 @@ impl Dispatch for Executor {
             key,
             whole_machine,
             call,
+            decoded,
             ..
         } = submission;
         // An operation id of the state store is reserved with no lock held: once a block of
@@ -311,7 +312,7 @@ impl Dispatch for Executor {
             let recorded =
                 record::answered(&self.inner.deps.recorder, call, &name, operation, false);
             let (stage, cancel) = ops.open(operation, key.clone());
-            let op = Op::new(operation, key.clone(), whole_machine, recorded);
+            let op = Op::new(operation, key.clone(), (whole_machine, decoded), recorded);
             run::spawn(Arc::clone(&self.inner), op, Start::Fresh, cancel);
             break (name, stage);
         };

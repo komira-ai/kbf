@@ -52,6 +52,8 @@ mod named;
 mod places;
 #[path = "action_tree/retry.rs"]
 mod retry;
+#[path = "action_tree/sidecar_order.rs"]
+mod sidecar_order;
 #[path = "action_tree/sidecars.rs"]
 mod sidecars;
 #[path = "action_tree/stages.rs"]
@@ -135,6 +137,8 @@ struct State {
     peak: usize,
     /// Every ranged read of an object: its key, the offset and the length.
     ranged: Vec<(String, u64, u64)>,
+    /// Every length asked of an object (a HEAD), by key, in the order asked.
+    heads_of: Vec<String>,
 }
 
 /// One open write of [`Farm`]'s, counted in [`State::open`] and [`State::peak`] until dropped.
@@ -465,7 +469,12 @@ impl LargeStore for Farm {
         &'a self,
         key: &'a ObjectKey,
     ) -> BoxFuture<'a, Result<Option<u64>, ObjectStoreError>> {
-        let length = self.object(key.as_str()).map(|bytes| bytes.len() as u64);
+        let mut state = self.state();
+        state.heads_of.push(key.to_string());
+        let length = state
+            .objects
+            .get(key.as_str())
+            .map(|bytes| bytes.len() as u64);
         Box::pin(async move { Ok(length) })
     }
 

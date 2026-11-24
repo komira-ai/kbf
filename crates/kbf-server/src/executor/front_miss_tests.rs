@@ -20,7 +20,7 @@ const REPUBLISH: ListingWrite = ListingWrite {
 /// The key or digest the mint of `action` in `form` parked, once the tree is stored.
 async fn mint(rig: &Rig, action: &Digest, form: InputTree) -> String {
     rig.front
-        .mint(lease(), action, WALL, form)
+        .mint(lease(), action, WALL, form, None)
         .await
         .expect("a dir");
     rig.front.stored(lease()).await.expect("stored");

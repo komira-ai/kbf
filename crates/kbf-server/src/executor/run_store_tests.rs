@@ -75,7 +75,7 @@ async fn an_operation_keeps_its_row_from_before_its_submit_until_it_finishes() {
         }
     );
     assert_eq!(
-        rig.counted("kbf_executor_step_seconds_count{step=\"row\"} "),
+        rig.counted("kbf_executor_step_seconds_count{step=\"row\",form=\"manifests\"} "),
         1,
         "the row's write is timed"
     );

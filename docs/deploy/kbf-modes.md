@@ -433,12 +433,15 @@ job's state from its host's agent, which trails the host by one or two beats: `q
 `run` are good to the wait between two reads (at most a poll) plus a heartbeat or two, not to the instant the host started or ended the
 job, and a job that starts and ends between two reads has a `run` and no `queue` or `task`. A phase that was not observed
 is absent, never zero. The buckets start at 1 ms. Where `prepare` and `start` go is the histogram
-`kbf_executor_step_seconds{step=...}`, each step timed around its one wait: `facts`, `put_dir` (with the closure's
+`kbf_executor_step_seconds{step=...,form=...}` (`form` the action tree's form, `manifests` or `provider`, and `none`
+for `facts`), each step timed around its one wait: `facts`, `put_dir` (with the closure's
 `action`, `walk` and `held`), `tree` (to the action tree's name), `row`, `rpc` (each `SubmitJob` call), `backoff`
 (the wait before a submit is sent again) and `tree_wait` (a run waiting for its tree's writes, before its submit,
 while its row is written), and the stages of those writes, timed on the task that writes the tree from its name on, so
 overlapping `tree_wait`: `tree_blobs` (the blobs that were nowhere, written whole), `tree_manifests` (the input root's
-manifests and `.kbf`, written together) and `tree_root` (the root, written last). [api.md](../api.md) lists them. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
+manifests and `.kbf`, written together) and `tree_root` (the root, written last), or, for a tree list, `tree_blobs`,
+`tree_list` (the list's one write) and `tree_sidecar` (its L2 sidecar, begun beside the list's write and written after
+it). [api.md](../api.md) lists them. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
 in the result's execution metadata as the `input_fetch`, `execution` and `output_upload` start and
 completed times, marked as a task's claim, and the run record and the read API say so with
 `phase_times: "task_claim"` (a run recorded by an earlier release is `measured`, and so is a record written before the

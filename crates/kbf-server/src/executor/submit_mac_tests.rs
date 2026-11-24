@@ -6,6 +6,7 @@ use std::time::Duration;
 use js_proto::v1::{
     Constraints, ExecMode, JobSpec, MountMode, MountPropagation, NetworkLevel, mount,
 };
+use kbf_front::DecodedAction;
 use kbf_proto::reapi::{Digest, Platform, platform::Property};
 
 use super::tests::{Harness, RUN, built_class};
@@ -41,7 +42,11 @@ struct Mac {
 
 #[tonic::async_trait]
 impl Inputs for Mac {
-    async fn action(&self, _: &Digest) -> Result<ActionFacts, InputsError> {
+    async fn action(
+        &self,
+        _: &Digest,
+        _decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError> {
         Ok(ActionFacts {
             image: format!("registry.test/kbf@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
@@ -121,7 +126,7 @@ async fn prepared(case: Case) -> Result<super::Prepared, Settled> {
         inputs: &inputs,
         ..harness.preparer()
     };
-    prepare(&ctx, RUN, &action(), case.booking).await
+    prepare(&ctx, RUN, (&action(), None), case.booking).await
 }
 
 /// Where a mount comes from: a host path, or `<provider>:<ref>` for a provider's tree.
@@ -240,7 +245,7 @@ async fn a_mac_jobs_wall_limit_is_its_timeout_plus_the_run_margin() {
         inputs: &inputs,
         ..harness.preparer()
     };
-    let job = prepare(&ctx, RUN, &action(), Booking::Share)
+    let job = prepare(&ctx, RUN, (&action(), None), Booking::Share)
         .await
         .expect("prepared");
     assert_eq!(job.spec.wall_limit_seconds, Some(20 + 77));

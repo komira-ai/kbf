@@ -10,7 +10,7 @@ use std::time::Duration;
 use js_proto::v1::{
     ExecMode, GetJobResponse, GetResultResponse, Job, JobResult, JobState, ResultReason, Shape,
 };
-use kbf_front::{Cache, Recorder, VerifiedBlob};
+use kbf_front::{Cache, DecodedAction, Recorder, VerifiedBlob};
 use kbf_job_client::fake::{FakeJobServer, Fault, Machine};
 use kbf_proto::reapi::{ActionResult, Digest, OutputFile};
 use kbf_server::executor::{
@@ -353,7 +353,11 @@ fn proto_digest(bytes: &[u8]) -> Digest {
 
 #[tonic::async_trait]
 impl Inputs for Seams {
-    async fn action(&self, _action: &Digest) -> Result<ActionFacts, InputsError> {
+    async fn action(
+        &self,
+        _action: &Digest,
+        _decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError> {
         let out = "buck-out/v2/art/root/7a3c1e9f0b2d4c68/pkg/__t__/o".to_owned();
         let shape = kbf_server::action_usage::Shape::of(&["cc".to_owned()], &[out]);
         Ok(ActionFacts {
@@ -381,6 +385,7 @@ impl Ingest for Seams {
         _action: &Digest,
         _wall: Duration,
         _tree: InputTree,
+        _decoded: Option<&DecodedAction>,
     ) -> Result<PackKey, MintError> {
         if let Some(why) = locked(&self.direct.script).mint_fails.pop_front() {
             return Err(why);

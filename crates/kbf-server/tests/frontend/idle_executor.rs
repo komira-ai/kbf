@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use js_proto::v1::{ExecMode, Shape};
+use kbf_front::DecodedAction;
 use kbf_job_client::fake::{FakeJobServer, Machine};
 use kbf_proto::reapi::Digest;
 use kbf_server::executor::{
@@ -25,7 +26,11 @@ struct Idle;
 
 #[tonic::async_trait]
 impl Inputs for Idle {
-    async fn action(&self, _action: &Digest) -> Result<ActionFacts, InputsError> {
+    async fn action(
+        &self,
+        _action: &Digest,
+        _decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError> {
         let out = "buck-out/v2/art/root/7a3c1e9f0b2d4c68/pkg/__t__/o".to_owned();
         let shape = kbf_server::action_usage::Shape::of(&["cc".to_owned()], &[out]);
         Ok(ActionFacts {
@@ -49,6 +54,7 @@ impl Ingest for Idle {
         _action: &Digest,
         _wall: Duration,
         _tree: InputTree,
+        _decoded: Option<&DecodedAction>,
     ) -> Result<PackKey, MintError> {
         Ok(PackKey::new(format!(
             "cas/b/{}/{:032x}-0",

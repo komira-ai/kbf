@@ -15,7 +15,7 @@ use super::listing::listed_base;
 use super::*;
 
 /// A rig whose writer writes sidecars from a pack index of its own, and the index.
-async fn sidecar_rig() -> (Rig, Arc<MemoryPackIndex>) {
+pub(super) async fn sidecar_rig() -> (Rig, Arc<MemoryPackIndex>) {
     let mut rig = Rig::new().await;
     let index = Arc::new(MemoryPackIndex::new(Arc::new(ManualClock::default())));
     let store = Arc::clone(&rig.farm) as Arc<dyn LargeStore>;
@@ -29,7 +29,7 @@ async fn sidecar_rig() -> (Rig, Arc<MemoryPackIndex>) {
 
 /// The packs and whole objects every list of the rig names, held with bytes so they can be read:
 /// the pack of the Action and Command, the base's pack and the base's whole file.
-fn hold_named_objects(rig: &Rig) {
+pub(super) fn hold_named_objects(rig: &Rig) {
     let mut state = rig.farm.state();
     state
         .objects
@@ -44,7 +44,7 @@ fn hold_named_objects(rig: &Rig) {
 }
 
 /// The id a list key `cas/l/<hex>` names.
-fn id_of(key: &str) -> [u8; 32] {
+pub(super) fn id_of(key: &str) -> [u8; 32] {
     let hex = key.strip_prefix("cas/l/").expect("a list key");
     let mut id = [0u8; 32];
     for (at, byte) in id.iter_mut().enumerate() {
@@ -54,7 +54,7 @@ fn id_of(key: &str) -> [u8; 32] {
 }
 
 /// An input root of one packed file.
-async fn one_file_root(rig: &Rig) -> Digest {
+pub(super) async fn one_file_root(rig: &Rig) -> Digest {
     let blob = rig.farm.packed("int main;", "cas/f/w/p9", 3000).await;
     rig.store(&directory(vec![file("a.c", &blob, false)], vec![], vec![]))
         .await
@@ -84,7 +84,7 @@ async fn dual_emission_keeps_the_tree_id() {
 
     let with = rig
         .writer
-        .write_listing_with(&kept, &listed_base(&rig), how, |_| ())
+        .write_listing_with(&kept, &listed_base(&rig), how, |_| (), |_, _| ())
         .await
         .expect("a listing");
 
@@ -143,7 +143,7 @@ async fn the_miss_path_reads_each_object_with_no_cells_once() {
     };
 
     rig.writer
-        .write_listing_with(&kept, &listed_base(&rig), how, |_| ())
+        .write_listing_with(&kept, &listed_base(&rig), how, |_| (), |_, _| ())
         .await
         .expect("a listing");
 
@@ -173,7 +173,7 @@ async fn the_miss_path_reads_each_object_with_no_cells_once() {
     let reads = rig.farm.state().ranged.len();
 
     rig.writer
-        .write_listing_with(&kept, &listed_base(&rig), how, |_| ())
+        .write_listing_with(&kept, &listed_base(&rig), how, |_| (), |_, _| ())
         .await
         .expect("a listing");
 
@@ -198,7 +198,7 @@ async fn a_lost_object_on_the_miss_path_never_fails_the_list() {
 
     let listing = rig
         .writer
-        .write_listing_with(&kept, &listed_base(&rig), how, |_| ())
+        .write_listing_with(&kept, &listed_base(&rig), how, |_| (), |_, _| ())
         .await
         .expect("a listing");
 

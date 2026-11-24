@@ -75,6 +75,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_pack::{MAX_LARGE, MAX_PACKS, MAX_RECORD_BYTES, TaskKeyError, check_build};
+use kbf_proto::reapi;
 use kbf_types::Digest;
 use tierstore::server::presign::PresignError;
 use tierstore::server::{PresignRequest, presign_put};
@@ -84,7 +85,7 @@ pub use self::closure::{
     ClosureError, ClosureLimits, InputClosure, KeptClosure, collect_closure,
     collect_closure_detaching, collect_closure_keeping,
 };
-pub(crate) use self::closure::{KeptDirectory, keeping_through};
+pub(crate) use self::closure::{KeptDirectory, Walk, keeping_through};
 pub use self::detached::{DETACHED_WRITES, DetachedWrites};
 pub use self::directories::{DIRECTORY_MEMORY_BYTES, DirectoryCache};
 pub use tierstore::server::AccessKey;
@@ -649,6 +650,7 @@ impl RunPrep {
             &RunAt {
                 lease,
                 action,
+                decoded: None,
                 now,
                 wall,
             },
@@ -736,7 +738,8 @@ impl PutDirPrep {
         &self.mint
     }
 
-    /// As [`RunPrep::prepare_put_dir`].
+    /// As [`RunPrep::prepare_put_dir`]; given `decoded`, `action`'s Action already decoded (the
+    /// one the Execute that started the run read), the closure walk does not read it again.
     ///
     /// # Errors
     /// [`PrepareError`], as there.
@@ -744,6 +747,7 @@ impl PutDirPrep {
         &self,
         lease: &str,
         action: &Digest,
+        decoded: Option<&reapi::Action>,
         now: SystemTime,
         wall: Duration,
     ) -> Result<PutDirRun, PrepareError> {
@@ -757,6 +761,7 @@ impl PutDirPrep {
             &RunAt {
                 lease,
                 action,
+                decoded,
                 now,
                 wall,
             },
@@ -787,6 +792,8 @@ impl PutDirPrep {
 struct RunAt<'a> {
     lease: &'a str,
     action: &'a Digest,
+    /// `action`'s Action, already decoded: the closure walk does not read it.
+    decoded: Option<&'a reapi::Action>,
     now: SystemTime,
     wall: Duration,
 }
@@ -817,7 +824,15 @@ async fn put_dir_run(
     run: &RunAt<'_>,
 ) -> Result<PutDirRun, PrepareError> {
     let not_after = not_after(run.lease, run.now, run.wall, slack)?;
-    let (kept, took) = keeping_through(backend, run.action, limits, directories, writes).await?;
+    let walk = Walk {
+        backend,
+        limits,
+        keep: true,
+        cache: directories,
+        writes,
+        decoded: run.decoded,
+    };
+    let (kept, took) = keeping_through(&walk, run.action).await?;
     let dir = mint.mint_put_dir(run.lease, run.action, run.now)?;
     Ok(PutDirRun {
         dir,

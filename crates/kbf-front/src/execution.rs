@@ -109,7 +109,7 @@ pub const LEASE_KINDS: [&str; 2] = ["action", "whole_machine"];
 pub const ERROR_DOMAIN: &str = "kbf";
 
 /// One execution the front hands to the dispatcher.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Submission {
     /// The instance and action: the key identical requests are joined by.
     pub key: kbf_types::ActionKey,
@@ -123,6 +123,21 @@ pub struct Submission {
     pub described: Described,
     /// What the front knew at submit: the size of the input tree. For the run record only.
     pub evidence: Evidence,
+    /// The Action and the Command of [`Submission::key`]'s action as this Execute decoded them,
+    /// so that its run reads neither from the CAS again. `None` when the submitter has not
+    /// decoded them; the dispatcher then reads them itself.
+    pub decoded: Option<Arc<DecodedAction>>,
+}
+
+/// The Action an Execute read and decoded, and its Command: the two messages a run's facts and
+/// its input closure are read from. Named by the action's digest ([`Submission::key`]), so what
+/// they say is what the CAS holds under it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedAction {
+    /// The Action.
+    pub action: Action,
+    /// The Command its `command_digest` names.
+    pub command: Command,
 }
 
 /// Where an operation is, as its callers see it.

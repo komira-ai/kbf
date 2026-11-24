@@ -78,6 +78,7 @@ impl RunPrepare for Preparing {
         &self,
         lease: &str,
         action: &Digest,
+        _decoded: Option<&Action>,
         now: SystemTime,
         wall: Duration,
     ) -> Result<PreparedPutDir, PrepareError> {
@@ -245,6 +246,7 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
                 label: Default::default(),
             },
             evidence: Default::default(),
+            decoded: None,
         })
         .expect("the executor takes the action");
     let mut stage = ticket.stage;

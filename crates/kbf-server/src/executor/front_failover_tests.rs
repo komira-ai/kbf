@@ -31,7 +31,7 @@ async fn a_run_is_prepared_and_ingested_through_a_failover_of_30_seconds() {
 
     let key = rig
         .front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
     let tree = rig.front.tree(lease()).await.expect("a tree");
@@ -90,7 +90,7 @@ async fn a_store_down_past_the_bound_makes_the_run_unavailable_saying_so() {
     let action = action_with_input(&rig, "input").await;
     let key = rig
         .front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
     rig.store.fail_over_for(Duration::from_secs(3_600));
@@ -103,6 +103,7 @@ async fn a_store_down_past_the_bound_makes_the_run_unavailable_saying_so() {
             &other,
             WALL,
             InputTree::Manifests,
+            None,
         )
         .await;
     let ingested = rig.front.ingest(lease(), &key, &action, &limits()).await;

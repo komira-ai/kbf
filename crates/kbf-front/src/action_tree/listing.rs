@@ -24,22 +24,33 @@
 //! it written and writes nothing. Before it is stored the list is read back by tierstore's own
 //! reader (`TreeListV2::open`, then `build`), so nothing is stored that the provider would refuse
 //! to read.
+//!
+//! With sidecars ([`TreeWriter::with_sidecars`]), the list's L2 sidecar is written once the list
+//! is stored: the sidecar's HEAD and the pack index's cells query run beside the list's write,
+//! since they read and write nothing the list needs, and the sidecar's write (or the tree's
+//! unlisted row) follows the list's, so no sidecar names a list the store does not have. A list
+//! whose write fails fails the tree, and what its sidecar read is dropped; a sidecar that fails
+//! never fails the list. The miss path's backfill ([`ListingWrite::republish`]) reads objects
+//! and records cells, and runs after the list's write.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
+use futures::future::join;
 use kbf_objstore::ObjectKey;
 use kbf_types::Digest;
 use tierstore::{BlobSource, EntryKind, MAX_TREE_LIST_BYTES, TreeEntry, TreeLimits, TreeListV2};
+use tokio::time::Instant;
 
 use super::place::{self, Place};
-use super::sidecar::Sidecars;
+use super::sidecar::{SidecarError, Sidecars, Staged};
 use super::tstree::{
     self, Child, DIR_MODE, EMPTY_SHA256, ENTRY_BYTES, HEADER_LEN, Item, RANGE_MERGE_GAP,
 };
-use super::{BaseTree, INPUT_ROOT, NoTree, TreeWriter, Trust, reserved_input};
+use super::{BaseTree, INPUT_ROOT, NoTree, TreeWriter, Trust, WriteStage, reserved_input};
 use crate::large_backfill::large_key;
 use crate::prepare_run::{KeptClosure, KeptDirectory};
 
@@ -213,7 +224,7 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_as(kept, base, (Trust::Memos, false), |_| ())
+        self.write_listing_as(kept, base, (Trust::Memos, false), |_| (), untimed)
             .await
     }
 
@@ -233,7 +244,7 @@ impl TreeWriter {
         base: &BaseTree,
         named: impl FnOnce(&Listing) + Send,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_as(kept, base, (Trust::Memos, false), named)
+        self.write_listing_as(kept, base, (Trust::Memos, false), named, untimed)
             .await
     }
 
@@ -249,7 +260,7 @@ impl TreeWriter {
         kept: &KeptClosure,
         base: &BaseTree,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_as(kept, base, (Trust::Store, false), |_| ())
+        self.write_listing_as(kept, base, (Trust::Store, false), |_| (), untimed)
             .await
     }
 
@@ -265,14 +276,18 @@ impl TreeWriter {
         base: &BaseTree,
         named: impl FnOnce(&Listing) + Send,
     ) -> Result<Listing, NoTree> {
-        self.write_listing_as(kept, base, (Trust::Store, false), named)
+        self.write_listing_as(kept, base, (Trust::Store, false), named, untimed)
             .await
     }
 
     /// Lists the action tree of `kept` over `base` as one tree list and stores it as `how`
     /// says, naming it as [`TreeWriter::write_listing_named`] does: checked against the store
     /// as [`TreeWriter::write_listing_checked`] is, and with its L2 sidecar republished
-    /// ([`ListingWrite::republish`]).
+    /// ([`ListingWrite::republish`]). `timed` is called with each stage the writes make and how
+    /// long it took, on tokio's clock, once it ended: the blobs that were nowhere
+    /// ([`WriteStage::Blobs`], a list with none has no such stage), the list's write, a failed one
+    /// included ([`WriteStage::List`]), and its sidecar, once the list is stored
+    /// ([`WriteStage::Sidecar`]). A stage cut off part way (the write was dropped) is not timed.
     ///
     /// # Errors
     /// As [`TreeWriter::write_listing_checked_named`].
@@ -282,13 +297,14 @@ impl TreeWriter {
         base: &BaseTree,
         how: ListingWrite,
         named: impl FnOnce(&Listing) + Send,
+        timed: impl Fn(WriteStage, Duration) + Send + Sync,
     ) -> Result<Listing, NoTree> {
         let trust = match how.checked {
             true => Trust::Store,
             false => Trust::Memos,
         };
         let how = (trust, how.republish);
-        self.write_listing_as(kept, base, how, named).await
+        self.write_listing_as(kept, base, how, named, timed).await
     }
 
     async fn write_listing_as(
@@ -297,6 +313,7 @@ impl TreeWriter {
         base: &BaseTree,
         (trust, republish): (Trust, bool),
         named: impl FnOnce(&Listing) + Send,
+        timed: impl Fn(WriteStage, Duration) + Send + Sync,
     ) -> Result<Listing, NoTree> {
         reserved_input(kept)?;
         let Some(listed) = &base.listing else {
@@ -341,27 +358,60 @@ impl TreeWriter {
             key: key.to_string(),
         };
         named(&listing);
-        self.write_whole(unlocated, now).await?;
-        let bytes = Bytes::from(bytes);
-        place::write_object(&*self.store, &self.retry, &key, bytes.clone()).await?;
-        if let Some(sidecars) = &self.sidecars {
-            sidecar(sidecars, &key, &bytes, republish).await;
+        if !unlocated.is_empty() {
+            let started = Instant::now();
+            let written = self.write_whole(unlocated, now).await;
+            timed(WriteStage::Blobs, started.elapsed());
+            written?;
         }
+        let bytes = Bytes::from(bytes);
+        let put = async {
+            let started = Instant::now();
+            let put = place::write_object(&*self.store, &self.retry, &key, bytes.clone()).await;
+            timed(WriteStage::List, started.elapsed());
+            put
+        };
+        let Some(sidecars) = &self.sidecars else {
+            put.await?;
+            return Ok(listing);
+        };
+        let started = Instant::now();
+        // Dual emission reads beside the list's write and writes after it; the miss path's
+        // backfill reads and records after it.
+        let (put, staged) = match republish {
+            false => {
+                let (put, staged) = join(put, sidecars.stage(&bytes)).await;
+                (put, Some(staged))
+            }
+            true => (put.await, None),
+        };
+        put?;
+        sidecar(sidecars, &key, &bytes, staged).await;
+        timed(WriteStage::Sidecar, started.elapsed());
         Ok(listing)
     }
 }
 
-/// Writes the L2 sidecar of the list `bytes` stored at `key`: from recorded cells only, or,
-/// on the miss path (`republish`), reading each object that has none once. A failure is logged
-/// and never fails the list: old readers read the list, and a new reader's refusal of a tree
-/// with no sidecar takes the executor's miss path.
-async fn sidecar(sidecars: &Sidecars, key: &ObjectKey, bytes: &[u8], republish: bool) {
-    let written = match republish {
-        false => sidecars
-            .emit(bytes)
+/// The timer of a write whose stages no one times.
+fn untimed(_: WriteStage, _: Duration) {}
+
+/// Writes the L2 sidecar of the list `bytes` stored at `key`: from recorded cells only, as
+/// `staged` found them beside the list's write, or, on the miss path (no `staged`), reading each
+/// object that has none once. A failure is logged and never fails the list: old readers read
+/// the list, and a new reader's refusal of a tree with no sidecar takes the executor's miss path.
+async fn sidecar(
+    sidecars: &Sidecars,
+    key: &ObjectKey,
+    bytes: &[u8],
+    staged: Option<Result<Staged, SidecarError>>,
+) {
+    let republish = staged.is_none();
+    let written = match staged {
+        Some(staged) => sidecars
+            .emit_staged(bytes, staged)
             .await
             .map(|emitted| format!("{emitted:?}")),
-        true => sidecars
+        None => sidecars
             .backfill(bytes)
             .await
             .map(|done| format!("{done:?}")),
