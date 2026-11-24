@@ -87,8 +87,9 @@ fn run(base: &Path, extra: &[&str]) -> String {
 
 /// Catches: `--log-dir` parsed and ignored (no file), the file missing the events
 /// stderr gets (the line saying the file is on is in both), a start that truncates the
-/// file (the second run's entries replace the first's), and the capture flags not
-/// reaching the file (`--log-files` and `--log-max-bytes` are in the line).
+/// file (the second run's entries replace the first's), the capture flags not
+/// reaching the file (`--log-files` and `--log-max-bytes` are in the line), and colour
+/// codes in the binary's stderr when it is not a terminal (a field must grep as written).
 #[test]
 fn log_dir_gets_the_events_and_a_restart_appends() {
     let base = fresh_dir("log-dir");
@@ -104,6 +105,13 @@ fn log_dir_gets_the_events_and_a_restart_appends() {
     ];
     let stderr = run(&base, &flags);
     assert!(stderr.contains(ON), "{stderr}");
+    // stderr is what journald or a container's log keeps: a field must read there as it is
+    // written, with no colour code between its name and its value.
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "colour codes on stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("max_bytes=1048576 files=3"), "{stderr:?}");
     let file = std::fs::read_to_string(log.join("kbf-server.log")).expect("the log file");
     assert!(file.contains(ON), "{file}");
     assert!(file.contains("max_bytes=1048576"), "{file}");
