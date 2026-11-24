@@ -125,9 +125,9 @@ Options:
           [default: 30]
 
       --http2-keepalive-timeout-secs <HTTP2_KEEPALIVE_TIMEOUT_SECS>
-          How long, in seconds, a PING may go unanswered before the connection is closed
+          How long, in seconds, a PING may go unanswered before the connection is closed, failing every action on it: the default outlasts a client's path that stalls for a minute
           
-          [default: 20]
+          [default: 120]
 
       --async-threads <N>
           Worker threads of the async runtime, which run every task between its waits. Default: every CPU the process may use
