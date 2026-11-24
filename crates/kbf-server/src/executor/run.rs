@@ -27,6 +27,11 @@
 //! miss path ([`Ingest::list_refused`](super::Ingest::list_refused)); any other ending, and the last
 //! attempt, answers them with its status, the job's output attached.
 //!
+//! Each job the service takes writes one INFO line, `the job service took the job`, with its
+//! operation, run and job id, the Execute's arrival and the submit's answer on the wall clock,
+//! and the time between them ([`log_submitted`]): the frontend's half of a job's start, per job,
+//! for joining with the host's own line for the same job id.
+//!
 //! A cancel asked for by a caller cancels the job (or, before the submit, stops the run) and
 //! answers the callers `CANCELLED`.
 //!
@@ -45,7 +50,7 @@
 
 use std::future::pending;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use js_proto::v1::{Job, JobResult, JobSpec, JobState};
 use kbf_front::{Finished, Stage};
@@ -83,10 +88,14 @@ pub(crate) struct Op {
     recorded: bool,
     /// When the Execute that opened it came.
     created: Instant,
+    /// The same moment on the wall clock, for the line each submitted job writes
+    /// ([`log_submitted`]).
+    arrived: SystemTime,
 }
 
 impl Op {
-    /// Operation `id` of `key`, opened now.
+    /// Operation `id` of `key`, opened now. For an operation taken up from the state store, now
+    /// is when this process took it up.
     pub(crate) fn new(
         id: OperationId,
         key: ActionKey,
@@ -99,6 +108,7 @@ impl Op {
             whole_machine,
             recorded,
             created: Instant::now(),
+            arrived: SystemTime::now(),
         }
     }
 }
@@ -244,7 +254,7 @@ pub(crate) async fn run(
         timeline.stamp(Mark::Seen, began, &metrics);
         let ended = match attached.take() {
             Some(row) => resume(&inner, &op, run, row, &mut cancel, &mut timeline).await,
-            None => fresh(&inner, &op, run, &mut cancel, &mut timeline).await,
+            None => fresh(&inner, &op, run, began, &mut cancel, &mut timeline).await,
         };
         match ended {
             Ended::Answer(finished) => break Some((run, finished)),
@@ -353,11 +363,12 @@ async fn finish(inner: &Arc<Inner>, op: &Op, run: RunId, finished: Finished) {
     inner.ops().finish(op.id, finished, Instant::now());
 }
 
-/// Runs `run` from its preparation.
+/// Runs `run` from its preparation; `began` is when the run was first seen ([`Mark::Seen`]).
 async fn fresh(
     inner: &Arc<Inner>,
     op: &Op,
     run: RunId,
+    began: Instant,
     cancel: &mut watch::Receiver<bool>,
     timeline: &mut Timeline,
 ) -> Ended {
@@ -383,7 +394,8 @@ async fn fresh(
             return Ended::Again(Settled::Infra(why), None);
         }
     };
-    timeline.stamp(Mark::Prepared, Instant::now(), metrics);
+    let ready = Instant::now();
+    timeline.stamp(Mark::Prepared, ready, metrics);
     let job = prepared.spec.job_id.clone();
     let row = OpRow {
         owner: String::new(),
@@ -439,8 +451,9 @@ async fn fresh(
         return Ended::Again(settled, None);
     }
     metrics.job_submitted();
-    timeline.stamp(Mark::Posted, Instant::now(), metrics);
-    tracing::debug!(operation = %op.id, %run, %job, "submitted");
+    let posted = Instant::now();
+    timeline.stamp(Mark::Posted, posted, metrics);
+    log_submitted(op, run, &job, [began, ready, posted]);
     if op.recorded {
         record::granted(&inner.deps.recorder, run, &job);
     }
@@ -450,6 +463,36 @@ async fn fresh(
         timeout: prepared.timeout,
     };
     watch_job(inner, op, run, &submitted, cancel, timeline).await
+}
+
+/// Writes the one line of a submitted job: its operation, run and job id; when the Execute came
+/// and when the job service answered the submit with the job, as Unix milliseconds; and, in
+/// milliseconds, the time from the Execute to that answer (`since_execute_ms`, every attempt
+/// before this one included) and this run's `prepare` and `start` phases ([`super::phases`]).
+/// `at` holds the run's [`Mark::Seen`], [`Mark::Prepared`] and [`Mark::Posted`] stamps.
+///
+/// The submit time is the Execute's wall-clock time plus the executor's own measure of the time
+/// since, so the two times differ by exactly `since_execute_ms` even if the wall clock steps.
+fn log_submitted(op: &Op, run: RunId, job: &str, at: [Instant; 3]) {
+    let [seen, ready, posted] = at;
+    let since_execute = posted.saturating_duration_since(op.created);
+    let unix_ms = |at: SystemTime| {
+        at.duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    };
+    tracing::info!(
+        operation = %op.id,
+        %run,
+        %job,
+        attempt = run.attempt,
+        execute_unix_ms = unix_ms(op.arrived),
+        submitted_unix_ms = unix_ms(op.arrived + since_execute),
+        since_execute_ms = since_execute.as_millis(),
+        prepare_ms = ready.saturating_duration_since(seen).as_millis(),
+        start_ms = posted.saturating_duration_since(ready).as_millis(),
+        "the job service took the job"
+    );
 }
 
 /// Submits `spec` until the job service answers with the job, sending it again while the answer
@@ -880,6 +923,9 @@ async fn follow_task(inner: Arc<Inner>, operation: OperationId) {
 #[cfg(test)]
 #[path = "run_end_tests.rs"]
 mod end_tests;
+#[cfg(test)]
+#[path = "run_line_tests.rs"]
+mod line_tests;
 #[cfg(test)]
 #[path = "run_list_tests.rs"]
 mod list_tests;
