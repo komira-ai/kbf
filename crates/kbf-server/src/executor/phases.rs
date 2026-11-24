@@ -10,10 +10,11 @@
 //!
 //! What the stamps can know is bounded by how the executor learns. The stamps are the
 //! executor's own clock, not the job's times, and the service learns a job's state from its
-//! host's agent, which trails the host by one or two beats; the executor reads each job once
-//! per poll. So `queue` and `task` are the executor's polls that first saw the job running and
-//! ended, not the instants the host started and finished it: each is good to a poll plus a
-//! heartbeat or two, and a job that starts and ends between two reads is seen ended without
+//! host's agent, which trails the host by one or two beats; the executor reads each job at once,
+//! then while it has not started at steps that double from 10 ms up to the poll, and once per
+//! poll while it runs ([`super::pace`]). So `queue` and `task` are the executor's reads that
+//! first saw the job running and ended, not the instants the host started and finished it:
+//! each is good to the wait between two reads (at most a poll) plus a heartbeat or two, and a job that starts and ends between two reads is seen ended without
 //! having been seen running (it has a `run` phase and no `queue` or `task`).
 //!
 //! The phases:

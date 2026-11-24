@@ -117,7 +117,7 @@ executor-max-run-secs = 3000
 # Retired: no longer read, every Execute is a job of the job service
 # (not in --help)
 # executor-ownership = "MODE"
-# How often each operation's job is read back from the job service, and a submit whose answer was lost is sent again, in milliseconds: 100 to 10000. Used only with `--executor js-agent`
+# How often each operation's running job is read back from the job service, and a submit whose answer was lost is sent again, in milliseconds: 100 to 10000. A job is read at once when submitted, and while it has not started again after 10 ms, doubling up to this. Used only with `--executor js-agent`
 executor-poll-ms = 250
 # Retired: no longer read, every Execute is a job of the job service
 # (not in --help)

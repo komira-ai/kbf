@@ -117,6 +117,28 @@ async fn the_wait_doubles_to_its_cap_and_an_answer_ends_it() {
     assert_eq!(level.pause(), POLL, "a definite answer is an answer");
 }
 
+/// Catches a short wait (the read of a job that has not started) kept while the service is
+/// busy, or a busy level that forgets it: while the service answers the wait is the one asked
+/// for; while it is busy, the level's wait, as any call's; and the one asked for again once the
+/// service answers.
+#[tokio::test(start_paused = true)]
+async fn a_short_wait_holds_only_while_the_service_answers() {
+    let level = Busy::new(POLL, no_jitter);
+    let short = Duration::from_millis(10);
+    assert_eq!(level.pause_or(short), short);
+    assert!(level.saw("reading a job", &busy_answer()).busy());
+    assert_eq!(level.pause_or(short), POLL);
+    tokio::time::advance(POLL).await;
+    assert!(level.saw("reading a job", &busy_answer()).busy());
+    assert_eq!(level.pause_or(short), POLL * 2);
+    tokio::time::advance(POLL * 2).await;
+    assert_eq!(
+        level.saw("reading a job", &Ok::<(), Error>(())),
+        Seen::AnsweredAgain
+    );
+    assert_eq!(level.pause_or(short), short);
+}
+
 /// Catches every operation's busy answer raising the shared level: a thousand at one moment
 /// raise it once, and the next raise waits for half the current wait.
 #[tokio::test(start_paused = true)]

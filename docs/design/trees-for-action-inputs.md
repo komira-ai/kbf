@@ -127,8 +127,9 @@ virtual worker, which names no host. The frontend can name a host only after `Su
 (or at once). Rule 2 and rule 1 add: the frontend may see a later state than `PLACED` on its first read, and a job may be requeued to another
 host (the start timeout, 900 s by default, counts from placement).
 
-The API has no watch: jobscheduler decided so for the hook ("this design adds no watch", LR12), and the executor reads each job once per
-`Config::poll` (default 1000 ms, read: `config.rs`). A frontend that reacts to `PLACED` as soon as it can reads often while a job is
+The API has no watch: jobscheduler decided so for the hook ("this design adds no watch", LR12), and the executor reads each job at once,
+then at steps doubling from 10 ms up to `Config::poll` while it is not started, and once per `Config::poll` (default 250 ms,
+read: `config.rs`) while it runs. A frontend that reacts to `PLACED` as soon as it can reads often while a job is
 `QUEUED` or `PLACED` (`job-rootfs.md` 7.3 says exactly that).
 
 ### 3.2 The options

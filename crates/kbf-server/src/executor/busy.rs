@@ -14,7 +14,8 @@
 //! service that stalled is not sent a thousand calls each poll. The first busy answer makes the
 //! wait one poll; each busy answer after the current wait has half passed doubles it, up to
 //! [`MAX_POLLS`] polls (10 s at the default poll); an answer of the service ends it once a whole wait has passed with no busy
-//! answer of any call, and the operations poll at the poll again. A service that answers some
+//! answer of any call, and the operations read at their own waits again (the poll, or the
+//! shorter steps of a job that has not started: [`super::pace`]). A service that answers some
 //! calls and not others (reads of jobs, but not of results) so stays busy, and its waits go on
 //! doubling, rather than ending and starting again at every answer.
 //! Each wait is jittered down by up to half ([`crate::join::jittered`]), so operations that wait
@@ -190,9 +191,16 @@ impl Busy {
     /// How long an operation waits before its next call to the service: the poll while it
     /// answers, else the level's wait, jittered.
     pub(crate) fn pause(&self) -> Duration {
+        self.pause_or(self.base)
+    }
+
+    /// [`Busy::pause`] with `quiet` as the wait while the service answers: the read of a job
+    /// that has not started waits less than the poll ([`super::pace`]), and as long as any
+    /// other call while the service is busy.
+    pub(crate) fn pause_or(&self, quiet: Duration) -> Duration {
         let level = self.state().level;
         if level == 0 {
-            return self.base;
+            return quiet;
         }
         jittered(self.step(level), (self.unit)())
     }

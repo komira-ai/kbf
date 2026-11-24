@@ -28,7 +28,7 @@ sequenceDiagram
     X->>X: prepare the run: read the action, mint the key, write the tree
     X->>S: exec/op/<id> {owner, action, attempt, job, key}
     X->>J: SubmitJob(k<frontend hash>-<id>-<attempt>)  (no CPU, no memory; size-class and size-fallback labels)
-    loop every --executor-poll-ms
+    loop at once, then 10 ms doubling to --executor-poll-ms while not started, then every --executor-poll-ms
         X->>J: GetJob
     end
     X->>J: GetResult
@@ -45,8 +45,10 @@ sequenceDiagram
 - **The id.** `k<first 8 hex of sha256(--executor-frontend-id)>-<operation>-<attempt>`: a submit whose answer was lost is sent
   again unchanged and makes no second job, and a frontend that takes the operation up computes the same id. It has three parts
   where the ids of earlier releases had four.
-- **Watching.** The pinned job service has no watch call; each operation's task reads its job every `--executor-poll-ms`
-  (250 ms by default) until it ends, then reads its result once. While the service is busy or cannot be reached (no answer
+- **Watching.** The pinned job service has no watch call; each operation's task reads its job as soon as it is submitted,
+  then, while the job is queued, placed or starting, after 10 ms, doubling up to `--executor-poll-ms` (250 ms by default), so a
+  job that starts at once is not seen a poll late; once it runs, every `--executor-poll-ms` until it ends, then reads its
+  result once. A job read running is read at the poll from then on. While the service is busy or cannot be reached (no answer
   within the call timeout, a reset connection, `RESOURCE_EXHAUSTED` and the other codes of its load), every operation waits
   longer between its calls, from the poll doubling to 40 polls (10 s at the default), one level for the whole frontend; no
   busy answer ends a run or spends an attempt, and a submit it did not take is sent again under the same id
