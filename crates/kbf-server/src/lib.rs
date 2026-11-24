@@ -68,6 +68,7 @@ pub mod api_client;
 mod build_commit;
 #[doc(hidden)]
 pub mod build_seq;
+mod closes;
 pub mod cold_apply;
 mod cold_counted;
 pub mod config;

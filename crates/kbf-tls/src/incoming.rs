@@ -4,7 +4,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -48,19 +48,44 @@ pub struct ConnInfo {
 /// socket does not report (a half-open connection, which only a keepalive timeout finds)
 /// is set by the drop of the connection the server then closes, which can come a moment
 /// after its streams end.
+///
+/// A server that closes a connection itself because it moved nothing for too long says so
+/// first ([`Liveness::mark_closed_quiet`]), so a stream that ends on it is told from one
+/// whose client went away; a later loss or drop does not undo it.
 #[derive(Clone, Debug, Default)]
-pub struct Liveness(Arc<AtomicBool>);
+pub struct Liveness(Arc<AtomicU8>);
+
+/// The connection is there.
+const LIVE: u8 = 0;
+/// The connection is gone.
+const GONE: u8 = 1;
+/// The server closed the connection because it moved nothing; gone too.
+const CLOSED_QUIET: u8 = 2;
 
 impl Liveness {
-    /// Whether the connection is gone.
+    /// Whether the connection is gone, for whatever reason.
     #[must_use]
     pub fn is_gone(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.load(Ordering::Acquire) != LIVE
     }
 
-    /// Records the connection gone.
+    /// Records the connection gone; one the server closed as quiet stays so.
     pub fn mark_gone(&self) {
-        self.0.store(true, Ordering::Release);
+        let _ = self
+            .0
+            .compare_exchange(LIVE, GONE, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// Whether the server closed the connection because it moved nothing for too long.
+    #[must_use]
+    pub fn closed_quiet(&self) -> bool {
+        self.0.load(Ordering::Acquire) == CLOSED_QUIET
+    }
+
+    /// Records that the server is closing the connection because it moved nothing for too
+    /// long: the connection is gone, and [`Liveness::closed_quiet`] from then on.
+    pub fn mark_closed_quiet(&self) {
+        self.0.store(CLOSED_QUIET, Ordering::Release);
     }
 }
 

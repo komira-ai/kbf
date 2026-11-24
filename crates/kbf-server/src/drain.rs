@@ -174,6 +174,12 @@ impl Drain {
         !std::mem::replace(&mut stages.refusing, true)
     }
 
+    /// Whether new Execute calls are refused UNAVAILABLE: [`Drain::refuse`], or the drain
+    /// begun.
+    pub(crate) fn is_refusing(&self) -> bool {
+        self.stages().refusing
+    }
+
     /// Takes new Execute calls again after [`Drain::refuse`]. Returns whether it did:
     /// `false` when nothing was refused, or GOAWAY has been sent (a drain that began
     /// is not undone) or the streams were closed.
