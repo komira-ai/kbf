@@ -917,8 +917,8 @@ mod store_tests;
 #[path = "run_tests.rs"]
 mod tests;
 #[cfg(test)]
-#[path = "run_watch_tests.rs"]
-mod watch_tests;
-#[cfg(test)]
 #[path = "run_tree_tests.rs"]
 mod tree_tests;
+#[cfg(test)]
+#[path = "run_watch_tests.rs"]
+mod watch_tests;
