@@ -43,8 +43,8 @@ the gate.
 
 That needs `id-token: write`. kbf's workflow lint lets a job hold it only for a push to `main`
 (`SIGNING_PUSH_ONLY`), so that no pull request or merge-queue run holds a token that can sign
-an attestation. A pull request's macOS jobs therefore stay on hosted runners until that rule
-changes; the farm job here runs after the merge. A fork gets no token and no variables: the
+an attestation. A pull request's macOS jobs therefore stay on hosted runners, and the farm job
+here runs after the merge (see Missing). A fork gets no token and no variables: the
 tailnet join is skipped, and with no `FARM_ADDRESS` the verb prints a notice and passes.
 
 The variables are not secrets, so a step's `env:` header in the log shows them, as it does in
@@ -88,13 +88,16 @@ keychain.
 
 ## Missing
 
-- A per-pull-request farm job: needs a ruling on `id-token: write` for a pull request's job.
+- A per-pull-request farm job: none is planned. No pull request or merge-queue run gets a token
+  that reaches the farm, so `macos-pr.yml`'s jobs stay on GitHub's hosted Macs until kbf itself
+  moves onto the farm, which waits for a forced rollback of the farm that cannot fail.
 - A loopback-only network level for a Mac action: the job service has one for native bodies, but
   no job level maps to it and kbf sends `none`.
 - Live output while the action runs (the REAPI has no log stream here).
 - Root-needing jobs: a macOS VM job (two per Mac under the licence); the agent has a VM backend
   that is off unless configured, and kbf has no path to it.
-- Signing and notarisation: where the keys live is not decided.
+- Signing and notarisation (the jobs that hold a signing key): they leave GitHub's hosted Macs
+  too, under a design of their own; this page covers only jobs that need no key.
 
 ## In this repository
 
