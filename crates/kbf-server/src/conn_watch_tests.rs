@@ -8,6 +8,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use futures::poll;
+use kbf_tls::Liveness;
 use tokio::io::{AsyncReadExt as _, AsyncWrite as _, AsyncWriteExt as _, DuplexStream};
 use tokio::time::advance;
 use tonic::transport::server::Connected as _;
@@ -22,7 +23,10 @@ const SECOND: Duration = Duration::from_secs(1);
 /// A watched end of a pipe that holds `bytes`, and the other end, the client's.
 fn pipe(bytes: usize, limit: Option<Duration>) -> (Watched<DuplexStream>, DuplexStream) {
     let (server, client) = tokio::io::duplex(bytes);
-    (Watched::new(server, limit, None), client)
+    (
+        Watched::new(server, limit, None, Liveness::default()),
+        client,
+    )
 }
 
 /// The kind and text of the error `polled` ended with, if it ended with one.
@@ -230,4 +234,25 @@ fn the_limit_is_the_ping_interval_and_timeout_and_none_without_pings() {
     assert_eq!(limit(timing), Some(Duration::from_secs(150)));
     assert_eq!(limit(off), None);
     assert!(PING_ANSWER_WAIT > Duration::from_secs(150));
+}
+
+/// Catches a quiet close the streams on the connection cannot tell from their client
+/// leaving: the connection's flag is not closed quiet while the watch waits, and is from
+/// the moment the limit passes, before the error that ends the streams is returned.
+#[tokio::test(start_paused = true)]
+async fn the_limit_marks_the_connection_closed_quiet() {
+    let (server, _client) = tokio::io::duplex(64);
+    let live = Liveness::default();
+    let mut watched = Watched::new(server, Some(LIMIT), None, live.clone());
+    let mut buf = [0; 8];
+    let mut read = pin!(watched.read(&mut buf));
+
+    assert!(poll!(read.as_mut()).is_pending());
+    advance(LIMIT - SECOND).await;
+    assert!(poll!(read.as_mut()).is_pending());
+    assert!(!live.is_gone(), "a connection inside its limit is there");
+    advance(SECOND).await;
+
+    assert_eq!(failed(poll!(read)), past_the_limit());
+    assert!(live.closed_quiet(), "the watch's close is recorded");
 }

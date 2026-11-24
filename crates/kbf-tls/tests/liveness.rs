@@ -180,3 +180,30 @@ async fn a_read_with_no_room_does_not_end_the_connection() {
     assert_eq!(conn.read(&mut byte).await.expect("read"), 0);
     assert!(info.live.is_gone(), "the peer's close is the end");
 }
+
+/// Asserts what a server's quiet close records: the connection is gone and closed quiet, a
+/// later loss or drop (`mark_gone`) leaves it closed quiet, and a connection that is only
+/// lost is never closed quiet. A clone reads the same flag, as every stream of a connection
+/// does.
+///
+/// Catches: a quiet close the drop of the connection overwrites (every stream that ends
+/// after it counted as a client gone), a quiet close not seen as gone, and a plain loss
+/// read as the server's close.
+#[test]
+fn a_quiet_close_stays_told_apart_from_a_loss() {
+    let live = kbf_tls::Liveness::default();
+    let stream = live.clone();
+    assert!(!stream.is_gone(), "a new connection is there");
+    assert!(!stream.closed_quiet(), "a new connection is not closed");
+
+    live.mark_closed_quiet();
+    assert!(stream.is_gone(), "a connection the server closed is gone");
+    assert!(stream.closed_quiet(), "and closed quiet");
+    live.mark_gone();
+    assert!(stream.closed_quiet(), "the drop after it keeps the cause");
+
+    let lost = kbf_tls::Liveness::default();
+    lost.mark_gone();
+    assert!(lost.is_gone(), "a lost connection is gone");
+    assert!(!lost.closed_quiet(), "and was not closed by the server");
+}
