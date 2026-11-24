@@ -294,6 +294,7 @@ impl Rig {
                 label: Default::default(),
             },
             evidence: Default::default(),
+            arrival: kbf_front::Arrival::now(),
         };
         let ticket = self.exec.submit(submission).expect("the executor takes it");
         Caller {

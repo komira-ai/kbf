@@ -435,6 +435,7 @@ pub(crate) fn submission_of(action: Digest) -> Submission {
             label: ActionLabel::default(),
         },
         evidence: kbf_invocation::Evidence::default(),
+        arrival: kbf_front::Arrival::now(),
     }
 }
 

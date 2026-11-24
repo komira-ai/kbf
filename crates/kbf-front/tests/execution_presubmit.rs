@@ -17,7 +17,8 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use kbf_auth::Authorizers;
 use kbf_front::{
-    Cache, Dispatch, ExecutionService, MemoryMetaLog, Stage, Submission, Ticket, VerifiedBlob,
+    Arrival, Cache, Dispatch, ExecutionService, MemoryMetaLog, Stage, Submission, Ticket,
+    VerifiedBlob,
 };
 use kbf_meta::Retention;
 use kbf_objstore::{
@@ -29,6 +30,7 @@ use kbf_proto::reapi::{Action, Command, Directory, DirectoryNode, ExecuteRequest
 use kbf_types::Digest;
 use prost::Message;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tonic::{Code, Request, Status};
 
 /// How long each store GET takes.
@@ -79,10 +81,12 @@ impl ObjectStore for Store {
     }
 }
 
-/// A dispatch that queues every submission and never runs it.
+/// A dispatch that queues every submission and never runs it, keeping each one's arrival
+/// beside the moment it was submitted.
 #[derive(Default)]
 struct Queue {
     submitted: Mutex<Vec<watch::Sender<Stage>>>,
+    arrivals: Mutex<Vec<(Arrival, Instant)>>,
 }
 
 impl Dispatch for Queue {
@@ -94,6 +98,10 @@ impl Dispatch for Queue {
             .unwrap_or_else(PoisonError::into_inner);
         let name = format!("operations/{}", held.len());
         held.push(tx);
+        self.arrivals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((submission.arrival, Instant::now()));
         let key = submission.key.clone();
         Ok(Ticket {
             name,
@@ -116,6 +124,7 @@ type Service = ExecutionService<Queue>;
 
 struct Rig {
     cache: Arc<Cache<MemoryMetaLog, Store>>,
+    queue: Arc<Queue>,
     service: Arc<Service>,
 }
 
@@ -133,14 +142,16 @@ impl Rig {
                 .expect("open"),
         );
         let (_, closing) = kbf_front::closing();
+        let queue = Arc::new(Queue::default());
         let service = ExecutionService::with_authorizers(
             Arc::clone(&cache),
-            Arc::new(Queue::default()),
+            Arc::clone(&queue),
             closing,
             Arc::new(Authorizers::allow_all()),
         );
         Self {
             cache,
+            queue,
             service: Arc::new(service),
         }
     }
@@ -447,5 +458,34 @@ async fn an_execute_slow_before_its_first_operation_warns_with_the_phases() {
     assert!(
         !lines.iter().any(|l| l.contains(&format!("{fast_action}"))),
         "a fast Execute warned: {lines:?}"
+    );
+}
+
+/// Catches a submission whose arrival is stamped once the Execute's reads are done (the
+/// executor's per-job line would then leave them out of the job's start): the arrival is the
+/// handler's start, exactly the moment the call came on the paused clock, and the 300 ms of the
+/// action's GET and the walk lie between it and the submit. (Its wall-clock half is checked with
+/// a fixed time where the executor writes it.)
+#[tokio::test(start_paused = true)]
+async fn the_submission_carries_the_executes_arrival_from_before_its_reads() {
+    let rig = Rig::new(GET).await;
+    let job = job("arrival", true);
+    rig.store(&job.blobs.iter().collect::<Vec<_>>()).await;
+    let came = Instant::now();
+    execute(&rig, &job).await.expect("joined").expect("Execute");
+    let arrivals = rig
+        .queue
+        .arrivals
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let [(arrival, submitted)] = arrivals[..] else {
+        panic!("one submission expected, got {arrivals:?}");
+    };
+    assert_eq!(arrival.at, came, "stamped as the handler starts");
+    assert_eq!(
+        submitted - arrival.at,
+        Duration::from_millis(300),
+        "the action's GET, then the walk's two with the command's beside them"
     );
 }

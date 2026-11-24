@@ -30,9 +30,9 @@
 //!
 //! Each job this process submits and the service takes writes one INFO line (a job taken up
 //! from the state store was logged by the process that submitted it), `the job service took the job`, with its
-//! operation, run and job id, the Execute's arrival and the submit's answer on the wall clock,
-//! and the time between them ([`log_submitted`]): the frontend's half of a job's start, per job,
-//! for joining with the host's own line for the same job id.
+//! operation, run and job id, the Execute's arrival at the front and at the executor and the
+//! submit's answer on the wall clock, and the times between them ([`log_submitted`]): the
+//! frontend's half of a job's start, per job, for joining with the host's own line for the same job id.
 //!
 //! A cancel asked for by a caller cancels the job (or, before the submit, stops the run) and
 //! answers the callers `CANCELLED`.
@@ -55,7 +55,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use js_proto::v1::{Job, JobResult, JobSpec, JobState};
-use kbf_front::{Finished, Stage};
+use kbf_front::{Arrival, Finished, Stage};
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::{self, ActionResult};
 use kbf_types::{ActionKey, OperationId};
@@ -89,21 +89,26 @@ pub(crate) struct Op {
     whole_machine: bool,
     /// Whether a recorded call waits on it.
     recorded: bool,
-    /// When the Execute that opened it came.
+    /// When the executor opened it for the Execute that came.
     created: Instant,
     /// The same moment on the wall clock, for the line each submitted job writes
     /// ([`log_submitted`]).
     arrived: SystemTime,
+    /// When that Execute reached the front, before its inputs were read; none for an
+    /// operation taken up from the state store. For the line only.
+    reapi: Option<Arrival>,
 }
 
 impl Op {
-    /// Operation `id` of `key`, opened now. For an operation taken up from the state store, now
-    /// is when this process took it up.
+    /// Operation `id` of `key`, opened now, by the Execute that reached the front at `reapi`.
+    /// For an operation taken up from the state store, now is when this process took it up, and
+    /// `reapi` is none.
     pub(crate) fn new(
         id: OperationId,
         key: ActionKey,
         whole_machine: bool,
         recorded: bool,
+        reapi: Option<Arrival>,
     ) -> Self {
         Self {
             id,
@@ -112,6 +117,7 @@ impl Op {
             recorded,
             created: Instant::now(),
             arrived: SystemTime::now(),
+            reapi,
         }
     }
 }
@@ -469,21 +475,27 @@ async fn fresh(
 }
 
 /// Writes the one line of a submitted job: its operation, run and job id; when the Execute came
-/// and when the job service answered the submit with the job, as Unix milliseconds; and, in
-/// milliseconds, the time from the Execute to that answer (`since_execute_ms`, every attempt
-/// before this one included) and this run's `prepare` and `start` phases ([`super::phases`]).
-/// `at` holds the run's [`Mark::Seen`], [`Mark::Prepared`] and [`Mark::Posted`] stamps.
+/// to the front (`reapi_unix_ms`), when the executor took it (`execute_unix_ms`) and when the job
+/// service answered the submit with the job, as Unix milliseconds; and, in milliseconds, the time
+/// from the front to the executor (`presubmit_ms`: the Execute's authorization, its action and
+/// command reads, its input walk and its operation id), from the executor to that answer (`since_execute_ms`, every attempt before this
+/// one included) and from the front to it (`since_reapi_ms`, their sum), and this run's `prepare`
+/// and `start` phases ([`super::phases`]). `at` holds the run's [`Mark::Seen`],
+/// [`Mark::Prepared`] and [`Mark::Posted`] stamps.
 ///
 /// The submit time is the Execute's wall-clock time plus the executor's own measure of the time
 /// since, so the two times differ by exactly `since_execute_ms` even if the wall clock steps.
 /// For an operation taken up from the state store, the Execute's time is when this process took
-/// it up ([`Op::new`]).
+/// it up ([`Op::new`]), and no front saw it: `reapi_unix_ms` and `presubmit_ms` are 0.
 fn log_submitted(op: &Op, run: RunId, job: &str, at: [Instant; 3]) {
     let [seen, ready, posted] = at;
     let since_execute_ms = posted.saturating_duration_since(op.created).as_millis();
-    let execute_unix_ms = (op.arrived.duration_since(UNIX_EPOCH))
-        .unwrap_or_default()
-        .as_millis();
+    let unix_ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    let execute_unix_ms = unix_ms(op.arrived);
+    let (reapi_unix_ms, presubmit_ms) = op.reapi.map_or((0, 0), |reapi| {
+        let presubmit = op.created.saturating_duration_since(reapi.at);
+        (unix_ms(reapi.unix), presubmit.as_millis())
+    });
     tracing::info!(
         operation = %op.id,
         %run,
@@ -492,6 +504,9 @@ fn log_submitted(op: &Op, run: RunId, job: &str, at: [Instant; 3]) {
         execute_unix_ms,
         submitted_unix_ms = execute_unix_ms + since_execute_ms,
         since_execute_ms,
+        reapi_unix_ms,
+        presubmit_ms,
+        since_reapi_ms = since_execute_ms + presubmit_ms,
         prepare_ms = ready.saturating_duration_since(seen).as_millis(),
         start_ms = posted.saturating_duration_since(ready).as_millis(),
         "the job service took the job"
