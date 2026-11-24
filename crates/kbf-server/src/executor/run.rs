@@ -27,7 +27,8 @@
 //! miss path ([`Ingest::list_refused`](super::Ingest::list_refused)); any other ending, and the last
 //! attempt, answers them with its status, the job's output attached.
 //!
-//! Each job the service takes writes one INFO line, `the job service took the job`, with its
+//! Each job this process submits and the service takes writes one INFO line (a job taken up
+//! from the state store was logged by the process that submitted it), `the job service took the job`, with its
 //! operation, run and job id, the Execute's arrival and the submit's answer on the wall clock,
 //! and the time between them ([`log_submitted`]): the frontend's half of a job's start, per job,
 //! for joining with the host's own line for the same job id.
@@ -473,22 +474,22 @@ async fn fresh(
 ///
 /// The submit time is the Execute's wall-clock time plus the executor's own measure of the time
 /// since, so the two times differ by exactly `since_execute_ms` even if the wall clock steps.
+/// For an operation taken up from the state store, the Execute's time is when this process took
+/// it up ([`Op::new`]).
 fn log_submitted(op: &Op, run: RunId, job: &str, at: [Instant; 3]) {
     let [seen, ready, posted] = at;
-    let since_execute = posted.saturating_duration_since(op.created);
-    let unix_ms = |at: SystemTime| {
-        at.duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    };
+    let since_execute_ms = posted.saturating_duration_since(op.created).as_millis();
+    let execute_unix_ms = (op.arrived.duration_since(UNIX_EPOCH))
+        .unwrap_or_default()
+        .as_millis();
     tracing::info!(
         operation = %op.id,
         %run,
         %job,
         attempt = run.attempt,
-        execute_unix_ms = unix_ms(op.arrived),
-        submitted_unix_ms = unix_ms(op.arrived + since_execute),
-        since_execute_ms = since_execute.as_millis(),
+        execute_unix_ms,
+        submitted_unix_ms = execute_unix_ms + since_execute_ms,
+        since_execute_ms,
         prepare_ms = ready.saturating_duration_since(seen).as_millis(),
         start_ms = posted.saturating_duration_since(ready).as_millis(),
         "the job service took the job"

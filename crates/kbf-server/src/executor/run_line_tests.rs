@@ -37,9 +37,16 @@ fn number(line: &str, name: &str) -> u128 {
         .unwrap_or_else(|error| panic!("{name} in {line}: {error}"))
 }
 
-/// The milliseconds of the paused clock since `t0`.
+/// The milliseconds of tokio's paused clock since `t0`: the test's own clock, moved only by
+/// the rig, so the values compared with it are exact, not bounds.
 fn ms_since(t0: Instant) -> u128 {
     t0.elapsed().as_millis()
+}
+
+/// Lets the tasks run, with no time passing once it is there, until `log` holds `n` lines.
+async fn until_lines(rig: &Rig, log: &test_log::Capture, n: usize) {
+    rig.until("the lines are written", || lines(&log.text()).len() >= n)
+        .await;
 }
 
 /// Checks the fields every line has: its ids, and a submit time that is the Execute's plus
@@ -89,6 +96,7 @@ async fn each_job_the_service_takes_writes_one_line_with_its_start_times() {
     );
     rig.ingest.release.notify_one();
     let first = rig.submitted(&caller, 0).await;
+    until_lines(&rig, &log, 1).await;
     let waited = ms_since(t0);
     assert_eq!(waited, (rig.cfg.poll * 4).as_millis());
     let text = log.text();
@@ -103,6 +111,7 @@ async fn each_job_the_service_takes_writes_one_line_with_its_start_times() {
     assert!(rig.fake.lose(&first));
     rig.ingest.release.notify_one();
     let second = rig.submitted(&caller, 1).await;
+    until_lines(&rig, &log, 2).await;
     let text = log.text();
     let written = lines(&text);
     assert_eq!(written.len(), 2, "{text}");
@@ -131,6 +140,7 @@ async fn a_submit_sent_again_after_a_lost_answer_writes_one_line() {
         rig.calls_of("SubmitJob") >= 2
     })
     .await;
+    until_lines(&rig, &log, 1).await;
     let waited = ms_since(t0);
     assert_eq!(rig.calls_of("SubmitJob"), 2);
     let text = log.text();
@@ -156,6 +166,7 @@ async fn a_refused_submit_writes_no_line() {
     );
     let caller = rig.submit(1);
     rig.submitted(&caller, 1).await;
+    until_lines(&rig, &log, 1).await;
     let text = log.text();
     let written = lines(&text);
     assert_eq!(written.len(), 1, "{text}");
