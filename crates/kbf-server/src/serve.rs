@@ -94,7 +94,9 @@ pub struct StreamTiming {
     /// that has been quiet (`--http2-keepalive-interval-secs`).
     pub keepalive_interval: Duration,
     /// How long a PING may go unanswered before the connection is closed
-    /// (`--http2-keepalive-timeout-secs`).
+    /// (`--http2-keepalive-timeout-secs`; GOAWAY NO_ERROR, then the close). That fails
+    /// every action on the connection, so the default, two minutes, outlasts a client's
+    /// path that stalls for a minute and then carries on.
     pub keepalive_timeout: Duration,
 }
 
@@ -103,7 +105,7 @@ impl Default for StreamTiming {
         Self {
             progress_interval: Duration::from_secs(30),
             keepalive_interval: Duration::from_secs(30),
-            keepalive_timeout: Duration::from_secs(20),
+            keepalive_timeout: Duration::from_secs(120),
         }
     }
 }

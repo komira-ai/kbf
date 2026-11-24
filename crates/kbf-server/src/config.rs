@@ -322,8 +322,8 @@ pub struct Args {
     /// quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused).
     #[arg(long, default_value_t = 30)]
     pub http2_keepalive_interval_secs: u64,
-    /// How long, in seconds, a PING may go unanswered before the connection is closed.
-    #[arg(long, default_value_t = 20)]
+    /// How long, in seconds, a PING may go unanswered before the connection is closed, failing every action on it: the default outlasts a client's path that stalls for a minute.
+    #[arg(long, default_value_t = 120)]
     pub http2_keepalive_timeout_secs: u64,
     /// Thread sizes: the overrides `--async-threads`, `--blocking-threads` and
     /// `--cpu-threads` (see `kbf_threads`). Left out, the server uses every CPU it may

@@ -114,6 +114,8 @@ pub mod serve;
 #[cfg(test)]
 mod serve_goaway_tests;
 #[cfg(test)]
+mod serve_keepalive_tests;
+#[cfg(test)]
 mod serve_remote_tests;
 #[cfg(test)]
 mod serve_start_tests;
