@@ -473,10 +473,9 @@ impl Rig {
     }
 
     pub(crate) async fn build(setup: Setup, adjust: impl FnOnce(&mut Config)) -> Self {
-        let _ = tracing_subscriber::fmt()
-            .with_test_writer()
-            .with_max_level(tracing::Level::INFO)
-            .try_init();
+        // The one global subscriber of the test binary ([`crate::test_log`]): a subscriber of
+        // the rig's own would leave the tests that capture the log lines with none.
+        crate::test_log::install();
         let hold = ClockHold::new();
         let fake = FakeJobServer::start().await.expect("a loopback port");
         fake.add_host(
