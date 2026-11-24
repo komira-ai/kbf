@@ -905,3 +905,6 @@ async fn a_walk_over_one_storage_node_never_skips() {
 
 #[path = "backend_packed_tests.rs"]
 mod packed;
+
+#[path = "backend_uploaded_tests.rs"]
+mod uploaded;

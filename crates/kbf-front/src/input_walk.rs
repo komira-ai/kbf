@@ -37,7 +37,10 @@
 //!   cached Directory before the store has answered; if the answer is that it is gone,
 //!   what was found below it (files, Directories, failures) is dropped from the report,
 //!   so the answer is the one a walk that stopped there gives. Content not cached is
-//!   read, once for all the walks that want it at the same time. The verified memory
+//!   read, once for all the walks that want it at the same time. A Directory a client
+//!   uploaded through the frontend's packs is in the cache from the moment it was stored
+//!   (`known_dirs`), so the Execute that names a tree just uploaded reads none of it; it is
+//!   asked about with the files like any cached Directory. The verified memory
 //!   above still skips even the FindMissing, within [`VERIFIED_TTL`].
 //! - **Deterministic.** What the walk answers does not depend on which read finishes
 //!   first. Directories that are not held and files that are missing are sorted sets.
@@ -74,10 +77,10 @@ use kbf_storage::StorageError;
 use kbf_types::Digest;
 use tokio::time::Instant;
 
-use crate::cache::is_empty_blob;
 use crate::dir_cache::{DirCache, Lookup};
 use crate::input_tree::{Decoded, Walked, decode};
-use crate::prepare_run::{DirectoryCache, KeptDirectory};
+use crate::known_dirs::{KnownDirs, keep_named};
+use crate::prepare_run::DirectoryCache;
 
 /// The most Directory blobs one [`walk`] reads from the store at once. The tree of a
 /// request is the only bound on its fan-out, so this is what keeps a few hundred
@@ -134,11 +137,11 @@ pub(crate) struct Trees {
     capacity: usize,
     ttl: Duration,
     /// What the Directories decode to, whatever became of their subtrees: by digest, so
-    /// it never goes stale, and no claim that anything is held.
-    dirs: DirCache,
-    /// Where each Directory a walk reads is also kept with its names, for the preparation of
-    /// the run an Execute starts; none until a preparer gives it ([`Trees::keep_into`]).
-    keep: Mutex<Option<Arc<DirectoryCache>>>,
+    /// it never goes stale, and no claim that anything is held; and where each Directory a
+    /// walk reads is also kept with its names, for the preparation of the run an Execute
+    /// starts ([`Trees::keep_into`]). Shared with the frontend's packs, whose writes put the
+    /// Directories clients upload in it ([`Trees::sharing`]).
+    known: Arc<KnownDirs>,
     /// When an Execute found the Command and every input of an Action held ([`Trees::vouch`]).
     vouched: Mutex<Vouched>,
 }
@@ -229,8 +232,7 @@ impl Trees {
             inner: Mutex::new(Remembered::default()),
             capacity,
             ttl,
-            dirs: DirCache::default(),
-            keep: Mutex::new(None),
+            known: Arc::default(),
             vouched: Mutex::new(Vouched::new(VOUCHED_ENTRIES)),
         }
     }
@@ -240,8 +242,24 @@ impl Trees {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_dir_cache(mut self, bytes: u64) -> Self {
-        self.dirs = DirCache::new(bytes);
+        self.known = Arc::new(KnownDirs::new(DirCache::new(bytes)));
         self
+    }
+
+    /// The default memory, over `known`: the Directories other walks over it read and that
+    /// clients uploaded through the packs that share it.
+    #[must_use]
+    pub(crate) fn sharing(known: Arc<KnownDirs>) -> Self {
+        Self {
+            known,
+            ..Self::default()
+        }
+    }
+
+    /// The decoded Directories this memory's walks take before reading: for tests.
+    #[cfg(test)]
+    pub(crate) fn dirs(&self) -> &DirCache {
+        &self.known.dirs
     }
 
     fn lock(&self) -> MutexGuard<'_, Remembered> {
@@ -323,15 +341,7 @@ impl Trees {
     /// From now on, every Directory a walk reads is also kept in `cache`, decoded with its
     /// names, for the run preparation's walk of the same tree. A later cache replaces it.
     pub(crate) fn keep_into(&self, cache: Arc<DirectoryCache>) {
-        *self.keep.lock().unwrap_or_else(PoisonError::into_inner) = Some(cache);
-    }
-
-    fn kept(&self) -> Option<Arc<DirectoryCache>> {
-        // Set or read in one statement: nothing can panic with the lock held.
-        self.keep
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.known.keep_into(cache);
     }
 
     fn vouches(&self) -> MutexGuard<'_, Vouched> {
@@ -448,21 +458,6 @@ async fn fetch<'a>(
     }
 }
 
-/// Keeps `dir`, read as `blob`, in `keep` with its names, for the preparation's walk of the
-/// same tree: not the empty Directory, which that walk never caches.
-fn keep_named(keep: &DirectoryCache, dir: Digest, blob: Bytes) {
-    if is_empty_blob(&dir) {
-        return;
-    }
-    // `decode` has checked every digest the blob names, so the parse finds no fault; a
-    // Directory parsed with one would be partial, and is not kept.
-    let parsed = KeptDirectory::parse(&dir, blob).ok();
-    let whole = parsed.filter(|parsed| parsed.fault.is_none());
-    whole
-        .into_iter()
-        .for_each(|parsed| keep.remember(dir, &parsed.kept));
-}
-
 /// What the walk has found so far, and where it goes next.
 struct Frontier {
     seen: BTreeSet<Digest>,
@@ -503,8 +498,8 @@ pub(crate) async fn walk_bounded(
     let begun = Instant::now();
     // Read before the first read: the walk is remembered only under the epoch it began in.
     let epoch = storage.epoch();
-    let cache = &trees.dirs;
-    let keep = trees.kept();
+    let cache = &trees.known.dirs;
+    let keep = trees.known.kept();
     let mut found = Frontier {
         seen: BTreeSet::from([root]),
         queue: VecDeque::from([(root, 0)]),

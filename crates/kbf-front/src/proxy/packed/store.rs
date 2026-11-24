@@ -22,8 +22,10 @@ use tonic::Status;
 
 use super::metrics::PackMetrics;
 use super::room::{Budget, DEFAULT_INFLIGHT_BYTES, Room};
+use super::uploaded::maybe_directories;
 use super::verifying::VerifyingKeys;
 use crate::cache::is_empty_blob;
+use crate::known_dirs::KnownDirs;
 use crate::large_backfill::LargeStore;
 use crate::store_wait::{Backoff, STORE_WAIT, StoreWaits};
 use crate::store_writes::{STORE_WRITES, StoreWrites};
@@ -191,6 +193,9 @@ pub struct Packs {
     pub(super) writer: String,
     /// [`PackSettings::store_writes`].
     store_writes: NonZeroUsize,
+    /// What the input walks over these packs know of Directories, the ones uploaded through
+    /// them included ([`Packs::known_dirs`]).
+    pub(super) known: Arc<KnownDirs>,
 }
 
 impl fmt::Debug for Packs {
@@ -253,6 +258,7 @@ impl Packs {
             loss,
             writer,
             store_writes: settings.store_writes,
+            known: Arc::default(),
         })
     }
 
@@ -499,6 +505,7 @@ impl Packs {
         blobs: Vec<(Digest, Bytes)>,
         room: Room,
     ) -> Result<(), Status> {
+        let directories = maybe_directories(&blobs);
         let blobs = blobs
             .into_iter()
             .map(|(digest, bytes)| Blob {
@@ -508,7 +515,9 @@ impl Packs {
             .collect();
         let packed = self.store.pack(blobs).await;
         drop(room);
-        self.stored(packed)
+        self.stored(packed)?;
+        self.learn_uploaded(directories);
+        Ok(())
     }
 
     /// The blob `digest` from its pack, hashed; `None` when the packs do not serve it and

@@ -266,11 +266,11 @@ async fn the_cache_holds_to_its_byte_bound_while_a_walk_fills_it() {
     assert!(walked.dir_cache_bytes > bound / 2, "and not left empty");
     assert!(walked.dir_cache_evicted > 0);
     assert_eq!(
-        walked.dir_cache_evicted + trees.dirs.len() as u64,
+        walked.dir_cache_evicted + trees.dirs().len() as u64,
         walked.dirs_read,
         "everything read is held or was pushed out"
     );
-    assert_eq!(walked.dir_cache_bytes, trees.dirs.bytes());
+    assert_eq!(walked.dir_cache_bytes, trees.dirs().bytes());
 
     let roomy = Trees::default().with_dir_cache(total);
     let store = Store::fixed(chains(20, 6).0, Duration::ZERO);
@@ -382,7 +382,7 @@ async fn a_read_that_fails_is_not_cached_and_every_walk_sees_it() {
     for walked in walks {
         assert_eq!(walked.expect("walk").absent, vec![gone]);
     }
-    assert_eq!(trees.dirs.len(), 1, "only the root");
+    assert_eq!(trees.dirs().len(), 1, "only the root");
 }
 
 // ---- what the walk reports ----

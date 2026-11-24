@@ -18,7 +18,7 @@ use super::*;
 /// it would have.
 fn cache(trees: &Trees, tree: &Tree, digest: Digest) {
     let decoded = decode(&digest, &tree.blobs[&digest]).expect("decodes");
-    match trees.dirs.lookup(&digest) {
+    match trees.dirs().lookup(&digest) {
         Lookup::Lead(lead) => {
             lead.finish(Arc::new(decoded));
         }
