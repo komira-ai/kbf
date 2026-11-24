@@ -427,8 +427,9 @@ fn field(line: &str, name: &str) -> String {
 ///   files' time, and the reverse), and in the counters: reads 2, skipped 1, asks 1,
 ///   files 4 (no two alike but skipped and asks).
 /// - a warm Execute that spends time on a walk it skipped.
-/// The action and the Command are two more GETs, so each Execute is 12 s before the walk
-/// and slow enough (10 s) to warn.
+/// The action is one more GET before the walk and the Command one beside it, so each
+/// Execute spends the action's 6 s and then the longer of the walk and the Command's 6 s:
+/// 12 s at the least, slow enough (10 s) to warn.
 #[tokio::test(start_paused = true)]
 async fn an_execute_reports_what_its_walk_read_skipped_and_spent() {
     let _ = log_lines();
@@ -458,7 +459,7 @@ async fn an_execute_reports_what_its_walk_read_skipped_and_spent() {
     assert_eq!(field(&cold, "file_asks"), "1", "{cold}");
     assert_eq!(field(&cold, "files_checked"), "4", "{cold}");
     assert_eq!(field(&cold, "walk_ms"), "15000", "{cold}");
-    assert_eq!(field(&cold, "presubmit_ms"), "27000", "{cold}");
+    assert_eq!(field(&cold, "presubmit_ms"), "21000", "{cold}");
 
     execute(&service, &job).await;
     let warm = warning(&job, 1);
@@ -519,7 +520,11 @@ async fn an_execute_reports_what_its_walk_read_skipped_and_spent() {
     assert_eq!(field(&cached, "file_asks"), "1", "{cached}");
     assert_eq!(field(&cached, "files_checked"), "4", "{cached}");
     assert_eq!(field(&cached, "walk_ms"), "3000", "{cached}");
-    assert_eq!(field(&cached, "presubmit_ms"), "15000", "{cached}");
+    assert_eq!(
+        field(&cached, "presubmit_ms"),
+        "12000",
+        "the Command's 6 s outlast the files' 3 s: {cached}"
+    );
     assert_eq!(m.execute_dir_cache_hits.get(), 2);
     assert_eq!(m.execute_dir_cache_present_checked.get(), 2);
     assert_eq!(m.execute_dir_cache_misses.get(), 2, "no new lead");

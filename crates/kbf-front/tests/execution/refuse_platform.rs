@@ -1,5 +1,5 @@
-//! When Execute refuses a platform: before any input is read, and also when the action
-//! cache holds a result for the action.
+//! When Execute refuses a platform: before anything about its inputs is answered, and also
+//! when the action cache holds a result for the action.
 
 use super::*;
 
@@ -79,10 +79,11 @@ async fn an_actions_bad_platform_is_refused_before_its_inputs_are_read() {
 }
 
 /// Catches: the same, for a platform that only the Command carries: the Command is
-/// read to find it, but the input tree, which is held here yet unreadable (its object
-/// is gone), must not be touched; UNAVAILABLE would say it was.
+/// read to find it while the input tree is walked, and the tree is held here yet
+/// unreadable (its object is gone), so the walk fails UNAVAILABLE. The refusal is the
+/// answer all the same; UNAVAILABLE would say the walk's failure was put first.
 #[tokio::test]
-async fn a_commands_bad_platform_is_refused_before_the_input_tree_is_read() {
+async fn a_commands_bad_platform_is_the_answer_over_an_unreadable_input_tree() {
     let script = Arc::new(Script::default());
     let farm = Farm::with_execution(Arc::clone(&script)).await;
     for (why, props, code) in bad_platforms() {
@@ -175,9 +176,10 @@ async fn a_good_platform_still_runs_and_still_hits_the_cache() {
 /// action not in the CAS, not decoding, naming no Command, a Command not held, or a
 /// Command that does not decode, are answered from the cache (an Execute that runs says
 /// what is wrong with them). The closing UNAVAILABLE for an unreadable action only pins
-/// the behaviour: the cache lookup before `refuse_platform_of` already fails on it, so
-/// that read error in `held` is unreachable apart from the lookup, and the Command-side
-/// one is covered by `a_commands_read_error_on_a_cache_hit_is_unavailable`.
+/// the behaviour: the cache lookup, which the Action's read runs beside, already fails on
+/// it, and the lookup's answer is put first; a hit whose Action read fails is
+/// `execution_overlap.rs`'s, and the Command-side one is covered by
+/// `a_commands_read_error_on_a_cache_hit_is_unavailable`.
 #[tokio::test]
 async fn a_cached_result_for_an_action_that_cannot_be_checked_is_served() {
     let script = Arc::new(Script::default());

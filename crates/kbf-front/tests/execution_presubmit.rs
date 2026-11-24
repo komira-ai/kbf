@@ -293,7 +293,8 @@ fn log_lines() -> Vec<String> {
 /// Catches: Execute time before its first operation that no metric shows (the A8 stall
 /// was invisible); a presubmit timer that stops before the walk or the submit, or starts
 /// after the action read (the action, the command and the two directories are four
-/// 100 ms GETs, so the sum must be 400 ms and the walk's 200 ms); a walk timer around
+/// 100 ms GETs; the command's runs beside the walk's two, so the sum must be 300 ms and the
+/// walk's 200 ms); a walk timer around
 /// the wrong span; a directory count that counts files or the root twice (two
 /// directories); a gauge that is not up while the call is inside the window or stays up
 /// after it; a submit that is not timed.
@@ -317,7 +318,11 @@ async fn the_time_before_the_first_operation_is_split_into_walk_and_submit() {
 
     assert_eq!(m.execute_presubmit_in_flight.get(), 0);
     assert_eq!(m.execute_presubmit.count(), 1);
-    assert_eq!(m.execute_presubmit.sum(), 400_000_000, "four GETs");
+    assert_eq!(
+        m.execute_presubmit.sum(),
+        300_000_000,
+        "the action's GET, then the walk's two with the command's beside them"
+    );
     assert_eq!(m.execute_walk.count(), 1);
     assert_eq!(m.execute_walk.sum(), 200_000_000, "the two directories");
     assert_eq!(m.execute_dir_reads.get(), 2);
@@ -346,7 +351,7 @@ async fn an_execute_that_fails_before_its_first_operation_is_still_measured() {
         .expect_err("missing");
     assert_eq!(status.code(), Code::FailedPrecondition);
     assert_eq!(m.execute_presubmit.count(), 1);
-    assert_eq!(m.execute_presubmit.sum(), 400_000_000);
+    assert_eq!(m.execute_presubmit.sum(), 300_000_000);
     assert_eq!(m.execute_presubmit_in_flight.get(), 0);
     assert_eq!(m.execute_submit.count(), 0, "never reached the scheduler");
 }
@@ -396,7 +401,8 @@ async fn an_execute_refused_for_a_missing_input_is_logged_with_its_action_and_co
 /// Catches: no warning for an Execute that spent 10 s or more before its first
 /// operation (the operator's only signal short of a scrape), one that omits the action,
 /// the walk or the directory count the operator reads the cause from, and one for a
-/// fast Execute. At 6 s a GET, the four GETs take 24 s.
+/// fast Execute. At 6 s a GET, the action's GET and then the walk's two (the command's beside
+/// them) take 18 s.
 #[tokio::test(start_paused = true)]
 async fn an_execute_slow_before_its_first_operation_warns_with_the_phases() {
     // Install the subscriber before the Execute logs; without this the warning can be
@@ -430,7 +436,7 @@ async fn an_execute_slow_before_its_first_operation_warns_with_the_phases() {
     };
     assert!(line.contains("WARN"), "{line}");
     for field in [
-        "presubmit_ms=24000",
+        "presubmit_ms=18000",
         "walk_ms=12000",
         "submit_ms=0",
         "dir_reads=2",

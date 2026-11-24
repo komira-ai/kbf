@@ -3,9 +3,11 @@
 //! Execute does steps 1 to 3 of `ARCHITECTURE.md#executing-an-action`, then streams the
 //! operation:
 //! - the action cache is checked first (with the closure check, unless the client set
-//!   `skip_cache_lookup`); a hit answers at once, `cached_result` set, and nothing runs;
-//! - the `Action`, its `Command` and its whole input tree must be in the CAS; every blob
-//!   that is not is listed in one FAILED_PRECONDITION, a `MISSING` violation each;
+//!   `skip_cache_lookup`), while the `Action` is read; a hit answers at once,
+//!   `cached_result` set, and nothing runs;
+//! - the `Action`, its `Command` and its whole input tree must be in the CAS (the Command is
+//!   read while the tree is walked, `execution_inputs.rs`); every blob that is not is listed
+//!   in one FAILED_PRECONDITION, a `MISSING` violation each;
 //! - the request goes to the [`Dispatch`], which joins a running twin (in-flight dedup) or
 //!   starts a new operation;
 //! - the call streams the operation: `QUEUED`, `EXECUTING` once its job has started, then
@@ -53,12 +55,15 @@
 //! without regard to case (`Kbf-Lease` is `kbf-lease`), and one given twice, also in two
 //! spellings, is INVALID_ARGUMENT. No other platform property is read or refused here.
 //!
-//! **When the platform is refused.** As early as it is known, before any input blob is
-//! read: an Action that carries a platform is checked right after it is decoded (so a bad
-//! platform beside missing blobs is INVALID_ARGUMENT for the platform, not MISSING), and a
-//! Command's platform as soon as the Command is read. An Execute the action cache answers is checked too: when the CAS holds the action (and its
-//! Command), a refused platform is an error instead of the cached result. An action the
-//! CAS does not hold, or that does not decode, is answered from the cache.
+//! **When the platform is refused.** Before anything about the inputs is answered: an Action
+//! that carries a platform is checked right after it is decoded, before its Command or any
+//! input blob is read (so a bad platform beside missing blobs is INVALID_ARGUMENT for the
+//! platform, not MISSING); a Command's platform as soon as the Command is read, which is while
+//! the input tree is walked, and its refusal is the answer over whatever the walk found (a
+//! MISSING input or a store that failed). An Execute the action cache answers is checked too:
+//! when the CAS holds the action (and its Command), a refused platform is an error instead of
+//! the cached result. An action the CAS does not hold, or that does not decode, is answered
+//! from the cache.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -75,8 +80,7 @@ use kbf_proto::reapi::{
     self, Action, Command, ExecuteOperationMetadata, ExecuteRequest, ExecuteResponse,
     WaitExecutionRequest, execution_stage,
 };
-use kbf_storage::StorageError;
-use kbf_types::{ActionKey, Digest};
+use kbf_types::Digest;
 use prost::Message;
 use prost_types::Any;
 use tokio::sync::watch;
@@ -85,7 +89,7 @@ use tonic::{Code, Request as GrpcRequest, Response, Status};
 use tracing::Instrument as _;
 
 use kbf_auth::AuthenticationMetadata;
-use kbf_invocation::{BookSource, CallKind, Evidence, ExecuteAnswer};
+use kbf_invocation::{CallKind, Evidence, ExecuteAnswer};
 
 use crate::backend::Backend;
 use crate::described::Described;
@@ -580,16 +584,24 @@ where
         metadata
             .invocation_display()
             .clone_into(&mut window.invocation);
-        if !request.skip_cache_lookup
-            && let Some((stored, result)) = self.cache.action_result(&action).await?
-        {
+        // The Action is read while the action cache is looked up: a miss reads its inputs
+        // from it next, and a hit checks its platform with it. A failed lookup is the
+        // answer, whatever the read found.
+        let lookup = async {
+            match request.skip_cache_lookup {
+                true => Ok(None),
+                false => self.cache.action_result(&action).await,
+            }
+        };
+        let (looked, read) = futures::future::join(lookup, self.read_input(&action)).await;
+        if let Some((stored, result)) = looked? {
             let name = format!(
                 "operations/cached/{}-{}",
                 action.hash_hex(),
                 action.size_bytes
             );
             // A result is not an excuse for a platform kbf refuses.
-            self.refuse_platform_of(&action).await?;
+            self.refuse_platform_of(read?).await?;
             tracing::debug!(%action, "answered from the action cache");
             let instance = &request.instance_name;
             self.recorder
@@ -612,7 +624,9 @@ where
             )])))));
         }
         let instance = request.instance_name;
-        let (mut submission, command) = self.submission(instance.clone(), action, window).await?;
+        let (mut submission, command) = self
+            .submission(instance.clone(), action, read?, window)
+            .await?;
         submission.call =
             ExecuteCall::new(&self.recorder, metadata, caller, &instance, action, command);
         submission.described.label = ActionLabel::sent(metadata);
@@ -630,168 +644,6 @@ where
         let ticket = submitted?;
         tracing::debug!(%action, operation = %ticket.name, "submitted");
         Ok(Either::Left(ticket))
-    }
-}
-
-impl<D> ExecutionService<D> {
-    /// Reads the action and checks its inputs are all held; the submission, with no call to
-    /// record yet, and the Command digest the action names.
-    async fn submission(
-        &self,
-        instance: String,
-        action: Digest,
-        window: &mut Presubmit<'_>,
-    ) -> Result<(Submission, Digest), Status> {
-        let Some(bytes) = self.read_input(&action).await? else {
-            return Err(missing(&[action]));
-        };
-        let decoded = Action::decode(bytes).map_err(|e| {
-            Status::invalid_argument(format!("action {action} does not decode: {e}"))
-        })?;
-        // A platform the Action carries is refused before anything else is read.
-        let own = if platform(&decoded, None).is_some() {
-            Some(wants_whole_machine(&decoded, None)?)
-        } else {
-            None
-        };
-        let command_digest = required(decoded.command_digest.as_ref(), "command_digest")?;
-        let root = required(decoded.input_root_digest.as_ref(), "input_root_digest")?;
-
-        let (mut absent, reading) = (Vec::new(), Instant::now());
-        let command = match self.read_input(&command_digest).await? {
-            Some(bytes) => Some(Command::decode(bytes).map_err(|e| {
-                Status::invalid_argument(format!("command {command_digest} does not decode: {e}"))
-            })?),
-            None => {
-                absent.push(command_digest);
-                None
-            }
-        };
-        // And a Command's, as soon as the Command is read: before the input tree is walked.
-        let whole_machine = match own {
-            Some(whole) => whole,
-            None => wants_whole_machine(&decoded, command.as_ref())?,
-        };
-        let walking = Instant::now();
-        let walked = self.cache.walk_inputs(root).await;
-        window.walk = walking.elapsed();
-        self.cache
-            .metrics()
-            .execute_walk
-            .observe_duration(window.walk);
-        let walked = walked?;
-        let (input_bytes, input_files) = (walked.input_bytes, walked.input_files);
-        window.dir_reads += walked.dirs_read;
-        window.dirs_skipped += walked.dirs_skipped;
-        window.dir_cache_hits += walked.dir_cache_hits;
-        window.dirs_present_checked += walked.dirs_present_checked;
-        window.dirs += walked.dirs_time;
-        window.files += walked.files_time;
-        window.file_asks += walked.file_asks;
-        window.files_checked += walked.files_checked;
-        self.observe_phases(&walked);
-        absent.extend(walked.absent);
-        if !absent.is_empty() {
-            tracing::warn!(
-                %action,
-                count = absent.len(),
-                first = %absent
-                    .iter()
-                    .take(REFUSED_LOGGED)
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-                "execute refused: input blob(s) are not in the CAS"
-            );
-            return Err(missing(&absent));
-        }
-        // The Command and every input held: the run's preparation need not ask again.
-        if let Some(at) = walked.held_since {
-            self.cache.vouch(action, at.min(reading));
-        }
-        let submission = Submission {
-            key: ActionKey { instance, action },
-            whole_machine,
-            call: None,
-            // The Command is here: an absent one returned MISSING above.
-            described: command.map(Described::of).unwrap_or_default(),
-            evidence: Evidence {
-                cpu_source: BookSource::default(),
-                memory_source: BookSource::default(),
-                input_bytes,
-                input_files,
-            },
-        };
-        Ok((submission, command_digest))
-    }
-
-    /// Refuses, for an Execute the action cache answers, the platform of the action that
-    /// cached result is for, if the action and its Command are in the CAS: the Action's
-    /// platform, else the Command's, as an Execute that ran would have read it. An action
-    /// or Command the CAS does not hold, or that does not decode, is not refused here (an
-    /// Execute that runs says so); a store that fails is the call's error.
-    async fn refuse_platform_of(&self, action: &Digest) -> Result<(), Status> {
-        let Some(decoded) = self.held::<Action>(action).await? else {
-            return Ok(());
-        };
-        let command = match decoded
-            .command_digest
-            .as_ref()
-            .map(|d| wire::digest(Some(d)))
-        {
-            Some(Ok(digest)) if platform(&decoded, None).is_none() => {
-                self.held::<Command>(&digest).await?
-            }
-            _ => None,
-        };
-        wants_whole_machine(&decoded, command.as_ref()).map(drop)
-    }
-
-    /// The message `digest` names, if the CAS holds it and it decodes.
-    async fn held<T: prost::Message + Default>(
-        &self,
-        digest: &Digest,
-    ) -> Result<Option<T>, Status> {
-        Ok(self
-            .read_input(digest)
-            .await?
-            .and_then(|bytes| T::decode(bytes).ok()))
-    }
-
-    /// The phases of a walk over a store in the metrics (a walk by the in-process cache
-    /// has none to report: its figures are zero and it counts its own).
-    fn observe_phases(&self, walked: &crate::input_tree::Walked) {
-        let m = self.cache.metrics();
-        m.execute_walk_dirs_read.add(walked.dirs_read);
-        m.execute_walk_dirs_skipped.add(walked.dirs_skipped);
-        m.execute_walk_file_asks.add(walked.file_asks);
-        m.execute_walk_files_checked.add(walked.files_checked);
-        for took in &walked.read_times {
-            m.execute_walk_dir_read.observe_duration(*took);
-        }
-        m.execute_dir_cache_hits.add(walked.dir_cache_hits);
-        m.execute_dir_cache_misses.add(walked.dir_cache_misses);
-        m.execute_dir_cache_merged.add(walked.dir_cache_merged);
-        m.execute_dir_cache_evictions.add(walked.dir_cache_evicted);
-        m.execute_dir_cache_present_checked
-            .add(walked.dirs_present_checked);
-        if walked.phased {
-            m.execute_dir_cache_bytes.set(walked.dir_cache_bytes);
-        }
-        if walked.phased {
-            m.execute_walk_dirs.observe_duration(walked.dirs_time);
-            m.execute_walk_files.observe_duration(walked.files_time);
-        }
-    }
-
-    /// A blob's bytes, or `None` if it is not held. Anything else (unreachable, store
-    /// down) fails the call: the input exists, so it is not MISSING.
-    async fn read_input(&self, digest: &Digest) -> Result<Option<Bytes>, Status> {
-        match self.cache.read_blob(digest).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(StorageError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
     }
 }
 
@@ -819,8 +671,8 @@ fn required(d: Option<&reapi::Digest>, field: &str) -> Result<Digest, Status> {
 /// machine: its `kbf-lease` value is `whole_machine` (`action` or none is not). The name is
 /// read without regard to case. INVALID_ARGUMENT for a value not in [`LEASE_KINDS`], and for
 /// the name given twice, also in two spellings. Reads nothing else of the platform, and no
-/// input of the action: it runs before any input is read, and for a cached result too
-/// ([`ExecutionService::refuse_platform_of`]).
+/// input of the action: it runs before anything about the inputs is answered, and for a
+/// cached result too (`ExecutionService::refuse_platform_of`).
 fn wants_whole_machine(action: &Action, command: Option<&Command>) -> Result<bool, Status> {
     let properties = platform(action, command).map_or(&[][..], |p| p.properties.as_slice());
     let mut named = properties
@@ -992,6 +844,9 @@ fn operations(
         }
     }))
 }
+
+#[path = "execution_inputs.rs"]
+mod inputs;
 
 #[cfg(test)]
 #[path = "execution_progress_tests.rs"]
