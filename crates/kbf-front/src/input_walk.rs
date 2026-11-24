@@ -338,8 +338,9 @@ impl Trees {
         self.lock().dirs.len()
     }
 
-    /// From now on, every Directory a walk reads is also kept in `cache`, decoded with its
-    /// names, for the run preparation's walk of the same tree. A later cache replaces it.
+    /// From now on, every Directory a walk reads, and every Directory a client uploads through
+    /// the packs this memory shares ([`Trees::sharing`]), is also kept in `cache`, decoded with
+    /// its names, for the run preparation's walk of the same tree. A later cache replaces it.
     pub(crate) fn keep_into(&self, cache: Arc<DirectoryCache>) {
         self.known.keep_into(cache);
     }

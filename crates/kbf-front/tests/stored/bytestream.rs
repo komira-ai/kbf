@@ -448,3 +448,54 @@ async fn an_index_that_cannot_answer_fails_unavailable() {
         assert_eq!(failed.code(), Code::Unavailable);
     }
 }
+
+/// A Directory naming `n` files, each by its digest in hex: its digest and bytes.
+fn directory_of(n: usize) -> (Digest, bytes::Bytes) {
+    use prost::Message as _;
+    let files = (0..n)
+        .map(|i| {
+            let file = blob_of(format!("file {i}").as_bytes()).0;
+            kbf_proto::reapi::FileNode {
+                name: file.hash_hex(),
+                digest: Some(kbf_front::digest_to_proto(&file)),
+                ..kbf_proto::reapi::FileNode::default()
+            }
+        })
+        .collect();
+    let message = kbf_proto::reapi::Directory {
+        files,
+        ..kbf_proto::reapi::Directory::default()
+    };
+    blob_of(&message.encode_to_vec())
+}
+
+/// The value of the packs' counter `name`, as `GET /metrics` prints it.
+fn pack_counter(rig: &Rig, name: &str) -> String {
+    let mut out = String::new();
+    rig.stored.packs().metrics().render(&mut out);
+    let prefix = format!("{name} ");
+    out.lines()
+        .find(|l| l.starts_with(&prefix))
+        .map_or_else(|| format!("{name} absent"), str::to_owned)
+}
+
+/// Asserts that a Directory written with a ByteStream Write small enough to pack is learnt for
+/// the input walks as it is stored, as one sent with BatchUpdateBlobs is; and that one too large
+/// to pack, which is written as a large object, is not (a walk that needs it reads it).
+#[tokio::test]
+async fn a_directory_written_into_a_pack_is_learnt_and_a_large_one_is_not() {
+    let rig = Rig::new().await;
+    let small = directory_of(2);
+    let large = directory_of(40);
+    assert!(small.1.len() as u64 <= crate::rig::SMALL && large.1.len() as u64 > crate::rig::SMALL);
+    let learnt = "kbf_pack_uploaded_directories_total";
+
+    let size = write(&rig, pieces(&small.0, &small.1, 50)).await;
+    assert_eq!(size.expect("written"), small.1.len() as i64);
+    assert_eq!(pack_counter(&rig, learnt), format!("{learnt} 1"));
+
+    let size = write(&rig, pieces(&large.0, &large.1, 1000)).await;
+    assert_eq!(size.expect("written"), large.1.len() as i64);
+    assert!(missing(&rig, &[large.0]).await.expect("asked").is_empty());
+    assert_eq!(pack_counter(&rig, learnt), format!("{learnt} 1"));
+}
