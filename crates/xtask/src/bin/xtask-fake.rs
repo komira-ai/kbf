@@ -57,7 +57,11 @@
 //!   no-proxy variables it ran under (`NAME=value`, empty when unset).
 //! - Run as `gh api <path>`, it prints the value under the key `<path>` of the JSON
 //!   object in `gh-api.json` next to it, or `gh: Not Found (HTTP 404)` on stderr and
-//!   exits 1 when there is none: the GitHub API, as a test wrote it.
+//!   exits 1 when there is none: the GitHub API, as a test wrote it. Run as
+//!   `gh api graphql -f query=<q> -f <name>=<value>...`, it answers the same way under the
+//!   key `graphql` and each `<name>=<value>` but the query, in order
+//!   (`graphql owner=o name=r after=c1`); `gh-fault` holding `graphql-garbage` makes it
+//!   answer every such call with a reply that is not JSON.
 //! - Run as `gh api <path> -X POST --input -`, it reads a JSON body on stdin. For
 //!   `repos/<repo>/git/tags` it stores a tag object under `repos/<repo>/git/tags/<id>` (its
 //!   tagger is `komira-release-bot[bot]`) and answers `{"sha": <id>}`. For
