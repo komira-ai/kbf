@@ -24,10 +24,16 @@
 //! prints after them shows it. (A workflow step's own header still shows the values of its
 //! `env:`; that is the workflow's to keep out.)
 //!
+//! Each `--output` path (relative to the checkout's root) is declared in the Command's
+//! `output_paths`, and when the command passed, what it left there is written below
+//! `--out-dir` at the same path ([`outputs`]): every declared path must come back, as a file or
+//! a directory.
+//!
 //! With an empty `--address` the verb prints a notice and exits 0: a fork, or a repository with
 //! no farm, runs nothing and fails nothing.
 
 pub mod client;
+pub mod outputs;
 pub mod toolchain;
 pub mod tree;
 
@@ -111,6 +117,14 @@ pub struct Args {
     /// The Cargo program that fetches the crates on this machine.
     #[arg(long = "cargo", default_value = "cargo")]
     pub cargo_program: PathBuf,
+    /// A path the command writes, relative to the checkout's root, written below `--out-dir`
+    /// at the same path when the command passes. Repeatable.
+    #[arg(long = "output")]
+    pub outputs: Vec<String>,
+    /// Where the outputs are written: the working directory (the checkout's root) when not
+    /// given.
+    #[arg(long)]
+    pub out_dir: Option<PathBuf>,
     /// The Cargo command to run on the Mac, after `--`: `test -p kbf-outputs --locked`.
     #[arg(last = true, required = true)]
     pub cargo: Vec<String>,
@@ -131,6 +145,12 @@ pub enum Problem {
         "the Cargo command is empty, or starts with an option ({0:?}): it starts with its subcommand"
     )]
     Cargo(String),
+    #[error("--output {0:?} is not a relative path of plain components")]
+    OutputPath(String),
+    #[error("--output {0:?} is given twice")]
+    OutputTwice(String),
+    #[error("--output {inner:?} is inside --output {outer:?}")]
+    OutputInside { inner: String, outer: String },
 }
 
 /// The checked settings of a run.
@@ -144,6 +164,8 @@ pub struct Settings {
     pub properties: Vec<(String, String)>,
     pub timeout_secs: u64,
     pub cargo: Vec<String>,
+    /// The `--output` paths, sorted.
+    pub outputs: Vec<String>,
 }
 
 impl Settings {
@@ -173,6 +195,7 @@ impl Settings {
             Some(sub) if !sub.starts_with('-') && !sub.starts_with('+') => {}
             first => return Err(Problem::Cargo(first.cloned().unwrap_or_default())),
         }
+        let outputs = outputs::declared(&args.outputs)?;
         let scheme = if tls { "https" } else { "http" };
         Ok(Settings {
             endpoint: format!("{scheme}://{host}"),
@@ -181,6 +204,7 @@ impl Settings {
             properties,
             timeout_secs: args.timeout_secs,
             cargo: args.cargo.clone(),
+            outputs,
         })
     }
 }
@@ -200,7 +224,8 @@ fn platform(s: &Settings) -> Platform {
 }
 
 /// The Command: the toolchain's `cargo` with the run's arguments, from the input root, its
-/// environment sorted by name. Its platform is the Action's ([`action`]).
+/// environment sorted by name, its `output_paths` the `--output` paths. Its platform is the
+/// Action's ([`action`]).
 #[must_use]
 pub fn command(s: &Settings) -> Command {
     let env = [
@@ -224,6 +249,7 @@ pub fn command(s: &Settings) -> Command {
                 value,
             })
             .collect(),
+        output_paths: s.outputs.clone(),
         ..Command::default()
     }
 }
@@ -450,14 +476,17 @@ pub fn progress_line(progress: Progress) -> &'static str {
     }
 }
 
-/// The run against the farm: upload what it lacks, execute, report.
+/// The run against the farm: upload what it lacks, execute, report, and write the outputs of a
+/// command that passed below `out_dir`.
 ///
 /// # Errors
-/// [`Error::Failed`], for every end but a command that exited 0.
+/// [`Error::Failed`], for every end but a command that exited 0 and whose outputs were
+/// written.
 pub async fn remote(
     s: &Settings,
     tree: &Tree,
     action: &Digest,
+    out_dir: &Path,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> Result<Vec<String>, Error> {
@@ -489,7 +518,20 @@ pub async fn remote(
         })
         .await
         .map_err(failed)?;
+    let result = response.result.clone().unwrap_or_default();
     lines.extend(report(&farm, s, response, out, err).await?);
+    let written = outputs::download(&farm, &result, &s.outputs, out_dir)
+        .await
+        .map_err(|e| Error::Failed(e.to_string()))?;
+    if !s.outputs.is_empty() {
+        let _ = writeln!(
+            err,
+            "mac-farm: {} output files ({} bytes) written below {}",
+            written.files,
+            written.bytes,
+            out_dir.display()
+        );
+    }
     Ok(lines)
 }
 
@@ -513,12 +555,18 @@ pub fn run_with(
     let settings = Settings::of(args).map_err(|p| Error::Failed(p.to_string()))?;
     let scratch = std::path::absolute(&args.scratch)
         .map_err(Error::spawn(format!("resolve {}", args.scratch.display())))?;
+    let out_dir = match &args.out_dir {
+        Some(dir) => {
+            std::path::absolute(dir).map_err(Error::spawn(format!("resolve {}", dir.display())))?
+        }
+        None => root.to_owned(),
+    };
     let (tree, action) = inputs(&settings, root, &scratch, host)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(Error::spawn("start the runtime".to_owned()))?;
-    runtime.block_on(remote(&settings, &tree, &action, out, err))
+    runtime.block_on(remote(&settings, &tree, &action, &out_dir, out, err))
 }
 
 /// The verb: the lines to print.

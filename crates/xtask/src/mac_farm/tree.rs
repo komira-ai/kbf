@@ -49,7 +49,7 @@ pub fn digest_of(bytes: &[u8]) -> Digest {
 }
 
 /// The components of `path`: `/`-separated, none empty, `.` or `..`.
-fn components(path: &str) -> Result<Vec<&str>, TreeError> {
+pub(crate) fn components(path: &str) -> Result<Vec<&str>, TreeError> {
     let parts: Vec<&str> = path.split('/').collect();
     if parts
         .iter()

@@ -1,6 +1,6 @@
 //! The REAPI calls of `mac-farm`, over one channel to the farm: which blobs the CAS lacks, their
 //! upload (small ones in batches, large ones streamed), the Execute of the action until it is
-//! done, and the read of a blob (the action's stdout and stderr).
+//! done, and the read of a blob (the action's stdout and stderr, and its output files).
 
 use std::collections::BTreeMap;
 
@@ -17,6 +17,7 @@ use kbf_proto::reapi::{
     FindMissingBlobsRequest, WaitExecutionRequest,
 };
 use prost::Message as _;
+use sha2::{Digest as _, Sha256};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Code, Status};
 
@@ -74,6 +75,8 @@ pub enum FarmError {
     NoResponse,
     #[error("the operation's response does not decode: {0}")]
     Garbage(String),
+    #[error("write the blob {hash}: {why}")]
+    Write { hash: String, why: String },
 }
 
 fn call(call: &'static str) -> impl FnOnce(Status) -> FarmError {
@@ -282,25 +285,48 @@ impl Farm {
     /// # Errors
     /// [`FarmError::Call`].
     pub async fn read(&self, digest: &Digest) -> Result<Vec<u8>, FarmError> {
-        if digest.size_bytes == 0 {
-            return Ok(Vec::new());
-        }
-        let name = self.resource(&format!("blobs/{}/{}", digest.hash, digest.size_bytes));
-        let mut answer = ByteStreamClient::new(self.channel.clone())
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .read(ReadRequest {
-                resource_name: name,
-                read_offset: 0,
-                read_limit: 0,
-            })
-            .await
-            .map_err(call("ByteStream.Read"))?
-            .into_inner();
         let mut out = Vec::new();
-        while let Some(message) = answer.message().await.map_err(call("ByteStream.Read"))? {
-            out.extend(message.data);
-        }
+        self.read_into(digest, &mut out).await?;
         Ok(out)
+    }
+
+    /// Writes the blob `digest` into `to` as its messages arrive (none for the empty blob),
+    /// hashing them on the way; its SHA-256 and size.
+    ///
+    /// # Errors
+    /// [`FarmError::Call`] for the read, [`FarmError::Write`] for `to`.
+    pub async fn read_into(
+        &self,
+        digest: &Digest,
+        to: &mut (dyn std::io::Write + Send),
+    ) -> Result<Digest, FarmError> {
+        let mut hash = Sha256::new();
+        let mut size = 0_usize;
+        if digest.size_bytes != 0 {
+            let name = self.resource(&format!("blobs/{}/{}", digest.hash, digest.size_bytes));
+            let mut answer = ByteStreamClient::new(self.channel.clone())
+                .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                .read(ReadRequest {
+                    resource_name: name,
+                    read_offset: 0,
+                    read_limit: 0,
+                })
+                .await
+                .map_err(call("ByteStream.Read"))?
+                .into_inner();
+            while let Some(message) = answer.message().await.map_err(call("ByteStream.Read"))? {
+                hash.update(&message.data);
+                size += message.data.len();
+                to.write_all(&message.data).map_err(|e| FarmError::Write {
+                    hash: digest.hash.clone(),
+                    why: e.to_string(),
+                })?;
+            }
+        }
+        Ok(Digest {
+            hash: hex::encode(hash.finalize()),
+            size_bytes: i64::try_from(size).unwrap_or(i64::MAX),
+        })
     }
 
     /// Executes `action` and follows its operation until it is done; `progress` is told each

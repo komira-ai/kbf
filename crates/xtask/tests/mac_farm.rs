@@ -5,6 +5,8 @@
 
 #[path = "mac_farm/fake.rs"]
 mod fake;
+#[path = "mac_farm/outputs.rs"]
+mod outputs;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -95,6 +97,8 @@ impl Rig {
             timeout_secs: 900,
             git: PathBuf::from("git"),
             cargo_program: PathBuf::from("cargo"),
+            outputs: Vec::new(),
+            out_dir: None,
             cargo: vec!["test".to_owned(), "-p".to_owned(), "kbf-update".to_owned()],
         }
     }
@@ -102,7 +106,15 @@ impl Rig {
     /// A run of the verb over a one-file checkout and a one-file toolchain; its result, stdout
     /// and stderr.
     fn run(&self, name: &str) -> (Result<Vec<String>, Error>, String, String) {
-        let dir = scratch(name);
+        self.run_in(&scratch(name), |a| a)
+    }
+
+    /// [`Rig::run`] in `dir`, with the flags `flags` makes of the rig's.
+    fn run_in(
+        &self,
+        dir: &TestDir,
+        flags: impl FnOnce(Args) -> Args,
+    ) -> (Result<Vec<String>, Error>, String, String) {
         let root = dir.path().join("checkout");
         std::fs::create_dir_all(&root).expect("mkdir");
         std::fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("write");
@@ -130,7 +142,7 @@ impl Rig {
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let result = run_with(
-            &self.args(&dir.path().join("scratch")),
+            &flags(self.args(&dir.path().join("scratch"))),
             &root,
             &mut host,
             &mut out,

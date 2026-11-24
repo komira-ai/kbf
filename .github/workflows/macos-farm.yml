@@ -1,7 +1,10 @@
 # The macOS crates' tests that need neither a socket nor a sandbox of their own, on a Mac of the
 # build farm instead of a GitHub-hosted macOS runner, after the merge
 # (docs/design/mac-ci-on-the-farm.md): kbf-outputs (which beta.yml's `native-macos` no longer
-# runs), kbf-seatbelt and kbf-update.
+# runs), kbf-seatbelt and kbf-update. And the release builds of the darwin-arm64 kbf and
+# kbf-deploy on a farm Mac, each binary brought back (`--output`) and its SHA-256 printed: a
+# build beside artifacts.yml's `darwin-arm64`, never instead of it (docs/artifacts.md, "The
+# seed build"); nothing here is uploaded, signed or released.
 #
 # The job runs on a hosted Linux runner. `cargo xtask mac-farm` sends each Cargo command to the
 # farm as one remote action on its Mac platform, with the checkout, the crates of Cargo.lock for
@@ -67,3 +70,22 @@ jobs:
           FARM_TLS: ${{ vars.FARM_TLS || 'false' }}
           FARM_PROPERTIES: ${{ vars.FARM_DARWIN_ARM64_PROPERTIES }}
         run: cargo xtask mac-farm --address "$FARM_ADDRESS" --instance "$FARM_INSTANCE" --tls "$FARM_TLS" --properties "$FARM_PROPERTIES" --scratch "$RUNNER_TEMP/mac-farm" -- test --locked --no-fail-fast -p kbf-seatbelt -p kbf-update
+      - name: The darwin-arm64 kbf's release build on a farm Mac, beside the seed build
+        timeout-minutes: 50
+        env:
+          FARM_ADDRESS: ${{ vars.FARM_ADDRESS }}
+          FARM_INSTANCE: ${{ vars.FARM_INSTANCE }}
+          FARM_TLS: ${{ vars.FARM_TLS || 'false' }}
+          FARM_PROPERTIES: ${{ vars.FARM_DARWIN_ARM64_PROPERTIES }}
+        run: cargo xtask mac-farm --address "$FARM_ADDRESS" --instance "$FARM_INSTANCE" --tls "$FARM_TLS" --properties "$FARM_PROPERTIES" --scratch "$RUNNER_TEMP/mac-farm" --output target/aarch64-apple-darwin/release/kbf --out-dir "$RUNNER_TEMP/mac-farm-out" -- build --locked --release --target aarch64-apple-darwin -p kbf-cli --bin kbf
+      - name: The darwin-arm64 kbf-deploy's release build on a farm Mac, beside the seed build
+        timeout-minutes: 50
+        env:
+          FARM_ADDRESS: ${{ vars.FARM_ADDRESS }}
+          FARM_INSTANCE: ${{ vars.FARM_INSTANCE }}
+          FARM_TLS: ${{ vars.FARM_TLS || 'false' }}
+          FARM_PROPERTIES: ${{ vars.FARM_DARWIN_ARM64_PROPERTIES }}
+        run: cargo xtask mac-farm --address "$FARM_ADDRESS" --instance "$FARM_INSTANCE" --tls "$FARM_TLS" --properties "$FARM_PROPERTIES" --scratch "$RUNNER_TEMP/mac-farm" --output target/aarch64-apple-darwin/release/kbf-deploy --out-dir "$RUNNER_TEMP/mac-farm-out" -- build --locked --release --target aarch64-apple-darwin -p kbf-deploy --bin kbf-deploy
+      - name: The SHA-256 of the binaries the farm built
+        if: ${{ vars.FARM_ADDRESS != '' }}
+        run: sha256sum "$RUNNER_TEMP/mac-farm-out/target/aarch64-apple-darwin/release/kbf" "$RUNNER_TEMP/mac-farm-out/target/aarch64-apple-darwin/release/kbf-deploy"
