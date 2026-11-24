@@ -29,6 +29,7 @@ Cargo command:
    The CAS is shared, so an unchanged toolchain or crate is sent once, not per run.
 4. The action is executed and followed to its end; a cut stream is followed again with
    WaitExecution, or executed again when the farm has forgotten the operation.
+5. The files the command was asked to leave (`--output`) are brought back (see Outputs).
 
 ## Authentication
 
@@ -62,6 +63,22 @@ changes (queued, running) and then the whole output. A passing result is cached 
 an unchanged commit's rerun is answered from the cache (and says so); a failing one is never
 cached.
 
+## Outputs
+
+Each `--output <path>` (relative to the checkout's root, repeatable) is one of the Command's
+`output_paths`. When the command exited 0, the client writes what the farm answered for each
+path below `--out-dir` (default: the working directory, the checkout's root) at the same path:
+a file as a file, with its executable bit, and a directory as the tree the farm sent. A path
+that is not plain (absolute, empty, with `.` or `..`), given twice, or inside another
+`--output` is refused before anything runs.
+
+The answer must be exactly the declared paths: a path the command did not leave, and one the
+farm names that was not declared, fail the run. A symlink (an answered one, or one inside an
+output directory) fails the run too: its target could point anywhere on the runner. A file is
+written as its bytes arrive and hashed on the way, and fails the run when its SHA-256 or size
+is not its digest's. Nothing is overwritten: a file or directory already at an output's place
+fails the run and keeps what was there. A command that failed brings nothing back.
+
 ## Time limit
 
 The action's timeout is `--timeout-secs` (default 2400 s), which the frontend holds under its
@@ -88,11 +105,45 @@ keychain.
 
 ## Missing
 
-- A per-pull-request farm job: none is planned. No pull request or merge-queue run gets a token
-  that reaches the farm, so `macos-pr.yml`'s jobs stay on GitHub's hosted Macs until kbf itself
-  moves onto the farm, which waits for a forced rollback of the farm that cannot fail.
-- A loopback-only network level for a Mac action: the job service has one for native bodies, but
-  no job level maps to it and kbf sends `none`.
+What keeps each macOS job of this repository that is not on the farm on a hosted runner:
+
+- **A pull request's and the merge queue's macOS jobs** (`macos-pr.yml`'s `macos-device` and
+  `macos-test`): the tailnet join needs `id-token: write`, and the workflow lint lets a job hold
+  it only for a push to `main` (Authentication). Moving any of them needs a ruling on that
+  scope for pull request runs, and then a change to the `macos_pr` lint and to AGENTS.md's B9
+  paragraph for this repository, which name these two jobs on `macos-15`.
+- **`macos-device`, and the gh steps of `beta.yml`'s `native-macos`** (the pinned gh against a
+  real attestation, `real_gh --ignored`): the test itself needs no network (it checks a stored
+  bundle against a stored trusted root), but the pinned gh is downloaded at the job's start,
+  and the action's inputs are the checkout, the crates and the toolchain only; the test also
+  reads `KBF_TEST_GH`, and the Command's environment is fixed. It needs an input of the run's
+  own (a file the runner fetched, at a path of the input root) and a way to name it to the test.
+- **update-register's five Mac tests** (`macos-test`, `native-macos`): four bind or connect a
+  Unix socket, which the sandbox denies. A loopback-only level would not help: the job
+  service's loopback level allows TCP and UDP on `localhost` only, not Unix sockets. They need
+  a level that allows Unix sockets below the run's directory (a jobscheduler change), or stay
+  hosted.
+- **kbf-task's tests** (`macos-test`, `ci.yml`'s `task-macos`): a run that is not a job
+  (`run.job == None`) starts the Command under `sandbox-exec`, which a process already under
+  the agent's sandbox cannot apply; the seatbelt tests also connect sockets, and one test binds
+  a Unix socket. Skipping `sandbox-exec` when already sandboxed is not sound: kbf-task's profile
+  denies the run's credential files (`--grant-token-file`, `--pack-url-file`,
+  `--put-urls-file`) by path, which the agent's profile cannot name, so a skip would hand the
+  Command those files. They stay hosted.
+- **`artifacts.yml`'s `darwin-arm64`**: it is a seed job (docs/artifacts.md, "The seed build"):
+  the release's darwin files are built on a hosted runner with no farm, so a broken kbf is
+  rebuilt without kbf; a build on the farm runs beside it, never instead of it (the
+  `seed_build` lint holds it). Beside it, `macos-farm` builds kbf and kbf-deploy on a farm Mac
+  after the merge (In this repository). Its other steps need the network (the cyclonedx, gh
+  and js-bundle downloads, `gh attestation verify`) or the runner (the artifact upload).
+  The farm's binaries are not yet the same bytes as the seed job's: the Command's environment
+  is fixed (`RUSTFLAGS=-D warnings`, no `MACOSX_DEPLOYMENT_TARGET`), the checkout's path differs,
+  the input root has no `.git`, so the farm's kbf names no commit (`kbf-server`'s build script
+  reads it from git), and the seed job's files are signed ad hoc after the build.
+- A loopback-only network level for a Mac action: the job service has one for native bodies,
+  but no job level maps to it (its job levels are none, allow-list and open), and kbf sends
+  `none`. Mapping an action to it changes the job service's job levels, and it opens a channel
+  among the concurrent runs on one Mac and to the Mac's own loopback services.
 - Live output while the action runs (the REAPI has no log stream here).
 - Root-needing jobs: a macOS VM job (two per Mac under the licence); the agent has a VM backend
   that is off unless configured, and kbf has no path to it.
@@ -104,5 +155,7 @@ keychain.
 `macos-farm.yml`'s `macos-farm` job runs, after the merge, the macOS crates whose tests need
 neither a socket nor a sandbox of their own (kbf-outputs, kbf-seatbelt, kbf-update) on a farm
 Mac; `beta.yml`'s `native-macos` no longer runs kbf-outputs, and keeps the tests that cannot
-move. A pull request still runs all of them on `macos-pr.yml`'s hosted runner (see
-Authentication).
+move. The same job then builds the darwin-arm64 kbf and kbf-deploy for release on a farm Mac,
+each built by itself as the seed job builds it, brings each binary back with `--output`, and
+prints its SHA-256; nothing it builds is uploaded or released. A pull request still runs all
+of the tests on `macos-pr.yml`'s hosted runner (see Authentication).

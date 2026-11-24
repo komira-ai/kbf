@@ -22,6 +22,8 @@ fn args() -> Args {
         timeout_secs: 600,
         git: PathBuf::from("git"),
         cargo_program: PathBuf::from("cargo"),
+        outputs: Vec::new(),
+        out_dir: None,
         cargo: vec!["test".to_owned(), "-p".to_owned(), "kbf-update".to_owned()],
     }
 }
@@ -43,6 +45,7 @@ fn the_flags_make_the_settings() {
             ],
             timeout_secs: 600,
             cargo: vec!["test".to_owned(), "-p".to_owned(), "kbf-update".to_owned()],
+            outputs: Vec::new(),
         }
     );
     let plain = Args {
@@ -145,6 +148,31 @@ fn the_command_is_the_sent_cargo_offline_with_the_sent_compiler() {
     );
     assert_eq!(c.working_directory, "");
     assert!(c.output_paths.is_empty());
+}
+
+/// Catches an `--output` left out of the Command (the farm would answer nothing for it), and
+/// the paths sent in the order given: REAPI wants `output_paths` sorted.
+#[test]
+fn the_outputs_are_the_commands_output_paths_sorted() {
+    let a = Args {
+        outputs: vec![
+            "target/b".to_owned(),
+            "dist".to_owned(),
+            "target/a".to_owned(),
+        ],
+        ..args()
+    };
+    let s = Settings::of(&a).expect("settings");
+    assert_eq!(s.outputs, ["dist", "target/a", "target/b"]);
+    assert_eq!(command(&s).output_paths, ["dist", "target/a", "target/b"]);
+    let a = Args {
+        outputs: vec!["../up".to_owned()],
+        ..args()
+    };
+    assert_eq!(
+        Settings::of(&a),
+        Err(Problem::OutputPath("../up".to_owned()))
+    );
 }
 
 /// Catches an Action that points at another Command or root, has no timeout or the wrong one,
