@@ -166,13 +166,14 @@ fn a_published_release_on_a_later_page_is_found() {
     // hundred would be no release.
     let fx = with_notes("previous-paged", |_| {});
     let drafts: Vec<_> = (0..100)
-        .map(|n| json!({"tag_name": format!("v1.0.{n}"), "draft": true}))
+        .map(|n| json!({"tagName": format!("v1.0.{n}"), "isDraft": true}))
         .collect();
+    let published = vec![json!({"tagName": "v0.9.0", "isDraft": false})];
     fake_gh_api(
         &fx,
         json!({
-            RELEASES_PAGE_1: drafts,
-            "repos/o/r/releases?per_page=100&page=2": [{"tag_name": "v0.9.0", "draft": false}],
+            RELEASES_PAGE_1: releases_page(drafts, Some("c1")),
+            "graphql owner=o name=r after=c1": releases_page(published, None),
         }),
     );
     let (code, o, err) = previous(&fx, TAG, RELEASE);
@@ -189,20 +190,23 @@ fn a_release_list_that_cannot_be_read_is_an_error_not_no_releases() {
     // make a release with a previous one the first release, its notes and checks without it.
     let fx = with_notes("previous-unreadable", |_| {});
     let cases = [
-        (json!({}), "gh api repos/o/r/releases: no list of entries"),
+        (json!({}), "gh api graphql: gh: Not Found (HTTP 404)"),
         (
-            json!({ RELEASES_PAGE_1: {"message": "x"} }),
-            "gh api repos/o/r/releases: no list of entries",
+            json!({ RELEASES_PAGE_1: {"data": {"repository": null}} }),
+            "gh api graphql releases of o/r: page 1: no list of entries",
         ),
         (
-            json!({ RELEASES_PAGE_1: [{"tag_name": "v0.9.0", "draft": "no"}] }),
-            "gh api repos/o/r/releases: a release without a tag_name or a boolean draft: \
-             {\"draft\":\"no\",\"tag_name\":\"v0.9.0\"}",
+            json!({ RELEASES_PAGE_1: releases_page(
+                vec![json!({"tagName": "v0.9.0", "isDraft": "no"})],
+                None,
+            ) }),
+            "gh api graphql releases of o/r: a release without a tagName or a boolean \
+             isDraft: {\"isDraft\":\"no\",\"tagName\":\"v0.9.0\"}",
         ),
         (
-            json!({ RELEASES_PAGE_1: [{"draft": false}] }),
-            "gh api repos/o/r/releases: a release without a tag_name or a boolean draft: \
-             {\"draft\":false}",
+            json!({ RELEASES_PAGE_1: releases_page(vec![json!({"isDraft": false})], None) }),
+            "gh api graphql releases of o/r: a release without a tagName or a boolean \
+             isDraft: {\"isDraft\":false}",
         ),
     ];
     for (api, said) in cases {

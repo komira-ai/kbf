@@ -57,7 +57,11 @@
 //!   no-proxy variables it ran under (`NAME=value`, empty when unset).
 //! - Run as `gh api <path>`, it prints the value under the key `<path>` of the JSON
 //!   object in `gh-api.json` next to it, or `gh: Not Found (HTTP 404)` on stderr and
-//!   exits 1 when there is none: the GitHub API, as a test wrote it.
+//!   exits 1 when there is none: the GitHub API, as a test wrote it. Run as
+//!   `gh api graphql -f query=<q> -f <name>=<value>...`, it answers the same way under the
+//!   key `graphql` and each `<name>=<value>` but the query, in order
+//!   (`graphql owner=o name=r after=c1`); `gh-fault` holding `graphql-garbage` makes it
+//!   answer every such call with a reply that is not JSON.
 //! - Run as `gh api <path> -X POST --input -`, it reads a JSON body on stdin. For
 //!   `repos/<repo>/git/tags` it stores a tag object under `repos/<repo>/git/tags/<id>` (its
 //!   tagger is `komira-release-bot[bot]`) and answers `{"sha": <id>}`. For
@@ -364,6 +368,7 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
     match args[0].as_str() {
         "api" if args[1] == "-X" => return issues_write(dir, args),
         "api" if args.iter().any(|a| a == "--input") => return api_write(dir, args),
+        "api" if args[1] == "graphql" => return api(dir, &graphql_key(&args[2..])),
         "api" => return api(dir, &args[1]),
         "release" => return release(dir, args),
         _ => {}
@@ -499,6 +504,19 @@ fn api_store(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
     serde_json::from_str(&text).expect("gh-api.json is a JSON object")
 }
 
+/// The `gh-api.json` key of `gh api graphql -f query=<q> -f <name>=<value>...`: `graphql`
+/// and each `<name>=<value>` but the query, in the order given (`graphql owner=o name=r
+/// after=c1`).
+fn graphql_key(fields: &[String]) -> String {
+    let vars = fields
+        .iter()
+        .filter(|f| *f != "-f" && !f.starts_with("query="));
+    std::iter::once("graphql")
+        .chain(vars.map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn api(dir: &Path, path: &str) -> ExitCode {
     if defect("api-fails") {
         eprintln!("gh: Server Error (HTTP 502)");
@@ -509,6 +527,10 @@ fn api(dir: &Path, path: &str) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let fault = std::fs::read_to_string(dir.join("gh-fault")).unwrap_or_default();
+    if fault.trim() == "graphql-garbage" && path.starts_with("graphql") {
+        println!("<html>");
+        return ExitCode::SUCCESS;
+    }
     if let Some(code) = fault
         .strip_prefix("fail-get:")
         .filter(|_| path.contains("/git/ref/"))

@@ -7,13 +7,16 @@ use std::process::Command;
 
 use kbf_testkit::dir::TestDir;
 use serde_json::{Value, json};
-use xtask::release::tags::{Base, Version};
+use xtask::release::tags::{self, Base, Version};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
 const REPO: &str = "komira-ai/kbf";
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/release-plan.txt");
 const VERSION_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../VERSION");
+
+#[path = "release_plan/releases.rs"]
+mod releases;
 
 /// One test's world: a git repository and a fake `gh` in a directory of its own.
 struct Fx {
@@ -95,10 +98,13 @@ impl Fx {
             .iter()
             .map(|t| json!({ "ref": format!("refs/tags/{t}") }))
             .collect();
-        let releases: Vec<Value> = releases.iter().map(|t| json!({ "tag_name": t })).collect();
+        let releases: Vec<Value> = releases
+            .iter()
+            .map(|t| json!({ "tagName": t, "isDraft": true }))
+            .collect();
         let mut map = serde_json::Map::new();
         map.insert(refs_path(), Value::Array(refs));
-        map.insert(releases_path(1), Value::Array(releases));
+        map.insert(releases_key(1), releases_answer(1, releases, false));
         for (tag, commit, status) in compares {
             map.insert(
                 format!("repos/{REPO}/compare/{tag}...{commit}"),
@@ -157,8 +163,22 @@ fn refs_path() -> String {
     format!("repos/{REPO}/git/matching-refs/tags/v")
 }
 
-fn releases_path(page: u32) -> String {
-    format!("repos/{REPO}/releases?per_page=100&page={page}")
+/// The fake's key for page `page` of the GraphQL release list: page 1 is read with no
+/// cursor, page `n` after the cursor `c<n-1>` page `n-1` gave.
+fn releases_key(page: u32) -> String {
+    match page {
+        1 => "graphql owner=komira-ai name=kbf".to_owned(),
+        n => format!("graphql owner=komira-ai name=kbf after=c{}", n - 1),
+    }
+}
+
+/// Page `page` of the release list: `nodes`, and whether another page follows (after the
+/// cursor `c<page>`).
+fn releases_answer(page: u32, nodes: Vec<Value>, more: bool) -> Value {
+    json!({ "data": { "repository": { "releases": {
+        "pageInfo": { "hasNextPage": more, "endCursor": format!("c{page}") },
+        "nodes": nodes,
+    } } } })
 }
 
 /// The line `key=` of a plan's output.
@@ -486,13 +506,6 @@ fn tag_refs(n: u64) -> Value {
         .collect()
 }
 
-/// A full page of releases, `v9.0.<from>` and the 99 after it.
-fn release_page(from: usize) -> Value {
-    (from..from + 100)
-        .map(|n| json!({ "tag_name": format!("v9.0.{n}") }))
-        .collect()
-}
-
 #[test]
 fn the_release_tags_are_read_in_one_call_however_many_there_are() {
     // Catches: the tags read page by page from an endpoint that ignores `page=` (at 100
@@ -501,7 +514,7 @@ fn the_release_tags_are_read_in_one_call_however_many_there_are() {
     let sha = fx.commit(&[("src/a.rs", Some("a"))]);
     let mut map = serde_json::Map::new();
     map.insert(refs_path(), tag_refs(101));
-    map.insert(releases_path(1), json!([]));
+    map.insert(releases_key(1), releases_answer(1, vec![], false));
     map.insert(
         format!("repos/{REPO}/compare/v0.0.101...{sha}"),
         json!({ "status": "ahead" }),
@@ -518,74 +531,6 @@ fn the_release_tags_are_read_in_one_call_however_many_there_are() {
     // Twice: once for Rule S, once for the version; each a single call with no paging.
     let once = format!("api {}", refs_path());
     assert_eq!(refs, [once.as_str(), once.as_str()], "{asked}");
-}
-
-#[test]
-fn the_releases_are_read_page_after_page_until_a_short_page() {
-    // Catches: only the first 100 releases read (a draft's number on page 2 reused), and a
-    // short page followed by one more request.
-    let fx = fx("release-pages", "9.0\n");
-    let sha = fx.commit(&[("src/a.rs", Some("a"))]);
-    let mut map = serde_json::Map::new();
-    map.insert(refs_path(), json!([]));
-    map.insert(releases_path(1), release_page(0));
-    map.insert(releases_path(2), json!([{ "tag_name": "v9.0.100" }]));
-    fx.write_answers(map);
-    let (code, out, err) = fx.plan(&sha, &[]);
-    assert_eq!(code, Some(0), "{err}");
-    assert_eq!(value(&out, "version"), "9.0.101", "{out}");
-    let asked = fx.gh_args();
-    assert_eq!(asked.matches("/releases?").count(), 2, "{asked}");
-    assert!(!asked.contains("page=3"), "{asked}");
-}
-
-#[test]
-fn a_release_list_that_gives_the_same_full_page_again_fails_the_plan() {
-    // Catches: an endpoint that ignores `page=` read without end (the run that asked for
-    // page 2200 and spent the API's rate limit).
-    let fx = fx("release-repeat", "9.0\n");
-    let sha = fx.commit(&[("src/a.rs", Some("a"))]);
-    let mut map = serde_json::Map::new();
-    map.insert(refs_path(), json!([]));
-    for page in 1..=5 {
-        map.insert(releases_path(page), release_page(0));
-    }
-    fx.write_answers(map);
-    let (code, out, err) = fx.plan(&sha, &[]);
-    assert_eq!(code, Some(1), "{out}");
-    assert_eq!(
-        err.trim_end(),
-        format!(
-            "xtask: gh api repos/{REPO}/releases: page 2 is page 1 again: the endpoint does \
-             not page with `page=`, so the list has no end to read to"
-        ),
-    );
-    assert!(!fx.gh_args().contains("page=3"), "{}", fx.gh_args());
-}
-
-#[test]
-fn a_release_list_still_full_after_100_pages_fails_the_plan() {
-    // Catches: a list whose every page is new and full read without end.
-    let fx = fx("release-cap", "9.0\n");
-    let sha = fx.commit(&[("src/a.rs", Some("a"))]);
-    let mut map = serde_json::Map::new();
-    map.insert(refs_path(), json!([]));
-    for page in 1..=101 {
-        map.insert(releases_path(page), release_page(page as usize * 100));
-    }
-    fx.write_answers(map);
-    let (code, out, err) = fx.plan(&sha, &[]);
-    assert_eq!(code, Some(1), "{out}");
-    assert_eq!(
-        err.trim_end(),
-        format!(
-            "xtask: gh api repos/{REPO}/releases: page 100 is still full (100 entries), the \
-             most pages read of one list: stopped rather than read on"
-        ),
-    );
-    let asked = fx.gh_args();
-    assert!(asked.contains("page=100\n"), "{asked}");
-    assert!(!asked.contains("page=101"), "{asked}");
 }
 
 #[test]
