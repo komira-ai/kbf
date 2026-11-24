@@ -34,6 +34,7 @@ impl RunPrepare for Idle {
         &self,
         _: &str,
         _: &kbf_types::Digest,
+        _decoded: Option<&kbf_proto::reapi::Action>,
         _: std::time::SystemTime,
         _: std::time::Duration,
     ) -> Result<PreparedPutDir, PrepareError> {

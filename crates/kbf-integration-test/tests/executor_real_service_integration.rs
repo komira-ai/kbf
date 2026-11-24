@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use js_proto::v1::{Job, JobState, ListJobsRequest, ResultReason};
-use kbf_front::{Described, Dispatch as _, Finished, Recorder, Stage, Submission};
+use kbf_front::{DecodedAction, Described, Dispatch as _, Finished, Recorder, Stage, Submission};
 use kbf_job_client::Client;
 use kbf_proto::reapi::Digest;
 use kbf_server::executor::{
@@ -102,7 +102,11 @@ struct FakeInputs {
 
 #[tonic::async_trait]
 impl Inputs for FakeInputs {
-    async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
+    async fn action(
+        &self,
+        action: &Digest,
+        _decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError> {
         let timeouts = self.timeouts.lock().unwrap_or_else(PoisonError::into_inner);
         let timeout = timeouts.get(&action.hash).copied();
         Ok(ActionFacts {
@@ -144,6 +148,7 @@ impl Ingest for FakeIngest {
         _action: &Digest,
         _wall: Duration,
         _tree: InputTree,
+        _decoded: Option<&DecodedAction>,
     ) -> Result<PackKey, MintError> {
         let key = PackKey::new(format!("cas/b/{}/0-0", build_id(run)));
         let dir = self.put.join(key.as_str());
@@ -294,6 +299,7 @@ impl Rig {
                 label: Default::default(),
             },
             evidence: Default::default(),
+            decoded: None,
             arrival: kbf_front::Arrival::now(),
         };
         let ticket = self.exec.submit(submission).expect("the executor takes it");

@@ -150,11 +150,10 @@ impl Series for Phase {
     const HELP: &'static str = "How long the phases of an executor run took, by phase; each \
                                 phase is between two moments the executor saw, not the host's \
                                 own instants";
-    const LABEL: &'static str = "phase";
     const ALL: &'static [Self] = &Self::ALL;
 
-    fn label(self) -> &'static str {
-        Self::label(self)
+    fn labels(self) -> String {
+        format!("phase=\"{}\"", self.label())
     }
 
     fn slot(self) -> usize {

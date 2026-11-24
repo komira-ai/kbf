@@ -92,7 +92,9 @@ impl Frontend {
 
     /// The run of `action` prepared, as the executor asks for it once the Execute submitted it.
     async fn prepare(&self, action: &Digest) -> Result<PutDirRun, PrepareError> {
-        self.prep.prepare_put_dir(LEASE, action, now(), WALL).await
+        self.prep
+            .prepare_put_dir(LEASE, action, None, now(), WALL)
+            .await
     }
 
     /// The counter `name` on the backend's metrics page.

@@ -150,7 +150,8 @@ async fn keep(inner: &Arc<Inner>, sweep: bool) {
             ops.open(operation, key.clone()).1
         };
         inner.deps.metrics.reattached();
-        let op = Op::new(operation, key, row.whole_machine, false, None);
+        // Taken up from the state store: its runs read the Action and the Command from the CAS.
+        let op = Op::new(operation, key, (row.whole_machine, None), false, None);
         tokio::spawn(run::run(
             Arc::clone(inner),
             op,

@@ -12,7 +12,7 @@ use kbf_types::OperationId;
 use super::*;
 use crate::executor::rows::OpRow;
 use crate::executor::task::RunId;
-use crate::executor::tests::{Rig, digest_of, settle};
+use crate::executor::tests::{Rig, digest_of, locked, settle};
 use crate::executor::{job_id, stored_name};
 
 const BEAT: Duration = Duration::from_secs(5);
@@ -369,6 +369,39 @@ async fn a_taken_up_operation_places_a_refused_start_again_within_the_default_ti
              would come after the action's deadline (20s from when it was asked for): \
              host-held {attempt} (not the action's own failure)"
         )
+    );
+    running.stop().await;
+}
+
+/// Catches a run of a taken-up operation given a decode it does not have (another process's
+/// Execute decoded the Action and the Command, and nothing of it is in the row): the run of an
+/// operation taken up from a gone process asks its facts and its mint with no decode, so both
+/// read the Action and the Command from the CAS.
+#[tokio::test(start_paused = true)]
+async fn a_taken_up_operation_runs_with_no_decode() {
+    let rig = Rig::stored().await;
+    let old = gone_job(&rig, 61, 0);
+    rig.rows("gone")
+        .put_op(OperationId(61), &row(1, &old, None))
+        .expect("row");
+    let running = Running::spawn(&rig.exec);
+    running.kept(1).await;
+    let next = job_id(&rig.cfg.frontend, RunId::new(OperationId(61), 1));
+
+    rig.until("the next attempt is submitted", || {
+        rig.fake.submitted(&next).is_some()
+    })
+    .await;
+
+    assert_eq!(
+        *locked(&rig.inputs.decoded),
+        [None],
+        "the facts read the CAS"
+    );
+    assert_eq!(
+        *locked(&rig.ingest.minted_decoded),
+        [None],
+        "so does the mint"
     );
     running.stop().await;
 }

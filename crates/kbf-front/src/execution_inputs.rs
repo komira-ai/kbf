@@ -12,6 +12,11 @@
 //! is refused, is the answer over whatever the walk found (MISSING, or a store that failed);
 //! then a walk that failed; and
 //! only then the MISSING of every blob not held, the Command's first.
+//!
+//! The decoded Action and Command go to the dispatcher with the submission
+//! ([`Submission::decoded`]), so the run's preparation reads neither from the CAS again.
+
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::join;
@@ -24,8 +29,8 @@ use tokio::time::Instant;
 use tonic::Status;
 
 use super::{
-    ExecutionService, Presubmit, REFUSED_LOGGED, Submission, missing, platform, required,
-    wants_whole_machine,
+    DecodedAction, ExecutionService, Presubmit, REFUSED_LOGGED, Submission, missing, platform,
+    required, wants_whole_machine,
 };
 use crate::described::Described;
 use crate::wire;
@@ -114,18 +119,26 @@ impl<D> ExecutionService<D> {
         if let Some(at) = walked.held_since {
             self.cache.vouch(action, at.min(reading));
         }
+        // The Command is here: an absent one returned MISSING above.
+        let described = command.clone().map(Described::of).unwrap_or_default();
+        let decoded = command.map(|command| {
+            Arc::new(DecodedAction {
+                action: decoded,
+                command,
+            })
+        });
         let submission = Submission {
             key: ActionKey { instance, action },
             whole_machine,
             call: None,
-            // The Command is here: an absent one returned MISSING above.
-            described: command.map(Described::of).unwrap_or_default(),
+            described,
             evidence: Evidence {
                 cpu_source: BookSource::default(),
                 memory_source: BookSource::default(),
                 input_bytes,
                 input_files,
             },
+            decoded,
             arrival: window.arrival,
         };
         Ok((submission, command_digest))

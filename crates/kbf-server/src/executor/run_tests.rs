@@ -120,7 +120,9 @@ async fn a_submit_whose_answer_was_lost_is_resent_with_the_same_spec_and_counted
     let step = |part: &str, step: &str| {
         let mut page = String::new();
         rig.metrics.render(&mut page);
-        let series = format!("kbf_executor_step_seconds_{part}{{step=\"{step}\"}} ");
+        let form = if step == "facts" { "none" } else { "manifests" };
+        let series =
+            format!("kbf_executor_step_seconds_{part}{{step=\"{step}\",form=\"{form}\"}} ");
         page.lines()
             .find_map(|line| line.strip_prefix(&series).map(str::to_owned))
             .unwrap_or_else(|| panic!("no {series}"))

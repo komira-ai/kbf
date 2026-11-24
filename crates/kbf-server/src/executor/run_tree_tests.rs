@@ -73,7 +73,7 @@ async fn every_attempt_submits_its_job_only_once_its_tree_is_stored() {
     assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));
     assert_eq!(asked(&rig), [run0, run1], "each waited for once");
     assert_eq!(
-        rig.counted("kbf_executor_step_seconds_count{step=\"tree_wait\"} "),
+        rig.counted("kbf_executor_step_seconds_count{step=\"tree_wait\",form=\"manifests\"} "),
         2
     );
 }
@@ -201,7 +201,7 @@ async fn the_row_is_written_while_the_tree_is_written() {
     assert_eq!(stored(&rig), []);
     assert_eq!(rig.calls_of("SubmitJob"), 0);
     assert_eq!(
-        rig.counted("kbf_executor_step_seconds_count{step=\"row\"} "),
+        rig.counted("kbf_executor_step_seconds_count{step=\"row\",form=\"manifests\"} "),
         1
     );
     rig.ingest.release.notify_one();

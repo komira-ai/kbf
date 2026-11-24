@@ -38,7 +38,7 @@ fn scratch(name: &str) -> TestDir {
 /// ended.
 async fn walk(prep: &PutDirPrep, action: &Digest) -> KeptClosure {
     let run = prep
-        .prepare_put_dir(LEASE, action, now(), WALL)
+        .prepare_put_dir(LEASE, action, None, now(), WALL)
         .await
         .expect("prepared");
     prep.detached_writes().settled().await;
@@ -186,7 +186,7 @@ async fn a_missing_directory_is_the_same_error_and_is_not_cached() {
     let cache = memory();
     let holed = Watched::holding(parts.without(&[parts.tree.lib])).await;
     let error = prep_over(&holed, &cache)
-        .prepare_put_dir(LEASE, &parts.action, now(), WALL)
+        .prepare_put_dir(LEASE, &parts.action, None, now(), WALL)
         .await
         .expect_err("refused");
     assert!(
@@ -227,7 +227,7 @@ async fn an_undecodable_directory_is_the_same_error_and_is_not_cached() {
     for _ in 0..2 {
         forget_reads(&store);
         let error = prep
-            .prepare_put_dir(LEASE, &action.0, now(), WALL)
+            .prepare_put_dir(LEASE, &action.0, None, now(), WALL)
             .await
             .expect_err("refused");
         assert!(
@@ -269,7 +269,7 @@ async fn a_directory_with_a_malformed_digest_is_the_same_error_and_is_not_cached
     for _ in 0..2 {
         forget_reads(&store);
         let error = prep
-            .prepare_put_dir(LEASE, &action.0, now(), WALL)
+            .prepare_put_dir(LEASE, &action.0, None, now(), WALL)
             .await
             .expect_err("refused");
         assert!(
@@ -315,7 +315,7 @@ async fn an_undecodable_disk_entry_falls_back_to_the_store() {
     .await;
     let cache = DirectoryCache::open(dir.path(), DIRECTORY_MEMORY_BYTES, 1 << 20);
     let error = prep_over(&store, &Arc::new(cache.expect("a cache")))
-        .prepare_put_dir(LEASE, &action.0, now(), WALL)
+        .prepare_put_dir(LEASE, &action.0, None, now(), WALL)
         .await
         .expect_err("refused");
     assert!(
@@ -404,7 +404,7 @@ async fn mint_put_dir_gives_the_dir_the_mint_verifies_and_reads_nothing() {
         .await
         .expect("minted");
     let run = prep
-        .prepare_put_dir(LEASE, &parts.action, now(), WALL)
+        .prepare_put_dir(LEASE, &parts.action, None, now(), WALL)
         .await
         .expect("prepared");
     assert_eq!(minted.dir, run.dir);

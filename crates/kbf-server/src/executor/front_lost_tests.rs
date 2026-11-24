@@ -47,7 +47,7 @@ fn counting(runs: &Arc<AtomicUsize>, answer: Result<(), String>) -> Republish {
 /// The tree a mint of `action` wrote, in hex, and the mint's answer.
 async fn mint_tree(rig: &Rig, action: &Digest) -> Result<String, MintError> {
     rig.front
-        .mint(lease(), action, WALL, InputTree::Manifests)
+        .mint(lease(), action, WALL, InputTree::Manifests, None)
         .await?;
     // The tree is remembered once its writes end, as the executor waits for them before a
     // submit; the answer is the mint's, which is what these tests assert.
@@ -320,7 +320,7 @@ async fn a_lost_tree_list_has_the_next_list_written_checked_once() {
     let action = action_with_input(&rig, "input").await;
     let mint = || async {
         rig.front
-            .mint(lease(), &action, WALL, InputTree::Provider)
+            .mint(lease(), &action, WALL, InputTree::Provider, None)
             .await
             .expect("a dir");
         let _writes = rig.front.stored(lease()).await;
