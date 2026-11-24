@@ -10,9 +10,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::api;
+use super::{api, graphql};
 use crate::Error;
-use crate::pages::{PER_PAGE, Pages};
+use crate::pages::MAX_PAGES;
 
 /// The `MAJOR.MINOR` a `VERSION` file holds: a release's version without its patch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -82,23 +82,65 @@ fn entries(got: Option<Value>, path: &str) -> Result<Vec<Value>, Error> {
     }
 }
 
-/// Every entry of a GitHub list at `path`, page after page (100 a page) until a page is
-/// short; [`Pages`] ends it with an error on a repeated page or at its cap.
-fn listed(gh: &Path, path: &str) -> Result<Vec<Value>, Error> {
+/// The GraphQL read of one page of releases: the two fields a release is read for, and the
+/// cursor of the next page. REST's `repos/<repo>/releases` answers each release with every
+/// asset it carries (81 a release here, about 145 kB): a page of 100 is about 16 MB and
+/// takes GitHub 5 to 8 seconds, close enough to its 10-second limit that it answers 504.
+pub const RELEASES_QUERY: &str = "query($owner: String!, $name: String!, $after: String) { \
+     repository(owner: $owner, name: $name) { releases(first: 100, after: $after) { \
+     pageInfo { hasNextPage endCursor } nodes { tagName isDraft } } } }";
+
+/// What the release list is named in errors.
+fn releases_what(repo: &str) -> String {
+    format!("gh api graphql releases of {repo}")
+}
+
+/// Every release of `repo` (`{tagName, isDraft}`), page after page until GitHub says no
+/// page follows. A page that is not there, a next page with no cursor, a cursor given
+/// twice (the read would never end) or a next page after [`MAX_PAGES`] is an error.
+fn releases(gh: &Path, repo: &str) -> Result<Vec<Value>, Error> {
+    let what = releases_what(repo);
+    // A `repo` with no `/` asks for an empty name, which GraphQL refuses.
+    let (owner, name) = repo.split_once('/').unwrap_or((repo, ""));
     let mut all = Vec::new();
-    let mut pages = Pages::new(path);
-    loop {
-        let got = api(
-            gh,
-            &format!("{path}?per_page={PER_PAGE}&page={}", pages.number()),
-        )?;
-        let got = entries(got, path)?;
-        let more = pages.more(&got)?;
-        all.extend(got);
+    let mut seen = BTreeSet::new();
+    let mut after: Option<String> = None;
+    for n in 1..=MAX_PAGES {
+        let mut vars = vec![("owner", owner), ("name", name)];
+        if let Some(cursor) = &after {
+            vars.push(("after", cursor));
+        }
+        let got = graphql(gh, RELEASES_QUERY, &vars)?;
+        let list = &got["data"]["repository"]["releases"];
+        let (Some(nodes), Some(more)) = (
+            list["nodes"].as_array(),
+            list["pageInfo"]["hasNextPage"].as_bool(),
+        ) else {
+            return Err(Error::Failed(format!(
+                "{what}: page {n}: no list of entries"
+            )));
+        };
+        all.extend(nodes.iter().cloned());
         if !more {
             return Ok(all);
         }
+        let Some(cursor) = list["pageInfo"]["endCursor"].as_str() else {
+            return Err(Error::Failed(format!(
+                "{what}: page {n} says another page follows but gives no cursor to it"
+            )));
+        };
+        if !seen.insert(cursor.to_owned()) {
+            return Err(Error::Failed(format!(
+                "{what}: page {n} gives the cursor {cursor:?} again, so the list has no end \
+                 to read to"
+            )));
+        }
+        after = Some(cursor.to_owned());
     }
+    Err(Error::Failed(format!(
+        "{what}: page {MAX_PAGES} says another page follows, the most pages read of one \
+         list: stopped rather than read on"
+    )))
 }
 
 /// The versions of the release tags of `repo` (its `v*` refs). GitHub's
@@ -116,28 +158,27 @@ pub fn tag_versions(gh: &Path, repo: &str) -> Result<Vec<Version>, Error> {
 /// The versions of the releases of `repo`, drafts among them (a draft names a tag it
 /// may not have yet, and its number is taken all the same).
 pub fn release_versions(gh: &Path, repo: &str) -> Result<Vec<Version>, Error> {
-    let releases = listed(gh, &format!("repos/{repo}/releases"))?;
-    Ok(releases
+    Ok(releases(gh, repo)?
         .iter()
-        .filter_map(|r| Version::parse_tag(r["tag_name"].as_str()?))
+        .filter_map(|r| Version::parse_tag(r["tagName"].as_str()?))
         .collect())
 }
 
 /// The tags of the published releases of `repo`: every release that is not a draft. A
-/// release whose `draft` is not a boolean is an error, not a guess either way.
+/// release whose `isDraft` is not a boolean is an error, not a guess either way.
 pub fn published_tags(gh: &Path, repo: &str) -> Result<BTreeSet<String>, Error> {
-    let path = format!("repos/{repo}/releases");
+    let what = releases_what(repo);
     let mut published = BTreeSet::new();
-    for release in listed(gh, &path)? {
-        let tag = release["tag_name"].as_str();
-        match (tag, release["draft"].as_bool()) {
+    for release in releases(gh, repo)? {
+        let tag = release["tagName"].as_str();
+        match (tag, release["isDraft"].as_bool()) {
             (Some(tag), Some(false)) => {
                 published.insert(tag.to_owned());
             }
             (Some(_), Some(true)) => {}
             _ => {
                 return Err(Error::Failed(format!(
-                    "gh api {path}: a release without a tag_name or a boolean draft: {release}"
+                    "{what}: a release without a tagName or a boolean isDraft: {release}"
                 )));
             }
         }

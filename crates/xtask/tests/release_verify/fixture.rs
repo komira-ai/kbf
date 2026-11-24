@@ -217,18 +217,31 @@ pub const GH_REPO: &str = "o/r";
 pub fn fake_gh(fx: &Fx, published: &[&str], drafts: &[&str]) -> PathBuf {
     let releases: Vec<serde_json::Value> = published
         .iter()
-        .map(|t| serde_json::json!({"tag_name": t, "draft": false}))
+        .map(|t| serde_json::json!({"tagName": t, "isDraft": false}))
         .chain(
             drafts
                 .iter()
-                .map(|t| serde_json::json!({"tag_name": t, "draft": true})),
+                .map(|t| serde_json::json!({"tagName": t, "isDraft": true})),
         )
         .collect();
-    fake_gh_api(fx, serde_json::json!({ RELEASES_PAGE_1: releases }))
+    fake_gh_api(
+        fx,
+        serde_json::json!({ RELEASES_PAGE_1: releases_page(releases, None) }),
+    )
 }
 
-/// The first page of the release list, as `release previous` asks for it.
-pub const RELEASES_PAGE_1: &str = "repos/o/r/releases?per_page=100&page=1";
+/// The fake's key for the first page of the GraphQL release list, as `release previous`
+/// asks for it (no cursor).
+pub const RELEASES_PAGE_1: &str = "graphql owner=o name=r";
+
+/// A page of the GraphQL release list holding `nodes`; `next` is the cursor of the page
+/// that follows, `None` on the last page.
+pub fn releases_page(nodes: Vec<serde_json::Value>, next: Option<&str>) -> serde_json::Value {
+    serde_json::json!({ "data": { "repository": { "releases": {
+        "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next },
+        "nodes": nodes,
+    } } } })
+}
 
 /// Makes `xtask-fake` the `gh` of `fx`, answering `gh api` with `api` (its `gh-api.json`).
 pub fn fake_gh_api(fx: &Fx, api: serde_json::Value) -> PathBuf {

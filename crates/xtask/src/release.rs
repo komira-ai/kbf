@@ -162,6 +162,27 @@ pub(crate) fn api(gh: &Path, path: &str) -> Result<Option<Value>, Error> {
         .map_err(|e| Error::Failed(format!("gh api {path}: not JSON: {e}")))
 }
 
+/// `gh api graphql -f query=<query> -f <name>=<value>...`: the JSON it printed. Each
+/// variable is passed as a string (`-f`, never `-F`, which would read `true` or `12` as
+/// another type). Any failure is an error, a GraphQL error included (`gh` exits non-zero on
+/// an answer with `errors`).
+pub(crate) fn graphql(gh: &Path, query: &str, vars: &[(&str, &str)]) -> Result<Value, Error> {
+    let mut cmd = Command::new(gh);
+    cmd.args(["api", "graphql", "-f", &format!("query={query}")]);
+    for (name, value) in vars {
+        cmd.args(["-f", &format!("{name}={value}")]);
+    }
+    let out = cmd
+        .output()
+        .map_err(Error::spawn(gh.display().to_string()))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(Error::Failed(format!("gh api graphql: {}", err.trim_end())));
+    }
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| Error::Failed(format!("gh api graphql: not JSON: {e}")))
+}
+
 /// Appends `lines` to `output` (on Actions, `GITHUB_OUTPUT`), one per line.
 fn append_output(output: &Path, lines: &[String]) -> Result<(), Error> {
     std::fs::OpenOptions::new()
