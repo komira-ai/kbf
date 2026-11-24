@@ -1,16 +1,16 @@
 //! The line each job the service takes writes: one per job, with its ids and the times of its
-//! start as the frontend saw them; none for a submit the service refused or a run cancelled
-//! before its job was taken.
+//! start as the frontend saw them, from the Execute's arrival at the front; none for a submit the
+//! service refused or a run cancelled before its job was taken.
 
 use std::sync::atomic::Ordering;
 
-use kbf_front::{Dispatch, Finished};
+use kbf_front::{Arrival, Dispatch, Finished, Submission};
 use kbf_job_client::fake::Fault;
 use tonic::Code;
 
 use super::*;
 use crate::executor::job_id;
-use crate::executor::tests::Rig;
+use crate::executor::tests::{Caller, Rig};
 use crate::test_log;
 
 /// The message of the line.
@@ -190,4 +190,171 @@ async fn a_run_cancelled_during_its_submit_writes_no_line() {
         "{finished:?}"
     );
     assert_eq!(lines(&log.text()), Vec::<&str>::new());
+}
+
+/// The front's wall-clock arrival the tests hand the executor: a fixed time, so its Unix
+/// milliseconds in the line are exact.
+const REAPI_UNIX_MS: u64 = 1_800_000_000_123;
+
+/// An Execute of the action of `tag` that reached the front at `at`, at [`REAPI_UNIX_MS`] plus
+/// `later_ms` on the wall clock.
+fn arrived(tag: u8, at: Instant, later_ms: u64) -> Submission {
+    Submission {
+        arrival: Arrival {
+            at,
+            unix: UNIX_EPOCH + Duration::from_millis(REAPI_UNIX_MS + later_ms),
+        },
+        ..crate::executor::tests::submission_of(crate::executor::tests::digest_of(tag))
+    }
+}
+
+/// Catches a line whose start figures begin at the executor, not at the front: an Execute that
+/// spent 80 ms at the front before the executor took it writes `presubmit_ms` 80, its front
+/// arrival as `reapi_unix_ms`, and `since_reapi_ms` 80 above `since_execute_ms`; the next
+/// attempt's line keeps both, its `since_execute_ms` counting the first attempt too.
+#[tokio::test(start_paused = true)]
+async fn the_line_counts_the_time_before_the_executor_from_the_fronts_arrival() {
+    let log = test_log::capture();
+    let rig = Rig::start().await;
+    rig.ingest.hold_stored.store(true, Ordering::SeqCst);
+    let front = Instant::now();
+    rig.advance(Duration::from_millis(80)).await;
+    let t0 = Instant::now();
+    let caller = Caller::of(rig.exec.submit(arrived(1, front, 0)).expect("taken"));
+    rig.until("the first run waits for its tree", || {
+        rig.ingest.stored_asked.lock().unwrap().len() == 1
+    })
+    .await;
+    rig.advance(rig.cfg.poll * 2).await;
+    rig.ingest.release.notify_one();
+    let first = rig.submitted(&caller, 0).await;
+    until_lines(&rig, &log, 1).await;
+    let since = ms_since(t0);
+    assert_eq!(since, (rig.cfg.poll * 2).as_millis());
+    let text = log.text();
+    let written = lines(&text);
+    assert_eq!(written.len(), 1, "{text}");
+    ids_and_times(written[0], &rig, RunId::new(caller.operation(), 0));
+    assert_eq!(number(written[0], "since_execute_ms"), since);
+    assert_eq!(number(written[0], "presubmit_ms"), 80);
+    assert_eq!(number(written[0], "since_reapi_ms"), since + 80);
+    assert_eq!(
+        number(written[0], "reapi_unix_ms"),
+        u128::from(REAPI_UNIX_MS)
+    );
+
+    rig.host_runs(&first);
+    assert!(rig.fake.lose(&first));
+    rig.ingest.release.notify_one();
+    let second = rig.submitted(&caller, 1).await;
+    until_lines(&rig, &log, 2).await;
+    let text = log.text();
+    let written = lines(&text);
+    ids_and_times(written[1], &rig, RunId::new(caller.operation(), 1));
+    assert_eq!(number(written[1], "since_execute_ms"), ms_since(t0));
+    assert_eq!(number(written[1], "presubmit_ms"), 80, "one Execute");
+    assert_eq!(number(written[1], "since_reapi_ms"), ms_since(t0) + 80);
+    assert_eq!(
+        number(written[1], "reapi_unix_ms"),
+        u128::from(REAPI_UNIX_MS)
+    );
+    rig.host_finishes(&second, 0);
+    assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));
+}
+
+/// Catches a line that takes the arrival of an Execute joined to a running operation: the
+/// second Execute of the action, which reached the front later, joins before the job is
+/// submitted, and the one line keeps the first Execute's arrival; and an Execute whose front
+/// stamp is the executor's own moment writes `presubmit_ms` 0, the boundary.
+#[tokio::test(start_paused = true)]
+async fn a_joined_execute_leaves_the_line_with_the_first_arrival() {
+    let log = test_log::capture();
+    let rig = Rig::start().await;
+    rig.ingest.hold_stored.store(true, Ordering::SeqCst);
+    let caller = Caller::of(
+        rig.exec
+            .submit(arrived(1, Instant::now(), 0))
+            .expect("taken"),
+    );
+    rig.until("the run waits for its tree", || {
+        rig.ingest.stored_asked.lock().unwrap().len() == 1
+    })
+    .await;
+    rig.advance(rig.cfg.poll).await;
+    let joined = rig
+        .exec
+        .submit(arrived(1, Instant::now(), 5_000))
+        .expect("joined");
+    assert_eq!(joined.name, caller.name, "the same operation");
+    rig.ingest.release.notify_one();
+    rig.submitted(&caller, 0).await;
+    until_lines(&rig, &log, 1).await;
+    let text = log.text();
+    let written = lines(&text);
+    assert_eq!(written.len(), 1, "{text}");
+    assert_eq!(number(written[0], "presubmit_ms"), 0);
+    assert_eq!(
+        number(written[0], "reapi_unix_ms"),
+        u128::from(REAPI_UNIX_MS)
+    );
+    assert_eq!(
+        number(written[0], "since_reapi_ms"),
+        number(written[0], "since_execute_ms")
+    );
+}
+
+/// Catches a line that invents a front arrival for an operation no front handed this process:
+/// one taken up from the state store, whose row names no put directory, runs again here, and
+/// its job's line writes `reapi_unix_ms` 0 and `presubmit_ms` 0, so `since_reapi_ms` is
+/// `since_execute_ms`.
+#[tokio::test(start_paused = true)]
+async fn a_taken_up_operation_writes_no_front_arrival() {
+    let log = test_log::capture();
+    let rig = Rig::stored().await;
+    let action = crate::executor::tests::digest_of(1);
+    let old = job_id(&rig.cfg.frontend, RunId::new(OperationId(60), 0));
+    rig.fake
+        .record(js_proto::v1::JobSpec {
+            job_id: old.clone(),
+            image: crate::executor::tests::IMAGE.to_owned(),
+            wall_limit_seconds: Some(360),
+            network: js_proto::v1::NetworkLevel::None.into(),
+            constraints: Some(rig.cfg.constraints()),
+            ..js_proto::v1::JobSpec::default()
+        })
+        .expect("a job");
+    let row = OpRow {
+        owner: String::new(),
+        instance: "main".to_owned(),
+        hash: action.hash_hex(),
+        size: action.size_bytes,
+        attempt: 0,
+        job: old,
+        key: None,
+        whole_machine: false,
+    };
+    rig.rows("gone").put_op(OperationId(60), &row).expect("row");
+    let running = crate::executor::Running::spawn(&rig.exec);
+    running.kept(1).await;
+    let run = RunId::new(OperationId(60), 1);
+    let next = job_id(&rig.cfg.frontend, run);
+    rig.until("the next attempt is submitted", || {
+        rig.fake.submitted(&next).is_some()
+    })
+    .await;
+    until_lines(&rig, &log, 1).await;
+    let text = log.text();
+    let written: Vec<_> = lines(&text)
+        .into_iter()
+        .filter(|line| line.contains(&format!(" job={next} ")))
+        .collect();
+    assert_eq!(written.len(), 1, "{text}");
+    ids_and_times(written[0], &rig, run);
+    assert_eq!(number(written[0], "reapi_unix_ms"), 0);
+    assert_eq!(number(written[0], "presubmit_ms"), 0);
+    assert_eq!(
+        number(written[0], "since_reapi_ms"),
+        number(written[0], "since_execute_ms")
+    );
+    running.stop().await;
 }

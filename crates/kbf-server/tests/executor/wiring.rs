@@ -245,6 +245,7 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
                 label: Default::default(),
             },
             evidence: Default::default(),
+            arrival: kbf_front::Arrival::now(),
         })
         .expect("the executor takes the action");
     let mut stage = ticket.stage;

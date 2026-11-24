@@ -126,6 +126,7 @@ impl<D> ExecutionService<D> {
                 input_bytes,
                 input_files,
             },
+            arrival: window.arrival,
         };
         Ok((submission, command_digest))
     }

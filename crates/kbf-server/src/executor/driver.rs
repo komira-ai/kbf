@@ -150,7 +150,7 @@ async fn keep(inner: &Arc<Inner>, sweep: bool) {
             ops.open(operation, key.clone()).1
         };
         inner.deps.metrics.reattached();
-        let op = Op::new(operation, key, row.whole_machine, false);
+        let op = Op::new(operation, key, row.whole_machine, false, None);
         tokio::spawn(run::run(
             Arc::clone(inner),
             op,
