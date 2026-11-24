@@ -1,7 +1,8 @@
 //! When a tree list's L2 sidecar is read and written beside the list's own write
 //! (`TreeWriter::write_listing_with`): the sidecar's HEAD is asked while the list's write is held,
 //! the sidecar and the unlisted row are written only once the list is stored, a list whose write
-//! fails fails the tree with no sidecar and no row, a sidecar that fails never fails the list, and
+//! fails fails the tree with no sidecar and no row, a sidecar whose reads or write fail never
+//! fails the list, and
 //! the list, its sidecar and its blobs are timed as stages of their own.
 //!
 //! Writes are held by the fake store's gate and the write is polled by hand, so which writes are
@@ -201,6 +202,37 @@ async fn a_sidecar_that_fails_still_returns_the_stored_list() {
     assert!(rig.farm.object(&sidecar).is_none(), "no sidecar");
     let failed = "kbf_l2_sidecars_total{result=\"failed\"}";
     assert_eq!(counted(&counters, failed), "1");
+}
+
+/// Catches a failure of the sidecar's reads beside the list's write that fails the list, or that
+/// is not counted: with the sidecar's HEAD failing while the list is written, the list is stored
+/// and returned, no sidecar is written, the failure is counted once, and both the list and the
+/// sidecar are timed.
+#[tokio::test]
+async fn a_sidecar_whose_reads_fail_beside_the_list_still_returns_the_stored_list() {
+    let key = list_key().await;
+    let sidecar = tierstore_list::sidecar_key(&id_of(&key));
+    let (rig, index, counters) = counted_rig(Rig::new().await);
+    hold_named_objects(&rig);
+    record_named_cells(&rig, &index).await;
+    let root = one_file_root(&rig).await;
+    rig.farm.state().faults.head_of = Some(sidecar.clone());
+    let timed = Arc::default();
+
+    let listing = write(&rig, &root, &timed).await.expect("a listing");
+
+    assert_eq!(listing.key(), key);
+    assert!(rig.farm.object(&key).is_some(), "the list is stored");
+    assert!(rig.farm.object(&sidecar).is_none(), "no sidecar");
+    assert_eq!(
+        rig.farm.puts(),
+        std::slice::from_ref(&key),
+        "no sidecar write"
+    );
+    let failed = "kbf_l2_sidecars_total{result=\"failed\"}";
+    assert_eq!(counted(&counters, failed), "1");
+    let stages: Vec<WriteStage> = timed.lock().expect("timed").iter().map(|t| t.0).collect();
+    assert_eq!(stages, [WriteStage::List, WriteStage::Sidecar]);
 }
 
 /// Catches a tree list's stages not timed, timed twice, or its sidecar timed as if it began after

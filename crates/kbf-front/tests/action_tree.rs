@@ -102,6 +102,8 @@ struct Faults {
     delay: Option<Duration>,
     /// The checks of a pack against the store.
     check: Fault,
+    /// A key whose length the store fails to tell (a HEAD that fails).
+    head_of: Option<String>,
 }
 
 #[derive(Default)]
@@ -471,6 +473,9 @@ impl LargeStore for Farm {
     ) -> BoxFuture<'a, Result<Option<u64>, ObjectStoreError>> {
         let mut state = self.state();
         state.heads_of.push(key.to_string());
+        if state.faults.head_of.as_deref() == Some(key.as_str()) {
+            return Box::pin(async { Err(ObjectStoreError::Unsupported("heads of this key")) });
+        }
         let length = state
             .objects
             .get(key.as_str())
