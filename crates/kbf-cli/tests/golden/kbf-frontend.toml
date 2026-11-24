@@ -214,9 +214,9 @@ job-reads-in-flight = 32
 # drain-deadline = "SECONDS"
 # How long, in seconds, a drain (a stop signal or `POST /v1/frontend/drain`) keeps serving everything after `/readyz` has begun to answer 503, so that the load balancer's health check sees it before any call is refused: at least its check interval times its unhealthy threshold, and the time its routes take to change. Then new Execute calls are refused UNAVAILABLE and every listener is sent GOAWAY. 0 goes on at once. The container's stop timeout must exceed this and the longest action to be waited for.
 drain-lb-wait = 10
-# How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused)
+# How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a quiet connection. 0 sends none and closes none (`--http2-keepalive-timeout-secs` unused)
 http2-keepalive-interval-secs = 30
-# How long, in seconds, a PING may go unanswered before the connection is closed, failing every action on it: the default outlasts a client's path that stalls for a minute
+# How long, in seconds, a connection may move nothing either way after the PING interval before it is closed, failing every action on it: a read from the client (a PING's answer is one) or a write the socket had held back going through moves it, so a client still reading a download over a slow path is kept however late a PING's answer comes behind it. The default outlasts a client's path that stalls for a minute
 http2-keepalive-timeout-secs = 120
 # The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves plain text, on any address; off loopback the start line carries a warning
 listen = "127.0.0.1:8980"
