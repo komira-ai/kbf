@@ -71,6 +71,9 @@ pub mod build_seq;
 pub mod cold_apply;
 mod cold_counted;
 pub mod config;
+mod conn_watch;
+#[cfg(test)]
+mod conn_watch_tests;
 mod deny_rows;
 pub mod drain;
 pub mod enroll;

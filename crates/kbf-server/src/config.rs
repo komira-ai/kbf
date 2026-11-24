@@ -319,10 +319,10 @@ pub struct Args {
     #[arg(long, default_value_t = 30)]
     pub progress_interval_secs: u64,
     /// How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a
-    /// quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused).
+    /// quiet connection. 0 sends none and closes none (`--http2-keepalive-timeout-secs` unused).
     #[arg(long, default_value_t = 30)]
     pub http2_keepalive_interval_secs: u64,
-    /// How long, in seconds, a PING may go unanswered before the connection is closed, failing every action on it: the default outlasts a client's path that stalls for a minute.
+    /// How long, in seconds, a connection may move nothing either way after the PING interval before it is closed, failing every action on it: a read from the client (a PING's answer is one) or a write the socket had held back going through moves it, so a client still reading a download over a slow path is kept however late a PING's answer comes behind it. The default outlasts a client's path that stalls for a minute.
     #[arg(long, default_value_t = 120)]
     pub http2_keepalive_timeout_secs: u64,
     /// Thread sizes: the overrides `--async-threads`, `--blocking-threads` and

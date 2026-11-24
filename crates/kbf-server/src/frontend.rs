@@ -999,13 +999,14 @@ impl<'a> Prepared<'a> {
         // Both listeners are closed the moment the drain begins and the worker listener
         // is stopped, whatever the transport is doing then.
         let (reapi_incoming, reapi_latch) = reapi.grpc(listeners.reapi_tls)?;
+        let reapi_incoming = crate::conn_watch::watched(reapi_incoming, listeners.streams);
         drain.begins().closes(reapi_latch);
         let worker_incoming = worker
             .map(|socket| socket.grpc(worker_tls))
             .transpose()?
             .map(|(incoming, latch)| {
                 worker_stop.closes(latch);
-                incoming
+                crate::conn_watch::watched(incoming, listeners.streams)
             });
         let api_listeners = api_socket.map(Socket::http_pair).transpose()?;
         let token = api.and_then(|api| api.token);

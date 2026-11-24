@@ -20,6 +20,7 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use tower_layer::{Identity, Stack};
 
+use crate::conn_watch::watched;
 use crate::drain::Drain;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::{Checks, Readiness};
@@ -93,10 +94,10 @@ pub struct StreamTiming {
     /// How often the REAPI and worker listeners send an HTTP/2 PING on a connection
     /// that has been quiet (`--http2-keepalive-interval-secs`).
     pub keepalive_interval: Duration,
-    /// How long a PING may go unanswered before the connection is closed
-    /// (`--http2-keepalive-timeout-secs`; GOAWAY NO_ERROR, then the close). That fails
-    /// every action on the connection, so the default, two minutes, outlasts a client's
-    /// path that stalls for a minute and then carries on.
+    /// How long, after the PING interval, a connection may move nothing either way before
+    /// it is closed (`--http2-keepalive-timeout-secs`; see [`crate::conn_watch`]). That
+    /// fails every action on the connection, so the default, two minutes, outlasts a
+    /// client's path that stalls for a minute and then carries on.
     pub keepalive_timeout: Duration,
 }
 
@@ -372,14 +373,15 @@ pub(crate) fn flow_control(server: Server, max_streams: u32) -> Server {
         .initial_connection_window_size(Some(windows.connection))
 }
 
-/// `server` pinging a quiet connection every `timing.keepalive_interval` and closing it
-/// when a ping stays unanswered for `timing.keepalive_timeout` (HTTP/2 PING, which a
-/// peer must answer even when it never sends data).
+/// `server` pinging a connection that has read nothing for `timing.keepalive_interval`
+/// (HTTP/2 PING, which a peer must answer even when it never sends data). Its answer is
+/// what moves a quiet connection; what closes a connection that stops moving is the watch
+/// on its listener's connections ([`crate::conn_watch::watched`]).
 pub(crate) fn keepalive(server: Server, timing: StreamTiming) -> Server {
     let on = !timing.keepalive_interval.is_zero();
     server
         .http2_keepalive_interval(on.then_some(timing.keepalive_interval))
-        .http2_keepalive_timeout(on.then_some(timing.keepalive_timeout))
+        .http2_keepalive_timeout(on.then_some(crate::conn_watch::PING_ANSWER_WAIT))
 }
 
 /// The members a frontend with a state store keeps, promoting joiners by their own beats
@@ -684,8 +686,14 @@ where
         .chain(&worker_tls)
         .cloned()
         .collect();
-    let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
-    let worker_incoming = Incoming::new(worker_incoming, worker_tls);
+    let reapi_incoming = watched(
+        Incoming::new(reapi_incoming, listeners.reapi_tls),
+        listeners.streams,
+    );
+    let worker_incoming = watched(
+        Incoming::new(worker_incoming, worker_tls),
+        listeners.streams,
+    );
     let probe_timeout = listeners.store_probe_timeout;
     let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));
     // One line: a `?` alone on its own line is a never-taken error region, a missed
