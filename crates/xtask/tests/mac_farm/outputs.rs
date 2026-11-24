@@ -429,3 +429,79 @@ fn a_read_into_a_writer_that_fails_ends_with_its_error() {
         format!("write the blob {}: no space left", digest.hash)
     );
 }
+
+/// The verb's flags as clap reads them from a command line.
+#[derive(clap::Parser)]
+struct Line {
+    #[command(flatten)]
+    args: Args,
+}
+
+/// Catches `--output` read once when it is given twice, `--out-dir` not reaching the run, and
+/// either flag missing from the verb's command line: a command line as a workflow step writes
+/// it, parsed by clap, declares both outputs and writes them below the out dir.
+#[test]
+fn the_command_line_declares_each_output_and_names_the_out_dir() {
+    use clap::Parser as _;
+    let rig = Rig::new();
+    let kbf = rig.put(b"kbf");
+    let deploy = rig.put(b"kbf-deploy");
+    rig.state.queue(Answer::Updates(vec![answered(
+        "op/line",
+        &passed(
+            vec![
+                file("bin/kbf", &kbf, true),
+                file("bin/kbf-deploy", &deploy, true),
+            ],
+            vec![],
+        ),
+    )]));
+    let dir = scratch("command-line");
+    let out = dir.path().join("out");
+    let address = format!("grpc://{}", rig.addr);
+    let scratch_dir = dir.path().join("scratch");
+    let argv: Vec<String> = [
+        "mac-farm",
+        "--address",
+        &address,
+        "--tls",
+        "false",
+        "--properties",
+        "OSFamily=macos",
+        "--scratch",
+        &scratch_dir.display().to_string(),
+        "--output",
+        "bin/kbf",
+        "--output",
+        "bin/kbf-deploy",
+        "--out-dir",
+        &out.display().to_string(),
+        "--",
+        "build",
+        "--release",
+    ]
+    .iter()
+    .map(|a| (*a).to_owned())
+    .collect();
+    let line = Line::try_parse_from(&argv).expect("the flags parse");
+    assert_eq!(line.args.outputs, ["bin/kbf", "bin/kbf-deploy"]);
+    assert_eq!(line.args.out_dir.as_deref(), Some(out.as_path()));
+    let as_strs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    assert_eq!(xtask::check_args(&as_strs), Ok(()));
+    let (result, _, stderr) = rig.run_in(&dir, |_| line.args);
+    assert_eq!(
+        result.expect("ok"),
+        ["ok: `cargo build --release` passed on a farm Mac"]
+    );
+    let (_, command) = rig.executed(0);
+    assert_eq!(command.output_paths, ["bin/kbf", "bin/kbf-deploy"]);
+    assert_eq!(std::fs::read(out.join("bin/kbf")).expect("kbf"), b"kbf");
+    assert_eq!(
+        std::fs::read(out.join("bin/kbf-deploy")).expect("kbf-deploy"),
+        b"kbf-deploy"
+    );
+    assert!(stderr.ends_with(&format!(
+        "mac-farm: 2 output files (13 bytes) written below {}\n",
+        out.display()
+    )));
+}
