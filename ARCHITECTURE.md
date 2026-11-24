@@ -120,7 +120,8 @@ the jobscheduler's job service, submitted at once by the frontend's executor (`-
 js-agent`, the only value) with no CPU or memory, the build target and what runs as its size-class label and
 the action's kind (what runs) as its size-fallback label.
 kbf does not schedule: how many jobs run, where and when is the job service's. The executor
-reads each job back every `--executor-poll-ms` (250 ms) until it ends
+reads each job back at once, then while it has not started at waits from 10 ms doubling up to
+`--executor-poll-ms` (250 ms), and every `--executor-poll-ms` until it ends
 ([direct-js.md](docs/design/direct-js.md)). The job is the
 `kbf-task` tool (crate `kbf-task`), which runs the action's Command and commits its outputs
 into a put directory that the frontend then reads once, hashes and records. With no
@@ -238,7 +239,7 @@ client                      kbf frontend                             job service
   |                            |    the same action, or open a new one   |
   |<-- QUEUED -----------------| 4. write exec/op/<id>, submit the job --->| kbf-task runs the action,
   |                            |    (no CPU, no memory, size class)      | writes outputs to its put dir
-  |                            |<-- GetJob every --executor-poll-ms -----|
+  |                            |<-- GetJob at once, then <= poll apart --|
   |                            |<-- job ended ---------------------------|
   |                            | 5. read the pack, hash, outputs stored? |
   |                            | 6. accept, write the AC entry           |

@@ -9,8 +9,9 @@
 //! The companions are the frontend's own. They are not refused without `--executor`, so a
 //! `kbf.toml` that names the job service starts with or without the executor.
 //!
-//! Every Execute is one job of the job service, submitted at once and read back every
-//! `--executor-poll-ms` ([`crate::executor::Executor`]): there are no virtual workers, no slots
+//! Every Execute is one job of the job service, submitted at once and read back at once, then
+//! at waits that double from 10 ms up to `--executor-poll-ms` while it has not started, and
+//! every `--executor-poll-ms` while it runs ([`crate::executor::Executor`]): there are no virtual workers, no slots
 //! and no ownership modes. Over a `--state-store` each frontend keeps a row for every operation
 //! and a liveness row that lives `--executor-live-secs`; once a frontend's row has expired,
 //! another frontend of the store takes up its unfinished operations. Every frontend of one farm
@@ -373,9 +374,10 @@ pub(super) fn args() -> Vec<Arg> {
             .value_parser(clap::value_parser!(u64).range(100..=10_000))
             .default_value(DEFAULT_POLL_MS)
             .help(
-                "How often each operation's job is read back from the job service, and a \
-                 submit whose answer was lost is sent again, in milliseconds: 100 to 10000. \
-                 Used only with `--executor js-agent`",
+                "How often each operation's running job is read back from the job service, \
+                 and a submit whose answer was lost is sent again, in milliseconds: 100 to \
+                 10000. A job is read at once when submitted, and while it has not started \
+                 again after 10 ms, doubling up to this. Used only with `--executor js-agent`",
             ),
         number(
             PREPARE_LIMIT,

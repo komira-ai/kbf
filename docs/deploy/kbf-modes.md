@@ -170,8 +170,10 @@ say: it serves the cache and the CAS and answers an Execute that misses the cach
 `FAILED_PRECONDITION`.
 
 kbf does not schedule. The job is submitted at once, with no count, queue or capacity in kbf: how
-many jobs run, where and when is the job service's. The frontend reads each job back every
-`--executor-poll-ms` (250 ms; 100 to 10000) until it ends and answers the operation. Stopping the
+many jobs run, where and when is the job service's. The frontend reads each job back as soon as it
+is submitted; while the job is queued, placed or starting, again after 10 ms, then 20, 40 and so on,
+doubling up to `--executor-poll-ms` (250 ms; 100 to 10000); once it runs, every `--executor-poll-ms`
+until it ends, and answers the operation. Stopping the
 frontend cancels nothing: its jobs run on, and over a `--state-store` another frontend, or the same
 one restarted, takes the operations up (below). A Linux job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
 the job's arguments are the tool's flags and nothing is mounted into the container. It names no
@@ -349,7 +351,7 @@ adds to the action's timeout), `--executor-failed-stderr-log-bytes` (512, at mos
 none: the end of a failed job's standard error is one WARN line
 of the frontend's log, `the end of the standard error of a job that did not end well`; the whole
 output goes with the result as before), `--executor-max-run-secs` and `--executor-default-timeout-secs`
-(3000), `--executor-call-timeout-secs` (5), `--executor-poll-ms` (250, from 100 to 10000: how often each operation's job is read back from the job service), `--executor-prepare-limit-secs` (300: how long a run's input
+(3000), `--executor-call-timeout-secs` (5), `--executor-poll-ms` (250, from 100 to 10000: how often each operation's running job is read back from the job service, and the longest wait between the reads of a job that has not started, which begin 10 ms apart and double), `--executor-prepare-limit-secs` (300: how long a run's input
 tree may take to publish). A job is given no network, whatever a `kbf.toml` of the releases before
 said with `--executor-network`. A setting that breaks a rule the executor's safety rests on is
 refused at start, exit status 2. A server that has more than
@@ -425,9 +427,10 @@ its action tree named), `start` (ready to the job service answering the submit w
 the tree's writes, with the operation's row written meanwhile, then each `SubmitJob`), `queue` (accepted to first read back as running), `task` (first
 read back as running to read back as ended), `run` (accepted to read back as ended, whether or not
 it was seen running), `ingest` (read back as ended to the read of the pack done), `submit` (the Execute to the job service's answer to its submit) and `execute` (the Execute to its callers answered). They are
-stamped by the executor on its own clock, once per poll of each job, and the job service learns a
+stamped by the executor on its own clock at its reads of each job (at once, then at steps from
+10 ms doubling to the poll while the job has not started, then once per poll), and the job service learns a
 job's state from its host's agent, which trails the host by one or two beats: `queue`, `task` and
-`run` are good to a pass plus a heartbeat or two, not to the instant the host started or ended the
+`run` are good to the wait between two reads (at most a poll) plus a heartbeat or two, not to the instant the host started or ended the
 job, and a job that starts and ends between two reads has a `run` and no `queue` or `task`. A phase that was not observed
 is absent, never zero. The buckets start at 1 ms. Where `prepare` and `start` go is the histogram
 `kbf_executor_step_seconds{step=...}`, each step timed around its one wait: `facts`, `put_dir` (with the closure's

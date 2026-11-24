@@ -12,7 +12,8 @@
 //! writes before it submits its job, since the job's host opens the tree as soon as the job is
 //! placed and a tree not yet in the store fails the job's start; a failed write ends the run
 //! with no job submitted, and a cancel then ends it with nothing to withdraw. The job is then read
-//! back every poll until it ends ([`outcome::judge`](super::outcome)): a job that ended well has
+//! back at once, while it has not started at steps that double up to the poll
+//! ([`super::pace`]), and every poll while it runs, until it ends ([`outcome::judge`](super::outcome)): a job that ended well has
 //! its pack ingested and answers the callers with the result, unless the action exited nonzero
 //! because its host could not read a declared input
 //! ([`Ingest::unreadable_input`](super::Ingest::unreadable_input)), which is an ending of the
@@ -71,6 +72,7 @@ use super::outcome::{
     refused,
 };
 use super::output::{Output, Tail};
+use super::pace::Pace;
 use super::phases::{Mark, Phase, Timeline};
 use super::record;
 use super::refused::{Refusal, Refusals};
@@ -619,9 +621,11 @@ async fn cancel_once(inner: &Inner, job: &str, left: &mut u32) -> bool {
     answered(&answer) || *left == 0
 }
 
-/// Reads the job back every poll until it ends, and makes what it ended as of it. While the job
-/// service is busy the reads wait longer ([`Busy::pause`](super::busy::Busy::pause)) and decide
-/// nothing; only a job the service says it no longer knows ends the run.
+/// Reads the job back until it ends, and makes what it ended as of it: the first read at once,
+/// the reads of a job that has not started steps apart that double up to the poll
+/// ([`super::pace`]), and every other read a poll after the last. While the job service is busy
+/// the reads wait longer ([`Busy::pause_or`](super::busy::Busy::pause_or)) and decide nothing;
+/// only a job the service says it no longer knows ends the run.
 async fn watch_job(
     inner: &Arc<Inner>,
     op: &Op,
@@ -633,15 +637,20 @@ async fn watch_job(
     let metrics = &inner.deps.metrics;
     let job = submitted.job.as_str();
     let (mut running, mut silence) = (false, false);
+    let mut pace = Pace::new(inner.cfg.poll);
+    // No wait before the first read; a read that fails, or a result not read, waits a poll.
+    let mut wait = None;
     let (read, result) = loop {
+        let pause = wait.map(|quiet| inner.busy.pause_or(quiet));
         tokio::select! {
             biased;
             () = cancel_asked(cancel) => {
                 withdraw(inner, job).await;
                 return Ended::Cancelled;
             }
-            () = sleep(inner.busy.pause()) => {}
+            () = waited(pause) => {}
         }
+        wait = Some(inner.cfg.poll);
         let read = inner.api().get_job(job).await;
         let busy = inner.busy.saw("reading a job", &read).busy();
         let read = match read {
@@ -663,8 +672,12 @@ async fn watch_job(
             metrics.host_silence();
         }
         match read.state() {
-            JobState::Queued | JobState::Placed | JobState::Starting => continue,
+            JobState::Queued | JobState::Placed | JobState::Starting => {
+                wait = Some(pace.not_started());
+                continue;
+            }
             JobState::Running => {
+                wait = Some(pace.running());
                 if !std::mem::replace(&mut running, true) {
                     timeline.stamp(Mark::Running, Instant::now(), metrics);
                     inner.ops().show(op.id, Stage::Executing);
@@ -748,6 +761,13 @@ async fn watch_job(
                 }
             }
         }
+    }
+}
+
+/// Completes after `pause`, or at once when there is none.
+async fn waited(pause: Option<Duration>) {
+    if let Some(pause) = pause {
+        sleep(pause).await;
     }
 }
 
@@ -946,3 +966,6 @@ mod tests;
 #[cfg(test)]
 #[path = "run_tree_tests.rs"]
 mod tree_tests;
+#[cfg(test)]
+#[path = "run_watch_tests.rs"]
+mod watch_tests;

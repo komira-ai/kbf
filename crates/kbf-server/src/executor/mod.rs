@@ -10,8 +10,9 @@
 //! many jobs run, and where, is the job service's. The only bound is a guard on the memory the
 //! open operations hold ([`MAX_OPEN`]).
 //!
-//! Each operation is driven by a task of its own ([`run`]): the job is read back every
-//! [`Config::poll`] until it ends (and less often while the job service is busy or cannot be
+//! Each operation is driven by a task of its own ([`run`]): the job is read back at once, then,
+//! while it has not started, at steps that double up to [`Config::poll`] ([`pace`]), and every
+//! [`Config::poll`] while it runs, until it ends (and less often while the job service is busy or cannot be
 //! reached, which never ends a run: [`busy`]); an ending of the farm's (the host lost, the job service
 //! restarted, the job failed at its start) submits the operation again as its next attempt, a
 //! new job with a new key, at most [`outcome::RESUBMITS`] times; a job a host would not start now
@@ -53,6 +54,7 @@ mod ops;
 mod out;
 mod outcome;
 mod output;
+mod pace;
 mod phases;
 mod probe;
 mod record;

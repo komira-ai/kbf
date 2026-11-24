@@ -42,7 +42,8 @@ async fn a_job_seen_running_records_every_phase_once() {
 /// still counted.
 #[tokio::test]
 async fn a_job_first_seen_ended_records_no_queue_or_task_phase() {
-    // The executor reads the job at its submit and not again until the job has ended.
+    // The executor reads the job at once (queued) and again at steps from 10 ms; the host runs
+    // it to its end with no await between its steps, so a read finds it queued or ended, not running.
     let rig = Rig::start(&[HOST], |cfg| cfg.poll = Duration::from_millis(400)).await;
     let mut caller = rig.submit(7);
     let job = rig.first_job(7).await;
