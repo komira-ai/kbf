@@ -31,15 +31,20 @@ use kbf_proto::grpc::health::v1::health_check_response::ServingStatus;
 use kbf_proto::grpc::health::v1::health_client::HealthClient;
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::grpc::health::v1::{HealthCheckRequest, HealthCheckResponse};
+use kbf_tls::{ConnInfo, Liveness};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::watch;
 use tonic::codegen::Service;
 use tonic::codegen::http::Uri;
+use tonic::service::Routes;
+use tonic::transport::server::{Connected, TcpConnectInfo};
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::closes::{Cause, CloseMetrics, ClosesLayer};
 use crate::config::Args;
 use crate::conn_watch::{Watched, limit};
+use crate::drain::Drain;
 use crate::grpc_health::HealthService;
 use crate::health::{Checks, Readiness};
 use crate::serve::{StreamTiming, keepalive};
@@ -150,13 +155,70 @@ impl Service<Uri> for OnePipe {
     }
 }
 
+/// One end of a pipe as a listener's connection: what a service learns of it, its flag
+/// among that, as a [`kbf_tls::Conn`] gives it.
+struct Peer {
+    io: DuplexStream,
+    info: ConnInfo,
+}
+
+impl tokio::io::AsyncRead for Peer {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Peer {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+impl Connected for Peer {
+    type ConnectInfo = ConnInfo;
+
+    fn connect_info(&self) -> ConnInfo {
+        self.info.clone()
+    }
+}
+
 /// `server_end` watched for `limit` ([`Watched`]), as the listeners watch each of theirs,
-/// and then an incoming that never ends: an incoming that ends stops the server.
+/// with its own flag, and then an incoming that never ends: an incoming that ends stops the
+/// server.
 fn one_connection(
     server_end: DuplexStream,
     limit: Option<Duration>,
-) -> impl futures::Stream<Item = io::Result<Watched<DuplexStream>>> {
-    futures::stream::iter([Ok(Watched::new(server_end, limit, None))])
+) -> impl futures::Stream<Item = io::Result<Watched<Peer>>> {
+    let info = ConnInfo {
+        tcp: TcpConnectInfo {
+            local_addr: None,
+            remote_addr: None,
+        },
+        certs: None,
+        live: Liveness::default(),
+    };
+    let live = info.live.clone();
+    let peer = Peer {
+        io: server_end,
+        info,
+    };
+    futures::stream::iter([Ok(Watched::new(peer, limit, None, live))])
         .chain(futures::stream::pending())
 }
 
@@ -350,21 +412,38 @@ impl ByteStream for Blob {
 /// for `limit`, over a [`Path`] that carries at most `rate` bytes a second to the client,
 /// and the path.
 async fn blob_client(
-    mut server: Server,
+    server: Server,
     limit: Option<Duration>,
     size: usize,
     rate: Option<u32>,
 ) -> (Path, ByteStreamClient<Channel>) {
+    let (path, client, _closes) = counted_blob_client(server, limit, size, rate).await;
+    (path, client)
+}
+
+/// [`blob_client`], with the server's calls counted as the frontend counts them
+/// ([`ClosesLayer`]): the counts too.
+async fn counted_blob_client(
+    mut server: Server,
+    limit: Option<Duration>,
+    size: usize,
+    rate: Option<u32>,
+) -> (Path, ByteStreamClient<Channel>, Arc<CloseMetrics>) {
     let (client_end, path_client) = tokio::io::duplex(PIPE_BYTES);
     let (path_server, server_end) = tokio::io::duplex(PIPE_BYTES);
     let path = Path::carrying(path_client, path_server, rate);
-    let server = server.add_service(ByteStreamServer::new(Blob { size }));
+    let closes = Arc::new(CloseMetrics::default());
+    let (closer, _closing) = kbf_front::closing();
+    let (drain, _goaway) = Drain::new(closer, Arc::new(Readiness::default()));
+    let layer = ClosesLayer::new(Arc::clone(&closes), Arc::new(drain));
+    let blob = Routes::new(ByteStreamServer::new(Blob { size }));
+    let server = server.add_routes(Routes::from(blob.into_axum_router().layer(layer)));
     tokio::spawn(server.serve_with_incoming(one_connection(server_end, limit)));
     let channel = Endpoint::from_static("http://kbf.test")
         .connect_with_connector(OnePipe(Some(client_end)))
         .await
         .expect("connected over the pipe");
-    (path, ByteStreamClient::new(channel))
+    (path, ByteStreamClient::new(channel), closes)
 }
 
 /// Reads the whole blob `client` serves: the bytes it read, or the error the read ended
@@ -520,4 +599,87 @@ async fn an_idle_connection_outlasts_the_ping_and_its_timeout() {
         answer.map_err(|e| e.message().to_owned()),
         Ok(ServingStatus::Serving as i32)
     );
+}
+
+/// The calls of `method` `closes` counted under each cause, in [`Cause::ALL`]'s order, once
+/// one is counted: the server records a call when the transport drops it, which can come
+/// after the client has read its end. The paused clock moves only while the test waits.
+async fn counted(closes: &CloseMetrics, method: &str) -> [u64; 7] {
+    let counts = || Cause::ALL.map(|cause| closes.of(method, cause));
+    let wait = async {
+        while counts().iter().sum::<u64>() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(HANG, wait)
+        .await
+        .expect("the call was never counted");
+    counts()
+}
+
+/// The counts with one call under `cause`.
+fn one(cause: Cause) -> [u64; 7] {
+    Cause::ALL.map(|c| u64::from(c == cause))
+}
+
+/// A blob larger than the client's flow-control windows and the pipes together, so the
+/// server is still writing it when its stream is cut: a stream whose every byte and status
+/// the server has written ends `ok` on the server's side, whatever becomes of them on the
+/// way.
+const OPEN_BLOB: usize = 16 * 1024 * 1024;
+
+/// Catches a stream the keepalive watch cut counted as its client leaving, or not counted:
+/// the download stalled past the PING interval and the keepalive timeout, which the client
+/// reads as "h2 protocol error", is the server's `keepalive` close of a `Read`.
+#[tokio::test(start_paused = true)]
+async fn a_download_the_watch_closes_counts_keepalive() {
+    let timing = default_timing();
+    let server = keepalive(Server::builder(), timing);
+    let (path, mut client, closes) =
+        counted_blob_client(server, limit(timing), OPEN_BLOB, None).await;
+    let stall = timing.keepalive_interval + timing.keepalive_timeout + Duration::from_secs(1);
+
+    let read = download_across(&mut client, Some((&path, stall))).await;
+    assert_eq!(
+        read,
+        Err("h2 protocol error: error reading a body from connection".to_owned())
+    );
+    assert_eq!(counted(&closes, "Read").await, one(Cause::Keepalive));
+}
+
+/// With the test above, the boundary: a download stalled a second short of the limit runs to
+/// its end and is counted `ok`, not as a close.
+#[tokio::test(start_paused = true)]
+async fn a_download_that_outlasts_a_stall_counts_ok() {
+    let timing = default_timing();
+    let server = keepalive(Server::builder(), timing);
+    let (path, mut client, closes) =
+        counted_blob_client(server, limit(timing), SLOW_BLOB, None).await;
+    let stall = timing.keepalive_interval + timing.keepalive_timeout - Duration::from_secs(1);
+
+    let read = download_across(&mut client, Some((&path, stall))).await;
+    assert_eq!(read, Ok(SLOW_BLOB));
+    assert_eq!(counted(&closes, "Read").await, one(Cause::Ok));
+}
+
+/// Catches a stream its client drops, on a connection that stays, counted as the server's
+/// close or a lost connection: the client reads the first message and drops the stream
+/// (gRPC sends RST_STREAM), and the server counts `client_cancel`.
+#[tokio::test(start_paused = true)]
+async fn a_download_its_client_drops_counts_client_cancel() {
+    let timing = default_timing();
+    let server = keepalive(Server::builder(), timing);
+    let (_path, mut client, closes) =
+        counted_blob_client(server, limit(timing), OPEN_BLOB, None).await;
+
+    let mut stream = client
+        .read(ReadRequest::default())
+        .await
+        .expect("the read opened")
+        .into_inner();
+    let first = stream.message().await.expect("a message");
+    assert!(first.is_some(), "the first message");
+    drop(stream);
+
+    assert_eq!(counted(&closes, "Read").await, one(Cause::ClientCancel));
 }

@@ -158,6 +158,7 @@ pub use self::janitor::{Janitor, JanitorFlagError, JanitorFlags, JanitorMetrics}
 pub use self::job_read::{JobReadError, JobReadFlags, JobTls};
 pub use self::pack_flags::{PackFlagError, PackFlags};
 pub use self::task_flags::{PutDirFlags, TaskFlagError};
+use crate::closes::{CloseMetrics, ClosesLayer};
 use crate::drain::Drain;
 use crate::enroll::flags::EnrollFlags;
 use crate::enroll::start as enroll_start;
@@ -1067,6 +1068,8 @@ impl<'a> Prepared<'a> {
         let delivery = object_stores.as_ref().map(|stores| stores.delivery.clone());
         // Set below, where the stand is built, if there is a state store to retire over.
         let retire = Arc::new(OnceLock::new());
+        // How the REAPI listener's calls end, counted from its layer and read by `/metrics`.
+        let closes = Arc::new(CloseMetrics::default());
         let backend_for_stand = backend.clone();
         let api_routes = crate::api::router(
             backend.clone(),
@@ -1093,6 +1096,7 @@ impl<'a> Prepared<'a> {
             members.clone(),
             tls_sources,
             Counters {
+                closes: Arc::clone(&closes),
                 packs: packs.clone(),
                 job_read: job_stats,
                 executor: executor.as_ref().map(|built| Arc::clone(&built.metrics)),
@@ -1145,6 +1149,8 @@ impl<'a> Prepared<'a> {
             reapi_routes
                 .into_axum_router()
                 .layer(AuthenticateLayer::new(policy.authenticator))
+                // Inside the metadata layer, whose ids its close lines name.
+                .layer(ClosesLayer::new(closes, Arc::clone(&drain)))
                 .layer(RequestMetadataLayer::new()),
         )
         .add_service(HealthServer::new(HealthService::of(
@@ -1341,6 +1347,8 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 /// What `GET /metrics` counts beside the always-present families, each only when its part of
 /// the frontend is on.
 struct Counters {
+    /// How the REAPI listener's calls ended.
+    closes: Arc<CloseMetrics>,
     /// The packs.
     packs: Option<Packs>,
     /// The job-facing read.
@@ -1363,6 +1371,7 @@ fn metrics_route(
     counters: Counters,
 ) -> axum::Router {
     let Counters {
+        closes,
         packs,
         job_read,
         executor,
@@ -1374,9 +1383,10 @@ fn metrics_route(
         let (history, packs) = (history.clone(), packs.clone());
         let executor = executor.clone();
         let job_read = job_read.clone();
-        let janitor = janitor.clone();
+        let (janitor, closes) = (janitor.clone(), Arc::clone(&closes));
         async move {
             let mut text = backend.render_metrics();
+            closes.render(&mut text);
             if let Some(history) = history {
                 history.render(&mut text);
             }

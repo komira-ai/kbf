@@ -144,7 +144,7 @@ fn index_form(digest: &Digest) -> BlobDigest {
 /// Asserts what a frontend started with the pack flags does: it passes its start check on the
 /// store, keeps a BatchUpdateBlobs in one pack of the store and in the index, answers
 /// FindMissingBlobs and BatchReadBlobs from them while its storage node is unreachable, and
-/// counts it all on `GET /metrics`.
+/// counts it all on `GET /metrics`, the calls' ends among it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_with_the_pack_flags_keeps_uploads_in_packs() {
     let s3 = FakeS3::start().await;
@@ -193,6 +193,12 @@ async fn a_frontend_with_the_pack_flags_keeps_uploads_in_packs() {
     let text = scrape(api).await;
     assert!(text.contains("kbf_pack_writes_total 1\n"), "{text}");
     assert!(text.contains("kbf_pack_reads_total 2\n"), "{text}");
+    // How the REAPI calls ended: the upload and the FindMissingBlobs, answered several round
+    // trips before the scrape, each once `ok`.
+    for method in ["BatchUpdateBlobs", "FindMissingBlobs"] {
+        let ok = format!("kbf_reapi_calls_closed_total{{method=\"{method}\",cause=\"ok\"}} 1\n");
+        assert!(text.contains(&ok), "{ok} in {text}");
+    }
     served.abort();
 }
 

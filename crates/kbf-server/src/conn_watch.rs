@@ -18,7 +18,7 @@ use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use futures::{Stream, StreamExt as _};
-use kbf_tls::Conn;
+use kbf_tls::{Conn, Liveness};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, Sleep};
 use tonic::transport::server::Connected;
@@ -53,8 +53,8 @@ where
     let limit = limit(timing);
     incoming.map(move |accepted| {
         accepted.map(|conn| {
-            let peer = conn.remote_addr();
-            Watched::new(conn, limit, peer)
+            let info = conn.connect_info();
+            Watched::new(conn, limit, info.tcp.remote_addr, info.live)
         })
     })
 }
@@ -82,12 +82,22 @@ struct Watch {
     timer: Pin<Box<Sleep>>,
     /// For the line logged when the limit passes.
     peer: Option<SocketAddr>,
+    /// The connection's own flag, marked closed quiet when the limit passes, so the streams
+    /// it ends are counted as this close and not as their client leaving
+    /// ([`crate::closes`]).
+    live: Liveness,
 }
 
 impl<IO> Watched<IO> {
     /// `io`, closed after `limit` without moving; with no limit, `io` as it is. `peer` is
-    /// named in the line logged when the limit passes.
-    pub(crate) fn new(io: IO, limit: Option<Duration>, peer: Option<SocketAddr>) -> Self {
+    /// named in the line logged when the limit passes, and `live` is marked closed quiet
+    /// then.
+    pub(crate) fn new(
+        io: IO,
+        limit: Option<Duration>,
+        peer: Option<SocketAddr>,
+        live: Liveness,
+    ) -> Self {
         let watch = limit.map(|limit| {
             let moved = Instant::now();
             Watch {
@@ -97,6 +107,7 @@ impl<IO> Watched<IO> {
                 expired: false,
                 timer: Box::pin(tokio::time::sleep_until(moved + limit)),
                 peer,
+                live,
             }
         });
         Self { io, watch }
@@ -145,6 +156,8 @@ impl Watch {
             }
             ready!(self.timer.as_mut().poll(cx));
             self.expired = true;
+            // Before the error below, which is what ends the connection's streams.
+            self.live.mark_closed_quiet();
             tracing::warn!(
                 peer = ?self.peer,
                 secs,
