@@ -67,7 +67,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::future::Either;
@@ -127,6 +127,10 @@ pub struct Submission {
     /// so that its run reads neither from the CAS again. `None` when the submitter has not
     /// decoded them; the dispatcher then reads them itself.
     pub decoded: Option<Arc<DecodedAction>>,
+    /// When the Execute reached the front, before it was authorized or anything of its action
+    /// read: the start of `kbf_execute_presubmit_seconds` (which ends later, at the call's first
+    /// stream item). For the server's per-job line only.
+    pub arrival: Arrival,
 }
 
 /// The Action an Execute read and decoded, and its Command: the two messages a run's facts and
@@ -138,6 +142,27 @@ pub struct DecodedAction {
     pub action: Action,
     /// The Command its `command_digest` names.
     pub command: Command,
+}
+
+/// When an Execute reached the front, on the monotonic clock and on the wall clock, taken
+/// together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Arrival {
+    /// The monotonic time (tokio's clock: paused in tests).
+    pub at: Instant,
+    /// The wall-clock time.
+    pub unix: SystemTime,
+}
+
+impl Arrival {
+    /// Now, on both clocks.
+    #[must_use]
+    pub fn now() -> Self {
+        Self {
+            at: Instant::now(),
+            unix: SystemTime::now(),
+        }
+    }
 }
 
 /// Where an operation is, as its callers see it.
@@ -360,10 +385,12 @@ pub const PRESUBMIT_WARN: Duration = Duration::from_secs(10);
 /// One Execute's time before its first stream item, from the handler's start: observed
 /// in `kbf_execute_presubmit_seconds` when dropped, whether the call answered, failed
 /// or was dropped by its caller (a stalled call the client gave up on is the one the
-/// operator needs to see), and logged at `WARN` when it took [`PRESUBMIT_WARN`] or more.
+/// operator needs to see), and logged at `WARN` when it took [`PRESUBMIT_WARN`] or more. Its
+/// start is also the [`Submission`]'s [`Arrival`].
 struct Presubmit<'a> {
     metrics: &'a CacheMetrics,
-    started: Instant,
+    /// The handler's start, which the [`Submission`] carries as its [`Arrival`].
+    arrival: Arrival,
     /// What the call is about, once its request is read; empty before (a call denied or
     /// dropped while authorizing).
     action: String,
@@ -390,7 +417,7 @@ impl<'a> Presubmit<'a> {
     fn begin(metrics: &'a CacheMetrics) -> Self {
         Self {
             metrics,
-            started: Instant::now(),
+            arrival: Arrival::now(),
             action: String::new(),
             instance: String::new(),
             invocation: String::new(),
@@ -411,7 +438,7 @@ impl<'a> Presubmit<'a> {
 
 impl Drop for Presubmit<'_> {
     fn drop(&mut self) {
-        let elapsed = self.started.elapsed();
+        let elapsed = self.arrival.at.elapsed();
         self.metrics.execute_presubmit.observe_duration(elapsed);
         if elapsed < PRESUBMIT_WARN {
             return;

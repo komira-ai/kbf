@@ -135,7 +135,7 @@ pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
 pub use crate::described::Described;
 pub use crate::execution::{
-    Closer, Closing, DecodedAction, Dispatch, ERROR_DOMAIN, ExecutionService, Finished,
+    Arrival, Closer, Closing, DecodedAction, Dispatch, ERROR_DOMAIN, ExecutionService, Finished,
     LEASE_KIND_KEY, LEASE_KINDS, OperationStream, Progress, ProgressTicker, Stage, Submission,
     Ticket, closing, missing_status, progress,
 };

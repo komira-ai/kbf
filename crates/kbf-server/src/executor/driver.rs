@@ -151,7 +151,7 @@ async fn keep(inner: &Arc<Inner>, sweep: bool) {
         };
         inner.deps.metrics.reattached();
         // Taken up from the state store: its runs read the Action and the Command from the CAS.
-        let op = Op::new(operation, key, (row.whole_machine, None), false);
+        let op = Op::new(operation, key, (row.whole_machine, None), false, None);
         tokio::spawn(run::run(
             Arc::clone(inner),
             op,

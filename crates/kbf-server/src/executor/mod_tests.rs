@@ -450,6 +450,7 @@ pub(crate) fn submission_of(action: Digest) -> Submission {
         },
         evidence: kbf_invocation::Evidence::default(),
         decoded: None,
+        arrival: kbf_front::Arrival::now(),
     }
 }
 

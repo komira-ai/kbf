@@ -139,6 +139,7 @@ impl<D> ExecutionService<D> {
                 input_files,
             },
             decoded,
+            arrival: window.arrival,
         };
         Ok((submission, command_digest))
     }

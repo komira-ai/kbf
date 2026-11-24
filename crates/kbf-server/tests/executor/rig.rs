@@ -427,6 +427,7 @@ impl Rig {
                 },
                 evidence: Default::default(),
                 decoded: None,
+                arrival: kbf_front::Arrival::now(),
             })
             .expect("the executor takes the action");
         Caller {
