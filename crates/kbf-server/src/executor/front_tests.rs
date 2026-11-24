@@ -16,12 +16,16 @@ use kbf_pack::{PackKeys, TaskManifest, Timing, Usage, WriterKind, write_pack};
 use kbf_pack_index::PackIndex;
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_proto::reapi::platform::Property;
-use kbf_proto::reapi::{self, Directory, FileNode, Platform};
+use kbf_proto::reapi::{self, Command, Directory, FileNode, Platform};
 use kbf_state::ManualClock;
 use kbf_storage::Storage;
 use kbf_types::{DigestFunction, OperationId};
 
+use crate::action_usage::Shape;
 use crate::executor::RunId;
+use crate::executor::mac::System;
+use crate::executor::size_class::SizeClass;
+use crate::executor::traits::Inputs;
 
 use super::*;
 
@@ -57,6 +61,7 @@ impl RunPrepare for Unprepared {
         &self,
         _: &str,
         _: &kbf_types::Digest,
+        _decoded: Option<&Action>,
         _: SystemTime,
         _: Duration,
     ) -> Result<PreparedPutDir, PrepareError> {
@@ -327,7 +332,7 @@ async fn an_action_runs_from_the_kbf_image_by_digest_and_has_its_timeout() {
             |_| {},
         )
         .await;
-    let facts = rig.front.action(&digest).await.expect("facts");
+    let facts = rig.front.action(&digest, None).await.expect("facts");
     assert_eq!(
         facts,
         ActionFacts {
@@ -348,14 +353,20 @@ async fn the_commands_platform_is_read_and_no_timeout_is_none() {
     let old = rig
         .action(|_| {}, |command| command.platform = Some(platform(IMAGE)))
         .await;
-    assert_eq!(rig.front.action(&old).await.expect("facts").timeout, None);
+    assert_eq!(
+        rig.front.action(&old, None).await.expect("facts").timeout,
+        None
+    );
     let zero = rig
         .action(
             |action| action.timeout = Some(seconds(0)),
             |command| command.platform = Some(platform(IMAGE)),
         )
         .await;
-    assert_eq!(rig.front.action(&zero).await.expect("facts").timeout, None);
+    assert_eq!(
+        rig.front.action(&zero, None).await.expect("facts").timeout,
+        None
+    );
 }
 
 /// Catches actions the executor must not run being passed on: an image named by a tag and a
@@ -380,7 +391,7 @@ async fn an_image_named_by_tag_or_a_negative_timeout_is_invalid() {
         )
         .await;
     for digest in [tagged, negative] {
-        let refused = rig.front.action(&digest).await;
+        let refused = rig.front.action(&digest, None).await;
         assert!(
             matches!(refused, Err(InputsError::Invalid(_))),
             "{refused:?}"
@@ -438,7 +449,7 @@ async fn an_action_naming_another_image_than_the_served_base_is_refused() {
             |_| {},
         )
         .await;
-    let refused = rig.front.action(&other).await;
+    let refused = rig.front.action(&other, None).await;
     let Err(InputsError::Invalid(why)) = refused else {
         panic!("not refused: {refused:?}");
     };
@@ -453,7 +464,7 @@ async fn an_action_naming_another_image_than_the_served_base_is_refused() {
         let bad = rig
             .action(|action| action.platform = Some(platform(value)), |_| {})
             .await;
-        let refused = rig.front.action(&bad).await;
+        let refused = rig.front.action(&bad, None).await;
         assert!(
             matches!(refused, Err(InputsError::Invalid(_))),
             "{refused:?}"
@@ -467,7 +478,7 @@ async fn an_action_naming_another_image_than_the_served_base_is_refused() {
     let alias = rig
         .action(|action| action.platform = Some(platform(&renamed)), |_| {})
         .await;
-    assert!(rig.front.action(&alias).await.is_ok());
+    assert!(rig.front.action(&alias, None).await.is_ok());
 }
 
 /// Catches an action that names no image being refused or run elsewhere: it gets the base, so it
@@ -476,7 +487,7 @@ async fn an_action_naming_another_image_than_the_served_base_is_refused() {
 async fn an_action_that_names_no_image_is_run_from_the_kbf_image() {
     let rig = Rig::new();
     let bare = rig.action(|_| {}, |_| {}).await;
-    let facts = rig.front.action(&bare).await.expect("runs");
+    let facts = rig.front.action(&bare, None).await.expect("runs");
     assert_eq!(facts.image, KBF_IMAGE);
 }
 
@@ -486,7 +497,7 @@ async fn an_action_that_names_no_image_is_run_from_the_kbf_image() {
 #[tokio::test]
 async fn an_action_the_cas_cannot_give_is_unavailable_and_one_that_is_malformed_is_invalid() {
     let rig = Rig::new();
-    let unheld = rig.front.action(&action_digest()).await;
+    let unheld = rig.front.action(&action_digest(), None).await;
     assert!(
         matches!(unheld, Err(InputsError::Unavailable(_))),
         "{unheld:?}"
@@ -495,11 +506,11 @@ async fn an_action_the_cas_cannot_give_is_unavailable_and_one_that_is_malformed_
     let junk = VerifiedBlob::hashed(Bytes::from_static(b"\xff\xff not an action"));
     let digest = junk.digest();
     rig.cache.store_blobs(vec![junk]).await.expect("stored");
-    let junk = rig.front.action(&wire(&digest)).await;
+    let junk = rig.front.action(&wire(&digest), None).await;
     assert!(matches!(junk, Err(InputsError::Invalid(_))), "{junk:?}");
 
     let no_command = rig.store(&Action::default()).await;
-    let none = rig.front.action(&wire(&no_command)).await;
+    let none = rig.front.action(&wire(&no_command), None).await;
     assert!(matches!(none, Err(InputsError::Invalid(_))), "{none:?}");
 
     let bad = Action {
@@ -510,7 +521,7 @@ async fn an_action_the_cas_cannot_give_is_unavailable_and_one_that_is_malformed_
         ..Action::default()
     };
     let bad = rig.store(&bad).await;
-    let refused = rig.front.action(&wire(&bad)).await;
+    let refused = rig.front.action(&wire(&bad), None).await;
     assert!(
         matches!(refused, Err(InputsError::Invalid(_))),
         "{refused:?}"
@@ -521,7 +532,7 @@ async fn an_action_the_cas_cannot_give_is_unavailable_and_one_that_is_malformed_
         ..Action::default()
     };
     let absent = rig.store(&absent).await;
-    let unheld = rig.front.action(&wire(&absent)).await;
+    let unheld = rig.front.action(&wire(&absent), None).await;
     assert!(
         matches!(unheld, Err(InputsError::Unavailable(_))),
         "{unheld:?}"
@@ -531,7 +542,7 @@ async fn an_action_the_cas_cannot_give_is_unavailable_and_one_that_is_malformed_
         hash: "a".repeat(64),
         size_bytes: -1,
     };
-    let refused = rig.front.action(&negative).await;
+    let refused = rig.front.action(&negative, None).await;
     assert!(
         matches!(refused, Err(InputsError::Invalid(_))),
         "{refused:?}"
@@ -768,7 +779,7 @@ async fn the_actions_platform_wins_over_the_commands() {
             |command| command.platform = Some(platform(OTHER_IMAGE)),
         )
         .await;
-    let facts = rig.front.action(&digest).await.expect("facts");
+    let facts = rig.front.action(&digest, None).await.expect("facts");
     assert_eq!(facts.image, KBF_IMAGE);
     // Were the Command's platform the one read, the other image would be refused.
 }
@@ -840,13 +851,13 @@ async fn the_actions_system_is_read_as_the_farm_reads_it() {
                 |command| command.platform = on_command.clone(),
             )
             .await;
-        let facts = rig.front.action(&digest).await.expect("facts");
+        let facts = rig.front.action(&digest, None).await.expect("facts");
         assert_eq!(facts.system, want, "{on_action:?} {on_command:?}");
     }
     let bad = rig
         .action(|a| a.platform = Some(props(&[("os", "windows")])), |_| {})
         .await;
-    let refused = rig.front.action(&bad).await.expect_err("refused");
+    let refused = rig.front.action(&bad, None).await.expect_err("refused");
     assert!(matches!(&refused, InputsError::Invalid(why) if why.contains("windows")));
 }
 

@@ -3,7 +3,9 @@
 //! own preparation ([`PutDirPrep`], with its cache of named Directories), both over the rig's
 //! backend, whose storage node records every blob read and every digest FindMissing names. The
 //! run's mint reads no Directory and asks about no blob the Execute already did; a mint with no
-//! Execute before it reads and asks for itself.
+//! Execute before it reads and asks for itself. The run's facts and closure take the Action and
+//! the Command the Execute decoded, which its submission carries, so each is read once per
+//! Execute; a run with no decode (an operation taken up from another process) reads them.
 
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -152,10 +154,11 @@ impl RunPrepare for Real {
         &self,
         run: &str,
         action: &kbf_types::Digest,
+        decoded: Option<&Action>,
         now: SystemTime,
         wall: Duration,
     ) -> Result<PreparedPutDir, PrepareError> {
-        RunPrepare::prepare_put_dir(self.prep(), run, action, now, wall).await
+        RunPrepare::prepare_put_dir(self.prep(), run, action, decoded, now, wall).await
     }
 
     async fn mint_put_dir(
@@ -169,12 +172,26 @@ impl RunPrepare for Real {
     }
 }
 
-/// A dispatch that takes every submission and runs nothing: the executor's part here is the
-/// mint the test makes itself.
-struct Taken;
+/// A dispatch that takes every submission, keeps it, and runs nothing: the executor's part here
+/// is the facts and the mint the test asks for itself.
+#[derive(Default)]
+struct Taken(Mutex<Vec<Submission>>);
+
+impl Taken {
+    /// The decode the one submission taken carries.
+    fn decoded(&self) -> Option<Arc<kbf_front::DecodedAction>> {
+        let taken = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let [submission] = taken.as_slice() else {
+            panic!("one submission, not {}", taken.len());
+        };
+        submission.decoded.clone()
+    }
+}
 
 impl Dispatch for Taken {
     fn submit(&self, submission: Submission) -> Result<Ticket, Status> {
+        let mut taken = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        taken.push(submission.clone());
         let key = submission.key;
         Ok(Ticket {
             name: "operations/1".to_owned(),
@@ -197,6 +214,7 @@ impl Dispatch for Taken {
 struct Walking {
     rig: Rig,
     service: ExecutionService<Taken>,
+    taken: Arc<Taken>,
     log: Arc<Log>,
     _closer: Closer,
 }
@@ -231,15 +249,17 @@ fn walking() -> Walking {
     );
     let backend = stash.get().expect("the rig set it").clone();
     let (closer, closing) = kbf_front::closing();
+    let taken = Arc::new(Taken::default());
     let service = ExecutionService::with_authorizers(
         backend,
-        Arc::new(Taken),
+        Arc::clone(&taken),
         closing,
         Arc::new(Authorizers::allow_all()),
     );
     Walking {
         rig,
         service,
+        taken,
         log,
         _closer: closer,
     }
@@ -332,7 +352,7 @@ async fn an_execute_and_the_mint_of_its_run_walk_the_inputs_once() {
     let submitted = service.execute(tonic::Request::new(request)).await;
     submitted.map(drop).expect("submitted");
     rig.front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
 
@@ -359,7 +379,7 @@ async fn a_mint_with_no_execute_before_it_walks_and_asks_for_itself() {
         files,
     } = input_set(&rig).await;
     rig.front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
 
@@ -368,4 +388,78 @@ async fn a_mint_with_no_execute_before_it_walks_and_asks_for_itself() {
     asked.push(command);
     asked.sort();
     assert_eq!(log.asked(), asked);
+}
+
+/// The Execute of `action`, its cache lookup skipped, submitted.
+async fn execute(service: &ExecutionService<Taken>, action: &Digest) {
+    let request = ExecuteRequest {
+        action_digest: Some(action.clone()),
+        skip_cache_lookup: true,
+        ..ExecuteRequest::default()
+    };
+    let submitted = service.execute(tonic::Request::new(request)).await;
+    submitted.map(drop).expect("submitted");
+}
+
+/// Asserts that an Execute and its run (the run's facts, then its mint, which
+/// collects the closure) read the Action and the Command from the node once each, the
+/// Execute's reads, and that the run still names and stores its tree and has the facts of the
+/// Action: the run takes both from the decode its submission carries. Catches the facts reading
+/// the Action and the Command again, and the closure reading the Action again.
+#[tokio::test]
+async fn an_execute_and_its_run_read_the_action_and_the_command_once() {
+    let Walking {
+        rig,
+        service,
+        taken,
+        log,
+        ..
+    } = walking();
+    let InputSet {
+        action, command, ..
+    } = input_set(&rig).await;
+    let cas_action = cas_digest(&action).expect("a digest");
+    execute(&service, &action).await;
+    let decoded = taken.decoded().expect("the submission carries the decode");
+
+    let facts = rig.front.action(&action, Some(&decoded)).await;
+    let minted = (rig.front)
+        .mint(lease(), &action, WALL, InputTree::Manifests, Some(&decoded))
+        .await;
+
+    assert_eq!(facts.expect("facts").timeout, None);
+    minted.expect("a dir");
+    rig.front.stored(lease()).await.expect("stored");
+    assert!(rig.front.tree(lease()).await.is_ok(), "a tree is named");
+    assert_eq!(
+        (log.reads_of(&cas_action), log.reads_of(&command)),
+        (1, 1),
+        "the Action and the Command, each read once"
+    );
+}
+
+/// Asserts that a run with no decode, as an operation taken up from another process has, reads
+/// the Action and the Command itself, with no Execute before it: its facts read both, and its
+/// closure the Action. Catches a run that has no facts or no closure when nothing was carried.
+#[tokio::test]
+async fn a_run_with_no_decode_reads_the_action_and_the_command_itself() {
+    let Walking { rig, log, .. } = walking();
+    let InputSet {
+        action, command, ..
+    } = input_set(&rig).await;
+    let cas_action = cas_digest(&action).expect("a digest");
+
+    let facts = rig.front.action(&action, None).await;
+    let minted = (rig.front)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
+        .await;
+
+    assert_eq!(facts.expect("facts").timeout, None);
+    minted.expect("a dir");
+    rig.front.stored(lease()).await.expect("stored");
+    assert_eq!(
+        (log.reads_of(&cas_action), log.reads_of(&command)),
+        (2, 1),
+        "the facts read both, the closure the Action"
+    );
 }

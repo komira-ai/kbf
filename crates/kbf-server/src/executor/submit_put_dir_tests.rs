@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use js_proto::v1::{JobSpec, NetworkLevel};
+use kbf_front::DecodedAction;
 use kbf_proto::reapi::Digest;
 
 use super::tests::{Harness, RUN, built_class};
@@ -72,6 +73,7 @@ impl Ingest for Recording {
         _: &Digest,
         _: Duration,
         tree: InputTree,
+        _decoded: Option<&DecodedAction>,
     ) -> Result<PackKey, MintError> {
         self.asked
             .lock()
@@ -87,7 +89,11 @@ impl Ingest for Recording {
 
 #[tonic::async_trait]
 impl Inputs for Treed {
-    async fn action(&self, _: &Digest) -> Result<ActionFacts, InputsError> {
+    async fn action(
+        &self,
+        _: &Digest,
+        _decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError> {
         Ok(ActionFacts {
             image: format!("registry.test/kbf@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
@@ -150,7 +156,7 @@ async fn prepared_as(case: Case) -> (Result<super::Prepared, Settled>, Vec<Input
         ingest: &ingest_dyn,
         ..harness.preparer()
     };
-    let job = prepare(&ctx, RUN, &action(), case.booking).await;
+    let job = prepare(&ctx, RUN, (&action(), None), case.booking).await;
     (job, ingest.asked())
 }
 
@@ -223,8 +229,12 @@ struct NoTree;
 
 #[tonic::async_trait]
 impl Inputs for NoTree {
-    async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
-        Treed::linux().action(action).await
+    async fn action(
+        &self,
+        action: &Digest,
+        _decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError> {
+        Treed::linux().action(action, None).await
     }
 }
 

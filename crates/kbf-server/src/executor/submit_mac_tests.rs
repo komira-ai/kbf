@@ -6,6 +6,7 @@ use std::time::Duration;
 use js_proto::v1::{
     Constraints, ExecMode, JobSpec, MountMode, MountPropagation, NetworkLevel, mount,
 };
+use kbf_front::DecodedAction;
 use kbf_proto::reapi::{Digest, Platform, platform::Property};
 
 use super::tests::{Harness, RUN, built_class};
@@ -41,7 +42,11 @@ struct Mac {
 
 #[tonic::async_trait]
 impl Inputs for Mac {
-    async fn action(&self, _: &Digest) -> Result<ActionFacts, InputsError> {
+    async fn action(
+        &self,
+        _: &Digest,
+        _decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError> {
         Ok(ActionFacts {
             image: format!("registry.test/kbf@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
@@ -121,7 +126,7 @@ async fn prepared(case: Case) -> Result<super::Prepared, Settled> {
         inputs: &inputs,
         ..harness.preparer()
     };
-    prepare(&ctx, RUN, &action(), case.booking).await
+    prepare(&ctx, RUN, (&action(), None), case.booking).await
 }
 
 /// Where a mount comes from: a host path, or `<provider>:<ref>` for a provider's tree.
@@ -240,7 +245,7 @@ async fn a_mac_jobs_wall_limit_is_its_timeout_plus_the_run_margin() {
         inputs: &inputs,
         ..harness.preparer()
     };
-    let job = prepare(&ctx, RUN, &action(), Booking::Share)
+    let job = prepare(&ctx, RUN, (&action(), None), Booking::Share)
         .await
         .expect("prepared");
     assert_eq!(job.spec.wall_limit_seconds, Some(20 + 77));
@@ -384,3 +389,74 @@ async fn a_mac_run_with_no_tree_is_infrastructure() {
 /// The macOS `kbf-task` bundle of a release, by its manifest digest.
 const BUNDLE: &str =
     "kbf-task@sha256:9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a";
+
+/// A mint that answers at once and keeps the decode each mint was given.
+#[derive(Default)]
+struct Minting(std::sync::Mutex<Vec<Option<DecodedAction>>>);
+
+#[tonic::async_trait]
+impl crate::executor::Ingest for Minting {
+    async fn mint(
+        &self,
+        run: RunId,
+        _: &Digest,
+        _: Duration,
+        _: crate::executor::InputTree,
+        decoded: Option<&DecodedAction>,
+    ) -> Result<crate::executor::PackKey, crate::executor::MintError> {
+        let mut minted = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        minted.push(decoded.cloned());
+        let dir = format!("cas/b/{}/aa-0", crate::executor::build_id(run));
+        Ok(crate::executor::PackKey::new(dir))
+    }
+
+    async fn ingest(
+        &self,
+        _: RunId,
+        _: &crate::executor::PackKey,
+        _: &Digest,
+        _: &crate::executor::UntrustedLimits,
+    ) -> crate::executor::Ingested {
+        crate::executor::Ingested::Unavailable("not read here".to_owned())
+    }
+}
+
+/// Catches a Mac run that drops the Execute's decode, so that its closure would read the Action
+/// from the CAS again, or labels its steps with a form other than its tree list's: the mint of a
+/// Mac run is given the decode the run was, and the job is prepared as a tree list.
+#[tokio::test]
+async fn a_mac_run_hands_its_decode_to_the_mint_and_is_a_tree_list() {
+    let harness = Harness::new();
+    let mut cfg = harness.cfg.clone();
+    cfg.mac = Some(pool(None));
+    let inputs: Arc<dyn Inputs> = Arc::new(Mac {
+        platform: KOMIRA_DARWIN.to_vec(),
+        tree: true,
+    });
+    let minting = Arc::new(Minting::default());
+    let ingest: Arc<dyn crate::executor::Ingest> = minting.clone();
+    let metrics = Metrics::default();
+    let ctx = Preparer {
+        cfg: &cfg,
+        metrics: &metrics,
+        inputs: &inputs,
+        ingest: &ingest,
+    };
+    let decoded = DecodedAction {
+        action: kbf_proto::reapi::Action::default(),
+        command: kbf_proto::reapi::Command {
+            arguments: vec!["xcrun".to_owned()],
+            ..Default::default()
+        },
+    };
+
+    let prepared = prepare(&ctx, RUN, (&action(), Some(&decoded)), Booking::Share).await;
+
+    let prepared = prepared.expect("a Mac job");
+    assert_eq!(prepared.form, crate::executor::InputTree::Provider);
+    let minted = minting.0.lock().expect("minted").clone();
+    assert_eq!(minted, [Some(decoded)]);
+}

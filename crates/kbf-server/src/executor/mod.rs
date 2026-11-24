@@ -275,6 +275,7 @@ impl Dispatch for Executor {
             key,
             whole_machine,
             call,
+            decoded,
             arrival,
             ..
         } = submission;
@@ -315,7 +316,7 @@ impl Dispatch for Executor {
             let op = Op::new(
                 operation,
                 key.clone(),
-                whole_machine,
+                (whole_machine, decoded),
                 recorded,
                 Some(arrival),
             );

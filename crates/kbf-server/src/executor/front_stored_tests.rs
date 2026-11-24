@@ -15,23 +15,26 @@ fn manifest(tree: &str) -> ObjectKey {
     ObjectKey::new(format!("cas/l/{tree}")).expect("a key")
 }
 
-/// One series of the steps family on `metrics`' page: `count` or `sum` of `step`.
-fn series(metrics: &Metrics, part: &str, step: &str) -> String {
+/// One series of the steps family on `metrics`' page: `count` or `sum` of `step` for a tree of
+/// `form` (`manifests` or `provider`).
+fn series(metrics: &Metrics, part: &str, (step, form): (&str, &str)) -> String {
     let mut page = String::new();
     metrics.render(&mut page);
-    let series = format!("kbf_executor_step_seconds_{part}{{step=\"{step}\"}} ");
+    let series = format!("kbf_executor_step_seconds_{part}{{step=\"{step}\",form=\"{form}\"}} ");
     page.lines()
         .find_map(|line| line.strip_prefix(&series))
-        .unwrap_or_else(|| panic!("no {step} in {page}"))
+        .unwrap_or_else(|| panic!("no {step} of {form} in {page}"))
         .to_owned()
 }
 
+/// The count of `step` for a tree of manifests.
 fn counted(metrics: &Metrics, step: &str) -> String {
-    series(metrics, "count", step)
+    series(metrics, "count", (step, "manifests"))
 }
 
+/// The sum of `step` for a tree of manifests.
 fn summed(metrics: &Metrics, step: &str) -> String {
-    series(metrics, "sum", step)
+    series(metrics, "sum", (step, "manifests"))
 }
 
 /// Catches a mint that waits for the tree's writes, or a wait that answers before they end:
@@ -44,7 +47,7 @@ async fn a_mint_names_its_tree_while_the_writes_are_held_and_stored_waits_for_th
     let action = action_with_input(&rig, "input").await;
     rig.store.hold_puts.store(true, Ordering::SeqCst);
     rig.front
-        .mint(run(1), &action, WALL, InputTree::Manifests)
+        .mint(run(1), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
     let tree = rig.front.tree(run(1)).await.expect("a name");
@@ -86,7 +89,7 @@ async fn a_tree_is_remembered_only_once_its_writes_succeed() {
     rig.store.hold_puts.store(true, Ordering::SeqCst);
     for n in [1, 2] {
         rig.front
-            .mint(run(n), &action, WALL, InputTree::Manifests)
+            .mint(run(n), &action, WALL, InputTree::Manifests, None)
             .await
             .expect("a dir");
     }
@@ -95,7 +98,7 @@ async fn a_tree_is_remembered_only_once_its_writes_succeed() {
     rig.front.stored(run(1)).await.expect("stored");
     rig.front.stored(run(2)).await.expect("stored");
     rig.front
-        .mint(run(3), &action, WALL, InputTree::Manifests)
+        .mint(run(3), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
     assert_eq!((prep.prepared(), prep.minted()), (2, 1));
@@ -117,7 +120,7 @@ async fn a_failed_tree_write_is_the_wait_answer_and_is_not_remembered() {
         let action = action_with_input(&rig, "input").await;
         rig.store.fail_puts.store(true, Ordering::SeqCst);
         rig.front
-            .mint(run(1), &action, WALL, form)
+            .mint(run(1), &action, WALL, form, None)
             .await
             .expect("a dir");
         let failed = rig.front.stored(run(1)).await;
@@ -127,7 +130,7 @@ async fn a_failed_tree_write_is_the_wait_answer_and_is_not_remembered() {
         );
         rig.store.fail_puts.store(false, Ordering::SeqCst);
         rig.front
-            .mint(run(2), &action, WALL, form)
+            .mint(run(2), &action, WALL, form, None)
             .await
             .expect("a dir");
         rig.front.stored(run(2)).await.expect("stored");
@@ -143,7 +146,7 @@ async fn stored_answers_at_once_for_a_run_with_no_writes_pending() {
     rig.front.stored(run(9)).await.expect("never minted");
     let action = action_with_input(&rig, "input").await;
     rig.front
-        .mint(run(1), &action, WALL, InputTree::Manifests)
+        .mint(run(1), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
     rig.front.stored(run(1)).await.expect("stored");
@@ -165,7 +168,7 @@ async fn a_mint_times_its_put_dir_and_its_tree_into_the_executor_metrics() {
     let metrics = Arc::new(Metrics::default());
     let front = rig.front.with_metrics(Arc::clone(&metrics));
     front
-        .mint(run(1), &action, WALL, InputTree::Manifests)
+        .mint(run(1), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
     front.stored(run(1)).await.expect("stored");
@@ -182,7 +185,7 @@ async fn a_mint_times_its_put_dir_and_its_tree_into_the_executor_metrics() {
         assert_eq!(summed(&metrics, step), sum, "{step}");
     }
     front
-        .mint(run(2), &action, WALL, InputTree::Manifests)
+        .mint(run(2), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
     assert_eq!(
@@ -195,7 +198,7 @@ async fn a_mint_times_its_put_dir_and_its_tree_into_the_executor_metrics() {
         "a remembered tree walks nothing"
     );
     let refused = front
-        .mint(run(3), &reserved, WALL, InputTree::Manifests)
+        .mint(run(3), &reserved, WALL, InputTree::Manifests, None)
         .await;
     assert!(matches!(refused, Err(MintError::Refused(_))), "{refused:?}");
     assert_eq!(
@@ -208,16 +211,35 @@ async fn a_mint_times_its_put_dir_and_its_tree_into_the_executor_metrics() {
         .expect("nothing pending for a refused tree");
 }
 
-/// Catches the stages of a tree's writes not timed into the executor's steps, timed twice, or
-/// timed for a tree list: a tree written as manifests, whose blobs the rig keeps only in its
-/// CAS, counts one `tree_blobs`, one `tree_manifests` and one `tree_root` once it is stored; a
-/// tree list, one write with no stages, counts none of them.
+/// Catches the stages of a tree's writes not timed into the executor's steps, timed twice, timed
+/// as the other form's, or counted under the other form: a tree written as manifests, whose
+/// blobs the rig keeps only in its CAS, counts one `tree_blobs`, one `tree_manifests` and one
+/// `tree_root` once it is stored, all as `manifests`; a tree list counts one `tree_blobs`, one
+/// `tree_list` and one `tree_sidecar`, all as `provider`; and neither counts anything under the
+/// other form.
 #[tokio::test]
-async fn the_stages_of_a_trees_writes_are_timed_into_the_executor_metrics() {
-    let stages = ["tree_blobs", "tree_manifests", "tree_root"];
-    for (form, base, counts) in [
-        (InputTree::Manifests, super::put_dir::base(), "1"),
-        (InputTree::Provider, super::put_dir::listed_base(), "0"),
+async fn the_stages_of_a_trees_writes_are_timed_by_form_into_the_executor_metrics() {
+    let stages = [
+        "tree",
+        "tree_blobs",
+        "tree_manifests",
+        "tree_root",
+        "tree_list",
+        "tree_sidecar",
+    ];
+    for (form, label, base, timed) in [
+        (
+            InputTree::Manifests,
+            "manifests",
+            super::put_dir::base(),
+            &["tree", "tree_blobs", "tree_manifests", "tree_root"][..],
+        ),
+        (
+            InputTree::Provider,
+            "provider",
+            super::put_dir::listed_base(),
+            &["tree", "tree_blobs", "tree_list", "tree_sidecar"][..],
+        ),
     ] {
         let prep = DirPrep::new(None, 7_200);
         let rig = super::put_dir::rig_over(prep, Some(base));
@@ -225,13 +247,19 @@ async fn the_stages_of_a_trees_writes_are_timed_into_the_executor_metrics() {
         let metrics = Arc::new(Metrics::default());
         let front = rig.front.with_metrics(Arc::clone(&metrics));
         front
-            .mint(run(1), &action, WALL, form)
+            .mint(run(1), &action, WALL, form, None)
             .await
             .expect("a dir");
         front.stored(run(1)).await.expect("stored");
-        assert_eq!(counted(&metrics, "tree"), "1", "{form:?}");
-        for stage in stages {
-            assert_eq!(counted(&metrics, stage), counts, "{form:?}: {stage}");
+        for other in ["manifests", "provider"] {
+            for stage in stages {
+                let want = match other == label && timed.contains(&stage) {
+                    true => "1",
+                    false => "0",
+                };
+                let got = series(&metrics, "count", (stage, other));
+                assert_eq!(got, want, "{form:?}: {stage} as {other}");
+            }
         }
     }
 }

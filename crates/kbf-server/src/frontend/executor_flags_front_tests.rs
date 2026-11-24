@@ -34,6 +34,7 @@ impl RunPrepare for Refusing {
         &self,
         _: &str,
         _: &kbf_types::Digest,
+        _decoded: Option<&kbf_proto::reapi::Action>,
         _: SystemTime,
         _: Duration,
     ) -> Result<PreparedPutDir, PrepareError> {
@@ -121,6 +122,7 @@ async fn minted(flags: &JsAgentFlags) -> (Result<String, MintError>, usize) {
             &action,
             Duration::from_secs(60),
             InputTree::Manifests,
+            None,
         )
         .await;
     let asked = *prepare.asked.lock().expect("a count");

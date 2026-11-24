@@ -10,7 +10,12 @@
 //! - [`Sidecars::emit`] is dual emission: it writes the sidecar from the cells the pack index
 //!   holds, and reads no object. A list naming an object with no recorded cells gets no sidecar:
 //!   its tree is recorded unlisted ([`kbf_pack_index::PackIndex::record_unlisted`]) and counted
-//!   (`kbf_l2_sidecar_missing_total`), for the backfill.
+//!   (`kbf_l2_sidecar_missing_total`), for the backfill. It comes in two parts: what it reads
+//!   (the sidecar's HEAD and the cells query, `Sidecars::stage`), which writes nothing and so
+//!   may run while the list itself is being stored, and what it writes from that
+//!   (`Sidecars::emit_staged`: the sidecar, or the unlisted row), which the tree writer makes
+//!   only once the list is stored, so no sidecar and no unlisted row names a list the store does
+//!   not have.
 //! - [`Sidecars::backfill`] is the miss path and the backfill: it reads each object the list names
 //!   whose cells are not recorded, once, in [`READ_WINDOW`] pieces fed to a
 //!   [`tierstore_list::CellHasher`] as they arrive, records the cells, writes the sidecar, and
@@ -59,6 +64,27 @@ pub enum Emitted {
         /// How many.
         missing: usize,
     },
+}
+
+/// What [`Sidecars::stage`] found, for [`Sidecars::emit_staged`] to write from.
+#[derive(Debug)]
+pub(crate) struct Staged {
+    /// The tree id: the SHA-256 of the version 2 list.
+    tree: [u8; 32],
+    /// The sidecar's key.
+    sidecar: ObjectKey,
+    found: Found,
+}
+
+/// What the store and the pack index hold for one sidecar.
+#[derive(Debug)]
+enum Found {
+    /// The sidecar is in the store already.
+    Present,
+    /// `missing` objects the list names have no recorded cells.
+    Unlisted { missing: usize },
+    /// The recorded cells of every object the list names.
+    Cells(BTreeMap<String, ObjectCells>),
 }
 
 /// What [`Sidecars::backfill`] did.
@@ -178,30 +204,95 @@ impl Sidecars {
     /// [`SidecarError`]; nothing that fails here fails the list.
     pub async fn emit(&self, v2: &[u8]) -> Result<Emitted, SidecarError> {
         let emitted = self.emit_counted(v2).await;
-        match &emitted {
-            Ok(Emitted::Unlisted { .. }) => self.counters.missing.add(1),
-            Ok(Emitted::Written) => {}
-            Err(_) => self.counters.failed.add(1),
-        }
+        self.count(&emitted);
         emitted
     }
 
     async fn emit_counted(&self, v2: &[u8]) -> Result<Emitted, SidecarError> {
+        let staged = self.stage(v2).await;
+        self.write_staged(v2, staged?).await
+    }
+
+    /// What dual emission of `v2` reads, and nothing it writes: whether the sidecar is in the
+    /// store already (a HEAD) and, when it is not, the recorded cells of every object the list
+    /// names (the pack index's cells query). It may run while `v2` itself is being stored; what it
+    /// found is written by [`Sidecars::emit_staged`] once `v2` is.
+    ///
+    /// # Errors
+    /// [`SidecarError`]: `v2` is not a list, or the store or the pack index failed.
+    pub(crate) async fn stage(&self, v2: &[u8]) -> Result<Staged, SidecarError> {
         let (tree, keys) = list_of(v2)?;
         let sidecar = key_of(&tree)?;
         if self.store.len(&sidecar).await?.is_some() {
-            self.counters.present.add(1);
-            return Ok(Emitted::Written);
+            return Ok(Staged {
+                tree,
+                sidecar,
+                found: Found::Present,
+            });
         }
         let cells = self.cells(&keys).await?;
         let missing = keys.len() - cells.len();
-        if missing > 0 {
-            let index = Arc::clone(&self.index);
-            blocking(move || index.record_unlisted(&tree)).await?;
-            return Ok(Emitted::Unlisted { missing });
+        let found = match missing {
+            0 => Found::Cells(cells),
+            missing => Found::Unlisted { missing },
+        };
+        Ok(Staged {
+            tree,
+            sidecar,
+            found,
+        })
+    }
+
+    /// Dual emission of the version 2 list `v2`, stored by now, from what [`Sidecars::stage`] of
+    /// it found (`staged`, its failure included): writes the sidecar from the cells, or records the
+    /// tree unlisted, and counts it as [`Sidecars::emit`] does.
+    ///
+    /// # Errors
+    /// As [`Sidecars::emit`].
+    pub(crate) async fn emit_staged(
+        &self,
+        v2: &[u8],
+        staged: Result<Staged, SidecarError>,
+    ) -> Result<Emitted, SidecarError> {
+        let emitted = match staged {
+            Ok(staged) => self.write_staged(v2, staged).await,
+            Err(error) => Err(error),
+        };
+        self.count(&emitted);
+        emitted
+    }
+
+    /// Writes what `staged` says for the stored list `v2`.
+    async fn write_staged(&self, v2: &[u8], staged: Staged) -> Result<Emitted, SidecarError> {
+        let Staged {
+            tree,
+            sidecar,
+            found,
+        } = staged;
+        match found {
+            Found::Present => {
+                self.counters.present.add(1);
+                Ok(Emitted::Written)
+            }
+            Found::Unlisted { missing } => {
+                let index = Arc::clone(&self.index);
+                blocking(move || index.record_unlisted(&tree)).await?;
+                Ok(Emitted::Unlisted { missing })
+            }
+            Found::Cells(cells) => {
+                self.write(v2, &sidecar, &cells).await?;
+                Ok(Emitted::Written)
+            }
         }
-        self.write(v2, &sidecar, &cells).await?;
-        Ok(Emitted::Written)
+    }
+
+    /// Counts what dual emission did.
+    fn count(&self, emitted: &Result<Emitted, SidecarError>) {
+        match emitted {
+            Ok(Emitted::Unlisted { .. }) => self.counters.missing.add(1),
+            Ok(Emitted::Written) => {}
+            Err(_) => self.counters.failed.add(1),
+        }
     }
 
     /// The miss path and the backfill of the version 2 list `v2`: reads once each object it

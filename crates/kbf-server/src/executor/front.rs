@@ -14,7 +14,11 @@
 //!   blob the frontend keeps in a pack). A run that cannot be prepared is the caller's
 //!   ([`MintError::Refused`]) unless the store could not be read ([`MintError::Unavailable`]):
 //!   see [`PrepareFault`].
-//! - **The action's facts** are read from the Action and the Command in the CAS: the
+//! - **The action's facts** are read from the Action and the Command: those the Execute that
+//!   opened the operation decoded ([`kbf_front::Submission::decoded`]), so the run reads neither
+//!   from the CAS again, or, for an operation taken up from another process, read from the CAS.
+//!   The closure of a run given the decoded Action does not read it either
+//!   ([`RunPrepare::prepare_put_dir`]). The facts are the
 //!   `container-image` platform property, which names the BASE environment the Command sees and
 //!   must be, by digest, the base the executor serves (an action that names none uses it); and
 //!   the timeout. The image a run is launched from is the kbf image, built from that base and
@@ -33,11 +37,13 @@
 //!   closure, the lookup of the places and every write; only the run's put directory is minted
 //!   ([`RunPrepare::mint_put_dir`]). The facts remembered are those of an action's digest, which
 //!   never expire: the Action, the Command and the platform they name are named by their
-//!   digests, so what they say cannot change. Only a read that succeeded is remembered.
+//!   digests, so what they say cannot change. Only facts that were had are remembered, from a
+//!   read or from the Execute's decode alike.
 //! - **The steps of a mint are timed** into the executor's `kbf_executor_step_seconds`
-//!   ([`Front::with_metrics`]): the put directory, the closure's parts and the tree's name;
-//!   and the stages of a tree's writes as manifests ([`kbf_front::action_tree::WriteStage`]),
-//!   on the task that writes it.
+//!   ([`Front::with_metrics`]), labelled with the tree's form: the put directory, the closure's
+//!   parts and the tree's name; and the stages of a tree's writes
+//!   ([`kbf_front::action_tree::WriteStage`]: as manifests, its blobs, manifests and root; as a
+//!   tree list, its blobs, the list and its sidecar), on the task that writes it.
 //! - **An object the store lost** ([`Ingest::lost`]): a job that did not start because the store
 //!   does not have an object of its tree. The store is general-purpose, and its objects can
 //!   vanish while the frontend's state names them, and a store can answer "not found" for a while
@@ -72,27 +78,26 @@ use kbf_front::prepare_run::{
     ClosureError, KeptClosure, PrepareError as RunPrepError, PrepareFault, PrepareTook, PutDirPrep,
     PutDirRun,
 };
-use kbf_front::{Backend, Described, IssuedPutDir, PackKeyMint, Packs};
-use kbf_proto::reapi::{self, Action, ActionResult, Command, Digest};
+use kbf_front::{Backend, DecodedAction, IssuedPutDir, PackKeyMint, Packs};
+use kbf_proto::reapi::{Action, ActionResult, Digest};
 use kbf_types::{DigestFunction, ImageRef};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::action_usage::Shape;
 use crate::executor::config::InputTree;
 use crate::executor::front_cache::Bounded;
-use crate::executor::mac::System;
 use crate::executor::metrics::Metrics;
-use crate::executor::size_class::SizeClass;
 use crate::executor::steps::Step;
 use crate::executor::task::{PackKey, RunId, build_id};
 use crate::executor::traits::{
-    ActionFacts, Ingest, Ingested, Inputs, InputsError, LostObject, MintError, MissPath,
-    RejectReason, UntrustedLimits,
+    ActionFacts, Ingest, Ingested, InputsError, LostObject, MintError, MissPath, RejectReason,
+    UntrustedLimits,
 };
 
+#[path = "front_facts.rs"]
+mod facts;
 #[path = "front_miss.rs"]
 mod miss;
 #[path = "front_unreadable.rs"]
@@ -124,6 +129,7 @@ pub enum PrepareError {
 pub trait RunPrepare: Send + Sync {
     /// The run of `action` on `run`, started at `now`, which may take `wall`, that commits
     /// into a put directory: the directory and the closure its action tree is written from.
+    /// Given `decoded`, `action`'s Action already decoded, the closure does not read it.
     ///
     /// # Errors
     /// [`PrepareError`].
@@ -131,6 +137,7 @@ pub trait RunPrepare: Send + Sync {
         &self,
         run: &str,
         action: &kbf_types::Digest,
+        decoded: Option<&Action>,
         now: SystemTime,
         wall: Duration,
     ) -> Result<PreparedPutDir, PrepareError>;
@@ -191,10 +198,11 @@ impl RunPrepare for PutDirPrep {
         &self,
         run: &str,
         action: &kbf_types::Digest,
+        decoded: Option<&Action>,
         now: SystemTime,
         wall: Duration,
     ) -> Result<PreparedPutDir, PrepareError> {
-        PutDirPrep::prepare_put_dir(self, run, action, now, wall)
+        PutDirPrep::prepare_put_dir(self, run, action, decoded, now, wall)
             .await
             .map(prepared_put_dir)
             .map_err(prepare_error)
@@ -557,10 +565,13 @@ impl Ingest for Front {
         action: &Digest,
         wall: Duration,
         tree: InputTree,
+        decoded: Option<&DecodedAction>,
     ) -> Result<PackKey, MintError> {
         let action = cas_digest(action).map_err(MintError::Refused)?;
         let now = (self.now)();
-        self.mint_put_dir(run, &action, (now, wall), tree).await
+        let decoded = decoded.map(|decoded| &decoded.action);
+        self.mint_put_dir(run, (&action, decoded), (now, wall), tree)
+            .await
     }
 
     async fn stored(&self, run: RunId) -> Result<(), MintError> {
@@ -678,11 +689,11 @@ impl Front {
     /// `form` says (its manifests, or its tree list), named and parked for [`Inputs::tree`]; the
     /// tree's writes go on after the mint answers, parked for [`Ingest::stored`]. An action tree
     /// remembered for the action in this form is not written again: only the directory is
-    /// minted.
+    /// minted. The closure reads the Action unless it is `decoded`.
     async fn mint_put_dir(
         &self,
         run: RunId,
-        action: &kbf_types::Digest,
+        (action, decoded): (&kbf_types::Digest, Option<&Action>),
         (now, wall): (SystemTime, Duration),
         form: InputTree,
     ) -> Result<PackKey, MintError> {
@@ -703,14 +714,16 @@ impl Front {
         let (dir, not_after, tree, writes) = match remembered {
             Some(tree) => {
                 let minted = prepare.mint_put_dir(&build, action, now, wall).await;
-                self.metrics.step_took(Step::PutDir, started.elapsed());
+                self.metrics
+                    .step_took(Step::PutDir, form, started.elapsed());
                 let minted = minted.map_err(MintError::from)?;
                 lasts(minted.not_after, now, wall)?;
                 (minted.dir, minted.not_after, tree, None)
             }
             None => {
-                let prepared = prepare.prepare_put_dir(&build, action, now, wall).await;
-                self.metrics.step_took(Step::PutDir, started.elapsed());
+                let prepared = (prepare.prepare_put_dir(&build, action, decoded, now, wall)).await;
+                self.metrics
+                    .step_took(Step::PutDir, form, started.elapsed());
                 let prepared = prepared.map_err(MintError::from)?;
                 let took = &prepared.took;
                 for (step, took) in [
@@ -718,7 +731,7 @@ impl Front {
                     (Step::Walk, took.walk),
                     (Step::Held, took.held),
                 ] {
-                    self.metrics.step_took(step, took);
+                    self.metrics.step_took(step, form, took);
                 }
                 lasts(prepared.not_after, now, wall)?;
                 let (tree, writes) =
@@ -763,7 +776,7 @@ impl Front {
         let (named, name) = oneshot::channel::<String>();
         let how = self.listing_write(&action, form, checked);
         let writes = tokio::spawn(async move {
-            let timed = |stage, took| metrics.step_took(Step::of_write(stage), took);
+            let timed = |stage, took| metrics.step_took(Step::of_write(stage), form, took);
             let tree = write_named(&writer, &base, &kept, (form, how), named, timed).await?;
             if checked {
                 lock_checked(&checks).remove(&action);
@@ -779,7 +792,7 @@ impl Front {
                 Ok(Ok(())) | Err(_) => broke(),
             });
         };
-        self.metrics.step_took(Step::Tree, started.elapsed());
+        self.metrics.step_took(Step::Tree, form, started.elapsed());
         Ok((tree, writes))
     }
 }
@@ -805,8 +818,9 @@ fn broke() -> MintError {
 /// against the store when a job of the action did not start for an object the store lost (and
 /// a tree list with its sidecar republished, as `how` says), and sends its name (its root
 /// manifest's digest in hex, or its tree list's key) to `named` as soon as the writer has it,
-/// before any write. The stages of a tree's writes as manifests are told to `timed`; a tree list
-/// is one write, and has none. Returns the name once every write succeeded.
+/// before any write. The stages of the tree's writes are told to `timed` (as manifests: its
+/// blobs, manifests and root; as a tree list: its blobs, the list and its sidecar). Returns the
+/// name once every write succeeded.
 async fn write_named(
     writer: &TreeWriter,
     base: &OnceLock<BaseTree>,
@@ -834,7 +848,7 @@ async fn write_named(
             let of_list = move |listing: &Listing| {
                 let _ = named.send(listing.key().to_owned());
             };
-            let listing = writer.write_listing_with(kept, base, how, of_list).await;
+            let listing = (writer.write_listing_with(kept, base, how, of_list, timed)).await;
             listing.map(|listing| listing.key().to_owned())
         }
     };
@@ -861,112 +875,6 @@ fn reason(why: kbf_front::RejectReason) -> RejectReason {
         Front::Expired => RejectReason::Expired,
         Front::Claimed => RejectReason::Claimed,
     }
-}
-
-/// The name of the platform property that names the image.
-const IMAGE_PROPERTY: &str = "container-image";
-
-#[tonic::async_trait]
-impl Inputs for Front {
-    async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
-        let key = (action.hash.clone(), action.size_bytes);
-        let remembered = self.facts().get(&key);
-        if let Some(facts) = remembered {
-            return Ok(facts);
-        }
-        let facts = self.read_facts(action).await?;
-        self.facts().put(key, facts.clone());
-        Ok(facts)
-    }
-
-    async fn tree(&self, run: RunId) -> Result<String, InputsError> {
-        let parked = self.parked().remove(&run);
-        parked
-            .map(|parked| parked.tree)
-            .ok_or_else(|| InputsError::Unavailable(format!("no tree was written for {run}")))
-    }
-}
-
-impl Front {
-    /// The facts of `action`, read from the CAS.
-    async fn read_facts(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
-        let digest = cas_digest(action).map_err(InputsError::Invalid)?;
-        let action: Action = self.read("action", &digest).await?;
-        let command = action
-            .command_digest
-            .as_ref()
-            .ok_or_else(|| InputsError::Invalid("the action names no command".to_owned()))?;
-        let command = cas_digest(command).map_err(InputsError::Invalid)?;
-        let command: Command = self.read("command", &command).await?;
-        let platform = platform_of(&action, &command);
-        check_base(platform, &self.base_image, &self.kbf_image)?;
-        let timeout = timeout_of(&action)?;
-        let system = System::of(platform).map_err(InputsError::Invalid)?;
-        // The target and kind of the action, read from its argv and output paths.
-        let described = Described::of(command);
-        let shape = Shape::of(&described.arguments, &described.outputs);
-        Ok(ActionFacts {
-            image: self.kbf_image.to_string(),
-            timeout,
-            system,
-            size_class: SizeClass::of_action(&shape),
-        })
-    }
-}
-
-/// Refuses an action whose `container-image` is not the base environment `base` this executor
-/// serves. The property is read from the Action's platform or else the Command's; one that
-/// names none means the base. Only the manifest digest is compared: two spellings of one digest
-/// are one image. The refusal names both images, and the kbf image the run would use.
-fn check_base(
-    platform: Option<&reapi::Platform>,
-    base: &ImageRef,
-    kbf: &ImageRef,
-) -> Result<(), InputsError> {
-    let named = platform
-        .and_then(|p| p.properties.iter().find(|p| p.name == IMAGE_PROPERTY))
-        .map(|p| p.value.as_str());
-    let Some(value) = named else {
-        return Ok(());
-    };
-    let image = ImageRef::parse(value).map_err(|e| InputsError::Invalid(e.to_string()))?;
-    match image.digest() == base.digest() {
-        true => Ok(()),
-        false => Err(InputsError::Invalid(format!(
-            "the action's {IMAGE_PROPERTY} {image} is not the base environment this executor \
-             serves, {base} (runs are launched from the kbf image {kbf}, which is built from \
-             it): name the served base, or none"
-        ))),
-    }
-}
-
-/// The platform of `action` if it names any property, or else of its `command`: as `kbf-front`
-/// reads it (`kbf-front`'s `execution.rs`), so the system the executor runs an action on is the
-/// one `kbf-front` read for it.
-// The Command's platform is deprecated in REAPI 2.2 in favour of the Action's, and clients that
-// predate it still send only the Command's: both are read, the Action's first.
-#[allow(deprecated)]
-fn platform_of<'a>(action: &'a Action, command: &'a Command) -> Option<&'a reapi::Platform> {
-    action
-        .platform
-        .as_ref()
-        .filter(|p| !p.properties.is_empty())
-        .or(command.platform.as_ref())
-}
-
-/// The action's timeout; none if it names none or zero.
-fn timeout_of(action: &Action) -> Result<Option<Duration>, InputsError> {
-    let Some(timeout) = &action.timeout else {
-        return Ok(None);
-    };
-    let (Ok(seconds), Ok(nanos)) = (u64::try_from(timeout.seconds), u32::try_from(timeout.nanos))
-    else {
-        return Err(InputsError::Invalid(
-            "the action's timeout is negative".to_owned(),
-        ));
-    };
-    let timeout = Duration::new(seconds, nanos);
-    Ok((!timeout.is_zero()).then_some(timeout))
 }
 
 #[cfg(test)]

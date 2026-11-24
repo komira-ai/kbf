@@ -1,6 +1,7 @@
-//! A family of duration histograms, one series per value of one label, for `GET /metrics`: the
+//! A family of duration histograms, one series per value of its labels, for `GET /metrics`: the
 //! phases of a run (`kbf_executor_phase_seconds`, [`crate::executor::phases`]) and the steps
-//! of its preparation and submit (`kbf_executor_step_seconds`, [`crate::executor::steps`]).
+//! of its preparation and submit, by the form of its action tree (`kbf_executor_step_seconds`,
+//! [`crate::executor::steps`]).
 //!
 //! The buckets reach from a millisecond, where a warm preparation and a submit on a warm
 //! connection fall, to an hour, where a queued job can.
@@ -31,19 +32,18 @@ pub(crate) const BOUNDS: [(u64, &str); 17] = [
     (3_600_000_000, "3600"),
 ];
 
-/// The values of a family's label: the series of the family, in the order it renders them.
+/// The values of a family's labels: the series of the family, in the order it renders them.
 pub(crate) trait Series: Copy + 'static {
     /// The family's name.
     const NAME: &'static str;
     /// The family's help text.
     const HELP: &'static str;
-    /// The name of the label.
-    const LABEL: &'static str;
     /// Every value, in the order the family lists them.
     const ALL: &'static [Self];
 
-    /// The label's value.
-    fn label(self) -> &'static str;
+    /// The series' labels as the text format writes them between the braces, `le` aside:
+    /// `phase="queue"`, say.
+    fn labels(self) -> String;
 
     /// The value's place in [`Series::ALL`].
     fn slot(self) -> usize;
@@ -84,21 +84,21 @@ impl<S: Series> Histograms<S> {
 
     /// Appends the family to `out`, in the Prometheus text format.
     pub(crate) fn render(&self, out: &mut String) {
-        let (name, key) = (S::NAME, S::LABEL);
+        let name = S::NAME;
         let _ = writeln!(out, "# HELP {name} {}\n# TYPE {name} histogram", S::HELP);
         let rows = S::ALL.iter().zip(self.buckets.iter().zip(&self.micros));
         for (series, (buckets, micros)) in rows {
-            let label = series.label();
+            let labels = series.labels();
             let mut seen = 0;
             let bounds = BOUNDS.iter().map(|(_, le)| *le).chain(["+Inf"]);
             for (le, count) in bounds.zip(buckets) {
                 seen += count.load(Ordering::Relaxed);
-                let _ = writeln!(out, "{name}_bucket{{{key}=\"{label}\",le=\"{le}\"}} {seen}");
+                let _ = writeln!(out, "{name}_bucket{{{labels},le=\"{le}\"}} {seen}");
             }
             let micros = micros.load(Ordering::Relaxed);
             let (whole, part) = (micros / 1_000_000, micros % 1_000_000);
-            let _ = writeln!(out, "{name}_sum{{{key}=\"{label}\"}} {whole}.{part:06}");
-            let _ = writeln!(out, "{name}_count{{{key}=\"{label}\"}} {seen}");
+            let _ = writeln!(out, "{name}_sum{{{labels}}} {whole}.{part:06}");
+            let _ = writeln!(out, "{name}_count{{{labels}}} {seen}");
         }
     }
 }

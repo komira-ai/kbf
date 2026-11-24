@@ -9,7 +9,9 @@ use kbf_state::{Store, Txn};
 use kbf_types::{ActionKey, OperationId};
 
 use super::*;
-use crate::executor::tests::{Caller, FakeIngest, Rig, digest_n, digest_of, settle, submission_of};
+use crate::executor::tests::{
+    Caller, FakeIngest, Rig, digest_n, digest_of, locked, settle, submission_of,
+};
 use crate::executor::{rows, stored_name};
 
 // ---- an Execute is a job, at once
@@ -462,4 +464,34 @@ async fn operation_ids_of_two_processes_over_one_store_never_meet() {
     }
     assert_eq!(ids.len(), 12);
     assert!(!ids.contains(&0));
+}
+
+// ---- the Execute's decode
+
+/// Catches the Action and Command an Execute decoded lost on the way to its run, or swapped for
+/// another's, so that the run would read them from the CAS again: the run's facts and its mint
+/// are both given the decode the submission carried.
+#[tokio::test(start_paused = true)]
+async fn the_decode_an_execute_carries_reaches_its_runs_facts_and_mint() {
+    let rig = Rig::start().await;
+    let decoded = kbf_front::DecodedAction {
+        action: kbf_proto::reapi::Action {
+            do_not_cache: true,
+            ..Default::default()
+        },
+        command: kbf_proto::reapi::Command {
+            arguments: vec!["cc".to_owned()],
+            ..Default::default()
+        },
+    };
+    let mut submission = submission_of(digest_of(1));
+    submission.decoded = Some(std::sync::Arc::new(decoded.clone()));
+
+    let caller = Caller::of(rig.exec.submit(submission).expect("taken"));
+    rig.submitted(&caller, 0).await;
+
+    let facts = locked(&rig.inputs.decoded).clone();
+    assert_eq!(facts, [Some(decoded.clone())], "the facts were given it");
+    let minted = locked(&rig.ingest.minted_decoded).clone();
+    assert_eq!(minted, [Some(decoded)], "the mint was given it");
 }
