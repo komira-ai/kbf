@@ -514,3 +514,29 @@ async fn a_backend_answers_a_job_read_locate_as_a_blob_source() {
         None
     );
 }
+
+/// Catches the split of a Directory read lost on its way from the packs to the walk: over a
+/// frontend's packs and one node, a tree whose root and one Directory are in a pack and whose
+/// other Directory is on the node alone is walked with three index lookups (the packs are asked
+/// first for each) and two ranged reads of the pack (the node's Directory has none).
+#[tokio::test]
+async fn a_walk_through_packs_reports_the_index_lookup_and_pack_read_of_each_read() {
+    let cache = Arc::new(Cache::memory());
+    let (a, b) = (blob("file a"), blob("file b"));
+    let (packed, on_node) = (dir(&[a.0], &[]), dir(&[b.0], &[]));
+    let root = dir(&[], &[packed.0, on_node.0]);
+    put(&cache, &[&on_node, &b]).await;
+    let packs = packs_holding(&[&root, &packed, &a]).await;
+    let storage = CacheStorage::new(Arc::clone(&cache), SegmentsConfig::DEFAULT);
+    let backend = Backend::remote_over(Arc::new(storage), Some(packs));
+
+    let walked = backend.walk_inputs(root.0).await.expect("walk");
+
+    assert!(walked.absent.is_empty(), "{:?}", walked.absent);
+    assert_eq!(walked.dirs_read, 3);
+    assert_eq!(
+        (walked.index_times.len(), walked.object_times.len()),
+        (3, 2)
+    );
+    assert_eq!(walked.depth, 2);
+}

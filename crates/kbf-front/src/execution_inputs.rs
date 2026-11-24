@@ -174,6 +174,12 @@ impl<D> ExecutionService<D> {
         for took in &walked.read_times {
             m.execute_walk_dir_read.observe_duration(*took);
         }
+        for took in &walked.index_times {
+            m.execute_walk_dir_index.observe_duration(*took);
+        }
+        for took in &walked.object_times {
+            m.execute_walk_dir_object.observe_duration(*took);
+        }
         m.execute_dir_cache_hits.add(walked.dir_cache_hits);
         m.execute_dir_cache_misses.add(walked.dir_cache_misses);
         m.execute_dir_cache_merged.add(walked.dir_cache_merged);
@@ -184,6 +190,7 @@ impl<D> ExecutionService<D> {
             m.execute_dir_cache_bytes.set(walked.dir_cache_bytes);
         }
         if walked.phased {
+            m.execute_walk_depth.observe(walked.depth);
             m.execute_walk_dirs.observe_duration(walked.dirs_time);
             m.execute_walk_files.observe_duration(walked.files_time);
         }

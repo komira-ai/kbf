@@ -73,7 +73,7 @@ pub use lost::{
 pub use packer::{
     Blob, FRONTEND_PACK_BYTES, Packed, Packer, PackerConfig, StoredPack, check_create_only,
 };
-pub use reader::{DEFAULT_CONCURRENCY, DEFAULT_GAP, Fetch, Reader, ReaderConfig};
+pub use reader::{DEFAULT_CONCURRENCY, DEFAULT_GAP, Fetch, ReadTimes, Reader, ReaderConfig};
 pub use sweep::{
     AgeOf, Claim, ClaimOf, DEFAULT_GRACE, INGEST_ALLOWANCE, MAX_KEY_LIFE, MIN_GRACE, SWEPT_PREFIX,
     SweepConfig, SweepError, SweepGates, SweepReport, Sweeper, task_key_age,

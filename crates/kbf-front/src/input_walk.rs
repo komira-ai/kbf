@@ -69,6 +69,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt as _, TryStreamExt as _};
+use kbf_pack::ReadTimes;
 use kbf_storage::StorageError;
 use kbf_types::Digest;
 use tokio::time::Instant;
@@ -112,6 +113,12 @@ type Answer<T> = Result<T, StorageError>;
 pub(crate) trait Blobs: Send + Sync {
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>>;
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>>;
+
+    /// [`Blobs::read_blob`], with how long a pack index lookup and a ranged read of a pack
+    /// took within it: neither for a store without packs.
+    fn read_timed<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, (Answer<Bytes>, ReadTimes)> {
+        Box::pin(async move { (self.read_blob(digest).await, ReadTimes::default()) })
+    }
 
     /// What a "held" answer rests on, as a number that changes when it may have changed
     /// (see `kbf_route::Router::epoch`); `None` when the store cannot say, and nothing
@@ -376,12 +383,15 @@ enum Fetched {
     Merged(Arc<Decoded>),
 }
 
-/// One Directory fetched: which, how long its read took (`None` if this walk did not
-/// read), and what came of it.
+/// One Directory fetched: which, how long its read took and its steps in the packs (`None`
+/// and none if this walk did not read), what came of it, and how many dependent reads the
+/// walk had made on the way to it, this one not counted.
 struct Fetch {
     dir: Digest,
     took: Option<Duration>,
+    steps: ReadTimes,
     outcome: Answer<Fetched>,
+    rounds: u64,
 }
 
 /// Reads `dir` for everyone who wants it: leads the read when `first` says to, or waits
@@ -390,7 +400,7 @@ async fn fetch<'a>(
     storage: &'a dyn Blobs,
     cache: &'a DirCache,
     keep: Option<&'a DirectoryCache>,
-    dir: Digest,
+    (dir, rounds): (Digest, u64),
     first: Lookup<'a>,
 ) -> Fetch {
     let mut look = first;
@@ -400,7 +410,9 @@ async fn fetch<'a>(
                 return Fetch {
                     dir,
                     took: None,
+                    steps: ReadTimes::default(),
                     outcome: Ok(Fetched::Merged(decoded)),
+                    rounds,
                 };
             }
             Lookup::Follow(gate) => {
@@ -410,7 +422,7 @@ async fn fetch<'a>(
             }
             Lookup::Lead(lead) => {
                 let began = Instant::now();
-                let blob = storage.read_blob(&dir).await;
+                let (blob, steps) = storage.read_timed(&dir).await;
                 let took = began.elapsed();
                 let outcome = match blob {
                     Err(e) => Err(e),
@@ -427,7 +439,9 @@ async fn fetch<'a>(
                 return Fetch {
                     dir,
                     took: Some(took),
+                    steps,
                     outcome,
+                    rounds,
                 };
             }
         }
@@ -452,7 +466,8 @@ fn keep_named(keep: &DirectoryCache, dir: Digest, blob: Bytes) {
 /// What the walk has found so far, and where it goes next.
 struct Frontier {
     seen: BTreeSet<Digest>,
-    queue: VecDeque<Digest>,
+    /// Each Directory to take, with the dependent reads the walk made on the way to it.
+    queue: VecDeque<(Digest, u64)>,
     /// The files named by the Directories taken.
     files: BTreeSet<Digest>,
     /// The Directories taken and what each names.
@@ -460,16 +475,18 @@ struct Frontier {
 }
 
 impl Frontier {
-    /// `dir` is held, and `decoded` is what it names: its files are to be asked about
-    /// and its subdirectories to be taken.
-    fn take(&mut self, dir: Digest, decoded: Arc<Decoded>) {
+    /// `dir` is held, and `decoded` is what it names, reached after `rounds` dependent reads:
+    /// its files are to be asked about and its subdirectories to be taken.
+    fn take(&mut self, dir: Digest, decoded: Arc<Decoded>, rounds: u64) {
         self.files.extend(decoded.files.iter().copied());
+        let seen = &mut self.seen;
         self.queue.extend(
             decoded
                 .dirs
                 .iter()
                 .copied()
-                .filter(|d| self.seen.insert(*d)),
+                .filter(|d| seen.insert(*d))
+                .map(|d| (d, rounds)),
         );
         self.graph.insert(dir, decoded);
     }
@@ -490,7 +507,7 @@ pub(crate) async fn walk_bounded(
     let keep = trees.kept();
     let mut found = Frontier {
         seen: BTreeSet::from([root]),
-        queue: VecDeque::from([root]),
+        queue: VecDeque::from([(root, 0)]),
         files: BTreeSet::new(),
         graph: HashMap::new(),
     };
@@ -506,7 +523,7 @@ pub(crate) async fn walk_bounded(
     let mut failures: Vec<(Digest, StorageError)> = Vec::new();
     loop {
         while reading.len() < reads_in_flight {
-            let Some(dir) = found.queue.pop_front() else {
+            let Some((dir, rounds)) = found.queue.pop_front() else {
                 break;
             };
             if let Some(at) = epoch.and_then(|e| trees.fresh(e, &dir, Instant::now())) {
@@ -519,20 +536,34 @@ pub(crate) async fn walk_bounded(
                     walked.dir_cache_hits += 1;
                     cached.insert(dir);
                     held_dirs.push(dir);
-                    found.take(dir, decoded);
+                    found.take(dir, decoded, rounds);
                 }
                 first => {
                     if matches!(first, Lookup::Lead(_)) {
                         walked.dir_cache_misses += 1;
                     }
-                    reading.push(fetch(storage, cache, keep.as_deref(), dir, first));
+                    let fetching = fetch(storage, cache, keep.as_deref(), (dir, rounds), first);
+                    reading.push(fetching);
                 }
             }
         }
-        let Some(Fetch { dir, took, outcome }) = reading.next().await else {
+        let Some(Fetch {
+            dir,
+            took,
+            steps,
+            outcome,
+            rounds,
+        }) = reading.next().await
+        else {
             break;
         };
+        // A read, or a wait for another walk's read: the Directories under it are one round
+        // further from the root.
+        let rounds = rounds + 1;
+        walked.depth = walked.depth.max(rounds);
         walked.read_times.extend(took);
+        walked.index_times.extend(steps.index);
+        walked.object_times.extend(steps.objects);
         match outcome {
             Err(StorageError::NotFound(_) | StorageError::Unreachable(_)) => {
                 absent_dirs.insert(dir);
@@ -552,7 +583,7 @@ pub(crate) async fn walk_bounded(
                         decoded
                     }
                 };
-                found.take(dir, decoded);
+                found.take(dir, decoded, rounds);
             }
         }
     }
@@ -684,3 +715,7 @@ mod dircache_tests;
 #[cfg(test)]
 #[path = "input_walk_handoff_tests.rs"]
 mod handoff_tests;
+
+#[cfg(test)]
+#[path = "input_walk_rounds_tests.rs"]
+mod rounds_tests;
