@@ -150,6 +150,13 @@ jobs:
     stage: suite
   - job: beta.yml#js-real-service
     stage: suite
+  # macos-farm.yml, started by a push to main beside the suite: macOS crates' tests on a farm
+  # Mac. It presents the run's OIDC token to the tailnet's identity federation and signs nothing:
+  # the row is `signing: true` because the job holds `id-token: write`, which only a signing row
+  # may.
+  - job: macos-farm.yml#macos-farm
+    stage: suite
+    signing: true
   - job: release.yml#plan
     stage: prod
   - job: release.yml#verify

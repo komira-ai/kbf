@@ -52,10 +52,16 @@ kbf-tree-bundle.workspace = true
 # The platforms a release is built for and the tarballs a host of each needs
 # (`release check`): the one list the installer's bundle reader is checked against.
 kbf-types.workspace = true
+# `mac-farm`: its uploads in flight at once, and the messages of a streamed upload.
+futures.workspace = true
 lzma-rs.workspace = true
 ruzstd.workspace = true
 # The free space of the runner's disk (`runner-disk`).
 rustix = { workspace = true, features = ["fs"] }
+# `mac-farm`: the REAPI messages it encodes and decodes (an Action's timeout is a protobuf
+# Duration).
+prost.workspace = true
+prost-types.workspace = true
 # `debs` reads the pins files of `.github/debs/`.
 serde.workspace = true
 serde_json.workspace = true
@@ -66,8 +72,9 @@ tar.workspace = true
 thiserror.workspace = true
 # The runtime `filer-presence-bench` drives its calls on.
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
-# The filer's gRPC endpoint and status (`filer-presence-bench`).
-tonic.workspace = true
+# The filer's gRPC endpoint and status (`filer-presence-bench`), and the farm's REAPI
+# services (`mac-farm`), over TLS with the system's roots when the farm serves TLS.
+tonic = { workspace = true, features = ["tls-ring", "tls-native-roots"] }
 # `fetch-pinned-js` reads kbf-js-version.toml.
 toml.workspace = true
 ureq.workspace = true
