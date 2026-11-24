@@ -5,8 +5,8 @@
 //! Every declared path must come back as a file or a directory, and nothing else may: a path
 //! the command did not leave, a path the farm names that was not declared, and a symlink (an
 //! answered one, or one inside an output directory) each fail the run. A file is written as its
-//! bytes arrive, hashed on the way, and fails the run when its hash or size is not its digest's.
-//! Nothing is overwritten: a file or directory already at an output's place fails the run.
+//! bytes arrive, hashed on the way, and fails the run when its hash or size is not its digest's;
+//! a file that failed is removed. Nothing is overwritten: a file or directory already at an output's place fails the run.
 
 #[cfg(test)]
 #[path = "outputs_tests.rs"]
@@ -211,16 +211,23 @@ async fn write(
         .mode(mode)
         .open(to)
         .map_err(failed)?;
-    let got = farm.read_into(digest, &mut file).await?;
-    if got != *digest {
-        return Err(OutputError::Corrupt {
-            path: shown.to_owned(),
-            hash: digest.hash.clone(),
-            size: digest.size_bytes,
-            got: got.hash,
-            got_size: got.size_bytes,
-        });
-    }
+    let got = match farm.read_into(digest, &mut file).await {
+        Ok(got) if got == *digest => got,
+        // A file that is not its digest's whole bytes is not left under the output's name.
+        failed => {
+            let _ = std::fs::remove_file(to);
+            return Err(match failed {
+                Ok(got) => OutputError::Corrupt {
+                    path: shown.to_owned(),
+                    hash: digest.hash.clone(),
+                    size: digest.size_bytes,
+                    got: got.hash,
+                    got_size: got.size_bytes,
+                },
+                Err(e) => e.into(),
+            });
+        }
+    };
     written.files += 1;
     written.bytes += got.size_bytes;
     Ok(())

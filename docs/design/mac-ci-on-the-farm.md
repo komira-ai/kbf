@@ -138,7 +138,8 @@ What keeps each macOS job of this repository that is not on the farm on a hosted
   and js-bundle downloads, `gh attestation verify`) or the runner (the artifact upload).
   The farm's binaries are not yet the same bytes as the seed job's: the Command's environment
   is fixed (`RUSTFLAGS=-D warnings`, no `MACOSX_DEPLOYMENT_TARGET`), the checkout's path differs,
-  and the seed job's files are signed ad hoc after the build.
+  the input root has no `.git`, so the farm's kbf names no commit (`kbf-server`'s build script
+  reads it from git), and the seed job's files are signed ad hoc after the build.
 - A loopback-only network level for a Mac action: the job service has one for native bodies,
   but no job level maps to it (its job levels are none, allow-list and open), and kbf sends
   `none`. Mapping an action to it changes the job service's job levels, and it opens a channel

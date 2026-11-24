@@ -4,7 +4,8 @@
 # runs), kbf-seatbelt and kbf-update. And the release builds of the darwin-arm64 kbf and
 # kbf-deploy on a farm Mac, each binary brought back (`--output`) and its SHA-256 printed: a
 # build beside artifacts.yml's `darwin-arm64`, never instead of it (docs/artifacts.md, "The
-# seed build"); nothing here is uploaded, signed or released.
+# seed build"); nothing here is uploaded, signed or released, and the bytes are not yet the
+# seed job's (docs/design/mac-ci-on-the-farm.md, "Missing", says why).
 #
 # The job runs on a hosted Linux runner. `cargo xtask mac-farm` sends each Cargo command to the
 # farm as one remote action on its Mac platform, with the checkout, the crates of Cargo.lock for

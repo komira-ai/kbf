@@ -279,8 +279,9 @@ fn a_symlink_among_the_outputs_fails_the_run() {
     );
 }
 
-/// Catches bytes the farm served under a digest that is not theirs written as that output: the
-/// file is hashed as it is written, and its hash and size must be the digest's.
+/// Catches bytes the farm served under a digest that is not theirs written as that output (the
+/// file is hashed as it is written, and its hash and size must be the digest's), and a file
+/// whose bytes were wrong or whose read failed left under the output's name.
 #[test]
 fn an_output_whose_bytes_are_not_its_digest_fails() {
     let rig = Rig::new();
@@ -303,6 +304,25 @@ fn an_output_whose_bytes_are_not_its_digest_fails() {
             "the output \"kbf\" is 14 bytes of {}, not the 12 bytes of {} the farm named",
             served.hash, named.hash
         )
+    );
+    let out = dir.path().join("out");
+    assert!(!out.join("kbf").exists(), "the wrong bytes are removed");
+    let gone = digest_of(b"never stored");
+    let (result, _) = rig.run_out(
+        &dir,
+        &["lost"],
+        &passed(vec![file("lost", &gone, false)], vec![]),
+    );
+    assert_eq!(
+        failure(result),
+        format!(
+            "ByteStream.Read: NotFound: no blobs/{}/{}",
+            gone.hash, gone.size_bytes
+        )
+    );
+    assert!(
+        !out.join("lost").exists(),
+        "a file whose read failed is removed"
     );
 }
 
