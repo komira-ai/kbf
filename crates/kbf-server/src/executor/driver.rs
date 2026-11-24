@@ -22,6 +22,9 @@ use crate::executor::{Executor, Inner};
 pub struct Running {
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
+    /// How many passes of [`keep`] the task has finished: what a test waits on.
+    #[cfg(test)]
+    kept: watch::Receiver<u64>,
     /// Ends the task when the handle is dropped unstopped.
     _abort: crate::serve::AbortOnDrop,
 }
@@ -31,19 +34,35 @@ impl Running {
     #[must_use]
     pub fn spawn(executor: &Executor) -> Self {
         let (stop, stopped) = watch::channel(false);
-        let task = tokio::spawn(drive(Arc::clone(executor.inner()), stopped));
+        // Only a test keeps the receiver; outside one the sender counts with none.
+        let (passes, _kept) = watch::channel(0);
+        let task = tokio::spawn(drive(Arc::clone(executor.inner()), stopped, passes));
         let abort = crate::serve::AbortOnDrop(task.abort_handle());
         Self {
             stop,
             task,
+            #[cfg(test)]
+            kept: _kept,
             _abort: abort,
         }
+    }
+
+    /// Waits until the task has finished `passes` passes of [`keep`], counted from the start:
+    /// the first pass renews the liveness row and sweeps, each beat after it is one more.
+    #[cfg(test)]
+    pub(crate) async fn kept(&self, passes: u64) {
+        let mut kept = self.kept.clone();
+        kept.wait_for(|done| *done >= passes)
+            .await
+            .expect("the task ended before that pass");
     }
 
     /// Stops the task and deletes the liveness row. Nothing is cancelled: an operation still
     /// open is taken up by another frontend of the store.
     pub async fn stop(self) {
-        let Self { stop, task, _abort } = self;
+        let Self {
+            stop, task, _abort, ..
+        } = self;
         let _ = stop.send(true);
         if let Err(e) = task.await {
             tracing::error!(error = %e, "the executor's task ended abnormally");
@@ -51,7 +70,8 @@ impl Running {
     }
 }
 
-async fn drive(inner: Arc<Inner>, mut stopped: watch::Receiver<bool>) {
+/// Runs until the stop, counting each finished pass of [`keep`] in `passes`.
+async fn drive(inner: Arc<Inner>, mut stopped: watch::Receiver<bool>, passes: watch::Sender<u64>) {
     if inner.rows.is_none() {
         let _ = stopped.wait_for(|stop| *stop).await;
         return;
@@ -60,6 +80,7 @@ async fn drive(inner: Arc<Inner>, mut stopped: watch::Receiver<bool>) {
     let sweep = inner.cfg.live / 2;
     let mut swept = Instant::now();
     keep(&inner, true).await;
+    passes.send_modify(|n| *n += 1);
     loop {
         tokio::select! {
             _ = stopped.wait_for(|stop| *stop) => break,
@@ -70,6 +91,7 @@ async fn drive(inner: Arc<Inner>, mut stopped: watch::Receiver<bool>) {
             swept = Instant::now();
         }
         keep(&inner, due).await;
+        passes.send_modify(|n| *n += 1);
     }
     let inner_for_leave = Arc::clone(&inner);
     let left =
