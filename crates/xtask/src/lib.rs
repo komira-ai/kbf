@@ -45,9 +45,11 @@
 //!   <tarball> <name>` ([`darwin`]): the macOS binary signed ad hoc with the hardened
 //!   runtime and exactly the entitlements the allow list ([`entitlements`]) gives it,
 //!   and checked again as it ships. macOS only.
-//! - `fetch --url <url> --sha256 <hex> --out <path> [--extract <format> [--member <path>]]`
-//!   ([`fetch`]): a pinned tool, downloaded over HTTPS and refused unless its SHA-256
-//!   matches, before anything is unpacked or written.
+//! - `fetch --url <url> --sha256 <hex> --out <path> [--extract <format> [--member <path>]]
+//!   [--cache <file> [--url <url>]...]` ([`fetch`]): a pinned tool, downloaded over HTTPS and
+//!   refused unless its SHA-256 matches, before anything is unpacked or written; with `--cache`,
+//!   taken from the file the actions cache restored when it matches, else downloaded from each
+//!   `--url` in turn, in bounded rounds, and kept there.
 //! - `debs --pins <file> --dir <dir>` ([`debs`]): the Debian packages a CI job installs with `dpkg`, pinned by
 //!   version and SHA-256 in `.github/debs/`: those the actions cache restored into `--dir` when they match, the rest
 //!   downloaded from the pinned mirrors in turn, in bounded rounds, and refused unless the SHA-256 matches.
@@ -299,24 +301,7 @@ enum Verb {
         output: PathBuf,
     },
     /// Download a pinned file, check its SHA-256 and install it (mode 0755).
-    Fetch {
-        /// Where to download it from (HTTPS; redirects must stay on HTTPS).
-        #[arg(long)]
-        url: String,
-        /// The SHA-256 of the download (before unpacking), 64 lowercase hex digits.
-        #[arg(long)]
-        sha256: fetch::Sha256,
-        /// The file to install; its directory is created when missing.
-        #[arg(long)]
-        out: PathBuf,
-        /// How the download is packed (default: it is the file).
-        #[arg(long, value_enum)]
-        extract: Option<fetch::Format>,
-        /// The file to take out of a tar or zip (`--extract tar.gz`, `tar.xz` or `zip`): its
-        /// path inside the archive.
-        #[arg(long)]
-        member: Option<PathBuf>,
-    },
+    Fetch(fetch::Args),
     /// Download a pinned release archive, check its SHA-256 and its build attestation (`gh attestation
     /// verify`, with the pinned `gh`), and only then take `--member` out of the file that was checked.
     FetchAttestedTool {
@@ -1061,16 +1046,9 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::SourceDateEpoch { commit, output } => {
             source_date_epoch(&root, &commit, &output).map(|line| vec![line])
         }
-        Verb::Fetch {
-            url,
-            sha256,
-            out,
-            extract,
-            member,
-        } => {
-            let unpack = fetch::Unpack::new(extract, member).map_err(Error::Usage)?;
-            let roots = fetch::host_roots();
-            Ok(vec![fetch::fetch(&url, &sha256, &unpack, &out, &roots)?])
+        Verb::Fetch(args) => {
+            let unpack = args.unpack().map_err(Error::Usage)?;
+            Ok(vec![fetch::run(&args, &unpack)?])
         }
         Verb::FetchAttestedTool {
             url,

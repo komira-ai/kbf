@@ -52,7 +52,8 @@ jobs:
     env:
       DENY_VERSION: 0.20.2
       DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
-      # The x86_64-linux tarball of ziglang.org/download/index.json.
+      # The x86_64-linux tarball of ziglang.org/download/index.json (the mirrors of the fetch
+      # step serve the same file; its SHA-256 is checked whichever served it).
       ZIG_VERSION: 0.14.1
       ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
     steps:
@@ -103,10 +104,30 @@ jobs:
       # Zig's C compiler and archiver, which carry macOS's libc headers: the cc crate reads
       # `CC_<target>` and `AR_<target>` as a program and its leading arguments. Zig is the release
       # tarball, checked against its SHA-256 before use and unpacked whole (its compiler needs its
-      # lib directory) into the runner's temporary directory.
+      # lib directory) into the runner's temporary directory. The tarball is restored from the
+      # actions cache under a key of its version and SHA-256, and fetched only when the cache
+      # missed (`cargo xtask fetch --cache`, crates/xtask/src/fetch.rs): from two of Zig's
+      # community mirrors and then ziglang.org, in turn, in three rounds 10 s and 30 s apart,
+      # each attempt given up after 5 minutes; checked against its SHA-256 either way. The fetch
+      # step's line says whether the cache hit. A miss is saved, so the next run makes no
+      # download; one on main is restored by every pull request.
+      - name: Restore the Zig tarball
+        if: ${{ !cancelled() }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: zig-cache
+        with:
+          path: ${{ runner.temp }}/zig-cache
+          key: zig-x86_64-linux-${{ env.ZIG_VERSION }}-${{ env.ZIG_SHA256 }}
       - name: Fetch Zig (pinned version and checksum), the C compiler for aarch64-apple-darwin
         if: ${{ !cancelled() }}
-        run: cargo xtask fetch --url "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" --sha256 "$ZIG_SHA256" --out "$RUNNER_TEMP/zig.tar.xz"
+        id: zig-fetch
+        run: cargo xtask fetch --cache "$RUNNER_TEMP/zig-cache/zig-x86_64-linux-$ZIG_VERSION.tar.xz" --url "https://pkg.earth/zig/zig-x86_64-linux-$ZIG_VERSION.tar.xz" --url "https://zig.linus.dev/zig/zig-x86_64-linux-$ZIG_VERSION.tar.xz" --url "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" --sha256 "$ZIG_SHA256" --out "$RUNNER_TEMP/zig.tar.xz"
+      - name: Save the Zig tarball
+        if: ${{ !cancelled() && steps.zig-fetch.outcome == 'success' && steps.zig-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/zig-cache
+          key: ${{ steps.zig-cache.outputs.cache-primary-key }}
       - run: tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
         if: ${{ !cancelled() }}
       - run: rustup target add aarch64-apple-darwin

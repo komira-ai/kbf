@@ -111,7 +111,11 @@ whatever it finds; it fails only when cargo-deny or the GitHub API did.
 A tool a job needs from outside the workspace (cargo-deny, cargo-llvm-cov,
 cargo-cyclonedx, Bazel, buck2) is pinned in the workflow by URL and SHA-256 and
 installed by `cargo xtask fetch`, which refuses a download whose SHA-256 differs
-before it unpacks or writes anything.
+before it unpacks or writes anything. A tool from a host that is slow or unreachable
+from the runners at times (Zig, from ziglang.org) is kept in the actions cache under
+a key of its version and SHA-256: with `--cache <file>` the verb installs the
+restored file when its SHA-256 matches, and only on a miss downloads it, from each
+`--url` in turn in three rounds, and keeps it for the cache to save.
 
 The pull-request gate (rules T1 and T3 of [AGENTS.md](AGENTS.md)) is 99.00% of
 lines and 99.00% of branches in every crate, measured on the fast tests (the
