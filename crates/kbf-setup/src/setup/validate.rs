@@ -60,6 +60,17 @@ pub struct Valid {
     pub local_database: Option<LocalDatabase>,
 }
 
+impl Valid {
+    /// The file that holds the database's password (`--database-password-file`), as the
+    /// `kbf.toml` setting it becomes.
+    pub fn database_password_file(&self) -> Option<&str> {
+        self.kbf
+            .iter()
+            .find(|s| s.table == "scheduler" && s.key == "state-store-password-file")
+            .map(|s| s.value.as_str())
+    }
+}
+
 /// The role and database `--create-local-database` makes, and where the local server's socket
 /// is, all from the `--database` URL. The names are plain (letters, digits, `_`, `-`).
 #[derive(Clone, PartialEq, Eq)]
@@ -128,6 +139,11 @@ impl Raw {
         let (database, local_database) = self.database(&mut problems);
         let database_defaulted = database.is_some() && self.database.is_none();
         let kbf = self.kbf.validate(self.mode, &mut problems);
+        if self.kbf.database_password_file.is_some() && self.database.is_none() {
+            problems.push(
+                "--database-password-file needs --database: the default database is reached by peer authentication, with no password".to_owned(),
+            );
+        }
         let installer_toml = paths::installer_toml(platform);
         if self
             .installer_config

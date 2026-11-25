@@ -2,33 +2,46 @@
 //! one real implementation here, so the tests of `run` play the server and the implementation is
 //! tested on its own.
 
-use kbf_state::postgres::PostgresConfig;
+use std::path::Path;
 
 use super::SetupError;
 use crate::database::{Database, SchemaOps};
 
 /// Where the state database is reached from.
 pub trait Schemas {
-    /// The schema runner for the database `url` names (validated: no password).
+    /// The schema runner for the database `url` names (validated: no password), with the
+    /// password of `password_file` (`--database-password-file`), else PGPASSWORD, else
+    /// `~/.pgpass`, as setup's own process has them.
     ///
     /// # Errors
-    /// The URL is not one the Postgres client takes.
-    fn of(&self, url: &str) -> Result<Box<dyn SchemaOps>, SetupError>;
+    /// The URL is not one the Postgres client takes, or the password cannot be had.
+    fn of(&self, url: &str, password_file: Option<&str>) -> Result<Box<dyn SchemaOps>, SetupError>;
 }
 
 /// The real server, with the migrations embedded in this build.
 pub struct Postgres;
 
 impl Schemas for Postgres {
-    fn of(&self, url: &str) -> Result<Box<dyn SchemaOps>, SetupError> {
-        // The client's own messages may quote the URL; none is kept.
-        let config = PostgresConfig::parse(url)
-            .map_err(|_| SetupError::Database("the --database URL is not usable".to_owned()))?;
+    fn of(&self, url: &str, password_file: Option<&str>) -> Result<Box<dyn SchemaOps>, SetupError> {
+        let file = password_file.map(Path::new);
+        let found = kbf_pg_auth::authenticate(url, file, &kbf_pg_auth::Context::of_process())
+            .map_err(refusal)?;
         Ok(Box::new(Database::new(
-            config,
+            found.config,
             kbf_pack_index::schema::embedded(),
         )))
     }
+}
+
+/// What setup says when the database cannot be reached from its flags. The client's own messages
+/// may quote the URL; none is kept.
+fn refusal(why: kbf_pg_auth::AuthError) -> SetupError {
+    SetupError::Database(match why {
+        kbf_pg_auth::AuthError::Url(_) | kbf_pg_auth::AuthError::InUrl => {
+            "the --database URL is not usable".to_owned()
+        }
+        why => format!("--database-password-file: {why}"),
+    })
 }
 
 /// What `run` takes from outside the host.

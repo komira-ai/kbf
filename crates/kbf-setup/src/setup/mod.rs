@@ -213,6 +213,7 @@ pub fn installer_settings(
         )));
     }
     settings.database = v.database.clone();
+    settings.database_password_file = v.database_password_file().map(PathBuf::from);
     // The node identity belongs to the frontend source, whichever way the file got it.
     (settings.node_cert, settings.node_key) = match (&settings.source, node_role(v.mode)) {
         (Source::Frontend, Some(role)) => {
@@ -365,7 +366,7 @@ pub fn run(
                 mode_name(valid.mode)
             )?;
         } else {
-            let schema = backend.schemas.of(url)?;
+            let schema = backend.schemas.of(url, valid.database_password_file())?;
             schema
                 .reach()
                 .map_err(|why| provision::unreached(&why, valid.mode))?;

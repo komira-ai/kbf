@@ -79,6 +79,7 @@ struct Raw {
     /// refuses a file that has one.
     proxy: Option<toml::Value>,
     database: Option<String>,
+    database_password_file: Option<String>,
     frontend_config: Option<String>,
 }
 
@@ -193,6 +194,11 @@ pub struct InstallerToml {
     /// leniently (only this key, and it refuses a password); this field exists so that the
     /// closed reader here does not reject the key, and it has no other consumer.
     pub database: Option<String>,
+    /// The file that holds the password of `database` (an absolute path; never the password,
+    /// the file is world-readable). `crate::database` and `kbf boot-check` read it, as root,
+    /// beside `database`; this field, like `database`'s, keeps the closed reader from
+    /// rejecting the key.
+    pub database_password_file: Option<PathBuf>,
     /// An absolute path that nothing reads since two-slot supervision was removed; it is accepted
     /// and written back so that the file of an earlier build (whose `setup` wrote it on an
     /// all-in-one host) still parses and round-trips. `setup` keeps the one a file has and
@@ -219,6 +225,7 @@ impl Default for InstallerToml {
             #[cfg(feature = "proxy")]
             proxy: None,
             database: None,
+            database_password_file: None,
             frontend_config: None,
         }
     }
@@ -565,6 +572,11 @@ impl InstallerToml {
         );
         let release_ca = absolute("release_ca", &raw.release_ca, &mut problems);
         let frontend_config = absolute("frontend_config", &raw.frontend_config, &mut problems);
+        let database_password_file = absolute(
+            "database_password_file",
+            &raw.database_password_file,
+            &mut problems,
+        );
         let identity_given = raw.node_cert.is_some() || raw.node_key.is_some();
         let snapshot_given = raw.frontend_url.is_some()
             || raw.frontend_ca.is_some()
@@ -615,6 +627,7 @@ impl InstallerToml {
                 #[cfg(feature = "proxy")]
                 proxy,
                 database: raw.database,
+                database_password_file,
                 frontend_config,
             }),
             _ => Err(ConfigError::Invalid(problems)),
@@ -675,6 +688,9 @@ impl InstallerToml {
         }
         if let Some(url) = &self.database {
             out.push_str(&format!("database = {}\n", toml_string(url)));
+        }
+        if let Some(p) = &self.database_password_file {
+            out.push_str(&format!("database_password_file = \"{}\"\n", p.display()));
         }
         if let Some(p) = &self.frontend_config {
             out.push_str(&format!("frontend_config = \"{}\"\n", p.display()));

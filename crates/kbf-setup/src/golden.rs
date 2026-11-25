@@ -30,6 +30,7 @@ pub fn installer_toml_url() -> InstallerToml {
         frontend: None,
         proxy: None,
         database: None,
+        database_password_file: None,
         frontend_config: None,
     }
 }

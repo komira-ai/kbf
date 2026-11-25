@@ -175,12 +175,16 @@ impl SchemaOps for Session {
 }
 
 impl Schemas for Server {
-    fn of(&self, url: &str) -> Result<Box<dyn SchemaOps>, SetupError> {
+    fn of(&self, url: &str, password_file: Option<&str>) -> Result<Box<dyn SchemaOps>, SetupError> {
+        let url = match password_file {
+            Some(file) => format!("{url} with the password of {file}"),
+            None => url.to_owned(),
+        };
         Ok(Box::new(Session {
             found: self.found,
             down: self.down,
             unreached: self.unreached.clone(),
-            url: url.to_owned(),
+            url,
             asked: self.asked.clone(),
         }))
     }
