@@ -51,6 +51,25 @@ impl fmt::Debug for PostgresUrl {
 }
 
 impl PostgresUrl {
+    /// This URL with the password `file`, `PGPASSWORD` or libpq's file gives
+    /// ([`kbf_pg_auth::authenticate`]), and where it came from. A URL that carries a password
+    /// already (one built by [`FromStr`] in this process; the flag refuses one) keeps it.
+    fn authenticated(
+        &self,
+        file: Option<&Path>,
+        context: &kbf_pg_auth::Context,
+    ) -> Result<(PostgresUrl, Option<kbf_pg_auth::Authenticated>), kbf_pg_auth::AuthError> {
+        if self.config.has_password() {
+            return Ok((self.clone(), None));
+        }
+        let found = kbf_pg_auth::authenticate(&self.text, file, context)?;
+        let url = PostgresUrl {
+            text: self.text.clone(),
+            config: Box::new(found.config.clone().with_application_name("kbf-server")),
+        };
+        Ok((url, Some(found)))
+    }
+
     /// The URL without user information or a `password` parameter: what two processes
     /// compare to know they mean the same database.
     fn identity(&self) -> String {
@@ -100,11 +119,14 @@ pub enum StateStoreUriError {
          postgres:///kbf?host=/run/postgresql"
     )]
     PostgresUrl,
-    /// A `postgres://` value that carries a password. The command line is
-    /// world-readable: the socket URL is reached by peer authentication and needs none.
+    /// A `postgres://` value that carries a password. The command line is world-readable:
+    /// the password goes in `--state-store-password-file`, PGPASSWORD or `.pgpass`
+    /// ([`crate::Args::with_state_store_password`]), and the socket URL needs none.
     #[error(
-        "postgres:// must carry no password (the command line is world-readable); use the \
-         Unix socket with peer authentication, as in postgres:///kbf?host=/run/postgresql"
+        "postgres:// must carry no password (the command line is world-readable): give it in a \
+         file of mode 0600 named by --state-store-password-file, in PGPASSWORD, or a line of \
+         ~/.pgpass (PGPASSFILE names another file); a Unix socket with peer authentication, as \
+         in postgres:///kbf?host=/run/postgresql, needs none"
     )]
     PostgresPassword,
     /// A `sqlite://` value that does not name a file by an absolute path.
@@ -305,6 +327,41 @@ pub struct Indexes {
 }
 
 impl crate::Args {
+    /// These flags with the password of a `postgres://` `--state-store`: the file
+    /// `--state-store-password-file` names, else `PGPASSWORD`, else libpq's password file, as
+    /// `context` has them ([`kbf_pg_auth`] has the rules). Where it came from is logged, and so is
+    /// a libpq file that was skipped. Flags with no Postgres store are returned as they are.
+    ///
+    /// # Errors
+    /// [`StateError::Password`] when the password cannot be had; [`StateError::PasswordFileForSqlite`]
+    /// for a password file beside a SQLite store.
+    pub fn with_state_store_password(
+        &self,
+        context: &kbf_pg_auth::Context,
+    ) -> Result<crate::Args, StateError> {
+        let file = self.state_store_password_file.as_deref();
+        let url = match &self.state_store {
+            Some(StateStoreUri::Postgres(url)) => url,
+            Some(StateStoreUri::Sqlite(_)) if file.is_some() => {
+                return Err(StateError::PasswordFileForSqlite);
+            }
+            _ => return Ok(self.clone()),
+        };
+        let (url, found) = url
+            .authenticated(file, context)
+            .map_err(StateError::Password)?;
+        if let Some(found) = found {
+            tracing::info!("state store password: {}", found.source);
+            if let Some(skipped) = &found.skipped {
+                tracing::warn!("state store password: {skipped}");
+            }
+        }
+        Ok(crate::Args {
+            state_store: Some(StateStoreUri::Postgres(url)),
+            ..self.clone()
+        })
+    }
+
     /// The state store `--state-store` names, opened, or `None` when the flag is not
     /// given (the scheduler's state is then in memory).
     ///
@@ -421,6 +478,13 @@ pub enum StateError {
     /// state store, or its directory cannot be made.
     #[error("the state store cannot be opened: {0}")]
     Open(String),
+    /// The password of a Postgres store cannot be had: its file cannot be used, or the
+    /// password cannot be sent.
+    #[error("the state store's password: {0}")]
+    Password(kbf_pg_auth::AuthError),
+    /// `--state-store-password-file` was given beside a SQLite store, which takes no password.
+    #[error("--state-store-password-file is for a postgres:// store, and this one is SQLite")]
+    PasswordFileForSqlite,
 }
 
 /// An open state store.
@@ -436,3 +500,7 @@ pub struct StateStore {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "state_store/password_tests.rs"]
+mod password_tests;

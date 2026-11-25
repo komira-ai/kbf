@@ -295,6 +295,41 @@ fn frontend_config_is_an_absolute_path_that_both_readers_take() {
     assert!(!err.contains("frontend.toml"), "{err}");
 }
 
+/// `database_password_file` names the file that holds the password of `database`, never the
+/// password: an absolute path of plain characters, written after `database` and read back.
+///
+/// Catches the key left out of `render` (a rerun of `setup` would drop it and the boot check
+/// would log in without the password), refused by the closed reader, or a relative path let
+/// through (the boot check runs from the unit's directory, not the operator's).
+#[test]
+fn database_password_file_is_an_absolute_path_written_after_the_database() {
+    let with = InstallerToml {
+        database: Some("postgres://db.example/kbf?user=kbf&sslmode=verify-full".to_owned()),
+        database_password_file: Some("/etc/kbf/database-password".into()),
+        ..InstallerToml::default()
+    };
+    let text = with.render();
+    assert!(
+        text.ends_with(
+            "\ndatabase = \"postgres://db.example/kbf?user=kbf&sslmode=verify-full\"\n\
+             database_password_file = \"/etc/kbf/database-password\"\n"
+        ),
+        "{text}"
+    );
+    assert_eq!(parsed(&text), with);
+    assert!(
+        !InstallerToml::default()
+            .render()
+            .contains("database_password_file")
+    );
+    let err = problems("database_password_file = \"pw\"\n");
+    assert_eq!(
+        err,
+        "installer.toml:\ndatabase_password_file: must be an absolute path of plain characters \
+         with no empty, . or .. part"
+    );
+}
+
 /// What the tolerant reader does read is refused when it is wrong, as the closed reader refuses
 /// it: a wrong type, a bound, the window above its maximum, an unknown key inside `[proxy]`
 /// (that table stays closed), text that is not TOML, a file over the cap. Neither a value nor a

@@ -2,6 +2,8 @@
 //! that came with them, and the real implementation of the seam (`Postgres`).
 //! The helpers are `tests.rs`'s.
 
+use std::os::unix::ffi::OsStringExt as _;
+
 use super::*;
 use crate::setup::backend::Postgres;
 use kbf_host::testkit::ScratchHost;
@@ -309,16 +311,50 @@ fn a_regular_file_shadowing_the_packaged_unit_stops_setup_before_any_step() {
 }
 
 /// Catches the real schema seam quoting the URL or connecting at construction: a URL the
-/// client cannot take is a fixed message (never the text), and a good one makes a runner
-/// without touching a server.
+/// client cannot take, or one that carries a password, is a fixed message (never the text), a
+/// password file that cannot be read is a refusal naming the flag and the file, and a good URL
+/// makes a runner without touching a server.
 #[test]
 fn the_postgres_seam_makes_a_runner_without_a_server_and_never_quotes_the_url() {
-    assert!(Postgres.of(DATABASE).is_ok());
-    let Err(err) = Postgres.of("postgres://u:hunter2@") else {
-        panic!("not a usable URL");
+    let dir = kbf_host::testkit::scratch("postgres-seam");
+    let context = |pgpassword: Option<&[u8]>| kbf_pg_auth::Context {
+        pgpassword: pgpassword.map(|p| std::ffi::OsString::from_vec(p.to_vec())),
+        passfile: None,
+        euid: rustix::process::geteuid().as_raw(),
+        user: None,
     };
-    assert!(!err.to_string().contains("hunter2"), "{err}");
-    assert!(matches!(err, SetupError::Database(_)));
+    let seam = Postgres {
+        context: context(None),
+    };
+    let said = |url: &str, file: Option<&str>, seam: &Postgres| match seam.of(url, file) {
+        Err(SetupError::Database(why)) => why,
+        Err(other) => panic!("not a database refusal: {other}"),
+        Ok(_) => panic!("{url}: not refused"),
+    };
+    assert!(seam.of(DATABASE, None).is_ok());
+    assert_eq!(
+        said("postgres://u:hunter2@", None, &seam),
+        "the --database URL is not usable"
+    );
+    assert_eq!(
+        said("postgres://u:hunter2@db.example/kbf", None, &seam),
+        "--database carries a password: give it in a file of mode 0600 named by \
+         --database-password-file, in PGPASSWORD, or a line of ~/.pgpass (PGPASSFILE names \
+         another file)"
+    );
+    let missing = dir.join("missing").display().to_string();
+    let enoent = std::io::Error::from_raw_os_error(rustix::io::Errno::NOENT.raw_os_error());
+    assert_eq!(
+        said(DATABASE, Some(&missing), &seam),
+        format!("--database-password-file: the password file {missing}: {enoent}")
+    );
+    let bad = Postgres {
+        context: context(Some(b"bad\xff")),
+    };
+    assert_eq!(
+        said(DATABASE, None, &bad),
+        "the password of --database: the password in PGPASSWORD is not UTF-8"
+    );
 }
 
 /// Catches `kbf.toml` writing over settings it cannot see once it carries `state-store`: a
@@ -386,7 +422,7 @@ fn setup_creates_the_schema_over_a_real_server() {
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
     let mut r = raw(Mode::Frontend);
     r.database = Some(without_password(&url));
-    let schemas = Postgres;
+    let schemas = Postgres::of_process();
     let backend = Backend { schemas: &schemas };
     let say = |options: Options| {
         let mut out = Vec::new();
@@ -535,10 +571,8 @@ fn an_invalid_config_file_is_refused_without_its_text() {
     std::fs::write(&path, "database = postgres://u:PW@h/x\n").expect("write");
     let err = crate::database::Database::from_installer_toml(&path).expect_err("not toml");
     let shown = format!("{err} {err:?}");
-    assert!(
-        !shown.contains("PW") && !shown.contains("postgres:"),
-        "{shown}"
-    );
+    // The text is not printed on failure: it is the thing that must hold no secret.
+    assert!(!shown.contains("PW") && !shown.contains("postgres:"));
 }
 
 /// Catches a config path outside the config directory: each file sits directly in the
@@ -592,4 +626,88 @@ fn setup_accepts_only_the_platforms_installer_toml_as_installer_config() {
         why.contains("setup writes /etc/kbf/installer.toml"),
         "{why}"
     );
+}
+
+/// Catches `--database-password-file` not reaching the three places that need it: setup's own
+/// login (the fake server is asked with the file), `installer.toml`'s `database_password_file`
+/// (the installer and the boot check read it) and `kbf.toml`'s `[scheduler]
+/// state-store-password-file` (the frontend's start reads it); and the flag taken without
+/// `--database` (the default database has no password), or with a file the service user does
+/// not own or others can read (the frontend would refuse it at its start).
+#[test]
+fn the_database_password_file_reaches_setup_installer_toml_and_kbf_toml() {
+    const PW: &str = "/etc/kbf/database-password";
+    let server = Server::fresh();
+    let mut exec = released(host(), Platform::Linux);
+    put(&mut exec, PW, 0o600, KBF_SERVER, "hunter2\n");
+    // The command line, parsed as `setup` parses it, and taken as `setup` takes it.
+    #[derive(clap::Parser)]
+    struct Line {
+        #[command(flatten)]
+        setup: crate::cli::SetupArgs,
+    }
+    let line = <Line as clap::Parser>::try_parse_from([
+        "setup".to_owned(),
+        "--mode=frontend".to_owned(),
+        format!("--database={DATABASE}"),
+        format!("--database-password-file={PW}"),
+        "--storage-url=http://127.0.0.1:8990".to_owned(),
+    ])
+    .expect("the flags parse");
+    let mut flags = crate::setup::raw_from(&line.setup);
+    assert_eq!(flags.kbf.database_password_file.as_deref(), Some(PW));
+    go_on(&FakeOs::linux(), &mut exec, &server, &flags, APPLY).expect("setup");
+    let with = format!("{DATABASE} with the password of {PW}");
+    assert_eq!(
+        *server.asked.borrow(),
+        [format!("reach {with}"), format!("setup {with}")]
+    );
+    let installer = text(&exec, INSTALLER_TOML);
+    assert!(
+        installer.contains(&format!(
+            "database = \"{DATABASE}\"\ndatabase_password_file = \"{PW}\"\n"
+        )),
+        "{installer}"
+    );
+    assert!(!installer.contains("hunter2"), "{installer}");
+    let kbf = text(&exec, KBF_TOML);
+    assert!(
+        kbf.contains(&format!(
+            "state-store = \"{DATABASE}\"\nstate-store-password-file = \"{PW}\"\n"
+        )),
+        "{kbf}"
+    );
+    flags.database = None;
+    let why = flags
+        .validate(Platform::Linux)
+        .expect_err("refused")
+        .join("; ");
+    assert_eq!(
+        why,
+        "--database-password-file needs --database: the default database is reached by peer \
+         authentication, with no password"
+    );
+    for (perms, owner) in [
+        (0o600, ROOT),
+        (0o640, KBF_SERVER),
+        (0o700, KBF_SERVER),
+        (0o500, KBF_SERVER),
+    ] {
+        let mut exec = released(host(), Platform::Linux);
+        put(&mut exec, PW, perms, owner, "hunter2\n");
+        let mut flags = raw(Mode::Frontend);
+        flags.kbf.database_password_file = Some(PW.to_owned());
+        let refused = go_on(&FakeOs::linux(), &mut exec, &Server::fresh(), &flags, APPLY)
+            .expect_err("refused");
+        let rule = if owner == ROOT {
+            "a password file must be owned by the user the service runs as"
+        } else {
+            "a password file must have mode 0600 or 0400"
+        };
+        assert_eq!(
+            refused.to_string(),
+            SetupError::Invalid(vec![format!("--database-password-file: {rule}")]).to_string(),
+            "{perms:o}"
+        );
+    }
 }

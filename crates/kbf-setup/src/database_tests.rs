@@ -95,10 +95,8 @@ fn the_database_setting_is_read_and_every_fault_is_refused_without_quoting_the_u
         let err = Database::from_installer_toml(&toml_file(&format!("database = \"{url}\"")))
             .unwrap_err();
         assert!(matches!(err, DatabaseError::Password(_)), "{url}");
-        assert!(
-            !err.to_string().contains(secret) && !err.to_string().contains("postgres://"),
-            "{err}"
-        );
+        // The text is not printed on failure: it is the thing that must hold no secret.
+        assert!(!err.to_string().contains(secret) && !err.to_string().contains("postgres://"));
     }
     // The one sslmode the state store's URL reader refuses is a bad URL, said without the
     // host; a URL that asks for TLS is taken.
@@ -106,7 +104,7 @@ fn the_database_setting_is_read_and_every_fault_is_refused_without_quoting_the_u
     let err =
         Database::from_installer_toml(&toml_file(&format!("database = \"{allow}\""))).unwrap_err();
     assert!(matches!(err, DatabaseError::BadUrl { .. }));
-    assert!(!err.to_string().contains("db.example"), "{err}");
+    assert!(!err.to_string().contains("db.example"));
     let tls = "postgres://db.example/kbf?sslmode=require";
     assert!(Database::from_installer_toml(&toml_file(&format!("database = \"{tls}\""))).is_ok());
 }

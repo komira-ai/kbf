@@ -37,12 +37,12 @@ docker run --name kbf-postgres --network none --user 65532:65532 \
 `/run/postgresql`. With `listen_addresses` empty and no network, the socket is the only way in,
 and only root and 65532 can enter the directory.
 
-**That directory's mode is the access control.** kbf never sends a password to Postgres: a
+**That directory's mode is the access control.** This setup sends no password to Postgres. A
 `--state-store` (or `state-store =`) value that carries one is refused at the flag
-(`crates/kbf-server/src/state_store.rs:102-108` the message, `:165-166` the refusal, `:182-184`
-the test for a password in user information or a `password` parameter), the accepted form is a
-socket URL reached by the process's own user (`:21-23`, `:175-176`), and the frontend has no
-password file to read. The container's Postgres therefore has to let the socket's callers in
+(`crates/kbf-server/src/state_store.rs`, `StateStoreUriError::PostgresPassword`). The URL is a
+socket URL reached by the process's own user, and the container is given no
+`state-store-password-file`, PGPASSWORD or `~/.pgpass`, which are the ways a frontend takes a
+password ([kbf-modes.md](kbf-modes.md#the-state-stores-password)). The container's Postgres therefore has to let the socket's callers in
 without a password; the official image does that when it is started with
 `-e POSTGRES_HOST_AUTH_METHOD=trust`, which is safe here only because of the two facts above
 (no network, a 0700 directory). Do not add either a published port or a looser mode.

@@ -190,13 +190,90 @@ fn a_url_that_cannot_be_used_is_refused_without_quoting_it() {
     ];
     for (url, says, secret) in refused {
         let body = format!("database = \"{url}\"\n");
-        let why = database_in("installer.toml", &body).unwrap_err();
+        let why = database_in("installer.toml", &body, &no_password()).unwrap_err();
         assert!(why.contains("installer.toml"), "{url}: {why}");
         assert!(why.contains(says), "{url}: {why}");
         assert!(!why.contains(secret), "{url}: {why}");
     }
     let tls = "database = \"postgres://db.example/kbf?sslmode=require\"\n";
-    assert!(database_in("installer.toml", tls).is_ok());
+    assert!(database_in("installer.toml", tls, &no_password()).is_ok());
+}
+
+/// A context with no PGPASSWORD and no libpq file: only a password file key gives a password.
+fn no_password() -> kbf_pg_auth::Context {
+    kbf_pg_auth::Context {
+        pgpassword: None,
+        passfile: None,
+        euid: rustix::process::geteuid().as_raw(),
+        user: None,
+    }
+}
+
+/// Asserts that `database_password_file` is read beside `database`: a file only its owner can
+/// read gives the step, one others can read is refused naming the file and its mode (never the
+/// password), and a relative path is refused; and that a URL that carries a password is refused
+/// with the text that names the ways to give one.
+#[test]
+fn the_password_file_key_is_read_beside_the_database() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("database-password");
+    let file = dir.join("pw");
+    std::fs::write(&file, "hunter2\n").expect("write");
+    let body =
+        |path: &str| format!("database = \"{SOCKET_URL}\"\ndatabase_password_file = \"{path}\"\n");
+    for mode in [0o600, 0o400] {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        let step = database_in(
+            "installer.toml",
+            &body(&file.display().to_string()),
+            &no_password(),
+        );
+        assert!(matches!(step, Ok(Some(_))), "{mode:o}");
+    }
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let why = database_in(
+        "installer.toml",
+        &body(&file.display().to_string()),
+        &no_password(),
+    )
+    .expect_err("a file others can read");
+    assert_eq!(
+        why,
+        format!(
+            "the password of the `database` in installer.toml: the password file {}: it has \
+             mode 0644; it must be 0600 or 0400",
+            file.display()
+        )
+    );
+    // libpq's file skipped (others can read it): a warning, no password, and the step all the same.
+    let pgpass = dir.join("pgpass");
+    std::fs::write(&pgpass, "*:*:*:*:hunter2\n").expect("write");
+    std::fs::set_permissions(&pgpass, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let mut skipping = no_password();
+    skipping.passfile = Some(pgpass);
+    let socket_only = format!("database = \"{SOCKET_URL}\"\n");
+    assert!(matches!(
+        database_in("installer.toml", &socket_only, &skipping),
+        Ok(Some(_))
+    ));
+    let why = database_in("installer.toml", &body("pw"), &no_password()).expect_err("relative");
+    assert_eq!(
+        why,
+        "the `database_password_file` in installer.toml is not an absolute path"
+    );
+    let why = database_in(
+        "installer.toml",
+        "database = \"postgres://kbf:hunter2@db/kbf\"\n",
+        &no_password(),
+    )
+    .expect_err("a password in the URL");
+    assert_eq!(
+        why,
+        "the `database` URL in installer.toml carries a password, and the file is \
+         world-readable: give it in a file of mode 0600 named by database_password_file, in \
+         PGPASSWORD, or a line of ~/.pgpass (PGPASSFILE names another file); peer \
+         authentication needs none"
+    );
 }
 
 /// Asserts that a check that did something says it in one line on standard error and stands

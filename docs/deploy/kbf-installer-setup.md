@@ -72,6 +72,7 @@ one of them exits 2 with a line that points to [kbf-modes.md](kbf-modes.md#the-r
 | `--release-source`, `--release-url`, `--release-ca`, `--frontend-worker-url`, `--frontend-ca`, `--frontend-ca-sha256`, `--commit` | retired: `setup` no longer installs a release or writes where releases come from. The flags are still taken, for one release, so a script that passes them goes on working: their values are not checked and not used, and `setup` prints one `warning: ignored: ...` line naming the ones given, ahead of its steps |
 | `--min-generation N` | the floor for orders; it only goes up, `0` is refused, and a lower value than `installer.toml` holds is refused (exit 5) |
 | `--database`, `--create-local-database` | the state database, see below; `--create-local-database` is redundant when `--database` is left out |
+| `--database-password-file` | the file that holds the password of `--database`, for a server that asks for one; needs `--database`, see below |
 | `--no-start` | enable units without starting them |
 | `--installer-config` | accepts only the platform's own `installer.toml` path; it is a flag of `run` |
 | `--proxy`, `--proxy-base-port`, `--buck2-auth`, `--buck2-token-file`, `--storage-port` | removed with the two-slot supervision. `kbf-installer setup` still parses them (they are hidden from the help) and refuses any of them, see "No proxy host" |
@@ -80,7 +81,13 @@ one of them exits 2 with a line that points to [kbf-modes.md](kbf-modes.md#the-r
 `postgres:///kbf?host=/run/postgresql&user=kbf-server`, and `setup`
 makes that role and database (see "The state database"). The role is required in a URL you give,
 because `setup` runs as root and the service as its own account. A URL with a password is
-refused (the file is world-readable), and no message quotes a URL. Settings of `kbf` that
+refused (the file is world-readable), and no message quotes a URL. A server that asks for a
+password gets it from `--database-password-file`. That file is checked as a key is (a regular
+file owned by the service user, with no group or other bits). `setup` reaches the server with it
+and writes it to `installer.toml` as `database_password_file` and to `kbf.toml` as
+`[scheduler] state-store-password-file`. PGPASSWORD and root's `~/.pgpass` also work for
+`setup`'s own login. The rules are in
+[kbf-modes.md](kbf-modes.md#the-state-stores-password). Settings of `kbf` that
 `setup` has no flag for (`releases-dir`, `reapi-auth-policy`, `worker-deny-list`,
 `proxy-auth-file` and the tuning keys) are the operator's; see the configuration reference. Such
 keys survive a re-run under the rule in "The `kbf.toml` file".
@@ -272,10 +279,12 @@ sudo kbf-installer --apply setup --mode=frontend ...    # same flags: makes the 
   with the role, and as the service account when it exists) and, when the server refuses,
   stops and says which rule is missing. Add the rules, reload the server (not restart) and run
   `setup` again. The map name is any name used on both sides.
-- **A remote or managed server.** `setup` holds no password and does not reach a remote
-  superuser. Create the role and database, make the server admit the logins, and run `setup`
-  with `--database` and without `--create-local-database`: it checks that it can log in, then
-  creates or brings forward the schema.
+- **A remote or managed server.** `setup` does not reach a remote superuser. Create the role
+  and database, make the server admit the logins, and run `setup` with `--database` and
+  without `--create-local-database`. It checks that it can log in, then creates or brings
+  forward the schema. A server that logs the role in with a password (AWS RDS, for one) takes
+  it from `--database-password-file`. Give the URL `sslmode=verify-full` and `sslrootcert`, so
+  the password goes only to the server the certificate names.
 
 Backups of the database are the operator's: Postgres is a runtime dependency that the operator
 provides, and its own backup and restore tools apply. Neither `setup` nor the package runs one,

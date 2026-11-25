@@ -292,6 +292,9 @@ where
     args.retired_scheduler.warn();
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
+    let args = &args
+        .with_state_store_password(&kbf_pg_auth::Context::of_process())
+        .map_err(ServeError::State)?;
     let pack_index = args.open_pack_index()?;
     let state = with_members(
         args.open_state_store().map_err(ServeError::State)?,
@@ -563,6 +566,29 @@ mod tests {
         assert!(said.contains("another kbf process"), "{said}");
         drop(first);
         start("three").await.expect("free once the first is gone");
+    }
+
+    /// Catches the start not asking for the store's password before it opens the store: a
+    /// password file beside a SQLite store (which takes none) stops the start with the full
+    /// refusal, and the SQLite file is never made.
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_with_asks_for_the_state_store_password_before_it_opens_the_store() {
+        let root = crate::test_dir::scratch_dir("kbf-server-state-password");
+        let state = root.join("state.db");
+        let args = Args::parse_from([
+            "kbf-server".to_owned(),
+            "--listen=127.0.0.1:0".to_owned(),
+            "--worker-listen=127.0.0.1:0".to_owned(),
+            format!("--state-store=sqlite://{}", state.display()),
+            format!("--state-store-password-file={}", root.join("pw").display()),
+        ]);
+        let refused = boot(&args, &root, "one").await.err().expect("refused");
+        assert_eq!(
+            refused.to_string(),
+            "--state-store: --state-store-password-file is for a postgres:// store, and this one \
+             is SQLite"
+        );
+        assert!(!state.exists(), "the store is not opened");
     }
 
     /// Starts a server over `args` on a metadata log and a cold store of its own, in the

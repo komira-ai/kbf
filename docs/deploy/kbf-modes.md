@@ -946,7 +946,9 @@ What the code supports is below.
    never edits either file; a role you made by hand is passed with `--database`. Postgres must
    flush commits before it acknowledges them (`synchronous_commit` on) or the start is
    refused. A URL with a password is refused: the command line is readable by every user on
-   the host, so the role is reached by the socket and peer authentication. The state store
+   the host. The role is reached by the socket and peer authentication, or, on a server that
+   asks for a password (a managed one such as AWS RDS), with the password from a file
+   (see "The state store's password"). The state store
    also holds the storage members, the enrollment registry and the object-store registration.
 2. **The CA and certificates.** A farm needs one CA and one certificate per node, each with
    exactly one role (`frontend` or `storage`, as `urn:kbf:role:<role>`; `urn:kbf:role:daemon`
@@ -988,6 +990,66 @@ flag of a store. The storage half takes `--frontend`, `--advertise-addr`, `--sto
 
 **Planned:** copying a joining member's slice to it
 (the join handoff, architecture-v2.md section 8.4) is not built.
+
+## The state store's password
+
+A Postgres URL never carries a password. kbf refuses one in user information (`kbf:secret@`)
+or as a `password` parameter wherever it takes a URL: `--state-store` (the `state-store`
+key of `kbf.toml`), the `database` key of `installer.toml`, `kbf-installer setup --database`,
+and `--pack-index` of `kbf-pack-adopt` and `kbf-l2-backfill`. A command line is readable by
+every user on the host, and `installer.toml` is world-readable. The refusal names the ways
+below and never quotes the URL.
+
+A server that asks for a password gets it from the first of these that has one:
+
+1. **A password file kbf is told of.** For the frontend it is `--state-store-password-file`
+   (`state-store-password-file` in the `[scheduler]` table of `kbf.toml`). For the installer's
+   schema step and `kbf boot-check` it is the `database_password_file` key of
+   `installer.toml`. `kbf-installer setup --database-password-file FILE` writes both and uses
+   the file itself to reach the server. The pack tools take no file.
+   - The file holds the password and nothing else. One line ending after it is dropped.
+   - It must be a regular file (a symbolic link is not followed) of mode 0600 or 0400, at most
+     4096 bytes, owned by the user that reads it. The frontend runs as `kbf-server`, so that
+     account owns the file. Root, which runs `setup`, the installer and `kbf boot-check`, reads
+     a file of any owner.
+   - A file that is named and cannot be used stops the start, naming the file and what is
+     wrong (`it has mode 0644; it must be 0600 or 0400`). kbf does not fall back to another
+     source.
+2. **`PGPASSWORD`**, as libpq takes it. An empty one is unset.
+3. **libpq's password file**: the file `PGPASSFILE` names, else `~/.pgpass`. Its lines are
+   `host:port:database:user:password`, and the first line that matches is used.
+   - `*` matches any value, `\` escapes `:` and `\`, and lines that start with `#` are comments.
+   - A host is matched by its name, and a Unix socket by its directory (`/run/postgresql`;
+     libpq's `localhost` for its default socket directory is not taken).
+   - A port the URL leaves out is 5432. A database left out is the role's name, and a role left
+     out is the name of the user kbf runs as.
+   - As libpq does, kbf skips a file its group or others can read or write, or one that is not a
+     regular file, and logs a warning. A missing file means no password.
+   - A URL that names several hosts takes a password only when every host's line gives the
+     same one, because the client offers one password to every host.
+
+With none of these the connection goes without a password, as before: peer authentication
+over a Unix socket. The frontend logs where the password came from at its start (`state store
+password: the password file /etc/kbf/db-password`). The password itself is never logged.
+
+Send a password over a network only with TLS that checks the server:
+`sslmode=verify-full&sslrootcert=/etc/kbf/db-ca.pem` (for AWS RDS, the region's CA bundle).
+`sslmode=require` encrypts the connection but does not check who answers.
+
+For example, a frontend whose database is on a managed server that asks for a password
+(the file is owned by `kbf-server`, mode 0600):
+
+```
+sudo kbf-installer --apply setup --mode=frontend \
+  --database='postgres://db.example/kbf?user=kbf&sslmode=verify-full&sslrootcert=/etc/kbf/db-ca.pem' \
+  --database-password-file=/etc/kbf/db-password ...
+```
+
+**Not built: RDS IAM authentication tokens.** A token is good for 15 minutes, and the store
+opens connections long after the start. It would need a password the client asks for at each
+connection, which the state store's client (`PostgresConfig` in the jobscheduler repository)
+does not offer, and AWS credentials to sign the token with. Once both exist, it would be one
+more source in `kbf-pg-auth`, chosen where `authenticate` chooses one.
 
 ## Stopping and draining
 

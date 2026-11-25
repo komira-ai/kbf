@@ -56,7 +56,8 @@ pub struct SetupArgs {
     /// kbf reads. For the modes that enroll.
     #[arg(long)]
     pub token_file: Option<String>,
-    /// The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password), for
+    /// The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password in the
+    /// URL: a server that asks for one takes it from --database-password-file), for
     /// `frontend`: written to installer.toml and, as `state-store`, to kbf.toml, and setup creates
     /// (or brings forward) its schema. Left out, it is
     /// postgres:///kbf?host=/run/postgresql&user=kbf-server on this host's own Postgres server
