@@ -322,8 +322,8 @@ file can be longer.
   dropped. The current file is opened for append and never truncated at start, so a
   restart keeps the entries before it. Files past the count (after `--log-files` is
   lowered) are removed at start.
-- **Format.** The same line as stderr (time, level, target, fields), without colour. INFO
-  and above.
+- **Format.** The same line as stderr (time, level, target, fields), INFO and above. Neither
+  has colour codes, so a field greps as it reads: `grep 'cause="keepalive"'`.
 - **Durability.** Each event is written to the file as it happens; the file is not
   `fsync`ed per line, so a crash of the host can lose the last seconds (a crash of the
   server cannot).

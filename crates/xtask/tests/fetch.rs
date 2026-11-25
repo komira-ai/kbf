@@ -306,6 +306,83 @@ fn flags_that_do_not_fit_together_exit_2() {
     assert!(!Path::new(out).exists());
 }
 
+#[test]
+fn the_verb_installs_from_a_cache_hit_with_no_connection() {
+    // Catches: a verb that downloads although the actions cache restored the pinned file (the
+    // URLs here answer nothing), that ignores --cache, or that exits 0 for a cached file of
+    // other bytes.
+    let dir = scratch("cli-cache");
+    let out = dir.join("bin").join("zig.tar.xz");
+    let cache = dir.join("cache").join("zig.tar.xz");
+    std::fs::create_dir_all(dir.join("cache")).expect("mkdir");
+    std::fs::write(&cache, TOOL).expect("seed the cache");
+    let run = |sha256: &str| {
+        Command::new(XTASK)
+            .args(["fetch", "--sha256", sha256])
+            .args([
+                "--url",
+                "https://127.0.0.1:9/one",
+                "--url",
+                "https://127.0.0.1:9/two",
+            ])
+            .arg("--out")
+            .arg(&out)
+            .arg("--cache")
+            .arg(&cache)
+            .output()
+            .expect("run xtask")
+    };
+    let pin = Sha256::of(TOOL).to_string();
+    let hit = run(&pin);
+    assert_eq!(
+        String::from_utf8_lossy(&hit.stdout),
+        format!(
+            "ok: the cache hit: {} has SHA-256 {pin}; nothing was downloaded; installed {}\n",
+            cache.display(),
+            out.display()
+        ),
+        "{}",
+        String::from_utf8_lossy(&hit.stderr)
+    );
+    assert_eq!(hit.status.code(), Some(0));
+    assert_eq!(std::fs::read(&out).expect("installed"), TOOL);
+    std::fs::remove_file(&out).expect("remove");
+    let refused = run(PIN);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stderr),
+        format!(
+            "xtask: the cached {cache:?} has SHA-256 {pin}, not the pinned {PIN}; nothing was \
+             installed\n"
+        )
+    );
+    assert!(!out.exists());
+}
+
+#[test]
+fn several_urls_without_a_cache_exit_2() {
+    // Catches: a second --url silently dropped (or tried) by the one-attempt fetch, which has
+    // no rounds to try it in.
+    let _out_own = scratch("cli-urls");
+    let out = _out_own.join("tool");
+    let (code, err) = xtask_fetch(&[
+        "--url",
+        "https://127.0.0.1:9/one",
+        "--url",
+        "https://127.0.0.1:9/two",
+        "--sha256",
+        PIN,
+        "--out",
+        out.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(
+        err.contains("only a cached fetch tries several URLs"),
+        "{err}"
+    );
+    assert!(!out.exists());
+}
+
 /// A gzip tar holding the regular file `member` with the bytes `TOOL`.
 fn tool_archive(member: &str) -> Vec<u8> {
     let mut h = tar::Header::new_ustar();
