@@ -128,6 +128,7 @@ pub fn full_spec(contents: &str) -> JobSpec {
         host_ports: Vec::new(),
         layers: Vec::new(),
         mounts: Vec::new(),
+        history_key: String::new(),
     }
 }
 

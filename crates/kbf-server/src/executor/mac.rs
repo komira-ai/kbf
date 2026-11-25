@@ -350,6 +350,7 @@ pub(super) fn mac_spec(job: MacJob<'_>) -> JobSpec {
         files: Vec::new(),
         priority: 0,
         labels: job.labels,
+        history_key: String::new(),
     }
 }
 

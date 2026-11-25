@@ -374,6 +374,7 @@ fn put_dir_spec(
         files: Vec::new(),
         priority: 0,
         labels: labels(ctx, booking.class(class)),
+        history_key: String::new(),
     }
 }
 
