@@ -136,8 +136,13 @@ pub(crate) fn lookup(path: &Path, targets: &[Target]) -> Result<Option<Found>, M
     }
     let mut text = Zeroizing::new(Vec::new());
     file.read_to_end(&mut text).map_err(unreadable)?;
-    let found: Vec<Option<(&[u8], usize)>> = targets.iter().map(|t| matching(&text, t)).collect();
-    let Some(Some((password, line))) = found.first().copied() else {
+    // Each host's password with its escapes undone, so that two lines that spell one password
+    // differently (or say more after it) agree.
+    let found: Vec<Option<(Zeroizing<Vec<u8>>, usize)>> = targets
+        .iter()
+        .map(|t| matching(&text, t).map(|(field, line)| (Zeroizing::new(unescape(field)), line)))
+        .collect();
+    let Some(Some((password, line))) = found.first().cloned() else {
         return if found.iter().all(Option::is_none) {
             Ok(None)
         } else {
@@ -146,7 +151,7 @@ pub(crate) fn lookup(path: &Path, targets: &[Target]) -> Result<Option<Found>, M
     };
     if found
         .iter()
-        .any(|other| other.is_none_or(|(p, _)| p != password))
+        .any(|other| other.as_ref().is_none_or(|(p, _)| *p != password))
     {
         return Err(Miss::HostsDiffer);
     }
@@ -154,7 +159,7 @@ pub(crate) fn lookup(path: &Path, targets: &[Target]) -> Result<Option<Found>, M
         path: path.to_owned(),
         line,
     };
-    Ok(Some((Zeroizing::new(unescape(password)), source)))
+    Ok(Some((password, source)))
 }
 
 /// The password field (escapes not yet undone) of the first line of `text` that matches

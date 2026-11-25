@@ -141,6 +141,31 @@ fn several_hosts_take_a_password_only_when_their_lines_agree() {
         assert_eq!(lookup(&path, &hosts).map(|_| ()), Err(Miss::HostsDiffer));
     }
     assert_eq!(found(&path, &[d]), None);
+    // One password, spelt with an escape on one line and followed by more on the other.
+    let spelt = secret(
+        &dir,
+        "pgpass-spelt",
+        b"a:5432:db:u:pw:more\nb:5432:db:u:p\\w\n",
+        0o600,
+    );
+    let [a, b] = ["a", "b"].map(|host| target(host, "5432", "db", "u"));
+    assert_eq!(found(&spelt, &[a, b]), Some(("pw".to_owned(), 1)));
+}
+
+/// Catches an empty password field taken as anything but the empty password libpq sends, and a
+/// `\r` before the line ending kept in the password.
+#[test]
+fn an_empty_password_field_is_the_empty_password() {
+    let dir = TestDir::under(std::env::temp_dir(), "pg-auth-pgpass-empty");
+    let path = secret(&dir, "pgpass", b"h:5432:db:u:\r\nh:5432:db:v:pw\r\n", 0o600);
+    assert_eq!(
+        found(&path, &[target("h", "5432", "db", "u")]),
+        Some((String::new(), 1))
+    );
+    assert_eq!(
+        found(&path, &[target("h", "5432", "db", "v")]),
+        Some(("pw".to_owned(), 2))
+    );
 }
 
 /// Catches a file its group or others can reach being read (libpq skips it, and says so), a

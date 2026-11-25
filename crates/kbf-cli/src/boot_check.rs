@@ -110,6 +110,9 @@ fn database_in(
 ) -> Result<Option<BootStep>, String> {
     let found =
         kbf_setup::database::installer_database(shown, text, context).map_err(|e| e.to_string())?;
+    if let Some(skipped) = found.as_ref().and_then(|found| found.skipped.as_ref()) {
+        eprintln!("kbf boot-check: warning: {skipped}");
+    }
     Ok(found.map(|found| kbf_pack_index::schema::boot_step(found.config)))
 }
 

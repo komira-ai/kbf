@@ -423,7 +423,7 @@ fn on_host(
     let reader = exec.clone();
     let os = SystemOs::new(&reader, platform);
     let options = Options { apply, no_start };
-    let schemas = Postgres;
+    let schemas = Postgres::of_process();
     let backend = Backend { schemas: &schemas };
     run(&os, &mut exec, &backend, &raw, options, out)
 }

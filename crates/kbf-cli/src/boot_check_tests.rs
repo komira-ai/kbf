@@ -245,6 +245,17 @@ fn the_password_file_key_is_read_beside_the_database() {
             file.display()
         )
     );
+    // libpq's file skipped (others can read it): a warning, no password, and the step all the same.
+    let pgpass = dir.join("pgpass");
+    std::fs::write(&pgpass, "*:*:*:*:hunter2\n").expect("write");
+    std::fs::set_permissions(&pgpass, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let mut skipping = no_password();
+    skipping.passfile = Some(pgpass);
+    let socket_only = format!("database = \"{SOCKET_URL}\"\n");
+    assert!(matches!(
+        database_in("installer.toml", &socket_only, &skipping),
+        Ok(Some(_))
+    ));
     let why = database_in("installer.toml", &body("pw"), &no_password()).expect_err("relative");
     assert_eq!(
         why,

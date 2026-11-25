@@ -1041,7 +1041,7 @@ For example, a frontend whose database is on a managed server that asks for a pa
 
 ```
 sudo kbf-installer --apply setup --mode=frontend \
-  --database='postgres://kbf@db.example/kbf?user=kbf&sslmode=verify-full&sslrootcert=/etc/kbf/db-ca.pem' \
+  --database='postgres://db.example/kbf?user=kbf&sslmode=verify-full&sslrootcert=/etc/kbf/db-ca.pem' \
   --database-password-file=/etc/kbf/db-password ...
 ```
 

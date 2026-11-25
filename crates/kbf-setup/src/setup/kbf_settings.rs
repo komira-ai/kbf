@@ -53,6 +53,9 @@ enum Want {
     Cert,
     /// A private key file.
     Key,
+    /// A file that holds a password: as a key, and of mode 0600 or 0400 exactly, as the
+    /// frontend's reader (`kbf-pg-auth`) requires.
+    Password,
     /// `http(s)://host[:port]`; plain `http` only to a loopback host.
     Url,
 }
@@ -149,7 +152,7 @@ const SPECS: [Spec; 13] = [
         "database-password-file",
         "scheduler",
         "state-store-password-file",
-        Want::Key,
+        Want::Password,
         Need::Optional,
     ),
 ];
@@ -343,7 +346,7 @@ fn check_value(kind: Want, value: &str) -> Result<(), &'static str> {
                     Ok(())
                 }
             }),
-        Want::Cert | Want::Key => check_path(value),
+        Want::Cert | Want::Key | Want::Password => check_path(value),
         Want::Url => check_url(value),
     }
 }
@@ -442,7 +445,7 @@ pub fn push_problems(
 ) {
     for s in SPECS
         .iter()
-        .filter(|s| matches!(s.kind, Want::Cert | Want::Key))
+        .filter(|s| matches!(s.kind, Want::Cert | Want::Key | Want::Password))
     {
         let Some(setting) = settings
             .iter()
@@ -473,6 +476,14 @@ fn check_file(
     let bits = meta.perms.bits();
     let service_owns = service == Some(meta.owner.uid);
     match kind {
+        Want::Password => {
+            if !service_owns {
+                return Err("a password file must be owned by the user the service runs as");
+            }
+            if !matches!(bits, 0o600 | 0o400) {
+                return Err("a password file must have mode 0600 or 0400");
+            }
+        }
         Want::Key => {
             if !service_owns {
                 return Err("a key must be owned by the user the service runs as");

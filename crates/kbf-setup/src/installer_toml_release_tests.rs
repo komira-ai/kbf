@@ -304,14 +304,14 @@ fn frontend_config_is_an_absolute_path_that_both_readers_take() {
 #[test]
 fn database_password_file_is_an_absolute_path_written_after_the_database() {
     let with = InstallerToml {
-        database: Some("postgres://kbf@db.example/kbf?sslmode=verify-full".to_owned()),
+        database: Some("postgres://db.example/kbf?user=kbf&sslmode=verify-full".to_owned()),
         database_password_file: Some("/etc/kbf/database-password".into()),
         ..InstallerToml::default()
     };
     let text = with.render();
     assert!(
         text.ends_with(
-            "\ndatabase = \"postgres://kbf@db.example/kbf?sslmode=verify-full\"\n\
+            "\ndatabase = \"postgres://db.example/kbf?user=kbf&sslmode=verify-full\"\n\
              database_password_file = \"/etc/kbf/database-password\"\n"
         ),
         "{text}"

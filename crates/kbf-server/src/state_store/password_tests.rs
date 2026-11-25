@@ -35,6 +35,17 @@ fn secret(dir: &Path, name: &str, text: &str, mode: u32) -> PathBuf {
     path
 }
 
+/// The messages of the log lines `text` holds about the store's password, each whole: what
+/// follows the level and the target, so that nothing else (a password) can ride along.
+fn messages(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            line.find("state store password: ")
+                .map(|at| line[at..].to_owned())
+        })
+        .collect()
+}
+
 /// Whether the Postgres store of `args` connects with a password.
 fn has_password(args: &Args) -> bool {
     match &args.state_store {
@@ -62,9 +73,14 @@ fn the_password_file_gives_the_postgres_store_its_password_and_the_log_says_so()
     assert!(has_password(&authed));
     assert_eq!(authed.state_store, flags.state_store);
     let text = log.text();
-    let want = format!("state store password: the password file {}", file.display());
-    assert!(text.contains(&want), "{text}");
-    assert!(!text.contains("hunter2"), "{text}");
+    assert_eq!(
+        messages(&text),
+        [format!(
+            "state store password: the password file {}",
+            file.display()
+        )],
+        "{text}"
+    );
 }
 
 /// Catches libpq's file skipped (group-readable) without a warning, a password taken from it
@@ -79,12 +95,18 @@ fn a_libpq_file_libpq_would_skip_is_a_warning_and_no_password() {
         .expect("no password, and no refusal");
     assert!(!has_password(&authed));
     let text = log.text();
-    assert!(text.contains("state store password: no password"), "{text}");
-    let warning = format!(
-        "state store password: {} is skipped, as libpq skips it",
-        pgpass.display()
+    assert_eq!(
+        messages(&text),
+        [
+            "state store password: no password".to_owned(),
+            format!(
+                "state store password: {} is skipped, as libpq skips it: its group or others \
+                 have access (mode 0644); it must be 0600 or less",
+                pgpass.display()
+            ),
+        ],
+        "{text}"
     );
-    assert!(text.contains(&warning), "{text}");
     let authed = args(&[URL])
         .with_state_store_password(&context(None))
         .expect("no password");

@@ -512,7 +512,7 @@ pub struct Args {
     /// Where the storage members and the unfinished operations are kept, so that another
     /// frontend, or this one after a restart, answers and takes them up: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a
     /// local Unix socket, reached as this process's own user (peer authentication), or a
-    /// server elsewhere, as `postgres://kbf@db.example/kbf?sslmode=verify-full&sslrootcert=/etc/kbf/db-ca.pem`.
+    /// server elsewhere, as `postgres://host/kbf?user=kbf&sslmode=verify-full&sslrootcert=/etc/kbf/db-ca.pem`.
     /// A URL with a password is refused, as the command line is world-readable: the password
     /// is read from `--state-store-password-file`, else PGPASSWORD, else `~/.pgpass`. The server must
     /// flush commits before it acknowledges them (`synchronous_commit` on) or the start is
