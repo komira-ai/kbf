@@ -225,7 +225,7 @@ fn the_context_reads_the_variables_as_libpq_does() {
         vars(&[
             ("PGPASSWORD", "pw"),
             ("PGPASSFILE", "/etc/kbf/pgpass"),
-            ("HOME", "/home/k"),
+            ("HOME", "/var/lib/kbf-k"),
         ]),
         7,
         Some("k".to_owned()),
@@ -245,12 +245,19 @@ fn the_context_reads_the_variables_as_libpq_does() {
          user: Some(\"k\") }"
     );
     let home = Context::from_env(
-        vars(&[("PGPASSWORD", ""), ("PGPASSFILE", ""), ("HOME", "/home/k")]),
+        vars(&[
+            ("PGPASSWORD", ""),
+            ("PGPASSFILE", ""),
+            ("HOME", "/var/lib/kbf-k"),
+        ]),
         7,
         None,
     );
     assert_eq!(home.pgpassword, None);
-    assert_eq!(home.passfile.as_deref(), Some(Path::new("/home/k/.pgpass")));
+    assert_eq!(
+        home.passfile.as_deref(),
+        Some(Path::new("/var/lib/kbf-k/.pgpass"))
+    );
     let bare = Context::from_env(vars(&[("HOME", "")]), 7, None);
     assert_eq!(bare.passfile, None);
     assert!(format!("{bare:?}").contains("pgpassword: None"));

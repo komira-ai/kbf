@@ -50,7 +50,10 @@ fn has_password(args: &Args) -> bool {
 fn the_password_file_gives_the_postgres_store_its_password_and_the_log_says_so() {
     let dir = TestDir::under(std::env::temp_dir(), "state-store-password-file");
     let file = secret(&dir, "pw", "hunter2\n", 0o600);
-    let flags = args(&[URL, &format!("--state-store-password-file={}", file.display())]);
+    let flags = args(&[
+        URL,
+        &format!("--state-store-password-file={}", file.display()),
+    ]);
     assert!(!has_password(&flags));
     let log = capture_at(tracing::Level::INFO);
     let authed = flags
@@ -77,7 +80,10 @@ fn a_libpq_file_libpq_would_skip_is_a_warning_and_no_password() {
     assert!(!has_password(&authed));
     let text = log.text();
     assert!(text.contains("state store password: no password"), "{text}");
-    let warning = format!("state store password: {} is skipped, as libpq skips it", pgpass.display());
+    let warning = format!(
+        "state store password: {} is skipped, as libpq skips it",
+        pgpass.display()
+    );
     assert!(text.contains(&warning), "{text}");
     let authed = args(&[URL])
         .with_state_store_password(&context(None))
@@ -97,7 +103,10 @@ fn a_password_file_that_cannot_be_used_or_has_no_postgres_store_is_refused() {
         .expect_err("a file others can read");
     assert!(matches!(
         &refused,
-        StateError::Password(AuthError::File { flaw: FileFlaw::Mode(0o644), .. })
+        StateError::Password(AuthError::File {
+            flaw: FileFlaw::Mode(0o644),
+            ..
+        })
     ));
     assert_eq!(
         refused.to_string(),
@@ -121,14 +130,18 @@ fn a_password_file_that_cannot_be_used_or_has_no_postgres_store_is_refused() {
 /// password (as the tests' database URL is) looked up again: its password file is not read.
 #[test]
 fn flags_without_a_postgres_store_or_with_a_password_already_are_left_as_they_are() {
-    let none = args(&[]).with_state_store_password(&context(None)).expect("none");
+    let none = args(&[])
+        .with_state_store_password(&context(None))
+        .expect("none");
     assert_eq!(none.state_store, None);
     let sqlite = args(&["--state-store=sqlite:///var/lib/kbf/state.db"])
         .with_state_store_password(&context(None))
         .expect("SQLite");
     assert_eq!(
         sqlite.state_store,
-        Some(StateStoreUri::Sqlite(PathBuf::from("/var/lib/kbf/state.db")))
+        Some(StateStoreUri::Sqlite(PathBuf::from(
+            "/var/lib/kbf/state.db"
+        )))
     );
     let mut built = args(&["--state-store-password-file=/nonexistent/pw", URL]);
     built.state_store = Some(

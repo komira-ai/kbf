@@ -536,12 +536,7 @@ pub struct Args {
     /// or 0400. Without it the password is PGPASSWORD's, else the line of libpq's password file
     /// (PGPASSFILE, else `~/.pgpass`) that matches the server, else none (peer authentication).
     /// Where it came from is logged at start; the password never is
-    #[arg(
-        long,
-        value_name = "FILE",
-        requires = "state_store",
-        display_order = 6
-    )]
+    #[arg(long, value_name = "FILE", requires = "state_store", display_order = 6)]
     pub state_store_password_file: Option<PathBuf>,
     /// How long, in seconds, a storage node's membership row lives without a heartbeat
     /// before the state store expires it and the member goes down in the storage map.

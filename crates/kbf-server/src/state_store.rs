@@ -347,7 +347,9 @@ impl crate::Args {
             }
             _ => return Ok(self.clone()),
         };
-        let (url, found) = url.authenticated(file, context).map_err(StateError::Password)?;
+        let (url, found) = url
+            .authenticated(file, context)
+            .map_err(StateError::Password)?;
         if let Some(found) = found {
             tracing::info!("state store password: {}", found.source);
             if let Some(skipped) = &found.skipped {
