@@ -18,13 +18,13 @@ use std::time::{Duration, Instant};
 use js_proto::v1::{ExecMode, Shape};
 use kbf_job_client::fake::{FakeJobServer, Machine, TOKEN};
 use kbf_objstore::s3::fake::FakeS3;
-use kbf_proto::google::longrunning::Operation;
+use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::execution_stage::Value as ExecStage;
 use kbf_proto::reapi::{
     Action, BatchUpdateBlobsRequest, Command as ReapiCommand, Directory, ExecuteOperationMetadata,
-    ExecuteRequest, FileNode, WaitExecutionRequest, batch_update_blobs_request,
+    ExecuteRequest, ExecuteResponse, FileNode, WaitExecutionRequest, batch_update_blobs_request,
 };
 use kbf_server::api_client::OperatorClient;
 use kbf_testkit::dir::TestDir;
@@ -476,6 +476,27 @@ impl Rig {
         }
     }
 
+    /// The id of the job the executor submitted after `previous`: the operation's next
+    /// attempt.
+    async fn job_after(&self, previous: &str) -> String {
+        let deadline = Instant::now() + PROMPT;
+        loop {
+            let jobs = self.fake.jobs();
+            let at = jobs
+                .iter()
+                .position(|j| j.id == previous)
+                .expect("the earlier job");
+            if let Some(job) = jobs.get(at + 1) {
+                return job.id.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no attempt was submitted after {previous}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// The id of the first job the executor submitted.
     async fn job_submitted(&self) -> String {
         let deadline = Instant::now() + PROMPT;
@@ -648,6 +669,70 @@ async fn sigterm_keeps_a_running_stream_when_there_is_no_deadline() {
     drop(executed);
     let status = rig.frontend.exited(PROMPT).await;
     assert!(status.success(), "kbf exited with {status}");
+}
+
+/// What a rolling update relies on (`docs/deploy/swarm-frontend.md`): an Execute open when the
+/// stop signal comes is followed to its answer while the frontend drains, and the client gets
+/// that answer on the same stream. The drain is past its load balancer wait (new executions
+/// refused, every listener sent GOAWAY) before the job ends. The job is then lost by its host
+/// three times: the executor submits the operation's second and third attempt during the drain,
+/// and at the third ending it answers the client with a done operation, UNAVAILABLE, its last
+/// attempt spent. Then the frontend, with nothing left to answer, exits 0 by itself while the
+/// client still holds its connection. Catches a drain that keeps the stream open but no longer
+/// delivers to it (a job's end is not read, an attempt is not submitted again, or the answer is
+/// cut by the stand-down or the exit), and one that waits on the client to go away before it
+/// exits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_answers_an_open_execute_whose_job_ends_during_the_drain() {
+    let mut rig = Rig::start("answer-in-drain", &[]).await;
+    let (mut executed, _) = rig.run_on_a_host("answered during the drain").await;
+    let first = rig.job_submitted().await;
+
+    rig.frontend.terminate();
+    rig.not_ready().await;
+    rig.draining().await;
+    let drain = rig.drain().await;
+    assert_eq!(drain["open_executions"], 1, "{drain}");
+
+    let mut job = first;
+    for attempt in 1..=3 {
+        assert!(rig.fake.lose(&job), "attempt {attempt} lost");
+        if attempt < 3 {
+            job = rig.job_after(&job).await;
+            assert!(
+                rig.fake.place(&job, "host-1"),
+                "attempt {} placed",
+                attempt + 1
+            );
+            assert!(rig.fake.starting(&job), "attempt {} starting", attempt + 1);
+            assert!(rig.fake.run(&job), "attempt {} running", attempt + 1);
+        }
+    }
+    let last = loop {
+        let op = next(&mut executed).await;
+        if op.done {
+            break op;
+        }
+    };
+    let response = match &last.result {
+        Some(operation::Result::Response(any)) => {
+            ExecuteResponse::decode(any.value.as_slice()).expect("an ExecuteResponse")
+        }
+        other => panic!("a done operation without a response: {other:?}"),
+    };
+    let status = response.status.expect("the answer's status");
+    assert_eq!(status.code, Code::Unavailable as i32, "{status:?}");
+    assert_eq!(rig.fake.jobs().len(), 3, "one job per attempt");
+
+    // The answer is sent and the stream ended; the client keeps its connection, and the
+    // frontend does not wait on it to exit.
+    let ended = tokio::time::timeout(PROMPT, executed.message())
+        .await
+        .expect("the stream ends after its answer");
+    assert!(matches!(ended, Ok(None)), "{ended:?}");
+    let exit = rig.frontend.exited(PROMPT).await;
+    assert!(exit.success(), "kbf exited with {exit}");
+    drop(executed);
 }
 
 /// Catches: `--progress-interval-secs 0` (and `--http2-keepalive-interval-secs 0`) ignored or

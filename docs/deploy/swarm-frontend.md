@@ -66,6 +66,43 @@ History is not all an update with `order: start-first` needs: the old and the ne
 also share the executor's jobs, which is the subject of
 [docs/design/n-frontends.md](../design/n-frontends.md) (section 9 gives the order of the steps).
 
+## What an update cuts, and what it does not
+
+An update cuts no build that is in flight on the old task. From the stop signal on, the old task:
+
+- keeps every open Execute and WaitExecution stream until its operation is answered. The job
+  runs on; if the farm loses it, the operation's next attempt is still submitted. The answer, a
+  result or a failure, goes to the client on the same stream.
+- answers every ByteStream read or write, cache call and Execute still being prepared.
+- exits only when nothing is left to answer, however long that takes.
+
+The test `sigterm_answers_an_open_execute_whose_job_ends_during_the_drain`
+(`crates/kbf-cli/tests/frontend_shutdown.rs`) holds a real frontend to this. It sends SIGTERM
+to a frontend with a running action and lets the drain refuse new executions and send GOAWAY.
+Then the fake job service loses the action's job three times, so its last attempt is spent. The
+test expects the UNAVAILABLE answer on the original stream, followed by the process exiting 0 by
+itself.
+
+Only these end a stream that is still open:
+
+| what | why |
+|---|---|
+| a second stop signal, or `--shutdown-timeout-secs` running out (none by default) | the operator's hard stop: the streams left end UNAVAILABLE |
+| the service's `stop_grace_period` running out | Swarm kills the old task. Give it longer than the longest action and its queue wait; one hour serves a farm whose actions take minutes |
+| a load balancer in front that closes a draining task's connections | it must stop sending new connections to a task whose `/readyz` answers 503, and leave its open ones to end. A TCP proxy needs no idle timeout and must not close connections when a health check fails |
+| a connection that moves nothing either way for `--http2-keepalive-interval-secs` plus `--http2-keepalive-timeout-secs` (30 + 120 s by default) | the frontend closes it, draining or not, since its client is taken for gone |
+
+The last row has nothing to do with an update. When the network path between clients and the
+frontends drops established connections, every stream on them fails, whichever task they reach,
+and the frontends close the connections once the limit has passed. A client that is still there
+sees its HTTP/2 keep-alive time out, or a broken pipe on an Execute (`h2 protocol error: error
+reading a body from connection`). Buck2 does not resume a broken stream through
+WaitExecution, so each such action fails. It looks like an update's cut when it happens during
+one, and is told apart by the frontends' logs. A cut by the update is the old task's WARN `the
+drain is ended by force: it cuts N open Execute or WaitExecution stream(s)`. A dead path is
+the WARN `closing a connection that moved nothing either way for the keepalive's limit`, on the
+new task as much as on the old.
+
 ## A release that removes flags
 
 A frontend refuses a `--config` file that still sets a flag its release removed: the start exits
