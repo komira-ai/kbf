@@ -187,26 +187,25 @@ fn a_skipped_or_ambiguous_libpq_file_reaches_the_caller() {
 
 /// Catches a password character that ends the parameter or the URL (`&`, `#`, `=`, `%`, `+`, a
 /// space, a `:` or `@`) or is decoded into another, a URL with a query given a second `?`, and
-/// the password shown in the configuration's `Debug` text.
+/// the password shown in the configuration's `Debug` text. The password is every printable ASCII
+/// character and one that is not ASCII, so no character the encoding must carry is left out.
 #[test]
 fn every_character_of_a_password_reaches_the_client_as_it_is() {
-    let tricky = "a&b=c#d%25e+f g:h@i/j?k\\l\u{e9}";
+    let every: String = (b' '..=b'~').map(char::from).chain(['\u{e9}']).collect();
     for url in [
         "postgres://kbf@db.example/kbf",
         " postgres://db.example/kbf?user=kbf ",
     ] {
-        let built = with_password(url, tricky);
-        assert_eq!(client_password(&built), tricky.as_bytes(), "{url}");
+        let built = with_password(url, &every);
+        assert_eq!(client_password(&built), every.as_bytes(), "{url}");
         assert_eq!(built.matches('?').count(), 1, "{url}");
     }
     let dir = TestDir::under(std::env::temp_dir(), "pg-auth-debug");
-    let file = secret(&dir, "pw", format!("{tricky}\n").as_bytes(), 0o600);
+    let file = secret(&dir, "pw", format!("{every}\n").as_bytes(), 0o600);
     let got = authenticate(URL, Some(&file), &context(None, None)).expect("authenticated");
     let shown = format!("{got:?}");
-    assert!(
-        !shown.contains("a&b") && !shown.contains("a%26b"),
-        "{shown}"
-    );
+    // A run of the password, as it is and as it is encoded, appears nowhere in the text.
+    assert!(!shown.contains("!\"#$%") && !shown.contains("%21%22%23"));
 }
 
 /// Catches PGPASSFILE not taking the place of `~/.pgpass`, an empty variable taken as set (libpq
