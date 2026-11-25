@@ -10,6 +10,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | Document | Covers |
 |---|---|
 | [direct-js.md](docs/design/direct-js.md) | what an Execute does now: one job of the job service, submitted at once and read back by polling; endings, resubmits and cancel; the state-store rows that let any frontend answer by name and take up a gone process's operations |
+| [one-file-action-tree.md](docs/design/one-file-action-tree.md) | a faster job start with the tree still stored before the submit: what the tree write (S3 PUTs to a node's tierstore), `SubmitJob` (11 Postgres round trips, then a wait on the placer's tables) and the host's tree attach (hundreds of manifests parsed per tree) cost, and the ranked plan, led by one tree list per action that `trees/<digest>` may name (**planned**) |
 | [scheduler.md](docs/design/scheduler.md) | (**superseded** by direct-js.md) the earlier farm scheduler: operations, leases, fencing, QoS, placement, accounting |
 | [simulation.md](docs/design/simulation.md) | what is simulated (the Raft log, the object store writes, the write tier), the conventions every simulation keeps, and the one-server cell |
 | [storage.md](docs/design/storage.md) | the CAS and action cache, segments, metadata, retention, the object store interface |
