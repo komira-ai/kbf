@@ -1917,6 +1917,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-pg-auth"
+version = "0.1.0"
+dependencies = [
+ "kbf-state",
+ "kbf-testkit",
+ "percent-encoding",
+ "postgres",
+ "rustix",
+ "thiserror",
+ "whoami",
+ "zeroize",
+]
+
+[[package]]
 name = "kbf-proto"
 version = "0.1.0"
 dependencies = [
@@ -2050,6 +2064,7 @@ dependencies = [
  "kbf-pack",
  "kbf-pack-index",
  "kbf-peer",
+ "kbf-pg-auth",
  "kbf-proto",
  "kbf-raft",
  "kbf-route",

@@ -292,6 +292,9 @@ where
     args.retired_scheduler.warn();
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
+    let args = &args
+        .with_state_store_password(&kbf_pg_auth::Context::of_process())
+        .map_err(ServeError::State)?;
     let pack_index = args.open_pack_index()?;
     let state = with_members(
         args.open_state_store().map_err(ServeError::State)?,
