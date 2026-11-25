@@ -8,7 +8,10 @@
 //! ([`crate::executor::size_class`]), its target, what runs and whether it is a test, and a fourth,
 //! `size-fallback`, the class of its kind (what runs), whose history sizes the job while its
 //! own class has too few runs; a whole-host job, which books a whole host and so is never
-//! sized, has neither, and an action with no program has no kind.
+//! sized, has neither, and an action with no program has no kind. The job's `history_key` is
+//! the key the job service keeps its usage history under, `<target> <action kind>` as they are
+//! (the client's when it sent both, else the action's paths'; [`SizeClass::history_key`]), and
+//! empty for an action with none and for a whole-host job.
 //!
 //! A Linux run commits into a put directory (`--task-out-root`, [`Config::task_out`]) and is a
 //! job ([`put_dir_spec`]): no image, its root the action tree as its one layer (the host
@@ -39,7 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use js_proto::v1::{JobSpec, Needs, NetworkLevel};
-use kbf_front::DecodedAction;
+use kbf_front::{ActionLabel, DecodedAction};
 use kbf_proto::reapi::Digest;
 use ring::digest::{SHA256, digest};
 use tokio::time::Instant;
@@ -180,11 +183,11 @@ pub(super) struct Preparer<'a> {
 
 /// The job of `run`, which runs `action` with `booking`, with its put directory: `action`'s
 /// facts and closure from `decoded`, the Action and Command its Execute decoded, when there are
-/// any, else from the CAS.
+/// any, else from the CAS, and its history key from what the client `sent` or else the facts.
 pub(super) async fn prepare(
     ctx: &Preparer<'_>,
     run: RunId,
-    (action, decoded): (&Digest, Option<&DecodedAction>),
+    (action, decoded, sent): (&Digest, Option<&DecodedAction>, &ActionLabel),
     booking: Booking,
 ) -> Result<Prepared, Settled> {
     let started = Instant::now();
@@ -201,7 +204,7 @@ pub(super) async fn prepare(
     if let System::Macos { os_version } = facts.system {
         let times = (timeout, wall);
         let action = (action, decoded);
-        return prepare_mac(ctx, run, action, booking, times, os_version, class).await;
+        return prepare_mac(ctx, run, action, booking, times, os_version, (class, sent)).await;
     }
     let Some(roots) = &ctx.cfg.task_out else {
         return Err(no_roots("a Linux action"));
@@ -222,7 +225,14 @@ pub(super) async fn prepare(
         tree: &tree,
         form,
     };
-    let spec = put_dir_spec(ctx, &job, run, action, (timeout, wall), (booking, class));
+    let spec = put_dir_spec(
+        ctx,
+        &job,
+        run,
+        action,
+        (timeout, wall),
+        (booking, class, sent),
+    );
     Ok(Prepared {
         spec,
         key,
@@ -250,7 +260,7 @@ async fn prepare_mac(
     booking: Booking,
     (timeout, wall): (Duration, Duration),
     os_version: Option<u32>,
-    class: &SizeClass,
+    (class, sent): (&SizeClass, &ActionLabel),
 ) -> Result<Prepared, Settled> {
     let Some(pool) = &ctx.cfg.mac else {
         return Err(Settled::Invalid(
@@ -283,6 +293,7 @@ async fn prepare_mac(
         needs: booking.needs(),
         wall_seconds: wall_seconds(wall),
         labels: labels(ctx, Some(class)),
+        history_key: class.history_key(sent).unwrap_or_default(),
     });
     Ok(Prepared {
         spec,
@@ -331,6 +342,14 @@ fn labels(ctx: &Preparer<'_>, class: Option<&SizeClass>) -> BTreeMap<String, Str
     .collect()
 }
 
+/// The history key of a job of `class` that its client `sent` ([`SizeClass::history_key`]);
+/// empty, which names none, for a job with no class: a whole-host job is never sized.
+fn history_key(class: Option<&SizeClass>, sent: &ActionLabel) -> String {
+    class
+        .and_then(|class| class.history_key(sent))
+        .unwrap_or_default()
+}
+
 /// Where a put-directory job reads and writes: the roots, the run's put directory
 /// (`cas/b/<run>/<nonce>`) and its action tree (the digest in hex, or with
 /// [`InputTree::Provider`] the key of its tree list).
@@ -350,7 +369,7 @@ fn put_dir_spec(
     run: RunId,
     action: &Digest,
     (timeout, wall): (Duration, Duration),
-    (booking, class): (Booking, &SizeClass),
+    (booking, class, sent): (Booking, &SizeClass, &ActionLabel),
 ) -> JobSpec {
     JobSpec {
         job_id: job_id(&ctx.cfg.frontend, run),
@@ -374,6 +393,7 @@ fn put_dir_spec(
         files: Vec::new(),
         priority: 0,
         labels: labels(ctx, booking.class(class)),
+        history_key: history_key(booking.class(class), sent),
     }
 }
 

@@ -239,7 +239,7 @@ container-image=docker://registry.example.com/build@sha256:<digest>
 ### Memory
 
 An action books no memory: the job carries no CPU or memory, and the job service sizes it from the
-history of the action's build target and kind (its `size-class` label), or, while that class has
+history of the action's build target and kind (its `history_key`, and its `size-class` label), or, while that class has
 run too few times, from that of its kind on any target (what runs, its `size-fallback` label). When the job service reports that an
 action ran past its memory limit, the frontend submits it again as the next attempt, at most twice,
 and then answers `FAILED_PRECONDITION` (out of memory). `kbf-lease=whole_machine` makes the job ask

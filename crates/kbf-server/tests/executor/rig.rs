@@ -16,8 +16,8 @@ use js_proto::v1::{
 };
 use kbf_auth::AuthenticationMetadata;
 use kbf_front::{
-    CallMetadata, DecodedAction, Described, Dispatch, ExecuteCall, Finished, InvocationId,
-    Recorder, Stage, Submission,
+    ActionLabel, CallMetadata, DecodedAction, Described, Dispatch, ExecuteCall, Finished,
+    InvocationId, Recorder, Stage, Submission,
 };
 use kbf_job_client::Client;
 use kbf_job_client::fake::{Call, FakeJobServer, Fault, Machine};
@@ -403,13 +403,32 @@ impl Rig {
     }
 
     /// Submits the action of `tag` to `exec`; `whole` asks for the whole machine, and `call`
-    /// is the call the invocation recorder is told of.
+    /// is the call the invocation recorder is told of. The Execute's client sent no target or
+    /// action kind, as Buck2 sends none.
     pub fn submit_to(
         &self,
         exec: &Executor,
         tag: u8,
         whole: bool,
         call: Option<ExecuteCall>,
+    ) -> Caller {
+        self.submit_labelled(exec, (tag, whole), call, ActionLabel::default())
+    }
+
+    /// Submits the action of `tag` with the target and action kind its Execute's client sent
+    /// in its `RequestMetadata` (`label`).
+    pub fn submit_sent(&self, tag: u8, label: ActionLabel) -> Caller {
+        self.submit_labelled(&self.exec, (tag, false), None, label)
+    }
+
+    /// Submits the action of `tag` to `exec` (`whole`: for the whole machine), its call `call`,
+    /// its client having sent `label`.
+    fn submit_labelled(
+        &self,
+        exec: &Executor,
+        (tag, whole): (u8, bool),
+        call: Option<ExecuteCall>,
+        label: ActionLabel,
     ) -> Caller {
         let key = ActionKey {
             instance: "main".to_owned(),
@@ -423,7 +442,7 @@ impl Rig {
                 described: Described {
                     arguments: vec!["/bin/run".to_owned()],
                     outputs: Vec::new(),
-                    label: Default::default(),
+                    label,
                 },
                 evidence: Default::default(),
                 decoded: None,

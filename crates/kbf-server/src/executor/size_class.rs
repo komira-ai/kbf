@@ -1,5 +1,6 @@
 //! The class the job service sizes an action's job by, the value of the job's `size-class`
-//! label, and the class of its kind, the value of its `size-fallback` label (below). A job that leaves its CPU and memory at zero is booked what the history of its class
+//! label, its history key (below), and the class of its kind, the value of its `size-fallback`
+//! label (below). A job that leaves its CPU and memory at zero is booked what the history of its class
 //! says (jobscheduler's `docs/design/sizing.md`, section 7.7), so every run of one piece of work
 //! must name one class, and no other work may share it.
 //!
@@ -53,18 +54,35 @@
 //! (or, cut, in `-` and 16 hex digits of a name that ends in `.kind`), so it never meets a
 //! target's or a shape's class.
 //!
+//! **The history key** ([`SizeClass::history_key`]), sent as the job's own field
+//! `JobSpec.history_key` (jobscheduler's `docs/design/sizing.md`, section 7.7): the key the job
+//! service keeps the action's usage history under, which it takes ahead of the `size-class`
+//! label. It is `<target> <action kind>` as they are, never lowered, cut or hashed, so a booking
+//! names the target it belongs to (`komira//src/json:json mojo_compile`). The target and the kind
+//! are the client's when its Execute's `RequestMetadata` names both (`target_id`,
+//! `action_mnemonic`); Buck2 names neither (it sends its build id and its own name and version
+//! alone), so for Buck2 they are always the action's own paths': the target's label as
+//! [`Shape::target`] reads it, the kind's words above, and `test` after them for a test run, so
+//! a target's test run is a key of its own. A key must be 1 to 512 bytes of printable ASCII
+//! (`js_types::HistoryKey`): a client's pair that is not one leaves the paths' key, and an action
+//! with no target, no program, or a target that is not printable ASCII has no key of its own (the
+//! job is sent none, and its `size-class` label sizes it). An operation taken up from the state
+//! store has no Execute, so its key is always the paths'.
+//!
 //! The words are written as `js_types::SizeClass::of_target` writes them, byte for byte, by a
-//! copy of its rule here: the jobscheduler revision this workspace takes predates it. The tests
-//! hold the copy to jobscheduler's own examples and hashes.
+//! copy of its rule here (`written`), which the tests hold to jobscheduler's own examples and
+//! hashes.
+
+use js_types::HistoryKey;
+use kbf_front::ActionLabel;
 
 use crate::action_usage::Shape;
 
 /// The label whose value names a job's class: jobscheduler's `js_types::SIZE_CLASS_LABEL`.
 pub(crate) const SIZE_CLASS_LABEL: &str = "size-class";
 
-/// The label whose value names a job's fallback class, its kind: `js_types::SIZE_FALLBACK_LABEL`
-/// of jobscheduler's main, copied here since the jobscheduler revision this workspace takes
-/// predates it.
+/// The label whose value names a job's fallback class, its kind: jobscheduler's
+/// `js_types::SIZE_FALLBACK_LABEL`.
 pub(crate) const SIZE_FALLBACK_LABEL: &str = "size-fallback";
 
 /// Longest label value, in bytes.
@@ -79,7 +97,8 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// The 64-bit FNV-1a prime.
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// A job's size class, and the class of its kind: each a valid value of the labels
+/// A job's size class, the class of its kind, and the history key its paths give
+/// ([`SizeClass::history_key`]); the class and the kind each a valid value of the labels
 /// [`SIZE_CLASS_LABEL`] and [`SIZE_FALLBACK_LABEL`] (1 to 63 bytes of `[a-z0-9._-]`) that starts
 /// and ends with a letter or a digit.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -88,6 +107,10 @@ pub struct SizeClass {
     class: String,
     /// The kind: what runs, and whether it is a test; `None` for an action with no program.
     kind: Option<String>,
+    /// The history key the action's own paths give ([`SizeClass::history_key`]): its target's
+    /// label and the kind's words, as they are; `None` for an action with no target or no
+    /// program, or whose key is no [`HistoryKey`].
+    history_key: Option<String>,
 }
 
 impl SizeClass {
@@ -102,10 +125,33 @@ impl SizeClass {
             (Some(target), None) => written(&format!("{} {test}", target.label)),
             (None, _) => format!("shape.{}", shape.key),
         };
+        let history_key = match (&shape.target, &words) {
+            (Some(target), Some(words)) if shape.test => {
+                history_key(&format!("{} {words} test", target.label))
+            }
+            (Some(target), Some(words)) => history_key(&format!("{} {words}", target.label)),
+            _ => None,
+        };
         Self {
             class,
             kind: words.map(|words| written(&format!("{words} {test} kind"))),
+            history_key,
         }
+    }
+
+    /// The key the job service keeps the action's usage history under (its `JobSpec.history_key`,
+    /// jobscheduler's `docs/design/sizing.md`, section 7.7): `<target> <action kind>`, as they
+    /// are, never lowered, cut or hashed. The target and the kind are the ones the client `sent`
+    /// in the Execute's `RequestMetadata` (`target_id`, `action_mnemonic`) when it sent both and
+    /// they make a [`HistoryKey`], else the ones the action's own paths give (its target's label,
+    /// the kind's words, and `test` for a test run); `None` when neither makes one (see the
+    /// module docs).
+    pub(crate) fn history_key(&self, sent: &ActionLabel) -> Option<String> {
+        let from_client = match (&sent.target, &sent.mnemonic) {
+            (Some(target), Some(mnemonic)) => history_key(&format!("{target} {mnemonic}")),
+            _ => None,
+        };
+        from_client.or_else(|| self.history_key.clone())
     }
 
     /// The class as the label's value.
@@ -119,6 +165,14 @@ impl SizeClass {
     pub(crate) fn kind(&self) -> Option<&str> {
         self.kind.as_deref()
     }
+}
+
+/// `text` when it is a [`HistoryKey`] (1 to 512 bytes of printable ASCII); `None` otherwise, for
+/// the key is sent as it is or not at all.
+fn history_key(text: &str) -> Option<String> {
+    HistoryKey::parse(text)
+        .ok()
+        .map(|key| key.as_str().to_owned())
 }
 
 /// The words that name the kind of an action whose shape's program words are `program` (see

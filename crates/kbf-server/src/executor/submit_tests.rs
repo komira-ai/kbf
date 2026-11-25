@@ -252,7 +252,13 @@ async fn prepared(
         inputs: &inputs,
         ..harness.preparer()
     };
-    prepare(&ctx, RUN, (&action(), None), booking).await
+    prepare(
+        &ctx,
+        RUN,
+        (&action(), None, &kbf_front::ActionLabel::default()),
+        booking,
+    )
+    .await
 }
 
 /// Catches the job's wall limit being the executor's longest run instead of the
@@ -487,7 +493,14 @@ impl Inputs for Broken {
 async fn an_action_that_cannot_be_read_settles_the_run_as_the_callers() {
     let mut harness = Harness::new();
     harness.inputs = Arc::new(Broken);
-    let Err(refused) = prepare(&harness.preparer(), RUN, (&action(), None), BOOKING).await else {
+    let Err(refused) = prepare(
+        &harness.preparer(),
+        RUN,
+        (&action(), None, &kbf_front::ActionLabel::default()),
+        BOOKING,
+    )
+    .await
+    else {
         panic!("prepared an action that cannot be read");
     };
     assert_eq!(refused, Settled::Invalid("no such action".to_owned()));

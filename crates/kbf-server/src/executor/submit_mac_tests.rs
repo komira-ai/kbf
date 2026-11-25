@@ -126,7 +126,13 @@ async fn prepared(case: Case) -> Result<super::Prepared, Settled> {
         inputs: &inputs,
         ..harness.preparer()
     };
-    prepare(&ctx, RUN, (&action(), None), case.booking).await
+    prepare(
+        &ctx,
+        RUN,
+        (&action(), None, &kbf_front::ActionLabel::default()),
+        case.booking,
+    )
+    .await
 }
 
 /// Where a mount comes from: a host path, or `<provider>:<ref>` for a provider's tree.
@@ -219,11 +225,39 @@ async fn a_komira_darwin_action_is_a_job_of_os_and_arch_only_with_the_tree_and_t
     assert!(spec.labels.contains_key(INSTANCE_LABEL));
     assert_eq!(spec.labels["size-class"], "root.pkg.t.cc.build");
     assert_eq!(spec.labels["size-fallback"], "cc.build.kind");
+    assert_eq!(spec.history_key, "root//pkg:t cc");
     assert_eq!(
         spec.needs,
         Some(js_proto::v1::Needs::default()),
         "no CPU, memory or disk: the service sizes the job from its class"
     );
+}
+
+/// Asserts that a Mac job whose Execute's client sent a target and an action kind is sent them
+/// as its history key, `<target_id> <action_mnemonic>`, in place of the key its paths give.
+/// Catches a Mac job that drops what the client sent, which the Linux job keeps.
+#[tokio::test(start_paused = true)]
+async fn a_mac_jobs_history_key_is_the_target_and_kind_its_client_sent() {
+    let mut harness = Harness::new();
+    harness.cfg.task_out = Some(PutDirRoots::new("/mnt/ts/put").expect("roots"));
+    harness.cfg.mac = Some(pool(None));
+    let inputs: Arc<dyn Inputs> = Arc::new(Mac {
+        platform: KOMIRA_DARWIN.to_vec(),
+        tree: true,
+    });
+    let ctx = Preparer {
+        metrics: &Metrics::default(),
+        inputs: &inputs,
+        ..harness.preparer()
+    };
+    let sent = kbf_front::ActionLabel {
+        mnemonic: Some("SwiftCompile".to_owned()),
+        target: Some("//ios/App:app".to_owned()),
+    };
+    let job = prepare(&ctx, RUN, (&action(), None, &sent), Booking::Share)
+        .await
+        .expect("a Mac job");
+    assert_eq!(job.spec.history_key, "//ios/App:app SwiftCompile");
 }
 
 /// Asserts the wall limit of a Mac job is the action's timeout plus the run margin, from the
@@ -245,9 +279,14 @@ async fn a_mac_jobs_wall_limit_is_its_timeout_plus_the_run_margin() {
         inputs: &inputs,
         ..harness.preparer()
     };
-    let job = prepare(&ctx, RUN, (&action(), None), Booking::Share)
-        .await
-        .expect("prepared");
+    let job = prepare(
+        &ctx,
+        RUN,
+        (&action(), None, &kbf_front::ActionLabel::default()),
+        Booking::Share,
+    )
+    .await
+    .expect("prepared");
     assert_eq!(job.spec.wall_limit_seconds, Some(20 + 77));
     let defaults = crate::executor::Config::new("front");
     assert_eq!(
@@ -453,7 +492,17 @@ async fn a_mac_run_hands_its_decode_to_the_mint_and_is_a_tree_list() {
         },
     };
 
-    let prepared = prepare(&ctx, RUN, (&action(), Some(&decoded)), Booking::Share).await;
+    let prepared = prepare(
+        &ctx,
+        RUN,
+        (
+            &action(),
+            Some(&decoded),
+            &kbf_front::ActionLabel::default(),
+        ),
+        Booking::Share,
+    )
+    .await;
 
     let prepared = prepared.expect("a Mac job");
     assert_eq!(prepared.form, crate::executor::InputTree::Provider);
