@@ -26,6 +26,7 @@ mod cas;
 mod denied;
 mod directories;
 mod empty_blob;
+mod execute_walk;
 mod failover;
 mod large;
 mod lost;

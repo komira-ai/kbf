@@ -22,8 +22,8 @@ use crate::rig::{Rig, blob_of};
 
 /// A dispatch that queues every submission and never runs it.
 #[derive(Default)]
-struct Queue {
-    submitted: Mutex<Vec<watch::Sender<Stage>>>,
+pub struct Queue {
+    pub submitted: Mutex<Vec<watch::Sender<Stage>>>,
 }
 
 impl Dispatch for Queue {
@@ -53,14 +53,14 @@ impl Dispatch for Queue {
     }
 }
 
-fn proto(digest: &Digest) -> kbf_proto::reapi::Digest {
+pub fn proto(digest: &Digest) -> kbf_proto::reapi::Digest {
     kbf_proto::reapi::Digest {
         hash: digest.hash_hex(),
         size_bytes: digest.size_bytes as i64,
     }
 }
 
-fn file(name: &str, digest: &Digest) -> FileNode {
+pub fn file(name: &str, digest: &Digest) -> FileNode {
     FileNode {
         name: name.to_owned(),
         digest: Some(proto(digest)),
