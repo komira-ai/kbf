@@ -3,7 +3,8 @@
 > **Status: proposal. Nothing here is built.** This page measures three steps of a job's start and
 > ranks the changes that make each one cheaper. Every change keeps today's order: the action tree is
 > stored completely, its last object last, before the job is submitted. Section 6 lists the work, each
-> item with a test that fails before it and a measurement to take after it.
+> item with a test that fails before it (except 1a, a configuration step) and a measurement to take
+> after it.
 
 komira-ai/kbf#2431 proposed submitting a job while its tree was still being written. It was closed:
 overlapping the two saved about 30 ms and brought back the risk of a start failing on a tree that was
@@ -15,22 +16,32 @@ not stored yet. This page keeps the order and asks what each step costs:
 
 ## 1. The answer in one page
 
-- **The largest cut is one tree file per action.** The file is written once by kbf and read whole by
-  the host. It replaces about 370-1,350 directory manifests per tree. Today each is read, hashed,
+- **The target is one tree file per action, written once by kbf and mapped by the host.** It replaces
+  about 370-1,350 directory manifests per tree and their root. Today each manifest is read, hashed,
   parsed twice as JSON and indexed on the heap at every attach (section 4).
-  - The format exists already: tierstore's tree list v2 (`TSTREE`). kbf already writes it for Macs.
-    tierstore already serves it in place, by binary search, with no per-entry parse.
-  - What is missing is small:
-    - tierstore: one branch in `read_tree`, so that `trees/<digest>` may name a tree list;
-    - kbf: a third `--executor-input-tree` form that gives the job that host path.
-  - Expected attach (inferred): about 7-10 ms for a typical tree, against 76-215 ms today.
-  - Expected tree write (inferred): one create-only PUT of 0.2-0.3 MB instead of two serial stages.
-    That is about 15-20 ms against 35-48 ms.
-  - What is lost is per-directory dedup across trees. Every start now fetches its own whole file of
-    0.2-3 MB. That costs one fill instead of about 14, and store space that needs a retention rule
-    (section 4.6).
-- **The tree write is plain S3 over HTTP/1.1 to a node's tierstore.** tierstore offers no faster
-  write path to a remote writer: its binary protocols are node-local (section 2).
+  - **The file exists already.** It is tierstore's tree list v2 (`TSTREE`), one object at
+    `cas/l/<sha256>`. kbf writes it for every Mac job, and for Linux jobs under
+    `--executor-input-tree provider`. tierstore serves it in place, by binary search, with no parse
+    per entry. Linux jobs still use the default, `manifests`.
+  - **The Linux hosts can already take it.** The farm's six Linux build nodes run the tierstore and
+    js-agent releases the provider needs, and their tierstore and agent have the mount provider
+    configured. What is left is a check of each agent's capability and the frontend's flag
+    (section 4.3).
+  - **What changes in code** (section 4.5):
+    - tierstore: tree lists are mapped, not read onto the heap, under a new budget,
+      `fs.tree_list_ram_bytes` (512 MiB by default; 2 GiB on a farm's busy hosts);
+    - kbf: the list's base part is encoded once per frontend, and its sidecar is written beside the
+      list, not after it.
+  - **Expected attach** (inferred): about 7-10 ms for a typical tree, against 76-215 ms today.
+  - **Expected tree write** (inferred): the list's and its sidecar's create-only PUTs at once, instead
+    of two serial stages: about 15-20 ms against 35-48 ms, once the sidecar no longer follows the
+    list.
+  - **What is lost** is per-directory dedup across trees. Every start writes and fetches its own whole
+    file of 0.3-7 MB. That costs one fill instead of about 14, and bytes that need a retention rule.
+    At these sizes neither changes the start (section 4.8).
+- **The tree write is plain S3 over HTTP/1.1 to tierstore's S3 front**, through kbf's `ObjectStore`
+  put path, with S3's errors (a 503 `SlowDown` is waited out, `action_tree/retry.rs`). That is
+  tierstore's fastest write path for a remote writer: its binary protocols are node-local (section 2).
   - Each new manifest is one PUT. Up to 16 go at once, with no batch, and the root is one more PUT
     after them.
   - The ~500 manifests are not 500 PUTs: kbf's memo skips every directory it has stored already.
@@ -55,13 +66,16 @@ The ranked plan (section 6, p50 of a start, every saving inferred unless marked)
 | rank | change | repo | saves | work |
 |---|---|---|---|---|
 | 0 | timers for what is not measured yet (slot waits and 503 waits of the tree writes, the phases of `SubmitJob`, the manifests written per tree) | kbf, jobscheduler | 0 (it decides 2, 3 and 5) | small |
-| 1 | one tree file per action on Linux: `trees/<list digest>` read as a tree list | tierstore, kbf | attach about 65 ms (light) to 200 ms (busy); tree write 20-30 ms | medium |
+| 1a | the provider form on one Linux frontend lane, measured against the other (configuration only) | kbf flag | attach about 65 ms (light) to 200 ms (busy), less what the provider adds (not measured on Linux); the tree write 15-33 ms against the manifest form, once 1b is in | small |
+| 1b | the list's base encoded once, and its sidecar written beside it | kbf | the base encode, and the sidecar's serial stage (`tree_sidecar`, not yet read); together at most the 60 ms the list form adds at kbf today | small |
+| 1c | tree lists mapped, not on the heap, under `fs.tree_list_ram_bytes` | tierstore | the two heap copies of every list in memory (each 0.2-5.2 GiB on a busy host); 0.003-0.25 ms per attach | medium |
+| 1e | a collector for tree lists no job names | kbf | no time; the bytes lists add (4.8). Before the provider form is the default | small |
+| 1d | only if 1a shows the provider's own cost: `trees/<list digest>` read as a tree list | tierstore, kbf | what 1a measures the provider to add | medium |
 | 2 | `SubmitJob` answers before it adds the job to the placer's tables | jobscheduler | the wait behind a pass's table read: 0 when no pass is reading, up to the read when one is | small |
 | 3 | tree writes do not queue behind pack uploads for store slots | kbf | up to about 10 of the root's 13-17 ms, if item 0 shows the slot wait | small |
 | 4 | one job read and no separate clock read in `SubmitJob` | jobscheduler | 2 of 11 round trips, 0.1-0.6 ms | small |
 | 5 | the pass reads queued jobs in batches, not one `get` each | jobscheduler | shortens the reads behind 2 and frees pool connections | small |
 | 6 | the submit transaction in fewer statements | jobscheduler | about 5 round trips (8 to 3), under 1 ms on a local socket | medium |
-| 7 | a mapped (not heap) backing for the tree file | tierstore | about 0.1 ms per attach at 2.4 MB (scratch); a memory saving | medium |
 
 Line references are to these trees, as read:
 
@@ -104,10 +118,14 @@ Words used for numbers:
     keep-alive, with one connection per request in flight (inferred from the features).
   - The pack store is plain `http://`: the client refuses `https://` (ARCHITECTURE.md, "S3 over TLS").
   - Idle connections close after 15 s.
-- **The server.** It is the tierstore S3 front of one of the farm's nodes
-  (`docs/deploy/kbf-modes.md:73-76`). Its handler is `Server::dispatch`, then `put_streamed`
-  (tierstore `server/ops.rs:438`, `:634-686`). It allows 32 puts at once, then waits and answers 503
-  `SlowDown` (`ops.rs:595-619`). Behind it is SeaweedFS (`docs/design/pack-index-over-the-store.md:35`).
+- **The server.** It is a tierstore S3 front named by `--pack-store-endpoint`: a node's tierstore, or a
+  tierstore that proxies the farm's hot and cold stores (`docs/deploy/kbf-modes.md:73-76`). Its handler
+  is `Server::dispatch`, then `put_streamed` (tierstore `server/ops.rs:438`, `:634-686`). It allows 32
+  puts at once, then waits and answers 503 `SlowDown` (`ops.rs:595-619`). Behind it is SeaweedFS
+  (`docs/design/pack-index-over-the-store.md:35`).
+- **The errors are S3's.** A 503 is waited out and the write sent again, and a pooled connection the
+  store had closed is tried once more (`action_tree/retry.rs:1-20`, `store_writes.rs:21-27`). Any other
+  refusal fails the tree.
 
 ### 2.2 Round trips per tree
 
@@ -380,15 +398,71 @@ version 2"; reader: `tree_list_v2.rs`, `tree_image.rs`; writer: kbf `action_tree
   parsed per entry.
 - **It is not mapped.** The `tierstore` crate forbids `unsafe` (`lib.rs:134`). Its sibling crate
   `tierstore-tree` maps its own list format through `vm-memory`, which needs no `unsafe`, and copies
-  records out (`crates/tierstore-tree/src/image.rs:1-8`).
+  records out (`crates/tierstore-tree/src/image.rs:1-8`). So every list in the fs's memory is a heap
+  copy of its whole file (`Tree::image`, `server/treefs/tree.rs:142-155`).
 - **Today only placements read it.** That is the mount provider's form (`--executor-input-tree
   provider`, and every Mac job; kbf `crates/kbf-server/src/executor/config.rs:31-42`,
   `executor/out.rs:122-131`). `trees/<digest>` always reads manifests (`placed.rs:241-306`).
 
-So the "one tree file, written once by kbf and read by the host" needs **no new format**. It needs the
-host path to accept the file that already exists.
+So the one tree file per action, written once by kbf, needs **no new format**. What it needs is the
+Linux jobs to use it, and the host to map it instead of copying it onto the heap.
 
-### 4.3 Size
+### 4.3 The provider form on Linux: what is in place, and what blocks the switch
+
+**How a Linux job would use it.** The frontend's `--executor-input-tree provider`:
+- writes the action's tree list, then its L2 sidecar (`cas/l2/<id>`, `action_tree/listing.rs:381-389`);
+- gives the job the layer `{provider: "tierstore", ref: <the list's key>}` (`executor/out.rs:122-131`).
+
+The host's agent then asks its node's tierstore to `Prepare` the tree as soon as the job is assigned
+(jobscheduler `crates/js-agent/src/lifecycle/machine/providing.rs`). tierstore's `Prepare`
+(`server/provider/prepare.rs:140-246`):
+- fills the list;
+- hashes it on one thread while it walks it on another;
+- writes it as the tree's image (`local_cache/trees/create.rs:392-416`);
+- answers with a placement.
+
+The fs then serves the placement from that image (`placed.rs:247-263`, `image_of`), and the list's
+ranges are queued as reads ahead of the job, so its files are fetched while the sandbox is made.
+
+**What is in place on the farm** (read only, from each node and the deploy record):
+
+| step | what | state |
+|---|---|---|
+| 1 | tierstore with the mount-provider interface (komira-ai/tierstore#337) | done: five reachable nodes run tierstore 0.3.184 |
+| 2 | js-agent 0.1.250 or later (komira-ai/jobscheduler#899) | done: those nodes run js-agent 0.1.401 |
+| 3 | the node's tierstore serves the provider socket, and its agent is started with it | done on all six build nodes, by the deploy record; the files are root-only and were not re-read for this page |
+| 4 | each agent reports the capability `mount-provider.tierstore` | not checked: the job service's list of agents needs an operator's token |
+| 5 | the frontend's `executor-input-tree = "provider"` | not done: Linux jobs use the default, `manifests` |
+
+**Measured so far.**
+- **At kbf:** the executor's `start_ms` p50 was 184 ms for a Mac job, which is always the list form
+  (n = 2,229), against 124 ms for a Linux job in the manifest form (n = 9,146). That is the per-job
+  join of the morning of 2026-11-25, over starts of at most 5 s. The forms differ in more than the tree,
+  so 60 ms bounds what the list form adds at kbf; it does not measure it.
+- **At the host:** `Prepare`'s time has not been measured on Linux, and the Macs' agent logs were not
+  in the join. No Linux job has run in the provider form on the farm.
+
+**What blocks the switch, in order:**
+1. **Step 4**, which an operator can read in a minute from the job service's list of agents. A node
+   that lacks the capability takes no provider job at all (placement requires it,
+   `docs/design/actions-as-jobs.md:515-518`). It loses capacity; it does not fail starts.
+2. **kbf's list cost.**
+   - The list form re-encodes the whole base for every tree (`tstree::encode`, `listing.rs:348`, over
+     `BaseTree::listed`, `action_tree/base.rs:91`), with no per-directory memo.
+   - It writes the sidecar only after the list (`listing.rs:381-389`), which is two serial PUTs, as
+     manifests and root are today.
+   - Without item 1b, the switch keeps today's write cost and adds the encode.
+3. **The provider's own cost on Linux**, not measured: the fill, the hash, the image write, the walk,
+   the placement, and the agent's mount. Item 1a measures it on one lane before the default moves.
+4. **Memory.** Each list in memory is held twice on the heap, by the tree store and by the fs
+   (section 4.6). A busy host keeps 560-760 trees in memory at once, so 0.3-7 MiB lists cost
+   0.2-5.2 GiB of heap per copy. Item 1c maps them once, under a budget.
+
+**What is safe already.** A list a host refuses is read as manifests on the next run, which spends no
+attempt (`Ingest::list_refused`, `executor/outcome.rs:105-112`, `executor/front_miss.rs`). Turning the
+flag back to `manifests` restores today's behaviour for the next run.
+
+### 4.4 Size
 
 The entry costs (inferred from the encoders):
 - **Tree list:** 64 bytes per entry (32 for the record, 32 for the SHA-256), plus the name once, plus at
@@ -403,79 +477,203 @@ of a list without ranges.
 
 | tree | entries | manifest bytes (whole tree) | tree list |
 |---|---|---|---|
-| typical | 2,800 | about 0.5-0.6 MB | about 0.23-0.30 MB |
+| 2,800 entries | 2,800 | about 0.5-0.6 MB | about 0.23-0.30 MB |
 | ten times larger | 28,000 | about 5-6 MB | about 2.3-3.0 MB |
 | a 7 MB list | about 90,000 | about 16-19 MB | 7 MB |
 
 - The list is about 0.4-0.5 times the size of the manifests; tierstore's spec says "a third" of v2
   against its v1 JSON list.
+- The list repeats the base tree's entries in every action's file (`BaseTree::listed`,
+  `listing.rs:7-14`). The table counts them in the entries. Below, lists are sized at 0.3 MB (the
+  2,800-entry tree), 0.6-0.8 MB (the busy evening's 1,353-manifest trees, about 7,500 entries) and up
+  to 7 MB. No sample of real list sizes was taken for this page.
 - The limits are far away:
   - a list is limited to 256 MiB (`MAX_TREE_LIST_BYTES`, `action_tree/listing.rs:64`; `tstree.rs:330`);
   - a whole-object fill is limited to 64 MiB (`WHOLE_FILL_LIMIT`, tierstore `server/local_cache/mod.rs:288`).
-- The list repeats the base tree's entries in every action's file (`BaseTree::listed`,
-  `listing.rs:7-14`). The table counts them in the entries.
 
-### 4.4 What changes
+### 4.5 What changes
 
-**tierstore** (komira-ai/tierstore):
+**kbf** (item 1b):
 
-1. **`read_tree`** (`server/treefs/core/placed.rs:241`). Ask for the root object as today. If its bytes
-   begin with the `TSTREE` magic, take it as a tree list: run `TreeImage::checked`, and return a
-   `Tree::image` with no location. Skip `fill-tree` and `flatten_in_waves`. A JSON manifest (first byte
-   `{`) takes today's path unchanged.
-2. **`fill-tree`** (`server/local_cache/tree_fill.rs`). Stop at a root that is a tree list. Today it
-   would try `parse_manifest`, fail, and fall back to the reader's path.
-3. **`Tree::image` without a location** (`server/treefs/tree.rs`). `looked_into` and `root_parent`
-   already treat `None` as a tree of `trees/` (`placed.rs:371`, `:451`).
-4. **No second hash.** The whole-object fill hashes the object as it lands, and refuses it unless the
-   digest is the key's (`server/local_cache/fill.rs:807-852`). That is the content check; a placement's
-   image is not hashed again at attach either (the doc of `image_of`, `placed.rs:306-316`). A list already in the cache was
-   checked when it was filled.
-5. **Docs.** `docs/design/virtual-build-fs.md` (the namespace section) and the tree list spec: a
-   `trees/<digest>` may name a list.
+1. **The base encoded once.** The base's records, names and keys are encoded once per frontend and
+   base tree. Only the input's records are appended per tree. Today `tstree::encode`
+   (`listing.rs:348`) walks the listed base (`action_tree/base.rs:91`) every time, and the list form
+   has only the `(action, form)` memo of 600 s
+   (`executor/front.rs:784-785`).
+2. **The sidecar beside the list.** The sidecar's PUT is made beside the list's, not after it.
+   The tree is stored once both have ended (`write_listing_as` awaits both, as now,
+   `listing.rs:370-392`). The provider needs the sidecar, so it stays before the submit.
+   - Today no sidecar and no unlisted row names a list the store does not have (`listing.rs:28-35`,
+     `sidecar.rs:10-18`). The new rule keeps that for the pack index's unlisted row, which is still
+     written only after the list. A sidecar may now be stored before its list for as long as one PUT
+     takes.
+   - A list whose PUT fails leaves its sidecar behind. No job was given that list. The sidecar is
+     named by the list's id, so a later write of the same list makes it valid again; otherwise it is
+     an object nothing names, as a pack whose record failed is today. The
+     two module docs change with the code (P10).
+   - A sidecar's failure still never fails the list (`listing.rs:404-411`).
+3. **The order is unchanged.** Blobs, then the list and its sidecar, then `SubmitJob`. The guard
+   `every_attempt_submits_its_job_only_once_its_tree_is_stored` (`executor/run_tree_tests.rs:38`)
+   covers the provider form too.
 
-**kbf** (komira-ai/kbf):
+**tierstore** (item 1c): mapped tree lists under a budget (section 4.6).
+- `image_of` (`placed.rs:306-316`) maps the image file instead of `read_image` (`placed.rs:92`).
+- `TreeImage` reads its records from a mapping through a record reader over `vm-memory`, which copies
+  each record out with no `unsafe`, as `tierstore-tree` does (`crates/tierstore-tree/src/image.rs:95-135`).
+  The heap backing stays for tests and for a host that cannot map.
+- `TreeImage::checked` still walks the whole list once at attach, so a damaged list is refused there,
+  not in a running job.
+- **No second hash.** `Prepare` refuses a list unless its hash is the key's (`prepare.rs`, `image_v2`),
+  and the whole-object fill does the same (`server/local_cache/fill.rs:807-852`). The image is not
+  hashed again at attach (the doc of `image_of`).
 
-1. **A third form, `--executor-input-tree list`** (`executor/config.rs:31-42`,
-   `frontend/executor_flags.rs:391-402`). The tree is written as one tree list, and the job's layer is
-   the host path `<mp>/trees/<sha256 of the list>` (`executor/out.rs:102-108`, chosen at
-   `executor/submit.rs:388-391`). This is a new accepted value of a CLI flag, so that pull request is
-   an interface change.
-2. **No L2 sidecar for this form.** The sidecar serves the mount provider's per-cell checks
-   (`docs/deploy/kbf-modes.md:309-312`). The fs checks each blob it fills against the list's SHA-256 of
-   that file, as it does against a manifest's. So the list form writes blobs, then the list, and
-   nothing after it (`action_tree/listing.rs:381-389` writes the sidecar after the list today).
-3. **The base encoded once.** `tstree::encode` walks the listed base for every tree today
-   (`listing.rs:1-14`), and the list form has no per-directory memo: only the `(action, form)` memo of
-   600 s (`executor/front.rs:784-785`). The base's records, names and keys should be encoded once per
-   frontend and only the input's records appended per tree.
-   - Measured, the per-job join of 2026-11-25, over starts of at most 5 s: the executor's `start_ms` of
-     a Mac job, which always uses the list form, was 184 ms at the p50 (n = 2,229), against 124 ms for a
-     Linux job of the manifest form (n = 9,146). The forms differ in more than the encode, so this bounds
-     it rather than measures it.
-   - The stage timers `tree_list` and `tree_sidecar` exist (`executor/steps.rs:42`, `:124-125`). No
-     scrape of them was kept, so how the 60 ms splits is not known. Item 0 reads them before this
-     change is sized.
-4. **The fallback.** The next attempt of a list-form run that failed `input-unavailable` uses the
-   manifest form (section 4.7).
-5. **The order is unchanged.** Blobs, then the list. `named` comes before the writes, and the submit
-   waits for `Ingest::stored`. The guard `every_attempt_submits_its_job_only_once_its_tree_is_stored`
-   (`executor/run_tree_tests.rs:38`) covers the new form too.
-6. **Docs.** `docs/design/actions-as-jobs.md` 4.7 and `docs/deploy/kbf-modes.md:296-312`.
+**Only if item 1a shows the provider's own cost** (item 1d): the host path. `read_tree`
+(`placed.rs:241`) would take a root whose bytes begin with `TSTREE` as a tree list, with no `fill-tree`
+and no `flatten_in_waves`. kbf would get a third form, `--executor-input-tree list`, whose layer is
+`<mp>/trees/<sha256 of the list>` and which needs no sidecar. That keeps the layer a host path and
+skips `Prepare`, the placement and the agent's mount. It is a new accepted flag value and a new name
+form in the fs, so it is built only if 1a shows that the provider adds a cost these remove.
 
-**jobscheduler:** nothing. The layer is still a host path under the agent's allowed `trees` root.
+**jobscheduler:** nothing.
 
-### 4.5 Expected attach and write (inferred)
+### 4.6 The RAM budget for mapped tree lists: `fs.tree_list_ram_bytes`
+
+**Today a list is held twice on the heap.** Both copies are in the one tierstore process that runs the
+fs and the provider:
+- the tree store's copy: `Prepare` hands it the `TreeImage` (`server/provider/prepare.rs:149-158`),
+  which keeps the list's bytes for the placement's life (`Content::Image`,
+  `local_cache/trees/state.rs:42`);
+- the fs's copy: it reads the image file again into a `Vec` (`read_image`, `placed.rs:92`, `:306-316`).
+
+Item 1c replaces both with one read-only mapping of the image file per list, shared by the store and
+the fs, and budgeted once.
+
+**The image file never changes.** It is written beside the walk and renamed into place
+(`local_cache/trees/create.rs:392-416`). The cache never writes, punches or truncates it while a tree
+names it, as `tierstore-tree`'s mapped images also require (`crates/tierstore-tree/src/image.rs:1-8`).
+A file truncated under a mapping would raise `SIGBUS`. Anything that truncates an image in place is
+out of scope, and the store's own code does not.
+
+**The setting.**
+- Name: `tree_list_ram_bytes`, an integer number of bytes in the `fs` interface's params, beside
+  `tree_idle_secs`.
+  - It is read in `server/config_interface.rs:125`, passed on in `server/config_fs.rs:206` and `:238`,
+    and defaulted in `server/treefs/config.rs:93`.
+  - The list of fs params in the config refusal's golden (`server/config_trees_tests.rs:159`) gains
+    it.
+- Default: 536,870,912 (512 MiB). That holds about 1,700 lists of 0.3 MiB or 73 of 7 MiB, enough for
+  a workstation or a small host.
+- A farm's busy build hosts set it to 2 GiB (`tree_list_ram_bytes = 2147483648`).
+- A value under one page (4,096) is refused at start, by name, as other params are.
+
+**What it budgets.**
+- It budgets the mapped bytes of the lists in memory: each list's file length, rounded up to the
+  page, counted once however many of the store and the fs use it.
+- It counts lists only. A manifest tree's heap index is counted as now (`heap_bytes`,
+  `core/memory.rs:84`, `:397`).
+
+**Resident or budgeted.**
+- The pages are budgeted, not locked. A list is mapped read-only and private. The attach's shape walk
+  reads every page once, so a list is resident when its first lookup is answered. No `MAP_POPULATE` is
+  needed, and no `mlock`: locking needs a privilege or a raised `RLIMIT_MEMLOCK` that the `tierstore`
+  user does not have.
+- Under memory pressure the kernel may drop a mapped page. It re-reads it from the image file on the
+  node's disk at the next touch. That costs a page fault, never a wrong answer.
+- A list the local cache evicts while it is mapped keeps its file open until the mapping is released.
+  The budget counts it until then.
+
+**What "held" means.** The code already has two kinds of attachment (`server/treefs/attach.rs:153-160`):
+- a **run attachment** (`has_run`): a run attached the tree through the control socket;
+- an **implicit attachment**: a lookup of `trees/<digest>` attached it (`core/implicit.rs:140-165`).
+  It ends once no request has named the tree for `fs.tree_idle_secs` (900 s by default).
+
+The idle sweep drops a tree only when it has neither, and no request has named it for that long
+(`Core::drop_idle`, `core/memory.rs:417-441`). It does this under the lifecycle lock, and frees the tree
+after the lock is released. Whether a provider placement's tree is run-attached or only implicitly
+attached was not established for this page. The rule below holds either way.
+
+**At the cap.** Before a new list is mapped, the fs releases mappings until the new one fits:
+- **Which lists.** A list is held while it has a run attachment or a request in flight on it. Lists
+  with only an implicit attachment are released, the least recently used first: the one no request
+  has named for longest, by the `used` stamp the idle sweep reads.
+- **How.** A release takes the same steps as the sweep, under the same lock: it ends the implicit
+  attachment, drops the tree from memory and releases its mapping. In effect it is the sweep with a
+  shorter idle bound, the shortest that frees enough.
+- **Releasing is not ending.** Every inode of a tree can be derived from its number (`ino.rs`). A
+  request that names a dropped tree's inode reads the tree again and is answered as before, as after
+  the idle sweep:
+  - a placement's tree through `fills.image` while the placement lives (`placed.rs:246-263`); a
+    running job's placement lives until its job ends;
+  - a placement that has ended is `ENOENT`, as after the sweep (`core/memory.rs:27-30`).
+
+  The cost is a re-read from the node's disk and a shape walk: under 1 ms for a typical list, a few ms
+  for a large one (section 4.7).
+- **A mount never fails for the cap.** If every mapped list is held and the new one still does not
+  fit, it is mapped anyway, past the cap.
+  - It is counted (`tierstore_fs_tree_list_over_cap_total`) and logged as a rate-limited warning:
+    `tree list <digest> mapped past fs.tree_list_ram_bytes: <bytes> of <cap> mapped, every mapped list held`.
+  - The next release a detach allows brings the total back under the cap.
+- **The idle sweep is unchanged.** The cap only makes lists with no run and no request in flight
+  leave earlier when memory is short.
+
+**Observed** (on the fs's report, `server/treefs`):
+
+| metric | kind | what |
+|---|---|---|
+| `tierstore_fs_tree_lists_mapped` | gauge | lists mapped now |
+| `tierstore_fs_tree_list_mapped_bytes` | gauge | their bytes, as budgeted |
+| `tierstore_fs_tree_list_ram_bytes` | gauge | the setting |
+| `tierstore_fs_tree_list_releases_total{why="cap"\|"idle"}` | counter | mappings released, and why |
+| `tierstore_fs_tree_list_over_cap_total` | counter | lists mapped past the cap |
+
+The idle sweep's info line (`say_memory` and `memory_line`, `core/memory.rs:403`, `:441`) gains:
+`tree lists: <n> mapped, <MiB> of <cap MiB>; <k> released for the cap and <i> idle since the last sweep`.
+
+**Checked against the working set.** Sizes in this part are in MiB.
+- **Trees in memory at once.** On the busy evening of 2026-11-25, the most trees any node attached
+  within 960 s was 560-702, depending on the node (measured: tierstore's per-attach line, 18:20-21:10Z,
+  five nodes). A busier window reached about 760. With the 900 s idle sweep, that is about how many
+  trees a node keeps in memory.
+- **Their bytes.** The lists are sized at 0.3 MiB (the 2,800-entry tree of 4.4) to 7 MiB, and about
+  0.6-0.8 MiB for the busy evening's 1,353-manifest trees. 560-760 lists at 0.3-7 MiB each is
+  0.2-5.2 GiB.
+  - 2 GiB holds the whole window while the mean list is under about 2.7 MiB (2,048 MiB / 760).
+  - Above that mean, the cap releases implicitly attached lists before 900 s. That costs a re-read
+    only if a request names one of them again.
+- **Held lists.** Only lists with a run attachment or a request in flight are held. 2 GiB is passed
+  only if those add up to more than 2 GiB: for example more than 292 such lists of 7 MiB, or more than
+  3,400 of 0.6 MiB. How many jobs a host runs at once was not measured; it is bounded by its cores,
+  not by its tree count.
+
+**Tests that fail before.** These run on the fs's rigs, on the core's injected clock. The clock is
+advanced between uses, so the use stamps never tie.
+- `a_list_past_the_cap_releases_the_least_recently_used_list_with_no_run_and_no_request`;
+- `a_list_a_run_attached_is_never_released_for_the_cap`;
+- `a_list_with_a_request_in_flight_is_never_released_for_the_cap`;
+- `a_mount_past_the_cap_with_every_list_held_still_attaches_and_is_counted`;
+- `a_released_list_is_read_again_by_the_next_request_under_its_tree_number`;
+- `a_released_placement_tree_whose_placement_ended_is_enoent`;
+- `the_store_and_the_fs_share_one_mapping_of_a_list_and_it_is_budgeted_once`;
+- `a_mapped_list_answers_entry_child_children_mode_and_links_as_the_heap_image_does`, on a large
+  generated tree;
+- `bytes_damaged_after_the_map_read_as_absent_not_a_panic`;
+- config: `tree_list_ram_bytes_defaults_to_512_mib`, `tree_list_ram_bytes_reads_2_gib`,
+  `tree_list_ram_bytes_under_a_page_is_refused_by_name`, and the fs-params golden;
+- the report: each metric moves as the cases above say.
+
+### 4.7 Expected attach and write (inferred)
 
 Attach of a list not yet on the node, which is every attach: a list is unique to its action, and 3,919
-of 3,925 morning attaches were the first of their digest on their node (measured).
+of 3,925 morning attaches were the first of their digest on their node (measured). The sum below is for
+the list itself; the provider form adds what `Prepare`, the placement and the agent's mount cost, which
+item 1a measures.
 
 | term | basis | 0.3 MB | 3 MB | 7 MB |
 |---|---|---|---|---|
 | one whole-object fill: a round trip to the store | the frontend's own GET p50 to the store, 3.9 ms (measured, all sizes; the node's fill path was not timed) | 4 | 4 | 4 |
 | transfer at 1-10 Gbit/s | not measured | 0.3-2.4 | 2.4-24 | 5.6-56 |
 | SHA-256 during the fill, on a node without SHA extensions | 5.5 ms/MB (measured, tierstore `tree-manifest.md`) | 1.7 | 17 | 39 |
-| read into one buffer, then the shape walk | 0.76 ms/MB walk (measured, same doc) | 0.3 | 2.5 | 5.5 |
+| the image written and mapped, then the shape walk | 0.76 ms/MB walk (measured, same doc) | 0.3 | 2.5 | 5.5 |
 | tree number and keep | | under 1 | under 1 | under 1 |
 | **attach** | | **about 7-10 ms** | **about 25-50 ms** | **about 55-105 ms** |
 
@@ -483,8 +681,8 @@ of 3,925 morning attaches were the first of their digest on their node (measured
   evening, for trees of 1,353 manifests (measured). The evening's trees are about 7,500 entries, a list
   of about 0.6-0.8 MB, so about 10-15 ms by the same sum (inferred).
 - **The saving** is about 65 ms at the p50 on the light morning and about 200 ms on the busy evening,
-  comparing like sizes. Both assume that host load slows the list's few steps less than it slows
-  parsing hundreds of manifests. That assumption is what item 1's measurement checks.
+  comparing like sizes, less what the provider form adds. Both assume that host load slows the list's
+  few steps less than it slows parsing hundreds of manifests. Item 1a's measurement checks that.
 - **Very large trees.** A 7 MB list (about 90,000 entries) is about 55-105 ms. The manifest path of a
   tree that size was not measured on the farm; the workstation's 52 ms for 31,000 entries, times the
   seven of 4.1, suggests several hundred ms (inferred).
@@ -493,79 +691,80 @@ of 3,925 morning attaches were the first of their digest on their node (measured
 - **The local work** on a workstation (scratch, measured, `sha2` with SHA extensions): read, hash and
   walk of a 0.22 MB list took 0.10 ms, against 4.0 ms for the same 2,800 entries as manifests. For
   31,000 entries it was 1.1 ms against 52 ms.
-- **Mapping instead of reading whole** saved 3 µs on the 0.22 MB list and 83 µs on the 2.4 MB list
-  (scratch, measured); a 7 MB list would save about 0.25 ms at the same rate (inferred). The gain is
-  one object and no parse. A mapped backing is item 7. It saves memory more than time, and it waits
-  until a host measurement shows the memory matters.
+- **What mapping saves.** Against reading the file whole, mapping saved 3 µs on the 0.22 MB list and
+  83 µs on the 2.4 MB list (scratch, measured), about 0.25 ms at 7 MB (inferred). The time gain is one
+  object and no parse. Mapping is for memory: it replaces a heap copy of every list in memory with
+  pages the kernel may drop and re-read, under the budget of 4.6.
 
 The write, on kbf's side:
 - **Today** it is two serial stages, 35-48 ms at the p50 (`tree_manifests` + `tree_root`, measured).
-- **With the list form** it is one PUT. Take it as the root's lone PUT (13-17 ms) plus the body:
-  0.3 MB at 1-10 Gbit/s is 0.3-2.4 ms. So about 15-20 ms, a saving of about 20-30 ms (inferred).
-- **This holds only if the encode is cheap** (kbf change 3), and less if item 3 removes the slot wait
-  first.
+- **With the list and its sidecar beside it** (item 1b) it is one round of PUTs. Take it as the root's
+  lone PUT (13-17 ms) plus the body: 0.3 MB at 1-10 Gbit/s is 0.3-2.4 ms. So about 15-20 ms, a saving
+  of about 20-30 ms (inferred).
+- **This holds only if the encode is cheap** (item 1b), and less if item 3 removes the slot wait first.
 
-### 4.6 What is lost
+### 4.8 What is lost
 
 - **Per-directory dedup across trees.**
   - Today a directory unchanged since another tree is written once (kbf's memo) and fetched once per
     node (98% of manifests came from the node's cache, measured).
-  - With one file per action, every start writes and fetches its whole list. That is 0.2-3 MB where
-    today it is about 14 small manifests.
-- **Why it does not matter for time.** One fill of 0.3 MB costs one round trip and a few ms of
-  transfer. The 14 fills it replaces cost a round trip per level, on top of reading every cached
-  manifest. Section 4.5 counts the transfer, and the list wins at the tree sizes measured on the farm
-  (372 and 1,353 manifests at the p50).
-- **What it costs in bytes (inferred).**
-  - At the morning's rate of about 5,600 starts an hour (12,974 Executes in 2 h 19 min, measured) and
-    0.3 MB a list, that is about 1.7 GB an hour, about 40 GB a day, written once and read once.
-  - Nothing deletes `cas/l/` today (`docs/design/actions-as-jobs.md:379`). So the list form needs a
-    retention rule, which manifests could do without because they dedup.
+  - With one file per action, every start writes and fetches its whole list: 0.3-7 MB where today it
+    is about 14 small manifests.
+- **Why it does not matter at 0.3-7 MB.**
+  - **Time.** One fill of 0.6 MB costs one round trip and under 5 ms of transfer at 1 Gbit/s. The 14
+    fills it replaces cost a round trip per level, on top of reading every cached manifest. Even a
+    7 MB list's whole attach (55-105 ms, 4.7) is under what the busy evening's attach takes today for
+    trees whose list would be about 0.7 MB (215 ms at the p50).
+  - **Memory.** The node's cache is no longer shared between trees. But the budget of 4.6 bounds what
+    the mapped lists hold, and the manifest trees' heap index (about 100 bytes and an allocation or two per
+    entry) is no longer built.
+  - **Bytes (inferred).** At the morning's rate of about 5,600 starts an hour (12,974 Executes in
+    2 h 19 min, measured) and 0.6-7 MB a list, that is about 3.4-39 GB an hour (1.7 GB at 0.3 MB), written once and read
+    once. That is small against a node's network link: one 10 Gbit/s link moves 4.5 TB an hour.
+- **What it does need: a retention rule.** Nothing deletes `cas/l/` today
+  (`docs/design/actions-as-jobs.md:379`). Manifests could do without because they dedup; lists cannot.
   - A list is needed while its jobs can still start: the 600 s memo plus resubmits. A collector that
-    removes lists older than a day, which no job names, is enough. It is not part of item 1's first
-    pull request. It must land before the list form is the default on every frontend.
+    removes lists older than a day, which no job names, is enough.
+  - It is item 1e. It must land before the provider form is the default on every frontend.
 - **The base tree is repeated in every list.** A shared base file plus a per-action delta would win
   back those bytes. But that is two objects, a new format (B8) and an ordering between them, so this
   page does not propose it.
 
-### 4.7 Rollout and older releases
+### 4.9 Rollout and older releases
 
 - **B8.** The tree list v2 does not change. Its golden (tierstore `tests/stored_formats/tree_list_v2.rs`)
-  must stay byte-identical, and that test is the evidence. What is new is a reader that accepts an
-  existing record at an existing name.
-- **An older tierstore** answers `EIO` for a list under `trees/`, with its rate-limited warning:
-  `parse_manifest` refuses the bytes. It never answers a wrong tree. The start fails
-  `input-unavailable`, which kbf takes as `infra` (`executor/outcome.rs:488-490`) and runs again. That
-  spends one of the operation's resubmits (`RESUBMITS` = 2, `outcome.rs:153`), and the next attempt
-  may land on an older host again.
-- **So the list form falls back.** An attempt of the list form that fails `input-unavailable` runs its
-  next attempt in the manifest form, as the provider form's miss path reads a refused list as
-  manifests (`Ingest::list_refused`, `executor/outcome.rs:105-112`, `executor/front_miss.rs`). The
-  provider form's refusal spends no attempt, because the host names the list in its refusal; an
-  older fs's `EIO` reaches kbf only as `input-unavailable`, so this fallback spends one. A run
-  therefore spends at most one attempt on an older host.
+  must stay byte-identical, and that test is the evidence. The mapped backing reads the same bytes.
+- **The provider form is already in production** for every Mac job, and the Linux hosts have the
+  provider configured (4.3). Moving Linux to it changes no format and no interface.
 - **The order of adoption.**
-  1. tierstore with the change of section 6, item 1, on every Linux host.
-  2. Then `--executor-input-tree list` on one frontend lane, measured against the other.
-  3. Then the default.
+  1. Item 0's timers.
+  2. An operator checks step 4 of 4.3.
+  3. Item 1a: `executor-input-tree = "provider"` on one frontend lane, measured against the other, with
+     the hosts' tierstore memory watched. This needs no code, so it comes first and sizes the rest.
+  4. Items 1b and 1c, in either order, each measured on that lane.
+  5. Item 1d only if step 3 or 4 shows a cost of the provider that it removes.
+  6. Item 1e, the collector.
+  7. Then the default.
 
   Turning the flag back to `manifests` restores today's behaviour for the next run.
-- **Failure cases of the list form:**
+- **Failure cases of the provider form on Linux:**
 
 | case | what happens |
 |---|---|
-| the list write fails | no job is submitted, as today (`run.rs:452-454`) |
+| the list or sidecar write fails | no job is submitted, as today (`run.rs:452-454`) |
 | a blob is lost before the list is written | MISSING, as today |
-| the list is absent at the attach (lost from the store) | the fill answers `upstream 404`, the lookup `ENOENT` at once, as for an absent root today |
-| the list is damaged (its hash is wrong) | the fill refuses it (`fill.rs:852`), and the lookup is `EIO` |
-| the list's bytes pass the hash but not the shape walk | `EIO`, and no tree number is taken |
+| a host without the capability | the job is never placed there; other hosts take it |
+| a host's tierstore refuses the list (`tree list not supported`, `ListVersionUnsupported`) | the next run reads the tree as manifests, and no attempt is spent (`outcome.rs:105-112`) |
+| the list is absent at `Prepare` | `no tree list at <key>` (`prepare.rs:265`), refused as above |
+| the list is damaged (its hash is wrong) | `Prepare` refuses it (`image_v2`) |
+| a mapped page is dropped under memory pressure | it is read again from the image file at the next touch |
+| the budget is full and every list is held | the list is mapped past the cap, counted and logged (4.6) |
 | a file's blob is lost after the attach | the running job's read fails as it does today with manifests |
-| an older tierstore on the host | `EIO`, `input-unavailable`; the next attempt uses the manifest form (above) |
 
 ## 5. What this does not change
 
 - **The order.** Blobs, then the tree's last object, then `SubmitJob`. The guard test stays.
-- **The Mac form.** Macs keep the mount provider. kbf change 3 makes their list cheaper too.
+- **The Mac form.** Macs keep the mount provider. Items 1b and 1c make their lists cheaper too.
 - **The agent's lookup pool and lifecycle worker** (komira-ai/jobscheduler#1068). The attach's queue
   time on the host is separate work.
 - **The REAPI part of the start** before the executor (the walk, the input checks).
@@ -595,38 +794,73 @@ on today's code. No test asserts timing (T10): waits are shown with gates and ex
 
 ### 1. One tree file per action on Linux
 
-- **Pull requests:** tierstore 4.4 items 1-3, then kbf 4.4 items 1-2, then kbf 4.4 item 3.
-- **Saves:** attach about 65 ms (light) to 200 ms (busy), tree write 20-30 ms (p50, inferred).
+**1a. The provider form on one Linux lane** (configuration; an operator's step)
+- **Change:** step 4 of 4.3 checked, then `executor-input-tree = "provider"` on one frontend lane. No
+  code. It can come first, as the measurement that sizes 1b-1d.
+- **Saves:** attach about 65 ms (light) to 200 ms (busy), less what `Prepare`, the placement and the
+  agent's mount add, which nothing has measured on Linux. The tree write: 35-48 ms today against about
+  15-20 ms for the list and its sidecar at once, so 15-33 ms, once 1b is in; before 1b, the sidecar's
+  serial PUT keeps two stages (p50, inferred).
+- **Fails before:** not a code change, so no new test. What it relies on holds today and keeps holding:
+  - the miss path's tests (`executor/front_miss.rs`): a refused list is read as manifests next and
+    spends no attempt;
+  - the order guard `every_attempt_submits_its_job_only_once_its_tree_is_stored` in the provider form.
+- **Measured after,** one lane against the other, 30 minutes light and 30 of burst:
+  - the agent's `Started` line from `taken` to `resolved`, and tierstore's `Prepare` time;
+  - tierstore's resident memory on the lane's hosts;
+  - kbf's `tree_list`, `tree_sidecar` and phase `start`;
+  - `list-refused` and `input-unavailable` by attempt;
+  - the fs's resident memory.
+
+**1b. kbf: the base encoded once, and the sidecar beside the list** (4.5)
+- **Saves:** the base encode and the sidecar's serial stage (`tree_sidecar`, which item 0 reads).
+  Together they are at most the 60 ms the list form adds at kbf at the p50 (measured as a bound).
+- **Fails before:**
+  - `the_base_is_encoded_once_for_many_trees`: an encoder that counts the base records it encodes,
+    over two trees of one base;
+  - `the_sidecar_put_is_in_flight_beside_the_lists_put`: a store whose two PUTs are gated by explicit
+    events. Both must be in flight before either is released, and `write_listing` must return only once
+    both have ended. Today the sidecar starts after the list's PUT returns (`listing.rs:381-389`);
+  - `an_unlisted_row_is_recorded_only_after_the_list_is_stored`, which holds today and keeps holding;
+  - `a_list_whose_put_fails_fails_the_tree_and_no_job_is_submitted`.
+- **Measured after:** `tree_list` and `tree_sidecar` against 1a's numbers.
+
+**1c. tierstore: mapped tree lists under `fs.tree_list_ram_bytes`** (4.5, 4.6)
+- **Saves:** the two heap copies of every list in memory, the tree store's and the fs's (each
+  0.2-5.2 GiB on a busy host at 0.3-7 MiB a list, inferred), and 0.003-0.25 ms per attach.
+- **Fails before:** the tests of 4.6.
+- **Holds today and keeps holding:** the v2 golden, and every placement-image test with the heap
+  backing.
+- **Measured after:** the metrics of 4.6 on a busy host, and the attach's time by list size.
+
+**1d. Only if 1a shows the provider's own cost: `trees/<list digest>` read as a tree list** (4.5)
+- **Saves:** what 1a measures `Prepare`, the placement, the agent's mount and the sidecar to cost.
 - **Fails before**, tierstore (rigs of `core/placed_image_tests.rs` and `core/tree_fill_tests.rs`):
   - `a_tree_list_at_trees_digest_is_attached_from_one_fill`: one whole fill, no `fill-tree`, no
     manifest read, and the entries by index equal the image's. Today it is `EIO`, because
-    `parse_manifest` refuses the list.
-  - `a_tree_list_that_fails_its_shape_walk_is_eio_and_takes_no_number`.
+    `parse_manifest` refuses the list;
+  - `a_tree_list_that_fails_its_shape_walk_is_eio_and_takes_no_number`;
   - `fill_tree_stops_at_a_root_that_is_a_tree_list`.
-- **Holds today and keeps holding:**
-  - `a_digest_the_upstream_has_no_tree_of_is_not_there_and_takes_no_number` (absent means `ENOENT`
-    at once);
-  - the v2 golden;
-  - every manifest-form test.
-- **Across releases (B8)**, both directions:
-  - the new reader on old data: `a_manifest_root_at_trees_digest_takes_the_manifest_path`, a JSON root
-    read exactly as today, with the same entries;
-  - the old reader on new data: `a_tree_list_given_to_the_manifest_reader_is_refused_not_misread`, run
-    on today's `read_tree` before the change lands, asserts `EIO` and no tree number. It holds today,
-    and it pins what an older host does with the new form;
-  - kbf: `a_list_attempt_that_fails_input_unavailable_runs_its_next_attempt_as_manifests`.
-- **Fails before**, kbf:
-  - `the_list_form_gives_the_job_trees_slash_the_lists_digest`: the layer is
-    `<mp>/trees/<sha256 of the list>`.
-  - `the_list_form_writes_its_blobs_then_one_list_and_no_sidecar`: a store that records the order of
-    its writes.
-  - `the_base_is_encoded_once_for_many_trees`: an encoder that counts base records encoded.
-  - With the form on, `every_attempt_submits_its_job_only_once_its_tree_is_stored`.
-- **Measured after:**
-  - tierstore's per-attach line for list trees, `ok in <ms>`, by list size;
-  - kbf's `tree_list` and phase `start`;
-  - `input-unavailable` by attempt, which stays at zero for attempt 0;
-  - one lane against the other.
+- **Across releases (B8),** both directions:
+  - the new reader on old data: `a_manifest_root_at_trees_digest_takes_the_manifest_path`;
+  - the old reader on new data: `a_tree_list_given_to_the_manifest_reader_is_refused_not_misread`.
+    It runs on today's `read_tree`, asserts `EIO` and no tree number, and pins what an older host does
+    with the new name form;
+  - kbf: `a_list_attempt_that_fails_input_unavailable_runs_its_next_attempt_as_manifests`. An older
+    fs answers `EIO`, which reaches kbf only as `input-unavailable`, so this fallback spends one
+    attempt of `RESUBMITS` (`outcome.rs:153`).
+- **Fails before**, kbf: `the_list_form_gives_the_job_trees_slash_the_lists_digest`, and
+  `the_list_form_writes_its_blobs_then_one_list_and_no_sidecar`.
+- **Measured after:** as 1a, the third lane against the provider lane.
+
+**1e. kbf: a collector for tree lists no job names** (4.8)
+- **Change:** a sweep that deletes `cas/l/<id>` lists, and their `cas/l2/<id>` sidecars, older than a
+  day that no operation's row names. It is dry run by default and reports a count of what it would
+  delete.
+- **Saves:** no time; it bounds the bytes the lists add.
+- **Fails before:** `a_list_older_than_a_day_that_no_operation_names_is_deleted_with_its_sidecar`,
+  `a_list_an_open_operation_names_is_kept_whatever_its_age`, and `a_dry_run_deletes_nothing_and_counts`.
+- **Measured after:** lists and bytes under `cas/l/`, by day.
 
 ### 2. `SubmitJob` answers before `note_inserted`
 
@@ -677,18 +911,6 @@ on today's code. No test asserts timing (T10): waits are shown with gates and ex
   identical to today's (a golden). The conflict path still answers `job-id-conflict`.
 - **Measured after:** the transaction phase.
 
-### 7. A mapped backing for the tree file
-
-- **Change:** `tree_image.rs`. A record reader over a `vm-memory` mapping, which copies records out with
-  no `unsafe`, as `tierstore-tree` does.
-- **Saves:** about 0.1 ms per attach at 2.4 MB (scratch), and the heap copy of each attached list.
-  It waits until a host measurement shows the memory matters.
-- **Fails before:**
-  - on a large generated tree, the mapped backing answers `entry`, `child`, `children`, `mode` and
-    `links` exactly as the heap image does;
-  - bytes damaged after the open read as absent, never a panic.
-- **Measured after:** resident memory of the fs with N trees attached.
-
 ### Not proposed
 
 | change | why not |
@@ -696,20 +918,31 @@ on today's code. No test asserts timing (T10): waits are shown with gates and ex
 | submitting before the tree is stored (komira-ai/kbf#2431) | it reorders the write and the submit |
 | `synchronous_commit` off for the submit | it breaks the store's rule C6, for about 0.9 ms (section 3.4) |
 | a wider manifest window (16 to 32), or a tierstore verb for many manifests in one request | item 1 removes the many manifests |
-| the mount provider form on Linux | it needs the agent's provider, the L2 sidecar and a second PUT. The host path form keeps the layer contract and needs neither |
+| locking mapped lists in RAM (`mlock`, `MAP_LOCKED`) | it needs a privilege the `tierstore` user does not have, and a dropped page costs only a fault (4.6) |
 
 ## 7. Decisions
 
-- **D1. The host path form, not the provider form, for Linux.** It is one branch in tierstore's
-  `read_tree` and a layer kbf already builds. It needs no change to the agent, its configuration or
-  jobscheduler, and no sidecar PUT after the list.
-- **D2. No L2 sidecar for the list form.** The fs checks every blob it fills against the SHA-256 in
-  the list, as it does against a manifest. The sidecar serves the mount provider, which this form does
-  not use.
+- **D1. The provider form first on Linux; the host-path list form only if it is measured to pay.** The
+  provider form is in production for every Mac job, and the Linux hosts have it configured (4.3). So
+  moving Linux to it is configuration, and its cost can be measured on one lane before any code. The
+  host-path form would skip `Prepare`, the placement and the sidecar. But it is a new name form and a
+  new flag value, so it waits for a measurement that shows a cost it removes.
+- **D2. The sidecar stays, beside the list.** The provider needs it before the submit. Writing it
+  beside the list removes the second serial PUT and keeps the pack index's unlisted row after the list.
 - **D3. No second hash at attach.** The fill checks the object against its key as it lands. A
   placement's image is not hashed again at attach either.
-- **D4. A heap buffer first, mapping later.** Mapping saved 83 µs at 2.4 MB (scratch), about 0.25 ms
-  at 7 MB (inferred). The crate forbids `unsafe`, so mapping needs the `vm-memory` refactor of item 7.
+- **D4. Lists are mapped, under a budget, with no `unsafe`.** Mapping saves little time (83 µs at
+  2.4 MB, scratch), but it replaces the two heap copies of every list in memory (the tree store's and the fs's) with one
+  mapping whose pages the kernel may drop.
+  The crate forbids `unsafe`, so the mapping goes through `vm-memory`, which copies each record out, as
+  `tierstore-tree` does.
+- **D4a. The budget's default is 512 MiB; a farm's busy hosts set 2 GiB.** The default suits a small
+  host. 2 GiB holds the busiest measured 900 s of trees while lists average under about 2.7 MiB (4.6).
+- **D4b. The pages are budgeted, not locked.** Locking needs a privilege the `tierstore` user lacks. The
+  attach's shape walk already brings every page in once.
+- **D4c. A mount never fails for the budget.** When every mapped list is held (a run attachment or a
+  request in flight), the new one is mapped past the cap and counted, because a refused mount would fail a job that has a host and a
+  tree.
 - **D5. `synchronous_commit` stays on.** See section 3.4.
 - **D6. EXPLAIN on a scratch copy with synthetic rows, not a replica.** No read-only replica of the
   job store was available. The schema is the code's own, and the row counts are twice the farm's
@@ -718,9 +951,9 @@ on today's code. No test asserts timing (T10): waits are shown with gates and ex
 - **D7. A tree's "about 500 manifests" is the host's count of the whole tree.** kbf writes only the
   directories it has not stored. The page uses the attach line's counts, which are per tree and per
   node.
-- **D8. A list-form attempt that fails `input-unavailable` falls back to manifests.** The job service
-  cannot place by tierstore release, so the fallback bounds what an older host costs a run to one
-  attempt, as the provider form's miss path does.
+- **D8. (1d only) A list-form attempt that fails `input-unavailable` falls back to manifests.** The
+  job service cannot place by tierstore release, so the fallback bounds what an older host costs a run
+  to one attempt.
 
 ## 8. What was not measured, and why
 
@@ -733,4 +966,7 @@ on today's code. No test asserts timing (T10): waits are shown with gates and ex
 | the farm's tierstore write route (entries or marks) | it is configuration, not code |
 | the size of real tree lists on the farm, and the base tree's entry count | the Mac lists were not sampled |
 | SHA extensions on the farm's Linux hosts | taken as absent, the slower case |
-| the network rate for a multi-MB fill | given as a range in 4.5 |
+| the network rate for a multi-MB fill | given as a range in 4.7 |
+| `Prepare`, the placement and the agent's mount on Linux | no Linux job has run in the provider form; the Macs' agent logs were not in the join (item 1a) |
+| step 4 of 4.3, each agent's capability | the job service's list of agents needs an operator's token |
+| how many jobs a host runs at once, and so how many lists are held | not in the per-attach line |
