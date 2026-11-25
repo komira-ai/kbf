@@ -90,7 +90,8 @@ state database is brought to the schema this `kbf` needs by the frontend itself 
 a container needs no step beforehand. The packaged units also run `kbf boot-check --mode=frontend`
 before the start ([kbf-units.md](kbf-units.md)), the same step; to run it by hand, use the image
 with the entrypoint replaced (`/usr/bin/kbf boot-check --mode=frontend --installer-config <file>`),
-which reads the `database` key of that `installer.toml` and refuses a URL that carries a password.
+which reads the `database` key of that `installer.toml` and refuses a URL that carries a password
+(the password of a server that asks for one is in the file `database_password_file` names).
 
 ## The coordinator
 

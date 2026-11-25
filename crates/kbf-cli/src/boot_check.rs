@@ -13,8 +13,11 @@
 //! Where the database is: the `database` key of `installer.toml`
 //! ([`DEFAULT_INSTALLER_CONFIG`], or `--installer-config`), a `postgres://` URL
 //! (`postgres:///kbf?host=/run/postgresql`). The file is world-readable, so a URL that carries
-//! a password is refused; peer authentication needs none. Only that one key is read. No
-//! message quotes the URL, and a server's refusal of the connection is reduced to its SQLSTATE.
+//! a password is refused; peer authentication needs none, and a server reached with a password
+//! takes it from the file the `database_password_file` key names, else PGPASSWORD, else
+//! `~/.pgpass` (`kbf_setup::database::installer_database` reads the two keys, as the installer
+//! does). No message quotes the URL, and a server's refusal of the connection is reduced to its
+//! SQLSTATE.
 //!
 //! The migrations are the ones embedded in this build, expand steps only. The step waits at
 //! most [`kbf_state::postgres::boot::LOCK_WAIT`] for any lock, and a busy schema is a refusal.
@@ -26,7 +29,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Arg, Command};
-use kbf_state::postgres::PostgresConfig;
 use kbf_state::postgres::boot::BootStep;
 
 use crate::names;
@@ -91,29 +93,27 @@ pub fn migrate_before_start<S: SchemaStep>(
 ///
 /// # Errors
 /// One line saying why the database cannot be reached from the file: it cannot be read, is
-/// not TOML, or its `database` URL is unusable or carries a password. Never the URL.
+/// not TOML, its `database` URL is unusable or carries a password, or the password cannot be
+/// had. Never the URL.
 pub fn database_of(path: &Path) -> Result<Option<BootStep>, String> {
     let shown = path.display().to_string();
     let text = std::fs::read_to_string(path).map_err(|e| format!("{shown}: {}", e.kind()))?;
-    database_in(&shown, &text)
+    database_in(&shown, &text, &kbf_pg_auth::Context::of_process())
 }
 
-/// [`database_of`] over text already read from the file named `shown`.
-fn database_in(shown: &str, text: &str) -> Result<Option<BootStep>, String> {
-    let table: toml::Table = text
-        .parse()
-        .map_err(|_| format!("{shown} is not valid TOML"))?;
-    let Some(url) = table.get("database").and_then(toml::Value::as_str) else {
-        return Ok(None);
-    };
-    let config = PostgresConfig::parse(url)
-        .map_err(|why| format!("the `database` URL in {shown} is not usable: {why}"))?;
-    if config.has_password() {
-        return Err(format!(
-            "the `database` URL in {shown} carries a password; use peer authentication"
-        ));
+/// [`database_of`] over text already read from the file named `shown`, with the password
+/// sources of `context`.
+fn database_in(
+    shown: &str,
+    text: &str,
+    context: &kbf_pg_auth::Context,
+) -> Result<Option<BootStep>, String> {
+    let found =
+        kbf_setup::database::installer_database(shown, text, context).map_err(|e| e.to_string())?;
+    if let Some(skipped) = found.as_ref().and_then(|found| found.skipped.as_ref()) {
+        eprintln!("kbf boot-check: warning: {skipped}");
     }
-    Ok(Some(kbf_pack_index::schema::boot_step(config)))
+    Ok(found.map(|found| kbf_pack_index::schema::boot_step(found.config)))
 }
 
 /// A parsed `kbf boot-check` command line.
@@ -154,7 +154,9 @@ pub fn command() -> Command {
                 .default_value(DEFAULT_INSTALLER_CONFIG)
                 .help(
                     "The installer.toml whose `database` key is the state database \
-                     (a postgres:// URL with no password)",
+                     (a postgres:// URL with no password; its password, if the server asks \
+                     for one, is in the file `database_password_file` names, PGPASSWORD or \
+                     ~/.pgpass)",
                 ),
         )
 }

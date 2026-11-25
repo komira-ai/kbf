@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use js_proto::v1::{JobSpec, Needs, NetworkLevel};
+use kbf_front::DecodedAction;
 use kbf_proto::reapi::Digest;
 use ring::digest::{SHA256, digest};
 use tokio::time::Instant;
@@ -49,7 +50,6 @@ use crate::executor::metrics::Metrics;
 use crate::executor::out::{PutDirRoots, TASK_IN_TREE, provider_layer};
 use crate::executor::outcome::Settled;
 use crate::executor::size_class::{SIZE_CLASS_LABEL, SIZE_FALLBACK_LABEL, SizeClass};
-use crate::executor::steps::Step;
 use crate::executor::task::{PackKey, RunId, build_id, put_dir_argv};
 use crate::executor::traits::{InputsError, MintError};
 use crate::executor::{Ingest, Inputs};
@@ -88,6 +88,9 @@ pub(super) struct Prepared {
     /// The action's timeout, or the executor's default when it names none: the deadline a
     /// refused start is placed again within ([`super::refused`]).
     pub(super) timeout: Duration,
+    /// The form the job's action tree was written in: what the steps after the preparation are
+    /// labelled with ([`crate::executor::steps`]).
+    pub(super) form: InputTree,
 }
 
 impl From<InputsError> for Settled {
@@ -175,16 +178,18 @@ pub(super) struct Preparer<'a> {
     pub(super) metrics: &'a Metrics,
 }
 
-/// The job of `run`, which runs `action` with `booking`, with its put directory.
+/// The job of `run`, which runs `action` with `booking`, with its put directory: `action`'s
+/// facts and closure from `decoded`, the Action and Command its Execute decoded, when there are
+/// any, else from the CAS.
 pub(super) async fn prepare(
     ctx: &Preparer<'_>,
     run: RunId,
-    action: &Digest,
+    (action, decoded): (&Digest, Option<&DecodedAction>),
     booking: Booking,
 ) -> Result<Prepared, Settled> {
     let started = Instant::now();
-    let facts = ctx.inputs.action(action).await;
-    ctx.metrics.step_took(Step::Facts, started.elapsed());
+    let facts = ctx.inputs.action(action, decoded).await;
+    ctx.metrics.facts_took(started.elapsed());
     let facts = facts?;
     let class = &facts.size_class;
     let timeout = facts.timeout.unwrap_or(ctx.cfg.default_timeout);
@@ -195,6 +200,7 @@ pub(super) async fn prepare(
     let wall = ctx.cfg.wall(timeout);
     if let System::Macos { os_version } = facts.system {
         let times = (timeout, wall);
+        let action = (action, decoded);
         return prepare_mac(ctx, run, action, booking, times, os_version, class).await;
     }
     let Some(roots) = &ctx.cfg.task_out else {
@@ -208,7 +214,7 @@ pub(super) async fn prepare(
     // Asked once: the frontend's miss path may have taken the action to manifests, and the mint
     // and the layer must agree on the form.
     let form = ctx.ingest.input_tree(action, ctx.cfg.input_tree);
-    let key = minted(ctx, run, action, wall, form).await?;
+    let key = minted(ctx, run, (action, decoded), wall, form).await?;
     let tree = ctx.inputs.tree(run).await?;
     let job = PutDirJob {
         roots,
@@ -217,7 +223,12 @@ pub(super) async fn prepare(
         form,
     };
     let spec = put_dir_spec(ctx, &job, run, action, (timeout, wall), (booking, class));
-    Ok(Prepared { spec, key, timeout })
+    Ok(Prepared {
+        spec,
+        key,
+        timeout,
+        form,
+    })
 }
 
 /// The refusal of a run of `what` when the executor was given no roots for the put directories.
@@ -235,7 +246,7 @@ fn no_roots(what: &str) -> Settled {
 async fn prepare_mac(
     ctx: &Preparer<'_>,
     run: RunId,
-    action: &Digest,
+    (action, decoded): (&Digest, Option<&DecodedAction>),
     booking: Booking,
     (timeout, wall): (Duration, Duration),
     os_version: Option<u32>,
@@ -260,7 +271,7 @@ async fn prepare_mac(
     };
     // A Mac has no host directory of manifests: its tree is always its tree list, which
     // tierstore's provider answers with the tree on its NFS loopback mount.
-    let key = minted(ctx, run, action, wall, InputTree::Provider).await?;
+    let key = minted(ctx, run, (action, decoded), wall, InputTree::Provider).await?;
     let tree = ctx.inputs.tree(run).await?;
     let spec = mac_spec(MacJob {
         job_id: job_id(&ctx.cfg.frontend, run),
@@ -273,18 +284,23 @@ async fn prepare_mac(
         wall_seconds: wall_seconds(wall),
         labels: labels(ctx, Some(class)),
     });
-    Ok(Prepared { spec, key, timeout })
+    Ok(Prepared {
+        spec,
+        key,
+        timeout,
+        form: InputTree::Provider,
+    })
 }
 
 /// The put directory of `run`, from the frontend's ingest, its input tree written as `tree` says.
 async fn minted(
     ctx: &Preparer<'_>,
     run: RunId,
-    action: &Digest,
+    (action, decoded): (&Digest, Option<&DecodedAction>),
     wall: Duration,
     tree: InputTree,
 ) -> Result<PackKey, Settled> {
-    let minted = ctx.ingest.mint(run, action, wall, tree).await;
+    let minted = ctx.ingest.mint(run, action, wall, tree, decoded).await;
     minted.map_err(not_minted)
 }
 

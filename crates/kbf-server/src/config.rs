@@ -511,8 +511,10 @@ pub struct Args {
     pub input_tree_reads_in_flight: NonZeroUsize,
     /// Where the storage members and the unfinished operations are kept, so that another
     /// frontend, or this one after a restart, answers and takes them up: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a
-    /// local Unix socket, reached as this process's own user (peer authentication; a URL
-    /// with a password is refused, as the command line is world-readable). The server must
+    /// local Unix socket, reached as this process's own user (peer authentication), or a
+    /// server elsewhere, as `postgres://host/kbf?user=kbf&sslmode=verify-full&sslrootcert=/etc/kbf/db-ca.pem`.
+    /// A URL with a password is refused, as the command line is world-readable: the password
+    /// is read from `--state-store-password-file`, else PGPASSWORD, else `~/.pgpass`. The server must
     /// flush commits before it acknowledges them (`synchronous_commit` on) or the start is
     /// refused; the tables are created if missing. Or `sqlite:///absolute/path`, a file on
     /// a local disk that this process owns (created, with its directory, if missing: 0600,
@@ -529,6 +531,13 @@ pub struct Args {
         display_order = 6,
     )]
     pub state_store: Option<crate::state_store::StateStoreUri>,
+    /// The file that holds the password of a `postgres://` `--state-store`, and nothing else (one
+    /// line ending after it is dropped): a regular file owned by this process's user, mode 0600
+    /// or 0400. Without it the password is PGPASSWORD's, else the line of libpq's password file
+    /// (PGPASSFILE, else `~/.pgpass`) that matches the server, else none (peer authentication).
+    /// Where it came from is logged at start; the password never is
+    #[arg(long, value_name = "FILE", requires = "state_store", display_order = 6)]
+    pub state_store_password_file: Option<PathBuf>,
     /// How long, in seconds, a storage node's membership row lives without a heartbeat
     /// before the state store expires it and the member goes down in the storage map.
     /// Nodes are asked to heartbeat three times as often.

@@ -52,7 +52,7 @@ Options:
       --token-file <TOKEN_FILE>
           The enrollment token (a file of mode 0600 or tighter); setup keeps a copy that only kbf reads. For the modes that enroll
       --database <DATABASE>
-          The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password), for `frontend`: written to installer.toml and, as `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. Left out, it is postgres:///kbf?host=/run/postgresql&user=kbf-server on this host's own Postgres server (kbf-server is the account the frontend's unit runs as), and setup creates the role and the database as if --create-local-database were given. Given, the server exists before setup runs, and so do the role and the database unless --create-local-database makes them
+          The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password in the URL: a server that asks for one takes it from --database-password-file), for `frontend`: written to installer.toml and, as `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. Left out, it is postgres:///kbf?host=/run/postgresql&user=kbf-server on this host's own Postgres server (kbf-server is the account the frontend's unit runs as), and setup creates the role and the database as if --create-local-database were given. Given, the server exists before setup runs, and so do the role and the database unless --create-local-database makes them
       --create-local-database
           Create the login role and the database the `--database` URL names (owned by the role, no password), on a host whose Postgres runs locally, as the server's superuser over its Unix socket (peer authentication, no password), if they are not there. `frontend` does this whenever --database is left out, so the flag only matters beside --database. Never edits `pg_hba.conf`; prints the rules the logins need, and refuses, saying which rule to add, when the server does not admit a login. With --database and without this flag, setup only checks that it can log in
       --no-start
@@ -81,6 +81,8 @@ Options:
           The frontend's certificate toward the storage node. frontend
       --storage-client-key <STORAGE_CLIENT_KEY>
           The private key of --storage-client-cert (a file of mode 0600 owned by the service user). frontend
+      --database-password-file <DATABASE_PASSWORD_FILE>
+          The file that holds the password of `--database`, for a server that asks for one (a file of mode 0600 owned by the service user, holding the password alone): written to kbf.toml as `state-store-password-file` and to installer.toml as `database_password_file`, and read by setup to reach the database. Needs --database. frontend
       --installer-config <INSTALLER_CONFIG>
           The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root: `/etc/kbf/installer.toml`, which is the only value setup accepts. The same flag, with the same meaning, as on `run`
       --release-source <RELEASE_SOURCE>

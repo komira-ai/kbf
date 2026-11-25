@@ -23,7 +23,7 @@ async fn a_put_dir_only_preparer_gives_the_dir_a_full_preparer_gives() {
     let (parts, store, full) = standard().await;
     let prep = only(&store);
     let run = prep
-        .prepare_put_dir(LEASE, &parts.action, now(), WALL)
+        .prepare_put_dir(LEASE, &parts.action, None, now(), WALL)
         .await
         .expect("prepared");
     let same = full
@@ -46,24 +46,24 @@ async fn a_put_dir_only_preparer_refuses_what_a_full_one_refuses() {
     let (parts, store, _) = standard().await;
     let prep = only(&store);
     let bad_lease = prep
-        .prepare_put_dir("a.b", &parts.action, now(), WALL)
+        .prepare_put_dir("a.b", &parts.action, None, now(), WALL)
         .await
         .expect_err("refused");
     assert!(matches!(bad_lease, PrepareError::Lease(_)), "{bad_lease}");
     let long = prep
-        .prepare_put_dir(LEASE, &parts.action, now(), MAX_EXPIRY)
+        .prepare_put_dir(LEASE, &parts.action, None, now(), MAX_EXPIRY)
         .await
         .expect_err("refused");
     assert!(matches!(long, PrepareError::Expiry(_)), "{long}");
     let early = UNIX_EPOCH - Duration::from_secs(1);
     let clock = prep
-        .prepare_put_dir(LEASE, &parts.action, early, WALL)
+        .prepare_put_dir(LEASE, &parts.action, None, early, WALL)
         .await
         .expect_err("refused");
     assert!(matches!(clock, PrepareError::Clock), "{clock}");
     let (_, holed, _) = missing(&[parts.tree.b]).await;
     let missing_input = only(&holed)
-        .prepare_put_dir(LEASE, &parts.action, now(), WALL)
+        .prepare_put_dir(LEASE, &parts.action, None, now(), WALL)
         .await
         .expect_err("refused");
     assert_eq!(
@@ -71,4 +71,58 @@ async fn a_put_dir_only_preparer_refuses_what_a_full_one_refuses() {
         PrepareFault::Refused,
         "{missing_input}"
     );
+}
+
+/// Asserts that a preparation given the Action decoded (the one the Execute that started the run
+/// read) reads it from no store: over a farm that does not hold the Action's blob it collects the
+/// same closure as a preparation that reads it from a farm that does, and never asks for the
+/// Action; while the same preparation given nothing finds the Action missing. Catches a walk that
+/// reads the Action again although it was handed it.
+#[tokio::test]
+async fn a_preparation_given_the_decoded_action_never_reads_it() {
+    let (parts, whole, _) = standard().await;
+    let (_, bytes) = parts.blob(&parts.action);
+    let decoded = reapi::Action::decode(bytes).expect("an Action");
+    let read = only(&whole)
+        .prepare_put_dir(LEASE, &parts.action, None, now(), WALL)
+        .await
+        .expect("prepared");
+    let holed = Watched::holding(parts.without(&[parts.action])).await;
+
+    let given = only(&holed)
+        .prepare_put_dir(LEASE, &parts.action, Some(&decoded), now(), WALL)
+        .await
+        .expect("prepared");
+
+    assert_eq!(given.kept.closure(), read.kept.closure());
+    assert_eq!(given.kept.root(), &parts.tree.root);
+    let read_action =
+        (holed.reads.lock().unwrap_or_else(PoisonError::into_inner)).contains(&parts.action);
+    assert!(!read_action, "the Action was read");
+    let unread = only(&holed)
+        .prepare_put_dir(LEASE, &parts.action, None, now(), WALL)
+        .await
+        .expect_err("the Action is missing");
+    assert_eq!(unread.fault(), PrepareFault::Refused, "{unread}");
+}
+
+/// Asserts that an Action handed to the preparation is checked as one read from the store is:
+/// one that names no input root is refused, the caller's to fix, naming the field. Catches a
+/// decoded Action taken on trust.
+#[tokio::test]
+async fn a_decoded_action_with_no_input_root_is_refused_as_a_read_one_is() {
+    let (parts, store, _) = standard().await;
+    let decoded = reapi::Action {
+        command_digest: Some(wire(&parts.command)),
+        input_root_digest: None,
+        ..reapi::Action::default()
+    };
+
+    let refused = only(&store)
+        .prepare_put_dir(LEASE, &parts.action, Some(&decoded), now(), WALL)
+        .await
+        .expect_err("refused");
+
+    assert_eq!(refused.fault(), PrepareFault::Refused, "{refused}");
+    assert!(refused.to_string().contains("input root"), "{refused}");
 }

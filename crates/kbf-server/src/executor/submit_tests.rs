@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use js_proto::v1::{JobResult, JobState, JobTimes, Needs, NetworkLevel, ResultReason};
+use kbf_front::DecodedAction;
 use kbf_proto::reapi::Digest;
 use kbf_types::OperationId;
 use ring::digest::{SHA256, digest};
@@ -36,6 +37,7 @@ impl Ingest for Easy {
         _: &Digest,
         _: Duration,
         _: InputTree,
+        _decoded: Option<&DecodedAction>,
     ) -> Result<PackKey, MintError> {
         Ok(PackKey::new(format!("cas/b/{}/aa-0", build_id(run))))
     }
@@ -47,7 +49,11 @@ impl Ingest for Easy {
 
 #[tonic::async_trait]
 impl Inputs for Easy {
-    async fn action(&self, _: &Digest) -> Result<ActionFacts, InputsError> {
+    async fn action(
+        &self,
+        _: &Digest,
+        _decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError> {
         Ok(ActionFacts {
             image: format!("registry.test/app@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
@@ -204,7 +210,11 @@ struct Timed(Option<Duration>);
 
 #[tonic::async_trait]
 impl Inputs for Timed {
-    async fn action(&self, _: &Digest) -> Result<ActionFacts, InputsError> {
+    async fn action(
+        &self,
+        _: &Digest,
+        _decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError> {
         Ok(ActionFacts {
             image: format!("registry.test/app@sha256:{DIGEST}"),
             timeout: self.0,
@@ -242,7 +252,7 @@ async fn prepared(
         inputs: &inputs,
         ..harness.preparer()
     };
-    prepare(&ctx, RUN, &action(), booking).await
+    prepare(&ctx, RUN, (&action(), None), booking).await
 }
 
 /// Catches the job's wall limit being the executor's longest run instead of the
@@ -426,6 +436,7 @@ impl Ingest for NoMint {
         _: &Digest,
         _: Duration,
         _: InputTree,
+        _decoded: Option<&DecodedAction>,
     ) -> Result<PackKey, MintError> {
         Err(self.0.clone())
     }
@@ -461,7 +472,11 @@ struct Broken;
 
 #[tonic::async_trait]
 impl Inputs for Broken {
-    async fn action(&self, _: &Digest) -> Result<ActionFacts, InputsError> {
+    async fn action(
+        &self,
+        _: &Digest,
+        _decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError> {
         Err(InputsError::Invalid("no such action".to_owned()))
     }
 }
@@ -472,7 +487,7 @@ impl Inputs for Broken {
 async fn an_action_that_cannot_be_read_settles_the_run_as_the_callers() {
     let mut harness = Harness::new();
     harness.inputs = Arc::new(Broken);
-    let Err(refused) = prepare(&harness.preparer(), RUN, &action(), BOOKING).await else {
+    let Err(refused) = prepare(&harness.preparer(), RUN, (&action(), None), BOOKING).await else {
         panic!("prepared an action that cannot be read");
     };
     assert_eq!(refused, Settled::Invalid("no such action".to_owned()));

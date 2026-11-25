@@ -36,6 +36,8 @@ kbf-proxy = { workspace = true, optional = true }
 # `schema::embedded` and `latest`: the migrations a release runs (the state store's and the pack index's).
 kbf-pack-index = { workspace = true, features = ["postgres"] }
 kbf-state = { workspace = true, features = ["postgres"] }
+# The password of the state database: a file, PGPASSWORD or .pgpass.
+kbf-pg-auth.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true

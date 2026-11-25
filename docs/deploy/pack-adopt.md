@@ -58,7 +58,7 @@ kbf-pack-adopt --source-store-endpoint http://s3.example:9000 --source-store-buc
 | `--source-prefix <prefix>` | the prefix of the members' keys, empty or ending in `/` (default `kbf/`) |
 | `--source-store-region <region>` | the signing region (default `us-east-1`) |
 | `--source-store-credentials-file <path>` | the key pair, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, in a file that group and others cannot access (mode 0600 or 0400). The secret is never a flag: a command line is world-readable. A key that may list and read the bucket is enough |
-| `--pack-index <url>` | the Postgres state store that holds the pack index, as a URL with no password (a command line is world-readable), such as `postgres:///kbf?host=/run/postgresql`: the tool connects as the user that runs it. Its schema must have the pack tables (`kbf-installer setup`) |
+| `--pack-index <url>` | the Postgres state store that holds the pack index, as a URL with no password (a command line is world-readable), such as `postgres:///kbf?host=/run/postgresql`: the tool connects as the user that runs it, with the password of PGPASSWORD or `~/.pgpass` when the server asks for one ([kbf-modes.md](kbf-modes.md#the-state-stores-password)). Its schema must have the pack tables (`kbf-installer setup`) |
 | `--mode dry-run\|apply` | `dry-run` (the default) records nothing; `apply` records the packs |
 | `--pack-store-bucket <bucket>` | with `--mode apply`, the bucket the frontends write packs to; refused unless it is `--source-store-bucket` |
 | `--checkpoint-file <path>` | keeps the report so far here, written beside the file and renamed over it, and resumes from it. A checkpoint of another mode, prefix or source store (endpoint and bucket) is refused |

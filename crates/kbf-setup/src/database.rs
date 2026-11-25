@@ -6,9 +6,12 @@
 //!
 //! Where the database is: the `database` key of `installer.toml`, a `postgres://` URL
 //! (`postgres:///kbf?host=/run/postgresql`). The file is world-readable, so a URL that
-//! carries a password is refused; peer authentication needs none. This module reads that
-//! one key and leaves the others to their own readers. No message here quotes the URL, and a server's refusal of
-//! the connection is reduced to its SQLSTATE (the server's text quotes role and database).
+//! carries a password is refused; peer authentication needs none, and a server reached with a
+//! password takes it from the file the `database_password_file` key names, else PGPASSWORD,
+//! else `~/.pgpass` ([`kbf_pg_auth`]; the installer and the boot check run as root, who reads a
+//! file the service owns). This module reads those two keys and leaves the others to their own
+//! readers. No message here quotes the URL, and a server's refusal of the connection is reduced
+//! to its SQLSTATE (the server's text quotes role and database).
 //!
 //! The migrations are the ones embedded in this installer build. An update needs schema
 //! `state_schema` (what the staged release's `--version --json` says); the installer runs
@@ -19,6 +22,7 @@
 use std::fs;
 use std::path::Path;
 
+use kbf_pg_auth::{AuthError, Authenticated, Context};
 use kbf_state::postgres::schema::{self, Migration, Outcome, SchemaError};
 use kbf_state::postgres::{ConfigError, PostgresConfig, Unreached};
 
@@ -48,23 +52,59 @@ pub enum DatabaseError {
         why: ConfigError,
     },
     /// The URL carries a password, in a world-readable file.
-    #[error("the `database` URL in {0} carries a password; use peer authentication")]
+    #[error(
+        "the `database` URL in {0} carries a password, and the file is world-readable: give it \
+         in a file of mode 0600 named by database_password_file, in PGPASSWORD, or a line of \
+         ~/.pgpass (PGPASSFILE names another file); peer authentication needs none"
+    )]
     Password(String),
+    /// `database_password_file` is not an absolute path.
+    #[error("the `database_password_file` in {0} is not an absolute path")]
+    PasswordFileKey(String),
+    /// The password cannot be had: its file cannot be used, or the client cannot send it.
+    #[error("the password of the `database` in {path}: {why}")]
+    PasswordSource {
+        /// The file.
+        path: String,
+        /// Why (never the password, never the URL).
+        why: AuthError,
+    },
 }
 
-/// The `database` URL of the file `shown`, parsed and refused when it carries a password.
+/// The state database the `installer.toml` text of the file `shown` names, with the password
+/// `database_password_file`, PGPASSWORD or libpq's file gives it as `context` has them; `None`
+/// when there is no `database` key (or it is not a string).
 ///
 /// # Errors
-/// [`DatabaseError::BadUrl`] or [`DatabaseError::Password`]; neither quotes the URL.
-fn check_url(shown: &str, url: &str) -> Result<PostgresConfig, DatabaseError> {
-    let config = PostgresConfig::parse(url).map_err(|why| DatabaseError::BadUrl {
-        path: shown.to_owned(),
-        why,
-    })?;
-    if config.has_password() {
-        return Err(DatabaseError::Password(shown.to_owned()));
-    }
-    Ok(config)
+/// [`DatabaseError`]: the text is not TOML, the URL is unusable or carries a password, the
+/// password file key is not an absolute path, or the password cannot be had. None quotes the
+/// URL.
+pub fn installer_database(
+    shown: &str,
+    text: &str,
+    context: &Context,
+) -> Result<Option<Authenticated>, DatabaseError> {
+    let table: toml::Table = text
+        .parse()
+        .map_err(|_| DatabaseError::NotToml(shown.to_owned()))?;
+    let Some(url) = table.get("database").and_then(toml::Value::as_str) else {
+        return Ok(None);
+    };
+    let file = match table.get("database_password_file") {
+        None => None,
+        Some(value) => match value.as_str() {
+            Some(path) if path.starts_with('/') => Some(Path::new(path)),
+            _ => return Err(DatabaseError::PasswordFileKey(shown.to_owned())),
+        },
+    };
+    let path = || shown.to_owned();
+    kbf_pg_auth::authenticate(url, file, context)
+        .map(Some)
+        .map_err(|why| match why {
+            AuthError::Url(why) => DatabaseError::BadUrl { path: path(), why },
+            AuthError::InUrl => DatabaseError::Password(path()),
+            why => DatabaseError::PasswordSource { path: path(), why },
+        })
 }
 
 /// What runs before a release starts, so the installer's helper can be tested without a
@@ -97,22 +137,26 @@ impl Database {
             path: shown.clone(),
             why: e.kind().to_string(),
         })?;
-        Database::from_installer_text(&shown, &text)
+        Database::from_installer_text(&shown, &text, &Context::of_process())
     }
 
-    /// [`Database::from_installer_toml`] over text already read from the file named `shown`.
+    /// [`Database::from_installer_toml`] over text already read from the file named `shown`,
+    /// with the password sources of `context` ([`installer_database`]).
     ///
     /// # Errors
-    /// [`DatabaseError`]: the text, the key or the URL is wrong.
-    pub fn from_installer_text(shown: &str, text: &str) -> Result<Database, DatabaseError> {
-        let table: toml::Table = text
-            .parse()
-            .map_err(|_| DatabaseError::NotToml(shown.to_owned()))?;
-        let Some(url) = table.get("database").and_then(toml::Value::as_str) else {
+    /// [`DatabaseError`]: the text, the keys, the URL or the password is wrong.
+    pub fn from_installer_text(
+        shown: &str,
+        text: &str,
+        context: &Context,
+    ) -> Result<Database, DatabaseError> {
+        let Some(found) = installer_database(shown, text, context)? else {
             return Err(DatabaseError::NoDatabase(shown.to_owned()));
         };
-        let config = check_url(shown, url)?;
-        Ok(Database::new(config, kbf_pack_index::schema::embedded()))
+        Ok(Database::new(
+            found.config,
+            kbf_pack_index::schema::embedded(),
+        ))
     }
 
     /// A database with the given migrations (a test plays another release).
@@ -252,3 +296,7 @@ pub(crate) fn dry_run_line(mode: &str, found: Option<u32>, newest: u32) -> Strin
 #[cfg(test)]
 #[path = "database_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "database_password_tests.rs"]
+mod password_tests;

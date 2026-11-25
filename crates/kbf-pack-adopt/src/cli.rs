@@ -40,8 +40,9 @@ const BAD_INDEX_URL: &str = "--pack-index: not a postgres:// URL this client can
      needs a host, and an sslmode other than allow), as in postgres:///kbf?host=/run/postgresql";
 
 const INDEX_PASSWORD: &str = "--pack-index: the URL must carry no password (a command line \
-     is world-readable); use the Unix socket with peer authentication, as in \
-     postgres:///kbf?host=/run/postgresql";
+     is world-readable): give it in PGPASSWORD, or a line of ~/.pgpass (PGPASSFILE names another \
+     file); a Unix socket with peer authentication, as in postgres:///kbf?host=/run/postgresql, \
+     needs none";
 
 /// What a run does with the segments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -245,14 +246,7 @@ impl Args {
     }
 
     fn index_config(&self) -> Result<PostgresConfig, Error> {
-        let parsed = PostgresConfig::parse(&self.pack_index);
-        // The parser's own message may quote the URL: none is kept.
-        let config = parsed.map_err(|_| Error::refused(BAD_INDEX_URL))?;
-        if config.has_password() {
-            return Err(Error::refused(INDEX_PASSWORD));
-        }
-        let config = config.with_application_name("kbf-pack-adopt");
-        Ok(config.with_max_connections(2))
+        index_config(&self.pack_index, &kbf_pg_auth::Context::of_process())
     }
 
     fn source_store(&self) -> Result<S3Store, Error> {
@@ -291,3 +285,23 @@ fn bad_credentials(path: &Path, why: &str) -> Error {
     let shown = path.display();
     Error::refused(format!("--source-store-credentials-file {shown}: {why}"))
 }
+
+/// The index's configuration: `url` with the password `PGPASSWORD` or libpq's file gives it as
+/// `context` has them ([`kbf_pg_auth`]), and a libpq file that was skipped said on standard
+/// error. The client's own messages may quote the URL: none is kept.
+fn index_config(url: &str, context: &kbf_pg_auth::Context) -> Result<PostgresConfig, Error> {
+    let found = kbf_pg_auth::authenticate(url, None, context).map_err(|why| match why {
+        kbf_pg_auth::AuthError::Url(_) => Error::refused(BAD_INDEX_URL),
+        kbf_pg_auth::AuthError::InUrl => Error::refused(INDEX_PASSWORD),
+        why => Error::refused(format!("--pack-index: {why}")),
+    })?;
+    if let Some(skipped) = &found.skipped {
+        eprintln!("kbf-pack-adopt: warning: {skipped}");
+    }
+    let config = found.config.with_application_name("kbf-pack-adopt");
+    Ok(config.with_max_connections(2))
+}
+
+#[cfg(test)]
+#[path = "cli_index_tests.rs"]
+mod index_tests;

@@ -52,7 +52,7 @@ kbf-l2-backfill --store-endpoint http://s3.example:9000 --store-bucket kbf-packs
 | `--store-bucket <bucket>` | the frontends' `--pack-store-bucket` |
 | `--store-region <region>` | the signing region (default `us-east-1`) |
 | `--store-credentials-file <path>` | the key pair, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, in a file that group and others cannot access (mode 0600 or 0400). The secret is never a flag. A dry run needs a key that may read; an apply, one that may read and create objects under `cas/l2/` |
-| `--pack-index <url>` | the Postgres state store that holds the pack index, as a URL with no password, such as `postgres:///kbf?host=/run/postgresql`. Its schema must have the cell and unlisted-tree tables (migration 5) |
+| `--pack-index <url>` | the Postgres state store that holds the pack index, as a URL with no password, such as `postgres:///kbf?host=/run/postgresql` (a server that asks for one gets it from PGPASSWORD or `~/.pgpass`, see [kbf-modes.md](kbf-modes.md#the-state-stores-password)). Its schema must have the cell and unlisted-tree tables (migration 5) |
 | `--mode dry-run\|apply` | `dry-run` (the default) writes nothing; `apply` reads the objects and writes the sidecars |
 | `--within-days <n>` | take the unlisted trees last recorded within `n` days (default 14, at least 1) |
 | `--trees-per-second <n>` | the most trees handled a second; each is a read of the list and, in an apply, of its unrecorded objects. A tree that took longer than the spacing is followed at once by the next |

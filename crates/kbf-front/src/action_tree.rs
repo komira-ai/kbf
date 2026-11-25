@@ -311,8 +311,10 @@ impl ActionTree {
 }
 
 /// A stage of an action tree's writes, in the order they are made: each begins when the one
-/// before it has ended. [`TreeWriter::write_named`] times each stage it makes, a failed one
-/// included, on tokio's clock.
+/// before it has ended, but for a tree list's sidecar, which begins with the list's own write.
+/// [`TreeWriter::write_named`] times each stage it makes, a failed one included, on tokio's
+/// clock; [`TreeWriter::write_listing_with`] times the stages of a tree list: its blobs, the
+/// list, and its sidecar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteStage {
     /// The blobs that were nowhere, written whole to `cas/l/`; a tree with none has no such
@@ -323,6 +325,12 @@ pub enum WriteStage {
     Manifests,
     /// The root manifest, which names the tree.
     Root,
+    /// A tree list's one write.
+    List,
+    /// A tree list's L2 sidecar ([`Sidecars`]): from its start, beside the list's write (or after
+    /// it, on the miss path), to its end, after the list is stored. A sidecar whose list was not
+    /// stored, or a writer with no sidecars, has no such stage.
+    Sidecar,
 }
 
 /// The manifest writer. Shared by every preparation: the manifest memo, the place memo and the

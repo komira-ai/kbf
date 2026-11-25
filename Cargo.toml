@@ -180,6 +180,10 @@ x509-parser = "0.18.1"
 # Overwrites the object-store keys a storage node holds when they are dropped (kbf-enroll).
 # Already in the tree through rustls.
 zeroize = "1.9.1"
+# The name of the effective user: the role a Postgres client logs in as when the URL names
+# none, matched against `.pgpass` lines (kbf-pg-auth). Already in the tree through
+# tokio-postgres, which asks it the same.
+whoami = "2.1.3"
 zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2"] }
 
 kbf-alert = { path = "crates/kbf-alert" }
@@ -213,6 +217,9 @@ kbf-pack-index = { path = "crates/kbf-pack-index" }
 # The update hook of the native kbf package (`kbf package-hook`); depends on update-hook alone.
 kbf-package-hook = { path = "crates/kbf-package-hook" }
 kbf-peer = { path = "crates/kbf-peer" }
+# The password of a Postgres connection, from a file, PGPASSWORD or `.pgpass`, never from
+# the URL (kbf-server, kbf-setup, kbf-cli, the pack tools).
+kbf-pg-auth = { path = "crates/kbf-pg-auth" }
 kbf-proto = { path = "crates/kbf-proto" }
 kbf-proxy = { path = "crates/kbf-proxy" }
 kbf-raft = { path = "crates/kbf-raft" }

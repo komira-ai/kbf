@@ -179,7 +179,9 @@ frontend given none exits 2 naming the flag, and `kbf --mode=frontend --check`, 
 unit runs before the start, exits 2 the same way. A `sqlite://` URI still starts in
 this release and logs a warning that SQLite is removed in the next (see the upgrade notes).
 The URI carries no password (kbf refuses one: the command line is readable by every user on
-the node), so the database is reached by the socket or by the server user's own role. The
+the node). The database is reached by the socket and the server user's own role, or with the
+password of `state-store-password-file` in `kbf.toml`, PGPASSWORD or `~/.pgpass`
+([kbf-modes.md](kbf-modes.md#the-state-stores-password)). The
 database and its schema are `kbf-installer`'s.
 
 **A state store that is not up yet.** A host that reboots starts Postgres and the frontend

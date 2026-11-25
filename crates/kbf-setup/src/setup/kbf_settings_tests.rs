@@ -34,6 +34,8 @@ fn frontend_flags() -> KbfFlags {
         storage_ca: some("/etc/kbf/ca.pem"),
         storage_client_cert: some("/etc/kbf/worker.pem"),
         storage_client_key: some("/etc/kbf/worker.key"),
+        // It needs --database, which these flags do not carry; its own tests give both.
+        database_password_file: None,
     }
 }
 

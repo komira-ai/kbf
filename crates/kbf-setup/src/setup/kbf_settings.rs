@@ -53,6 +53,9 @@ enum Want {
     Cert,
     /// A private key file.
     Key,
+    /// A file that holds a password: as a key, and of mode 0600 or 0400 exactly, as the
+    /// frontend's reader (`kbf-pg-auth`) requires.
+    Password,
     /// `http(s)://host[:port]`; plain `http` only to a loopback host.
     Url,
 }
@@ -111,7 +114,7 @@ macro_rules! renamed {
 }
 
 /// The settings, in the order of the written file within each table.
-const SPECS: [Spec; 12] = [
+const SPECS: [Spec; 13] = [
     same!("listen", "listener", Want::Addr, Need::Optional,),
     same!("worker-listen", "listener", Want::Addr, Need::Optional,),
     same!(
@@ -143,6 +146,13 @@ const SPECS: [Spec; 12] = [
         "storage-client-key",
         "storage-client",
         Want::Key,
+        Need::Optional,
+    ),
+    renamed!(
+        "database-password-file",
+        "scheduler",
+        "state-store-password-file",
+        Want::Password,
         Need::Optional,
     ),
 ];
@@ -200,11 +210,18 @@ pub struct KbfFlags {
     /// user). frontend.
     #[arg(long)]
     pub storage_client_key: Option<String>,
+    /// The file that holds the password of `--database`, for a server that asks for one (a
+    /// file of mode 0600 owned by the service user, holding the password alone): written to
+    /// kbf.toml as `state-store-password-file` and to installer.toml as
+    /// `database_password_file`, and read by setup to reach the database. Needs --database.
+    /// frontend.
+    #[arg(long)]
+    pub database_password_file: Option<String>,
 }
 
 impl KbfFlags {
     /// The flags by name, as given.
-    fn slots(&self) -> [(&'static str, &Option<String>); 12] {
+    fn slots(&self) -> [(&'static str, &Option<String>); 13] {
         [
             ("listen", &self.listen),
             ("worker-listen", &self.worker_listen),
@@ -218,6 +235,7 @@ impl KbfFlags {
             ("storage-ca", &self.storage_ca),
             ("storage-client-cert", &self.storage_client_cert),
             ("storage-client-key", &self.storage_client_key),
+            ("database-password-file", &self.database_password_file),
         ]
     }
 
@@ -328,7 +346,7 @@ fn check_value(kind: Want, value: &str) -> Result<(), &'static str> {
                     Ok(())
                 }
             }),
-        Want::Cert | Want::Key => check_path(value),
+        Want::Cert | Want::Key | Want::Password => check_path(value),
         Want::Url => check_url(value),
     }
 }
@@ -427,7 +445,7 @@ pub fn push_problems(
 ) {
     for s in SPECS
         .iter()
-        .filter(|s| matches!(s.kind, Want::Cert | Want::Key))
+        .filter(|s| matches!(s.kind, Want::Cert | Want::Key | Want::Password))
     {
         let Some(setting) = settings
             .iter()
@@ -458,6 +476,14 @@ fn check_file(
     let bits = meta.perms.bits();
     let service_owns = service == Some(meta.owner.uid);
     match kind {
+        Want::Password => {
+            if !service_owns {
+                return Err("a password file must be owned by the user the service runs as");
+            }
+            if !matches!(bits, 0o600 | 0o400) {
+                return Err("a password file must have mode 0600 or 0400");
+            }
+        }
         Want::Key => {
             if !service_owns {
                 return Err("a key must be owned by the user the service runs as");

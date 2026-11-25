@@ -22,6 +22,8 @@ kbf-pack.workspace = true
 kbf-pack-index = { workspace = true, features = ["postgres"] }
 # `PostgresConfig`.
 kbf-state = { workspace = true, features = ["postgres"] }
+# The password of --pack-index: PGPASSWORD or .pgpass.
+kbf-pg-auth.workspace = true
 # The credentials file, the checkpoint and the report are JSON.
 serde.workspace = true
 serde_json.workspace = true

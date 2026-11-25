@@ -120,6 +120,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "readyz-store-timeout-ms",
             "scheduler-core",
             "state-store",
+            "state-store-password-file",
             "state-store-wait-secs",
             "unservable-wait-secs",
             "usage-profiles",

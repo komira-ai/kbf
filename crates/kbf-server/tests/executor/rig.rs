@@ -16,8 +16,8 @@ use js_proto::v1::{
 };
 use kbf_auth::AuthenticationMetadata;
 use kbf_front::{
-    CallMetadata, Described, Dispatch, ExecuteCall, Finished, InvocationId, Recorder, Stage,
-    Submission,
+    CallMetadata, DecodedAction, Described, Dispatch, ExecuteCall, Finished, InvocationId,
+    Recorder, Stage, Submission,
 };
 use kbf_job_client::Client;
 use kbf_job_client::fake::{Call, FakeJobServer, Fault, Machine};
@@ -83,7 +83,11 @@ impl FakeInputs {
 
 #[tonic::async_trait]
 impl Inputs for FakeInputs {
-    async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
+    async fn action(
+        &self,
+        action: &Digest,
+        _decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError> {
         locked(&self.looked_up).push(action.hash.clone());
         locked(&self.facts).clone()
     }
@@ -166,6 +170,7 @@ impl Ingest for FakeIngest {
         _action: &Digest,
         wall: Duration,
         tree: InputTree,
+        _decoded: Option<&DecodedAction>,
     ) -> Result<PackKey, MintError> {
         locked(&self.calls_in_order).push("mint");
         locked(&self.forms).push(tree);
@@ -421,6 +426,7 @@ impl Rig {
                     label: Default::default(),
                 },
                 evidence: Default::default(),
+                decoded: None,
                 arrival: kbf_front::Arrival::now(),
             })
             .expect("the executor takes the action");

@@ -84,6 +84,7 @@ impl RunPrepare for DirPrep {
         &self,
         lease: &str,
         action: &kbf_types::Digest,
+        _decoded: Option<&Action>,
         now: SystemTime,
         _: Duration,
     ) -> Result<PreparedPutDir, PrepareError> {
@@ -209,7 +210,7 @@ async fn a_run_gets_its_dir_and_its_tree_once() {
     let action = action_with_input(&rig, "input").await;
     let key = rig
         .front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
     let nonce = key
@@ -243,7 +244,7 @@ async fn a_mac_runs_put_directory_has_the_shape_the_agent_takes() {
     let action = action_with_input(&rig, "input").await;
     let key = rig
         .front
-        .mint(lease(), &action, WALL, InputTree::Provider)
+        .mint(lease(), &action, WALL, InputTree::Provider, None)
         .await
         .expect("a dir");
     let parts: Vec<&str> = key.as_str().split('/').collect();
@@ -273,7 +274,7 @@ async fn before_the_base_tree_is_published_a_run_is_unavailable() {
     let action = action_with_input(&rig, "input").await;
     let refused = rig
         .front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
         .await;
     assert!(
         matches!(&refused, Err(MintError::Unavailable(why)) if why.contains("base tree")),
@@ -290,7 +291,7 @@ async fn a_tree_that_cannot_be_written_is_refused_or_unavailable() {
     let reserved = action_with_input(&rig, ".kbf-out").await;
     let refused = rig
         .front
-        .mint(lease(), &reserved, WALL, InputTree::Manifests)
+        .mint(lease(), &reserved, WALL, InputTree::Manifests, None)
         .await;
     assert!(
         matches!(&refused, Err(MintError::Refused(why)) if why.contains(".kbf-out")),
@@ -301,7 +302,7 @@ async fn a_tree_that_cannot_be_written_is_refused_or_unavailable() {
     rig.store.fail_reads.store(true, Ordering::SeqCst);
     let down = rig
         .front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
         .await;
     assert!(matches!(down, Err(MintError::Unavailable(_))), "{down:?}");
 }
@@ -318,7 +319,7 @@ async fn a_preparation_that_cannot_give_a_dir_refuses_the_run() {
         let action = action_with_input(&rig, "input").await;
         let got = rig
             .front
-            .mint(lease(), &action, WALL, InputTree::Manifests)
+            .mint(lease(), &action, WALL, InputTree::Manifests, None)
             .await;
         assert_eq!(
             matches!(got, Err(MintError::Unavailable(_))),
@@ -331,7 +332,7 @@ async fn a_preparation_that_cannot_give_a_dir_refuses_the_run() {
     let action = action_with_input(&short, "input").await;
     let got = short
         .front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
         .await;
     assert!(matches!(got, Err(MintError::Refused(_))), "{got:?}");
 }
@@ -345,7 +346,7 @@ async fn a_pack_committed_in_the_dir_becomes_the_result() {
     let action = action_with_input(&rig, "input").await;
     let key = rig
         .front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
     let pack = write_pack(&manifest_of("7-3", &action), &[]).expect("a pack");
@@ -399,7 +400,7 @@ async fn a_tree_that_only_the_pack_holds_is_read_through_the_same_packs() {
     let action = action_with_input(&rig, "input").await;
     let key = rig
         .front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
     let file = b"a file inside the output directory".to_vec();
@@ -443,7 +444,7 @@ async fn a_provider_run_gets_the_key_of_a_stored_tree_list_once() {
     let rig = rig_over(DirPrep::new(None, 7_200), Some(listed_base()));
     let action = action_with_input(&rig, "input").await;
     rig.front
-        .mint(lease(), &action, WALL, InputTree::Provider)
+        .mint(lease(), &action, WALL, InputTree::Provider, None)
         .await
         .expect("a dir");
 
@@ -524,7 +525,7 @@ async fn a_provider_run_over_an_unlisted_base_is_unavailable_and_manifests_still
     let action = action_with_input(&rig, "input").await;
     let refused = rig
         .front
-        .mint(lease(), &action, WALL, InputTree::Provider)
+        .mint(lease(), &action, WALL, InputTree::Provider, None)
         .await;
     assert_eq!(
         refused,
@@ -539,7 +540,7 @@ async fn a_provider_run_over_an_unlisted_base_is_unavailable_and_manifests_still
     ));
 
     rig.front
-        .mint(lease(), &action, WALL, InputTree::Manifests)
+        .mint(lease(), &action, WALL, InputTree::Manifests, None)
         .await
         .expect("a dir");
     let tree = rig.front.tree(lease()).await.expect("a tree");
@@ -556,7 +557,7 @@ async fn a_provider_run_with_a_reserved_input_name_is_refused() {
     let reserved = action_with_input(&rig, ".kbf-out").await;
     let refused = rig
         .front
-        .mint(lease(), &reserved, WALL, InputTree::Provider)
+        .mint(lease(), &reserved, WALL, InputTree::Provider, None)
         .await;
     assert!(
         matches!(&refused, Err(MintError::Refused(why)) if why.contains(".kbf-out")),

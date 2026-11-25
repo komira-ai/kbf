@@ -334,7 +334,7 @@ async fn the_put_dir_flags_open_a_preparer_of_put_dirs() {
         .expect("a preparer");
     let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
     let run = prep
-        .prepare_put_dir(LEASE, &action, now, Duration::from_secs(60))
+        .prepare_put_dir(LEASE, &action, None, now, Duration::from_secs(60))
         .await
         .expect("run");
     let mint = PackKeyMint::new(SECRET.as_bytes()).expect("a mint");
@@ -375,7 +375,7 @@ async fn the_put_dir_preparation_makes_directories() {
     let prep = put_dir_flags(dir.path()).open(backend).expect("opened");
     let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
     let wall = Duration::from_secs(60);
-    let run = RunPrepare::prepare_put_dir(&prep, LEASE, &action, now, wall)
+    let run = RunPrepare::prepare_put_dir(&prep, LEASE, &action, None, now, wall)
         .await
         .expect("prepared");
     assert!(
@@ -384,7 +384,7 @@ async fn the_put_dir_preparation_makes_directories() {
         run.dir
     );
     assert_eq!(run.not_after, 1_790_000_040 + 60 + DEFAULT_URL_SLACK_SECS);
-    let bad = RunPrepare::prepare_put_dir(&prep, "a.b", &action, now, wall)
+    let bad = RunPrepare::prepare_put_dir(&prep, "a.b", &action, None, now, wall)
         .await
         .expect_err("refused");
     assert!(matches!(bad, PrepareError::Refused(_)), "{bad:?}");
@@ -509,9 +509,10 @@ async fn the_parsed_cache_flags_keep_the_directories_of_a_run_on_the_disk() {
     let (backend, action, root) = farm_with_a_tree().await;
     let prep = flags.open(backend.clone()).expect("opened");
     let now = UNIX_EPOCH + Duration::from_secs(1_790_000_040);
-    let run = RunPrepare::prepare_put_dir(&prep, LEASE, &action, now, Duration::from_secs(60))
-        .await
-        .expect("prepared");
+    let run =
+        RunPrepare::prepare_put_dir(&prep, LEASE, &action, None, now, Duration::from_secs(60))
+            .await
+            .expect("prepared");
     assert_eq!(run.kept.directory_count(), 1);
     // The cache is written by a task the preparation does not wait for.
     prep.detached_writes().settled().await;

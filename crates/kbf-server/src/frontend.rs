@@ -239,6 +239,7 @@ pub const ALLOWED: &[&str] = &[
     "shutdown_timeout_secs",
     "invocation_memory",
     "state_store",
+    "state_store_password_file",
     "pack_index",
     "member_ttl_secs",
     "member_dwell_secs",
@@ -743,13 +744,15 @@ fn bind_frontend(
     let prepared = Prepared::new(flags)?;
     // The flag's own refusals come before the wait for the store, as they did before it.
     flags.server.pack_index_url()?;
-    let state = flags
+    let server = flags
         .server
+        .with_state_store_password(&kbf_pg_auth::Context::of_process())?;
+    let state = server
         .state_store
         .as_ref()
         .map(|uri| state_schema::open_migrated(uri, flags.state_store_wait))
         .transpose()?;
-    let indexes = flags.server.open_indexes()?;
+    let indexes = server.open_indexes()?;
     let (pack_index, actions) = match indexes {
         Some(Indexes { packs, actions }) => (Some(packs), Some(actions)),
         None => (None, None),

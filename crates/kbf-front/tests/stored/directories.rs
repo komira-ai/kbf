@@ -334,7 +334,7 @@ fn preparer(rig: &Rig, writes: &DetachedWrites) -> PutDirPrep {
 async fn prepared_directories(prep: &PutDirPrep, action: &Digest) -> usize {
     let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_040);
     let wall = std::time::Duration::from_secs(7_200);
-    let run = prep.prepare_put_dir(LEASE, action, now, wall).await;
+    let run = prep.prepare_put_dir(LEASE, action, None, now, wall).await;
     run.expect("prepared").kept.directory_count()
 }
 

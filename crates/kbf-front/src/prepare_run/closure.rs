@@ -37,6 +37,11 @@
 //!
 //! [`PrepareTook`] says how long a walk's three parts took, by the clock of `tokio::time`.
 //!
+//! **The Action, read or given.** A walk given the Action already decoded (the one the Execute
+//! that started the run read, [`crate::DecodedAction`]) does not read it from the store: it
+//! takes the Command and the input root it names, checked as a read one is. Given none, it reads
+//! the Action by its digest.
+//!
 //! [`collect_closure_keeping`] makes the same walk and keeps every `Directory` it read, its
 //! digests parsed, for the action tree's manifest writer ([`crate::action_tree`]): the walk the
 //! frontend makes before every submit stays the only walk. What it keeps is bounded by the same
@@ -157,7 +162,7 @@ pub enum ClosureError {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PrepareTook {
     /// From the start to the Action, read from the store and decoded, with the Command and the
-    /// input root named.
+    /// input root named; next to nothing for a walk given the Action decoded.
     pub action: Duration,
     /// All levels of the `Directory` walk, from the first read of the input root to the end of the
     /// last level: the cache, the rows, the blob reads and the parse of every `Directory`.
@@ -413,6 +418,7 @@ pub async fn collect_closure_detaching(
         keep: false,
         cache: None,
         writes,
+        decoded: None,
     };
     Ok(collect(&walk, action).await?.closure)
 }
@@ -426,35 +432,32 @@ pub async fn collect_closure_keeping(
     action: &Digest,
     limits: ClosureLimits,
 ) -> Result<KeptClosure, ClosureError> {
-    let kept = keeping_through(backend, action, limits, None, &DetachedWrites::shared()).await;
-    Ok(kept?.0)
-}
-
-/// [`collect_closure_keeping`], reading each `Directory` through `cache` when there is one, its
-/// writes after the walk bounded by `writes`, and how long its parts took.
-///
-/// # Errors
-/// As [`collect_closure`].
-pub(crate) async fn keeping_through(
-    backend: &Backend,
-    action: &Digest,
-    limits: ClosureLimits,
-    cache: Option<&Arc<DirectoryCache>>,
-    writes: &DetachedWrites,
-) -> Result<(KeptClosure, PrepareTook), ClosureError> {
     let walk = Walk {
         backend,
         limits,
         keep: true,
-        cache,
-        writes,
+        cache: None,
+        writes: &DetachedWrites::shared(),
+        decoded: None,
     };
+    let kept = keeping_through(&walk, action).await;
+    Ok(kept?.0)
+}
+
+/// [`collect_closure_keeping`] as `walk` says (which must keep), and how long its parts took.
+///
+/// # Errors
+/// As [`collect_closure`].
+pub(crate) async fn keeping_through(
+    walk: &Walk<'_>,
+    action: &Digest,
+) -> Result<(KeptClosure, PrepareTook), ClosureError> {
     let Collected {
         closure,
         root,
         directories,
         took,
-    } = collect(&walk, action).await?;
+    } = collect(walk, action).await?;
     let kept = KeptClosure {
         closure,
         root,
@@ -464,13 +467,17 @@ pub(crate) async fn keeping_through(
 }
 
 /// What one walk reads through and writes with.
-struct Walk<'a> {
-    backend: &'a Backend,
-    limits: ClosureLimits,
+pub(crate) struct Walk<'a> {
+    pub(crate) backend: &'a Backend,
+    pub(crate) limits: ClosureLimits,
     /// Whether every `Directory` is kept.
-    keep: bool,
-    cache: Option<&'a Arc<DirectoryCache>>,
-    writes: &'a DetachedWrites,
+    pub(crate) keep: bool,
+    /// Where each `Directory` is read through first, when there is one.
+    pub(crate) cache: Option<&'a Arc<DirectoryCache>>,
+    /// The bound on the writes after the walk.
+    pub(crate) writes: &'a DetachedWrites,
+    /// The Action, already decoded: it is not read from the store.
+    pub(crate) decoded: Option<&'a reapi::Action>,
 }
 
 /// What a walk found.
@@ -534,11 +541,21 @@ async fn walk_tree(
         limits,
         keep,
         cache,
+        decoded,
         ..
     } = *walk;
     let started = Instant::now();
-    let blob = read(backend, "the Action", action).await?;
-    let decoded = reapi::Action::decode(blob).map_err(|e| invalid("the Action", action, &e))?;
+    let read_here;
+    let decoded = match decoded {
+        Some(decoded) => decoded,
+        None => {
+            let blob = read(backend, "the Action", action).await?;
+            let decoded =
+                reapi::Action::decode(blob).map_err(|e| invalid("the Action", action, &e))?;
+            read_here = decoded;
+            &read_here
+        }
+    };
     let named = |what, digest: Option<&reapi::Digest>| {
         wire::digest(digest).map_err(|status| invalid(what, action, &status.message()))
     };

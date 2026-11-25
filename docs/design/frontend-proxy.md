@@ -347,7 +347,9 @@ creates that role and database as the server's superuser over the socket (peer, 
 `--create-local-database` does the same for a URL given); it never edits `pg_hba.conf` or
 `pg_ident.conf`, prints the exact lines to add and refuses, naming the missing rule, when the
 server does not admit a login (`docs/deploy/kbf-installer-setup.md`, "The state database").
-Off-host Postgres (client TLS) is out of scope. A `sqlite://` URI still starts in this release
+This placement is on-host; an off-host server is reached with client TLS (`sslmode`,
+`sslrootcert`) and a password from a file, PGPASSWORD or `~/.pgpass`
+(`docs/deploy/kbf-modes.md`, "The state store's password"). A `sqlite://` URI still starts in this release
 and logs a warning that SQLite is removed in the next; a SQLite file is held by one process, so
 a second frontend over it is refused.
 

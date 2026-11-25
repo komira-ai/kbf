@@ -10,7 +10,7 @@ const CFG: &str = "7a3c1e9f0b2d4c68";
 async fn class_of(command: impl FnOnce(&mut kbf_proto::reapi::Command)) -> String {
     let rig = Rig::new();
     let digest = rig.action(|_| {}, command).await;
-    let facts = rig.front.action(&digest).await.expect("facts");
+    let facts = rig.front.action(&digest, None).await.expect("facts");
     facts.size_class.as_str().to_owned()
 }
 

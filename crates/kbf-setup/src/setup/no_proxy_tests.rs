@@ -38,7 +38,7 @@ const PROXY_FILE: &str = "release_source = \"frontend\"\n\n[proxy]\nlisten = \"1
 struct NoServer;
 
 impl Schemas for NoServer {
-    fn of(&self, _: &str) -> Result<Box<dyn SchemaOps>, SetupError> {
+    fn of(&self, _: &str, _: Option<&str>) -> Result<Box<dyn SchemaOps>, SetupError> {
         Err(SetupError::Database("no server".to_owned()))
     }
 }

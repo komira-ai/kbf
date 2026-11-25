@@ -1,4 +1,5 @@
-//! What Execute reads from the platform: the lease kind, its name in any case.
+//! What Execute reads from the platform: the lease kind, its name in any case; and the Action
+//! and Command it decoded, which the submission carries.
 
 use super::*;
 
@@ -108,4 +109,31 @@ async fn the_lease_property_name_is_read_in_any_case() {
     assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
     assert!(status.message().contains("given twice"), "{status:?}");
     assert_eq!(script.submitted().len(), 1);
+}
+
+/// Catches: a submission that does not carry the Action and Command the Execute decoded, or
+/// carries others (another action's, or the Command undecoded), so the run would read them from
+/// the CAS again: the submission's `decoded` is the Action under the submitted digest and the
+/// Command it names, as the CAS holds them.
+#[tokio::test]
+async fn the_submission_carries_the_action_and_command_the_execute_decoded() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let job = job("carried", &[("kbf-lease", "action")], false);
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+
+    start(&farm, &job.action).await.expect("Execute");
+
+    let [submission] = script.submitted().try_into().expect("one submission");
+    let decoded = submission.decoded.expect("the decode is carried");
+    assert_eq!(submission.key.action, job.action.digest);
+    assert_eq!(
+        decoded.action,
+        Action::decode(job.action.data.as_slice()).expect("an Action")
+    );
+    assert_eq!(
+        decoded.command,
+        Command::decode(job.blobs[1].data.as_slice()).expect("a Command")
+    );
+    assert_eq!(decoded.command.arguments, ["carried"]);
 }

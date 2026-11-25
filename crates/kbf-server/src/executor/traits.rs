@@ -11,6 +11,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::executor::task::RunId;
+use kbf_front::DecodedAction;
 use kbf_proto::reapi::{ActionResult, Digest};
 
 use crate::executor::config::InputTree;
@@ -116,7 +117,9 @@ pub trait Ingest: Send + Sync {
     /// Issued by the same secret that [`ingest`](Self::ingest) verifies it with: a directory the
     /// ingest did not issue for this run and this action is refused there. Called once for a
     /// run. The run's input tree is named here too, as `tree` says, for [`Inputs::tree`], and
-    /// may still be being written when the mint answers ([`Ingest::stored`]).
+    /// may still be being written when the mint answers ([`Ingest::stored`]). `decoded` is the
+    /// Action and Command the Execute that opened the operation decoded, when this process
+    /// has them ([`kbf_front::Submission::decoded`]): the Action is then not read again.
     ///
     /// # Errors
     /// [`MintError`].
@@ -126,6 +129,7 @@ pub trait Ingest: Send + Sync {
         action: &Digest,
         wall: Duration,
         tree: InputTree,
+        decoded: Option<&DecodedAction>,
     ) -> Result<PackKey, MintError>;
 
     /// Waits until the action tree [`Ingest::mint`] named for `run` is in the store. A mint
@@ -265,11 +269,17 @@ pub enum InputsError {
 /// The CAS read of an action and the action tree of its run.
 #[tonic::async_trait]
 pub trait Inputs: Send + Sync {
-    /// The image and timeout of `action`.
+    /// The facts of `action`: from `decoded`, the Action and Command the Execute that opened the
+    /// operation decoded, when this process has them ([`kbf_front::Submission::decoded`]), and
+    /// read from the CAS when it does not (an operation taken up from another process).
     ///
     /// # Errors
     /// [`InputsError`].
-    async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError>;
+    async fn action(
+        &self,
+        action: &Digest,
+        decoded: Option<&DecodedAction>,
+    ) -> Result<ActionFacts, InputsError>;
 
     /// The action tree [`Ingest::mint`] named for the run of `run` that commits into a put
     /// directory, as it was asked to write it: with [`InputTree::Manifests`], its root

@@ -1,5 +1,5 @@
-//! `fetch --url <https url> --sha256 <hex> --out <path> [--extract <format> [--member <path>]]`:
-//! installs a pinned tool for a CI job.
+//! `fetch --url <https url> --sha256 <hex> --out <path> [--extract <format> [--member <path>]]
+//! [--cache <file> [--url <https url>]...]`: installs a pinned tool for a CI job.
 //!
 //! The order is the point:
 //!
@@ -13,6 +13,19 @@
 //! 4. The file is written to `<out>.part` beside `--out`, made executable (0755) and
 //!    renamed over `--out`. When writing or renaming fails, `<out>.part` is removed, so
 //!    `--out` holds either the whole new file or what it held before.
+//!
+//! With `--cache <file>` ([`fetch_cached`]), the file the actions cache restores and saves holds
+//! the download as it was fetched, and steps 1 and 2 become:
+//!
+//! - when the file is there, it is the download: its SHA-256 is compared with `--sha256` and a
+//!   mismatch is refused, the file left as it is and nothing installed. No network is used;
+//! - when it is not, each `--url` is tried in turn, in [`WAITS`]`.len()` rounds with the pause
+//!   of [`WAITS`] before each round, each attempt given up after [`ATTEMPT_TIMEOUT`]; the first
+//!   download whose SHA-256 is the pinned one is written to the file (through a `.part` file,
+//!   mode 0644) and installed. A download of other bytes is one more failed attempt. When every
+//!   attempt failed, the error names each one, in order, and nothing is written.
+//!
+//! Without `--cache` there is one `--url` and one attempt, given up after [`DOWNLOAD_TIMEOUT`].
 
 use std::fmt;
 use std::io::Read;
@@ -31,6 +44,20 @@ pub const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
 
 /// How long one download may take, redirects included.
 pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The pause before each round of downloads of [`first_pinned`]: none before the first.
+pub const WAITS: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+
+/// How long one attempt of [`fetch_cached`] may take, redirects included: a stalled host gives
+/// way to the next `--url` well before [`DOWNLOAD_TIMEOUT`].
+pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The download of one URL: its bytes, or why it failed (one line).
+pub type Get<'a> = &'a dyn Fn(&str) -> Result<Vec<u8>, String>;
 
 /// A SHA-256 digest, written as 64 lowercase hex digits.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -70,6 +97,68 @@ impl FromStr for Sha256 {
             Ok(()) if lowercase => Ok(Sha256(digest)),
             _ => Err(NotASha256(s.to_owned())),
         }
+    }
+}
+
+/// The flags of `cargo xtask fetch`.
+#[derive(clap::Args)]
+pub struct Args {
+    /// Where to download it from (HTTPS; redirects must stay on HTTPS). With `--cache`, given
+    /// once per URL to try, in order.
+    #[arg(long, required = true)]
+    pub url: Vec<String>,
+    /// The SHA-256 of the download (before unpacking), 64 lowercase hex digits.
+    #[arg(long)]
+    pub sha256: Sha256,
+    /// The file to install; its directory is created when missing.
+    #[arg(long)]
+    pub out: PathBuf,
+    /// How the download is packed (default: it is the file).
+    #[arg(long, value_enum)]
+    pub extract: Option<Format>,
+    /// The file to take out of a tar or zip (`--extract tar.gz`, `tar.xz` or `zip`): its
+    /// path inside the archive.
+    #[arg(long)]
+    pub member: Option<PathBuf>,
+    /// The file the actions cache restores and saves: the download as fetched, used when it is
+    /// there and its SHA-256 is the pinned one, written when it is not.
+    #[arg(long)]
+    pub cache: Option<PathBuf>,
+}
+
+impl Args {
+    /// How the file comes out of the download ([`Unpack::new`]); `Err` also when `--url` is
+    /// given more than once without `--cache`.
+    pub fn unpack(&self) -> Result<Unpack, String> {
+        if self.cache.is_none() && self.url.len() > 1 {
+            return Err(
+                "--url is given once without --cache: only a cached fetch tries \
+                        several URLs"
+                    .to_owned(),
+            );
+        }
+        Unpack::new(self.extract, self.member.clone())
+    }
+}
+
+/// The verb, with the host's roots: [`fetch_cached`] with `--cache` (each attempt given up after
+/// [`ATTEMPT_TIMEOUT`], sleeping between rounds), else [`fetch`] of the one `--url`.
+pub fn run(args: &Args, unpack: &Unpack) -> Result<String, Error> {
+    let roots = host_roots();
+    match &args.cache {
+        Some(cache) => fetch_cached(
+            &Cached {
+                urls: &args.url,
+                sha256: &args.sha256,
+                unpack,
+                out: &args.out,
+                cache,
+            },
+            &https(&roots, ATTEMPT_TIMEOUT),
+            &std::thread::sleep,
+        ),
+        // Without `--cache` there is one `--url` ([`Args::unpack`] refuses more; clap, none).
+        None => fetch(&args.url.concat(), &args.sha256, unpack, &args.out, &roots),
     }
 }
 
@@ -159,6 +248,25 @@ pub enum Error {
     NotAFile(PathBuf),
     #[error("install {path:?}: {why}")]
     Install { path: PathBuf, why: String },
+    /// The cache file could not be read, or the download not written to it.
+    #[error("the cache {path:?}: {why}; nothing was installed")]
+    Cache { path: PathBuf, why: String },
+    /// The cache file is not the pinned download.
+    #[error(
+        "the cached {path:?} has SHA-256 {actual}, not the pinned {expected}; nothing was installed"
+    )]
+    CachedMismatch {
+        path: PathBuf,
+        expected: Sha256,
+        actual: Sha256,
+    },
+    /// The cache missed and no URL gave the pinned download in any round.
+    #[error("the cache {cache:?} missed and no download was the pinned file: {}; nothing was installed", attempts.join("; "))]
+    Unavailable {
+        cache: PathBuf,
+        /// Each attempt, in order: its URL and why it failed.
+        attempts: Vec<String>,
+    },
 }
 
 /// The error for an archive that could not be decoded.
@@ -249,6 +357,110 @@ pub fn fetch(
     ))
 }
 
+/// Downloads with `agent(roots, timeout)`: one client for every attempt, each failure one line.
+pub fn https(
+    roots: &[CertificateDer<'static>],
+    timeout: Duration,
+) -> impl Fn(&str) -> Result<Vec<u8>, String> {
+    let agent = agent(roots, timeout);
+    move |url| download_with(&agent, url).map_err(|e| e.to_string())
+}
+
+/// The bytes of the first of `urls` whose download has SHA-256 `sha256`, round after round,
+/// `pause` waiting the [`WAITS`] before each round, and where they came from:
+/// `<url> has SHA-256 <hex>`, with the attempts that failed before it. `Err` is every attempt,
+/// in order: its URL and why it failed (an error of `get`, or a download of other bytes).
+pub fn first_pinned(
+    urls: &[String],
+    sha256: &Sha256,
+    get: Get<'_>,
+    pause: &dyn Fn(Duration),
+) -> Result<(Vec<u8>, String), Vec<String>> {
+    let mut attempts = Vec::new();
+    for wait in WAITS {
+        pause(wait);
+        for url in urls {
+            let failed = match get(url) {
+                Ok(bytes) if Sha256::of(&bytes) == *sha256 => {
+                    let mut line = format!("{url} has SHA-256 {sha256}");
+                    if !attempts.is_empty() {
+                        line.push_str(&format!(
+                            ", after {} failed: {}",
+                            attempts.len(),
+                            attempts.join("; ")
+                        ));
+                    }
+                    return Ok((bytes, line));
+                }
+                Ok(bytes) => format!("SHA-256 {}, not the pinned one", Sha256::of(&bytes)),
+                Err(why) => why.replace(['\r', '\n'], " "),
+            };
+            attempts.push(format!("{url}: {failed}"));
+        }
+    }
+    Err(attempts)
+}
+
+/// What [`fetch_cached`] installs, and from where.
+pub struct Cached<'a> {
+    /// The URLs to download from on a miss, in order.
+    pub urls: &'a [String],
+    /// The SHA-256 of the download (before unpacking).
+    pub sha256: &'a Sha256,
+    /// How the file comes out of the download.
+    pub unpack: &'a Unpack,
+    /// The file to install.
+    pub out: &'a Path,
+    /// The file the actions cache restores and saves: the download as fetched.
+    pub cache: &'a Path,
+}
+
+/// Installs `req.out` from the download in `req.cache` when it is there, else from the first of
+/// `req.urls` that gives the pinned bytes ([`first_pinned`]), kept in `req.cache`: the line to
+/// print, which says whether the cache hit.
+pub fn fetch_cached(
+    req: &Cached<'_>,
+    get: Get<'_>,
+    pause: &dyn Fn(Duration),
+) -> Result<String, Error> {
+    let cache_error = |e: std::io::Error| Error::Cache {
+        path: req.cache.to_owned(),
+        why: e.to_string(),
+    };
+    let (bytes, from) = match std::fs::read(req.cache) {
+        Ok(bytes) => {
+            let actual = Sha256::of(&bytes);
+            if actual != *req.sha256 {
+                return Err(Error::CachedMismatch {
+                    path: req.cache.to_owned(),
+                    expected: *req.sha256,
+                    actual,
+                });
+            }
+            let from = format!(
+                "the cache hit: {} has SHA-256 {actual}; nothing was downloaded",
+                req.cache.display()
+            );
+            (bytes, from)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let (bytes, line) =
+                first_pinned(req.urls, req.sha256, get, pause).map_err(|attempts| {
+                    Error::Unavailable {
+                        cache: req.cache.to_owned(),
+                        attempts,
+                    }
+                })?;
+            write_file(req.cache, &bytes, 0o644).map_err(cache_error)?;
+            let from = format!("the cache missed: {line}; kept in {}", req.cache.display());
+            (bytes, from)
+        }
+        Err(e) => return Err(cache_error(e)),
+    };
+    install(&bytes, req.sha256, req.unpack, req.out)?;
+    Ok(format!("ok: {from}; installed {}", req.out.display()))
+}
+
 /// The file `out` is written as before it is renamed over `out`.
 pub fn part_path(out: &Path) -> PathBuf {
     let mut part = out.as_os_str().to_owned();
@@ -321,3 +533,6 @@ fn zip_member(zip: &[u8], member: &Path) -> Result<Vec<u8>, Error> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cache_tests;

@@ -1,0 +1,28 @@
+[package]
+name = "kbf-pg-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kbf-state = { workspace = true, features = ["postgres"] }
+# The client's own reading of the URL, for the hosts, ports, role and database a
+# `.pgpass` line is matched against (`PostgresConfig` keeps them to itself).
+postgres.workspace = true
+percent-encoding.workspace = true
+# The effective uid a password file must be owned by, and its non-blocking open.
+rustix = { workspace = true, features = ["fs", "process"] }
+thiserror.workspace = true
+# The role the client logs in as when the URL names none (the client asks whoami too).
+whoami.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+# Scratch directories the tests own (kbf_testkit::dir).
+kbf-testkit.workspace = true
+
+[lints]
+workspace = true
