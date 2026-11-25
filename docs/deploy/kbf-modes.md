@@ -177,7 +177,9 @@ until it ends, and answers the operation. Stopping the
 frontend cancels nothing: its jobs run on, and over a `--state-store` another frontend, or the same
 one restarted, takes the operations up (below). A Linux job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
 the job's arguments are the tool's flags and nothing is mounted into the container. It names no
-cores and no memory: it carries a `size-class` label, the action's build target, the words of its
+cores and no memory: it carries a `history_key`, the action's build target and the words of its kind as
+they are (`root//crates/kbf-server:kbf-server rustc`; the client's `target_id` and `action_mnemonic` when it
+sends both, which Buck2 does not), under which the job service keeps its history, and a `size-class` label, the action's build target, the words of its
 kind (below) and whether it is a test run (`rustc` building `root//crates/kbf-server:kbf-server` is
 `root.crates.kbf-server.kbf-server.rustc.build`, so one target's compile, link, gate and coverage
 actions are each their own class; an action whose output paths name no target is `shape.` and its

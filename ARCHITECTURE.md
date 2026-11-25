@@ -144,7 +144,8 @@ is answered `FAILED_PRECONDITION`: running actions is the frontend's (`kbf --mod
 
 **Where an action runs.** Every Execute that the action cache does not answer runs as one job of
 the jobscheduler's job service, submitted at once by the frontend's executor (`--executor
-js-agent`, the only value) with no CPU or memory, the build target and what runs as its size-class label and
+js-agent`, the only value) with no CPU or memory, the build target and what runs as its history key
+(`<target> <action kind>` as they are, the job's `history_key`) and as its size-class label, and
 the action's kind (what runs) as its size-fallback label.
 kbf does not schedule: how many jobs run, where and when is the job service's. The executor
 reads each job back at once, then while it has not started at waits from 10 ms doubling up to

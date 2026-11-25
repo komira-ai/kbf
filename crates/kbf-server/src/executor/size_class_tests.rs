@@ -1,3 +1,5 @@
+use kbf_front::ActionLabel;
+
 use super::{SizeClass, fnv1a, written};
 use crate::action_usage::Shape;
 
@@ -367,4 +369,135 @@ fn a_kind_never_meets_a_targets_or_a_shapes_class() {
     assert!(head.ends_with("tool.build.kind"), "{kind:?}");
     assert_eq!(hash.len(), 16, "{kind:?}");
     assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()), "{kind:?}");
+}
+
+/// What a client that sends neither a target nor an action kind sends (Buck2 sends none).
+fn none_sent() -> ActionLabel {
+    ActionLabel::default()
+}
+
+/// What a client sends that names `target` and `mnemonic`.
+fn sent(target: Option<&str>, mnemonic: Option<&str>) -> ActionLabel {
+    ActionLabel {
+        target: target.map(str::to_owned),
+        mnemonic: mnemonic.map(str::to_owned),
+    }
+}
+
+/// A compile, by `program`, of `root//crates/<pkg>:<pkg>` under `buck-out`.
+fn compile_of(program: &str, pkg: &str) -> SizeClass {
+    let out = format!("buck-out/v2/art/root/{CFG}/crates/{pkg}/__{pkg}__/lib.rlib");
+    SizeClass::of_action(&shape(&[program, "src/lib.rs", "-o", &out], &[&out]))
+}
+
+/// Asserts that with nothing sent, a build's history key is its target's label and the kind's
+/// words as they are (`root//crates/kbf-server:kbf-server rustc`, against the class
+/// `root.crates.kbf-server.kbf-server.rustc.build`), a target's test run is a key of its own
+/// (`... test`), and two builds of the target (other configuration, other inputs) are one key.
+/// Catches a key written as a label value (lowered, dotted), one that holds a configuration
+/// hash and so never repeats, and a test run sharing its compile's history.
+#[test]
+fn a_history_key_is_the_target_and_kind_as_they_are_and_a_test_is_its_own() {
+    let built = compile_of("rustc", "kbf-server");
+    assert_eq!(
+        built.history_key(&none_sent()).as_deref(),
+        Some("root//crates/kbf-server:kbf-server rustc")
+    );
+    let out = "buck-out/v2/art/root/0123456789abcdef/crates/kbf-server/__kbf-server__/lib.rlib";
+    let again = SizeClass::of_action(&shape(&["rustc", "src/other.rs", "-o", out], &[out]));
+    assert_eq!(
+        again.history_key(&none_sent()),
+        built.history_key(&none_sent())
+    );
+    let mojo = format!("buck-out/v2/art/komira/{CFG}/src/json/__json__/json.mojoc");
+    let compiled = SizeClass::of_action(&shape(&["mojo_compile", "a.mojo", "-o", &mojo], &[&mojo]));
+    assert_eq!(
+        compiled.history_key(&none_sent()).as_deref(),
+        Some("komira//src/json:json mojo_compile")
+    );
+    let binary = format!("buck-out/v2/art/root/{CFG}/crates/kbf-server/__kbf-server__/test");
+    let run = SizeClass::of_action(&shape(
+        &[&binary, "--test-threads=1"],
+        &["buck-out/v2/test/execution/root/0123456789abcdef/fedcba9876543210/default/o"],
+    ));
+    assert_eq!(
+        run.history_key(&none_sent()).as_deref(),
+        Some("root//crates/kbf-server:kbf-server root/crates/kbf-server/__kbf-server__/test test")
+    );
+}
+
+/// Asserts that a target too long for a label value keeps its whole name in the history key,
+/// while its class is cut and hashed. Catches the key cut or hashed as the label is, which is
+/// what made the farm's logs unreadable.
+#[test]
+fn a_long_targets_history_key_is_whole_where_its_class_is_cut() {
+    let pkg = "very_long_package_name/".repeat(3);
+    let out = format!("buck-out/v2/art/root/{CFG}/komira/crates/{pkg}__integration__/o");
+    let built = SizeClass::of_action(&shape(&["cc"], &[&out]));
+    let key = built.history_key(&none_sent()).expect("a key");
+    assert_eq!(
+        key,
+        format!(
+            "root//komira/crates/{}:integration cc",
+            pkg.trim_end_matches('/')
+        )
+    );
+    assert!(built.as_str().len() <= 63 && built.as_str().contains('-'));
+}
+
+/// Asserts that an action whose paths name no target, one with no program (no kind) and one
+/// whose target is not printable ASCII have no history key of their own: the job is sent none
+/// and its class label sizes it. Catches a key invented from the shape's hash, and a key the
+/// job service would refuse, which would fail the action.
+#[test]
+fn an_action_with_no_target_no_kind_or_an_unprintable_target_has_no_key_of_its_own() {
+    let no_target = SizeClass::of_action(&shape(&["cc", "-c", "a.c"], &["out/a.o"]));
+    assert_eq!(no_target.history_key(&none_sent()), None);
+    let out = format!("buck-out/v2/art/root/{CFG}/pkg/__t__/o");
+    let no_kind = SizeClass::of_action(&shape(&[], &[&out]));
+    assert_eq!(no_kind.history_key(&none_sent()), None);
+    let accented = format!("buck-out/v2/art/root/{CFG}/pkg/__été__/o");
+    let unprintable = SizeClass::of_action(&shape(&["cc"], &[&accented]));
+    assert!(
+        unprintable.as_str().starts_with("root.pkg"),
+        "{unprintable:?}"
+    );
+    assert_eq!(unprintable.history_key(&none_sent()), None);
+}
+
+/// Asserts that a client that sends both a target and an action kind names the key
+/// `<target_id> <action_mnemonic>` as sent, for an action with a key of its own and for one
+/// without; that one that sends only one of them, or a pair that is no key (a line break, a
+/// byte above ASCII, more than 512 bytes together), leaves the key the paths give; and that a
+/// pair of exactly 512 bytes is sent whole. Catches a half-sent pair mixed with the paths' words,
+/// a key the job service would refuse, and one cut to fit.
+#[test]
+fn a_target_and_kind_the_client_sent_name_the_key_when_both_make_one() {
+    let built = compile_of("rustc", "kbf-server");
+    let own = built.history_key(&none_sent());
+    let both = sent(Some("//app/Server:server"), Some("CppCompile"));
+    assert_eq!(
+        built.history_key(&both).as_deref(),
+        Some("//app/Server:server CppCompile")
+    );
+    let no_target = SizeClass::of_action(&shape(&["cc", "-c", "a.c"], &["out/a.o"]));
+    assert_eq!(
+        no_target.history_key(&both).as_deref(),
+        Some("//app/Server:server CppCompile")
+    );
+    let longest = format!("//{}:t", "p".repeat(512 - "//:t Compile".len()));
+    let at_bound = sent(Some(&longest), Some("Compile"));
+    let key = built.history_key(&at_bound).expect("a key");
+    assert_eq!((key.len(), key), (512, format!("{longest} Compile")));
+    let over = format!("{longest}p");
+    for half in [
+        sent(Some("//app:server"), None),
+        sent(None, Some("CppCompile")),
+        sent(Some("//app:ser\nver"), Some("CppCompile")),
+        sent(Some("//app:serveré"), Some("CppCompile")),
+        sent(Some(&over), Some("Compile")),
+    ] {
+        assert_eq!(built.history_key(&half), own, "{half:?}");
+    }
+    assert_eq!(no_target.history_key(&sent(Some("//a:b"), None)), None);
 }

@@ -156,7 +156,13 @@ async fn prepared_as(case: Case) -> (Result<super::Prepared, Settled>, Vec<Input
         ingest: &ingest_dyn,
         ..harness.preparer()
     };
-    let job = prepare(&ctx, RUN, (&action(), None), case.booking).await;
+    let job = prepare(
+        &ctx,
+        RUN,
+        (&action(), None, &kbf_front::ActionLabel::default()),
+        case.booking,
+    )
+    .await;
     (job, ingest.asked())
 }
 

@@ -27,6 +27,8 @@ hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["service", "tokio"] }
 # The messages of the job service the host executor submits jobs to (src/executor).
 js-proto.workspace = true
+# The rule of the job's history key (`js_types::HistoryKey`, src/executor/size_class.rs).
+js-types.workspace = true
 kbf-auth.workspace = true
 kbf-ca.workspace = true
 kbf-front.workspace = true

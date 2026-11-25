@@ -254,12 +254,13 @@ init-script helpers, the libraries only those use, and util-linux's `su`, so the
 | `command` | `/.kbf-tools/kbf-task`, the whole program; there is no image entrypoint | empty: the image's entrypoint |
 | `args` | the task's flags, with `--tree` | the task's flags |
 | `env` | empty | the same |
-| `needs` | `cpu_millis` and `memory_bytes` 0, sized by the job service from the `size-class` label's history (3.5); no `disk_bytes` (D4) | the same |
+| `needs` | `cpu_millis` and `memory_bytes` 0, sized by the job service from the history kept under `history_key` (else the `size-class` label's, 3.5); no `disk_bytes` (D4) | the same |
 | `constraints` | `os=linux`, the configured `arch`, contained | the same |
 | `wall_limit_seconds` | the action's timeout plus the run margin | the same |
 | `network` | `none` (3.6) | the operator's level, default allow-list |
 | host ports passed through | one: the node's tierstore loopback port, at the same port on the job's loopback (5.2) | none |
 | `files` | the output write grant (5.2; no read grant: nothing is read over the network) | the read grant and the PUT URLs |
+| `history_key` | `<target> <action kind>` as they are (3.5) | the same |
 | `labels` | `kbf-frontend`, `kbf-instance`, `size-class` (3.5) | the same |
 
 **The tree is fixed in the prepared spec.** It is built once, in the executor's `prepare`, from the base tree of the
@@ -276,7 +277,12 @@ start is a question for jobscheduler (section 13).
 target, read from its own `buck-out` paths, the words of its kind (what runs: the program and a subcommand or flag of
 it) and its mode, a test run or a build: `<target> <kind words> build` or `<target> <kind words> test` (`<target> build`
 or `<target> test` for an action with no program) written as a label value (`crates/kbf-server/src/executor/size_class.rs`), or `shape.<key>` for an action whose paths
-name no target. A `whole_machine` job books a whole host and carries no class. A Mac job names the farm's booking (the
+name no target. The job's `history_key`, which the job service keeps the class's history under ahead of the label, is
+the same class written as it is, never lowered, cut or hashed: `<target> <action kind>` (`komira//src/json:json
+mojo_compile`; a test run's kind ends in `test`). The target and the kind are the client's when its Execute's
+`RequestMetadata` names both (`target_id`, `action_mnemonic`); Buck2 names neither, so for Buck2 they are the action's own
+paths'. A key that is not 1 to 512 bytes of printable ASCII is not sent, and an action with no target or no program has
+none. A `whole_machine` job books a whole host and carries no class and no key. A Mac job names the farm's booking (the
 hard cap a daemon would set) beside its class: the cold size of a class is taken from the largest host the job service
 knows. `disk_bytes` is dropped (D4): O4, and while kbf books
 it js-sched places a kbf job only on a host reporting `disk-gib` (kbf#2287 item 3). A tree's bytes are in tierstore's

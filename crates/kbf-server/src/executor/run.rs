@@ -55,7 +55,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use js_proto::v1::{Job, JobResult, JobSpec, JobState};
-use kbf_front::{Arrival, DecodedAction, Finished, Stage};
+use kbf_front::{ActionLabel, Arrival, DecodedAction, Finished, Stage};
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::{self, ActionResult};
 use kbf_types::{ActionKey, OperationId};
@@ -91,6 +91,8 @@ pub(crate) struct Op {
     /// The Action and Command the Execute that opened it decoded; none for an operation taken
     /// up from the state store, whose runs read them from the CAS.
     decoded: Option<Arc<DecodedAction>>,
+    /// The target and action kind its Execute's client sent; none taken up from the store.
+    sent: ActionLabel,
     /// Whether a recorded call waits on it.
     recorded: bool,
     /// When the executor opened it for the Execute that came.
@@ -110,7 +112,7 @@ impl Op {
     pub(crate) fn new(
         id: OperationId,
         key: ActionKey,
-        (whole_machine, decoded): (bool, Option<Arc<DecodedAction>>),
+        (whole_machine, decoded, sent): (bool, Option<Arc<DecodedAction>>, ActionLabel),
         recorded: bool,
         reapi: Option<Arrival>,
     ) -> Self {
@@ -119,6 +121,7 @@ impl Op {
             key,
             whole_machine,
             decoded,
+            sent,
             recorded,
             created: Instant::now(),
             arrived: SystemTime::now(),
@@ -398,7 +401,7 @@ async fn fresh(
     let prepared = tokio::select! {
         biased;
         () = cancel_asked(cancel) => return Ended::Cancelled,
-        prepared = timeout(inner.cfg.prepare_limit, prepare(&preparer, run, (&action, op.decoded.as_deref()), booking)) => prepared,
+        prepared = timeout(inner.cfg.prepare_limit, prepare(&preparer, run, (&action, op.decoded.as_deref(), &op.sent), booking)) => prepared,
     };
     let prepared = match prepared {
         Ok(Ok(prepared)) => prepared,
