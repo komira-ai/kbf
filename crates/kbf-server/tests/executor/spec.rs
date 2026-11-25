@@ -2,7 +2,7 @@
 //! flags, and what the executor refuses to submit at all.
 
 use js_proto::v1::{ExecMode, NetworkLevel, Shape};
-use kbf_front::Finished;
+use kbf_front::{ActionLabel, Finished};
 use kbf_job_client::fake::{Fault, Machine};
 use kbf_server::executor::{MintError, TASK_IN_TREE};
 use tonic::Code;
@@ -95,6 +95,30 @@ async fn a_job_holds_no_image_port_file_network_or_secret() {
     ] {
         assert!(!spec.args.iter().any(|a| a == flag), "{flag} was passed");
     }
+}
+
+/// Asserts that a job whose Execute's client sent no target or action kind (as Buck2 sends
+/// none) is sent the history key its action's own paths give, `<target> <kind words>` as they
+/// are (`root//pkg:t cc`: never lowered, cut or hashed as the `size-class` label is), and that
+/// one whose client sent both is sent `<target_id> <action_mnemonic>` as sent, from the
+/// Execute through the executor to the submitted job. Catches the client's metadata dropped
+/// before the job is made, a job sent no key, and a key written as a label value.
+#[tokio::test]
+async fn a_job_is_sent_its_history_key_from_the_client_else_from_its_paths() {
+    let rig = Rig::start(&[HOST], |_| {}).await;
+    let (_caller, job) = submitted(&rig).await;
+    assert_eq!(job.spec.history_key, "root//pkg:t cc");
+    assert_eq!(
+        job.spec.labels.get("size-class").map(String::as_str),
+        Some("root.pkg.t.cc.build")
+    );
+    let sent = ActionLabel {
+        mnemonic: Some("CppCompile".to_owned()),
+        target: Some("//app/Server:server".to_owned()),
+    };
+    rig.submit_sent(4, sent);
+    let job = rig.first_job(4).await;
+    assert_eq!(job.spec.history_key, "//app/Server:server CppCompile");
 }
 
 /// Catches a job the preparation refuses (an input not held, a tree over budget) being run

@@ -39,7 +39,8 @@ sequenceDiagram
 
 - **Joining.** An Execute of an action that is open on this frontend joins its operation: one job, every caller answered.
 - **The job.** As before ([jobs-on-jobscheduler-and-tierstore.md](jobs-on-jobscheduler-and-tierstore.md)): the kbf image or the
-  action tree, no CPU and no memory, labelled `size-class` with the build target, its kind's words and whether it is a test (the job
+  action tree, no CPU and no memory, its `history_key` the build target and its kind as they are (the client's `target_id` and
+  `action_mnemonic` when it sends both), labelled `size-class` with the build target, its kind's words and whether it is a test (the job
   service sizes it from that class's history), `size-fallback` with its kind, what runs (whose history sizes it while the class
   has too few runs; jobscheduler's `docs/design/sizing.md`, section 7.8), `kbf-frontend` and `kbf-instance`. A platform that names `kbf-lease=whole_machine` gets a whole host.
 - **The id.** `k<first 8 hex of sha256(--executor-frontend-id)>-<operation>-<attempt>`: a submit whose answer was lost is sent

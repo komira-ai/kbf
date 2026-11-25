@@ -2048,6 +2048,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "js-proto",
+ "js-types",
  "kbf-auth",
  "kbf-ca",
  "kbf-caps",

@@ -318,6 +318,8 @@ pub(super) struct MacJob<'a> {
     pub(super) wall_seconds: u64,
     /// The labels of every job.
     pub(super) labels: BTreeMap<String, String>,
+    /// The key the job's usage history is kept under (`SizeClass::history_key`); empty for none.
+    pub(super) history_key: String,
 }
 
 /// The Mac job of `job`: the pool's task bundle, whose entrypoint runs, the tree (from
@@ -350,7 +352,7 @@ pub(super) fn mac_spec(job: MacJob<'_>) -> JobSpec {
         files: Vec::new(),
         priority: 0,
         labels: job.labels,
-        history_key: String::new(),
+        history_key: job.history_key,
     }
 }
 
