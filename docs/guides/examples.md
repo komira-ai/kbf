@@ -277,15 +277,23 @@ kbf --mode=frontend \
     --executor=js-agent
 ```
 
-The executor needs more flags (`--executor-job-url`, `--executor-job-token-file`, the base image
-and base tree); they are listed in [kbf-modes.md](../deploy/kbf-modes.md) and
+The executor needs more flags, and the frontend refuses to start without them:
+`--executor-job-url`, `--executor-job-token-file`, `--executor-frontend-id`,
+`--executor-base-image`, `--executor-kbf-image` and `--executor-base-tree`; the pack store
+(`--pack-index`, `--pack-store-endpoint`, `--pack-store-bucket` and
+`--pack-store-credentials-file`), which keeps the outputs the jobs write; and
+`--task-secret-file` with `--task-out-root`. They are listed in
+[kbf-modes.md](../deploy/kbf-modes.md) and
 [job-service-cutover.md](../deploy/job-service-cutover.md).
 
 - `--listen` is the REAPI address your clients use. Without `--reapi-tls-cert` and
   `--reapi-tls-key` it serves plain text on any address, and off loopback the start line warns.
 - Without the TLS flags the storage node serves plain text and its address must be loopback;
   off one machine, give both processes the certificate flags.
-- `--cold-store=file://...` is a directory, so the box needs no S3 service and holds no key.
+- `--cold-store=file://...` is a directory, so the storage node needs no S3 service and holds
+  no key. The frontend's executor does need one: the pack store is an S3-compatible store
+  (for example MinIO) reached over `http://` (an `https://` endpoint is refused: S3 over TLS is
+  not built yet), with its key pair in a JSON file only its owner can read.
   Add `--hot-store=file:///fast/kbf` to the storage node to put a fast disk in front of it.
 - `--state-store` names where the executor keeps its open operations and finished answers: a Postgres URL. A `sqlite://` store still starts in
   this release and logs a warning that it is removed in the next.

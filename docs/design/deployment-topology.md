@@ -1,5 +1,7 @@
 # Deployment topology
 
+> **Superseded on 2026-11-12** for the servers by the frontend with no storage node (komira-ai/kbf#2317: blobs in packs, the pack index and the action table in the Postgres state store) and by [architecture-v2.md](architecture-v2.md): frontends are stateless on one Postgres state store behind a load balancer or `kbf-proxy`, storage is placed by digest with no leader, and each storage node's metadata log is single-voter. The three-voter Raft log, the leader and its followers below are no longer the direction ([ARCHITECTURE.md](../../ARCHITECTURE.md#several-frontends-no-leader)). This page records the earlier plan.
+
 > **kbf-daemon is deleted.** The daemon and its `--server` list are gone with it; sections that say how daemons reach servers are records. Placed actions run only as js-agent jobs, and a storage node runs `kbf --mode=storage`.
 
 This document records the shape the maintainers decided for running kbf with more
