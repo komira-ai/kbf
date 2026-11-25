@@ -115,11 +115,12 @@ MemoryMin=16G
 MemorySwapMax=0
 OOMScoreAdjust=-925
 CPUWeight=300
-# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for the bucket, mode 0600: a secret
-# never goes on the command line.
-EnvironmentFile=/etc/kbf/s3.env
+# The bucket's key pair is the JSON file of --cold-store-credentials-file
+# ({"access_key_id": "...", "secret_access_key": "..."}, owned by kbf-server, mode 0600 or
+# 0400, not a link): a secret never goes on the command line.
 ExecStart=/usr/local/bin/kbf-server \
     --cold-store=s3://kbf?endpoint=http://127.0.0.1:9000&conditional-put=true \
+    --cold-store-credentials-file=/etc/kbf/cold-store-keys.json \
     --meta-dir=/var/lib/kbf-server/raft \
     --listen=<storage host address>:8980 \
     --reapi-tls-cert=/etc/kbf/reapi.pem \
