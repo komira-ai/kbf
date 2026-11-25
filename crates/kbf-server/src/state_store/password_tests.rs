@@ -50,7 +50,7 @@ fn messages(text: &str) -> Vec<String> {
 fn has_password(args: &Args) -> bool {
     match &args.state_store {
         Some(StateStoreUri::Postgres(url)) => url.config.has_password(),
-        other => panic!("not a Postgres store: {other:?}"),
+        _ => panic!("not a Postgres store"),
     }
 }
 

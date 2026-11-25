@@ -571,10 +571,8 @@ fn an_invalid_config_file_is_refused_without_its_text() {
     std::fs::write(&path, "database = postgres://u:PW@h/x\n").expect("write");
     let err = crate::database::Database::from_installer_toml(&path).expect_err("not toml");
     let shown = format!("{err} {err:?}");
-    assert!(
-        !shown.contains("PW") && !shown.contains("postgres:"),
-        "{shown}"
-    );
+    // The text is not printed on failure: it is the thing that must hold no secret.
+    assert!(!shown.contains("PW") && !shown.contains("postgres:"));
 }
 
 /// Catches a config path outside the config directory: each file sits directly in the
@@ -642,8 +640,22 @@ fn the_database_password_file_reaches_setup_installer_toml_and_kbf_toml() {
     let server = Server::fresh();
     let mut exec = released(host(), Platform::Linux);
     put(&mut exec, PW, 0o600, KBF_SERVER, "hunter2\n");
-    let mut flags = raw(Mode::Frontend);
-    flags.kbf.database_password_file = Some(PW.to_owned());
+    // The command line, parsed as `setup` parses it, and taken as `setup` takes it.
+    #[derive(clap::Parser)]
+    struct Line {
+        #[command(flatten)]
+        setup: crate::cli::SetupArgs,
+    }
+    let line = <Line as clap::Parser>::try_parse_from([
+        "setup".to_owned(),
+        "--mode=frontend".to_owned(),
+        format!("--database={DATABASE}"),
+        format!("--database-password-file={PW}"),
+        "--storage-url=http://127.0.0.1:8990".to_owned(),
+    ])
+    .expect("the flags parse");
+    let mut flags = crate::setup::raw_from(&line.setup);
+    assert_eq!(flags.kbf.database_password_file.as_deref(), Some(PW));
     go_on(&FakeOs::linux(), &mut exec, &server, &flags, APPLY).expect("setup");
     let with = format!("{DATABASE} with the password of {PW}");
     assert_eq!(

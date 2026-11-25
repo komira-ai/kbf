@@ -8,8 +8,7 @@ use kbf_pg_auth::{AuthError, Context, FileFlaw, Source};
 
 use super::{DatabaseError, installer_database};
 
-const URL: &str =
-    "postgres://db.example/kbf?user=kbf&sslmode=verify-full&sslrootcert=/etc/kbf/ca.pem";
+const URL: &str = "postgres://db.example/kbf?user=kbf&sslmode=require";
 
 /// A context with this euid, the given PGPASSWORD and no libpq file.
 fn context(pgpassword: Option<&str>) -> Context {

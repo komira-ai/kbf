@@ -10,8 +10,7 @@ use kbf_testkit::dir::TestDir;
 use super::{BAD_INDEX_URL, INDEX_PASSWORD, index_config};
 use crate::error::Error;
 
-const URL: &str =
-    "postgres://db.example/kbf?user=kbf&sslmode=verify-full&sslrootcert=/etc/kbf/ca.pem";
+const URL: &str = "postgres://db.example/kbf?user=kbf&sslmode=require";
 
 fn context(pgpassword: Option<&str>, passfile: Option<PathBuf>) -> Context {
     Context {
