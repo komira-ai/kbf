@@ -70,8 +70,8 @@
 //! store has no Execute, so its key is always the paths'.
 //!
 //! The words are written as `js_types::SizeClass::of_target` writes them, byte for byte, by a
-//! copy of its rule here: the jobscheduler revision this workspace takes predates it. The tests
-//! hold the copy to jobscheduler's own examples and hashes.
+//! copy of its rule here (`written`), which the tests hold to jobscheduler's own examples and
+//! hashes.
 
 use js_types::HistoryKey;
 use kbf_front::ActionLabel;
@@ -81,9 +81,8 @@ use crate::action_usage::Shape;
 /// The label whose value names a job's class: jobscheduler's `js_types::SIZE_CLASS_LABEL`.
 pub(crate) const SIZE_CLASS_LABEL: &str = "size-class";
 
-/// The label whose value names a job's fallback class, its kind: `js_types::SIZE_FALLBACK_LABEL`
-/// of jobscheduler's main, copied here since the jobscheduler revision this workspace takes
-/// predates it.
+/// The label whose value names a job's fallback class, its kind: jobscheduler's
+/// `js_types::SIZE_FALLBACK_LABEL`.
 pub(crate) const SIZE_FALLBACK_LABEL: &str = "size-fallback";
 
 /// Longest label value, in bytes.
