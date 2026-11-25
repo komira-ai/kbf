@@ -23,7 +23,7 @@ Line references are to these trees, as read:
 | repository | commit |
 |---|---|
 | komira-ai/kbf | `21da3803a` |
-| komira-ai/tierstore | `99d5d3c73` |
+| komira-ai/tierstore | `a8607f0` |
 | komira-ai/jobscheduler | `94e91073c` |
 
 ## 1. What happens today
@@ -112,7 +112,7 @@ Line references are to these trees, as read:
   2. `Core::resolve` reads the name as a digest (`treefs/core/implicit.rs:53-58`).
   3. The tree is attached by `read_tree` (`treefs/core/placed.rs:233-293`).
   4. `read_tree` fetches the manifests level by level through the fill socket. One bound covers the
-     whole read: `TREE_READ`, 30 s (`placed.rs:60-68`, from komira-ai/tierstore#404).
+     whole read: `TREE_READ`, 30 s (`placed.rs:60-67`, from komira-ai/tierstore#404).
 - **An absent root answers ENOENT.** When the upstream answers `upstream 404` for the root manifest
   itself, the result is `Unread::Gone` (`placed.rs:277-289`), which becomes `ENOENT`
   (`Core::refusal`, `implicit.rs:270-279`).
@@ -255,7 +255,7 @@ Every option must keep three properties:
   | bound | value |
   |---|---|
   | `W` | 10 s |
-  | `TREE_READ` (`placed.rs:68`) | 30 s |
+  | `TREE_READ` (`placed.rs:67`) | 30 s |
   | the agent's `LOOKUP_MS` (`crun/fs/mod.rs:69`), queue wait included | 60 s |
   | the job service's start timeout | 900 s |
 
@@ -264,21 +264,25 @@ Every option must keep three properties:
     (failure table below).
 - **The rests.** 10 ms first, doubling, at most 100 ms (decision D3). A start that finds its root
   stored on the first try, which is most of them (section 4), pays nothing.
+- **Where the waiting lookup runs.**
+  - A `.writing` lookup makes its first try on the fetch pool, like any lookup.
+  - Only if the root is missing does it move to a deadline queue. A small pool of its own serves
+    that queue, one try at a time, so no thread is held for a whole wait.
+  - At most 16 lookups wait at once; one past that is answered `ENOENT` at once. Section 5.2 gives
+    the reasons.
 - **The cost while it waits.**
-  - The waiting lookup holds one of the agent's 4 `js-lookups` threads and one of tierstore's 16
-    fetch threads.
-  - So 4 lookups waiting on one host delay every other start's lookups on that host by up to `W`.
-  - The fetch threads also serve running jobs' opens of files the node does not hold yet
-    (`treefs/fetches.rs:1-18`). 4 waiting lookups would hold a quarter of them, so running jobs'
-    cold opens can slow too.
-  - That is the price of the option. Section 4 estimates how often it is paid, and task 4 measures
-    both pools.
+  - The waiting lookup holds one of the agent's 4 `js-lookups` threads, which is the price of the
+    option. Section 4 estimates how often it is paid, and section 5.2 how much it adds.
+  - It holds no fetch thread. So attaches of stored trees, and running jobs' opens of files the
+    node does not hold yet, never wait behind it.
+  - It holds no tree in memory: a root that is not there yet has nothing to read. Section 5.1
+    gives what the trees a host does hold cost.
 - **Two names, one tree.**
   - `<digest>` and `<digest>.writing` resolve to the same tree number and directory inode.
   - Lookups of one digest under its two names can now read and attach at the same time.
-    - The `read_ahead` doc assumes one lookup per name (`implicit.rs:88-93`).
+    - The `read_ahead` doc assumes one lookup per name (`implicit.rs:77-82`).
     - The attach that loses the race must keep the winner's number (`attach_read`,
-      `implicit.rs:125-146`). Task 1 tests that.
+      `implicit.rs:124-146`). Task 1 tests that.
   - The agent opens the host path once and keeps the descriptor, never the path.
     - The open: `crates/js-agent/src/crun/fs/mod.rs:581-603`. The `--mount-root` row of
       `crates/js-agent/src/lib.rs:107` says a path is "bound by what was opened, never by its path".
@@ -549,7 +553,202 @@ per-job sums, so it is larger than the sums of medians above: the segments' tail
 - **No numbers for the Macs.** The Macs ran many of the window's jobs, but their agents' logs were
   not in the data, so they have no per-job join. Their saving is not estimated.
 
-## 5. Comparison and recommendation
+## 5. Option (a) on a host: tree memory and threads
+
+Before any task of (a) starts, two host-side questions need answers:
+- what a host's attached trees cost in memory;
+- how many lookups can wait at once without starving the attaches of trees already stored.
+
+The figures in this section have three sources:
+- **The attach lines.** tierstore's `lookup of <digest>: ok in <ms> ms; <K> manifests` lines on two
+  Linux hosts, 16:40-18:08Z on 2026-11-24: 2,434 attaches of 2,283 distinct trees. These are the
+  hosts called *A* and *B* below.
+- **The base tree.** The base-tree bundle of the deployed kbf release v0.0.127, which is a release
+  asset.
+- **The frontend's walk counters.**
+
+All of it was read from data already collected. No host was read for this section.
+
+### 5.1 Tree metadata in memory
+
+**How a tree is held.** All of this is read from tierstore code at `a8607f0`.
+
+- **An attached tree of manifests is a flattened index on the heap**
+  (`crates/tierstore/src/server/treefs/tree.rs:22-44`):
+  - one `TreeEntry` per entry;
+  - a table of each directory's children, about 8 bytes per entry.
+  - Nothing of it is mmap-backed. No file under `crates/tierstore/src/server/treefs` maps memory (a
+    grep for `mmap`). A tree there is vectors on the heap, or a tree list read into a buffer
+    (`core/placed.rs:91`).
+  - Each manifest is read whole into a buffer (`core/placed.rs:80-87`) and parsed. The buffer is
+    dropped once it is parsed.
+- **Per entry it costs about 128 bytes plus the name** (inferred). That is 104 bytes of
+  `TreeEntry`, 16 of name header and 8 of tables.
+  - The 104 bytes come from the field layout in `tree_manifest.rs:157-218`. A standalone copy of the
+    types gave the same `size_of`.
+  - tierstore's own estimate of a tree's heap (`Tree::heap_bytes`, `tree.rs:119-123`) uses the same
+    sum.
+  - Its estimate leaves out a file's pack key and a link's target, which a manifest tree allocates
+    per entry. So the real figure is somewhat higher for trees whose files are in packs.
+- **While a tree is read, the peak is about 1.5 times what is kept** (inferred). The parsed
+  manifests of the whole tree live until the flattening ends (`tree_manifest/waves.rs:53-97`).
+- **How long a tree stays.** A tree attached by a lookup stays until no request has named it for
+  `fs.tree_idle_secs`, which is 900 s by default. The sweep runs every 60 s, so a tree stays at most
+  about 960 s after it was last named (`core/memory.rs:1-32`, `core/implicit.rs:39-44`).
+- **Nothing caps tree memory today.**
+  - There is no limit on the count or bytes of trees in memory.
+  - The fs unit has no memory limit (tierstore `docs/design/virtual-build-fs.md:912`).
+  - At each sweep the fs logs the total: `<N> trees in memory, <M> of them attached: <E> entries,
+    about <B> MiB` (`core/memory.rs:441-450`). That line is how a host measures this directly.
+
+**Per tree, over real trees.**
+
+| quantity | p50 | p99 | max | source |
+|---|---|---|---|---|
+| manifests per tree, `K` (distinct directories, root included) | 505 | 2,279 | 2,657 | **measured**: the attach lines, n = 2,339 with `K` > 0 (95 more had `K` = 0) |
+| the base tree every action tree holds | 316 manifests, 2,792 entries, 350,719 bytes of manifests, mean name 9.3 bytes | | | **measured**: the v0.0.127 base-tree bundle, parsed |
+| entries per tree | 4,500-6,600 | 20,000-42,000 | 23,000-50,000 | **inferred**: the base tree plus `K` − 316 action directories at 8.8 to 20.2 entries each. 8.8 is the base tree's own ratio. 20.2 is the frontend's per-walk mean less the base tree: (3,194 − 2,004 files + 378 − 316 directories) over the 62 action directories that leave. The means are `kbf_execute_walk_files_checked_total` and the dir cache's hits and misses, over 8,832 walks. They count distinct files, so they understate repeated ones |
+| manifest bytes per tree | 0.6-0.9 MB | 2.7-5.7 MB | 3.1-6.7 MB | **inferred**: entries × the base tree's 133.6 bytes of manifest per entry: 372,939 bytes over its 2,791 entries below the root, duplicate directories counted each time (125.6 bytes per entry stored once) |
+| index in memory per tree | 0.6-0.9 MB | 2.8-5.8 MB | 3.2-6.9 MB | **inferred**: entries × about 137 bytes |
+
+**Trees a host holds at once.** Inferred. The count is the distinct trees attached in any trailing
+960 s, on the 10 s grid, after each host's tierstore restart. Trees attached by a run, and trees
+named again, stay longer, so this is a floor.
+
+| host | p50 | p99 | max |
+|---|---|---|---|
+| *A* (busier, 1,976 distinct trees) | 343 | 750 | 756 |
+| *B* | 29 | 115 | 166 |
+
+**What that needs, against what the hosts have.** Inferred.
+
+- At *A*'s peak, 756 trees of the mean size need about 0.9-1.6 GB of index. The mean `K` is 934,
+  which gives 8,200-15,300 entries per tree.
+- If every one were as large as the largest tree seen, the bound is about 5.2 GB (756 × 6.9 MB).
+- Each lookup reads one tree, on a fetch thread. With up to 16 reads at once (section 5.2 keeps
+  that), the peak while reading adds at most a few hundred MB.
+- The job service schedules up to 256,000 MiB (about 250 GiB) on that host. That is the limit its
+  `predicted-memory` refusals named during the same measurement, not the host's `MemTotal`. The
+  measurement's notes quote the refusal line; the kept log does not hold it, so it is not
+  re-derived. Against that limit, the trees are 0.3-0.6% at the mean size and 2% at the bound.
+- This is today's cost. Option (a) does not add to it:
+  - a waiting lookup reads nothing until its root is stored;
+  - the tree it then reads is the same tree, under the same number, that a later plain lookup would
+    read;
+  - two names do not make two trees (section 3(a), "Two names, one tree").
+- What (a) adds is per waiting lookup: one queued closure and its FUSE reply, a few hundred bytes.
+
+### 5.2 Fetch threads, and the agent's lookup threads
+
+**What holds what today.**
+
+- **tierstore.** `fs.threads` (16 by default) sets both the FUSE reader threads and the fetch
+  threads (`treefs/serving.rs:84-86,221`).
+  - Every lookup in `trees/` is parked on a fetch thread (`treefs/node_fs.rs:168-173,360-363`). So
+    are the opens that wait for a fill.
+  - The fetch queue is one unbounded FIFO (`treefs/fetches.rs:49-56`).
+- **The agent.** It sends tierstore at most as many lookups at once as its `js-lookups` pool has
+  threads: 4 (`crates/js-agent/src/pool.rs:32`, `crun/fs/mod.rs:283`).
+  - Only the agent opens `trees/<digest>` by name. Jobs see a clone of the opened directory
+    (`job-rootfs.md:584-610`).
+  - A lookup blocked in the kernel keeps its agent thread until the fs answers (`pool.rs:16-17`).
+
+**How many lookups would wait at once.** Inferred from the per-job model of section 4: each joined
+start's `R`, starting at its `dirs` step, on its own host.
+
+| | burst | mid | light |
+|---|---|---|---|
+| starts that would wait (of the joined jobs) | 78 of 963 | 93 of 978 | 112 of 962 |
+| most waiting at one moment on one host | 11 | 10 | 12 |
+| starts on one host in the busiest 10 s, if every one waited the full `W` | 113 | 81 | 76 |
+| waits as a share of the agent's lookup-thread time (sum of `R` / sum of `dirs` → `resolved`) | 9.3% | 1.9% | 8.4% |
+
+- **The worst case:** many starts land before their trees are stored. In the third row's 10 s, 113
+  starts on one host each wait the full 10 s. That is the store failing for every write at once.
+- **Today that would starve the attaches of stored trees.**
+  - Only 4 of those lookups reach tierstore at once, because the agent has 4 threads. The rest
+    queue inside the agent.
+  - Those 4 sit on 4 of tierstore's 16 fetch threads for the whole `W`.
+  - Nothing in tierstore stops another client from parking more: a second agent, a raised agent
+    pool, or a tool.
+  - With 16 parked, every fetch thread sleeps. Every attach of a stored tree, and every running job's
+    open of a file the node must fill, waits up to `W` behind them.
+
+**The bound.** It applies to the `.writing` lookups only (decision D6).
+
+1. **The first try is an ordinary lookup.**
+   - A `.writing` lookup is parked on the fetch pool, as every lookup in `trees/` is today. It makes
+     its first try of the root there.
+   - When the root is stored (most starts, section 4), the attach goes on there as for the plain
+     name. Nothing else differs, and no waits structure is touched.
+2. **Only a lookup that missed waits, and it waits without a thread.**
+   - On `upstream 404` for the root, the fetch thread does not rest. It hands the request (its
+     closure and FUSE reply) to a deadline queue and is free at once.
+   - The queue is served by a small pool, `fs-wait`, of 2 threads. At each due time a waits thread
+     makes one try, which is one fill of one manifest, and puts the request back with its next due
+     time.
+   - A waits thread is held for one try at a time, never for a whole wait.
+3. **A root that appears goes back to the fetch pool for its attach.**
+   - When a try finds the root, the request is parked on the fetch pool again for the attach.
+   - So the waits pool never reads a tree, and at most 16 trees are read at once, as today.
+   - A fetch thread is never held by a wait. Attaches of stored trees, under either name, and
+     running jobs' opens of files the node must fill never queue behind a waiting lookup.
+4. **`W` counts from the first try.**
+   - A request whose `W` has passed is answered `ENOENT` at its next due time, whether or not a try
+     is in flight.
+   - With 2 waits threads and tries of a few ms each, a due time is late by at most a few tries.
+     So a lookup is answered within about `W`, plus one try, plus the attach if the root appeared.
+     The attach is bounded by `TREE_READ`, as any attach is.
+5. **A cap of 16 lookups waiting after a miss.**
+   - Only lookups whose first try missed count against it. A lookup of a stored root never does.
+   - One past the cap is answered `ENOENT` at once, with a rate-limited warning.
+   - The cap bounds the queue's memory and the upstream tries per second: 16 waits at one try per
+     100 ms is at most 160 tries a second.
+   - The cap is a backstop against a client with more threads. The 4-thread agent never reaches it.
+   - Refusing at a lower cap would fail real starts. In the same model, a cap of 2 refuses
+     1.3-3.5% of starts and a cap of 4 refuses 0.6-1.8%. Those are counts of modelled waits that
+     overlap, before the agent's own limit of 4.
+6. **The agent's threads are not bounded by tierstore.**
+   - A waiting start holds one of the agent's 4 for its `R`. In the model that is 1.9-9.3% more
+     lookup-thread time than the attaches already take.
+   - That is a queue for other starts on the host, not a starvation: each wait ends within `W`.
+   - Removing that queue is a matter of the agent's own pool size, its lookup-pool work, not of this
+     design. Task 4 measures it with the pool's queue time (komira-ai/jobscheduler#1068).
+
+**Tests that hold the bounds.** In tierstore, on the existing rigs, with progress by events and the
+injected clock. No wall time is measured.
+
+- **A stored tree is answered while the waits are full.**
+  - Set up 1 fetch thread and 1 waits thread. Fill the queue with waiting `.writing` lookups whose
+    tries are held on a gate.
+  - Then a lookup of a stored tree is answered while they still wait, under the plain name and
+    under `.writing` alike.
+  - This fails if a wait holds the fetch thread.
+  - The rig and the helpers: `node_fs_stall_tests.rs:17-24` `hand`, `fetches_tests.rs:15-50`, and
+    `testing.rs:947-953` `until`.
+- **A found root is attached on the fetch pool.** With the fetch thread held on a gate, a waiting
+  lookup whose root has appeared is not answered until the fetch thread is free. With the waits
+  thread held instead, it is answered.
+- **The cap.**
+  - The 17th lookup to miss is answered `ENOENT` before any gate opens, with the clock unmoved and
+    no try made.
+  - A 17th lookup of a stored root is answered with its tree.
+- **From the first try.** With 1 waits thread held in a try, a second waiting lookup whose `W`
+  passes is answered `ENOENT` at its next due time on the injected clock, not after the held try
+  ends.
+- **Draining.** The fs's drain returns only after every waiting lookup is answered.
+- **Memory.** After a `.writing` lookup of an absent root is answered `ENOENT`, the trees in memory
+  are as before: `footprint()`, `core/memory.rs:388-399`. Once the root is stored, a `.writing`
+  lookup and a plain lookup of the same digest leave one tree in memory, with one tree's
+  `heap_bytes`.
+- **Two traps in the existing rigs**, which the tests must avoid:
+  - `Wire::deliver` waits until no request is parked (`node_fs_tests.rs:316-319`). So the waits
+    pool's count must stay out of `parked()`, or the tests use `hand` and wait on the reply.
+  - `Rig::new`'s pause does nothing and its clock never moves (`testing.rs:646-652`). So the wait
+    tests need a core whose pause moves the clock, such as `core_over` in
+    `core/tree_read_tests.rs:39-69`, moved into `testing.rs`.
+
+## 6. Comparison and recommendation
 
 | | (a) fs waits for a `.writing` name | (b) release call | (c) root first | (d) no change |
 |---|---|---|---|---|
@@ -558,7 +757,7 @@ per-job sums, so it is larger than the sums of medians above: the segments' tail
 | an orphaned job | ends at `W` | sits until a timeout, unless new code releases or cancels it | — | none |
 | contract changes | jobscheduler doc text only; tierstore's fs gains a name form | jobscheduler public API, stored job, start wire, capability | tierstore and kbf invariants | none |
 | saving at the p50, placed at once | about 30 ms (per job), 31-61 ms (medians) | 9-36 ms | 0 | 0 |
-| new cost | up to `W` of a lookup thread per waiting start; one upstream read per rest | a second message on the path with the 10 s tail | correctness | 50-60 ms per start |
+| new cost | up to `W` of an agent lookup thread per waiting start (1.9-9.3% more lookup-thread time, modelled); no fetch thread; no tree memory; one upstream read per rest | a second message on the path with the 10 s tail | correctness | 50-60 ms per start |
 
 **Recommended: (a).**
 
@@ -572,7 +771,7 @@ per-job sums, so it is larger than the sums of medians above: the segments' tail
 **What it leaves.** It is worth doing only with the other start work, because by itself it moves a
 start placed at once from about 0.47 to about 0.44 s.
 
-## 6. Implementation tasks, in order
+## 7. Implementation tasks, in order
 
 None is started. Each needs a decision first, marked **[decision]**.
 
@@ -584,18 +783,35 @@ None is started. Each needs a decision first, marked **[decision]**.
      - `treefs/core/placed.rs`: `read_tree`'s `fetch`, root only, inside the existing `Until`; the
        rests through `Fills::pause` (`treefs/fills.rs`).
      - `treefs/core/implicit.rs`: `attach_read` keeps one number when both names attach at once.
+     - `treefs/node_fs.rs`, `treefs/fetches.rs`, `treefs/serving.rs`, as section 5.2 sets out:
+       - the deadline queue and its 2 `fs-wait` threads;
+       - a `.writing` lookup that missed handed to it, and one whose root appears parked again on
+         the fetch pool;
+       - the cap of 16 lookups that missed, its `ENOENT` answered at once;
+       - `W` counted from the first try;
+       - drain covering the queue.
+     - `treefs/testing.rs`: `core_over` moved here from `core/tree_read_tests.rs`, and a wire rig
+       around it with its own fetch and wait counts.
      - `docs/design/virtual-build-fs.md`: lines 462-472 and 1236.
-   - **Tests that fail before**, on the injected clock in `treefs/core/tree_read_tests.rs` and
-     `implicit_tests.rs`:
+   - **Tests that fail before**, on the injected clock in `treefs/core/tree_read_tests.rs`,
+     `implicit_tests.rs` and the fs's wire tests:
      - a `.writing` lookup whose root is added after two rests resolves to the same tree number as
        the plain name (today it is `ENOENT`);
      - one never added is `ENOENT` at exactly `W`;
-     - lookups of both names at the same time get one tree number.
+     - lookups of both names at the same time get one tree number;
+     - the bounds of section 5.2:
+       - a stored tree, under either name, answered while the waits are full;
+       - a found root attached on the fetch pool;
+       - the 17th lookup to miss refused at once, while a 17th of a stored root is answered;
+       - `W` kept while a try is held;
+       - drain;
+     - the memory checks of section 5.2: no tree in memory after a refused wait; one tree for both
+       names.
    - **Tests that hold today and must keep holding:**
      - a missing child is still `EIO` at once;
      - the plain name is unchanged (the existing test).
-   - **Measured after:** a `waited <ms>` field on the fs's lookup line, and a count of lookups that
-     reached `W`.
+   - **Measured after:** a `waited <ms>` field on the fs's lookup line, a count of lookups that
+     reached `W`, and a count of lookups the cap refused.
    - **Why it needs a decision:** a new name form in tierstore's fs namespace, which is an
      interface.
 2. **[decision] jobscheduler: say in `job-rootfs.md` that a host path's file system may wait inside
@@ -634,8 +850,12 @@ None is started. Each needs a decision first, marked **[decision]**.
      - the share of `.writing` lookups that waited, and their wait p50 / p90;
      - `input-unavailable` by attempt, which should stay at about zero on attempt 0;
      - the agent lookup pool's queue time (komira-ai/jobscheduler#1068);
-     - tierstore's fetch-pool occupancy, and the p90 of running jobs' cold opens.
-   - **Success:** a p50 saving of at least 25 ms and no rise in start failures.
+     - the waits pool's most at once and its refusals, which should be none;
+     - the p90 of running jobs' cold opens, against the other lane;
+     - each host's `trees in memory` line (section 5.1), to replace the inferred tree counts and
+       bytes with measured ones.
+   - **Success:** a p50 saving of at least 25 ms, no rise in start failures, and no refusal by the
+     cap.
    - **Why it needs a decision:** it changes the farm.
 5. **[decision] the Mac form: the same flag for the mount provider.**
    - **Repos:** komira-ai/tierstore (`server/provider/prepare.rs`: a `ref` marked as being written
@@ -644,7 +864,7 @@ None is started. Each needs a decision first, marked **[decision]**.
    - **Tests:** the same pattern as task 1.
    - **Why it is last:** it can only be measured once the Macs' starts are in the per-job join.
 
-## 7. Decisions
+## 8. Decisions
 
 - **D1. The flag is in the name.**
   - The fs sees nothing of a job but the name (section 1.3), and the agent's allowed roots
@@ -664,8 +884,25 @@ None is started. Each needs a decision first, marked **[decision]**.
   given a free retry.
 - **D5. The row is still written before the submit.** It keeps the takeover path's rule that a
   submitted job always has a row.
+- **D6. A lookup that missed waits in a deadline queue, not on a thread.**
+  - **A cap on the fetch pool alone** still lets waits hold the fetch threads that stored attaches
+    and cold opens need. With one fetch thread, one wait would block everything.
+  - **A waits pool that held a thread per wait, and attached there**, was rejected too:
+    - a waits thread could be held for a whole `TREE_READ` by an attach;
+    - lookups queued behind it would then pass their `W` unanswered.
+  - **The queue** keeps both pools' work short: fetch threads read trees; waits threads make one
+    try at a time.
+  - **The sizes:** 2 waits threads, because a try is a few ms. The cap is 16, which the agent
+    cannot reach. It is a backstop, not a limiter: in the model a cap at 2 or 4 would fail 0.6-3.5%
+    of starts.
+  - All three are constants, for the reason of D2.
+- **D7. No cap on tree memory is added.**
+  - (a) adds no tree to memory.
+  - Today's cost is about 0.9-1.6 GB at the busiest host's peak, inferred, against about 250 GiB that
+    the job service schedules there.
+  - Task 4 reads the fs's own memory line on each host to confirm that with measured numbers.
 
-## 8. What this does not cover
+## 9. What this does not cover
 
 - **The REAPI part of the start.** The Execute's authorization, its reads and the input walk before
   the executor.
