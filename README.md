@@ -3,13 +3,15 @@
 kbf is an open-source remote build and test farm for [Bazel](https://bazel.build)
 and [Buck2](https://buck2.build). It speaks the
 [Remote Execution API v2](https://github.com/bazelbuild/remote-apis) (REAPI v2):
-a build tool sends actions to kbf, kbf runs them on worker machines, and the
-results come back through a shared content-addressable cache.
+a build tool sends actions to kbf, kbf has a job service run them on worker
+machines, and the results come back through a shared content-addressable cache.
 
 kbf is written in Rust. Its programs are named `kbf-*`:
 
 - `kbf-server`: the REAPI v2 service. It serves the action cache and the
-  content-addressable storage, and schedules actions onto workers.
+  content-addressable storage. A frontend (`kbf --mode=frontend --executor js-agent`)
+  submits each action it is asked to execute as a job of the jobscheduler job service,
+  which places the job on a worker; kbf has no scheduler of its own.
 - `kbf-task`: runs one action's command and stages its outputs. It is the entrypoint of
   the job a js-agent runs for a placed action; a Linux node and a Mac both run actions
   only as js-agent jobs of the jobscheduler job service
@@ -30,7 +32,9 @@ breaking changes.
 
 [ARCHITECTURE.md](ARCHITECTURE.md) describes how kbf is put together, and links the
 design documents in [docs/design](docs/design): direct job submission, storage, the
-execution path, and capabilities.
+execution path, and capabilities. Its [What a farm needs](ARCHITECTURE.md#what-a-farm-needs)
+section lists what a farm of your own needs (Postgres, a job service, an S3-compatible
+object store) and what is not built yet (S3 over TLS, the AWS credential chain).
 
 [docs/artifacts.md](docs/artifacts.md) says which binaries CI builds and attests, and
 how a node verifies one before it runs it.

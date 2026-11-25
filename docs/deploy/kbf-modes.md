@@ -874,7 +874,10 @@ The cold store is the durable home of every blob: a `file://` directory on one h
   `[history]` of `kbf.toml`) names a file of the same form and rules as `--cold-store-credentials-file`
   for an `s3://` `--history-objects`, so a Docker Swarm secret can feed it. Given, the `AWS_*` variables
   are not read and a bad file is refused at start; left out, they are read as before.
-- **Who never holds a key.** A frontend serves no blob itself and holds no store and no credential.
+- **Which keys a frontend holds.** Only the ones it is given: the pack store's key pair, from the file of
+  `--pack-store-credentials-file`, when it keeps packs, and the key pairs registered for storage nodes,
+  under `--object-store-secrets-dir`, when that is given. A frontend with `--storage` and neither holds no
+  store and no credential.
 
 The units that `kbf-deploy` renders for `storage` still give the key
 pair through `EnvironmentFile=<KBF_ETC>/s3.env`; see [kbf-units.md](kbf-units.md).
