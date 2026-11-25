@@ -105,7 +105,9 @@ Several frontends over one store are supported on `main` today:
   once it has expired, another frontend takes up the operations of the one that is gone
   ([direct-js.md](../design/direct-js.md) section 3).
 
-The Postgres URL carries no password (kbf refuses one). The client speaks TLS to Postgres
+The Postgres URL carries no password (kbf refuses one). A server that asks for a password gets
+it from `state-store-password-file` in `kbf.toml`, PGPASSWORD or `~/.pgpass`
+([kbf-modes.md](kbf-modes.md#the-state-stores-password)). The client speaks TLS to Postgres
 when the URL asks for it (`sslmode=require`, or `verify-ca`/`verify-full` with
 `sslrootcert` naming the root certificates' PEM file; `sslmode=allow` is refused). Reach
 the database by a local socket, or over a network on which only the frontends can reach
