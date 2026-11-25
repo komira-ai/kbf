@@ -187,11 +187,16 @@ fn a_skipped_or_ambiguous_libpq_file_reaches_the_caller() {
 
 /// Catches a password character that ends the parameter or the URL (`&`, `#`, `=`, `%`, `+`, a
 /// space, a `:` or `@`) or is decoded into another, a URL with a query given a second `?`, and
-/// the password shown in the configuration's `Debug` text. The password is every printable ASCII
-/// character and one that is not ASCII, so no character the encoding must carry is left out.
+/// the password shown in the configuration's `Debug` text. The password is every printable
+/// character from U+0020 to U+00FF (all of printable ASCII, and the Latin-1 letters and signs
+/// beyond it, which are two UTF-8 bytes each), so no character the encoding must carry is left out.
 #[test]
 fn every_character_of_a_password_reaches_the_client_as_it_is() {
-    let every: String = (b' '..=b'~').map(char::from).chain(['\u{e9}']).collect();
+    let every: String = (0x20..=0xff)
+        .filter_map(char::from_u32)
+        .filter(|c| !c.is_control())
+        .collect();
+    assert!(!every.is_ascii() && every.contains(' ') && every.contains('~'));
     for url in [
         "postgres://kbf@db.example/kbf",
         " postgres://db.example/kbf?user=kbf ",
