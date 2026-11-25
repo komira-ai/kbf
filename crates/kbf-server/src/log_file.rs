@@ -1,7 +1,9 @@
 //! The server's durable log: a size-capped, rotating file that gets every event the
-//! stderr log gets, in the same format (time, level, target, fields).
+//! stderr log gets, in the same format (time, level, target, fields), and with no colour
+//! codes in either: stderr is read from journald or a container's log, where an ANSI
+//! sequence around each field name would keep `grep 'cause="keepalive"'` from matching.
 //!
-//! stderr (journald under systemd) is unchanged; the file is in addition to it. The
+//! The file is in addition to stderr (journald under systemd). The
 //! directory is `--log-dir`, else `log/` under the `--hot-store` directory (beside
 //! `meta/`, where the metadata log lives), else there is no file
 //! ([`crate::Args::log_dir`]).
@@ -271,14 +273,15 @@ fn absent_ok(result: io::Result<()>) -> io::Result<()> {
 }
 
 /// The server's subscriber: events at INFO and above to `stderr`, and to `file` when
-/// there is one, both in the default fmt format (the file without colour).
+/// there is one, both in the default fmt format without colour, so a line of either reads
+/// `key="value"` as written.
 pub fn subscriber<W>(stderr: W, file: Option<LogFile>) -> impl Subscriber + Send + Sync
 where
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
     tracing_subscriber::registry()
         .with(LevelFilter::INFO)
-        .with(fmt::layer().with_writer(stderr))
+        .with(fmt::layer().with_ansi(false).with_writer(stderr))
         .with(file.map(|file| fmt::layer().with_ansi(false).with_writer(file)))
 }
 

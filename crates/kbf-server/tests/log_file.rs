@@ -417,23 +417,10 @@ impl Stderr {
     }
 }
 
-/// `text` without ANSI colour sequences, each line without its leading timestamp.
+/// Each line of `text` without its leading timestamp, and nothing else taken out: a colour
+/// code left in either log is a difference between them.
 fn plain(text: &str) -> Vec<String> {
-    let mut stripped = String::new();
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            for skipped in chars.by_ref() {
-                if skipped == 'm' {
-                    break;
-                }
-            }
-        } else {
-            stripped.push(c);
-        }
-    }
-    stripped
-        .lines()
+    text.lines()
         .map(|l| {
             let rest = l.split_once(' ').map_or(l, |(_, rest)| rest);
             rest.trim_start().to_owned()
@@ -442,8 +429,10 @@ fn plain(text: &str) -> Vec<String> {
 }
 
 /// Catches: the file layer and the stderr layer formatting an event differently (the
-/// file must read like journald's copy), debug events reaching either, and a file that
-/// is broken costing stderr its copy of the event.
+/// file must read like journald's copy, byte for byte after the timestamp), colour codes
+/// in the stderr copy (a field there must grep as written, `operation="op-1"`), debug
+/// events reaching either, and a file that is broken costing stderr its copy of the
+/// event.
 #[test]
 fn both_logs_get_the_same_events_and_a_broken_file_never_costs_stderr_its_copy() {
     let dir = fresh_dir("both");
@@ -454,13 +443,18 @@ fn both_logs_get_the_same_events_and_a_broken_file_never_costs_stderr_its_copy()
         tracing::debug!("never written");
     });
     let file = fs::read_to_string(dir.join(FILE_NAME)).expect("the log");
-    assert_eq!(plain(&file), plain(&stderr.text()));
+    let copy = stderr.text();
+    assert_eq!(plain(&file), plain(&copy));
     assert_eq!(plain(&file).len(), 1, "{file}");
     assert!(
         plain(&file)[0].starts_with("INFO log_file: the log file test event"),
         "{file}"
     );
     assert!(file.contains("operation=\"op-1\""), "{file}");
+    assert!(
+        copy.contains("operation=\"op-1\" lease=\"1.2\""),
+        "a field of the stderr copy does not read as written: {copy:?}"
+    );
 
     // A file whose directory cannot be made: its parent is a regular file.
     let blocked = fresh_dir("both-blocked");
