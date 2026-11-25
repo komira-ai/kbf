@@ -2,7 +2,7 @@
 //! little-endian fields, an FNV-1a checksum) that the state store keeps in an `est/` row
 //! and that every later build must read as the summary it was written from.
 //!
-//! `tests/golden/codec-v2/` holds the record of each summary below as hex text, after comment
+//! `tests/golden/codec-v3/` holds the record of each summary below as hex text, after comment
 //! lines (beginning with `#`) that say what the file pins. The summaries are synthetic: no
 //! farm data was read to make them. Each is made by feeding made-up runs to the estimator's
 //! own update path (`Summary::new` and `Summary::observe`, the calls `Summaries::observe`
@@ -17,14 +17,15 @@
 //!   rewrite of a row);
 //! - a record with its version byte changed, or any other byte changed, is refused.
 //!
-//! `tests/golden/codec/` holds the records the build before the version 2 record (which adds
-//! the 32-byte minute ring) wrote for the same corpus. Those files are what stores written by
-//! that build hold: this build reads each as a summary and writes it back as version 2, which
-//! reads as the same summary.
+//! `tests/golden/codec/` holds the version 1 records and `tests/golden/codec-v2/` the version 2
+//! records (which add the 32-byte minute ring) that earlier builds wrote for the same corpus;
+//! version 3 adds the 128-byte ring of CPU peaks after it. Those files are what stores written
+//! by those builds hold: this build reads each as a summary and writes it back as version 3,
+//! which reads as the same summary.
 //!
-//! Both directories are append-only: a file that exists is never rewritten to match a new
+//! The directories are append-only: a file that exists is never rewritten to match a new
 //! encoding, because its bytes are what an earlier build wrote. A change to a file needs a
-//! reason in the pull request that makes it. A summary without a file in `codec-v2` is
+//! reason in the pull request that makes it. A summary without a file in `codec-v3` is
 //! written by `cargo test -p kbf-estimator --test codec_golden -- --ignored
 //! write_missing_files`, which never replaces a file.
 
@@ -33,13 +34,17 @@ use std::path::{Path, PathBuf};
 use kbf_estimator::{Basis, Bounds, Day, GIB, MIB, Outcome, Run, Summary};
 
 /// The version byte of the record, its first byte.
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 /// The length of the record: every field, fixed.
-const LEN: usize = 718;
-/// The version byte of the record the build before wrote.
+const LEN: usize = 846;
+/// The version byte of the record the builds before version 3 wrote.
+const VERSION_2: u8 = 2;
+/// The length of that record: [`LEN`] without the 128 bytes of the ring of CPU peaks.
+const LEN_2: usize = LEN - 128;
+/// The version byte of the record the builds before version 2 wrote.
 const VERSION_1: u8 = 1;
-/// The length of that record: [`LEN`] without the 32 bytes of the minute ring.
-const LEN_1: usize = LEN - 32;
+/// The length of that record: [`LEN_2`] without the 32 bytes of the minute ring.
+const LEN_1: usize = LEN_2 - 32;
 
 /// A run of `outcome` that took 2 s of wall time and used `peak` bytes of a booking of 4 GiB.
 fn run(outcome: Outcome, peak: u64) -> Run {
@@ -164,6 +169,11 @@ fn corpus() -> Vec<(&'static str, Summary)> {
 }
 
 fn golden_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/codec-v3")
+}
+
+/// The files of the version 2 records.
+fn golden_dir_2() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/codec-v2")
 }
 
@@ -251,6 +261,54 @@ fn a_record_that_is_not_exactly_one_of_the_files_is_refused() {
     }
 }
 
+/// `bytes` with its first byte set to `version` and its trailing FNV-1a checksum computed
+/// again, so that only the version byte disagrees with the length.
+fn with_version(bytes: &[u8], version: u8) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    out[0] = version;
+    let body = out.len() - 8;
+    let sum = out[..body]
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    out[body..].copy_from_slice(&sum.to_le_bytes());
+    out
+}
+
+/// Catches: a decoder that takes the version from the byte alone, not from the length too,
+/// and so reads a record of one version's length that carries another version's byte (with
+/// a checksum that holds) as a summary. The unchanged records still read, so the checksum
+/// computed here is the codec's.
+#[test]
+fn a_record_whose_version_byte_is_not_the_version_of_its_length_is_refused() {
+    let dirs = [
+        (golden_dir_1(), VERSION_1),
+        (golden_dir_2(), VERSION_2),
+        (golden_dir(), VERSION),
+    ];
+    for (dir, version) in dirs {
+        for (name, _) in corpus() {
+            let bytes = record_in(&dir, name);
+            assert_eq!(
+                with_version(&bytes, version),
+                bytes,
+                "{name} (version {version}): the checksum is the codec's"
+            );
+            for other in [0, VERSION_1, VERSION_2, VERSION, VERSION + 1] {
+                if other == version {
+                    continue;
+                }
+                assert_eq!(
+                    Summary::decode(&with_version(&bytes, other)),
+                    None,
+                    "{name} (version {version}): carries version byte {other}"
+                );
+            }
+        }
+    }
+}
+
 /// The names of the files in `dir`, sorted.
 fn files_in(dir: &Path) -> Vec<String> {
     let mut found: Vec<String> = std::fs::read_dir(dir)
@@ -273,37 +331,46 @@ fn the_golden_directories_hold_exactly_the_files_the_corpus_names() {
         .collect();
     named.sort();
     assert_eq!(files_in(&golden_dir()), named);
+    assert_eq!(files_in(&golden_dir_2()), named);
     assert_eq!(files_in(&golden_dir_1()), named);
 }
 
-/// Catches: a build that cannot read a record the build before it wrote (a store written by
-/// that build holds only these), and one that writes such a record back as something that
-/// does not read as the same summary: each version 1 file decodes, is written as a version 2
-/// record with the minute ring added, and that record decodes to the same summary. A version 1
-/// record with a byte changed or cut short is refused as before.
+/// Catches: a build that cannot read a record an earlier build wrote (a store written by
+/// such a build holds only these), and one that writes such a record back as something that
+/// does not read as the same summary: each version 1 and each version 2 file decodes, is
+/// written as a version 3 record with the rings it lacked added, and that record decodes to
+/// the same summary. A version 1 or 2 record with a byte changed or cut short is refused as
+/// before.
 #[test]
-fn a_version_1_record_still_reads_and_is_written_back_as_version_2() {
-    for (name, _) in corpus() {
-        let bytes = record_in(&golden_dir_1(), name);
-        assert_eq!(bytes.len(), LEN_1, "{name}: the length of the record");
-        assert_eq!(bytes[0], VERSION_1, "{name}: the version byte");
-        let read = Summary::decode(&bytes).unwrap_or_else(|| panic!("{name}: not read"));
-        let again = read.encode();
-        assert_eq!(again.len(), LEN, "{name}: written back at the new length");
-        assert_eq!(again[0], VERSION, "{name}: written back as the new version");
-        assert_eq!(
-            Summary::decode(&again),
-            Some(read),
-            "{name}: the same summary"
-        );
-        let mut flipped = bytes.clone();
-        flipped[LEN_1 / 2] ^= 0x01;
-        assert_eq!(Summary::decode(&flipped), None, "{name}: a byte changed");
-        assert_eq!(
-            Summary::decode(&bytes[..LEN_1 - 1]),
-            None,
-            "{name}: cut short"
-        );
+fn a_version_1_or_2_record_still_reads_and_is_written_back_as_version_3() {
+    let earlier = [
+        (golden_dir_1(), VERSION_1, LEN_1),
+        (golden_dir_2(), VERSION_2, LEN_2),
+    ];
+    for (dir, version, len) in earlier {
+        for (name, _) in corpus() {
+            let bytes = record_in(&dir, name);
+            let name = format!("{name} (version {version})");
+            assert_eq!(bytes.len(), len, "{name}: the length of the record");
+            assert_eq!(bytes[0], version, "{name}: the version byte");
+            let read = Summary::decode(&bytes).unwrap_or_else(|| panic!("{name}: not read"));
+            let again = read.encode();
+            assert_eq!(again.len(), LEN, "{name}: written back at the new length");
+            assert_eq!(again[0], VERSION, "{name}: written back as the new version");
+            assert_eq!(
+                Summary::decode(&again),
+                Some(read),
+                "{name}: the same summary"
+            );
+            let mut flipped = bytes.clone();
+            flipped[len / 2] ^= 0x01;
+            assert_eq!(Summary::decode(&flipped), None, "{name}: a byte changed");
+            assert_eq!(
+                Summary::decode(&bytes[..len - 1]),
+                None,
+                "{name}: cut short"
+            );
+        }
     }
 }
 
