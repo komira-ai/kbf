@@ -368,6 +368,17 @@ pub(crate) struct Walked {
     pub(crate) dirs_read: u64,
     /// How long each of those reads took, and each failed read too (a walk over a store).
     pub(crate) read_times: Vec<std::time::Duration>,
+    /// Of those reads, the ones made through packs: how long each one's pack index lookup
+    /// took, and each one's ranged read of a pack (a read the index placed in no pack, or
+    /// that found the blob in the packs' read cache, has no ranged read; one found in that
+    /// cache has no lookup either).
+    pub(crate) index_times: Vec<std::time::Duration>,
+    pub(crate) object_times: Vec<std::time::Duration>,
+    /// The most reads, each waiting on the one before (the Directory it names), on any path
+    /// from the root the walk took: 0 when it read nothing, the tree's depth in Directories
+    /// when it read them all (a walk over a store). A Directory taken from the content cache
+    /// adds no round; one another walk was reading adds one, as it waited for it.
+    pub(crate) depth: u64,
     /// Of a walk over a store, with its content cache of decoded Directories: the
     /// Directories it took without reading (from the cache, or from a read another walk
     /// had open: `dir_cache_merged` of them); the cached ones among them, whose digests

@@ -37,7 +37,10 @@
 //!   cached Directory before the store has answered; if the answer is that it is gone,
 //!   what was found below it (files, Directories, failures) is dropped from the report,
 //!   so the answer is the one a walk that stopped there gives. Content not cached is
-//!   read, once for all the walks that want it at the same time. The verified memory
+//!   read, once for all the walks that want it at the same time. A Directory a client
+//!   uploaded through the frontend's packs is in the cache from the moment it was stored
+//!   (`known_dirs`), so the Execute that names a tree just uploaded reads none of it; it is
+//!   asked about with the files like any cached Directory. The verified memory
 //!   above still skips even the FindMissing, within [`VERIFIED_TTL`].
 //! - **Deterministic.** What the walk answers does not depend on which read finishes
 //!   first. Directories that are not held and files that are missing are sorted sets.
@@ -69,14 +72,15 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt as _, TryStreamExt as _};
+use kbf_pack::ReadTimes;
 use kbf_storage::StorageError;
 use kbf_types::Digest;
 use tokio::time::Instant;
 
-use crate::cache::is_empty_blob;
 use crate::dir_cache::{DirCache, Lookup};
 use crate::input_tree::{Decoded, Walked, decode};
-use crate::prepare_run::{DirectoryCache, KeptDirectory};
+use crate::known_dirs::{KnownDirs, keep_named};
+use crate::prepare_run::DirectoryCache;
 
 /// The most Directory blobs one [`walk`] reads from the store at once. The tree of a
 /// request is the only bound on its fan-out, so this is what keeps a few hundred
@@ -113,6 +117,12 @@ pub(crate) trait Blobs: Send + Sync {
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>>;
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>>;
 
+    /// [`Blobs::read_blob`], with how long a pack index lookup and a ranged read of a pack
+    /// took within it: neither for a store without packs.
+    fn read_timed<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, (Answer<Bytes>, ReadTimes)> {
+        Box::pin(async move { (self.read_blob(digest).await, ReadTimes::default()) })
+    }
+
     /// What a "held" answer rests on, as a number that changes when it may have changed
     /// (see `kbf_route::Router::epoch`); `None` when the store cannot say, and nothing
     /// is then remembered.
@@ -127,11 +137,11 @@ pub(crate) struct Trees {
     capacity: usize,
     ttl: Duration,
     /// What the Directories decode to, whatever became of their subtrees: by digest, so
-    /// it never goes stale, and no claim that anything is held.
-    dirs: DirCache,
-    /// Where each Directory a walk reads is also kept with its names, for the preparation of
-    /// the run an Execute starts; none until a preparer gives it ([`Trees::keep_into`]).
-    keep: Mutex<Option<Arc<DirectoryCache>>>,
+    /// it never goes stale, and no claim that anything is held; and where each Directory a
+    /// walk reads is also kept with its names, for the preparation of the run an Execute
+    /// starts ([`Trees::keep_into`]). Shared with the frontend's packs, whose writes put the
+    /// Directories clients upload in it ([`Trees::sharing`]).
+    known: Arc<KnownDirs>,
     /// When an Execute found the Command and every input of an Action held ([`Trees::vouch`]).
     vouched: Mutex<Vouched>,
 }
@@ -222,8 +232,7 @@ impl Trees {
             inner: Mutex::new(Remembered::default()),
             capacity,
             ttl,
-            dirs: DirCache::default(),
-            keep: Mutex::new(None),
+            known: Arc::default(),
             vouched: Mutex::new(Vouched::new(VOUCHED_ENTRIES)),
         }
     }
@@ -233,8 +242,24 @@ impl Trees {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_dir_cache(mut self, bytes: u64) -> Self {
-        self.dirs = DirCache::new(bytes);
+        self.known = Arc::new(KnownDirs::new(DirCache::new(bytes)));
         self
+    }
+
+    /// The default memory, over `known`: the Directories other walks over it read and that
+    /// clients uploaded through the packs that share it.
+    #[must_use]
+    pub(crate) fn sharing(known: Arc<KnownDirs>) -> Self {
+        Self {
+            known,
+            ..Self::default()
+        }
+    }
+
+    /// The decoded Directories this memory's walks take before reading: for tests.
+    #[cfg(test)]
+    pub(crate) fn dirs(&self) -> &DirCache {
+        &self.known.dirs
     }
 
     fn lock(&self) -> MutexGuard<'_, Remembered> {
@@ -313,18 +338,11 @@ impl Trees {
         self.lock().dirs.len()
     }
 
-    /// From now on, every Directory a walk reads is also kept in `cache`, decoded with its
-    /// names, for the run preparation's walk of the same tree. A later cache replaces it.
+    /// From now on, every Directory a walk reads, and every Directory a client uploads through
+    /// the packs this memory shares ([`Trees::sharing`]), is also kept in `cache`, decoded with
+    /// its names, for the run preparation's walk of the same tree. A later cache replaces it.
     pub(crate) fn keep_into(&self, cache: Arc<DirectoryCache>) {
-        *self.keep.lock().unwrap_or_else(PoisonError::into_inner) = Some(cache);
-    }
-
-    fn kept(&self) -> Option<Arc<DirectoryCache>> {
-        // Set or read in one statement: nothing can panic with the lock held.
-        self.keep
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.known.keep_into(cache);
     }
 
     fn vouches(&self) -> MutexGuard<'_, Vouched> {
@@ -376,12 +394,15 @@ enum Fetched {
     Merged(Arc<Decoded>),
 }
 
-/// One Directory fetched: which, how long its read took (`None` if this walk did not
-/// read), and what came of it.
+/// One Directory fetched: which, how long its read took and its steps in the packs (`None`
+/// and none if this walk did not read), what came of it, and how many dependent reads the
+/// walk had made on the way to it, this one not counted.
 struct Fetch {
     dir: Digest,
     took: Option<Duration>,
+    steps: ReadTimes,
     outcome: Answer<Fetched>,
+    rounds: u64,
 }
 
 /// Reads `dir` for everyone who wants it: leads the read when `first` says to, or waits
@@ -390,7 +411,7 @@ async fn fetch<'a>(
     storage: &'a dyn Blobs,
     cache: &'a DirCache,
     keep: Option<&'a DirectoryCache>,
-    dir: Digest,
+    (dir, rounds): (Digest, u64),
     first: Lookup<'a>,
 ) -> Fetch {
     let mut look = first;
@@ -400,7 +421,9 @@ async fn fetch<'a>(
                 return Fetch {
                     dir,
                     took: None,
+                    steps: ReadTimes::default(),
                     outcome: Ok(Fetched::Merged(decoded)),
+                    rounds,
                 };
             }
             Lookup::Follow(gate) => {
@@ -410,7 +433,7 @@ async fn fetch<'a>(
             }
             Lookup::Lead(lead) => {
                 let began = Instant::now();
-                let blob = storage.read_blob(&dir).await;
+                let (blob, steps) = storage.read_timed(&dir).await;
                 let took = began.elapsed();
                 let outcome = match blob {
                     Err(e) => Err(e),
@@ -427,32 +450,20 @@ async fn fetch<'a>(
                 return Fetch {
                     dir,
                     took: Some(took),
+                    steps,
                     outcome,
+                    rounds,
                 };
             }
         }
     }
 }
 
-/// Keeps `dir`, read as `blob`, in `keep` with its names, for the preparation's walk of the
-/// same tree: not the empty Directory, which that walk never caches.
-fn keep_named(keep: &DirectoryCache, dir: Digest, blob: Bytes) {
-    if is_empty_blob(&dir) {
-        return;
-    }
-    // `decode` has checked every digest the blob names, so the parse finds no fault; a
-    // Directory parsed with one would be partial, and is not kept.
-    let parsed = KeptDirectory::parse(&dir, blob).ok();
-    let whole = parsed.filter(|parsed| parsed.fault.is_none());
-    whole
-        .into_iter()
-        .for_each(|parsed| keep.remember(dir, &parsed.kept));
-}
-
 /// What the walk has found so far, and where it goes next.
 struct Frontier {
     seen: BTreeSet<Digest>,
-    queue: VecDeque<Digest>,
+    /// Each Directory to take, with the dependent reads the walk made on the way to it.
+    queue: VecDeque<(Digest, u64)>,
     /// The files named by the Directories taken.
     files: BTreeSet<Digest>,
     /// The Directories taken and what each names.
@@ -460,16 +471,18 @@ struct Frontier {
 }
 
 impl Frontier {
-    /// `dir` is held, and `decoded` is what it names: its files are to be asked about
-    /// and its subdirectories to be taken.
-    fn take(&mut self, dir: Digest, decoded: Arc<Decoded>) {
+    /// `dir` is held, and `decoded` is what it names, reached after `rounds` dependent reads:
+    /// its files are to be asked about and its subdirectories to be taken.
+    fn take(&mut self, dir: Digest, decoded: Arc<Decoded>, rounds: u64) {
         self.files.extend(decoded.files.iter().copied());
+        let seen = &mut self.seen;
         self.queue.extend(
             decoded
                 .dirs
                 .iter()
                 .copied()
-                .filter(|d| self.seen.insert(*d)),
+                .filter(|d| seen.insert(*d))
+                .map(|d| (d, rounds)),
         );
         self.graph.insert(dir, decoded);
     }
@@ -486,11 +499,11 @@ pub(crate) async fn walk_bounded(
     let begun = Instant::now();
     // Read before the first read: the walk is remembered only under the epoch it began in.
     let epoch = storage.epoch();
-    let cache = &trees.dirs;
-    let keep = trees.kept();
+    let cache = &trees.known.dirs;
+    let keep = trees.known.kept();
     let mut found = Frontier {
         seen: BTreeSet::from([root]),
-        queue: VecDeque::from([root]),
+        queue: VecDeque::from([(root, 0)]),
         files: BTreeSet::new(),
         graph: HashMap::new(),
     };
@@ -506,7 +519,7 @@ pub(crate) async fn walk_bounded(
     let mut failures: Vec<(Digest, StorageError)> = Vec::new();
     loop {
         while reading.len() < reads_in_flight {
-            let Some(dir) = found.queue.pop_front() else {
+            let Some((dir, rounds)) = found.queue.pop_front() else {
                 break;
             };
             if let Some(at) = epoch.and_then(|e| trees.fresh(e, &dir, Instant::now())) {
@@ -519,20 +532,34 @@ pub(crate) async fn walk_bounded(
                     walked.dir_cache_hits += 1;
                     cached.insert(dir);
                     held_dirs.push(dir);
-                    found.take(dir, decoded);
+                    found.take(dir, decoded, rounds);
                 }
                 first => {
                     if matches!(first, Lookup::Lead(_)) {
                         walked.dir_cache_misses += 1;
                     }
-                    reading.push(fetch(storage, cache, keep.as_deref(), dir, first));
+                    let fetching = fetch(storage, cache, keep.as_deref(), (dir, rounds), first);
+                    reading.push(fetching);
                 }
             }
         }
-        let Some(Fetch { dir, took, outcome }) = reading.next().await else {
+        let Some(Fetch {
+            dir,
+            took,
+            steps,
+            outcome,
+            rounds,
+        }) = reading.next().await
+        else {
             break;
         };
+        // A read, or a wait for another walk's read: the Directories under it are one round
+        // further from the root.
+        let rounds = rounds + 1;
+        walked.depth = walked.depth.max(rounds);
         walked.read_times.extend(took);
+        walked.index_times.extend(steps.index);
+        walked.object_times.extend(steps.objects);
         match outcome {
             Err(StorageError::NotFound(_) | StorageError::Unreachable(_)) => {
                 absent_dirs.insert(dir);
@@ -552,7 +579,7 @@ pub(crate) async fn walk_bounded(
                         decoded
                     }
                 };
-                found.take(dir, decoded);
+                found.take(dir, decoded, rounds);
             }
         }
     }
@@ -684,3 +711,7 @@ mod dircache_tests;
 #[cfg(test)]
 #[path = "input_walk_handoff_tests.rs"]
 mod handoff_tests;
+
+#[cfg(test)]
+#[path = "input_walk_rounds_tests.rs"]
+mod rounds_tests;

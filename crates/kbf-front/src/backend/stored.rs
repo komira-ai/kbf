@@ -41,10 +41,11 @@ pub(super) struct StoredPlane {
 
 impl StoredPlane {
     pub(super) fn new(stored: Arc<Stored>) -> Self {
+        let trees = Trees::sharing(Arc::clone(stored.packs().known_dirs()));
         Self {
             stored,
             metrics: CacheMetrics::default(),
-            trees: Trees::default(),
+            trees,
         }
     }
 

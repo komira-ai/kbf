@@ -14,7 +14,7 @@ use futures::future::BoxFuture;
 use kbf_objstore::{BodyStream, ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_pack::{
     Blob, FRONTEND_PACK_BYTES, Fetch, Loss, LossGuard, PackError, PackKeys, Packed, Packer,
-    PackerConfig, ReadCache, ReadError, Reader, ReaderConfig, check_create_only,
+    PackerConfig, ReadCache, ReadError, ReadTimes, Reader, ReaderConfig, check_create_only,
 };
 use kbf_pack_index::{BlobDigest, Location, MAX_BATCH, PackIndex, PackIndexError};
 use kbf_types::{Digest, DigestFunction};
@@ -22,8 +22,10 @@ use tonic::Status;
 
 use super::metrics::PackMetrics;
 use super::room::{Budget, DEFAULT_INFLIGHT_BYTES, Room};
+use super::uploaded::maybe_directories;
 use super::verifying::VerifyingKeys;
 use crate::cache::is_empty_blob;
+use crate::known_dirs::KnownDirs;
 use crate::large_backfill::LargeStore;
 use crate::store_wait::{Backoff, STORE_WAIT, StoreWaits};
 use crate::store_writes::{STORE_WRITES, StoreWrites};
@@ -83,11 +85,12 @@ pub trait PackStore: Send + Sync {
     /// Packs `blobs` and records the packs (the write rule: stored, then recorded).
     fn pack(&self, blobs: Vec<Blob>) -> BoxFuture<'_, Result<Packed, PackError>>;
 
-    /// Reads `digests` through the index and the packs, one [`Fetch`] each.
+    /// Reads `digests` through the index and the packs, one [`Fetch`] each, with how long the
+    /// index lookups and the ranged reads took ([`Reader::read_timed`]).
     fn read<'a>(
         &'a self,
         digests: &'a [BlobDigest],
-    ) -> BoxFuture<'a, Result<Vec<Fetch>, ReadError>>;
+    ) -> BoxFuture<'a, Result<(Vec<Fetch>, ReadTimes), ReadError>>;
 
     /// Checks that the store refuses to replace an object.
     fn check_create_only(&self) -> BoxFuture<'_, Result<(), PackError>>;
@@ -132,8 +135,8 @@ impl<S: ObjectStore> PackStore for Over<S> {
     fn read<'a>(
         &'a self,
         digests: &'a [BlobDigest],
-    ) -> BoxFuture<'a, Result<Vec<Fetch>, ReadError>> {
-        Box::pin(self.reader.read(digests))
+    ) -> BoxFuture<'a, Result<(Vec<Fetch>, ReadTimes), ReadError>> {
+        Box::pin(self.reader.read_timed(digests))
     }
 
     fn check_create_only(&self) -> BoxFuture<'_, Result<(), PackError>> {
@@ -190,6 +193,9 @@ pub struct Packs {
     pub(super) writer: String,
     /// [`PackSettings::store_writes`].
     store_writes: NonZeroUsize,
+    /// What the input walks over these packs know of Directories, the ones uploaded through
+    /// them included ([`Packs::known_dirs`]).
+    pub(super) known: Arc<KnownDirs>,
 }
 
 impl fmt::Debug for Packs {
@@ -252,6 +258,7 @@ impl Packs {
             loss,
             writer,
             store_writes: settings.store_writes,
+            known: Arc::default(),
         })
     }
 
@@ -498,6 +505,7 @@ impl Packs {
         blobs: Vec<(Digest, Bytes)>,
         room: Room,
     ) -> Result<(), Status> {
+        let directories = maybe_directories(&blobs);
         let blobs = blobs
             .into_iter()
             .map(|(digest, bytes)| Blob {
@@ -507,7 +515,9 @@ impl Packs {
             .collect();
         let packed = self.store.pack(blobs).await;
         drop(room);
-        self.stored(packed)
+        self.stored(packed)?;
+        self.learn_uploaded(directories);
+        Ok(())
     }
 
     /// The blob `digest` from its pack, hashed; `None` when the packs do not serve it and
@@ -518,9 +528,18 @@ impl Packs {
     /// UNAVAILABLE when the index or the store failed, or the pack held other bytes than the
     /// digest (never served).
     pub async fn read(&self, digest: &Digest) -> Result<Option<Bytes>, Status> {
-        let mut answers = self.read_many(std::slice::from_ref(digest)).await;
+        self.read_timed(digest).await.0
+    }
+
+    /// [`Packs::read`], with how long the index lookup and the ranged read of the pack took
+    /// (each `None` when the read did not take that step, or failed).
+    pub(crate) async fn read_timed(
+        &self,
+        digest: &Digest,
+    ) -> (Result<Option<Bytes>, Status>, ReadTimes) {
+        let (mut answers, times) = self.read_many_timed(std::slice::from_ref(digest)).await;
         // One digest was asked: one answer comes back.
-        answers.swap_remove(0)
+        (answers.swap_remove(0), times)
     }
 
     /// The blobs `digests` from their packs, one answer each in the order asked, as
@@ -530,14 +549,25 @@ impl Packs {
     /// served with no bytes without asking the index or the store ([`Packs::missing`] holds it
     /// too). When the index or the store fails, each blob that was asked for is that failure.
     pub async fn read_many(&self, digests: &[Digest]) -> Vec<Result<Option<Bytes>, Status>> {
+        self.read_many_timed(digests).await.0
+    }
+
+    /// [`Packs::read_many`], with how long its index lookups and ranged reads took.
+    async fn read_many_timed(
+        &self,
+        digests: &[Digest],
+    ) -> (Vec<Result<Option<Bytes>, Status>>, ReadTimes) {
         let inside: Vec<&Digest> = digests
             .iter()
             .filter(|d| self.fits(d) && !is_empty_blob(d))
             .collect();
         let asked: Vec<BlobDigest> = inside.iter().copied().map(to_index).collect();
-        let read = self.store.read(&asked).await;
+        let (read, times) = match self.store.read(&asked).await {
+            Ok((fetched, times)) => (Ok(fetched), times),
+            Err(error) => (Err(error), ReadTimes::default()),
+        };
         let mut served = self.served(&inside, read).into_iter();
-        digests
+        let answers = digests
             .iter()
             .map(|digest| {
                 if is_empty_blob(digest) {
@@ -548,7 +578,8 @@ impl Packs {
                     Ok(None)
                 }
             })
-            .collect()
+            .collect();
+        (answers, times)
     }
 
     /// Whether a blob of this digest is within [`Packs::max_blob_bytes`].

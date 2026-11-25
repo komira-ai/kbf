@@ -34,6 +34,9 @@ pub enum Unit {
     Bytes,
     /// A number of things (blobs in a segment).
     Count,
+    /// A small number of steps, each one waiting on the one before (the rounds of dependent
+    /// reads of an input-tree walk).
+    Rounds,
 }
 
 /// Latency bounds, in nanoseconds: 1 ms to 60 s.
@@ -73,12 +76,16 @@ const BYTES_BOUNDS: [u64; 11] = [
 /// Count bounds: 1 to 16384, by fours.
 const COUNT_BOUNDS: [u64; 8] = [1, 4, 16, 64, 256, 1024, 4096, 16384];
 
+/// Round bounds: every round to 8, then coarser to 64 (a source tree is rarely deeper than 30).
+const ROUNDS_BOUNDS: [u64; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 24, 32, 64];
+
 impl Unit {
     const fn bounds(self) -> &'static [u64] {
         match self {
             Self::Seconds => &SECONDS_BOUNDS,
             Self::Bytes => &BYTES_BOUNDS,
             Self::Count => &COUNT_BOUNDS,
+            Self::Rounds => &ROUNDS_BOUNDS,
         }
     }
 
@@ -87,7 +94,7 @@ impl Unit {
         match self {
             // Exact for every bound; a sum is printed to the nanosecond.
             Self::Seconds => format!("{}", value as f64 / 1e9),
-            Self::Bytes | Self::Count => value.to_string(),
+            Self::Bytes | Self::Count | Self::Rounds => value.to_string(),
         }
     }
 }
@@ -439,6 +446,15 @@ pub struct CacheMetrics {
     /// (`kbf_execute_walk_dir_read_seconds`): failed reads included, reads another
     /// check shared and Directories taken from the content cache not.
     pub execute_walk_dir_read: Histogram,
+    /// Of those reads, the ones through packs: the pack index lookup of each
+    /// (`kbf_execute_walk_dir_index_seconds`), and the ranged read of the pack of each that
+    /// the index placed in one and the packs' read cache did not hold
+    /// (`kbf_execute_walk_dir_object_seconds`).
+    pub execute_walk_dir_index: Histogram,
+    pub execute_walk_dir_object: Histogram,
+    /// Of an input-tree check over a store, the most Directory reads on one path from the
+    /// root, each waiting on the one before (`kbf_execute_walk_depth`): 0 when it read none.
+    pub execute_walk_depth: Histogram,
     /// Of the content cache of decoded Directories behind those checks: Directories
     /// taken without a read (from the cache, or from a read another check had open);
     /// reads led; of the hits, those another check's read supplied; Directories
@@ -517,6 +533,9 @@ impl Default for CacheMetrics {
             execute_walk_file_asks: Counter::default(),
             execute_walk_files_checked: Counter::default(),
             execute_walk_dir_read: Histogram::new(Unit::Seconds),
+            execute_walk_dir_index: Histogram::new(Unit::Seconds),
+            execute_walk_dir_object: Histogram::new(Unit::Seconds),
+            execute_walk_depth: Histogram::new(Unit::Rounds),
             execute_dir_cache_hits: Counter::default(),
             execute_dir_cache_misses: Counter::default(),
             execute_dir_cache_merged: Counter::default(),
@@ -657,6 +676,24 @@ impl CacheMetrics {
                 "One Directory read from the store by an Execute input-tree check: the \
                  store's latency per read, failed reads included",
                 &self.execute_walk_dir_read,
+            ),
+            (
+                "kbf_execute_walk_dir_index_seconds",
+                "Of the Directory reads of an Execute input-tree check made through packs, \
+                 the pack index lookup of each",
+                &self.execute_walk_dir_index,
+            ),
+            (
+                "kbf_execute_walk_dir_object_seconds",
+                "Of the Directory reads of an Execute input-tree check made through packs, \
+                 the ranged read of the pack of each the read cache did not hold",
+                &self.execute_walk_dir_object,
+            ),
+            (
+                "kbf_execute_walk_depth",
+                "The most Directory reads on one path from the root of an Execute input-tree \
+                 check over a store, each waiting on the one before: 0 when it read none",
+                &self.execute_walk_depth,
             ),
             (
                 "kbf_execute_submit_seconds",

@@ -4,8 +4,9 @@
 //! Command and the input tree that Execute reads are in the pack index and not on the storage
 //! nodes. [`Layered`] asks the packs for a blob and, if they do not serve it, the blobs under
 //! it (a node, or the nodes of a map); for what is held it asks the index first and the nodes
-//! about only what the index lacks. A store without packs does not build one: its calls are
-//! the ones they were. The closure check of the action cache reads the blobs through it too
+//! about only what the index lacks. A read through it says how long its index lookup and its
+//! ranged read of a pack took ([`Blobs::read_timed`]), which the input walk reports. A store
+//! without packs does not build one: its calls are the ones they were. The closure check of the action cache reads the blobs through it too
 //! (`closed`, and the proxy's `GetActionResult`), so a result's output that is only in a pack
 //! is held.
 
@@ -13,6 +14,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use kbf_pack::ReadTimes;
 use kbf_route::Router;
 use kbf_storage::StorageError;
 use kbf_types::Digest;
@@ -58,11 +60,18 @@ impl Layered<'_> {
 
 impl Blobs for Layered<'_> {
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<Bytes>> {
+        Box::pin(async move { self.read_timed(digest).await.0 })
+    }
+
+    fn read_timed<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, (Answer<Bytes>, ReadTimes)> {
         Box::pin(async move {
-            match self.packs.read(digest).await.map_err(unavailable)? {
-                Some(bytes) => Ok(bytes),
-                None => self.rest.read_blob(digest).await,
-            }
+            let (packed, times) = self.packs.read_timed(digest).await;
+            let answer = match packed.map_err(unavailable) {
+                Ok(Some(bytes)) => Ok(bytes),
+                Ok(None) => self.rest.read_blob(digest).await,
+                Err(error) => Err(error),
+            };
+            (answer, times)
         })
     }
 

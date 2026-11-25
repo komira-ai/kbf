@@ -72,6 +72,9 @@ pub struct PackMetrics {
     /// missing from then on, so clients upload them again, and action-cache entries that name
     /// them are misses.
     pub lost_forgotten: Counter,
+    /// Uploaded blobs that were Directories not known yet, put in the input walks' caches as
+    /// they were stored ([`super::Packs::known_dirs`]).
+    pub(super) uploaded_directories: Counter,
     /// Uploads that had to wait for room, because the uploads in flight held all of
     /// `--pack-inflight-bytes`.
     pub upload_waits: Counter,
@@ -308,6 +311,12 @@ impl PackMetrics {
                 "kbf_pack_read_lost_forgotten_total",
                 "Reads of a lost blob after which the index forgot its pack, gone from the store",
                 &self.lost_forgotten,
+            ),
+            (
+                "kbf_pack_uploaded_directories_total",
+                "Uploaded blobs that were Directories not known yet, put in the Execute input \
+                 walks' caches as they were stored",
+                &self.uploaded_directories,
             ),
             (
                 "kbf_pack_upload_waits_total",

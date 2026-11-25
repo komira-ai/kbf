@@ -32,6 +32,28 @@ fn a_histogram_prints_cumulative_buckets_in_seconds() {
     assert_eq!((h.count(), h.sum()), (3, 90_002_000_001));
 }
 
+/// Catches a walk that read nothing counted with one that read a round (the first bound is 0),
+/// and a depth printed as seconds.
+#[test]
+fn rounds_print_every_small_depth_in_its_own_bucket() {
+    let h = Histogram::new(Unit::Rounds);
+    h.observe(0);
+    h.observe(1);
+    h.observe(7);
+    h.observe(65);
+    let mut out = String::new();
+    h.render(&mut out, "d", "");
+    let buckets = lines(&out, "d_bucket");
+    assert_eq!(buckets.len(), ROUNDS_BOUNDS.len() + 1);
+    assert_eq!(buckets[0], r#"d_bucket{le="0"} 1"#);
+    assert_eq!(buckets[1], r#"d_bucket{le="1"} 2"#);
+    assert_eq!(buckets[6], r#"d_bucket{le="6"} 2"#);
+    assert_eq!(buckets[7], r#"d_bucket{le="7"} 3"#);
+    assert_eq!(buckets[14], r#"d_bucket{le="64"} 3"#);
+    assert_eq!(buckets[15], r#"d_bucket{le="+Inf"} 4"#);
+    assert_eq!(lines(&out, "d_sum"), ["d_sum 73"]);
+}
+
 /// Catches a label printed without its comma before `le`, or `_sum` and `_count`
 /// without the label (two series of one family would then collide), and sizes or
 /// counts printed as seconds.
@@ -183,6 +205,12 @@ fn every_family_is_printed_once_with_its_type() {
     metrics.execute_dir_cache_bytes.set(28);
     metrics.execute_walk_dir_read.observe(29);
     metrics.execute_walk_dir_read.observe(30);
+    metrics.execute_walk_dir_index.observe(31);
+    metrics.execute_walk_dir_object.observe(32);
+    metrics.execute_walk_dir_object.observe(33);
+    metrics.execute_walk_depth.observe(0);
+    metrics.execute_walk_depth.observe(3);
+    metrics.execute_walk_depth.observe(9);
     let _presubmit = metrics.execute_presubmit_in_flight.raise();
     let (_tier, _tier2) = (
         metrics.tier_in_flight.raise(),
@@ -232,6 +260,9 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_execute_walk_dirs_seconds histogram",
             "kbf_execute_walk_files_seconds histogram",
             "kbf_execute_walk_dir_read_seconds histogram",
+            "kbf_execute_walk_dir_index_seconds histogram",
+            "kbf_execute_walk_dir_object_seconds histogram",
+            "kbf_execute_walk_depth histogram",
             "kbf_execute_submit_seconds histogram",
             "kbf_tier_wait_seconds histogram",
             "kbf_tier_call_seconds histogram",
@@ -290,6 +321,10 @@ fn every_family_is_printed_once_with_its_type() {
         ("kbf_execute_dir_cache_present_checked_total", 27),
         ("kbf_execute_dir_cache_bytes", 28),
         ("kbf_execute_walk_dir_read_seconds_count", 2),
+        ("kbf_execute_walk_dir_index_seconds_count", 1),
+        ("kbf_execute_walk_dir_object_seconds_count", 2),
+        ("kbf_execute_walk_depth_count", 3),
+        ("kbf_execute_walk_depth_sum", 12),
         ("kbf_execute_presubmit_in_flight", 1),
         ("kbf_tier_in_flight", 2),
         ("kbf_storage_open_write_fds", 21),

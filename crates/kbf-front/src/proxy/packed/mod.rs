@@ -66,6 +66,7 @@ mod large;
 mod metrics;
 mod room;
 mod store;
+mod uploaded;
 mod verifying;
 
 pub(in crate::proxy) use self::bytestream::{applies, read as read_stream, write as write_stream};

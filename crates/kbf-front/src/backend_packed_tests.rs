@@ -18,20 +18,39 @@ use prost::Message as _;
 use super::*;
 use crate::{PackSettings, Packs};
 
-/// Packs over an in-memory store and index that hold `blobs`.
-async fn packs_holding(blobs: &[&(Digest, Bytes)]) -> Packs {
+/// An in-memory store that refuses to replace an object, and an in-memory index.
+pub(super) fn store_and_index() -> (Arc<MemoryStore>, Arc<dyn PackIndex>) {
     let create_only = Capabilities {
         conditional_put: true,
         object_lock: false,
     };
     let store = Arc::new(MemoryStore::new(create_only));
     let clock = Arc::new(ManualClock::default());
-    let index: Arc<dyn PackIndex> = Arc::new(MemoryPackIndex::new(clock));
-    let keys = PackKeys::new(WriterKind::Frontend, "fe1", "boot1").expect("keys");
-    let made = Packs::new(store, index, keys, PackSettings::default());
-    let packs = made.expect("packs");
-    let blobs = blobs.iter().map(|(d, b)| (*d, b.clone())).collect();
-    packs.put(blobs).await.expect("packed");
+    (store, Arc::new(MemoryPackIndex::new(clock)))
+}
+
+/// The packs of the frontend `name` over `store` and `index`.
+pub(super) fn packs_of(name: &str, store: &Arc<MemoryStore>, index: &Arc<dyn PackIndex>) -> Packs {
+    let keys = PackKeys::new(WriterKind::Frontend, name, "boot1").expect("keys");
+    let made = Packs::new(
+        Arc::clone(store),
+        Arc::clone(index),
+        keys,
+        PackSettings::default(),
+    );
+    made.expect("packs")
+}
+
+/// `blobs` as [`Packs::put`] takes them.
+pub(super) fn owned(blobs: &[&(Digest, Bytes)]) -> Vec<(Digest, Bytes)> {
+    blobs.iter().map(|(d, b)| (*d, b.clone())).collect()
+}
+
+/// Packs over an in-memory store and index that hold `blobs`, uploaded through them.
+async fn packs_holding(blobs: &[&(Digest, Bytes)]) -> Packs {
+    let (store, index) = store_and_index();
+    let packs = packs_of("fe1", &store, &index);
+    packs.put(owned(blobs)).await.expect("packed");
     packs
 }
 
@@ -513,4 +532,37 @@ async fn a_backend_answers_a_job_read_locate_as_a_blob_source() {
         BlobSource::large_len(&local, &held.0).await.expect("none"),
         None
     );
+}
+
+/// Catches the split of a Directory read lost on its way from the packs to the walk: over a
+/// frontend's packs and one node, a tree whose root and one Directory are in a pack (another
+/// frontend uploaded them, so this one has to read them) and whose other Directory is on the
+/// node alone is walked with three index lookups (the packs are asked first for each) and two
+/// ranged reads of the pack (the node's Directory has none).
+#[tokio::test]
+async fn a_walk_through_packs_reports_the_index_lookup_and_pack_read_of_each_read() {
+    let cache = Arc::new(Cache::memory());
+    let (a, b) = (blob("file a"), blob("file b"));
+    let (packed, on_node) = (dir(&[a.0], &[]), dir(&[b.0], &[]));
+    let root = dir(&[], &[packed.0, on_node.0]);
+    put(&cache, &[&on_node, &b]).await;
+    let (store, index) = store_and_index();
+    let uploader = packs_of("fe2", &store, &index);
+    uploader
+        .put(owned(&[&root, &packed, &a]))
+        .await
+        .expect("packed");
+    let packs = packs_of("fe1", &store, &index);
+    let storage = CacheStorage::new(Arc::clone(&cache), SegmentsConfig::DEFAULT);
+    let backend = Backend::remote_over(Arc::new(storage), Some(packs));
+
+    let walked = backend.walk_inputs(root.0).await.expect("walk");
+
+    assert!(walked.absent.is_empty(), "{:?}", walked.absent);
+    assert_eq!(walked.dirs_read, 3);
+    assert_eq!(
+        (walked.index_times.len(), walked.object_times.len()),
+        (3, 2)
+    );
+    assert_eq!(walked.depth, 2);
 }

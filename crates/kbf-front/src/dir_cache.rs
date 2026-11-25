@@ -13,6 +13,9 @@
 //!   reach at once is read by the first, and the second waits for that read instead of
 //!   starting its own ([`Lookup::Follow`]). A reader that is dropped, or fails, ends its
 //!   flight and the waiters look again, so none waits on a read that is gone.
+//! - **Filled by uploads too.** A Directory a client uploads through the frontend's packs
+//!   is cached as it is stored (`known_dirs`), taking the lead of its digest as a read
+//!   would; one cached already or being read is left as it is.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

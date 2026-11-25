@@ -497,6 +497,19 @@ async fn an_execute_reports_what_its_walk_read_skipped_and_spent() {
         "each read of the cold walk"
     );
     assert_eq!(m.execute_walk_dir_read.sum(), 12_000_000_000);
+    assert_eq!(
+        (m.execute_walk_depth.count(), m.execute_walk_depth.sum()),
+        (2, 2),
+        "the cold walk read two Directories in a chain, the warm walk none"
+    );
+    assert_eq!(
+        (
+            m.execute_walk_dir_index.count(),
+            m.execute_walk_dir_object.count()
+        ),
+        (0, 0),
+        "no packs: no read had an index lookup or a ranged read of a pack"
+    );
     assert_eq!(m.execute_dir_cache_misses.get(), 2);
     assert_eq!(m.execute_dir_cache_hits.get(), 0);
     assert_eq!(m.execute_dir_cache_present_checked.get(), 0);
@@ -533,6 +546,11 @@ async fn an_execute_reports_what_its_walk_read_skipped_and_spent() {
     assert_eq!(m.execute_dir_cache_bytes.get(), held);
     assert_eq!(m.execute_walk_dirs_read.get(), 2, "nothing read");
     assert_eq!(m.execute_walk_dir_read.count(), 2, "and so nothing timed");
+    assert_eq!(
+        (m.execute_walk_depth.count(), m.execute_walk_depth.sum()),
+        (3, 2),
+        "a walk of cached Directories waits on no read"
+    );
     assert_eq!(m.execute_walk_files.count(), 3);
     assert_eq!(m.execute_walk_files.sum(), 6_000_000_000);
 
@@ -542,6 +560,8 @@ async fn an_execute_reports_what_its_walk_read_skipped_and_spent() {
         "kbf_execute_dir_cache_misses_total 2",
         "kbf_execute_dir_cache_present_checked_total 2",
         "kbf_execute_walk_dir_read_seconds_count 2",
+        "kbf_execute_walk_depth_count 3",
+        "kbf_execute_walk_depth_sum 2",
     ] {
         assert!(text.lines().any(|l| l == line), "{line} missing");
     }

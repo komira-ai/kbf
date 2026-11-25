@@ -17,12 +17,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
 use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError, kbf_key};
 use kbf_pack_index::{BlobDigest, MAX_BATCH, PackIndex, PackIndexError};
+use tokio::time::Instant;
 
 use crate::blocking::offload;
 use crate::cache::ReadCache;
@@ -63,6 +65,17 @@ pub enum Fetch {
         /// the drop (logged), or when the row already pointed elsewhere.
         dropped: bool,
     },
+}
+
+/// How long the two steps of one [`Reader::read_timed`] took: asking the index where the
+/// blobs are, and reading their ranges of the packs. A step the read did not take (every blob
+/// was in the cache, or the index placed none in a pack) is `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadTimes {
+    /// The index lookups, from the first to the end of the last.
+    pub index: Option<Duration>,
+    /// The ranged reads of the packs, from the first to the end of the last.
+    pub objects: Option<Duration>,
 }
 
 /// How the reader groups requests and notes use.
@@ -160,17 +173,40 @@ impl<S: ObjectStore> Reader<S> {
     /// pack by a string that is not an object key; [`ReadError::Store`] when the store fails a
     /// read for a reason other than a missing object. No blob is returned then.
     pub async fn read(&self, digests: &[BlobDigest]) -> Result<Vec<Fetch>, ReadError> {
+        Ok(self.read_timed(digests).await?.0)
+    }
+
+    /// [`Reader::read`], with how long its index lookups and its ranged reads took.
+    ///
+    /// # Errors
+    /// As [`Reader::read`].
+    pub async fn read_timed(
+        &self,
+        digests: &[BlobDigest],
+    ) -> Result<(Vec<Fetch>, ReadTimes), ReadError> {
         let distinct: BTreeSet<BlobDigest> = digests.iter().copied().collect();
         let wanted: Vec<BlobDigest> = distinct.into_iter().collect();
         let mut found = BTreeMap::new();
         let rest = self.answer_from_cache(wanted, &mut found).await;
+        let mut times = ReadTimes::default();
+        let looking = Instant::now();
         let spans = self.plan(&rest, &mut found).await?;
+        times.index = (!rest.is_empty()).then(|| looking.elapsed());
+        let reading = Instant::now();
+        let fetched = match spans.is_empty() {
+            true => Vec::new(),
+            false => {
+                let fetched = self.fetch_all(spans).await;
+                times.objects = Some(reading.elapsed());
+                fetched
+            }
+        };
         let mut fresh = Vec::new();
         let mut damaged = Vec::new();
         let mut lost = LostPacks::new();
         // For each pack read, the end of the furthest bytes the store gave of it.
         let mut read: BTreeMap<ObjectKey, u64> = BTreeMap::new();
-        for (span, got) in self.fetch_all(spans).await {
+        for (span, got) in fetched {
             let bytes = got?;
             if let Some(whole) = &bytes {
                 let through = read.entry(span.pack.clone()).or_default();
@@ -204,7 +240,7 @@ impl<S: ObjectStore> Reader<S> {
         let answer = digests
             .iter()
             .map(|digest| found.get(digest).cloned().unwrap_or(Fetch::Missing));
-        Ok(answer.collect())
+        Ok((answer.collect(), times))
     }
 
     /// Tells the index of the blobs served since the last time, in batches. Returns how many

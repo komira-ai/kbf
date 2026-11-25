@@ -36,7 +36,10 @@
 //! the closure check is not: a blob a worker wrote into a pack is not on a node, so the check
 //! of an action-cache write and of every hit asks the pack index first and the nodes for the
 //! rest (`closed`), and the entry handed to the nodes names only the blobs they hold.
-//! Without packs the nodes check the entry alone, as they always did.
+//! Without packs the nodes check the entry alone, as they always did. The input check over
+//! packs shares what it knows of Directories with them (`known_dirs`): a Directory a client
+//! uploaded through them is decoded as it is stored, and the Execute that names it does not
+//! read it back (it still asks whether the store holds it).
 
 mod closed;
 mod handoff;
@@ -192,7 +195,7 @@ impl Backend {
         Self(Arc::new(RoutedPlane {
             routed,
             bootstrap: Remote::new(storage, packs.clone()),
-            trees: Trees::default(),
+            trees: trees_over(packs.as_ref()),
             packs,
         }))
     }
@@ -554,7 +557,7 @@ impl Remote {
         Self {
             storage,
             metrics: CacheMetrics::default(),
-            trees: Trees::default(),
+            trees: trees_over(packs.as_ref()),
             packs,
         }
     }
@@ -699,6 +702,14 @@ impl Plane for Remote {
     fn trees(&self) -> Option<&Trees> {
         Some(&self.trees)
     }
+}
+
+/// The memory of an input check over `packs`: it takes what they learn of the Directories
+/// clients upload through them, and what one plane's checks read the other's take too.
+fn trees_over(packs: Option<&Packs>) -> Trees {
+    packs.map_or_else(Trees::default, |packs| {
+        Trees::sharing(Arc::clone(packs.known_dirs()))
+    })
 }
 
 /// The storage nodes of a map, or the one node `--storage` names until the map has two

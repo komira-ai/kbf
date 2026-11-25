@@ -445,3 +445,38 @@ async fn a_drop_the_index_refuses_leaves_the_row() {
     assert_eq!(first, [Fetch::Damaged { dropped: false }]);
     assert_eq!(second, [Fetch::Damaged { dropped: true }]);
 }
+
+/// Asserts that a timed read says which of its two steps it took, and answers as `read` does:
+/// a blob in a pack takes an index lookup and a ranged read; a blob the index has no row for
+/// takes the lookup alone; a blob the cache holds takes neither; an empty call takes neither.
+#[tokio::test]
+async fn a_timed_read_names_the_steps_it_took() {
+    let blobs = [blob("alpha"), blob("bravo")];
+    let rig = packed(&blobs[..1]).await;
+    let dir = cache_dir("reader-timed");
+    let reader = rig.reader(Some(cache_in(&dir)), ReaderConfig::default());
+
+    let (got, cold) = reader.read_timed(&digests(&blobs[..1])).await.unwrap();
+    assert_eq!(got, expected(&blobs[..1]));
+    assert_eq!((cold.index.is_some(), cold.objects.is_some()), (true, true));
+
+    let (got, unknown) = reader.read_timed(&digests(&blobs[1..])).await.unwrap();
+    assert_eq!(got, [Fetch::Missing]);
+    assert_eq!(
+        (unknown.index.is_some(), unknown.objects.is_some()),
+        (true, false)
+    );
+
+    let (got, cached) = reader.read_timed(&digests(&blobs[..1])).await.unwrap();
+    assert_eq!(got, expected(&blobs[..1]));
+    assert_eq!(cached, kbf_pack::ReadTimes::default());
+    assert_eq!(
+        rig.store.ranges().len(),
+        1,
+        "the cached blob was read again"
+    );
+
+    let (got, none) = reader.read_timed(&[]).await.unwrap();
+    assert!(got.is_empty());
+    assert_eq!(none, kbf_pack::ReadTimes::default());
+}

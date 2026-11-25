@@ -15,8 +15,10 @@ use crate::prepare_run::DirectoryCache;
 
 impl Backend {
     /// From now on, every Directory the input check of an Execute over this backend reads is
-    /// also kept in `cache`, decoded with its names. Over a map still on its one bootstrap
-    /// node, that node's walk keeps nothing here.
+    /// also kept in `cache`, decoded with its names, and so is every Directory a client
+    /// uploads through the backend's packs. Over a map still on its one bootstrap node, that
+    /// node's walk keeps nothing here unless the frontend has packs, which the two walks
+    /// share.
     pub(crate) fn keep_directories(&self, cache: Arc<DirectoryCache>) {
         let trees = self.0.trees().into_iter();
         trees.for_each(|trees| trees.keep_into(Arc::clone(&cache)));
