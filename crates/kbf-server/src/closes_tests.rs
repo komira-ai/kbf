@@ -2,7 +2,8 @@
 //! status its response carries, or from its connection and the drain when it is dropped
 //! before one. The routes are a fake service whose response body the test feeds frame by
 //! frame; the connection is a [`Liveness`] the test marks; the clock is paused and moved
-//! by hand, so a logged duration is the one the test made.
+//! only by the test and by the fake routes' [`ROUTES_TAKE`], so a logged duration is the one
+//! the test made.
 
 use std::future::Future;
 use std::io;
@@ -49,7 +50,13 @@ enum Answer {
     Never,
 }
 
-/// Routes that answer each call with the next [`Answer`].
+/// How long the fake routes take to answer, on the paused clock: so the logged duration of
+/// every call they answer counts their time from the call's open, and a test left on the
+/// real clock panics (`advance` needs a paused clock) instead of reading the wall clock.
+const ROUTES_TAKE: Duration = Duration::from_millis(1);
+
+/// Routes that answer each call with the next [`Answer`], [`ROUTES_TAKE`] after it came (an
+/// error too); a call given [`Answer::Never`], or none, is never answered.
 struct Routes(Option<Answer>);
 
 impl Service<http::Request<()>> for Routes {
@@ -66,9 +73,15 @@ impl Service<http::Request<()>> for Routes {
             Some(Answer::Body(headers, body)) => {
                 let mut response = http::Response::new(body);
                 *response.headers_mut() = headers;
-                Box::pin(async { Ok(response) })
+                Box::pin(async {
+                    tokio::time::advance(ROUTES_TAKE).await;
+                    Ok(response)
+                })
             }
-            Some(Answer::Fail) => Box::pin(async { Err(io::Error::other("routes failed")) }),
+            Some(Answer::Fail) => Box::pin(async {
+                tokio::time::advance(ROUTES_TAKE).await;
+                Err(io::Error::other("routes failed"))
+            }),
             Some(Answer::Never) | None => Box::pin(std::future::pending()),
         }
     }
@@ -184,7 +197,7 @@ fn line(level: &str, fields: &str) -> String {
 
 /// Catches a stream that ends with its OK trailers counted as anything but `ok`, or logged:
 /// a normal end is neither abnormal nor lost.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stream_that_ends_ok_counts_ok_and_logs_nothing() {
     let log = capture();
     let rig = Rig::new();
@@ -207,7 +220,7 @@ async fn a_stream_that_ends_ok_counts_ok_and_logs_nothing() {
 /// sent in the headers with nothing else) counted as a server error, a drop, or logged:
 /// every action-cache miss would then be a line. Also a trailers-only response the
 /// transport drops without reading its empty body, which must still count its status.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_status_the_request_called_for_counts_client_error_and_logs_nothing() {
     let log = capture();
     let rig = Rig::new();
@@ -228,7 +241,7 @@ async fn a_status_the_request_called_for_counts_client_error_and_logs_nothing() 
 
 /// Catches a server's error status (INTERNAL in the trailers of a stream) not counted as
 /// `server_error`, or not logged with its status, method, peer and the call's ids.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_server_error_status_counts_and_logs_one_line() {
     let log = capture();
     let rig = Rig::new();
@@ -257,14 +270,14 @@ async fn a_server_error_status_counts_and_logs_one_line() {
         close_lines(&log),
         [line(
             "WARN",
-            "method=\"Execute\" cause=\"server_error\" status=\"Internal\" peer=\"192.0.2.7:40312\" invocation=\"inv-1\" action=\"act-9\" request_id=\"envoy-req-3\" duration_ms=0"
+            "method=\"Execute\" cause=\"server_error\" status=\"Internal\" peer=\"192.0.2.7:40312\" invocation=\"inv-1\" action=\"act-9\" request_id=\"envoy-req-3\" duration_ms=1"
         )]
     );
 }
 
 /// Catches a response that ends with no status (a body that ends bare, a body that fails,
 /// the routes' own error) counted as anything but `server_error`: none is an answer.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_end_with_no_status_counts_server_error() {
     let rig = Rig::new();
     let live = Liveness::default();
@@ -307,8 +320,8 @@ async fn an_end_with_no_status_counts_server_error() {
 
 /// Catches a stream its client resets, on a connection that stays, counted as anything but
 /// `client_cancel`, or logged at WARN, or with a duration other than the time it was open
-/// (the paused clock moved 90 s), or with the connection's peer instead of the client the
-/// proxy names.
+/// (the paused clock moved 90 s after the routes' [`ROUTES_TAKE`]), or with the
+/// connection's peer instead of the client the proxy names.
 #[tokio::test(start_paused = true)]
 async fn a_reset_on_a_connection_that_stays_counts_client_cancel() {
     let log = capture();
@@ -334,14 +347,14 @@ async fn a_reset_on_a_connection_that_stays_counts_client_cancel() {
         close_lines(&log),
         [line(
             "INFO",
-            "method=\"Execute\" cause=\"client_cancel\" status=\"-\" peer=\"198.51.100.4\" invocation=\"-\" action=\"\" request_id=\"-\" duration_ms=90000"
+            "method=\"Execute\" cause=\"client_cancel\" status=\"-\" peer=\"198.51.100.4\" invocation=\"-\" action=\"\" request_id=\"-\" duration_ms=90001"
         )]
     );
 }
 
 /// Catches a call dropped before its routes answered (a client that resets a Write still
 /// being read) not counted at all: the record is the call's, not only its body's.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_call_dropped_before_its_answer_is_counted() {
     let rig = Rig::new();
     let live = Liveness::default();
@@ -355,7 +368,7 @@ async fn a_call_dropped_before_its_answer_is_counted() {
 /// Catches a stream whose connection is lost counted as the client's cancel, as a
 /// keepalive close or not at all; and a call with no connection to ask (no `ConnInfo`)
 /// taken for a cancel. Logged at WARN.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_lost_connection_counts_connection_lost() {
     let log = capture();
     let rig = Rig::new();
@@ -388,11 +401,11 @@ async fn a_lost_connection_counts_connection_lost() {
         [
             line(
                 "WARN",
-                "method=\"Read\" cause=\"connection_lost\" status=\"-\" peer=\"192.0.2.7:40312\" invocation=\"-\" action=\"\" request_id=\"-\" duration_ms=0"
+                "method=\"Read\" cause=\"connection_lost\" status=\"-\" peer=\"192.0.2.7:40312\" invocation=\"-\" action=\"\" request_id=\"-\" duration_ms=1"
             ),
             line(
                 "WARN",
-                "method=\"Read\" cause=\"connection_lost\" status=\"-\" peer=\"-\" invocation=\"-\" action=\"\" request_id=\"-\" duration_ms=0"
+                "method=\"Read\" cause=\"connection_lost\" status=\"-\" peer=\"-\" invocation=\"-\" action=\"\" request_id=\"-\" duration_ms=1"
             ),
         ]
     );
@@ -401,7 +414,7 @@ async fn a_lost_connection_counts_connection_lost() {
 /// Catches a stream on a connection the keepalive watch closed counted as a lost connection
 /// or a drain: the watch's close is the server's own, and it wins over a drain that closed
 /// at the same time.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_keepalive_close_counts_keepalive() {
     let log = capture();
     let rig = Rig::new();
@@ -424,7 +437,7 @@ async fn a_keepalive_close_counts_keepalive() {
         close_lines(&log),
         [line(
             "WARN",
-            "method=\"Execute\" cause=\"keepalive\" status=\"-\" peer=\"192.0.2.7:40312\" invocation=\"-\" action=\"\" request_id=\"-\" duration_ms=0"
+            "method=\"Execute\" cause=\"keepalive\" status=\"-\" peer=\"192.0.2.7:40312\" invocation=\"-\" action=\"\" request_id=\"-\" duration_ms=1"
         )]
     );
 }
@@ -432,7 +445,7 @@ async fn a_keepalive_close_counts_keepalive() {
 /// Catches the drain's ends counted as server errors or cancels: an UNAVAILABLE while the
 /// drain refuses new calls, and a stream dropped after the drain closed. An UNAVAILABLE
 /// with no drain is a server error.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_drains_ends_count_drain() {
     let rig = Rig::new();
     let live = Liveness::default();
@@ -486,7 +499,7 @@ async fn the_drains_ends_count_drain() {
 
 /// Catches a call to a path the table does not name counted under another method or not at
 /// all, and a request id that is too long or not printable logged as it came.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unknown_path_counts_as_other_and_a_bad_request_id_is_not_logged() {
     let log = capture();
     let rig = Rig::new();
@@ -513,7 +526,7 @@ async fn an_unknown_path_counts_as_other_and_a_bad_request_id_is_not_logged() {
     assert_eq!(rig.counts("Execute"), [0; 7]);
     let cancelled = line(
         "INFO",
-        "method=\"other\" cause=\"client_cancel\" status=\"-\" peer=\"192.0.2.7:40312\" invocation=\"-\" action=\"\" request_id=\"-\" duration_ms=0",
+        "method=\"other\" cause=\"client_cancel\" status=\"-\" peer=\"192.0.2.7:40312\" invocation=\"-\" action=\"\" request_id=\"-\" duration_ms=1",
     );
     assert_eq!(close_lines(&log), [cancelled.clone(), cancelled]);
 }
@@ -602,7 +615,7 @@ fn every_status_code_has_its_cause() {
 
 /// Catches a retire's refusal (the drain refusing new Execute calls UNAVAILABLE before, or
 /// without, its GOAWAY) counted as a server error: it is the drain's.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_refusal_before_the_drain_begins_counts_drain() {
     let rig = Rig::new();
     rig.drain.refuse();
