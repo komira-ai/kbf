@@ -38,6 +38,8 @@ mod flight;
 mod golden;
 #[path = "action_tree/kept.rs"]
 mod kept;
+#[path = "action_tree/kept_short.rs"]
+mod kept_short;
 #[path = "action_tree/limits.rs"]
 mod limits;
 #[path = "action_tree/listing.rs"]
@@ -108,6 +110,15 @@ struct Faults {
     check: Fault,
     /// A key whose length the store fails to tell (a HEAD that fails).
     head_of: Option<String>,
+    /// The answers the next writes of a key give, in order, each keeping an object of 0 bytes
+    /// under the key first, as a store that keeps a write whose body failed before its first
+    /// byte does.
+    keeps: BTreeMap<String, VecDeque<ObjectStoreError>>,
+    /// A key whose delete the store refuses.
+    delete: Option<String>,
+    /// The answers the next writes of a key give, in order, after they stored the object (an
+    /// answer lost with its connection).
+    stored_then: BTreeMap<String, VecDeque<ObjectStoreError>>,
 }
 
 #[derive(Default)]
@@ -145,6 +156,8 @@ struct State {
     ranged: Vec<(String, u64, u64)>,
     /// Every length asked of an object (a HEAD), by key, in the order asked.
     heads_of: Vec<String>,
+    /// Every delete, by key, in the order made.
+    deletes: Vec<String>,
 }
 
 /// One open write of [`Farm`]'s, counted in [`State::open`] and [`State::peak`] until dropped.
@@ -529,6 +542,17 @@ impl LargeStore for Farm {
             if let Some(answer) = scripted {
                 return Err(answer);
             }
+            let kept = {
+                let mut state = self.state();
+                let answer = (state.faults.keeps.get_mut(&name)).and_then(VecDeque::pop_front);
+                if answer.is_some() {
+                    state.objects.insert(name.clone(), Bytes::new());
+                }
+                answer
+            };
+            if let Some(answer) = kept {
+                return Err(answer);
+            }
             let mut got = Vec::new();
             while let Some(piece) = body.next().await {
                 match piece {
@@ -544,9 +568,20 @@ impl LargeStore for Farm {
                 return Err(ObjectStoreError::AlreadyExists(key.clone()));
             }
             assert_eq!(got.len() as u64, len, "a body of the length declared");
-            state.objects.insert(name, Bytes::from(got));
-            Ok(())
+            state.objects.insert(name.clone(), Bytes::from(got));
+            let lost = (state.faults.stored_then.get_mut(&name)).and_then(VecDeque::pop_front);
+            lost.map_or(Ok(()), Err)
         })
+    }
+
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
+        let mut state = self.state();
+        state.deletes.push(key.to_string());
+        if state.faults.delete.as_deref() == Some(key.as_str()) {
+            return Box::pin(async { Err(ObjectStoreError::Unsupported("deletes of this key")) });
+        }
+        state.objects.remove(key.as_str());
+        Box::pin(async { Ok(()) })
     }
 
     fn read_range<'a>(

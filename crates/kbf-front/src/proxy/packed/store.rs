@@ -118,6 +118,9 @@ pub trait PackStore: Send + Sync {
         len: u64,
         body: BodyStream,
     ) -> BoxFuture<'a, Result<(), ObjectStoreError>>;
+
+    /// Deletes the object `key`; an absent key is success ([`ObjectStore::delete`]).
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> BoxFuture<'a, Result<(), ObjectStoreError>>;
 }
 
 /// A packer and a reader over one store.
@@ -166,6 +169,10 @@ impl<S: ObjectStore> PackStore for Over<S> {
         body: BodyStream,
     ) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
         Box::pin(self.store.put_stream(key, len, body))
+    }
+
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
+        Box::pin(self.store.delete(key))
     }
 }
 
@@ -745,6 +752,10 @@ impl LargeStore for Packs {
         body: BodyStream,
     ) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
         self.store.put_stream(key, len, body)
+    }
+
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
+        self.store.delete(key)
     }
 
     fn read_range<'a>(

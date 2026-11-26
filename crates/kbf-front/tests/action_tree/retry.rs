@@ -1,7 +1,8 @@
-//! The retry of a create-only write to `cas/l/`: a connection that turns out to be dead is
-//! tried once more, a 503 is waited out within the configured total, a 503 `SlowDown`
-//! (back-pressure) is waited out past it, nothing else is repeated, and the waits are counted
-//! with the packs' when the retry is told to. The waits are recorded by a fake [`Sleeper`], never taken.
+//! The retry of a create-only write to `cas/l/`: a connection that turns out to be dead, and a
+//! body tierstore saw stall, are each tried once more, a 503 is waited out within the configured
+//! total, a 503 `SlowDown` (back-pressure) is waited out past it, nothing else is repeated, and
+//! the waits are counted with the packs' when the retry is told to. The waits are recorded by a
+//! fake [`Sleeper`], never taken.
 
 use kbf_front::action_tree::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, Sleeper};
 
@@ -211,8 +212,32 @@ async fn a_zero_total_never_retries_a_503() {
     assert!(sleeps.waits().is_empty());
 }
 
-/// Catches: an answer that is not a connection failure or a 503 repeated: a 403, and a body
-/// whose bytes are not its digest's, are the failure on the first attempt.
+/// Catches: a 400 other than a stalled body's `RequestTimeout` repeated: a `BadDigest` is the
+/// failure on the first attempt, naming the store's answer.
+#[tokio::test]
+async fn a_400_other_than_request_timeout_is_not_repeated() {
+    let (rig, sleeps) = rig(DEFAULT_TOTAL).await;
+    let (root, key, _) = unlocated(&rig).await;
+    let bad = ObjectStoreError::Service {
+        status: 400,
+        code: "BadDigest".to_owned(),
+        message: "no".to_owned(),
+    };
+    script(&rig, &key, vec![bad]);
+    let failed = rig.write(&root).await.expect_err("no tree");
+    assert_eq!(
+        failed,
+        NoTree::Put {
+            key: key.clone(),
+            why: "store answered 400 BadDigest: no".to_owned()
+        }
+    );
+    assert_eq!(rig.farm.puts_of(&key["cas/l/".len()..]), 1);
+    assert!(sleeps.waits().is_empty());
+}
+
+/// Catches: an answer that is not a connection failure, a stalled body or a 503 repeated: a
+/// 403, and a body whose bytes are not its digest's, are the failure on the first attempt.
 #[tokio::test]
 async fn other_failures_are_not_repeated() {
     let (rig, sleeps) = rig(DEFAULT_TOTAL).await;

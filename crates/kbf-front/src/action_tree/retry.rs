@@ -3,11 +3,15 @@
 //!
 //! Every write of a tree is create-only and content-bound (the same key always gets the same
 //! bytes), so repeating one is safe: an object an earlier attempt did store is `AlreadyExists`,
-//! which the write counts as done. Three answers are repeated, and no other:
+//! which the write counts as done (a blob's write asks the key's length first and after such an
+//! answer: [`super::place`]). Four answers are repeated, and no other:
 //!
 //! - **A connection-level failure** ([`ObjectStoreError::Transport`]: a pooled connection the
 //!   store had closed, "connection closed before message completed", "Broken pipe"): once, at
 //!   once, on the connection the client makes next. A second failure is the failure.
+//! - **A stalled body** ([`ObjectStoreError::Service`] with status 400 and the code
+//!   `RequestTimeout`: tierstore had no byte of the body for its idle timeout, and closed the
+//!   connection): once, at once, with the body read again. A second one is the failure.
 //! - **A 503** ([`ObjectStoreError::Service`] with status 503: the store is not taking writes
 //!   for a while, typically 10 to 40 s while it registers or fails over its metadata): after a
 //!   wait that starts at about [`FIRST_WAIT`] and doubles up to [`LONGEST_WAIT`], each jittered
@@ -131,8 +135,15 @@ pub(crate) fn is_slow_down(error: &ObjectStoreError) -> bool {
     matches!(error, ObjectStoreError::Service { status: 503, code, .. } if code == "SlowDown")
 }
 
+/// Whether `error` is the store's answer to a body of which no byte came for its idle timeout:
+/// a 400 `RequestTimeout`.
+fn is_stalled(error: &ObjectStoreError) -> bool {
+    matches!(error, ObjectStoreError::Service { status: 400, code, .. } if code == "RequestTimeout")
+}
+
 /// Runs `attempt` (one create-only write of `key`), and again after a connection-level failure
-/// (once), a 503 (within the total) or a 503 `SlowDown` (for as long as the store answers it).
+/// (once), a stalled body (once), a 503 (within the total) or a 503 `SlowDown` (for as long as
+/// the store answers it).
 ///
 /// # Errors
 /// [`NoTree::Put`] with the store's last answer, or the [`Failed::Other`] of an attempt.
@@ -167,6 +178,7 @@ where
     Fut: Future<Output = Result<(), Failed<E>>>,
 {
     let mut reconnected = false;
+    let mut resent = false;
     let mut waits = retry.backoff.call(Op::Put);
     loop {
         let error = match attempt().await {
@@ -179,6 +191,10 @@ where
         };
         if matches!(error, ObjectStoreError::Transport(_)) && !reconnected {
             reconnected = true;
+            continue;
+        }
+        if is_stalled(&error) && !resent {
+            resent = true;
             continue;
         }
         let asked = Instant::now();
