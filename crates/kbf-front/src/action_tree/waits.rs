@@ -7,9 +7,9 @@
 //! - **the manifest slot**: the wait for one of the writer's slots for manifest writes
 //!   ([`super::MANIFEST_WRITES`], shared by every tree the frontend writes); a tree list takes
 //!   none, so its part is zero;
-//! - **the store slot**: the waits for one of the slots of the frontend's pack store
-//!   ([`crate::STORE_WRITES`], `--pack-store-writes`, shared with every pack upload), one wait
-//!   per attempt, added up;
+//! - **the store slot**: the waits for one of the pack store's slots for tree writes
+//!   (`crate::store_writes::TREE_WRITES`, shared by every tree the frontend writes, and not with
+//!   the pack uploads, which take one of `--pack-store-writes`), one wait per attempt, added up;
 //! - **the 503 waits**: the waits between attempts for a store that answered 503, `SlowDown`
 //!   or not ([`super::retry`]), added up;
 //! - **the request**: the rest of the write, from its first attempt to its answer, the store
@@ -17,11 +17,13 @@
 //!
 //! The store slot is taken below the writer, in the pack store, which every writer shares. The
 //! tree's write runs its attempts under a tally of its own ([`tallied`]), a tokio task-local
-//! carried by the write's future, and the slot's wait is added to the tally of the write that
-//! waited ([`waited_for_slot`]); a write under no tally (a pack upload, a blob of the tree's first
-//! stage) adds nothing. The 503 waits are added the same way ([`waited_out_503`]). Tallies are
-//! never nested: each write of a manifest, the root or the list is tallied once, by the one place
-//! that makes it (the writes in flight, [`super::flight`], and the list's write).
+//! carried by the write's future; the pack store takes a tree slot for a write under a tally
+//! ([`in_tree_write`]), and the slot's wait is added to the tally of the write that waited
+//! ([`waited_for_slot`]). A write under no tally (a pack upload, a blob of the tree's first
+//! stage, a list's sidecar) takes one of `--pack-store-writes` and adds nothing. The 503 waits
+//! are added the same way ([`waited_out_503`]). Tallies are never nested: each write of a
+//! manifest, the root or the list is tallied once, by the one place that makes it (the writes in
+//! flight, [`super::flight`], and the list's write).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -38,7 +40,7 @@ use super::WriteStage;
 pub struct WriteWaits {
     /// The wait for a slot for manifest writes; zero for a tree list, which takes none.
     pub manifest_slot: Duration,
-    /// The waits for a slot of the frontend's pack store, one per attempt, added up.
+    /// The waits for one of the pack store's slots for tree writes, one per attempt, added up.
     pub store_slot: Duration,
     /// The waits between attempts for a store that answered 503, added up.
     pub store_503: Duration,
@@ -106,6 +108,13 @@ pub(crate) async fn tallied<T>(
         request: took.saturating_sub(store_slot).saturating_sub(store_503),
     };
     (answer, waits)
+}
+
+/// Whether the write being made is a tree's write of a manifest, its root or its list: made under
+/// a tally ([`tallied`]), which only those writes are. The pack store gives such a write one of
+/// its slots for tree writes, not one the uploads share (`crate::store_writes`).
+pub(crate) fn in_tree_write() -> bool {
+    TALLY.try_with(|_| ()).is_ok()
 }
 
 /// A write waited `took` for a slot of the pack store: added to its tally, if it has one.

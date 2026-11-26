@@ -31,3 +31,4 @@ mod failover;
 mod large;
 mod lost;
 mod rig;
+mod slow;

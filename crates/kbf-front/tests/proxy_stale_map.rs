@@ -244,3 +244,63 @@ async fn a_newer_map_with_no_writer_is_unavailable() {
     assert_eq!(calls(&t.fakes).iter().sum::<usize>(), 1);
     assert_eq!(t.maps.fetches.load(SeqCst), 1);
 }
+
+/// Catches a retry that stops short of the router's bound, or goes past it: the writer
+/// answers STALE_MAP `MAX_MAP_REFETCHES` times, each fetch bringing a map one generation
+/// newer (a run of promotions during one upload), and serves the next try. The upload
+/// succeeds on that try, after exactly `MAX_MAP_REFETCHES` fetches, tagged with the last
+/// map's generation; no other node is asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_map_that_moves_up_to_the_bound_still_takes_the_upload() {
+    let last = 7 + MAX_MAP_REFETCHES as u64;
+    let maps: Vec<_> = (7..=last)
+        .map(|g| map(g, [MemberState::Active; 3]))
+        .collect();
+    let (kind, size, first) = writer_of(&maps[0]);
+    let mut fakes: Vec<_> = (0..3).map(|_| Fake::new(false)).collect();
+    fakes[first - 1] = Fake::stale_for(MAX_MAP_REFETCHES, 99, 0);
+    let t = rig(fakes, maps).await;
+
+    client(&t.front)
+        .write(Request::new(small(upload("main", kind, size))))
+        .await
+        .expect("the last try is taken");
+
+    let mut want = vec![0, 0, 0];
+    want[first - 1] = 1 + MAX_MAP_REFETCHES;
+    assert_eq!(calls(&t.fakes), want);
+    assert_eq!(t.maps.fetches.load(SeqCst), MAX_MAP_REFETCHES);
+    let seen = t.fakes[first - 1].seen.lock().expect("lock").clone();
+    let tags: Vec<_> = seen
+        .iter()
+        .map(|s| {
+            s.metadata
+                .get("kbf-map-generation")
+                .map(|v| v.to_str().expect("text").to_owned())
+        })
+        .collect();
+    let want: Vec<_> = (7..=last).map(|g| Some(g.to_string())).collect();
+    assert_eq!(tags, want);
+}
+
+/// Catches a retry against a map that is no newer: the writer answers STALE_MAP naming
+/// generation 8, but the fetch brings generation 7 again (the frontend cannot see the newer
+/// map yet), so the upload ends UNAVAILABLE after that one fetch, with no second call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fetch_that_brings_no_newer_map_is_unavailable() {
+    let only = map(7, [MemberState::Active; 3]);
+    let (kind, size, first) = writer_of(&only);
+    let mut fakes: Vec<_> = (0..3).map(|_| Fake::new(false)).collect();
+    fakes[first - 1] = Fake::stale_for(1, 8, 0);
+    let t = rig(fakes, vec![only]).await;
+
+    let status = client(&t.front)
+        .write(Request::new(small(upload("main", kind, size))))
+        .await
+        .expect_err("no newer map");
+    assert_eq!(status.code(), Code::Unavailable, "{status}");
+    let mut want = vec![0, 0, 0];
+    want[first - 1] = 1;
+    assert_eq!(calls(&t.fakes), want);
+    assert_eq!(t.maps.fetches.load(SeqCst), 1);
+}
