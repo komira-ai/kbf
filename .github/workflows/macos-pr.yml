@@ -58,6 +58,9 @@ jobs:
       # a full backlog is refused at once, a connect that succeeds leaves the rest only what is left,
       # and a missing or stale socket is a connect error (crates/update-register/src/tests.rs).
       - run: cargo test -p update-register --locked -- --exact tests::a_listener_whose_backlog_is_full_is_refused_at_once tests::the_deadline_left_after_the_connect_is_all_that_follows_gets tests::a_socket_left_by_a_listener_that_is_gone_is_refused tests::a_missing_socket_names_its_path tests::a_deadline_already_passed_does_not_connect
+      # The registration client reads the answer of an updater that closed first (`busy`): on a Mac
+      # the read's timeout is refused on such a socket, and the answer is read without it.
+      - run: cargo test -p update-register --locked -- --exact tests::the_answer_of_a_peer_that_closed_is_still_read
       # The task runner's tests without its test-only feature: they run the Command under the
       # macOS confine for real (ci.yml's `task-macos`, which runs them after the merge).
       - run: cargo test -p kbf-task --locked --no-fail-fast
