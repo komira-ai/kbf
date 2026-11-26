@@ -28,7 +28,7 @@ use crate::cache::is_empty_blob;
 use crate::known_dirs::KnownDirs;
 use crate::large_backfill::LargeStore;
 use crate::store_wait::{Backoff, STORE_WAIT, StoreWaits};
-use crate::store_writes::{STORE_WRITES, StoreWrites};
+use crate::store_writes::{STORE_WRITES, StoreWrites, TREE_WRITES};
 
 /// The largest blob a frontend puts in a pack or serves from one by default: 64 MiB, the
 /// most it holds in memory to hash a blob before the first byte of it is sent.
@@ -60,7 +60,8 @@ pub struct PackSettings {
     pub upload_idle_timeout: Duration,
     /// The blobs read from packs are kept here, when there is a cache.
     pub cache: Option<Arc<ReadCache>>,
-    /// The most writes at the store at once, of every writer through the packs together
+    /// The most writes at the store at once, of every writer through the packs together but for
+    /// an action tree's manifests, roots and lists, which have slots of their own
     /// (`crate::store_writes`): a write past it waits for one to end. A write whose body is in
     /// hand waits out the store's 503 `SlowDown` holding its slot.
     pub store_writes: NonZeroUsize,
@@ -209,7 +210,8 @@ impl fmt::Debug for Packs {
 impl Packs {
     /// Packs written to `store` under `keys` and recorded in `index`, as `settings` say. Every
     /// write to `store` through them, by any caller, takes one of
-    /// [`PackSettings::store_writes`] slots.
+    /// [`PackSettings::store_writes`] slots, but for the writes of an action tree's manifests,
+    /// root and list, which take one of the tree writes' own slots (`crate::store_writes`).
     ///
     /// # Errors
     /// [`PackError::NotCreateOnly`] when the store does not claim create-only writes. Call
@@ -227,7 +229,12 @@ impl Packs {
         let writer = keys.writer();
         let waits = Arc::<StoreWaits>::default();
         let backoff = Backoff::new(STORE_WAIT, Arc::clone(&waits));
-        let store = Arc::new(StoreWrites::new(store, settings.store_writes, backoff));
+        let store = Arc::new(StoreWrites::new(
+            store,
+            settings.store_writes,
+            TREE_WRITES,
+            backoff,
+        ));
         let packer = Packer::new(store.clone(), index.clone(), keys.clone(), config)?;
         let loss = Arc::<LossGuard>::default();
         let reader = Reader::new(

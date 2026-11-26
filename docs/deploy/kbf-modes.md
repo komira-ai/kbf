@@ -125,12 +125,15 @@ nothing holds only its reservation, never a buffer of the claimed size. Both fla
 accepted and ignored without `--pack-store-endpoint`.
 
 Every write to the pack store shares one bound, `--pack-store-writes` (default 64, from 1 to
-4096): the packs of client uploads, the large blobs past them, and the blobs and manifests of
-action trees (a manifest takes its `--task-manifest-writes` slot first). A write past it waits
-at the frontend for one to end, so a burst queues here and not at the store. A streamed write
-holds its slot for its whole body: a client's upload of a blob over 64 MiB keeps one for as long
-as it takes to send (one that stops sending is ended by `--pack-upload-idle-timeout`), so as many
-slow large uploads as there are slots hold the other writers back until one ends.
+4096): the packs of client uploads, the large blobs past them, and the blobs action trees write
+whole. The writes of action trees' manifests (`.kbf` among them), roots and lists take one of 32
+slots of their own instead (a manifest takes its `--task-manifest-writes` slot first), so a run
+waiting for its tree does not wait behind the uploads; the store's own bound on its puts, which
+it answers `SlowDown` past, still holds both. A write past its bound waits at the frontend for
+one to end, so a burst queues here and not at the store. A streamed write holds its slot for its
+whole body: a client's upload of a blob over 64 MiB keeps one for as long as it takes to send
+(one that stops sending is ended by `--pack-upload-idle-timeout`), so as many slow large uploads
+as there are slots hold the other writers of those slots back until one ends.
 
 Every call of the frontend to the pack store (a client's upload or read, an action's preparation
 and ingest, base publication, the janitor's listings and deletes) waits out a store that answers
@@ -446,7 +449,7 @@ manifests and `.kbf`, written together) and `tree_root` (the root, written last)
 it). [api.md](../api.md) lists them. Where the time of each write of those stages goes is
 `kbf_executor_tree_write_seconds{stage=...,part=...}`, one observation per write a tree made of its manifests
 (`tree_manifests`), its root (`tree_root`) or its list (`tree_list`): `manifest_slot` (the wait for one of the
-writer's 32 manifest slots), `store_slot` (the waits for one of the `--pack-store-writes` slots the pack uploads share),
+writer's 32 manifest slots), `store_slot` (the waits for one of the pack store's 32 slots for tree writes, which the pack uploads do not take),
 `store_503` (the waits out of the store's 503s, `SlowDown` included) and `request` (the rest, the attempts at the store);
 a stage's time well above its parts' `request` is spent waiting. `kbf_executor_tree_manifests_written` counts the
 manifests each tree's manifests stage wrote itself. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried

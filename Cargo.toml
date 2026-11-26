@@ -103,7 +103,7 @@ prost-types = "0.14.4"
 prost-build = "0.14.4"
 # The CommonMark parser that reads CLAUDE.md in kbf-integration-test's `agents_md` lint. Already
 # in the tree through prost-build; no default features: no HTML rendering, no getopts.
-pulldown-cmark = { version = "0.13.5", default-features = false }
+pulldown-cmark = { version = "0.13.6", default-features = false }
 # The RFC 8187 `filename*` of the blob route's Content-Disposition (kbf-server). Already in
 # the tree through axum.
 percent-encoding = "2.3.2"
@@ -182,7 +182,7 @@ zeroize = "1.9.1"
 # none, matched against `.pgpass` lines (kbf-pg-auth). Already in the tree through
 # tokio-postgres, which asks it the same.
 whoami = "2.1.3"
-zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
 
 kbf-alert = { path = "crates/kbf-alert" }
 kbf-auth = { path = "crates/kbf-auth" }

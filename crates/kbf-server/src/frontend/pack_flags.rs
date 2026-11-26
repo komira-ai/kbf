@@ -175,8 +175,10 @@ pub(super) fn args() -> [Arg; 11] {
             .help(
                 "The most writes this frontend has at the pack store at once, from 1 to 4096, \
                  shared by every writer: the packs of client uploads, the large blobs past \
-                 them, and the blobs and manifests of action trees. A write past it waits at \
-                 the frontend for one to end, so a burst queues here and not at the store. A \
+                 them, and the blobs action trees write whole. The writes of action trees' \
+                 manifests, roots and lists take 32 slots of their own instead, so they never \
+                 wait behind the uploads. A write past it waits at the frontend for one to \
+                 end, so a burst queues here and not at the store. A \
                  pack the store answers 503 SlowDown (it is taking as many uploads as it can) \
                  is written again after jittered waits that double from about 0.5 s to 8 s, \
                  holding its slot, for as long as the store answers it; any other 503, to any \

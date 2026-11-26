@@ -1,5 +1,6 @@
-//! [`StoreWrites`]: the writes share the slots, a `SlowDown` of a write whose body is in hand is
-//! waited out holding the slot, and a streamed write is made once. (The waits for a store's
+//! [`StoreWrites`]: the writes share the slots, a tree's manifests, roots and lists take slots of
+//! their own, a `SlowDown` of a write whose body is in hand is waited out holding the slot, and a
+//! streamed write is made once. (The waits for a store's
 //! other 503s are tested with [`Waiting`](crate::store_wait::Waiting), in `store_wait_tests`.)
 //! The waits are recorded by a fake [`Sleeper`] (or held by one until a test lets them end),
 //! never taken, and every bound is checked by counting the calls the store saw.
@@ -11,11 +12,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use futures::future::BoxFuture;
 use futures::stream;
 use kbf_objstore::MemoryStore;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 
 use super::*;
 use crate::action_tree::{FIRST_WAIT, Sleeper};
 use crate::store_wait::{STORE_WAIT, no_jitter};
+use std::future::Future;
 use std::time::Duration;
 
 /// A memory store whose writes answer the errors scripted for them first, wait at a gate the
@@ -228,11 +230,40 @@ fn body(bytes: &'static [u8]) -> BodyStream {
     Box::pin(stream::iter([Ok(Bytes::from_static(bytes))]))
 }
 
-/// `slots` over `fake`, waiting with `sleeps`.
+/// `n` slots over `fake`, and as many for tree writes, waiting with `sleeps`.
 fn over(fake: &Arc<Fake>, n: usize, sleeps: &Arc<Sleeps>) -> Arc<StoreWrites<Fake>> {
+    over_with(fake, n, n, sleeps)
+}
+
+/// `n` slots over `fake` and `trees` slots for tree writes, waiting with `sleeps`.
+fn over_with(
+    fake: &Arc<Fake>,
+    n: usize,
+    trees: usize,
+    sleeps: &Arc<Sleeps>,
+) -> Arc<StoreWrites<Fake>> {
     let sleeper = Arc::clone(sleeps) as Arc<dyn Sleeper>;
     let backoff = Backoff::with(STORE_WAIT, sleeper, no_jitter(), Arc::default());
-    Arc::new(StoreWrites::new(Arc::clone(fake), slots(n), backoff))
+    Arc::new(StoreWrites::new(
+        Arc::clone(fake),
+        slots(n),
+        slots(trees),
+        backoff,
+    ))
+}
+
+/// A one-byte body that comes only once `release` is sent or dropped: a streamed write of it holds
+/// its slot inside the store until then.
+fn held_body(release: oneshot::Receiver<()>) -> BodyStream {
+    Box::pin(stream::once(async move {
+        let _ = release.await;
+        Ok(Bytes::from_static(b"h"))
+    }))
+}
+
+/// `write` made as a tree's write (under a tally), answered with where its time went.
+async fn as_tree<T>(write: impl Future<Output = T>) -> (T, crate::action_tree::WriteWaits) {
+    crate::action_tree::tallied(Duration::ZERO, write).await
 }
 
 /// Catches a `SlowDown` that fails a write, or one waited out on a schedule other than the
@@ -448,20 +479,32 @@ fn the_default_bound_is_64() {
     assert_eq!(STORE_WRITES.get(), 64);
 }
 
-/// Catches the wait for a slot left out of a tree's write, told to a write that did not wait, or
-/// told as its request, for a streamed write and a whole one alike: with the one slot held by a
-/// write under no tally, a tree's write waits for it; 7 ms on tokio's paused clock later the held
-/// write is let through, and the tree's write is told its 7 ms as its store slot, with no 503 wait
-/// and no request time (the store answers at once), while the held write, under no tally, is told
-/// to nobody.
+/// Catches a default bound that is not the flags' documented 32 tree slots, or one that is not the
+/// tree writer's manifest slots (a manifest with one of those should wait for no other).
+#[test]
+fn the_tree_writes_have_32_slots_as_many_as_the_manifest_slots() {
+    assert_eq!(TREE_WRITES.get(), 32);
+    assert_eq!(TREE_WRITES.get(), crate::action_tree::MANIFEST_WRITES);
+}
+
+/// Catches a tree's write that queues behind the uploads for a slot, the failure the tree slots
+/// exist for, streamed or whole: with the one upload slot held by a streamed upload whose body has
+/// not come, a tree's write reaches the store and is stored with no wait for a slot, while the
+/// upload still holds its slot; the upload is stored once its body comes. The clock is tokio's,
+/// paused, so a write that waited for nothing is told exactly no wait.
 #[tokio::test(start_paused = true)]
-async fn a_tree_write_is_told_its_wait_for_a_slot_and_no_other_write_is() {
+async fn a_tree_write_reaches_the_store_while_every_upload_slot_is_held() {
     for streamed in [true, false] {
-        let fake = Arc::new(Fake::with_gate(0));
-        let store = over(&fake, 1, &Sleeps::at_once());
-        let held = tokio::spawn({
+        let fake = Arc::new(Fake::open());
+        let store = over_with(&fake, 1, 1, &Sleeps::at_once());
+        let (release, released) = oneshot::channel();
+        let upload = tokio::spawn({
             let store = Arc::clone(&store);
-            async move { store.put_stream(&key("held"), 3, body(b"abc")).await }
+            async move {
+                store
+                    .put_stream(&key("upload"), 1, held_body(released))
+                    .await
+            }
         });
         fake.until_inside(1).await;
         let tree_key = key("tree");
@@ -475,15 +518,125 @@ async fn a_tree_write_is_told_its_wait_for_a_slot_and_no_other_write_is() {
                 }
             }
         };
-        let mut tree = std::pin::pin!(crate::action_tree::tallied(Duration::ZERO, write));
+
+        let (put, waits) = as_tree(write).await;
+
+        put.expect("stored");
+        assert_eq!(waits.store_slot, Duration::ZERO, "streamed: {streamed}");
+        assert_eq!(store.len(&tree_key).await.expect("asked"), Some(3));
+        assert!(!upload.is_finished(), "the upload still holds its slot");
+        release.send(()).expect("the upload waits for its body");
+        upload.await.expect("joined").expect("stored");
+        assert_eq!(fake.writes(), 2);
+    }
+}
+
+/// Catches an upload that queues behind the trees' writes, or a tree slot taken by a write that
+/// is not a tree's: with the one tree slot held by a tree's write whose body has not come, an
+/// upload reaches the store and is stored.
+#[tokio::test]
+async fn an_upload_reaches_the_store_while_every_tree_slot_is_held() {
+    let fake = Arc::new(Fake::open());
+    let store = over_with(&fake, 1, 1, &Sleeps::at_once());
+    let (release, released) = oneshot::channel();
+    let tree = tokio::spawn({
+        let store = Arc::clone(&store);
+        as_tree(async move { store.put_stream(&key("tree"), 1, held_body(released)).await })
+    });
+    fake.until_inside(1).await;
+
+    store
+        .put_new(&key("upload"), Bytes::from_static(b"u"), None)
+        .await
+        .expect("stored");
+
+    assert!(!tree.is_finished(), "the tree's write still holds its slot");
+    release
+        .send(())
+        .expect("the tree's write waits for its body");
+    let (put, _) = tree.await.expect("joined");
+    put.expect("stored");
+    assert_eq!(fake.writes(), 2);
+}
+
+/// Catches tree writes past their own bound reaching the store, or the two bounds merged into
+/// one: with one upload slot, one tree slot and the store holding every write it gets, three
+/// uploads and three tree writes (whole and streamed) put exactly two inside it, one of each; once
+/// the store lets them through, all six are stored and no more than two were ever inside at once.
+#[tokio::test]
+async fn uploads_and_tree_writes_each_stay_within_their_slots() {
+    let fake = Arc::new(Fake::with_gate(0));
+    let store = over_with(&fake, 1, 1, &Sleeps::at_once());
+    let mut writes = Vec::new();
+    for n in 0..6 {
+        let store = Arc::clone(&store);
+        let write = async move {
+            let key = key(&format!("w{n}"));
+            match n % 2 == 0 {
+                true => store.put_new(&key, Bytes::from_static(b"w"), None).await,
+                false => store.put_stream(&key, 1, body(b"w")).await,
+            }
+        };
+        writes.push(tokio::spawn(async move {
+            match n < 3 {
+                true => write.await,
+                false => as_tree(write).await.0,
+            }
+        }));
+    }
+
+    fake.until_inside(2).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(fake.writes(), 2, "a write past its slots reached the store");
+    fake.gate.add_permits(6);
+    for write in writes {
+        write.await.expect("ran").expect("stored");
+    }
+
+    assert_eq!(fake.writes(), 6);
+    assert_eq!(fake.most(), 2);
+}
+
+/// Catches the wait for a tree slot left out of a tree's write, told to a write that did not
+/// wait, or told as its request, for a streamed write and a whole one alike: with the one tree
+/// slot held by another tree's write, a tree's write waits for it; 7 ms on tokio's paused clock
+/// later the held write is let through, and the waiting write is told its 7 ms as its store slot,
+/// with no 503 wait and no request time (the store answers at once), while the held write, which
+/// waited for nothing, is told no store slot.
+#[tokio::test(start_paused = true)]
+async fn a_tree_write_is_told_its_wait_for_a_tree_slot_and_no_other_write_is() {
+    for streamed in [true, false] {
+        let fake = Arc::new(Fake::with_gate(0));
+        let store = over_with(&fake, 1, 1, &Sleeps::at_once());
+        let held = tokio::spawn({
+            let store = Arc::clone(&store);
+            as_tree(async move { store.put_stream(&key("held"), 3, body(b"abc")).await })
+        });
+        fake.until_inside(1).await;
+        let tree_key = key("tree");
+        let write = async {
+            match streamed {
+                true => store.put_stream(&tree_key, 3, body(b"def")).await,
+                false => {
+                    store
+                        .put_new(&tree_key, Bytes::from_static(b"def"), None)
+                        .await
+                }
+            }
+        };
+        let mut tree = std::pin::pin!(as_tree(write));
         assert!(
             futures::poll!(tree.as_mut()).is_pending(),
-            "no slot is free"
+            "no tree slot is free"
         );
         assert_eq!(fake.writes(), 1, "the tree's write waits outside the store");
         tokio::time::advance(Duration::from_millis(7)).await;
         fake.gate.add_permits(2);
-        held.await.expect("joined").expect("stored");
+        let (put, held_waits) = held.await.expect("joined");
+        put.expect("stored");
+        assert_eq!(held_waits.store_slot, Duration::ZERO);
         let (put, waits) = tree.await;
         put.expect("stored");
         let want = crate::action_tree::WriteWaits {
