@@ -317,6 +317,7 @@ fn row(tag: u8) -> OpRow {
         job: format!("k0-{tag}-0"),
         key: None,
         whole_machine: false,
+        tree: None,
     }
 }
 

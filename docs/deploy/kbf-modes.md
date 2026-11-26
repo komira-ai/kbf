@@ -592,6 +592,41 @@ line. `GET /metrics` has `kbf_cas_b_janitor_listed_total`,
 sweep), `..._sweeps_total` and `..._sweep_errors_total` (sweeps the listing or the pack index
 stopped).
 
+**The collector of tree lists** (off by default, and a dry run until told to delete; the
+`[executor]` table of `kbf.toml`). In the provider form (`--executor-input-tree provider`) and for
+every Mac job, each action's tree is one tree list `cas/l/<id>` with its L2 sidecar `cas/l2/<id>`;
+lists do not dedup across trees as manifests do, so every start adds one
+(docs/design/one-file-action-tree.md, 4.8). With `--executor-list-sweep-key-file` and
+`--executor-list-sweep-sidecar-key-file` the leader lists `cas/l2/` every
+`--executor-list-sweep-interval-secs` (default 3600, 60 to 86400), asks the store for the size and
+the write time of each sidecar's list (a HEAD), and finds the lists older than a day that no open
+operation's row names (the `exec/op/` row of an operation names the tree list its current
+attempt's job reads) and that the pack index does not record as a pack. Without
+`--executor-list-sweep-apply` it only counts them (`kbf_tree_list_sweep_would_delete_lists_total`,
+`..._would_delete_list_bytes_total`, `..._would_delete_sidecars_total`); with it, it deletes each
+list and then its sidecar (`..._deleted_lists_total`, `..._deleted_list_bytes_total`,
+`..._deleted_sidecars_total`). A sidecar whose list is gone is deleted once it is a day old and no
+open row names its list. Only a
+list a sidecar names is ever deleted: the manifests, large blobs and whole objects that share
+`cas/l/` are not listed, and a list with no sidecar is left. A row of the operations that cannot
+be read (corrupt, or written by a later release) or a pack index that fails stops the pass before
+the page's deletes; a 401 or 403 ends the pass, and so do 5 store calls failing in a row
+(`..._pass_errors_total`). Every pass, a dry run too, counts the lists it found and their bytes by
+age in whole days (`kbf_tree_list_sweep_lists{age_days="0"}` to `{age_days="7+"}`, and
+`kbf_tree_list_sweep_list_bytes`, from the last pass that reached the end of the listing), and
+`kbf_tree_list_sweep_apply` says whether passes delete. The two key files are tier store GC keys
+(`--gc-key-file` there), the first of the prefix exactly `cas/l/`, the second of exactly `cas/l2/`,
+each owned by the server's user, mode 0600 or 0400; they sign the requests to the store of
+`--pack-store-endpoint`, which the collector needs, as it needs `--pack-index` and the state
+store. Turn it on only once every frontend of the state store runs a release that writes the list
+into its rows, and turn it off before a frontend is rolled back to an older release: an older
+frontend's rows name no list (and one that takes up an operation writes its row again without
+it), so only the age rule protects its jobs. A list is written create-only, so a list reused a
+day after its first write is old though in use: an operation that takes it up after a pass read
+the rows can find it deleted. Its job's start is then refused (`no tree list at <key>`), which the
+frontend reads as a refused list: it writes the list again and runs the job once more, spending no
+attempt (`kbf_executor_runs_total{outcome="list_refused"}`).
+
 The blobs the storage members flushed before the frontends wrote packs are in no pack the
 index knows, so a read of one still goes to the members. `kbf-pack-adopt`, an operator tool and
 a binary of its own, indexes those segments where they lie, with no byte copied and nothing

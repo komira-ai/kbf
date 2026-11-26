@@ -39,6 +39,7 @@ fn row_of(tag: u8, job: &str) -> OpRow {
         job: job.to_owned(),
         key: None,
         whole_machine: false,
+        tree: None,
     }
 }
 
@@ -71,6 +72,7 @@ async fn an_operation_keeps_its_row_from_before_its_submit_until_it_finishes() {
             job: job.clone(),
             key: Some(key),
             whole_machine: false,
+            tree: None,
             ..row_of(1, "")
         }
     );

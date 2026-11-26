@@ -85,6 +85,9 @@
 //! flags and the rule for an orphan): the leader then sweeps the task packs and large objects
 //! under `cas/b/` that nothing recorded and are older than the grace, on an interval, through the
 //! tier store's GC key, and counts what it did (`kbf_cas_b_janitor_*` on `GET /metrics`).
+//! **The collector of tree lists** is off unless `--executor-list-sweep-key-file` is given
+//! (`list_sweep`): the leader then counts, and with `--executor-list-sweep-apply` deletes, the
+//! tree lists older than a day no open operation names (`kbf_tree_list_sweep_*`).
 //!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) of a frontend with a `--storage` node fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
@@ -156,6 +159,8 @@ pub use self::executor_flags::{ExecutorFlags, JsAgentFlags};
 use self::executor_open::executor_of;
 pub use self::janitor::{Janitor, JanitorFlagError, JanitorFlags, JanitorMetrics};
 pub use self::job_read::{JobReadError, JobReadFlags, JobTls};
+pub use self::list_sweep::ListSweepFlags;
+use self::list_sweep::{ListSweep, ListSweepMetrics};
 pub use self::pack_flags::{PackFlagError, PackFlags};
 pub use self::task_flags::{PutDirFlags, TaskFlagError};
 use crate::closes::{CloseMetrics, ClosesLayer};
@@ -309,6 +314,9 @@ pub struct FrontendFlags {
     /// `--task-janitor-key-file` and its companions: the sweep of the task packs under `cas/b/`
     /// that nothing recorded. `None` without the key file, where nothing is swept.
     pub janitor: Option<JanitorFlags>,
+    /// `--executor-list-sweep-key-file` and its companions: the collector of the tree lists no
+    /// open operation names. `None` without the key file, where nothing is collected.
+    pub list_sweep: Option<ListSweepFlags>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -359,6 +367,8 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
     let put_dir = task_flags::from_matches(m).map_err(refuse)?;
     let janitor = janitor::from_matches(m);
     janitor::check(janitor.as_ref(), packs.as_ref()).map_err(refuse)?;
+    let list_sweep = list_sweep::from_matches(m);
+    list_sweep::check(list_sweep.as_ref(), packs.as_ref()).map_err(refuse)?;
     if let Some(js) = executor.js.as_mut() {
         let beside = executor_bind::Beside {
             put_dir: put_dir.as_ref(),
@@ -381,6 +391,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         job_read,
         put_dir,
         janitor,
+        list_sweep,
     })
 }
 
@@ -545,6 +556,9 @@ pub struct FrontendHandle {
     /// The count of sweeps the janitor of `cas/b/` has finished, if `--task-janitor-key-file`
     /// was given.
     janitor_sweeps: Option<tokio::sync::watch::Receiver<u64>>,
+    /// The count of passes the collector of tree lists has finished, if
+    /// `--executor-list-sweep-key-file` was given.
+    list_sweeps: Option<tokio::sync::watch::Receiver<u64>>,
     /// The executor `--executor js-agent` builds: its task keeps its place in the state store
     /// while the frontend serves.
     executor: Option<Executor>,
@@ -559,6 +573,13 @@ impl FrontendHandle {
     #[must_use]
     pub fn janitor_sweeps(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         self.janitor_sweeps.clone()
+    }
+
+    /// The count of passes the collector of tree lists has finished, told as each ends, or
+    /// `None` without `--executor-list-sweep-key-file`.
+    #[must_use]
+    pub fn list_sweeps(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.list_sweeps.clone()
     }
 
     /// The pack index `--pack-index` opened on the Postgres state store, or `None` without the
@@ -914,6 +935,17 @@ impl<'a> Prepared<'a> {
         )?;
         let janitor_metrics = janitor.as_ref().map(Janitor::metrics);
         let janitor_sweeps = janitor_metrics.as_ref().map(|metrics| metrics.finished());
+        let list_sweep = list_sweep::open(
+            flags.list_sweep.as_ref(),
+            flags.packs.as_ref(),
+            pack_index.as_ref(),
+            state_store.as_ref(),
+            &readiness,
+        )?;
+        let list_sweep_metrics = list_sweep.as_ref().map(ListSweep::metrics);
+        let list_sweeps = list_sweep_metrics
+            .as_ref()
+            .map(|metrics| metrics.finished());
         let backend = match (&plane, &routed) {
             (stored::Plane::Stored(stored), _) => Backend::stored(Arc::clone(stored)),
             (stored::Plane::Node { storage, .. }, Some(routed)) => {
@@ -1104,6 +1136,7 @@ impl<'a> Prepared<'a> {
                 job_read: job_stats,
                 executor: executor.as_ref().map(|built| Arc::clone(&built.metrics)),
                 janitor: janitor_metrics,
+                list_sweep: list_sweep_metrics,
             },
         ));
         // The storage health, if there are members.
@@ -1185,6 +1218,7 @@ impl<'a> Prepared<'a> {
         background.extend(enroll_renewal);
         background.extend(job_task);
         background.extend(janitor.map(|janitor| janitor.run().boxed()));
+        background.extend(list_sweep.map(|sweep| sweep.run().boxed()));
 
         let shutdown = shutdown()?;
         let stopper = Arc::clone(&drain);
@@ -1298,6 +1332,7 @@ impl<'a> Prepared<'a> {
             packs,
             put_dir_prep,
             janitor_sweeps,
+            list_sweeps,
             executor: executor.map(|built| built.executor),
             base_tree,
         })
@@ -1360,6 +1395,8 @@ struct Counters {
     executor: Option<Arc<ExecutorMetrics>>,
     /// The janitor of `cas/b/`.
     janitor: Option<Arc<JanitorMetrics>>,
+    /// The collector of tree lists.
+    list_sweep: Option<Arc<ListSweepMetrics>>,
 }
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
@@ -1379,6 +1416,7 @@ fn metrics_route(
         job_read,
         executor,
         janitor,
+        list_sweep,
     } = counters;
     let tls = Arc::new(tls);
     let render = move || {
@@ -1387,6 +1425,7 @@ fn metrics_route(
         let executor = executor.clone();
         let job_read = job_read.clone();
         let (janitor, closes) = (janitor.clone(), Arc::clone(&closes));
+        let list_sweep = list_sweep.clone();
         async move {
             let mut text = backend.render_metrics();
             closes.render(&mut text);
@@ -1400,6 +1439,9 @@ fn metrics_route(
             }
             if let Some(janitor) = janitor {
                 janitor.render(&mut text);
+            }
+            if let Some(list_sweep) = list_sweep {
+                list_sweep.render(&mut text);
             }
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
@@ -1482,6 +1524,7 @@ mod executor_open;
 mod handoff;
 mod janitor;
 mod job_read;
+mod list_sweep;
 mod pack_flags;
 pub mod removed;
 mod state_schema;

@@ -230,6 +230,7 @@ async fn a_row_another_process_owns_hands_over_even_when_the_tree_write_failed()
                 job: "their-job".to_owned(),
                 key: None,
                 whole_machine: false,
+                tree: None,
             },
         )
         .expect("their row");

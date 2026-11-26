@@ -292,23 +292,28 @@ struct KeyFile {
 
 /// The credentials in the file at `path`, whose prefix must be exactly [`SWEPT_PREFIX`].
 fn read_key(path: &Path) -> Result<Credentials, JanitorFlagError> {
-    let bad = |why: String| JanitorFlagError::Key {
+    read_gc_key(path, SWEPT_PREFIX, "the janitor").map_err(|why| JanitorFlagError::Key {
         path: path.display().to_string(),
         why,
-    };
-    let bytes = read_owner_only(path, MAX_FILE_BYTES).map_err(|error| bad(error.to_string()))?;
+    })
+}
+
+/// The credentials in the tier store GC key file at `path`, whose prefix must be exactly
+/// `prefix`, the one prefix `sweeper` (named in the refusal) lists and deletes in; or what is
+/// wrong with the file, which never quotes the secret.
+pub(super) fn read_gc_key(path: &Path, prefix: &str, sweeper: &str) -> Result<Credentials, String> {
+    let bytes = read_owner_only(path, MAX_FILE_BYTES).map_err(|error| error.to_string())?;
     let bytes = Zeroizing::new(bytes);
     // The error of the parser is dropped: for a value of the wrong type it quotes the value.
-    let key = serde_json::from_slice::<KeyFile>(&bytes).map_err(|_| bad(NOT_KEY.to_owned()))?;
-    if key.prefix != SWEPT_PREFIX {
-        return Err(bad(format!(
-            "the prefix is {:?} and must be exactly {SWEPT_PREFIX:?}: the janitor sweeps \
-             nothing else",
+    let key = serde_json::from_slice::<KeyFile>(&bytes).map_err(|_| NOT_KEY.to_owned())?;
+    if key.prefix != prefix {
+        return Err(format!(
+            "the prefix is {:?} and must be exactly {prefix:?}: {sweeper} sweeps nothing else",
             key.prefix
-        )));
+        ));
     }
     if key.access_key_id.is_empty() || key.secret_access_key.is_empty() {
-        return Err(bad(NOT_KEY.to_owned()));
+        return Err(NOT_KEY.to_owned());
     }
     Ok(Credentials::new(key.access_key_id, key.secret_access_key))
 }

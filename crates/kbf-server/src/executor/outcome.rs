@@ -46,7 +46,7 @@
 //! | failed to start input-unavailable | `infra` | `UNAVAILABLE`: a host path the job named could not be read on its host, rerun |
 //! | failed to start host-unsafe | `infra` | `UNAVAILABLE`: rerun |
 //! | failed to start, any code, its detail naming an object of its tree the store answered 404 for | `infra` | `UNAVAILABLE`: the frontend drops what its memos say of the object and tells its packs of the absence, and the next attempt's tree is checked against the store, rerun |
-//! | failed to start, any code, its detail saying the host refused the job's tree list as not mountable (`tree list not supported: <reason>`) | `list-refused` | `UNAVAILABLE`: the frontend takes its miss path, and the next attempt's tree is written again (the first time) or as manifests (after); the run is rerun without spending an attempt, up to [`LIST_REFUSALS`] times in an operation |
+//! | failed to start, any code, its detail saying the host refused the job's tree list as not mountable (`tree list not supported: <reason>`) or found no list at its key (`no tree list at <key>`) | `list-refused` | `UNAVAILABLE`: the frontend takes its miss path, and the next attempt's tree is written again (the first time) or as manifests (after); the run is rerun without spending an attempt, up to [`LIST_REFUSALS`] times in an operation |
 //! | failed to start egress-unchecked | `infra` | `UNAVAILABLE`: the host's agent could not check the limits of the job's network, rerun |
 //! | failed to start, any other code or detail | `infra` | `UNAVAILABLE`: rerun |
 //! | in a state this server does not know | `infra` | `UNAVAILABLE`: rerun |
@@ -110,6 +110,15 @@
 //! refusal after those is run again as any `infra` ending. The text is read before
 //! [`lost_of`]: when a detail holds both, the tree list is what the host could not use, and the
 //! lost object, if there is one, is found again by the next attempt's refusal.
+//!
+//! **A tree list the store no longer has.** tierstore's provider refuses a start whose list is
+//! not in the store with `no tree list at <key>`. The collector of tree lists deletes a list no
+//! open operation names once it is a day old, and a list written create-only keeps the time of
+//! its first write, so an operation that takes up an old list (from the 600 s memo, or a write
+//! that found the key there) after the collector last read the rows can find it deleted. That
+//! start is read as a refused list too: the miss path's first step drops the action's
+//! remembered trees, so the next attempt writes the list again (the store no longer has it, so
+//! the create-only write stores it), and the run spends no attempt.
 //!
 //! **An input the host could not read.** A job service result says the job's inputs failed on its
 //! host with `input_failure` (the agent's code: `input-unreadable`, `host-port-lost`), its reason
@@ -341,10 +350,15 @@ pub(super) fn source_missing(detail: &str) -> Option<String> {
 /// supported: v1_list` (or `missing_sidecar`, `unknown_cell_digest`, `unknown_version`).
 pub(super) const LIST_NOT_SUPPORTED: &str = "tree list not supported: ";
 
+/// What tierstore's provider writes before the key of a job's tree list the store does not have
+/// (`no tree list at cas/l/<id>`).
+pub(super) const LIST_ABSENT: &str = "no tree list at ";
+
 /// Whether a start failure's `detail` says a node refused the job's tree list as not mountable
-/// through tierstore: [`LIST_NOT_SUPPORTED`] anywhere in it. Nothing else of the detail is read.
+/// through tierstore, or found no list at its key: [`LIST_NOT_SUPPORTED`] or [`LIST_ABSENT`]
+/// anywhere in it. Nothing else of the detail is read.
 pub(super) fn list_refused(detail: &str) -> bool {
-    detail.contains(LIST_NOT_SUPPORTED)
+    detail.contains(LIST_NOT_SUPPORTED) || detail.contains(LIST_ABSENT)
 }
 
 /// The object a start failure's `detail` says the store does not have: a manifest

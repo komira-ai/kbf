@@ -17,7 +17,9 @@
 //! mounts both under one mount point, and the host's agent lists them as its mount roots
 //! (`--mount-root put=<mp>/put`, `--mount-root-ro trees=<mp>/trees`).
 
-use js_proto::v1::{Layer, Mount, MountMode, MountPropagation, ProviderSource, layer, mount};
+use js_proto::v1::{
+    JobSpec, Layer, Mount, MountMode, MountPropagation, ProviderSource, layer, mount,
+};
 
 /// The mount provider a job's tree is asked of with `--executor-input-tree provider`: the
 /// name tierstore's provider has on every host (`--mount-provider tierstore=<socket>`).
@@ -131,6 +133,25 @@ pub fn provider_layer(key: &str) -> Layer {
             r#ref: key.to_owned(),
         })),
     }
+}
+
+/// The key of the tree list `spec`'s tree is read from: the `ref` [`PROVIDER`] is given, in a
+/// layer (the provider form, [`provider_layer`]) or a mount (a Mac job's tree). `None` for a
+/// job whose tree is a host directory of manifests.
+#[must_use]
+pub fn tree_list_of(spec: &JobSpec) -> Option<&str> {
+    let layers = spec.layers.iter().filter_map(|l| match &l.source {
+        Some(layer::Source::Provider(source)) => Some(source),
+        _ => None,
+    });
+    let mounts = spec.mounts.iter().filter_map(|m| match &m.source {
+        Some(mount::Source::Provider(source)) => Some(source),
+        _ => None,
+    });
+    layers
+        .chain(mounts)
+        .find(|source| source.provider == PROVIDER)
+        .map(|source| source.r#ref.as_str())
 }
 
 #[cfg(test)]
