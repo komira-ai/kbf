@@ -1,7 +1,9 @@
 //! Execute's reads overlap where nothing orders them, and read nothing more for it: the Action
 //! is read while the action cache is looked up, and the Command while the input tree is walked
 //! (its Directory reads and its held-file check); the answer is still made in the order the
-//! reads would have run one after another.
+//! reads would have run one after another. The action tree's write is started (the dispatch's
+//! `start_tree`) once the walk has read its Directories and the Command is decoded, while the
+//! walk still asks whether the files are held; the dispatch is told the finding.
 //!
 //! The store is a real in-memory storage node behind a wrapper that records every call it
 //! takes, in the order taken, and holds the answer of the calls a test names for an hour of
@@ -15,8 +17,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use kbf_auth::Authorizers;
 use kbf_front::{
-    Backend, Cache, CacheStorage, Closer, Dispatch, ExecutionService, MemoryMetaLog,
-    SegmentsConfig, Stage, Submission, Ticket,
+    Backend, Cache, CacheStorage, Closer, DecodedAction, Dispatch, ExecutionService, HeldFinding,
+    MemoryMetaLog, SegmentsConfig, Stage, Submission, Ticket,
 };
 use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::MemoryStore;
@@ -90,13 +92,14 @@ impl Recorded {
         })
     }
 
-    /// The calls taken, in the order taken.
+    /// The calls taken of the store, in the order taken: not the dispatch's tree starts, which
+    /// the record keeps only to order them among the calls.
     fn made(&self) -> Vec<Call> {
         let log = lock(&self.log);
         log.iter()
             .filter_map(|event| match event {
-                Event::Made(call) => Some(*call),
-                Event::Answered(_) => None,
+                Event::Made(call) if *call != START_TREE => Some(*call),
+                Event::Made(_) | Event::Answered(_) => None,
             })
             .collect()
     }
@@ -170,10 +173,15 @@ impl Storage for Recorded {
     }
 }
 
-/// A dispatch that takes every submission and runs nothing.
-#[derive(Default)]
+/// An action tree write the Execute started: the action, its decode and the finding it is told.
+type Started = (Digest, Arc<DecodedAction>, HeldFinding);
+
+/// A dispatch that takes every submission and runs nothing, and keeps every tree write the
+/// Execute starts, each recorded in the store's record as the call `start_tree` when started.
 struct Taken {
+    store: Arc<Recorded>,
     submitted: Mutex<Vec<Submission>>,
+    started: Mutex<Vec<Started>>,
 }
 
 impl Dispatch for Taken {
@@ -195,7 +203,15 @@ impl Dispatch for Taken {
     fn cancel(&self, _name: &str) -> bool {
         false
     }
+
+    fn start_tree(&self, action: Digest, decoded: Arc<DecodedAction>, finding: HeldFinding) {
+        lock(&self.store.log).push(Event::Made(START_TREE));
+        lock(&self.started).push((action, decoded, finding));
+    }
 }
+
+/// The call a tree write's start is recorded as.
+const START_TREE: Call = Call::Other("start_tree");
 
 /// An action: its digest, and the digests of its Command, its input root and its one file.
 #[derive(Clone, Copy, Debug)]
@@ -230,7 +246,11 @@ impl Rig {
             failing: Mutex::new(Vec::new()),
         });
         let storage: Arc<dyn Storage> = store.clone();
-        let dispatch = Arc::new(Taken::default());
+        let dispatch = Arc::new(Taken {
+            store: Arc::clone(&store),
+            submitted: Mutex::new(Vec::new()),
+            started: Mutex::new(Vec::new()),
+        });
         let (closer, closing) = kbf_front::closing();
         let service = ExecutionService::with_authorizers(
             Backend::remote(storage),
@@ -332,6 +352,11 @@ impl Rig {
     /// How many submissions the dispatch took.
     fn submitted(&self) -> usize {
         lock(&self.dispatch.submitted).len()
+    }
+
+    /// The tree writes the Execute started, taken from the dispatch.
+    fn started(&self) -> Vec<Started> {
+        std::mem::take(&mut *lock(&self.dispatch.started))
     }
 
     /// Writes a cached result for `job`'s action.
@@ -548,4 +573,103 @@ async fn the_answers_keep_the_order_of_reads_made_one_after_another() {
     let status = rig.execute(&job, false).await.expect_err("unavailable");
     assert_eq!(status.code(), Code::Unavailable, "{status:?}");
     assert_eq!(rig.submitted(), 0);
+}
+
+/// Asserts that the action tree's write is started while the walk's held-file check is still
+/// unanswered, after the walk read the root Directory, and once: with FindMissing held, the
+/// start is in the record after the root's read and before FindMissing's answer. The Execute
+/// then submits, the submission carries the very decode the start was given, and the start's
+/// finding is held. Catches a write started only after the held check (or at the submit), one
+/// started before the Directories are read, a second decode, and a finding never told.
+#[tokio::test(start_paused = true)]
+async fn the_tree_write_starts_while_the_held_files_are_asked_about() {
+    let rig = Rig::new();
+    let job = rig.job("written beside the check", &[], &[]).await;
+    rig.hold(Call::Ask);
+
+    rig.execute(&job, true).await.expect("submitted");
+
+    let read = rig.store.at(Event::Made(Call::Read(job.root)));
+    let started = rig.store.at(Event::Made(START_TREE));
+    let answered = rig.store.at(Event::Answered(Call::Ask));
+    let log = lock(&rig.store.log).clone();
+    assert!(read < started, "started before the root was read: {log:?}");
+    assert!(started < answered, "waited for the held check: {log:?}");
+    let [(action, decoded, finding)] = <[Started; 1]>::try_from(rig.started()).expect("one start");
+    assert_eq!(action, job.action);
+    let submitted = lock(&rig.dispatch.submitted).pop().expect("one submission");
+    let carried = submitted
+        .decoded
+        .expect("the submission carries the decode");
+    assert!(Arc::ptr_eq(&carried, &decoded), "one decode for both");
+    assert!(finding.wait().await, "every input was found held");
+}
+
+/// Asserts that the tree's write is started only once the Command is decoded: with the
+/// Command's read held, the walk ends (its FindMissing made) before the Command's answer, and
+/// the start comes after that answer; the finding is held. Catches a start given an Action
+/// with no Command, which no run's facts can be read from.
+#[tokio::test(start_paused = true)]
+async fn the_tree_write_waits_for_the_command() {
+    let rig = Rig::new();
+    let job = rig.job("command held", &[], &[]).await;
+    rig.hold(Call::Read(job.command));
+
+    rig.execute(&job, true).await.expect("submitted");
+
+    let command = rig.store.at(Event::Answered(Call::Read(job.command)));
+    assert!(rig.store.at(Event::Made(Call::Ask)) < command);
+    assert!(command < rig.store.at(Event::Made(START_TREE)));
+    let [(_, _, finding)] = <[Started; 1]>::try_from(rig.started()).expect("one start");
+    assert!(finding.wait().await, "every input was found held");
+}
+
+/// Asserts that an Execute that ends MISSING tells its started write that the inputs are not
+/// held, and submits nothing: the file absent, the write is started (the Directories were read
+/// and the Command decoded) and its finding is not held. With the Command absent too, nothing
+/// is started at all. Catches a write trusted for an Execute that ended MISSING.
+#[tokio::test(start_paused = true)]
+async fn an_execute_that_ends_missing_tells_its_write_the_inputs_are_not_held() {
+    let rig = Rig::new();
+    let job = rig.job("file absent", &[], &["file"]).await;
+    let status = rig.execute(&job, true).await.expect_err("missing");
+    assert_eq!(missing_subjects(&status), vec![subject(&job.file)]);
+    let [(_, _, finding)] = <[Started; 1]>::try_from(rig.started()).expect("one start");
+    assert!(!finding.wait().await, "an input was absent");
+
+    let job = rig.job("both absent", &[], &["command", "file"]).await;
+    rig.execute(&job, true).await.expect_err("missing");
+    assert_eq!(rig.started().len(), 0, "no Command, no start");
+    assert_eq!(rig.submitted(), 0);
+}
+
+/// Asserts that no tree write is started for an Execute with no run to take it, or whose walk
+/// never read its Directories: a Command whose platform is refused, an action that asks for a
+/// whole machine (submitted, but no run of it writes a tree), a root Directory the store fails
+/// to read, and a hit of the action cache. Catches a write started for an action that never
+/// runs, or before the walk knows what the tree is.
+#[tokio::test(start_paused = true)]
+async fn no_tree_write_is_started_where_no_run_can_take_it() {
+    let rig = Rig::new();
+    let job = rig.job("refused", &[("kbf-lease", "vm")], &[]).await;
+    rig.execute(&job, true).await.expect_err("refused");
+    assert_eq!(rig.started().len(), 0, "a refused platform");
+
+    let job = rig
+        .job("whole", &[("kbf-lease", "whole_machine")], &[])
+        .await;
+    rig.execute(&job, true).await.expect("submitted");
+    assert_eq!(rig.started().len(), 0, "a whole machine");
+    assert_eq!(rig.submitted(), 1);
+
+    let job = rig.job("cached", &[], &[]).await;
+    rig.cache_result(&job).await;
+    rig.execute(&job, false).await.expect("a hit");
+    assert_eq!(rig.started().len(), 0, "a hit");
+
+    let rig = Rig::new();
+    let job = rig.job("root unreadable", &[], &[]).await;
+    rig.fail(Call::Read(job.root));
+    rig.execute(&job, true).await.expect_err("unavailable");
+    assert_eq!(rig.started().len(), 0, "a walk that failed");
 }

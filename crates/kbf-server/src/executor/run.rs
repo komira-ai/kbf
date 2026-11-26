@@ -168,7 +168,7 @@ enum Ended {
 }
 
 /// `digest` as REAPI spells it.
-fn reapi_digest(digest: &kbf_types::Digest) -> reapi::Digest {
+pub(super) fn reapi_digest(digest: &kbf_types::Digest) -> reapi::Digest {
     reapi::Digest {
         hash: digest.hash_hex(),
         size_bytes: i64::try_from(digest.size_bytes).unwrap_or(i64::MAX),

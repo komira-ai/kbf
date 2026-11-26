@@ -126,3 +126,36 @@ async fn a_decoded_action_with_no_input_root_is_refused_as_a_read_one_is() {
     assert_eq!(refused.fault(), PrepareFault::Refused, "{refused}");
     assert!(refused.to_string().contains("input root"), "{refused}");
 }
+
+/// Asserts that a closure collected ahead of its run (while its Execute still checks the inputs)
+/// asks the store nothing about the Command or the files: over a farm that holds neither the
+/// Command nor the file `b`, it collects the closure a full preparation collects over a farm that
+/// holds everything, with no FindMissing at all; a Directory the farm does not hold still fails
+/// it, the caller's to fix. Catches a held check made ahead of the Execute's finding (one more
+/// FindMissing pass per Execute), and a closure taken from a tree the walk never read.
+#[tokio::test]
+async fn a_closure_collected_ahead_of_its_run_asks_nothing_held() {
+    let (parts, whole, _) = standard().await;
+    let (_, bytes) = parts.blob(&parts.action);
+    let decoded = reapi::Action::decode(bytes).expect("an Action");
+    let full = only(&whole)
+        .prepare_put_dir(LEASE, &parts.action, None, now(), WALL)
+        .await
+        .expect("prepared");
+    let (_, holed, _) = missing(&[parts.command, parts.tree.b]).await;
+
+    let (kept, _took) = only(&holed)
+        .collect_unchecked(&parts.action, &decoded)
+        .await
+        .expect("collected");
+
+    assert_eq!(kept.closure(), full.kept.closure());
+    assert_eq!(kept.directory_count(), full.kept.directory_count());
+    assert_eq!(holed.asks.load(SeqCst), 0, "nothing asked of the store");
+    let (_, no_lib, _) = missing(&[parts.tree.lib]).await;
+    let refused = only(&no_lib)
+        .collect_unchecked(&parts.action, &decoded)
+        .await
+        .expect_err("a Directory is absent");
+    assert_eq!(refused.fault(), PrepareFault::Refused, "{refused}");
+}

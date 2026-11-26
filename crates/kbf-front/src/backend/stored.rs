@@ -26,7 +26,7 @@ use super::layered::unavailable;
 use super::{Answer, Layered, Plane, checked};
 use crate::input_tree::Walked;
 use crate::input_walk::Blobs as _;
-use crate::input_walk::{Trees, walk};
+use crate::input_walk::{DirsRead, Trees, walk_told};
 use crate::meta_log::Leadership;
 use crate::metrics::CacheMetrics;
 use crate::proxy::Absent;
@@ -161,13 +161,13 @@ impl Plane for StoredPlane {
         Box::pin(self.stored.put_action_result(action, result))
     }
 
-    fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>> {
+    fn walk_inputs(&self, root: Digest, told: DirsRead) -> BoxFuture<'_, Answer<Walked>> {
         Box::pin(async move {
             let layered = Layered {
                 packs: self.packs(),
                 rest: &Absent,
             };
-            walk(&layered, root, &self.trees).await
+            walk_told(&layered, root, &self.trees, told).await
         })
     }
 
