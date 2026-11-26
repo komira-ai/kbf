@@ -1096,11 +1096,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "js-sizing"
-version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=7b5563528ec3aa60fae06df2b1af915701351c48#7b5563528ec3aa60fae06df2b1af915701351c48"
-
-[[package]]
 name = "js-state"
 version = "0.1.0"
 source = "git+https://github.com/komira-ai/jobscheduler?rev=7b5563528ec3aa60fae06df2b1af915701351c48#7b5563528ec3aa60fae06df2b1af915701351c48"
@@ -1146,16 +1141,6 @@ source = "git+https://github.com/komira-ai/jobscheduler?rev=7b5563528ec3aa60fae0
 dependencies = [
  "serde",
  "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "js-usage"
-version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=7b5563528ec3aa60fae06df2b1af915701351c48#7b5563528ec3aa60fae06df2b1af915701351c48"
-dependencies = [
- "js-state",
- "js-types",
  "thiserror",
 ]
 
@@ -1429,13 +1414,6 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror",
-]
-
-[[package]]
-name = "kbf-estimator"
-version = "0.1.0"
-dependencies = [
- "js-sizing",
 ]
 
 [[package]]
@@ -2054,7 +2032,6 @@ dependencies = [
  "kbf-caps",
  "kbf-enroll",
  "kbf-enroll-registry",
- "kbf-estimator",
  "kbf-front",
  "kbf-history",
  "kbf-image",
@@ -2087,7 +2064,6 @@ dependencies = [
  "kbf-types",
  "kbf-ui",
  "kbf-updater",
- "kbf-usage",
  "libc",
  "percent-encoding",
  "postgres",
@@ -2456,20 +2432,6 @@ dependencies = [
  "tokio",
  "update-hook",
  "update-rights",
-]
-
-[[package]]
-name = "kbf-usage"
-version = "0.1.0"
-dependencies = [
- "hex",
- "js-types",
- "js-usage",
- "kbf-estimator",
- "kbf-state",
- "kbf-types",
- "sha2",
- "thiserror",
 ]
 
 [[package]]
