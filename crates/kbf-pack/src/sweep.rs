@@ -111,6 +111,27 @@ fn is_named(named: &BTreeSet<String>, key: &str) -> bool {
         .is_some_and(|dir| named.contains(&dir))
 }
 
+/// The keys among `orphans` that are objects of no put directory `named` answers, the others
+/// counted in `report`. `named` is asked only when there is an orphan, after the page's ages and
+/// the index's answer and just before its deletes: an operation opened before this read is seen,
+/// and one opened after it has a put directory minted after it, younger than the grace. Not a
+/// method of the generic [`Sweeper`], so it is one function whatever the store.
+async fn unnamed(
+    named: &NamedOf,
+    orphans: Vec<String>,
+    report: &mut SweepReport,
+) -> Result<Vec<String>, SweepError> {
+    if orphans.is_empty() {
+        return Ok(orphans);
+    }
+    let named = Arc::clone(named);
+    let named = offload(move || named()).await.map_err(SweepError::Named)?;
+    let (kept, unnamed): (Vec<String>, Vec<String>) =
+        orphans.into_iter().partition(|key| is_named(&named, key));
+    report.named += kept.len();
+    Ok(unnamed)
+}
+
 /// The questions a sweep asks of its caller.
 pub struct SweepGates {
     /// When the key was minted, read from the key; `None` for a key that does not say.
@@ -303,19 +324,9 @@ impl<S: ObjectStore> Sweeper<S> {
         let names = candidates.iter().map(ToString::to_string).collect();
         let orphans = self.unreferenced(names).await?;
         report.referenced += asked.saturating_sub(orphans.len());
-        if orphans.is_empty() {
-            return Ok(());
-        }
-        // Read after the page's ages and the index's answer, just before its deletes: an
-        // operation opened before this read is seen, and one opened after it has a put
-        // directory minted after it, younger than the grace.
-        let named = self.named().await?;
+        let orphans = unnamed(&self.gates.named, orphans, report).await?;
         for key in candidates {
             if !orphans.contains(&key.to_string()) {
-                continue;
-            }
-            if is_named(&named, key.as_str()) {
-                report.named += 1;
                 continue;
             }
             // From here to the end of the delete nothing may begin to verify the key (and
@@ -370,11 +381,6 @@ impl<S: ObjectStore> Sweeper<S> {
             }
         }
         Ok(())
-    }
-
-    async fn named(&self) -> Result<BTreeSet<String>, SweepError> {
-        let named = Arc::clone(&self.gates.named);
-        offload(move || named()).await.map_err(SweepError::Named)
     }
 
     async fn unreferenced(&self, keys: Vec<String>) -> Result<Vec<String>, SweepError> {
