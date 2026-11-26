@@ -71,7 +71,7 @@ mod tree_writes;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use kbf_front::{Dispatch, Recorder, Stage, Submission, Ticket};
+use kbf_front::{DecodedAction, Dispatch, HeldFinding, Recorder, Stage, Submission, Ticket};
 use kbf_job_client::Client;
 use kbf_types::OperationId;
 use tokio::sync::watch;
@@ -341,6 +341,21 @@ impl Dispatch for Executor {
     fn cancel(&self, name: &str) -> bool {
         parse_stored_name(name).is_some_and(|operation| self.inner.ops().cancel(operation))
     }
+
+    fn start_tree(
+        &self,
+        action: kbf_types::Digest,
+        decoded: Arc<DecodedAction>,
+        finding: HeldFinding,
+    ) {
+        // With no roots for a put directory, no run of the action is minted: no tree to start.
+        if self.inner.cfg.task_out.is_none() {
+            return;
+        }
+        let configured = self.inner.cfg.input_tree;
+        let action = run::reapi_digest(&action);
+        (self.inner.deps.ingest).start_tree(&action, decoded, configured, finding);
+    }
 }
 
 /// What a server hands its Executes to: its executor, or, on a server that runs none, a refusal
@@ -382,6 +397,17 @@ impl Dispatch for Dispatcher {
         match self {
             Self::Executor(executor) => executor.cancel(name),
             Self::None => false,
+        }
+    }
+
+    fn start_tree(
+        &self,
+        action: kbf_types::Digest,
+        decoded: Arc<DecodedAction>,
+        finding: HeldFinding,
+    ) {
+        if let Self::Executor(executor) = self {
+            executor.start_tree(action, decoded, finding);
         }
     }
 }

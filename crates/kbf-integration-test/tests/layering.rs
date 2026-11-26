@@ -10,8 +10,8 @@
 //!   crate (tokio, tonic, hyper, reqwest, the rand family, getrandom, mio, socket2);
 //! - a pure crate that depends on a kbf crate outside the pure set;
 //! - a pure crate that reaches a crate taken from a git repository other than the ones
-//!   listed in `PURE_GIT_CRATES` (today `js-sizing`, `js-caps`, `js-types` and `js-sim`, which
-//!   `kbf-estimator`, `kbf-caps`, `kbf-types` and `kbf-sim` re-export);
+//!   listed in `PURE_GIT_CRATES` (today `js-caps`, `js-types` and `js-sim`, which `kbf-caps`,
+//!   `kbf-types` and `kbf-sim` re-export);
 //! - a pure crate whose `lib.rs` no longer denies the `clippy.toml` lists, which would
 //!   silently switch off the clock, sleep, network and `HashMap` checks for it;
 //! - a pure crate renamed or removed, which would otherwise make every check above
@@ -90,7 +90,6 @@ const PURE: &[&str] = &[
     "kbf-caps",
     "kbf-segments",
     "kbf-meta",
-    "kbf-estimator",
     "kbf-raft",
     "kbf-invocation",
     "kbf-map",
@@ -123,8 +122,8 @@ const DENY_ATTR: &str = "#![deny(clippy::disallowed_methods, clippy::disallowed_
 
 /// The crates of other repositories (taken by `git` dependency, `source` beginning
 /// `git+`) that a pure crate may reach, with the one repository each may come from.
-/// `kbf-estimator` re-exports `js-sizing`, `kbf-caps` re-exports `js-caps`, `kbf-types`
-/// re-exports `js-types` and `kbf-sim` re-exports `js-sim`; they depend on one another and on
+/// `kbf-caps` re-exports `js-caps`, `kbf-types` re-exports `js-types` and `kbf-sim`
+/// re-exports `js-sim`; they depend on one another and on
 /// crates.io crates only, and each denies the `clippy.toml` lists in its own root. A
 /// further git crate in a pure crate's tree is a decision, so it is listed here by name.
 const PURE_GIT_CRATES: &[(&str, &str)] = &[
@@ -134,10 +133,6 @@ const PURE_GIT_CRATES: &[(&str, &str)] = &[
     ),
     (
         "js-sim",
-        "git+https://github.com/komira-ai/jobscheduler?rev=",
-    ),
-    (
-        "js-sizing",
         "git+https://github.com/komira-ai/jobscheduler?rev=",
     ),
     (

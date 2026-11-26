@@ -76,11 +76,9 @@ hyper-util = { version = "0.1.21", default-features = false }
 js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
 js-proto = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
 js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
-js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
 js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
 js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
 js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
-js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
 # tierstore and objstore-s3 moved to the tierstore repository (https://github.com/komira-ai/tierstore).
 # Both are taken from it at this one revision. The revision is raised by a pull request of
 # its own that runs the whole CI, never along with other changes.
@@ -105,7 +103,7 @@ prost-types = "0.14.4"
 prost-build = "0.14.4"
 # The CommonMark parser that reads CLAUDE.md in kbf-integration-test's `agents_md` lint. Already
 # in the tree through prost-build; no default features: no HTML rendering, no getopts.
-pulldown-cmark = { version = "0.13.5", default-features = false }
+pulldown-cmark = { version = "0.13.6", default-features = false }
 # The RFC 8187 `filename*` of the blob route's Content-Disposition (kbf-server). Already in
 # the tree through axum.
 percent-encoding = "2.3.2"
@@ -184,7 +182,7 @@ zeroize = "1.9.1"
 # none, matched against `.pgpass` lines (kbf-pg-auth). Already in the tree through
 # tokio-postgres, which asks it the same.
 whoami = "2.1.3"
-zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
 
 kbf-alert = { path = "crates/kbf-alert" }
 kbf-auth = { path = "crates/kbf-auth" }
@@ -195,7 +193,6 @@ kbf-cli = { path = "crates/kbf-cli" }
 kbf-deploy = { path = "crates/kbf-deploy" }
 kbf-enroll-registry = { path = "crates/kbf-enroll-registry" }
 kbf-enroll = { path = "crates/kbf-enroll" }
-kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
 kbf-gate = { path = "crates/kbf-gate" }
 kbf-harness = { path = "crates/kbf-harness" }
@@ -249,7 +246,6 @@ kbf-ui = { path = "crates/kbf-ui" }
 kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
 kbf-updater = { path = "crates/kbf-updater" }
-kbf-usage = { path = "crates/kbf-usage" }
 # The contract between a host updater and a service's update hook, and the harness that proves a
 # hook keeps it; it depends on no other workspace crate (kbf-integration-test keeps it so).
 update-hook = { path = "crates/update-hook" }
