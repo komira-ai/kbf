@@ -43,7 +43,9 @@
 //!   ([`Front::with_metrics`]), labelled with the tree's form: the put directory, the closure's
 //!   parts and the tree's name; and the stages of a tree's writes
 //!   ([`kbf_front::action_tree::WriteStage`]: as manifests, its blobs, manifests and root; as a
-//!   tree list, its blobs, the list and its sidecar), on the task that writes it.
+//!   tree list, its blobs, the list and its sidecar), on the task that writes it; with each write
+//!   of the manifests, the root or the list, by part, and the manifests a tree wrote, into
+//!   [`crate::executor::tree_writes`]' families.
 //! - **An object the store lost** ([`Ingest::lost`]): a job that did not start because the store
 //!   does not have an object of its tree. The store is general-purpose, and its objects can
 //!   vanish while the frontend's state names them, and a store can answer "not found" for a while
@@ -72,7 +74,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_front::action_tree::NoTree;
 use kbf_front::action_tree::{
-    ActionTree, BaseTree, Listing, ListingWrite, MEMO_TTL, PutRetry, TreeWriter, WriteStage,
+    ActionTree, BaseTree, Listing, ListingWrite, MEMO_TTL, PutRetry, TreeWriter, WriteTimed,
 };
 use kbf_front::prepare_run::{
     ClosureError, KeptClosure, PrepareError as RunPrepError, PrepareFault, PrepareTook, PutDirPrep,
@@ -776,7 +778,7 @@ impl Front {
         let (named, name) = oneshot::channel::<String>();
         let how = self.listing_write(&action, form, checked);
         let writes = tokio::spawn(async move {
-            let timed = |stage, took| metrics.step_took(Step::of_write(stage), form, took);
+            let timed = |timed| metrics.tree_write(form, timed);
             let tree = write_named(&writer, &base, &kept, (form, how), named, timed).await?;
             if checked {
                 lock_checked(&checks).remove(&action);
@@ -819,15 +821,16 @@ fn broke() -> MintError {
 /// a tree list with its sidecar republished, as `how` says), and sends its name (its root
 /// manifest's digest in hex, or its tree list's key) to `named` as soon as the writer has it,
 /// before any write. The stages of the tree's writes are told to `timed` (as manifests: its
-/// blobs, manifests and root; as a tree list: its blobs, the list and its sidecar). Returns the
-/// name once every write succeeded.
+/// blobs, manifests and root; as a tree list: its blobs, the list and its sidecar), with each
+/// write of the manifests, the root or the list and how many manifests it wrote
+/// ([`WriteTimed`]). Returns the name once every write succeeded.
 async fn write_named(
     writer: &TreeWriter,
     base: &OnceLock<BaseTree>,
     kept: &KeptClosure,
     (form, how): (InputTree, ListingWrite),
     named: oneshot::Sender<String>,
-    timed: impl Fn(WriteStage, Duration) + Send + Sync,
+    timed: impl Fn(WriteTimed) + Send + Sync,
 ) -> Result<String, MintError> {
     // The mint checked the base before it collected the closure, and a base once set stays.
     let Some(base) = base.get() else {

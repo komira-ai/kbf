@@ -447,3 +447,51 @@ async fn reads_take_no_slot() {
 fn the_default_bound_is_64() {
     assert_eq!(STORE_WRITES.get(), 64);
 }
+
+/// Catches the wait for a slot left out of a tree's write, told to a write that did not wait, or
+/// told as its request, for a streamed write and a whole one alike: with the one slot held by a
+/// write under no tally, a tree's write waits for it; 7 ms on tokio's paused clock later the held
+/// write is let through, and the tree's write is told its 7 ms as its store slot, with no 503 wait
+/// and no request time (the store answers at once), while the held write, under no tally, is told
+/// to nobody.
+#[tokio::test(start_paused = true)]
+async fn a_tree_write_is_told_its_wait_for_a_slot_and_no_other_write_is() {
+    for streamed in [true, false] {
+        let fake = Arc::new(Fake::with_gate(0));
+        let store = over(&fake, 1, &Sleeps::at_once());
+        let held = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { store.put_stream(&key("held"), 3, body(b"abc")).await }
+        });
+        fake.until_inside(1).await;
+        let tree_key = key("tree");
+        let write = async {
+            match streamed {
+                true => store.put_stream(&tree_key, 3, body(b"def")).await,
+                false => {
+                    store
+                        .put_new(&tree_key, Bytes::from_static(b"def"), None)
+                        .await
+                }
+            }
+        };
+        let mut tree = std::pin::pin!(crate::action_tree::tallied(Duration::ZERO, write));
+        assert!(
+            futures::poll!(tree.as_mut()).is_pending(),
+            "no slot is free"
+        );
+        assert_eq!(fake.writes(), 1, "the tree's write waits outside the store");
+        tokio::time::advance(Duration::from_millis(7)).await;
+        fake.gate.add_permits(2);
+        held.await.expect("joined").expect("stored");
+        let (put, waits) = tree.await;
+        put.expect("stored");
+        let want = crate::action_tree::WriteWaits {
+            manifest_slot: Duration::ZERO,
+            store_slot: Duration::from_millis(7),
+            store_503: Duration::ZERO,
+            request: Duration::ZERO,
+        };
+        assert_eq!(waits, want, "streamed: {streamed}");
+    }
+}

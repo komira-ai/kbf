@@ -46,7 +46,7 @@ async fn a_tree_is_named_before_its_first_write_and_is_the_tree_written() {
                 let puts = farm.puts().len();
                 *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, puts));
             },
-            |_, _| (),
+            |_| (),
         )
         .await
         .expect("a tree");
@@ -80,7 +80,7 @@ async fn a_tree_whose_lookups_fail_is_never_named() {
             move |tree| {
                 *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, 0));
             },
-            |_, _| (),
+            |_| (),
         )
         .await
         .expect_err("no tree");
@@ -109,7 +109,7 @@ async fn a_named_tree_whose_write_fails_is_not_written() {
             move |tree| {
                 *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, 0));
             },
-            |_, _| (),
+            |_| (),
         )
         .await
         .expect_err("no tree");
@@ -210,7 +210,7 @@ async fn a_checked_tree_and_list_are_named_before_their_first_write() {
                 let puts = farm.puts().len();
                 *into.lock().unwrap_or_else(PoisonError::into_inner) = Some((*tree, puts));
             },
-            |_, _| (),
+            |_| (),
         )
         .await
         .expect("a tree");

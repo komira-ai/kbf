@@ -10,7 +10,7 @@
 use std::pin::pin;
 
 use futures::poll;
-use kbf_front::action_tree::WriteStage;
+use kbf_front::action_tree::{WriteStage, WriteTimed};
 
 use super::*;
 
@@ -25,10 +25,14 @@ fn held<T>(timed: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     timed.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A timer of a write's stages into `timed`.
-fn timer(timed: &Timed) -> impl Fn(WriteStage, Duration) + Send + Sync + 'static {
+/// A timer of a write's stages into `timed`; its writes' parts and counts are left out.
+fn timer(timed: &Timed) -> impl Fn(WriteTimed) + Send + Sync + 'static {
     let timed = Arc::clone(timed);
-    move |stage, took| held(&timed).push((stage, took))
+    move |event| {
+        if let WriteTimed::Stage(stage, took) = event {
+            held(&timed).push((stage, took));
+        }
+    }
 }
 
 /// The stages timed so far, which are taken out.
