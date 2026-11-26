@@ -443,7 +443,13 @@ while its row is written), and the stages of those writes, timed on the task tha
 overlapping `tree_wait`: `tree_blobs` (the blobs that were nowhere, written whole), `tree_manifests` (the input root's
 manifests and `.kbf`, written together) and `tree_root` (the root, written last), or, for a tree list, `tree_blobs`,
 `tree_list` (the list's one write) and `tree_sidecar` (its L2 sidecar, begun beside the list's write and written after
-it). [api.md](../api.md) lists them. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
+it). [api.md](../api.md) lists them. Where the time of each write of those stages goes is
+`kbf_executor_tree_write_seconds{stage=...,part=...}`, one observation per write a tree made of its manifests
+(`tree_manifests`), its root (`tree_root`) or its list (`tree_list`): `manifest_slot` (the wait for one of the
+writer's 32 manifest slots), `store_slot` (the waits for one of the `--pack-store-writes` slots the pack uploads share),
+`store_503` (the waits out of the store's 503s, `SlowDown` included) and `request` (the rest, the attempts at the store);
+a stage's time well above its parts' `request` is spent waiting. `kbf_executor_tree_manifests_written` counts the
+manifests each tree's manifests stage wrote itself. The task's own account of its steps (`fetch_ms`, `run_ms` and `pack_ms` of the manifest) is carried
 in the result's execution metadata as the `input_fetch`, `execution` and `output_upload` start and
 completed times, marked as a task's claim, and the run record and the read API say so with
 `phase_times: "task_claim"` (a run recorded by an earlier release is `measured`, and so is a record written before the

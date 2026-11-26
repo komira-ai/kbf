@@ -2,8 +2,10 @@
 //! the packs, and what it asked of the job service: the jobs submitted, those submitted again
 //! after an answer was lost, the operations run again as a new attempt, the jobs cancelled for
 //! their callers, the operations taken up from the state store, and the jobs seen on a host that
-//! missed its grace; and how long the phases of a run ([`crate::executor::phases`]) and the
-//! steps of its preparation and submit ([`crate::executor::steps`]) took.
+//! missed its grace; how long the phases of a run ([`crate::executor::phases`]) and the
+//! steps of its preparation and submit ([`crate::executor::steps`]) took; and where the time of
+//! an action tree's writes went, and how many manifests each tree wrote
+//! ([`crate::executor::tree_writes`]).
 //!
 //! The counters are shared by the executor and the page that renders them. A server that never
 //! builds an executor builds none of this and renders none of it.
@@ -11,12 +13,15 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use kbf_front::action_tree::WriteTimed;
+
 use crate::executor::RejectReason;
 use crate::executor::config::InputTree;
 use crate::executor::outcome::Settled;
 use crate::executor::phases::{Phase, PhaseHistograms};
 use crate::executor::steps::{Step, StepHistograms, StepOf};
 use crate::executor::traits::MissPath;
+use crate::executor::tree_writes::{self, ManifestsWritten, WriteHistograms};
 
 /// How a run ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +154,8 @@ pub struct Metrics {
     list_refused: [AtomicU64; MissPath::ALL.len()],
     phases: PhaseHistograms,
     steps: StepHistograms,
+    tree_writes: WriteHistograms,
+    manifests_written: ManifestsWritten,
 }
 
 impl Metrics {
@@ -173,6 +180,21 @@ impl Metrics {
     /// ([`Step::Facts`] is counted with no form, whatever `form` says).
     pub(crate) fn step_took(&self, step: Step, form: InputTree, took: std::time::Duration) {
         self.steps.observe(StepOf { step, form }, took);
+    }
+
+    /// What the writes of an action tree of `form` told their timer: a stage, timed as its
+    /// step; one write of a stage, by part ([`crate::executor::tree_writes`]); or how many
+    /// manifests the tree wrote.
+    pub(crate) fn tree_write(&self, form: InputTree, timed: WriteTimed) {
+        match timed {
+            WriteTimed::Stage(stage, took) => self.step_took(Step::of_write(stage), form, took),
+            WriteTimed::Write(stage, waits) => {
+                if let Some(stage) = tree_writes::Stage::of(stage) {
+                    tree_writes::observe(&self.tree_writes, stage, waits);
+                }
+            }
+            WriteTimed::Manifests(written) => self.manifests_written.observe(written),
+        }
     }
 
     /// The `facts` step of a run took `took`: before the run's form is chosen.
@@ -313,6 +335,8 @@ impl Metrics {
         }
         self.phases.render(out);
         self.steps.render(out);
+        self.tree_writes.render(out);
+        self.manifests_written.render(out);
     }
 }
 

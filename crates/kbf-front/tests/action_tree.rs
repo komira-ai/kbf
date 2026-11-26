@@ -60,6 +60,8 @@ mod sidecars;
 mod stages;
 #[path = "action_tree/store.rs"]
 mod store;
+#[path = "action_tree/waits.rs"]
+mod waits;
 #[path = "action_tree/whiteout.rs"]
 mod whiteout;
 

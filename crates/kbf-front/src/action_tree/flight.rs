@@ -11,6 +11,10 @@
 //! burst of preparations queues at the frontend instead of at the store, where every request
 //! would wait and each preparation's writes would take longer the more there are.
 //!
+//! Each write's wait for its slot, and where the rest of its time went ([`WriteWaits`]), are told
+//! to the preparation that made it, once the write ends; a preparation that waited for another's
+//! write is told nothing of it.
+//!
 //! A write is entered under its manifest's digest when the first preparation asks for it, and
 //! taken out by whichever of its waiters sees it end, stored or failed: a write that failed is
 //! made anew by the next preparation that asks. A waiter dropped part way (its preparation ran
@@ -26,14 +30,17 @@ use futures::FutureExt as _;
 use futures::future::{BoxFuture, Shared};
 use kbf_types::Digest;
 use tokio::sync::Semaphore;
+use tokio::time::Instant;
 
 use super::NoTree;
 use super::place::store_object;
 use super::retry::PutRetry;
+use super::waits::{WriteWaits, tallied};
 use crate::large_backfill::{LargeStore, large_key};
 
-/// One write in flight: its end, the store's answer (`why` it failed) for every waiter.
-type Flight = Shared<BoxFuture<'static, Result<(), String>>>;
+/// One write in flight: its end, the store's answer (`why` it failed) for every waiter, and where
+/// its time went.
+type Flight = Shared<BoxFuture<'static, (Result<(), String>, WriteWaits)>>;
 
 /// The writes in flight, by manifest digest, and the slots they make their requests in.
 pub(super) struct Flights {
@@ -51,7 +58,8 @@ impl Flights {
     }
 
     /// Writes the manifest `digest` (`bytes`) to `cas/l/` through `store`, repeated by `retry`,
-    /// or waits for the write of it already in flight.
+    /// or waits for the write of it already in flight. A write this call made is told to `wrote`
+    /// once it ends, stored or failed; a write it waited for is not.
     ///
     /// # Errors
     /// [`NoTree::Put`]: the store refused the write, this waiter's or the one it waited for.
@@ -61,20 +69,25 @@ impl Flights {
         retry: &PutRetry,
         digest: Digest,
         bytes: Bytes,
+        wrote: &(dyn Fn(WriteWaits) + Sync),
     ) -> Result<(), NoTree> {
+        let mut made = false;
         let flight = self
             .lock()
             .entry(digest)
             .or_insert_with(|| {
+                made = true;
                 let (store, retry) = (Arc::clone(store), retry.clone());
                 let slots = Arc::clone(&self.slots);
                 async move {
                     // Held until the write ends, retries and their waits included. The
                     // semaphore is never closed, so this is always a permit.
+                    let asked = Instant::now();
                     let _slot = slots.acquire_owned().await;
                     let key = large_key(&digest);
-                    let stored = store_object(&*store, &retry, &key, bytes).await;
-                    stored.map_err(|error| error.to_string())
+                    let write = store_object(&*store, &retry, &key, bytes);
+                    let (stored, waits) = tallied(asked.elapsed(), write).await;
+                    (stored.map_err(|error| error.to_string()), waits)
                 }
                 .boxed()
                 .shared()
@@ -88,8 +101,11 @@ impl Flights {
         };
         // A clone is awaited: the waiter's own is never polled, so it still names the write
         // when the waiter is dropped. Dropped part way, the clone goes first (it was made last).
-        let answer = waiter.flight.clone().await;
+        let (answer, waits) = waiter.flight.clone().await;
         waiter.ended = true;
+        if made {
+            wrote(waits);
+        }
         answer.map_err(|why| NoTree::Put {
             key: large_key(&digest).to_string(),
             why,
@@ -122,3 +138,7 @@ impl Drop for Waiter<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "flight_tests.rs"]
+mod tests;

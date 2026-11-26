@@ -13,7 +13,7 @@ use std::pin::pin;
 
 use futures::poll;
 use kbf_front::action_tree::{
-    Listing, ListingWrite, SidecarCounters, Sidecars, WriteStage, read_cells,
+    Listing, ListingWrite, SidecarCounters, Sidecars, WriteStage, WriteTimed, read_cells,
 };
 use kbf_pack_index::PackIndex;
 use kbf_pack_index::memory::MemoryPackIndex;
@@ -91,9 +91,11 @@ async fn write(
 ) -> Result<Listing, NoTree> {
     let kept = rig.kept(root).await;
     let timed = Arc::clone(timed);
-    let timer = move |stage, took| {
-        let mut timed = timed.lock().unwrap_or_else(PoisonError::into_inner);
-        timed.push((stage, took));
+    let timer = move |event| {
+        if let WriteTimed::Stage(stage, took) = event {
+            let mut timed = timed.lock().unwrap_or_else(PoisonError::into_inner);
+            timed.push((stage, took));
+        }
     };
     let base = listed_base(rig);
     let how = ListingWrite::default();
@@ -119,7 +121,7 @@ async fn the_sidecar_head_is_asked_while_the_list_write_is_held() {
     let how = ListingWrite::default();
     let mut writing = pin!(
         rig.writer
-            .write_listing_with(&kept, &base, how, |_| (), |_, _| ())
+            .write_listing_with(&kept, &base, how, |_| (), |_| ())
     );
 
     assert!(poll!(writing.as_mut()).is_pending());

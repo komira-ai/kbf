@@ -22,6 +22,9 @@
 //!   toward the total. What ends it is the caller: a preparation that runs out of its limit
 //!   drops the write, and with it the retry.
 //!
+//! The waits a write of the tree's manifests, root or list makes are added to that write's tally
+//! ([`super::waits`]), as its 503 waits.
+//!
 //! Every other answer (a 403, a 500, a body that failed its digest check) is reported on the
 //! first attempt. A write whose body is read from a source is made again by reading the source
 //! again: the attempt is a function that builds its own body.
@@ -32,8 +35,10 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use kbf_objstore::{ObjectKey, ObjectStoreError};
+use tokio::time::Instant;
 
 use super::NoTree;
+use super::waits::waited_out_503;
 use crate::store_metrics::Op;
 use crate::store_wait::{Backoff, Next, StoreWaits, no_jitter, spread};
 
@@ -176,7 +181,10 @@ where
             reconnected = true;
             continue;
         }
-        if waits.after(&error, true).await == Next::Again {
+        let asked = Instant::now();
+        let next = waits.after(&error, true).await;
+        waited_out_503(asked.elapsed());
+        if next == Next::Again {
             continue;
         }
         return Err(Failed::Store(waits.exhausted(error)));

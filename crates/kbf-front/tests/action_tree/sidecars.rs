@@ -84,7 +84,7 @@ async fn dual_emission_keeps_the_tree_id() {
 
     let with = rig
         .writer
-        .write_listing_with(&kept, &listed_base(&rig), how, |_| (), |_, _| ())
+        .write_listing_with(&kept, &listed_base(&rig), how, |_| (), |_| ())
         .await
         .expect("a listing");
 
@@ -143,7 +143,7 @@ async fn the_miss_path_reads_each_object_with_no_cells_once() {
     };
 
     rig.writer
-        .write_listing_with(&kept, &listed_base(&rig), how, |_| (), |_, _| ())
+        .write_listing_with(&kept, &listed_base(&rig), how, |_| (), |_| ())
         .await
         .expect("a listing");
 
@@ -173,7 +173,7 @@ async fn the_miss_path_reads_each_object_with_no_cells_once() {
     let reads = rig.farm.state().ranged.len();
 
     rig.writer
-        .write_listing_with(&kept, &listed_base(&rig), how, |_| (), |_, _| ())
+        .write_listing_with(&kept, &listed_base(&rig), how, |_| (), |_| ())
         .await
         .expect("a listing");
 
@@ -198,7 +198,7 @@ async fn a_lost_object_on_the_miss_path_never_fails_the_list() {
 
     let listing = rig
         .writer
-        .write_listing_with(&kept, &listed_base(&rig), how, |_| (), |_, _| ())
+        .write_listing_with(&kept, &listed_base(&rig), how, |_| (), |_| ())
         .await
         .expect("a listing");
 

@@ -263,3 +263,79 @@ async fn the_stages_of_a_trees_writes_are_timed_by_form_into_the_executor_metric
         }
     }
 }
+
+/// One line of `family` on `metrics`' page, `labels` its braces' contents (empty: none).
+fn line(metrics: &Metrics, family: &str, labels: &str) -> String {
+    let mut page = String::new();
+    metrics.render(&mut page);
+    let series = match labels {
+        "" => format!("{family} "),
+        labels => format!("{family}{{{labels}}} "),
+    };
+    page.lines()
+        .find_map(|line| line.strip_prefix(&series))
+        .unwrap_or_else(|| panic!("no {series} in {page}"))
+        .to_owned()
+}
+
+/// Catches a tree's writes not timed by part into the executor's metrics, timed under another
+/// stage, or its manifests not counted once a tree: a tree written as manifests, through the
+/// frontend's packs, counts each part of its two manifest writes (the input root's and `.kbf`'s)
+/// under `tree_manifests` and of its root's under `tree_root`, nothing under `tree_list`, and one
+/// tree of two manifests; a tree list counts each part but the manifest slot of its one write
+/// under `tree_list`, nothing under the manifests' stages, and no tree of manifests.
+#[tokio::test]
+async fn a_trees_writes_are_counted_by_part_and_its_manifests_once_a_tree() {
+    let parts = ["manifest_slot", "store_slot", "store_503", "request"];
+    for (form, base, writes, trees) in [
+        (
+            InputTree::Manifests,
+            super::put_dir::base(),
+            [
+                ("tree_manifests", "2"),
+                ("tree_root", "1"),
+                ("tree_list", "0"),
+            ],
+            ("1", "2"),
+        ),
+        (
+            InputTree::Provider,
+            super::put_dir::listed_base(),
+            [
+                ("tree_manifests", "0"),
+                ("tree_root", "0"),
+                ("tree_list", "1"),
+            ],
+            ("0", "0"),
+        ),
+    ] {
+        let prep = DirPrep::new(None, 7_200);
+        let rig = super::put_dir::rig_over(prep, Some(base));
+        let action = action_with_input(&rig, "input").await;
+        let metrics = Arc::new(Metrics::default());
+        let front = rig.front.with_metrics(Arc::clone(&metrics));
+        front
+            .mint(run(1), &action, WALL, form, None)
+            .await
+            .expect("a dir");
+        front.stored(run(1)).await.expect("stored");
+        let family = "kbf_executor_tree_write_seconds_count";
+        for (stage, want) in writes {
+            for part in parts {
+                if stage == "tree_list" && part == "manifest_slot" {
+                    continue;
+                }
+                let labels = format!(r#"stage="{stage}",part="{part}""#);
+                let got = line(&metrics, family, &labels);
+                assert_eq!(got, want, "{form:?}: {labels}");
+            }
+        }
+        let family = "kbf_executor_tree_manifests_written";
+        let got = (
+            line(&metrics, &format!("{family}_count"), ""),
+            line(&metrics, &format!("{family}_sum"), ""),
+        );
+        let want = (trees.0.to_owned(), trees.1.to_owned());
+        assert_eq!(got, want, "{form:?}");
+    }
+}

@@ -10,7 +10,9 @@
 //!   write past it waits for a slot before it makes its request, so a burst of uploads queues at
 //!   the frontend, where it costs the callers time, instead of at the store, which answers
 //!   `SlowDown` to all of them. A write holds its slot until it ends, its waits for `SlowDown`
-//!   included. Reads, lengths, deletes and listings take no slot.
+//!   included. Reads, lengths, deletes and listings take no slot. The wait for a slot of a write
+//!   of an action tree's manifests, root or list is told to that write
+//!   ([`crate::action_tree::WriteWaits::store_slot`]).
 //! - **Streamed writes hold a slot for their whole body.** A streamed write takes its slot before
 //!   it reads its body and keeps it until the store has the last byte. For a client's blob over
 //!   the packs' bound, that is as long as the client takes to send it: a client that stops
@@ -34,8 +36,10 @@ use kbf_objstore::{
     BodyStream, ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{AcquireError, Semaphore, SemaphorePermit};
+use tokio::time::Instant;
 
+use crate::action_tree::waited_for_slot;
 use crate::store_wait::{Backoff, Waiting};
 
 /// The default of `--pack-store-writes`: the most writes a frontend has at its pack store at once.
@@ -60,6 +64,17 @@ impl<S: ObjectStore> StoreWrites<S> {
     }
 }
 
+impl<S> StoreWrites<S> {
+    /// One slot, the wait for it told to the action tree's write that waited, if it was one
+    /// ([`crate::action_tree::waited_for_slot`]).
+    async fn slot(&self) -> Result<SemaphorePermit<'_>, AcquireError> {
+        let asked = Instant::now();
+        let slot = self.slots.acquire().await;
+        waited_for_slot(asked.elapsed());
+        slot
+    }
+}
+
 impl<S: ObjectStore> ObjectStore for StoreWrites<S> {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
@@ -73,7 +88,7 @@ impl<S: ObjectStore> ObjectStore for StoreWrites<S> {
     ) -> Result<(), ObjectStoreError> {
         // Held until the write ends, its waits included. The semaphore is never closed, so this
         // is always a permit.
-        let _slot = self.slots.acquire().await;
+        let _slot = self.slot().await;
         self.inner.put_new(key, body, retain_until).await
     }
 
@@ -84,7 +99,7 @@ impl<S: ObjectStore> ObjectStore for StoreWrites<S> {
         body: BodyStream,
     ) -> Result<(), ObjectStoreError> {
         // Taken before the body is read, so a write that waits for a slot reads nothing of it.
-        let _slot = self.slots.acquire().await;
+        let _slot = self.slot().await;
         self.inner.put_stream(key, len, body).await
     }
 

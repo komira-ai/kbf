@@ -66,6 +66,7 @@ mod steps;
 mod submit;
 mod task;
 mod traits;
+mod tree_writes;
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;

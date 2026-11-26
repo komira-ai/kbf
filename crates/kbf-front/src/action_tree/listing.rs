@@ -50,7 +50,10 @@ use super::sidecar::{SidecarError, Sidecars, Staged};
 use super::tstree::{
     self, Child, DIR_MODE, EMPTY_SHA256, ENTRY_BYTES, HEADER_LEN, Item, RANGE_MERGE_GAP,
 };
-use super::{BaseTree, INPUT_ROOT, NoTree, TreeWriter, Trust, WriteStage, reserved_input};
+use super::waits::tallied;
+use super::{
+    BaseTree, INPUT_ROOT, NoTree, TreeWriter, Trust, WriteStage, WriteTimed, reserved_input,
+};
 use crate::large_backfill::large_key;
 use crate::prepare_run::{KeptClosure, KeptDirectory};
 
@@ -283,11 +286,13 @@ impl TreeWriter {
     /// Lists the action tree of `kept` over `base` as one tree list and stores it as `how`
     /// says, naming it as [`TreeWriter::write_listing_named`] does: checked against the store
     /// as [`TreeWriter::write_listing_checked`] is, and with its L2 sidecar republished
-    /// ([`ListingWrite::republish`]). `timed` is called with each stage the writes make and how
-    /// long it took, on tokio's clock, once it ended: the blobs that were nowhere
+    /// ([`ListingWrite::republish`]). `timed` is told each stage the writes make and how long it
+    /// took, on tokio's clock, once it ended ([`WriteTimed::Stage`]): the blobs that were nowhere
     /// ([`WriteStage::Blobs`], a list with none has no such stage), the list's write, a failed one
     /// included ([`WriteStage::List`]), and its sidecar, once the list is stored
-    /// ([`WriteStage::Sidecar`]). A stage cut off part way (the write was dropped) is not timed.
+    /// ([`WriteStage::Sidecar`]); and, just before the list's stage, where the time of the list's
+    /// one write went ([`WriteTimed::Write`]). A stage cut off part way (the write was dropped) is
+    /// not timed.
     ///
     /// # Errors
     /// As [`TreeWriter::write_listing_checked_named`].
@@ -297,7 +302,7 @@ impl TreeWriter {
         base: &BaseTree,
         how: ListingWrite,
         named: impl FnOnce(&Listing) + Send,
-        timed: impl Fn(WriteStage, Duration) + Send + Sync,
+        timed: impl Fn(WriteTimed) + Send + Sync,
     ) -> Result<Listing, NoTree> {
         let trust = match how.checked {
             true => Trust::Store,
@@ -313,7 +318,7 @@ impl TreeWriter {
         base: &BaseTree,
         (trust, republish): (Trust, bool),
         named: impl FnOnce(&Listing) + Send,
-        timed: impl Fn(WriteStage, Duration) + Send + Sync,
+        timed: impl Fn(WriteTimed) + Send + Sync,
     ) -> Result<Listing, NoTree> {
         reserved_input(kept)?;
         let Some(listed) = &base.listing else {
@@ -361,14 +366,17 @@ impl TreeWriter {
         if !unlocated.is_empty() {
             let started = Instant::now();
             let written = self.write_whole(unlocated, now).await;
-            timed(WriteStage::Blobs, started.elapsed());
+            timed(WriteTimed::Stage(WriteStage::Blobs, started.elapsed()));
             written?;
         }
         let bytes = Bytes::from(bytes);
         let put = async {
             let started = Instant::now();
-            let put = place::write_object(&*self.store, &self.retry, &key, bytes.clone()).await;
-            timed(WriteStage::List, started.elapsed());
+            let write = place::write_object(&*self.store, &self.retry, &key, bytes.clone());
+            // A tree list takes no manifest slot.
+            let (put, waits) = tallied(Duration::ZERO, write).await;
+            timed(WriteTimed::Write(WriteStage::List, waits));
+            timed(WriteTimed::Stage(WriteStage::List, started.elapsed()));
             put
         };
         let Some(sidecars) = &self.sidecars else {
@@ -387,13 +395,13 @@ impl TreeWriter {
         };
         put?;
         sidecar(sidecars, &key, &bytes, staged).await;
-        timed(WriteStage::Sidecar, started.elapsed());
+        timed(WriteTimed::Stage(WriteStage::Sidecar, started.elapsed()));
         Ok(listing)
     }
 }
 
 /// The timer of a write whose stages no one times.
-fn untimed(_: WriteStage, _: Duration) {}
+fn untimed(_: WriteTimed) {}
 
 /// Writes the L2 sidecar of the list `bytes` stored at `key`: from recorded cells only, as
 /// `staged` found them beside the list's write, or, on the miss path (no `staged`), reading each
