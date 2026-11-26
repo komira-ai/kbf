@@ -127,8 +127,6 @@ struct State {
     spans: BTreeMap<Digest, Span>,
     /// The objects of the store, by key, with their bytes.
     objects: BTreeMap<String, Bytes>,
-    /// Objects the store holds whose bytes no test reads: their lengths.
-    sized: BTreeMap<String, u64>,
     /// Keys a presence check does not see but a create-only write finds taken.
     late: BTreeSet<String>,
     /// Bytes served for a blob instead of its own.
@@ -472,10 +470,7 @@ impl BlobSource for Farm {
                 state.heads.push(*digest);
                 let key = whole_key(&digest.hash_hex());
                 let length = state.objects.get(&key).map(|b| b.len() as u64);
-                (
-                    state.faults.head,
-                    length.or_else(|| state.sized.get(&key).copied()),
-                )
+                (state.faults.head, length)
             };
             fault(head).await?;
             Ok(length)
