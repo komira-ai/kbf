@@ -92,13 +92,14 @@ impl Recorded {
         })
     }
 
-    /// The calls taken, in the order taken.
+    /// The calls taken of the store, in the order taken: not the dispatch's tree starts, which
+    /// the record keeps only to order them among the calls.
     fn made(&self) -> Vec<Call> {
         let log = lock(&self.log);
         log.iter()
             .filter_map(|event| match event {
-                Event::Made(call) => Some(*call),
-                Event::Answered(_) => None,
+                Event::Made(call) if *call != START_TREE => Some(*call),
+                Event::Made(_) | Event::Answered(_) => None,
             })
             .collect()
     }
