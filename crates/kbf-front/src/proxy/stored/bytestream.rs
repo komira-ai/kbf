@@ -12,14 +12,17 @@
 //! is answered at once. A blob within the bound takes its size from the room that uploads share
 //! before a byte past the first message is read, is received whole, hashed and packed; a larger
 //! one is streamed to its object as its messages arrive ([`Packs::put_large`]). A write that
-//! gets no byte for [`Packs::upload_idle_timeout`] is ended DEADLINE_EXCEEDED and stores nothing.
+//! gets no byte for [`Packs::upload_idle_timeout`] while it waits for the next message is ended
+//! DEADLINE_EXCEEDED and stores nothing: the time is counted from the later of the start of the
+//! wait and the last frame of the body that carried a byte ([`Progress`]), so a message that is
+//! slow to arrive but keeps coming is never cut, and time spent waiting for room is not idle.
 //!
 //! **QueryWriteStatus** says a blob the index holds is complete at its size, and otherwise the
 //! bytes that have arrived of an upload of that name in flight in this process, or 0.
 //!
 //! **Compressed** names (`compressed-blobs/`) are INVALID_ARGUMENT, on every call.
 
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,9 +36,11 @@ use kbf_proto::google::bytestream::{
 };
 use kbf_storage::in_flight;
 use kbf_types::Digest;
+use tokio::time::{Instant, timeout_at};
 use tonic::{Request, Response, Status, Streaming};
 
 use super::Stored;
+use super::progress::Progress;
 use super::uploads::Upload;
 use crate::READ_CHUNK_BYTES;
 use crate::proxy::name;
@@ -129,6 +134,13 @@ impl ByteStream for StoredByteStream {
     ) -> Result<Response<WriteResponse>, Status> {
         let deadline = deadline::of_metadata(request.metadata());
         let caller = kbf_auth::metadata(&request);
+        // The routes always watch the body (`progress::Watched`); a call that came another way
+        // has progress that never moves, so its idle timeout counts whole messages.
+        let progress = request
+            .extensions()
+            .get::<Progress>()
+            .cloned()
+            .unwrap_or_else(Progress::from_now);
         let mut stream = request.into_inner();
         let first = stream
             .message()
@@ -163,6 +175,7 @@ impl ByteStream for StoredByteStream {
             digest,
             upload,
             idle: packs.upload_idle_timeout(),
+            progress,
             received: 0,
             finished: false,
         };
@@ -240,6 +253,8 @@ struct Receiving {
     digest: Digest,
     upload: Upload,
     idle: Duration,
+    /// When a byte of the body last arrived.
+    progress: Progress,
     received: u64,
     finished: bool,
 }
@@ -250,8 +265,9 @@ impl Receiving {
     ///
     /// # Errors
     /// INVALID_ARGUMENT for a message that breaks the rules of an upload or a stream that ends
-    /// without `finish_write`; DEADLINE_EXCEEDED when no message came within the idle timeout;
-    /// or the client's own error.
+    /// without `finish_write`; DEADLINE_EXCEEDED when no byte of the body arrived for the idle
+    /// timeout, counted from the later of the start of this wait and the last byte; or the
+    /// client's own error.
     async fn next(&mut self) -> Result<Option<Bytes>, Status> {
         if self.finished {
             return Ok(None);
@@ -259,13 +275,22 @@ impl Receiving {
         let message = match self.first.take() {
             Some(first) => first,
             None => {
-                let waiting = tokio::time::timeout(self.idle, self.stream.message());
-                let arrived = waiting.await.map_err(|_| {
-                    Status::deadline_exceeded(format!(
-                        "no byte of {} arrived for {:?}",
-                        self.digest, self.idle
-                    ))
-                })?;
+                let waiting = Instant::now();
+                let mut message = pin!(self.stream.message());
+                // The deadline moves on with every byte that arrives inside the message.
+                let arrived = loop {
+                    let deadline = waiting.max(self.progress.last()) + self.idle;
+                    match timeout_at(deadline, message.as_mut()).await {
+                        Ok(arrived) => break arrived,
+                        Err(_) if self.progress.last() + self.idle <= Instant::now() => {
+                            return Err(Status::deadline_exceeded(format!(
+                                "no byte of {} arrived for {:?}",
+                                self.digest, self.idle
+                            )));
+                        }
+                        Err(_) => {}
+                    }
+                };
                 arrived?.ok_or_else(|| {
                     Status::invalid_argument("write stream ended without finish_write")
                 })?

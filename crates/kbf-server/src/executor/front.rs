@@ -14,6 +14,13 @@
 //!   blob the frontend keeps in a pack). A run that cannot be prepared is the caller's
 //!   ([`MintError::Refused`]) unless the store could not be read ([`MintError::Unavailable`]):
 //!   see [`PrepareFault`].
+//! - **A tree started ahead of its run** ([`Ingest::start_tree`], `front_early.rs`): an Execute
+//!   that missed the action cache starts its tree's write while its input walk still asks
+//!   whether the files are held. The closure is collected with no held check
+//!   ([`RunPrepare::collect_unchecked`]) and the tree written as a mint writes it; the next mint
+//!   of the action in that form takes the write and mints only the put directory, and
+//!   [`Ingest::stored`] waits for the write as for its own. The tree is remembered only once
+//!   every write succeeded and the Execute found every input held.
 //! - **The action's facts** are read from the Action and the Command: those the Execute that
 //!   opened the operation decoded ([`kbf_front::Submission::decoded`]), so the run reads neither
 //!   from the CAS again, or, for an operation taken up from another process, read from the CAS.
@@ -67,6 +74,7 @@
 //!   long as the memo keeps the action (bounded as the trees are).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use futures::future::BoxFuture;
@@ -80,7 +88,7 @@ use kbf_front::prepare_run::{
     ClosureError, KeptClosure, PrepareError as RunPrepError, PrepareFault, PrepareTook, PutDirPrep,
     PutDirRun,
 };
-use kbf_front::{Backend, DecodedAction, IssuedPutDir, PackKeyMint, Packs};
+use kbf_front::{Backend, DecodedAction, HeldFinding, IssuedPutDir, PackKeyMint, Packs};
 use kbf_proto::reapi::{Action, ActionResult, Digest};
 use kbf_types::{DigestFunction, ImageRef};
 use std::sync::Arc;
@@ -98,6 +106,8 @@ use crate::executor::traits::{
     UntrustedLimits,
 };
 
+#[path = "front_early.rs"]
+mod early;
 #[path = "front_facts.rs"]
 mod facts;
 #[path = "front_miss.rs"]
@@ -157,6 +167,23 @@ pub trait RunPrepare: Send + Sync {
         now: SystemTime,
         wall: Duration,
     ) -> Result<MintedDir, PrepareError>;
+
+    /// The closure of `action`, whose Action is `decoded`, with no put directory and no held
+    /// check, for an action tree written while its Execute still checks its inputs
+    /// ([`Ingest::start_tree`]). By default none: no tree is started ahead of its run.
+    ///
+    /// # Errors
+    /// [`PrepareError`]; by default [`PrepareError::Refused`].
+    async fn collect_unchecked(
+        &self,
+        action: &kbf_types::Digest,
+        decoded: &Action,
+    ) -> Result<(KeptClosure, PrepareTook), PrepareError> {
+        let _ = (action, decoded);
+        Err(PrepareError::Refused(
+            "this preparation collects no closure ahead of its run".to_owned(),
+        ))
+    }
 }
 
 /// What the frontend's run preparation gives a run that commits into a put directory
@@ -224,6 +251,15 @@ impl RunPrepare for PutDirPrep {
             dir: minted.dir.dir().to_owned(),
             not_after: minted.not_after,
         })
+    }
+
+    async fn collect_unchecked(
+        &self,
+        action: &kbf_types::Digest,
+        decoded: &Action,
+    ) -> Result<(KeptClosure, PrepareTook), PrepareError> {
+        let collected = PutDirPrep::collect_unchecked(self, action, decoded).await;
+        collected.map_err(prepare_error)
     }
 }
 
@@ -410,6 +446,10 @@ pub struct Front {
     /// The step of the miss path an action is on, after a host refused its tree list as not
     /// mountable ([`Ingest::list_refused`]).
     misses: Misses,
+    /// The action trees started ahead of their runs ([`Ingest::start_tree`]), by action and form.
+    earlies: early::Earlies,
+    /// The id of the next of them.
+    early_ids: AtomicU64,
     /// Held while the base tree is published again: one publish at a time.
     republishing: tokio::sync::Mutex<()>,
     /// What publishes the base tree again.
@@ -460,6 +500,8 @@ impl Front {
             metrics: Arc::new(Metrics::default()),
             checked: Arc::new(Mutex::new(Bounded::new(TREE_ENTRIES))),
             misses: Mutex::new(Bounded::new(TREE_ENTRIES)),
+            earlies: Arc::default(),
+            early_ids: AtomicU64::new(0),
             republishing: tokio::sync::Mutex::new(()),
             republish,
         }
@@ -634,11 +676,14 @@ impl Ingest for Front {
             LostObject::Source(key) => key.clone(),
         };
         let mut own = false;
+        // Checked first, so no tree is started ahead of a run or remembered from one under way
+        // from now on; then the writes under way are dropped, then the trees.
+        self.checked().put(action, ());
+        self.forget_early(&action);
         for form in [InputTree::Manifests, InputTree::Provider] {
             let tree = self.trees().remove(&(action, form));
             own |= tree.is_some_and(|(tree, _)| tree.ends_with(&named_as));
         }
-        self.checked().put(action, ());
         // The memos first, so the next attempt's tree names nothing they said of the object.
         let (named, loss) = match object {
             LostObject::Manifest(sha) => (self.writer.lost_manifest(sha), None),
@@ -667,6 +712,16 @@ impl Ingest for Front {
             Err(_) => configured,
         }
     }
+
+    fn start_tree(
+        &self,
+        action: &Digest,
+        decoded: Arc<DecodedAction>,
+        configured: InputTree,
+        finding: HeldFinding,
+    ) {
+        self.start_early(action, decoded, configured, finding);
+    }
 }
 
 /// The put directory the frontend issued, from its text `cas/b/<build>/<nonce>`.
@@ -689,9 +744,11 @@ fn lasts(not_after: u64, now: SystemTime, wall: Duration) -> Result<(), MintErro
 impl Front {
     /// [`Ingest::mint`]: the put directory of the run, and the action tree over the base tree as
     /// `form` says (its manifests, or its tree list), named and parked for [`Inputs::tree`]; the
-    /// tree's writes go on after the mint answers, parked for [`Ingest::stored`]. An action tree
-    /// remembered for the action in this form is not written again: only the directory is
-    /// minted. The closure reads the Action unless it is `decoded`.
+    /// tree's writes go on after the mint answers, parked for [`Ingest::stored`]. A tree its
+    /// Execute started writing ahead of the run ([`Ingest::start_tree`]), or one remembered for
+    /// the action in this form, is not written again: only the directory is minted, and the
+    /// started write is parked as the run's own. The closure reads the Action unless it is
+    /// `decoded`.
     async fn mint_put_dir(
         &self,
         run: RunId,
@@ -709,18 +766,26 @@ impl Front {
         let prepare = &self.prepare;
         // Checked until a checked tree is stored: a run that fails before keeps it so.
         let checked = self.checked().get(action).is_some();
-        let remembered = (!checked)
-            .then(|| self.remembered_tree(action, form, now))
-            .flatten();
+        // The tree its Execute started writing beside its input check, once; else one
+        // remembered, which a write that ended put before it was forgotten.
+        let early = match checked {
+            true => None,
+            false => self.take_early(action, form).await,
+        };
+        let known = match (early, checked) {
+            (Some((tree, writes)), _) => Some((tree, Some(writes))),
+            (None, false) => (self.remembered_tree(action, form, now)).map(|tree| (tree, None)),
+            (None, true) => None,
+        };
         let started = Instant::now();
-        let (dir, not_after, tree, writes) = match remembered {
-            Some(tree) => {
+        let (dir, not_after, tree, writes) = match known {
+            Some((tree, writes)) => {
                 let minted = prepare.mint_put_dir(&build, action, now, wall).await;
                 self.metrics
                     .step_took(Step::PutDir, form, started.elapsed());
                 let minted = minted.map_err(MintError::from)?;
                 lasts(minted.not_after, now, wall)?;
-                (minted.dir, minted.not_after, tree, None)
+                (minted.dir, minted.not_after, tree, writes)
             }
             None => {
                 let prepared = (prepare.prepare_put_dir(&build, action, decoded, now, wall)).await;

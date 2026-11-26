@@ -74,6 +74,7 @@ mod closure;
 mod cpu;
 mod described;
 mod dir_cache;
+mod early_tree;
 mod execution;
 mod finished_row;
 pub mod grants;
@@ -135,6 +136,7 @@ pub use crate::cache::{
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
 pub use crate::described::Described;
+pub use crate::early_tree::{HeldFinding, InputsHeld, inputs_held};
 pub use crate::execution::{
     Arrival, Closer, Closing, DecodedAction, Dispatch, ERROR_DOMAIN, ExecutionService, Finished,
     LEASE_KIND_KEY, LEASE_KINDS, OperationStream, Progress, ProgressTicker, Stage, Submission,

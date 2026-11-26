@@ -419,6 +419,7 @@ pub async fn collect_closure_detaching(
         cache: None,
         writes,
         decoded: None,
+        check_held: true,
     };
     Ok(collect(&walk, action).await?.closure)
 }
@@ -439,6 +440,7 @@ pub async fn collect_closure_keeping(
         cache: None,
         writes: &DetachedWrites::shared(),
         decoded: None,
+        check_held: true,
     };
     let kept = keeping_through(&walk, action).await;
     Ok(kept?.0)
@@ -478,6 +480,9 @@ pub(crate) struct Walk<'a> {
     pub(crate) writes: &'a DetachedWrites,
     /// The Action, already decoded: it is not read from the store.
     pub(crate) decoded: Option<&'a reapi::Action>,
+    /// Whether the Command and every file are checked held (the Execute's finding, or else a
+    /// FindMissing); not by a walk whose caller waits for the Execute's finding itself.
+    pub(crate) check_held: bool,
 }
 
 /// What a walk found.
@@ -542,6 +547,7 @@ async fn walk_tree(
         keep,
         cache,
         decoded,
+        check_held,
         ..
     } = *walk;
     let started = Instant::now();
@@ -621,11 +627,14 @@ async fn walk_tree(
     }
     let walk_took = walking.elapsed();
     let checking = Instant::now();
-    match backend.vouched(action) {
-        true => backend.metrics().prepare_held_vouched.add(1),
-        false => {
-            backend.metrics().prepare_held_checked.add(1);
-            require_held(backend, &command, files).await?;
+    // A walk that does not check leaves the Execute's finding for the run that does.
+    if check_held {
+        match backend.vouched(action) {
+            true => backend.metrics().prepare_held_vouched.add(1),
+            false => {
+                backend.metrics().prepare_held_checked.add(1);
+                require_held(backend, &command, files).await?;
+            }
         }
     }
     let held = checking.elapsed();

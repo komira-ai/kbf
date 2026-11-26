@@ -497,3 +497,36 @@ async fn the_decode_an_execute_carries_reaches_its_runs_facts_and_mint() {
     let minted = locked(&rig.ingest.minted_decoded).clone();
     assert_eq!(minted, [Some(decoded)], "the mint was given it");
 }
+
+// ---- a tree started ahead of its run
+
+/// Asserts that a tree an Execute started ahead of its run reaches the frontend's ingest, with
+/// the action as REAPI names it and the form the executor is configured with, through the
+/// executor and through a server's dispatcher; that an executor with no roots for a put
+/// directory (no run of it is ever minted) hands none on; and that a server with no executor
+/// starts none, opening no operation either way. Catches a start lost on its way to the
+/// frontend, a tree written where no run can take it, and a start that opens an operation.
+#[tokio::test(start_paused = true)]
+async fn a_tree_started_ahead_of_its_run_reaches_the_frontend() {
+    let decoded = || {
+        std::sync::Arc::new(kbf_front::DecodedAction {
+            action: kbf_proto::reapi::Action::default(),
+            command: kbf_proto::reapi::Command::default(),
+        })
+    };
+    let finding = || kbf_front::inputs_held().1;
+    let rig = Rig::with(|cfg| cfg.input_tree = InputTree::Provider).await;
+
+    rig.exec.start_tree(digest_of(1), decoded(), finding());
+    let served = Dispatcher::of(Some(rig.executor("p-other")));
+    served.start_tree(digest_of(2), decoded(), finding());
+    Dispatcher::of(None).start_tree(digest_of(3), decoded(), finding());
+
+    let wanted = [1, 2].map(|tag| (run::reapi_digest(&digest_of(tag)), InputTree::Provider));
+    assert_eq!(*locked(&rig.ingest.started), wanted);
+    assert_eq!(rig.exec.open(), 0, "no operation is opened");
+    assert!(rig.fake.jobs().is_empty(), "no job is submitted");
+    let rootless = Rig::with(|cfg| cfg.task_out = None).await;
+    rootless.exec.start_tree(digest_of(4), decoded(), finding());
+    assert!(locked(&rootless.ingest.started).is_empty(), "no roots");
+}

@@ -6,7 +6,8 @@
 //! - **`kbf_executor_tree_write_seconds`** has one observation per write a tree made, once it
 //!   ended, stored or failed, of each of its parts ([`WriteWaits`]): `manifest_slot` (the wait
 //!   for one of the writer's manifest slots, shared by every tree), `store_slot` (the waits for
-//!   one of the pack store's slots, shared with every pack upload, added up over the attempts),
+//!   one of the pack store's slots for tree writes, shared by every tree and not with the pack
+//!   uploads, added up over the attempts),
 //!   `store_503` (the waits between attempts for a store that answered 503) and `request` (the
 //!   rest: the attempts at the store). `stage` is the stage the write was made in, as the step
 //!   family names it: `tree_manifests` (one observation per manifest, `.kbf` among them),

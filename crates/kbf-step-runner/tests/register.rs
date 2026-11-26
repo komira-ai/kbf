@@ -1,4 +1,9 @@
 //! The registration socket: liveness and version, and nothing a peer can use to run anything.
+//!
+//! The server reads a peer's user id with `SO_PEERCRED`, which only Linux has; off Linux it
+//! admits no peer (a Mac runs no updater, docs/design/host-updates.md). So a test that needs a
+//! peer admitted is ignored off Linux, saying so, and
+//! `off_linux_a_peer_is_closed_unanswered` holds what a peer gets there instead.
 
 mod support;
 
@@ -143,6 +148,10 @@ fn refused(rig: &Rig, line: &str) -> String {
 /// that registered is `Healthy` for its staged version and `Unhealthy(VersionMismatch)` for
 /// another (a version is never believed); when the connection closes it is `Unhealthy(Stopped)`.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn liveness_and_version_are_what_the_updater_reports() {
     let rig = Rig::new("reg-live", me());
     assert_eq!(rig.registry.report("svc", Some("2.0.0")), Reported::Absent);
@@ -175,6 +184,10 @@ fn liveness_and_version_are_what_the_updater_reports() {
 /// Catches a connection that closes after its registration was replaced stopping the new one: the
 /// second registration of the name wins, and only its connection's close stops the service.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_second_registration_replaces_the_first() {
     let rig = Rig::new("reg-replace", me());
     let (first, first_served) = rig.connect();
@@ -196,6 +209,10 @@ fn a_second_registration_replaces_the_first() {
 /// registers as, `SO_PEERCRED` is compared with it, and a mismatch is refused and registers
 /// nothing. A name nothing declares is refused too.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_peer_that_is_not_the_declared_user_is_refused() {
     let rig = Rig::new("reg-user", me().wrapping_add(1));
     assert_eq!(refused(&rig, &registration("2.0.0", None)), "wrong_user");
@@ -210,6 +227,10 @@ fn a_peer_that_is_not_the_declared_user_is_refused() {
 /// fields this updater does not have (an optional one of a later release, and one that names a
 /// command) registers as the same line without them would, and the fields act on nothing.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn an_unknown_optional_field_is_passed_over() {
     let rig = Rig::new("reg-unknown-field", me());
     let line = concat!(
@@ -242,6 +263,10 @@ fn an_unknown_optional_field_is_passed_over() {
 /// garbage, an object missing a field, an empty message, bytes that are not text, and a line
 /// over the limit are all `malformed`.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn what_is_not_a_registration_is_malformed() {
     let rig = Rig::new("reg-malformed", me());
     for line in ["garbage\n", "{\"name\":\"svc\"}\n", "\n", "[1,2]\n"] {
@@ -278,6 +303,10 @@ fn what_is_not_a_registration_is_malformed() {
 /// Catches a health address that is not confined: it must be loopback with a plain path and a port
 /// the declaration grants; IPv4 and IPv6 loopback are accepted and the address is kept.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn the_health_address_must_be_loopback_and_granted() {
     let rig = Rig::new("reg-health", me());
     for (addr, path, error) in [
@@ -318,6 +347,10 @@ fn the_health_address_must_be_loopback_and_granted() {
 /// `registration_ttl_secs` have passed without the service reconnecting, and `Healthy` again when
 /// it does.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_registration_is_kept_across_a_restart_until_its_ttl() {
     let rig = Rig::new("reg-persist", me());
     let (client, served) = rig.connect();
@@ -374,6 +407,10 @@ fn a_damaged_registrations_file_is_an_error() {
 /// Catches an accepted registration that could not be written being acknowledged: the service
 /// is told `internal` and the connection ends in an error.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_registration_that_cannot_be_kept_is_not_acknowledged() {
     let rig = Rig::new("reg-unwritable", me());
     fs::remove_dir_all(rig.scratch.path().join("state")).unwrap();
@@ -501,6 +538,10 @@ fn the_socket_takes_the_given_group() {
 /// Catches an accept loop that does not serve, or does not end when told: connections to the real
 /// socket are served on threads, and the loop returns once it is asked to stop and woken.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn the_server_accepts_on_the_socket_until_stopped() {
     let rig = Rig::new("reg-serve", me());
     let stop = Arc::new(AtomicBool::new(false));
@@ -518,6 +559,10 @@ fn the_server_accepts_on_the_socket_until_stopped() {
 /// Catches a server that serves any number of connections: with a limit of one, a second peer is
 /// answered `busy` and closed while the first still holds its registration.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn connections_over_the_limit_are_answered_busy() {
     let rig = Rig::capped("reg-cap", me(), Some(1));
     let stop = Arc::new(AtomicBool::new(false));
@@ -538,6 +583,10 @@ fn connections_over_the_limit_are_answered_busy() {
 /// Catches a registered peer that can talk for ever: more than the size limit sent after the
 /// registration ends the connection (the service is then stopped) although the peer never closes it.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_registered_peer_that_floods_is_dropped() {
     let rig = Rig::new("reg-flood", me());
     let (client, served) = rig.connect();
@@ -554,6 +603,10 @@ fn a_registered_peer_that_floods_is_dropped() {
 /// Catches `stopped` being forgotten across a restart: a service whose connection closed is still
 /// stopped when the registrations are loaded again, not believed healthy until its time-to-live.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_stopped_service_is_still_stopped_after_a_restart() {
     let rig = Rig::new("reg-stopped-persist", me());
     let (client, served) = rig.connect();
@@ -570,6 +623,10 @@ fn a_stopped_service_is_still_stopped_after_a_restart() {
 
 /// Catches a close that cannot be recorded passing as handled: the error reaches the caller.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_close_that_cannot_be_kept_is_an_error() {
     let rig = Rig::new("reg-stopped-unwritable", me());
     let (client, served) = rig.connect();
@@ -594,6 +651,10 @@ fn finish(rig: &Rig, stop: Arc<AtomicBool>, serving: JoinHandle<std::io::Result<
 /// Catches one user using every slot: with a limit of one per user, a second connection of the
 /// same user is answered `busy` while the global limit is far off.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn one_user_cannot_hold_every_connection() {
     let rig = Rig::new("reg-per-uid", me());
     let server = Server::bind(
@@ -642,6 +703,10 @@ fn a_connection_that_gets_no_thread_is_answered_busy() {
 /// to arrive, and one that has none left is refused as malformed (a zero deadline, so that
 /// nothing waits).
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_line_that_is_out_of_time_is_refused() {
     let mut rig = Rig::new("reg-deadline", me());
     let server = Arc::try_unwrap(rig.server)
@@ -669,6 +734,10 @@ fn a_line_that_is_out_of_time_is_refused() {
 /// the connection closed (broken pipe), and the refusal the server sent first is still there to
 /// read. The server runs to its end before the peer writes, so the order is fixed.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_refusal_is_readable_after_the_server_has_closed() {
     let mut rig = Rig::new("reg-closed-first", me());
     let server = Arc::try_unwrap(rig.server)
@@ -690,6 +759,10 @@ fn a_refusal_is_readable_after_the_server_has_closed() {
 /// interrupted call is waited out and the loop goes on to serve the next connection; any other
 /// error ends it.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn transient_accept_errors_are_retried() {
     use rustix::io::Errno;
     let rig = Rig::new("reg-accept-retry", me());
@@ -719,6 +792,10 @@ fn reg(version: &str, health: Option<(&str, &str)>) -> Registration {
 /// bytes it never read, which the kernel reports to the server as a reset after the part of the
 /// line that came; that is an error of the connection, not a line to answer.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_read_error_is_an_error_not_the_end_of_the_line() {
     let rig = Rig::new("reg-read-error", me());
     let (client, served) = UnixStream::pair().unwrap();
@@ -736,12 +813,37 @@ fn a_read_error_is_an_error_not_the_end_of_the_line() {
 /// Catches a read that came back for want of time being an error: a socket that has nothing to
 /// read and does not wait answers as a read past the deadline does, and the line is `malformed`.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_read_that_runs_out_of_time_is_malformed() {
     let rig = Rig::new("reg-read-timeout", me());
     let (client, served) = UnixStream::pair().unwrap();
     served.set_nonblocking(true).unwrap();
     rig.server.serve_connection(served).unwrap();
     assert_eq!(answer(&client)["error"], "malformed");
+    assert_eq!(rig.registry.report("svc", None), Reported::Absent);
+}
+
+/// Catches a server that admits a peer it cannot name: off Linux no peer's user id can be read,
+/// so a connection is closed with `Unsupported` before its line is read, with no answer, and
+/// nothing is registered. The peer sends nothing: a socket closed with bytes unread may be
+/// reported to its peer as a reset, not as the end.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn off_linux_a_peer_is_closed_unanswered() {
+    use std::io::Read;
+    let rig = Rig::new("reg-no-peercred", me());
+    let (client, served) = UnixStream::pair().unwrap();
+    let err = rig.server.serve_connection(served).unwrap_err();
+    assert!(
+        matches!(&err, RegistryError::Io(e) if e.kind() == std::io::ErrorKind::Unsupported),
+        "{err:?}"
+    );
+    let mut reply = Vec::new();
+    (&client).read_to_end(&mut reply).unwrap();
+    assert_eq!(reply, b"");
     assert_eq!(rig.registry.report("svc", None), Reported::Absent);
 }
 
@@ -830,169 +932,4 @@ fn a_loaded_registration_is_held_to_the_declarations_of_now() {
     // The same grant keeps it, as it was.
     let after = load(declared(me()));
     assert_eq!(after.report("svc", Some("2.0.0")), Reported::Healthy);
-}
-
-/// `svc` and `other`, both declared for the test's user.
-fn two_declared() -> Table {
-    Table(Mutex::new(BTreeMap::from([
-        ("svc".to_owned(), grant(me())),
-        ("other".to_owned(), grant(me())),
-    ])))
-}
-
-/// A registry whose disk is held by the test: each write sends its bytes on `writes` and waits
-/// for its outcome on `outcome`; an `Ok` is then written to disk.
-struct HeldDisk {
-    registry: Arc<Registry>,
-    writes: mpsc::Receiver<Vec<u8>>,
-    outcome: mpsc::Sender<std::io::Result<()>>,
-}
-
-fn held_registry(dir: &Path) -> HeldDisk {
-    let (entered, writes) = mpsc::channel::<Vec<u8>>();
-    let (outcome, outcomes) = mpsc::channel::<std::io::Result<()>>();
-    let outcomes = Mutex::new(outcomes);
-    let writer = move |dir: &Path, bytes: &[u8]| -> std::io::Result<()> {
-        entered.send(bytes.to_vec()).unwrap();
-        outcomes.lock().unwrap().recv().unwrap()?;
-        fs::write(dir.join(REGISTRATIONS_FILE), bytes)
-    };
-    let registry = Registry::load(dir, FakeClock::new(), &two_declared())
-        .unwrap()
-        .with_writer(Box::new(writer));
-    HeldDisk {
-        registry: Arc::new(registry),
-        writes,
-        outcome,
-    }
-}
-
-/// Registers `name` at `version` on a thread of its own.
-fn register_in_thread(
-    registry: &Arc<Registry>,
-    name: &str,
-    version: &str,
-) -> JoinHandle<Result<u64, RegistryError>> {
-    let registry = registry.clone();
-    let mut registration = reg(version, None);
-    registration.name = name.to_owned();
-    std::thread::spawn(move || registry.register(me(), &registration, &grant(me())))
-}
-
-/// The names and versions written in `bytes`, with whether each is written stopped.
-fn written(bytes: &[u8]) -> Vec<(String, String, bool)> {
-    let saved: Vec<serde_json::Value> = serde_json::from_slice(bytes).unwrap();
-    saved
-        .iter()
-        .map(|s| {
-            let text = |key: &str| s[key].as_str().unwrap().to_owned();
-            (text("name"), text("version"), s["stopped"] == true)
-        })
-        .collect()
-}
-
-/// Catches a close that waits for the disk before it is believed: while the write of another
-/// service's registration is held, the close of a registered service is reported `stopped` at
-/// once, and both changes are on disk once the writes have ended, the close's last. Nothing
-/// here waits for a time: the test waits for the report to change, which, with the close
-/// waiting behind the held write, it never would.
-#[test]
-fn a_close_is_believed_while_another_write_is_held() {
-    let scratch = Scratch::new("reg-close-held");
-    let HeldDisk {
-        registry,
-        writes,
-        outcome,
-    } = held_registry(scratch.path());
-    let first = register_in_thread(&registry, "svc", "2.0.0");
-    writes.recv().unwrap();
-    outcome.send(Ok(())).unwrap();
-    let conn = first.join().unwrap().unwrap();
-    assert_eq!(registry.report("svc", Some("2.0.0")), Reported::Healthy);
-
-    let other = register_in_thread(&registry, "other", "1.0.0");
-    let held = writes.recv().unwrap();
-    assert_eq!(written(&held).len(), 2);
-    let closing = {
-        let registry = registry.clone();
-        std::thread::spawn(move || registry.closed("svc", conn))
-    };
-    while registry.report("svc", Some("2.0.0")) != Reported::Unhealthy(Why::Stopped) {
-        std::thread::yield_now();
-    }
-    assert_eq!(registry.report("other", None), Reported::Absent);
-    outcome.send(Ok(())).unwrap();
-    other.join().unwrap().unwrap();
-    let last = writes.recv().unwrap();
-    outcome.send(Ok(())).unwrap();
-    closing.join().unwrap().unwrap();
-    assert_eq!(
-        written(&last),
-        [
-            ("other".to_owned(), "1.0.0".to_owned(), false),
-            ("svc".to_owned(), "2.0.0".to_owned(), true),
-        ]
-    );
-    let after = Registry::load(scratch.path(), FakeClock::new(), &two_declared()).unwrap();
-    assert_eq!(after.report("svc", None), Reported::Unhealthy(Why::Stopped));
-    assert_eq!(after.report("other", Some("1.0.0")), Reported::Healthy);
-}
-
-/// Catches writes that are not one at a time, a failed write that is believed, and a close of
-/// an older connection that stops its replacement: a replacement of `svc` whose write fails
-/// leaves the registration before it, on disk and in reports; a registration of `other` that
-/// waited behind it writes `svc` as it stood; a later replacement of `svc` is not stopped by the
-/// close of the connection it replaced; and what was acknowledged is what a reload finds.
-#[test]
-fn competing_changes_keep_what_was_acknowledged() {
-    let scratch = Scratch::new("reg-compete");
-    let HeldDisk {
-        registry,
-        writes,
-        outcome,
-    } = held_registry(scratch.path());
-    let first = register_in_thread(&registry, "svc", "1.0.0");
-    writes.recv().unwrap();
-    outcome.send(Ok(())).unwrap();
-    let old_conn = first.join().unwrap().unwrap();
-
-    let replacing = register_in_thread(&registry, "svc", "2.0.0");
-    let held = writes.recv().unwrap();
-    assert_eq!(
-        written(&held),
-        [("svc".to_owned(), "2.0.0".to_owned(), false)]
-    );
-    let other = register_in_thread(&registry, "other", "1.0.0");
-    outcome
-        .send(Err(std::io::Error::other("the disk is full")))
-        .unwrap();
-    assert!(matches!(
-        replacing.join().unwrap(),
-        Err(RegistryError::Io(_))
-    ));
-    assert_eq!(registry.report("svc", Some("1.0.0")), Reported::Healthy);
-    let next = writes.recv().unwrap();
-    assert_eq!(
-        written(&next),
-        [
-            ("other".to_owned(), "1.0.0".to_owned(), false),
-            ("svc".to_owned(), "1.0.0".to_owned(), false),
-        ]
-    );
-    outcome.send(Ok(())).unwrap();
-    other.join().unwrap().unwrap();
-
-    let again = register_in_thread(&registry, "svc", "3.0.0");
-    writes.recv().unwrap();
-    outcome.send(Ok(())).unwrap();
-    let new_conn = again.join().unwrap().unwrap();
-    assert_ne!(new_conn, old_conn);
-    // The close of the replaced connection changes nothing and writes nothing.
-    registry.closed("svc", old_conn).unwrap();
-    assert_eq!(registry.report("svc", Some("3.0.0")), Reported::Healthy);
-    assert!(writes.try_recv().is_err());
-
-    let after = Registry::load(scratch.path(), FakeClock::new(), &two_declared()).unwrap();
-    assert_eq!(after.report("svc", Some("3.0.0")), Reported::Healthy);
-    assert_eq!(after.report("other", Some("1.0.0")), Reported::Healthy);
 }

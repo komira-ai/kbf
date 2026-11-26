@@ -35,6 +35,7 @@ impl Front {
             None => MissPath::Republish,
             Some(_) => MissPath::Manifests,
         };
+        self.forget_early(action);
         for form in [InputTree::Manifests, InputTree::Provider] {
             self.trees().remove(&(*action, form));
         }
