@@ -686,6 +686,20 @@ impl Rows {
     /// that is not what it says, or one of a version this build does not know
     /// ([`RowsError::Corrupt`] names it). A caller deletes nothing on an error.
     pub fn named_lists(&self) -> Result<BTreeSet<String>, RowsError> {
+        self.named(|row| row.tree)
+    }
+
+    /// The put directories the open operations' rows name ([`OpRow::key`]): what the janitor of
+    /// `cas/b/` must not delete, whatever their age.
+    ///
+    /// # Errors
+    /// As [`Rows::named_lists`]: a caller deletes nothing on an error.
+    pub fn named_put_dirs(&self) -> Result<BTreeSet<String>, RowsError> {
+        self.named(|row| row.key)
+    }
+
+    /// What `of` reads from each open operation's row, every row of the store read.
+    fn named(&self, of: fn(OpRow) -> Option<String>) -> Result<BTreeSet<String>, RowsError> {
         let mut named = BTreeSet::new();
         for (key, found) in self.store.scan_prefix(OP_PREFIX)? {
             let Some(row) = decode(&key, &found.value)? else {
@@ -694,7 +708,7 @@ impl Rows {
                     "a row of a version this build does not know: what it names is not known",
                 ));
             };
-            named.extend(row.tree);
+            named.extend(of(row));
         }
         Ok(named)
     }
