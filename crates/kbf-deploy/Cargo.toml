@@ -84,5 +84,10 @@ rusqlite.workspace = true
 workspace = true
 
 [package.metadata.buildrules]
-# Policy only: `actions = { name = ["lint", "test"] }`, `default-action`, `[package.metadata.buildrules.lint]`.
-# Absent keys inherit [workspace.metadata.buildrules]. See docs/contract.md.
+# The farm lane's `//:ci` (docs/farm.md) checks the format of, builds and lints this package but
+# does not run its tests: its HTTPS and mdm tests load the host's trusted root certificates, which a
+# farm action has none of, and tests/frontend_units_stop.rs reads a document of the repository. They
+# run in ci.yml alone.
+
+[package.metadata.buildrules.actions]
+ci = ["fmt", "lint"]

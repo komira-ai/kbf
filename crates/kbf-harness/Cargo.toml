@@ -44,5 +44,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 workspace = true
 
 [package.metadata.buildrules]
-# Policy only: `actions = { name = ["lint", "test"] }`, `default-action`, `[package.metadata.buildrules.lint]`.
-# Absent keys inherit [workspace.metadata.buildrules]. See docs/contract.md.
+# The farm lane's `//:ci` (docs/farm.md) checks the format of, builds and lints this package but
+# does not run its tests: its stand-in test looks for a binary cargo builds beside the test binary
+# in target/, a layout a farm action does not have. They run in ci.yml alone.
+
+[package.metadata.buildrules.actions]
+ci = ["fmt", "lint"]

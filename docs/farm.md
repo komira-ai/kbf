@@ -122,6 +122,8 @@ does. Each member below says why in its `[package.metadata.buildrules]`, and its
 | `kbf-signer` | its Unix sockets, below the test's temporary directory, are longer than a socket path may be on the farm |
 | `kbf-enroll` | a config test expects `/proc/self` to be a symlink root owns, which it is not inside a farm action |
 | `kbf-coverage` | its command-line tests run git and read the repository's `coverage-floors` |
+| `kbf-deploy` | its HTTPS and mdm tests load the host's trusted root certificates, which a farm action has none of; one test reads a document of the repository |
+| `kbf-harness` | its stand-in test looks for a binary cargo builds beside the test binary in `target/` |
 
 No member declares buildrules' Postgres fixture (`postgres = { url-env = ... }`): every member
 whose tests need Postgres either needs it durable (above) or is left to `ci.yml` for another reason.
