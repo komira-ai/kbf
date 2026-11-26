@@ -2,8 +2,8 @@
 //! socket in a directory of the test.
 //!
 //! The server reads a client's user id with `SO_PEERCRED`, which only Linux has; off Linux it
-//! admits no client. So a test that needs a client admitted is ignored off Linux, saying so, and
-//! `off_linux_a_client_gets_no_answer` holds what a client gets there instead.
+//! admits no client. So a test that needs a client admitted is ignored off Linux, saying so;
+//! `off_linux_a_peer_is_closed_unanswered` in `register.rs` holds what a peer gets there instead.
 
 mod support;
 
@@ -274,17 +274,6 @@ fn a_health_address_the_declaration_does_not_allow_is_refused() {
     for (bad, want) in cases {
         assert_eq!(refusal(live.register("2.0.0", Some(&bad))), want, "{bad:?}");
     }
-    assert_eq!(live.reported(None), Reported::Absent);
-}
-
-/// Off Linux the server cannot read a client's user id and admits none: the client gets no
-/// answer, and nothing is registered.
-#[cfg(not(target_os = "linux"))]
-#[test]
-fn off_linux_a_client_gets_no_answer() {
-    let live = Live::start("regc-no-peercred", me(), |s| s);
-    let got = live.register("2.0.0", None);
-    assert!(matches!(got, Err(Error::NoAnswer)), "{got:?}");
     assert_eq!(live.reported(None), Reported::Absent);
 }
 

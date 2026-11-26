@@ -44,6 +44,7 @@ fn reg(version: &str) -> Registration {
     }
 }
 
+/// `svc` and `other`, both declared for the test's user.
 fn two_declared() -> Table {
     Table(Mutex::new(BTreeMap::from([
         ("svc".to_owned(), grant(me())),
