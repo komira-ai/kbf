@@ -48,6 +48,8 @@ mod lost;
 mod memo;
 #[path = "action_tree/named.rs"]
 mod named;
+#[path = "action_tree/pack_slots.rs"]
+mod pack_slots;
 #[path = "action_tree/places.rs"]
 mod places;
 #[path = "action_tree/retry.rs"]
