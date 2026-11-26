@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use http_body::{Body as _, Frame};
+use http_body::Frame;
 use tokio::time::Instant;
 use tonic::Status;
 use tonic::body::Body;
@@ -86,7 +86,7 @@ impl http_body::Body for Watching {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
-        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        let polled = http_body::Body::poll_frame(Pin::new(&mut self.body), cx);
         if let Poll::Ready(Some(Ok(frame))) = &polled
             && frame.data_ref().is_some_and(|data| !data.is_empty())
         {
@@ -96,7 +96,7 @@ impl http_body::Body for Watching {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
+        http_body::Body::is_end_stream(&self.body)
     }
 }
 

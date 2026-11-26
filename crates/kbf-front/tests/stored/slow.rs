@@ -24,7 +24,7 @@ use tonic::{Code, Status};
 
 use crate::bytestream::{read, read_name, status, upload_name};
 use crate::cas::missing;
-use crate::rig::{Rig, SMALL, blob_len};
+use crate::rig::{Rig, SMALL, blob_of};
 
 /// The idle timeout of these tests: not the default, so that a receive that ignored the setting
 /// would be seen.
@@ -46,6 +46,12 @@ async fn rig_with_room(room: u32) -> Rig {
         ..PackSettings::default()
     };
     Rig::with(settings).await
+}
+
+/// A blob of 100 bytes, `text` over and over, and its digest: each test's text is its own.
+fn hundred_bytes(text: &[u8]) -> (Digest, Bytes) {
+    let bytes: Vec<u8> = text.iter().copied().cycle().take(100).collect();
+    blob_of(&bytes)
 }
 
 /// A request body the test feeds: the frames sent arrive in order, and the body ends when the
@@ -169,7 +175,7 @@ async fn trickle(sender: &mpsc::UnboundedSender<Bytes>, bytes: &[u8]) {
 #[tokio::test(start_paused = true)]
 async fn a_message_slower_than_the_idle_timeout_that_keeps_coming_is_stored() {
     let rig = rig_with_room(1024).await;
-    let (digest, bytes) = blob_len(100, 31);
+    let (digest, bytes) = hundred_bytes(b"keeps coming ");
     let (sender, call) = start(&rig);
     sender
         .send(Bytes::from(wire(&first(&digest, &bytes, 10))))
@@ -192,7 +198,7 @@ async fn a_message_slower_than_the_idle_timeout_that_keeps_coming_is_stored() {
 #[tokio::test(start_paused = true)]
 async fn a_message_that_stops_coming_partway_is_ended_deadline_exceeded() {
     let rig = rig_with_room(1024).await;
-    let (digest, bytes) = blob_len(100, 32);
+    let (digest, bytes) = hundred_bytes(b"stops partway ");
     let (sender, call) = start(&rig);
     sender
         .send(Bytes::from(wire(&first(&digest, &bytes, 10))))
@@ -219,8 +225,8 @@ async fn a_message_that_stops_coming_partway_is_ended_deadline_exceeded() {
 #[tokio::test(start_paused = true)]
 async fn the_time_an_upload_waits_for_room_is_not_idle() {
     let rig = rig_with_room(100).await;
-    let (holder, holder_bytes) = blob_len(100, 33);
-    let (waiter, waiter_bytes) = blob_len(100, 34);
+    let (holder, holder_bytes) = hundred_bytes(b"holds the room ");
+    let (waiter, waiter_bytes) = hundred_bytes(b"waits for room ");
     let (holding, held) = start(&rig);
     holding
         .send(Bytes::from(wire(&first(&holder, &holder_bytes, 10))))
