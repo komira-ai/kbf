@@ -1,5 +1,9 @@
 //! The registration client (`update-register`) against the real registration server, over a unix
 //! socket in a directory of the test.
+//!
+//! The server reads a client's user id with `SO_PEERCRED`, which only Linux has; off Linux it
+//! admits no client. So a test that needs a client admitted is ignored off Linux, saying so;
+//! `off_linux_a_peer_is_closed_unanswered` in `register.rs` holds what a peer gets there instead.
 
 mod support;
 
@@ -132,6 +136,10 @@ fn refusal(result: Result<update_register::Registration, Error>) -> Refusal {
 /// A service that registers without a health address is registered, and is reported healthy for
 /// its version while it holds the connection: not `Absent`, and with no health address kept.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_service_without_a_health_address_is_not_absent() {
     let live = Live::start("regc-nohealth", me(), |s| s);
     assert_eq!(live.reported(Some("2.0.0")), Reported::Absent);
@@ -145,6 +153,10 @@ fn a_service_without_a_health_address_is_not_absent() {
 /// The health address and path the client sends are the ones the registry keeps, for IPv4 and
 /// IPv6 loopback.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn the_health_address_arrives_as_sent() {
     for (addr, port) in [("127.0.0.1:9301", 9301), ("[::1]:9302", 9302)] {
         // A directory of its own per address: the previous server's connection thread, which
@@ -172,6 +184,10 @@ fn the_health_address_arrives_as_sent() {
 
 /// The version the client sends is the one believed: another staged version is a mismatch.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_version_other_than_the_staged_one_is_a_mismatch() {
     let live = Live::start("regc-version", me(), |s| s);
     let held = live.register("1.9.0", None).unwrap();
@@ -187,6 +203,10 @@ fn a_version_other_than_the_staged_one_is_a_mismatch() {
 /// The registration is the connection: dropping it is the service stopping, and registering
 /// again brings it back.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn dropping_the_registration_is_the_service_stopping() {
     let live = Live::start("regc-drop", me(), |s| s);
     let held = live.register("2.0.0", None).unwrap();
@@ -210,6 +230,10 @@ fn dropping_the_registration_is_the_service_stopping() {
 
 /// A client whose user is not the one the declaration names is refused, and nothing is recorded.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_client_with_the_wrong_uid_is_refused() {
     let live = Live::start("regc-uid", me().wrapping_add(1), |s| s);
     assert_eq!(refusal(live.register("2.0.0", None)), Refusal::WrongUser);
@@ -218,6 +242,10 @@ fn a_client_with_the_wrong_uid_is_refused() {
 
 /// A name no declaration names is refused.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_service_nothing_declares_is_refused() {
     let live = Live::start("regc-unknown", me(), |s| s);
     let got = register(&live.sock, "stranger", "1.0.0", None);
@@ -228,6 +256,10 @@ fn a_service_nothing_declares_is_refused() {
 /// A health address that is not loopback, a path that is not one, and a port the declaration
 /// does not grant are each their own refusal.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_health_address_the_declaration_does_not_allow_is_refused() {
     let live = Live::start("regc-badhealth", me(), |s| s);
     let cases = [
@@ -256,6 +288,10 @@ fn a_full_server_is_busy() {
 /// A server that cannot keep the registration (its state directory is gone) says so, and the
 /// registration is not believed.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn a_server_that_cannot_keep_the_registration_says_so() {
     let live = Live::start("regc-internal", me(), |s| s);
     fs::remove_dir_all(live.scratch.path().join("state")).unwrap();
@@ -283,6 +319,10 @@ fn the_client_and_the_server_agree_on_every_reason() {
 /// A registration of exactly the longest line the server reads goes through; the client's limit
 /// is the server's, and one byte more is refused by the client without a connection to read it.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "needs SO_PEERCRED, which only Linux has"
+)]
 fn the_longest_line_the_server_reads_is_the_longest_the_client_sends() {
     assert_eq!(update_register::MAX_LINE, MAX_LINE);
     let live = Live::start("regc-long", me(), |s| s);
