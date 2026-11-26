@@ -39,8 +39,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::{Front, RunPrepare, Trees, cas_digest, lock_checked, lock_trees, write_named};
-use crate::executor::front_cache::Bounded;
 use crate::executor::config::InputTree;
+use crate::executor::front_cache::Bounded;
 use crate::executor::mac::System;
 use crate::executor::metrics::Metrics;
 use crate::executor::steps::Step;

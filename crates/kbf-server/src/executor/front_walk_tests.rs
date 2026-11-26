@@ -201,7 +201,11 @@ impl RunPrepare for Real {
 struct Taken(Mutex<Vec<Submission>>, Mutex<Vec<Started>>);
 
 /// A tree write an Execute started: its action, its decode and the finding it is told.
-type Started = (kbf_types::Digest, Arc<kbf_front::DecodedAction>, HeldFinding);
+type Started = (
+    kbf_types::Digest,
+    Arc<kbf_front::DecodedAction>,
+    HeldFinding,
+);
 
 impl Taken {
     /// The decode the one submission taken carries.

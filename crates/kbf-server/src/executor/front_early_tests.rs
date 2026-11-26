@@ -57,7 +57,13 @@ async fn the_run_takes_the_tree_its_execute_started_and_waits_for_its_writes() {
         finding,
     );
     let minted = (rig.front)
-        .mint(lease(), &set.action, WALL, InputTree::Manifests, Some(&decoded))
+        .mint(
+            lease(),
+            &set.action,
+            WALL,
+            InputTree::Manifests,
+            Some(&decoded),
+        )
         .await;
     minted.expect("a dir");
     let tree = rig.front.tree(lease()).await.expect("the tree is named");
@@ -75,7 +81,9 @@ async fn the_run_takes_the_tree_its_execute_started_and_waits_for_its_writes() {
     let mut once = set.files.to_vec();
     once.sort();
     assert_eq!(log.asked(), once);
-    let remembered = rig.front.remembered_tree(&action, InputTree::Manifests, clock());
+    let remembered = rig
+        .front
+        .remembered_tree(&action, InputTree::Manifests, clock());
     assert_eq!(remembered, Some(tree));
     assert!(!under_way(rig, &action, InputTree::Manifests), "forgotten");
 }
@@ -140,19 +148,15 @@ async fn a_write_that_named_no_tree_leaves_the_run_its_own_answer() {
     let (said, finding) = inputs_held();
     said.held();
 
-    rig.front.start_tree(
-        &action,
-        Arc::clone(&decoded),
-        InputTree::Manifests,
-        finding,
-    );
+    rig.front
+        .start_tree(&action, Arc::clone(&decoded), InputTree::Manifests, finding);
     let minted = (rig.front)
         .mint(lease(), &action, WALL, InputTree::Manifests, Some(&decoded))
         .await;
 
     let error = minted.expect_err("the input root is not held");
     assert_eq!((real.collected(), real.prepared()), (1, 1));
-    let alone = walking();
+    let alone = super::walking();
     let (same, decoded) = rootless(&alone).await;
     let unstarted = (alone.rig.front)
         .mint(lease(), &same, WALL, InputTree::Manifests, Some(&decoded))
@@ -214,7 +218,10 @@ async fn a_tree_is_started_once_and_in_the_form_of_its_run() {
     let (_, remembered) = inputs_held();
     rig.front
         .start_tree(&set.action, Arc::clone(&decoded), form, remembered);
-    assert!(!under_way(rig, &action, form), "remembered: nothing started");
+    assert!(
+        !under_way(rig, &action, form),
+        "remembered: nothing started"
+    );
 
     let mac = Arc::new(DecodedAction {
         action: Action {
@@ -312,12 +319,18 @@ async fn a_refused_tree_list_drops_the_write_under_way_and_not_the_next() {
     let_writes_through(rig);
     first.await.expect("the task ended").expect("written");
 
-    assert!(under_way(rig, &action, form), "the first's end kept the next");
+    assert!(
+        under_way(rig, &action, form),
+        "the first's end kept the next"
+    );
     assert_eq!(rig.front.remembered_tree(&action, form, clock()), None);
     let (tree, writes) = (rig.front.take_early(&action, form).await).expect("named");
     said.held();
     writes.await.expect("the task ended").expect("written");
-    assert_eq!(rig.front.remembered_tree(&action, form, clock()), Some(tree));
+    assert_eq!(
+        rig.front.remembered_tree(&action, form, clock()),
+        Some(tree)
+    );
 }
 
 /// Asserts that a write that fails after it named the tree fails the run that took it, as the

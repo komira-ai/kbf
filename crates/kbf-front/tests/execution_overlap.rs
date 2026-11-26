@@ -597,7 +597,9 @@ async fn the_tree_write_starts_while_the_held_files_are_asked_about() {
     let [(action, decoded, finding)] = <[Started; 1]>::try_from(rig.started()).expect("one start");
     assert_eq!(action, job.action);
     let submitted = lock(&rig.dispatch.submitted).pop().expect("one submission");
-    let carried = submitted.decoded.expect("the submission carries the decode");
+    let carried = submitted
+        .decoded
+        .expect("the submission carries the decode");
     assert!(Arc::ptr_eq(&carried, &decoded), "one decode for both");
     assert!(finding.wait().await, "every input was found held");
 }
