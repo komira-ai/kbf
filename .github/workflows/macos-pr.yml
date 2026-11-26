@@ -4,7 +4,7 @@
 # - `macos-test` runs the tests of the macOS crates as an ordinary user: the steps of beta.yml's
 #   `native-macos` that need no root, the task runner's tests (ci.yml's `task-macos` runs them
 #   after the merge), and the other crates whose tests pass on a Mac (the sandbox profile writer,
-#   the update types).
+#   the update types, the updater's registration server).
 # - `macos-device` runs the rest of `native-macos`: the pinned gh against a real attestation.
 #
 # A macOS action itself runs as a js-agent job (docs/design/actions-as-jobs.md section 14); no
@@ -63,6 +63,10 @@ jobs:
       - run: cargo test -p kbf-task --locked --no-fail-fast
       # The crates whose tests pass on a Mac: the sandbox profile writer and the update types.
       - run: cargo test --locked --no-fail-fast -p kbf-seatbelt -p kbf-update
+      # The registration server's tests (kbf-step-runner): off Linux it reads no peer's user id
+      # (`SO_PEERCRED` is Linux's) and admits no peer, which a test of its own holds; each test
+      # that needs a peer admitted is ignored here with that reason.
+      - run: cargo test -p kbf-step-runner --locked --no-fail-fast --test register --test register_client --test register_disk
 
   macos-device:
     runs-on: macos-15
