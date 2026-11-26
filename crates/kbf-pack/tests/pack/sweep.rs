@@ -10,7 +10,9 @@ use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
-use kbf_pack::{Slot, SweepConfig, SweepError, SweepGates, Sweeper, TaskPackKey, task_key_age};
+use kbf_pack::{
+    Slot, SweepConfig, SweepError, SweepGates, Sweeper, TaskPackKey, none_named, task_key_age,
+};
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_pack_index::{
     BlobDigest, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
@@ -48,6 +50,7 @@ fn gates(leader: bool, verifying: Option<String>) -> SweepGates {
         is_leader: Box::new(move || leader),
         verifying: Box::new(move |k| verifying.as_deref() == Some(k)),
         claim: Box::new(|_| Some(Box::new(()))),
+        named: none_named(),
     }
 }
 
@@ -368,6 +371,7 @@ async fn an_old_large_object_is_swept_and_a_young_one_kept() {
         is_leader: Box::new(|| true),
         verifying: Box::new(|_| false),
         claim: Box::new(|_| Some(Box::new(()))),
+        named: none_named(),
     };
     let report = sweeper(&rig, gates).sweep(now()).await.unwrap();
     assert!(!rig.store.holds(&old).await);
@@ -416,6 +420,7 @@ async fn an_old_put_dir_object_is_swept_and_a_young_one_kept() {
         is_leader: Box::new(|| true),
         verifying: Box::new(|_| false),
         claim: Box::new(|_| Some(Box::new(()))),
+        named: none_named(),
     };
     let report = sweeper(&rig, gates).sweep(now()).await.unwrap();
     assert!(!rig.store.holds(&old_pack).await);
@@ -450,6 +455,7 @@ async fn old_keys_of_every_other_prefix_survive_a_sweep_of_cas_b() {
         is_leader: Box::new(|| true),
         verifying: Box::new(|_| false),
         claim: Box::new(|_| Some(Box::new(()))),
+        named: none_named(),
     };
     let report = sweeper(&rig, gates).sweep(now()).await.unwrap();
     assert_eq!((report.listed, report.deleted), (2, 2));
@@ -518,6 +524,7 @@ async fn a_key_outside_cas_b_in_a_listing_is_never_deleted() {
         is_leader: Box::new(|| true),
         verifying: Box::new(|_| false),
         claim: Box::new(|_| Some(Box::new(()))),
+        named: none_named(),
     };
     let store = Arc::new(IgnoresPrefix(Arc::clone(&rig.store)));
     let sweep = Sweeper::new(store, index, SweepConfig::default(), gates);

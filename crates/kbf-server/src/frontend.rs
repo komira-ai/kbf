@@ -83,8 +83,9 @@
 //!
 //! **The `cas/b/` janitor** is off unless `--task-janitor-key-file` is given (`janitor` has the
 //! flags and the rule for an orphan): the leader then sweeps the task packs and large objects
-//! under `cas/b/` that nothing recorded and are older than the grace, on an interval, through the
-//! tier store's GC key, and counts what it did (`kbf_cas_b_janitor_*` on `GET /metrics`).
+//! under `cas/b/` that nothing recorded, no open operation names and are older than the grace, on
+//! an interval, through the tier store's GC key: it counts them, and with `--task-janitor-apply`
+//! deletes them (`kbf_cas_b_janitor_*` on `GET /metrics`).
 //! **The collector of tree lists** is off unless `--executor-list-sweep-key-file` is given
 //! (`list_sweep`): the leader then counts, and with `--executor-list-sweep-apply` deletes, the
 //! tree lists older than a day no open operation names (`kbf_tree_list_sweep_*`).
@@ -931,6 +932,7 @@ impl<'a> Prepared<'a> {
             flags.packs.as_ref(),
             packs.as_ref(),
             pack_index.as_ref(),
+            state_store.as_ref(),
             &readiness,
         )?;
         let janitor_metrics = janitor.as_ref().map(Janitor::metrics);

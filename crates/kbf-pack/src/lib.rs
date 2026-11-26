@@ -18,7 +18,7 @@
 //!   store: least recently used out first, written with a temporary file and a rename,
 //!   checked by digest on every read.
 //! - [`Sweeper`] deletes the orphans under `cas/b/`: the packs a task wrote that nothing ever
-//!   recorded, once they are older than a grace period.
+//!   recorded and no open operation names, once they are older than a grace period.
 //! - [`Adopter`] indexes, in place, the segments that storage members flushed to the cold store
 //!   before there were packs: a segment has the layout of a pack, so one record of the index
 //!   per segment, made from its footer, makes its blobs readable through [`Reader`]. It copies
@@ -75,6 +75,7 @@ pub use packer::{
 };
 pub use reader::{DEFAULT_CONCURRENCY, DEFAULT_GAP, Fetch, ReadTimes, Reader, ReaderConfig};
 pub use sweep::{
-    AgeOf, Claim, ClaimOf, DEFAULT_GRACE, INGEST_ALLOWANCE, MAX_KEY_LIFE, MIN_GRACE, SWEPT_PREFIX,
-    SweepConfig, SweepError, SweepGates, SweepReport, Sweeper, task_key_age,
+    AgeOf, Claim, ClaimOf, DEFAULT_GRACE, INGEST_ALLOWANCE, MAX_KEY_LIFE, MIN_GRACE, NamedOf,
+    SWEPT_PREFIX, SweepConfig, SweepError, SweepGates, SweepReport, Sweeper, none_named,
+    task_key_age,
 };
