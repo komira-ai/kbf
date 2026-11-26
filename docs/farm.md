@@ -152,7 +152,8 @@ The build farm is on a private Tailscale network. The job joins it with
 `tailscale/github-action`, pinned by commit, as an ephemeral node tagged `tag:ci`, with the job's
 OIDC token (workload identity federation: no secret is stored). Its inputs are the organisation's
 variables `TS_CLIENT_ID` and `TS_AUDIENCE`. Then `cargo xtask farm-config`
-(`crates/xtask/src/farm_config.rs`) masks the farm's address in the log and writes the farm's
+(`crates/xtask/src/farm_config.rs`) masks the farm's address in the log (as given, its host, and
+every address the host resolves to, which buck2's connection errors print) and writes the farm's
 buckconfig under `~/.buckconfig.d`, where buck2 reads it, from `FARM_ADDRESS`, `FARM_INSTANCE`,
 `FARM_TLS` and `FARM_LINUX_X86_64_PROPERTIES`. It refuses an empty value, so a run without the
 variables never builds on the runner.

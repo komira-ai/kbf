@@ -34,10 +34,26 @@ fn args(out: &Path) -> Args {
     }
 }
 
+/// The fake resolver of these tests: `farm.example` is two addresses, every other name none, so
+/// no test asks a real resolver.
+fn resolve(host: &str, _port: u16) -> Vec<std::net::IpAddr> {
+    match host {
+        "farm.example" => vec![
+            "192.0.2.9".parse().expect("ip"),
+            "2001:db8::9".parse().expect("ip"),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// What `farm.example` adds to the masks: the bare host and each address, alone and with the port.
+const RESOLVED: &str = "::add-mask::farm.example\n::add-mask::192.0.2.9\n::add-mask::192.0.2.9:8980\n\
+                        ::add-mask::2001:db8::9\n::add-mask::[2001:db8::9]:8980\n";
+
 /// The result of `run_with` for `args`, and the lines it printed.
 fn run_of(args: &Args) -> (Result<String, Error>, String) {
     let mut printed = Vec::new();
-    let result = run_with(args, &mut printed);
+    let result = run_with(args, &mut printed, &resolve);
     (result, String::from_utf8(printed).expect("utf-8"))
 }
 
@@ -82,7 +98,7 @@ fn the_buckconfig_is_exactly_the_farms_keys_and_the_worker_properties_under_buil
     assert_eq!(result, Ok(format!("farm-config: wrote {}", out.display())));
     assert_eq!(
         printed,
-        "::add-mask::grpc://farm.example:8980\n::add-mask::farm.example:8980\n"
+        format!("::add-mask::grpc://farm.example:8980\n::add-mask::farm.example:8980\n{RESOLVED}")
     );
     assert_eq!(std::fs::read_to_string(&out).expect("read"), WHOLE);
 
@@ -316,6 +332,64 @@ fn a_log_that_cannot_be_written_does_not_stop_the_file() {
     // Catches: a closed log failing the verb.
     let dir = scratch("log-closed");
     let out = dir.join("config");
-    assert!(run_with(&args(&out), &mut Refusing).is_ok());
+    assert!(run_with(&args(&out), &mut Refusing, &resolve).is_ok());
     assert_eq!(std::fs::read_to_string(&out).expect("read"), WHOLE);
+}
+
+fn settings<'a>(address: &'a str, host: &'a str, port: u16) -> Settings<'a> {
+    Settings {
+        address,
+        host,
+        port,
+        instance: "main",
+        tls: false,
+        properties: "p",
+    }
+}
+
+#[test]
+fn the_host_and_every_address_it_resolves_to_are_masked_once() {
+    // Catches: the resolved address that buck2's connection errors print (`tcp connect error ...
+    // <ip>:<port>`) reaching the public log, the bare host left unmasked, an IPv6 address with
+    // the port written without brackets, a mask repeated, and a lookup of a bracketed host.
+    let address = "grpc://farm.example:8980";
+    assert_eq!(
+        resolved_masks(&settings(address, "farm.example", 8980), &resolve).concat(),
+        RESOLVED.replace('\n', "")
+    );
+    // A host that does not resolve: only the host itself.
+    assert_eq!(
+        resolved_masks(&settings("other.example:1", "other.example", 1), &resolve),
+        ["::add-mask::other.example"]
+    );
+    // An IP that resolves to itself repeats nothing `masks` printed (the bare address).
+    let ip = |host: &str, _: u16| vec![host.parse().expect("ip")];
+    assert_eq!(
+        resolved_masks(&settings("192.0.2.4:80", "192.0.2.4", 80), &ip),
+        ["::add-mask::192.0.2.4"]
+    );
+    assert_eq!(
+        resolved_masks(&settings("[2001:db8::4]:80", "[2001:db8::4]", 80), &ip),
+        ["::add-mask::[2001:db8::4]", "::add-mask::2001:db8::4"]
+    );
+    // The same address twice from the resolver is masked once.
+    let twice = |_: &str, _: u16| vec!["192.0.2.6".parse().expect("ip"); 2];
+    assert_eq!(
+        resolved_masks(&settings("h:2", "h", 2), &twice),
+        [
+            "::add-mask::h",
+            "::add-mask::192.0.2.6",
+            "::add-mask::192.0.2.6:2"
+        ]
+    );
+}
+
+#[test]
+fn check_hands_over_the_host_and_port_it_read() {
+    // Catches: a host or port taken from the wrong side of the last `:`, and a scheme kept.
+    let dir = scratch("parts");
+    let mut a = args(&dir.join("config"));
+    a.address = "grpcs://[2001:db8::1]:443".to_owned();
+    let s = check(&a).expect("checked");
+    assert_eq!((s.host, s.port), ("[2001:db8::1]", 443));
 }

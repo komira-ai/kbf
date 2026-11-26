@@ -9,6 +9,8 @@ use kbf_testkit::dir::TestDir;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 
+// A host name: only the refusals and the usage errors use it, which end before the verb resolves
+// the host, so no test asks the system resolver for a name.
 const ADDRESS: &str = "grpc://farm.example:8980";
 const PROPERTIES: &str = "OSFamily=Linux,ISA=x86-64";
 
@@ -47,13 +49,15 @@ fn the_file_is_written_whole_in_a_directory_made_for_it_and_only_its_name_is_pri
         .join("home")
         .join(".buckconfig.d")
         .join("farm.buckconfig");
-    let o = farm_config(ADDRESS, "main", "true", PROPERTIES, &out);
+    // An IP literal: the verb's resolver turns it into itself with no lookup, so the test needs
+    // no DNS; the resolved forms of a host name are the unit tests' (src/farm_config/tests.rs).
+    let o = farm_config("grpc://192.0.2.5:8980", "main", "true", PROPERTIES, &out);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     assert_eq!(
         stdout(&o),
         format!(
-            "::add-mask::grpc://farm.example:8980\n::add-mask::farm.example:8980\n\
-             farm-config: wrote {}\n",
+            "::add-mask::grpc://192.0.2.5:8980\n::add-mask::192.0.2.5:8980\n\
+             ::add-mask::192.0.2.5\nfarm-config: wrote {}\n",
             out.display()
         )
     );
@@ -62,9 +66,9 @@ fn the_file_is_written_whole_in_a_directory_made_for_it_and_only_its_name_is_pri
         std::fs::read_to_string(&out).expect("read"),
         "\
 [buck2_re_client]
-  engine_address = grpc://farm.example:8980
-  action_cache_address = grpc://farm.example:8980
-  cas_address = grpc://farm.example:8980
+  engine_address = grpc://192.0.2.5:8980
+  action_cache_address = grpc://192.0.2.5:8980
+  cas_address = grpc://192.0.2.5:8980
   instance_name = main
   tls = true
   execution_concurrency_limit = 256
@@ -78,7 +82,8 @@ fn the_file_is_written_whole_in_a_directory_made_for_it_and_only_its_name_is_pri
 
 #[test]
 fn an_address_without_a_scheme_is_masked_once_and_tls_false_is_written() {
-    // Catches: a double mask for an address that has no scheme, and `tls = false` not written.
+    // Catches: a double mask for an address that has no scheme (the address, then its bare host,
+    // each once: an IP resolves to itself, already masked), and `tls = false` not written.
     let dir = scratch("plain");
     let out = dir.join("farm.buckconfig");
     let o = farm_config("192.0.2.3:8980", "main", "false", PROPERTIES, &out);
@@ -86,7 +91,7 @@ fn an_address_without_a_scheme_is_masked_once_and_tls_false_is_written() {
     assert_eq!(
         stdout(&o),
         format!(
-            "::add-mask::192.0.2.3:8980\nfarm-config: wrote {}\n",
+            "::add-mask::192.0.2.3:8980\n::add-mask::192.0.2.3\nfarm-config: wrote {}\n",
             out.display()
         )
     );
@@ -165,7 +170,7 @@ fn every_refusal_exits_1_names_its_flag_prints_the_masks_first_and_writes_nothin
 fn a_file_that_cannot_be_written_exits_1_naming_it() {
     // Catches: a config that could not be written reported as written.
     let dir = scratch("unwritable");
-    let o = farm_config(ADDRESS, "main", "true", PROPERTIES, dir.path());
+    let o = farm_config("192.0.2.5:8980", "main", "true", PROPERTIES, dir.path());
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(
         stderr(&o),

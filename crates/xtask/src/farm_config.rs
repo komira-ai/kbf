@@ -6,6 +6,8 @@
 //! 1. The first lines the verb prints mask the address in the workflow's log
 //!    (`::add-mask::<address>`, and the same without its scheme): the logs of a public
 //!    repository's runs are public, so nothing printed after them, a refusal included, shows it.
+//!    Once the address is checked, the bare host and every address it resolves to are masked too
+//!    ([`resolved_masks`]): buck2's connection errors name the resolved address.
 //! 2. The flags are checked, and each refusal names its flag: the address, the instance and the
 //!    properties are not blank (a fork's run gets no variables, and buck2 would then build on the
 //!    runner), no value holds a line break (each value is one line of the file), `--tls` is
@@ -86,6 +88,10 @@ pub enum Error {
 pub struct Settings<'a> {
     /// The address.
     pub address: &'a str,
+    /// The host of the address, as written (an IPv6 host in its brackets).
+    pub host: &'a str,
+    /// The port of the address.
+    pub port: u16,
     /// The instance name.
     pub instance: &'a str,
     /// Whether the farm is served over TLS.
@@ -133,8 +139,9 @@ fn is_scheme(scheme: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
-/// Fails unless `address` is `host:port` behind no scheme or a scheme such as `grpc://`.
-fn check_address(address: &str) -> Result<(), Error> {
+/// The host and port of `address`, unless it is not `host:port` behind no scheme or a scheme such
+/// as `grpc://`.
+fn check_address(address: &str) -> Result<(&str, u16), Error> {
     let fail = |why| Err(Error::Address { why });
     if address
         .split_once("://")
@@ -148,11 +155,10 @@ fn check_address(address: &str) -> Result<(), Error> {
     if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c == '/') {
         return fail("the host is empty, or holds whitespace or a `/`");
     }
-    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) || port.parse::<u16>().is_err()
-    {
-        return fail("the port is not a number from 0 to 65535");
+    match port.parse::<u16>() {
+        Ok(number) if port.bytes().all(|b| b.is_ascii_digit()) => Ok((host, number)),
+        _ => fail("the port is not a number from 0 to 65535"),
     }
-    Ok(())
 }
 
 /// The checked settings of `args`.
@@ -162,7 +168,7 @@ fn check_address(address: &str) -> Result<(), Error> {
 /// refused.
 pub fn check(args: &Args) -> Result<Settings<'_>, Error> {
     let address = one_line("address", &args.address)?;
-    check_address(address)?;
+    let (host, port) = check_address(address)?;
     let instance = one_line("instance", &args.instance)?;
     let tls = match args.tls.as_str() {
         "true" => true,
@@ -172,6 +178,8 @@ pub fn check(args: &Args) -> Result<Settings<'_>, Error> {
     let properties = one_line("properties", &args.properties)?;
     Ok(Settings {
         address,
+        host,
+        port,
         instance,
         tls,
         properties,
@@ -185,6 +193,7 @@ pub fn render(settings: &Settings<'_>) -> String {
         instance,
         tls,
         properties,
+        ..
     } = settings;
     // `grpc_keepalive_timeout_secs`: the connection to the farm can be slow (through a tailnet
     // relay it carries a few MB/s for all of a job's uploads together). buck2 PINGs a connection
@@ -223,16 +232,57 @@ fn write(path: &Path, text: &str) -> Result<(), Error> {
         })
 }
 
-/// The verb, with the masking lines written to `out`: the line to print when the file is written.
+/// What a host name resolves to: the system's resolver in [`run`], a fake in the tests.
+pub type Resolve<'a> = &'a dyn Fn(&str, u16) -> Vec<std::net::IpAddr>;
+
+/// The lines that mask what buck2 may print of a checked address besides the address itself: the
+/// bare host, and every address the host resolves to, alone and with the port. A connection
+/// error names the resolved address (`tcp connect error ... <ip>:<port>`), which the masks of the
+/// address as given do not cover when it names a host. A host that does not resolve adds only
+/// its own mask; buck2 then fails naming the host, which is masked. Lines `masks` already printed
+/// are not repeated.
+pub fn resolved_masks(settings: &Settings<'_>, resolve: Resolve<'_>) -> Vec<String> {
+    let (address, port) = (settings.address, settings.port);
+    let bare = without_scheme(address);
+    let mut lines: Vec<String> = Vec::new();
+    let mut add = |value: String| {
+        let line = format!("::add-mask::{value}");
+        if value != address && value != bare && !lines.contains(&line) {
+            lines.push(line);
+        }
+    };
+    add(settings.host.to_owned());
+    let name = settings.host.trim_start_matches('[').trim_end_matches(']');
+    for ip in resolve(name, port) {
+        add(ip.to_string());
+        add(std::net::SocketAddr::new(ip, port).to_string());
+    }
+    lines
+}
+
+/// The system's resolver: every address `host` resolves to, none when it does not.
+fn system_resolve(host: &str, port: u16) -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+    (host, port)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|a| a.ip()).collect())
+        .unwrap_or_default()
+}
+
+/// The verb, with the masking lines written to `out` and host names resolved by `resolve`: the
+/// line to print when the file is written.
 ///
 /// # Errors
 /// [`Error`] for a refused flag or a file that cannot be written.
-pub fn run_with(args: &Args, out: &mut dyn Write) -> Result<String, Error> {
+pub fn run_with(args: &Args, out: &mut dyn Write, resolve: Resolve<'_>) -> Result<String, Error> {
     for line in masks(&args.address) {
         // A log that cannot be written loses the mask, not the verb's verdict.
         let _ = writeln!(out, "{line}");
     }
     let settings = check(args)?;
+    for line in resolved_masks(&settings, resolve) {
+        let _ = writeln!(out, "{line}");
+    }
     write(&args.out, &render(&settings))?;
     Ok(format!("farm-config: wrote {}", args.out.display()))
 }
@@ -242,7 +292,7 @@ pub fn run_with(args: &Args, out: &mut dyn Write) -> Result<String, Error> {
 /// # Errors
 /// [`Error`] for a refused flag or a file that cannot be written.
 pub fn run(args: &Args) -> Result<String, Error> {
-    run_with(args, &mut std::io::stdout().lock())
+    run_with(args, &mut std::io::stdout().lock(), &system_resolve)
 }
 
 #[cfg(test)]
