@@ -437,7 +437,8 @@ job, and a job that starts and ends between two reads has a `run` and no `queue`
 is absent, never zero. The buckets start at 1 ms. Where `prepare` and `start` go is the histogram
 `kbf_executor_step_seconds{step=...,form=...}` (`form` the action tree's form, `manifests` or `provider`, and `none`
 for `facts`), each step timed around its one wait: `facts`, `put_dir` (with the closure's
-`action`, `walk` and `held`), `tree` (to the action tree's name), `row`, `rpc` (each `SubmitJob` call), `backoff`
+`action`, `walk` and `held`; the directory alone for a run that takes the tree its Execute started writing ahead of it,
+whose `action` and `walk` are timed on the task that writes it, with no `held`), `tree` (to the action tree's name), `row`, `rpc` (each `SubmitJob` call), `backoff`
 (the wait before a submit is sent again) and `tree_wait` (a run waiting for its tree's writes, before its submit,
 while its row is written), and the stages of those writes, timed on the task that writes the tree from its name on, so
 overlapping `tree_wait`: `tree_blobs` (the blobs that were nowhere, written whole), `tree_manifests` (the input root's

@@ -61,7 +61,11 @@ impl Front {
     }
 
     /// The facts of the Action `action`, whose Command is `command`.
-    fn facts_of(&self, action: &Action, command: &Command) -> Result<ActionFacts, InputsError> {
+    pub(super) fn facts_of(
+        &self,
+        action: &Action,
+        command: &Command,
+    ) -> Result<ActionFacts, InputsError> {
         let platform = platform_of(action, command);
         check_base(platform, &self.base_image, &self.kbf_image)?;
         let timeout = timeout_of(action)?;
