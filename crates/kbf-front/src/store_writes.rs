@@ -16,7 +16,7 @@
 //! - **A tree's writes do not queue behind the uploads.** A tree's manifests, root and list are
 //!   small, and a run waits for them before it is submitted; with every one of the
 //!   `--pack-store-writes` slots held by uploads, they still reach the store. A write is one of
-//!   them when it is made under the tally of a tree's write ([`crate::action_tree::tallied`]),
+//!   them when it is made under the tally of a tree's write (`crate::action_tree::tallied`),
 //!   which only those writes are; the wait for its slot is told to that write
 //!   ([`crate::action_tree::WriteWaits::store_slot`]). The blobs a tree writes whole, and its
 //!   list's L2 sidecar, are made under no tally and share `--pack-store-writes` with the uploads.

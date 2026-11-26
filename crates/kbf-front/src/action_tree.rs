@@ -119,8 +119,8 @@ pub use self::sidecar::{
 };
 #[cfg(test)]
 pub(crate) use self::waits::tallied;
-pub(crate) use self::waits::{in_tree_write, waited_for_slot};
 pub use self::waits::{WriteTimed, WriteWaits};
+pub(crate) use self::waits::{in_tree_write, waited_for_slot};
 
 use self::encode::{Child, Manifest};
 use self::flight::Flights;

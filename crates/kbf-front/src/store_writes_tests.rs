@@ -490,8 +490,9 @@ fn the_tree_writes_have_32_slots_as_many_as_the_manifest_slots() {
 /// Catches a tree's write that queues behind the uploads for a slot, the failure the tree slots
 /// exist for, streamed or whole: with the one upload slot held by a streamed upload whose body has
 /// not come, a tree's write reaches the store and is stored with no wait for a slot, while the
-/// upload still holds its slot; the upload is stored once its body comes.
-#[tokio::test]
+/// upload still holds its slot; the upload is stored once its body comes. The clock is tokio's,
+/// paused, so a write that waited for nothing is told exactly no wait.
+#[tokio::test(start_paused = true)]
 async fn a_tree_write_reaches_the_store_while_every_upload_slot_is_held() {
     for streamed in [true, false] {
         let fake = Arc::new(Fake::open());
