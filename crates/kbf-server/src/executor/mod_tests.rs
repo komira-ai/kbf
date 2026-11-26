@@ -118,6 +118,9 @@ pub(crate) struct FakeIngest {
     /// first is answered `Republish`, the others `Manifests`, and from the second on the form of
     /// an action's tree is manifests.
     pub list_refused: Mutex<Vec<kbf_proto::reapi::Digest>>,
+    /// Every tree started ahead of its run ([`Ingest::start_tree`]): the action and the form
+    /// the executor is configured with, in order.
+    pub started: Mutex<Vec<(kbf_proto::reapi::Digest, InputTree)>>,
 }
 
 impl FakeIngest {
@@ -192,6 +195,16 @@ impl Ingest for FakeIngest {
             0 | 1 => configured,
             _ => InputTree::Manifests,
         }
+    }
+
+    fn start_tree(
+        &self,
+        action: &kbf_proto::reapi::Digest,
+        _decoded: Arc<DecodedAction>,
+        configured: InputTree,
+        _finding: kbf_front::HeldFinding,
+    ) {
+        locked(&self.started).push((action.clone(), configured));
     }
 }
 
@@ -539,6 +552,7 @@ impl Rig {
             minted_as: Mutex::new(Vec::new()),
             minted_decoded: Mutex::new(Vec::new()),
             list_refused: Mutex::new(Vec::new()),
+            started: Mutex::new(Vec::new()),
         });
         let metrics = Arc::new(Metrics::default());
         let mut rig = Self {

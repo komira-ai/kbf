@@ -330,7 +330,12 @@ client                      kbf frontend                             job service
 2. **Inputs.** The `Action`, its `Command` and every blob of its input tree must be in
    the CAS; each one that is not becomes a `MISSING` violation in a single
    `FAILED_PRECONDITION`, as REAPI asks. The `Command` is read while the input tree is
-   walked; a platform it refuses is still the answer over anything the walk found.
+   walked; a platform it refuses is still the answer over anything the walk found. Once
+   the walk has read every Directory and the `Command` is decoded, the executor starts
+   writing the action tree (`Dispatch::start_tree`) while the walk asks whether the files
+   are held. The run that step 4 starts takes that write instead of writing its own, and
+   its job is still submitted only once the tree's last object is stored. The executor
+   remembers the tree for later runs only if the walk found every input held.
 3. **Submit.** The front hands the request to the executor through the `Dispatch`
    trait. If an identical action (same instance name and action digest) is already
    open on this frontend, the caller is attached to its operation (in-flight dedup).

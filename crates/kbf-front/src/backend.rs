@@ -11,7 +11,7 @@
 //! halves of the action-cache write after one. Client CAS, ByteStream and action-cache
 //! calls are not here: they are the cache's services, or the proxy's.
 //!
-//! **The input check over a [`Storage`]** ([`walk`], in `input_walk`) reads each Directory of the tree
+//! **The input check over a [`Storage`]** ([`walk_told`], in `input_walk`) reads each Directory of the tree
 //! from the node and asks it which files are missing. Over one node it remembers nothing
 //! between Executes. Over a map the same walk reads each Directory from its owners, and
 //! remembers the subtrees it found held for a short time, under the map's epoch, so the
@@ -64,7 +64,7 @@ pub(crate) use self::layered::{Layered, Primary};
 use crate::cache::Cache;
 use crate::closure;
 use crate::input_tree::Walked;
-use crate::input_walk::{Blobs, Trees, walk};
+use crate::input_walk::{Blobs, DirsRead, Trees, walk_told};
 use crate::meta_log::{Leadership, MetaLog};
 use crate::metrics::CacheMetrics;
 use crate::proxy::{Packs, Stored};
@@ -138,7 +138,7 @@ trait Plane: Send + Sync {
             self.commit_action_record(*action, record).await
         })
     }
-    fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>>;
+    fn walk_inputs(&self, root: Digest, told: DirsRead) -> BoxFuture<'_, Answer<Walked>>;
     fn put_streamed<'a>(
         &'a self,
         digest: &'a Digest,
@@ -384,10 +384,6 @@ impl Backend {
         self.0.put_action_result(&action, result).await
     }
 
-    pub(crate) async fn walk_inputs(&self, root: Digest) -> Result<Walked, StorageError> {
-        self.0.walk_inputs(root).await
-    }
-
     /// Whether [`Backend::put_streamed`] writes a large blob to `cas/l/<sha256>` in the packs'
     /// object store itself, which is the case for a frontend with no storage node. The ingest
     /// then writes no second copy of the key beside it.
@@ -505,7 +501,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Plane for Local<M, O> {
         })
     }
 
-    fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>> {
+    fn walk_inputs(&self, root: Digest, _: DirsRead) -> BoxFuture<'_, Answer<Walked>> {
         Box::pin(async move { self.0.walk_inputs(root).await.map_err(StorageError::from) })
     }
 
@@ -673,12 +669,15 @@ impl Plane for Remote {
         })
     }
 
-    fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>> {
+    fn walk_inputs(&self, root: Digest, told: DirsRead) -> BoxFuture<'_, Answer<Walked>> {
         Box::pin(async move {
             let held = Held(&*self.storage);
             match &self.packs {
-                None => walk(&held, root, &self.trees).await,
-                Some(packs) => walk(&Layered { packs, rest: &held }, root, &self.trees).await,
+                None => walk_told(&held, root, &self.trees, told).await,
+                Some(packs) => {
+                    let layered = Layered { packs, rest: &held };
+                    walk_told(&layered, root, &self.trees, told).await
+                }
             }
         })
     }
@@ -851,17 +850,19 @@ impl Plane for RoutedPlane {
         }
     }
 
-    fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>> {
+    fn walk_inputs(&self, root: Digest, told: DirsRead) -> BoxFuture<'_, Answer<Walked>> {
         match (self.routing(), &self.packs) {
-            (Some(router), None) => Box::pin(async move { walk(router, root, &self.trees).await }),
+            (Some(router), None) => {
+                Box::pin(async move { walk_told(router, root, &self.trees, told).await })
+            }
             (Some(router), Some(packs)) => Box::pin(async move {
                 let layered = Layered {
                     packs,
                     rest: router,
                 };
-                walk(&layered, root, &self.trees).await
+                walk_told(&layered, root, &self.trees, told).await
             }),
-            (None, _) => self.bootstrap.walk_inputs(root),
+            (None, _) => self.bootstrap.walk_inputs(root, told),
         }
     }
 
