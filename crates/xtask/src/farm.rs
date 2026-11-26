@@ -126,17 +126,19 @@ pub fn has_value(json: &str) -> bool {
 }
 
 /// The last summary line of a build's output, from `Commands: `, and the number after its
-/// `local: `; `None` when there is none.
+/// `local: `; `None` when there is none, or when the last line holding `Commands: ` is not a
+/// readable summary (an earlier one is never read in its place: it may be of another build).
 pub fn summary(log: &str) -> Option<(&str, u64)> {
-    log.lines().rev().find_map(|line| {
-        let line = &line[line.find("Commands: ")?..];
-        let (_, after) = line.split_once("local: ")?;
-        let digits = after
-            .split(|c: char| !c.is_ascii_digit())
-            .next()
-            .unwrap_or_default();
-        Some((line, digits.parse().ok()?))
-    })
+    let line = log
+        .lines()
+        .rev()
+        .find_map(|line| line.find("Commands: ").map(|at| &line[at..]))?;
+    let (_, after) = line.split_once("local: ")?;
+    let digits = after
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap_or_default();
+    Some((line, digits.parse().ok()?))
 }
 
 /// Builds `targets` with the buck2 at `buck2`, writing buck2's standard error to `log` as it

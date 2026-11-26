@@ -393,3 +393,46 @@ fn check_hands_over_the_host_and_port_it_read() {
     let s = check(&a).expect("checked");
     assert_eq!((s.host, s.port), ("[2001:db8::1]", 443));
 }
+
+#[test]
+fn every_line_of_an_address_with_a_line_break_is_masked_before_the_refusal() {
+    // Catches: the line after a line break in the address reaching the public log unmasked (a
+    // mask covers one line), and a line masked twice.
+    assert_eq!(
+        masks("farm.example:80\nb"),
+        ["::add-mask::farm.example:80", "::add-mask::b"]
+    );
+    assert_eq!(
+        masks("grpc://h:1\r\ngrpc://h:1\r"),
+        ["::add-mask::grpc://h:1", "::add-mask::h:1"]
+    );
+    let dir = scratch("address-line-break");
+    let mut a = args(&dir.join("config"));
+    a.address = "grpc://farm.example:8980\nsecond".to_owned();
+    let (result, printed) = run_of(&a);
+    assert_eq!(result, Err(Error::LineBreak { flag: "address" }));
+    assert_eq!(
+        printed,
+        "::add-mask::grpc://farm.example:8980\n::add-mask::farm.example:8980\n::add-mask::second\n"
+    );
+}
+
+#[test]
+fn a_lookup_gives_its_addresses_and_a_failed_one_gives_none() {
+    // Catches: a failed lookup failing the verb or masking something, and an answer's addresses
+    // dropped or changed.
+    let answer: Vec<std::net::SocketAddr> = vec![
+        "192.0.2.1:80".parse().expect("addr"),
+        "[2001:db8::1]:80".parse().expect("addr"),
+    ];
+    assert_eq!(
+        ips(Ok(answer.into_iter())),
+        [
+            "192.0.2.1".parse::<std::net::IpAddr>().expect("ip"),
+            "2001:db8::1".parse().expect("ip")
+        ]
+    );
+    let failed: std::io::Result<std::vec::IntoIter<std::net::SocketAddr>> =
+        Err(std::io::Error::other("no such host"));
+    assert_eq!(ips(failed), Vec::<std::net::IpAddr>::new());
+}

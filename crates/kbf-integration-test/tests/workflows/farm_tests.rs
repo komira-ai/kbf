@@ -218,9 +218,32 @@ fn exactly_one_step_joins_the_network() {
         problems(&with(&step, &format!("{step}{step}"))),
         [ONE_JOIN_PROBLEM]
     );
-    let without = with(&step, "");
-    let found = problems(&without);
-    assert_eq!(found[0], ONE_JOIN_PROBLEM, "{found:#?}");
+    // With no join, no step comes after it: the config and the build are missing too.
+    let after = [ONE_JOIN_PROBLEM, CONFIG_PROBLEM, BUILD_PROBLEM];
+    assert_eq!(problems(&with(&step, "")), after);
+    // An action whose name only starts like the join's is not the join.
+    let look_alike = join_line().replace("tailscale/github-action@", "tailscale/github-actionx@");
+    assert_eq!(problems(&with(&join_line(), &look_alike)), after);
+}
+
+#[test]
+fn a_file_that_is_not_a_workflow_mapping_is_refused() {
+    // Catches: a file that does not parse, or whose root is not a mapping, read as a farm.yml with
+    // nothing wrong, or the name check accepting a root that is not a mapping.
+    let broken = "a: [";
+    let why = yaml::load(broken).expect_err("does not parse");
+    assert_eq!(problems(broken), [why]);
+    assert_eq!(problems("- x\n"), [ON_PROBLEM]);
+    assert!(!super::is_named(&yaml::load("- farm\n").expect("a list")));
+}
+
+#[test]
+fn push_must_name_main_as_a_list() {
+    // Catches: `branches: main` (a scalar) read as the list `[main]`.
+    assert_eq!(
+        problems(&with("branches: [main]", "branches: main")),
+        [ON_PROBLEM]
+    );
 }
 
 #[test]

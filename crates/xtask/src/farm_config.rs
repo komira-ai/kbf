@@ -105,16 +105,18 @@ fn without_scheme(address: &str) -> &str {
     address.split_once("://").map_or(address, |(_, rest)| rest)
 }
 
-/// The lines that mask `address` in a workflow's log: the address, and its form without a scheme
-/// when it has one. None for a blank address, which there is nothing to mask in.
+/// The lines that mask `address` in a workflow's log: each of its lines (an address with a line
+/// break is refused, but only after these are printed, and a mask covers one line), and the form
+/// of each without a scheme when it has one, each once. None for a blank address, which there is
+/// nothing to mask in.
 pub fn masks(address: &str) -> Vec<String> {
-    let address = address.trim();
-    let bare = without_scheme(address);
-    let mut lines = Vec::new();
-    if !address.is_empty() {
-        lines.push(format!("::add-mask::{address}"));
-        if bare != address && !bare.is_empty() {
-            lines.push(format!("::add-mask::{bare}"));
+    let mut lines: Vec<String> = Vec::new();
+    for part in address.split(['\n', '\r']).map(str::trim) {
+        for value in [part, without_scheme(part)] {
+            let line = format!("::add-mask::{value}");
+            if !value.is_empty() && !lines.contains(&line) {
+                lines.push(line);
+            }
         }
     }
     lines
@@ -260,13 +262,18 @@ pub fn resolved_masks(settings: &Settings<'_>, resolve: Resolve<'_>) -> Vec<Stri
     lines
 }
 
-/// The system's resolver: every address `host` resolves to, none when it does not.
-fn system_resolve(host: &str, port: u16) -> Vec<std::net::IpAddr> {
-    use std::net::ToSocketAddrs;
-    (host, port)
-        .to_socket_addrs()
+/// The addresses of what a lookup gave: every one when it answered, none when it failed.
+fn ips(
+    answer: std::io::Result<impl Iterator<Item = std::net::SocketAddr>>,
+) -> Vec<std::net::IpAddr> {
+    answer
         .map(|addrs| addrs.map(|a| a.ip()).collect())
         .unwrap_or_default()
+}
+
+/// The system's resolver: every address `host` resolves to, none when it does not.
+fn system_resolve(host: &str, port: u16) -> Vec<std::net::IpAddr> {
+    ips(std::net::ToSocketAddrs::to_socket_addrs(&(host, port)))
 }
 
 /// The verb, with the masking lines written to `out` and host names resolved by `resolve`: the

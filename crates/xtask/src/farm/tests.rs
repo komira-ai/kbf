@@ -49,6 +49,9 @@ fn a_log_with_no_readable_summary_has_none() {
         "BUILD SUCCEEDED\n",
         "Commands: 2 (cached: 2, remote: 0)\n",
         "Commands: 2 (cached: 2, remote: 0, local: none)\n",
+        // A readable summary before an unreadable last one: the last one is the build's.
+        "Commands: 2 (cached: 2, remote: 0, local: 0)\nCommands: 3 (cached: 3, remote: 0, local: \n",
+        "Commands: 2 (cached: 2, remote: 0, local: 0)\nCommands: 3 (cached: 3, remote: 0)\n",
     ] {
         assert_eq!(summary(log), None, "{log}");
     }
