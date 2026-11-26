@@ -1,3 +1,11 @@
 load("//:buildrules.bzl", "cargo_package")
 
-cargo_package(path = ".")
+# What this package reads beyond what buildrules gives each of its units (a library src/ and
+# build.rs, a test target tests/), which a Buck2 action sees only when declared: its library
+# includes the kbf-task image's files of the root's packaging/container/kbf-task.
+cargo_package(
+    path = ".",
+    extra_srcs = [
+        "//:packaging/container/kbf-task",
+    ],
+)

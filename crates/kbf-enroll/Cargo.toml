@@ -46,5 +46,9 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "syn
 workspace = true
 
 [package.metadata.buildrules]
-# Policy only: `actions = { name = ["lint", "test"] }`, `default-action`, `[package.metadata.buildrules.lint]`.
-# Absent keys inherit [workspace.metadata.buildrules]. See docs/contract.md.
+# The farm lane's `//:ci` (docs/farm.md) checks the format of, builds and lints this package but
+# does not run its tests: a config test expects /proc/self to be a symlink root owns, which it is
+# not inside a farm action. They run in ci.yml alone.
+
+[package.metadata.buildrules.actions]
+ci = ["fmt", "lint"]

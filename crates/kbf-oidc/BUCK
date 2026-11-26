@@ -1,3 +1,11 @@
 load("//:buildrules.bzl", "cargo_package")
 
-cargo_package(path = ".")
+# What this package reads beyond what buildrules gives each of its units (a library src/ and
+# build.rs, a test target tests/), which a Buck2 action sees only when declared: its library
+# includes the keys of testdata/.
+cargo_package(
+    path = ".",
+    extra_srcs = [
+        "testdata",
+    ],
+)

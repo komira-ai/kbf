@@ -1,3 +1,19 @@
 load("//:buildrules.bzl", "cargo_package")
 
-cargo_package(path = ".")
+# What this package reads beyond what buildrules gives each of its units (a library src/ and
+# build.rs, a test target tests/), which a Buck2 action sees only when declared: its library tests
+# include a golden of tests/golden.
+cargo_package(
+    path = ".",
+    extra_srcs = [
+        "tests/golden",
+    ],
+)
+
+# Read by other members (their extra_srcs); exported by reference, so each stays at its path.
+export_file(
+    name = "tests/data/buck2-execute.requestmetadata",
+    src = "tests/data/buck2-execute.requestmetadata",
+    mode = "reference",
+    visibility = ["PUBLIC"],
+)

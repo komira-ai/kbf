@@ -1,10 +1,9 @@
-# The farm lane, a shadow of ci.yml: `buck2 build //:ci //:sync_check` of the Cargo workspace
+# The farm lane, a shadow of ci.yml: `buck2 build //:ci` of the Cargo workspace
 # through buildrules (BUCK, buildrules.bzl, .buckconfig), with every action run on the build farm or
 # taken from its cache (docs/farm.md). `//:ci` is every member's `:fmt` (rustfmt), `:lint` (clippy
 # with `-D warnings`) and `:test` (each test target run as a build action), but for the members
 # whose `[package.metadata.buildrules]` leaves a step to ci.yml; docs/farm.md says which and why.
-# `//:sync_check` runs `buildrules sync` as a farm action and is red unless it writes exactly the
-# committed build table.
+# Every target also runs `:check`, red unless the generated build table matches the Cargo files.
 #
 # It is not a gate and not a required check. ci.yml stays the pull-request gate (its tests under
 # coverage, the 99% floors, the tests the farm cannot run), and the release stays plain cargo on
@@ -115,8 +114,8 @@ jobs:
       # (crates/xtask/src/farm/table.rs); builds the targets with buck2's progress in this log,
       # fails unless the summary line says `local: 0` (every action ran on the farm or came from its
       # cache), and stops buck2's daemon however the build ended.
-      - name: buck2 build //:ci //:sync_check on the build farm, local 0
-        run: cargo xtask farm-build --buck2 "$RUNNER_TEMP/bin/buck2" --target //:ci --target //:sync_check --patch "$RUNNER_TEMP/buildrules-sync/buildrules-sync.patch" --summary "$GITHUB_STEP_SUMMARY" --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID"
+      - name: buck2 build //:ci on the build farm, local 0
+        run: cargo xtask farm-build --buck2 "$RUNNER_TEMP/bin/buck2" --target //:ci --patch "$RUNNER_TEMP/buildrules-sync/buildrules-sync.patch" --summary "$GITHUB_STEP_SUMMARY" --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID"
       # A stale table's fix, for the contributor to read and `git apply` (docs/farm.md). The file
       # exists only when the build step wrote it; any other failure uploads nothing.
       - name: Upload the regenerated build table as a patch

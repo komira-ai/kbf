@@ -1,3 +1,11 @@
 load("//:buildrules.bzl", "cargo_package")
 
 cargo_package(path = ".")
+
+# Read by other members (their extra_srcs); exported by reference, so each stays at its path.
+export_file(
+    name = "tests/support",
+    src = "tests/support",
+    mode = "reference",
+    visibility = ["PUBLIC"],
+)

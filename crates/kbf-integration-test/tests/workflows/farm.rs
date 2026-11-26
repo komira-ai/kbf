@@ -1,6 +1,6 @@
 //! The one workflow that holds `id-token: write` on a pull request: `farm.yml`, the farm lane.
 //!
-//! Its job `build` runs `buck2 build //:ci //:sync_check` of the Cargo workspace on the build farm,
+//! Its job `build` runs `buck2 build //:ci` of the Cargo workspace on the build farm,
 //! which is reachable only on its Tailscale network, and joins that network with the run's OIDC
 //! token (workload identity federation: no stored secret). So it holds `contents: read` and
 //! `id-token: write` on a pull request too, but only under its exact `if:` ([`JOB_IF`]): a push to
@@ -22,7 +22,7 @@
 //!   whose `with:` is exactly [`JOIN_INPUTS`] (the tailnet identity from organisation variables, and
 //!   the tag `tag:ci`);
 //! - a step after the join runs `cargo xtask farm-config`, and a later step runs `cargo xtask
-//!   farm-build` of `--target //:ci` and `--target //:sync_check`; no step before the join runs
+//!   farm-build` of `--target //:ci`; no step before the join runs
 //!   `farm-build`;
 //! - the job names no `secrets` context, key or word.
 
@@ -52,7 +52,7 @@ pub const CONFIG_COMMAND: &str = "cargo xtask farm-config";
 /// The command of the step that builds on the farm.
 pub const BUILD_COMMAND: &str = "cargo xtask farm-build";
 /// The targets the build step names, each as `--target <target>`.
-pub const TARGETS: [&str; 2] = ["//:ci", "//:sync_check"];
+pub const TARGETS: [&str; 1] = ["//:ci"];
 
 /// What a file whose `on` is anything else is refused with.
 pub const ON_PROBLEM: &str =
@@ -76,7 +76,8 @@ pub const INPUTS_PROBLEM: &str = "job build: the tailscale/github-action step's 
 /// What a job with no configuring step after the join is refused with.
 pub const CONFIG_PROBLEM: &str = "job build: no step after the join runs `cargo xtask farm-config`";
 /// What a job with no build step after the configuring step is refused with.
-pub const BUILD_PROBLEM: &str = "job build: no step after farm-config runs `cargo xtask farm-build` of --target //:ci and --target //:sync_check";
+pub const BUILD_PROBLEM: &str =
+    "job build: no step after farm-config runs `cargo xtask farm-build` of --target //:ci";
 /// What a build step before the join is refused with.
 pub const EARLY_BUILD_PROBLEM: &str =
     "job build: a step runs `cargo xtask farm-build` before the join of the farm's network";

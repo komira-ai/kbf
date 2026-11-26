@@ -34,6 +34,10 @@ kbf-testkit = { workspace = true, features = ["postgres"] }
 workspace = true
 
 [package.metadata.buildrules]
-# Its tests need a Postgres server, named by KBF_TEST_POSTGRES_URL as in ci.yml: on the farm each
-# test target runs with a private one that buildrules starts on a Unix socket (docs/farm.md).
-postgres = { url-env = "KBF_TEST_POSTGRES_URL" }
+# The farm lane's `//:ci` (docs/farm.md) checks the format of, builds and lints this package but
+# does not run its tests: they need a Postgres server with synchronous_commit on, which the state
+# store requires, and buildrules' Postgres runs with it off (komira-ai/buildrules#166); they also
+# read kbf-server's golden state file. They run in ci.yml alone.
+
+[package.metadata.buildrules.actions]
+ci = ["fmt", "lint"]

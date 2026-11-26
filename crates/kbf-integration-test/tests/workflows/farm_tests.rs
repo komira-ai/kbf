@@ -272,8 +272,8 @@ fn the_join_takes_exactly_its_inputs() {
 }
 
 #[test]
-fn the_build_comes_after_the_join_and_the_config_and_names_both_targets() {
-    // Catches: no build step, a build of another target or of only one target, a build with no
+fn the_build_comes_after_the_join_and_the_config_and_names_its_target() {
+    // Catches: no build step, a build of another target or of no target, a build with no
     // farm-config before it, and a build that runs before the join.
     let build = "run: cargo xtask farm-build --buck2";
     assert_eq!(
@@ -284,10 +284,7 @@ fn the_build_comes_after_the_join_and_the_config_and_names_both_targets() {
         problems(&with("--target //:ci ", "--target //:other ")),
         [BUILD_PROBLEM]
     );
-    assert_eq!(
-        problems(&with("--target //:sync_check ", "")),
-        [BUILD_PROBLEM]
-    );
+    assert_eq!(problems(&with("--target //:ci ", "")), [BUILD_PROBLEM]);
     assert_eq!(
         problems(&with(
             "run: cargo xtask farm-config",
@@ -297,7 +294,7 @@ fn the_build_comes_after_the_join_and_the_config_and_names_both_targets() {
     );
     let early = with(
         "      - name: Join the farm's Tailscale network\n",
-        "      - run: cargo xtask farm-build --target //:ci --target //:sync_check\n      - name: Join the farm's Tailscale network\n",
+        "      - run: cargo xtask farm-build --target //:ci\n      - name: Join the farm's Tailscale network\n",
     );
     assert_eq!(problems(&early), [EARLY_BUILD_PROBLEM]);
 }

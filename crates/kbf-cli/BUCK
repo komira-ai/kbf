@@ -1,3 +1,21 @@
 load("//:buildrules.bzl", "cargo_package")
 
-cargo_package(path = ".")
+# What this package reads beyond what buildrules gives each of its units (a library src/ and
+# build.rs, a test target tests/), which a Buck2 action sees only when declared: its tests include
+# the root README.md, kbf-enroll's test support (`#[path]`) and kbf-setup's goldens.
+cargo_package(
+    path = ".",
+    extra_srcs = [
+        "//:README.md",
+        "//crates/kbf-enroll:tests/support",
+        "//crates/kbf-setup:tests/golden",
+    ],
+)
+
+# Read by other members (their extra_srcs); exported by reference, so each stays at its path.
+export_file(
+    name = "tests/golden",
+    src = "tests/golden",
+    mode = "reference",
+    visibility = ["PUBLIC"],
+)

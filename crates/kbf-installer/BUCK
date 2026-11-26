@@ -1,3 +1,12 @@
 load("//:buildrules.bzl", "cargo_package")
 
-cargo_package(path = ".")
+# What this package reads beyond what buildrules gives each of its units (a library src/ and
+# build.rs, a test target tests/), which a Buck2 action sees only when declared: its library tests
+# include the goldens of testdata/ and kbf-setup's goldens.
+cargo_package(
+    path = ".",
+    extra_srcs = [
+        "testdata",
+        "//crates/kbf-setup:tests/golden",
+    ],
+)

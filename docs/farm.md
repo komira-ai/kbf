@@ -13,17 +13,16 @@ a build farm outage turns it red and holds nothing. Nothing of it is shipped.
 
 ## What it builds
 
-`buck2 build //:ci //:sync_check`:
+`buck2 build //:ci` runs three steps for each member of the workspace, but where the member's
+`[package.metadata.buildrules]` leaves one to `ci.yml` (below):
 
-- `//:ci` runs three steps for each member of the workspace, but where the member's
-  `[package.metadata.buildrules]` leaves one to `ci.yml` (below):
-  - `:fmt`: the pinned `rustfmt --check` over the files `cargo fmt` reads;
-  - `:lint`: clippy over the library, the binaries and every test target, with `[workspace.lints]`
-    and `clippy.toml`, warnings as errors;
-  - `:test`: each test target run as a build action. Its `.passed` marker exists only if every test
-    of the target passed, and a cached marker means the tests passed on byte-identical inputs.
-- `//:sync_check` runs `buildrules sync` as a farm action, with no network, and is red unless it
-  writes exactly the committed table (below).
+- `:fmt`: the pinned `rustfmt --check` over the files `cargo fmt` reads;
+- `:lint`: clippy over the library, the binaries and every test target, with `[workspace.lints]`
+  and `clippy.toml`, warnings as errors;
+- `:test`: each test target run as a build action. Its `.passed` marker exists only if every test
+  of the target passed, and a cached marker means the tests passed on byte-identical inputs.
+
+Every target also runs `//:check`, which is red unless the generated table matches the Cargo files.
 
 The summary line must read `Commands: N (cached: N, remote: N, local: 0)`: no action ran on the
 runner. `farm.yml` runs the build as one command, `cargo xtask farm-build`
@@ -37,9 +36,9 @@ The files of the build, all generated or written once by `buildrules`; cargo rea
 |---|---|---|
 | `.buckconfig` | the cells, buildrules pinned by commit, the execution platform | `buildrules init` |
 | `toolchains/`, `platforms/` | the pinned Rust toolchain and the remote execution platform | `buildrules init` |
-| `BUCK` | `cargo_workspace`, and the `cargo_sync` targets `//:sync` and `//:sync_check` | by hand, once |
+| `BUCK` | `cargo_workspace`, and the root files members read, exported by reference | by hand, once |
 | `crates/*/BUCK` | one `cargo_package` per member | `buildrules cargo adopt`, once; then by hand (`extra_srcs`, below) |
-| `[package.metadata.buildrules]` in each member's `Cargo.toml`, `[workspace.metadata.buildrules]` in the root's | the policy: which steps `//:ci` runs, a member's Postgres | `buildrules cargo adopt`, then by hand |
+| `[package.metadata.buildrules]` in each member's `Cargo.toml`, `[workspace.metadata.buildrules]` in the root's | the policy: which steps `//:ci` runs | `buildrules cargo adopt`, then by hand |
 | `buildrules.lock.bzl`, `buildrules.bzl`, `third_party/buildrules/` | Cargo's unit graph of every member; every crates.io crate as a unit pinned by SHA-256; each git dependency (jobscheduler's and tierstore's crates) as GitHub's archive of its pinned commit, by SHA-256 and size (`git_archives.tsv`) | `buildrules sync`; never edited by hand |
 
 `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml` stay the source. `//:check` fails every
@@ -69,8 +68,10 @@ job makes the fix and hands it to you (`crates/xtask/src/farm/table.rs`).
    that merge; if `git apply` refuses it, merge main into the branch and push, and the next run
    carries a new patch.
 
-With a farm configuration of your own (below), `buck2 build //:sync --out .` writes the same files
-from the farm, for a change that keeps to the packages and git commits the table already records.
+buildrules can also sync on the farm (`cargo_sync`, with no network), but not this workspace yet: a
+member of a git dependency that inherits its own root's `workspace.dependencies` does not resolve
+there (komira-ai/buildrules#187). So `BUCK` declares no sync target, and the sync with the network
+above is the one way to regenerate the table.
 
 The job does not push the regenerated files to the branch itself: that needs a token that can
 write to the repository, in the one job that holds an OIDC token and runs a pull request's code;
@@ -85,7 +86,8 @@ in the member's BUCK file (`extra_srcs`), with the reason in a comment there.
 ## What stays in ci.yml, and why
 
 A farm action has its declared inputs and nothing else: no network, no `PATH` but buildrules'
-busybox directory, no git checkout, not root, no Docker or systemd. buildrules' test gate refuses a
+busybox directory, no git checkout, not root, no Docker or systemd, and only the Postgres
+buildrules starts, which runs with `synchronous_commit` off. buildrules' test gate refuses a
 test target that has an `#[ignore]`d test, because an ignored test is a test that never runs, and
 `:test` runs a whole test target, so it cannot leave one slow test out as the pull-request profile
 does. Each member below says why in its `[package.metadata.buildrules]`, and its tests run in
@@ -116,11 +118,13 @@ does. Each member below says why in its `[package.metadata.buildrules]`, and its
 | `kbf-history` | a slow test (`history`) |
 | `kbf-transfer` | slow tests (`engine`) |
 | `xtask` | a slow test (`check_asset`) |
+| `kbf-pack-adopt`, `kbf-pack-index`, `kbf-setup`, `kbf-state-copy` | Postgres with `synchronous_commit` on, which the state store requires; buildrules' Postgres runs with it off (komira-ai/buildrules#166). `kbf-state-copy` also reads `kbf-server`'s golden state file |
+| `kbf-signer` | its Unix sockets, below the test's temporary directory, are longer than a socket path may be on the farm |
+| `kbf-enroll` | a config test expects `/proc/self` to be a symlink root owns, which it is not inside a farm action |
+| `kbf-coverage` | its command-line tests run git and read the repository's `coverage-floors` |
 
-**Postgres on the farm.** `kbf-pack-adopt`, `kbf-pack-index`, `kbf-setup` and `kbf-state-copy`
-declare `postgres = { url-env = "KBF_TEST_POSTGRES_URL" }`: buildrules starts a private server of
-its pinned Postgres for each test target, on a Unix socket in the action's scratch directory, and
-names it in `KBF_TEST_POSTGRES_URL`, the variable `ci.yml` sets.
+No member declares buildrules' Postgres fixture (`postgres = { url-env = ... }`): every member
+whose tests need Postgres either needs it durable (above) or is left to `ci.yml` for another reason.
 
 Some checks only `ci.yml` makes, for every member:
 
@@ -138,7 +142,7 @@ that names the build farm: `[buck2_re_client]` with the endpoints and instance, 
 
 ```sh
 buck2 build //crates/kbf-types:test    # one member's tests
-buck2 build //:ci //:sync_check        # what farm.yml builds
+buck2 build //:ci                      # what farm.yml builds
 buck2 log what-failed                  # the failing actions and their commands
 ```
 
