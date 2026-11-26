@@ -341,6 +341,7 @@ async fn an_operation_another_frontend_runs_is_followed_until_its_answer_is_writ
         job: format!("job-{op}"),
         key: None,
         whole_machine: false,
+        tree: None,
     };
     let (running, vanished) = (OperationId(70), OperationId(71));
     theirs.put_op(running, &row(70)).expect("their row");
@@ -405,6 +406,7 @@ async fn a_name_the_store_cannot_read_is_unknown() {
         job: "j".to_owned(),
         key: None,
         whole_machine: false,
+        tree: None,
     };
     let mut value = vec![rows::VERSION];
     value.extend(serde_json::to_vec(&bad_hash).expect("json"));

@@ -95,6 +95,14 @@ executor-input-tree = "manifests"
 # executor-job-url = "URL"
 # The kbf image, pinned by digest like `--executor-base-image` and built from it, that every job is launched from. It keeps the task tool as its `ENTRYPOINT`, so the job's arguments are the tool's flags and the action runs inside this image. Must be another image than the base. Needed with `--executor js-agent`
 # executor-kbf-image = "IMAGE"
+# Delete what the collector of tree lists finds. Left out, each pass is a dry run: it counts and logs what it would delete, and deletes nothing. Needs `--executor-list-sweep-key-file`
+executor-list-sweep-apply = false
+# How often, in seconds, the collector of tree lists starts a pass, at least 60 and at most 86400. Used only with `--executor-list-sweep-key-file`
+executor-list-sweep-interval-secs = 3600
+# Turns on the collector of tree lists: it deletes the tree lists `cas/l/<id>` (and their sidecars `cas/l2/<id>`) older than a day that no open operation names and the pack index does not record; without `--executor-list-sweep-apply` it only counts them. The file is the tier store's GC key of `cas/l/`, `{"access_key_id": "...", "secret_access_key": "...", "prefix": "cas/l/"}` (the prefix must be exactly `cas/l/`), owned by this user and readable by it alone (mode 0600 or 0400); it is used against `--pack-store-endpoint`'s store, which this needs, as it needs `--pack-index` and a state store. Only a list a sidecar names is deleted, never another object of `cas/l/`. Runs on the leader only. Needs `--executor-list-sweep-sidecar-key-file`. Left out, nothing is deleted
+# executor-list-sweep-key-file = "PATH"
+# The tier store's GC key of `cas/l2/` for the collector of tree lists, as `--executor-list-sweep-key-file`'s but with the prefix exactly `cas/l2/`: the collector lists the sidecars and deletes them with it. Needs `--executor-list-sweep-key-file`
+# executor-list-sweep-sidecar-key-file = "PATH"
 # How long the liveness row of this process lives in the state store after its last renewal, on the store's clock, in seconds. Once it has expired, another frontend of the store takes up this process's unfinished operations. Read only with `--state-store`. Used only with `--executor js-agent`
 executor-live-secs = 20
 # Removed with the executor's presigned path. Any value is refused at start

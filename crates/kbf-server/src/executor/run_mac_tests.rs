@@ -10,7 +10,7 @@ use kbf_job_client::fake::Machine;
 use tonic::Code;
 
 use super::*;
-use crate::executor::tests::{Caller, IMAGE, Rig};
+use crate::executor::tests::{Caller, IMAGE, Rig, Setup};
 use crate::executor::{ActionFacts, MacPool, RejectReason, System};
 
 /// The macOS `kbf-task` bundle of a release, by its manifest digest.
@@ -21,7 +21,12 @@ const BUNDLE: &str =
 /// itself (`os=macos`, `arch=arm64`, the native runtime) with no Xcode; its actions ask for a Mac
 /// when `mac`. The Mac job, which names no `exec` and no Xcode, is placed on it.
 async fn rig(mac: bool) -> Rig {
-    let rig = Rig::with(|cfg| {
+    rig_over(mac, Setup::default()).await
+}
+
+/// [`rig`], built with `setup`.
+async fn rig_over(mac: bool, setup: Setup) -> Rig {
+    let rig = Rig::build(setup, |cfg| {
         cfg.mac = Some(MacPool {
             bundle: BUNDLE.to_owned(),
             os_version: crate::executor::DEFAULT_MAC_OS_VERSION,
@@ -170,4 +175,25 @@ async fn a_cancel_while_a_mac_pack_is_awaited_answers_cancelled() {
     assert_eq!(keys_read(&rig).len(), reads, "no read after the cancel");
     assert_eq!(rig.calls_of("CancelJob"), 0);
     assert_eq!(rig.fake.jobs().len(), 1);
+}
+
+/// Asserts that a Mac operation's row names the tree list its job's tree is mounted from (the
+/// ref of tierstore's provider in the Mac job's mount), as `cas/l/<id>`, while the job runs.
+/// Catches: a Mac job, always in the list form, whose open operation names no list, so the
+/// collector of tree lists would take its list for one no job needs.
+#[tokio::test(start_paused = true)]
+async fn a_mac_operations_row_names_its_jobs_tree_list() {
+    let stored = Setup {
+        store: true,
+        record: false,
+    };
+    let rig = rig_over(true, stored).await;
+    let key = format!("cas/l/{}", "cd".repeat(32));
+    *rig.inputs.tree.lock().expect("tree") = Ok(key.clone());
+    let caller = rig.submit(1);
+    let job = rig.submitted(&caller, 0).await;
+    let spec = rig.fake.submitted(&job).expect("submitted");
+    assert!(crate::executor::mac::is_mac(Some(&spec)), "a Mac job");
+    let row = rig.rows("reader").op(caller.operation()).expect("a read");
+    assert_eq!(row.expect("open").tree, Some(key));
 }

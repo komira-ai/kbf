@@ -1,6 +1,6 @@
 # A faster job start with the tree still stored first: one tree file, and the costs of the write and the submit
 
-> **Status: proposal. Nothing here is built.** This page measures three steps of a job's start and
+> **Status: proposal. Of its items only 1e, the collector of tree lists, is built.** This page measures three steps of a job's start and
 > ranks the changes that make each one cheaper. Every change keeps today's order: the action tree is
 > stored completely, its last object last, before the job is submitted. Section 6 lists the work, each
 > item with a test that fails before it (except 1a, a configuration step) and a measurement to take
@@ -721,7 +721,7 @@ The write, on kbf's side:
   - **Bytes (inferred).** At the morning's rate of about 5,600 starts an hour (12,974 Executes in
     2 h 19 min, measured) and 0.6-7 MB a list, that is about 3.4-39 GB an hour (1.7 GB at 0.3 MB), written once and read
     once. That is small against a node's network link: one 10 Gbit/s link moves 4.5 TB an hour.
-- **What it does need: a retention rule.** Nothing deletes `cas/l/` today
+- **What it does need: a retention rule.** Nothing deleted under `cas/l/` before item 1e
   (`docs/design/actions-as-jobs.md:379`). Manifests could do without because they dedup; lists cannot.
   - A list is needed while its jobs can still start: the 600 s memo plus resubmits. A collector that
     removes lists older than a day, which no job names, is enough.
@@ -861,6 +861,17 @@ on today's code. No test asserts timing (T10): waits are shown with gates and ex
 - **Fails before:** `a_list_older_than_a_day_that_no_operation_names_is_deleted_with_its_sidecar`,
   `a_list_an_open_operation_names_is_kept_whatever_its_age`, and `a_dry_run_deletes_nothing_and_counts`.
 - **Measured after:** lists and bytes under `cas/l/`, by day.
+- **Built** (kbf `crates/kbf-server/src/frontend/list_sweep.rs`): the frontend's leader runs it
+  with `--executor-list-sweep-key-file` and `--executor-list-sweep-sidecar-key-file`, a dry run
+  unless `--executor-list-sweep-apply` is given. As built:
+  - an operation's `exec/op/` row gains an optional `tree`, the key of the list its attempt's job
+    reads; no row named the list before, and a row with no list keeps its bytes (B8);
+  - the lists are found from their sidecars, `cas/l2/`, so no manifest or large blob of `cas/l/`
+    is read or listed; a list with no sidecar is not collected;
+  - the age is the time the store says the list was written (a HEAD), and an old list the pack
+    index records as a pack is kept too;
+  - the measurement is `kbf_tree_list_sweep_lists` and `kbf_tree_list_sweep_list_bytes` by age in
+    whole days, counted by every pass, a dry run included.
 
 ### 2. `SubmitJob` answers before `note_inserted`
 

@@ -89,7 +89,7 @@ job goes where it places it.
 |---|---|
 | `meta/next_op` | the shared counter operation ids are reserved from, in blocks of 1024 (the format of earlier releases) |
 | `exec/live/<instance>` | this process is alive; renewed every quarter of `--executor-live-secs` (20 s), with that time to live |
-| `exec/op/<operation>` | an unfinished operation: owner, instance, action, attempt, job id, put directory (version byte + JSON) |
+| `exec/op/<operation>` | an unfinished operation: owner, instance, action, attempt, job id, put directory, and the tree list its job reads when it has one (version byte + JSON) |
 | `exec/act/<hash>-<size>/<instance, hex>` | the unfinished operation of an action (version byte + 8-byte id), written with the first attempt's `exec/op/` row and deleted with its answer |
 | `done/<operation>`, `doneof/<operation>` | how it finished and what it ran (the format of earlier releases), at least 10 minutes |
 
@@ -110,7 +110,10 @@ job goes where it places it.
 What an earlier release loses by not knowing `exec/live/`, `exec/op/` and `exec/act/` (B8): nothing it reads; its own `op/` rows
 are not read by this release, so a client of an operation it left reattaches by Execute (a cache hit or a new run). It writes no
 `exec/act/` row, so an Execute on a frontend of this release does not join an operation an earlier release runs: the join across
-frontends is lost while both run, nothing else.
+frontends is lost while both run, nothing else. The `exec/op/` row's `tree`, the key of the tree list the attempt's job
+reads (the provider form, and every Mac job), is a field an earlier release ignores; it is left out of a row with no list, so
+such a row has an earlier release's bytes. A row an earlier release writes names no list (one it takes up and writes again
+loses the field), so the collector of tree lists protects that release's lists by their age alone.
 
 ## 4. What is kept as a bound
 

@@ -189,6 +189,7 @@ async fn a_follower_is_answered_with_the_failure_of_the_operation_it_follows() {
         job: "theirs".to_owned(),
         key: Some("cas/b/1/aa".to_owned()),
         whole_machine: false,
+        tree: None,
     };
     let other = kbf_types::OperationId(900_000);
     assert_eq!(theirs.open_op(other, &row), Ok(rows::Opened::Ours));

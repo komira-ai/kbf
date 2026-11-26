@@ -60,6 +60,7 @@ fn row(tag: u8) -> OpRow {
         job: format!("k0-{tag}-1"),
         key: Some(format!("cas/b/{tag}-1/aa")),
         whole_machine: true,
+        tree: None,
     }
 }
 
@@ -709,4 +710,130 @@ fn a_finish_between_the_reads_of_a_look_is_seen_done() {
         Look::Done(action(1), ran(0))
     );
     assert_eq!(follower.look(op(9)).expect("a look"), Look::Gone);
+}
+
+// ---- the tree lists the open rows name
+
+/// The key of the tree list of the tag `tag`.
+fn list(tag: u8) -> String {
+    format!("cas/l/{}", format!("{tag:02x}").repeat(32))
+}
+
+/// Asserts that the lists the collector of tree lists keeps are those the open operations'
+/// rows name, each once, whoever owns the row: a row with no list (a tree of manifests) adds
+/// none, a finished operation's list is no longer named, and a later attempt's row names its
+/// own list instead of the earlier one's. Catches: a scan that reads only this process's rows,
+/// keeps a finished operation's list for ever, or keeps the first attempt's list.
+#[test]
+fn the_named_lists_are_those_of_the_open_rows() {
+    let env = env();
+    let (a, b) = (env.rows("a"), env.rows("b"));
+    assert_eq!(a.named_lists(), Ok(BTreeSet::new()));
+    let with = |tag: u8, tree: u8| OpRow {
+        tree: Some(list(tree)),
+        ..row(tag)
+    };
+    a.put_op(op(1), &with(1, 1)).expect("row");
+    b.put_op(op(2), &with(2, 2)).expect("row");
+    b.put_op(op(3), &with(3, 2)).expect("row");
+    a.put_op(op(4), &row(4)).expect("a tree of manifests");
+    let named = |rows: &Rows| rows.named_lists().expect("a scan");
+    assert_eq!(named(&a), BTreeSet::from([list(1), list(2)]));
+    assert_eq!(named(&b), named(&a), "whoever reads");
+    a.finish(op(1), &action(1), &ran(0), DAY).expect("finished");
+    assert_eq!(named(&a), BTreeSet::from([list(2)]));
+    let later = OpRow {
+        attempt: 2,
+        ..with(2, 9)
+    };
+    b.put_op(op(2), &later).expect("the next attempt");
+    assert_eq!(
+        named(&a),
+        BTreeSet::from([list(2), list(9)]),
+        "op 3 still names 2"
+    );
+}
+
+/// Asserts that a row whose list cannot be known stops the scan, naming the row: one of a
+/// version this build does not know, and one that is not what it says; and that a store that
+/// fails is an error too. The collector then deletes nothing. Catches: such a row skipped as
+/// the orphan scan skips it, which would let the collector delete a list a later release's
+/// running job reads.
+#[test]
+fn a_row_whose_list_cannot_be_known_fails_the_scan() {
+    let env = env();
+    let a = env.rows("a");
+    a.put_op(
+        op(1),
+        &OpRow {
+            tree: Some(list(1)),
+            ..row(1)
+        },
+    )
+    .expect("row");
+    env.put(&op_key(op(2)), &[VERSION + 1, b'{', b'}']);
+    let later = a.named_lists();
+    assert_eq!(
+        later,
+        Err(RowsError::Corrupt {
+            key: op_key(op(2)),
+            why: "a row of a version this build does not know: what it names is not known"
+                .to_owned(),
+        })
+    );
+    env.put(&op_key(op(2)), b"\x01{broken");
+    assert!(matches!(
+        a.named_lists(),
+        Err(RowsError::Corrupt { key, .. }) if key == op_key(op(2))
+    ));
+    env.put(&op_key(op(2)), &encode(&row(2)));
+    assert_eq!(a.named_lists(), Ok(BTreeSet::from([list(1)])));
+    env.store.reads_fail.store(true, Ordering::SeqCst);
+    assert!(matches!(a.named_lists(), Err(RowsError::Store(_))));
+}
+
+/// Asserts the format of the row's list across releases (B8): a row with no list is written
+/// with exactly the fields an earlier release wrote, so its bytes are unchanged; a row with one
+/// adds the field `tree`, which an earlier release's reader ignores; and a row an earlier
+/// release wrote, with no `tree`, reads as naming no list.
+#[test]
+fn the_rows_list_is_a_field_earlier_releases_skip_and_left_out_when_none() {
+    let manifests = String::from_utf8(encode(&row(1))[1..].to_vec()).expect("json");
+    let earlier = format!(
+        "{{\"owner\":\"ignored\",\"instance\":\"main\",\"hash\":\"{}\",\"size\":4097,\
+         \"attempt\":1,\"job\":\"k0-1-1\",\"key\":\"cas/b/1-1/aa\",\"whole_machine\":true}}",
+        "01".repeat(32)
+    );
+    assert_eq!(manifests, earlier);
+    let listed = OpRow {
+        tree: Some(list(7)),
+        ..row(1)
+    };
+    let json = String::from_utf8(encode(&listed)[1..].to_vec()).expect("json");
+    assert_eq!(
+        json,
+        format!(
+            "{},\"tree\":\"{}\"}}",
+            &earlier[..earlier.len() - 1],
+            list(7)
+        )
+    );
+    /// The fields of the row as a release before the list's reads it, which takes no unknown
+    /// field as an error (`decode`'s doc).
+    #[derive(Deserialize, PartialEq, Debug)]
+    struct Earlier {
+        job: String,
+        key: Option<String>,
+    }
+    let read: Earlier = serde_json::from_str(&json).expect("an earlier release reads it");
+    assert_eq!(
+        read,
+        Earlier {
+            job: "k0-1-1".to_owned(),
+            key: Some("cas/b/1-1/aa".to_owned())
+        }
+    );
+    let mut value = vec![VERSION];
+    value.extend(earlier.as_bytes());
+    assert_eq!(decode("exec/op/1", &value), Ok(Some(row(1))));
 }

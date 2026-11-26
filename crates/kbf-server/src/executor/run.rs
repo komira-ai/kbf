@@ -423,6 +423,7 @@ async fn fresh(
         job: job.clone(),
         key: Some(prepared.key.as_str().to_owned()),
         whole_machine: op.whole_machine,
+        tree: super::out::tree_list_of(&prepared.spec).map(str::to_owned),
     };
     let id = op.id;
     let first = run.attempt == 0;

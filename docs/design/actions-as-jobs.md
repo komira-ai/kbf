@@ -236,7 +236,7 @@ init-script helpers, the libraries only those use, and util-linux's `su`, so the
    `kbf.toml` cannot point a farm at a base tree the release did not build.
 5. **Old versions.** Each published base tree gets a row in the frontend's state store, `job-tree/<digest>` (release,
    first published, last named in a job), a new record type that an older release skips (B8). Nothing is deleted
-   now: `cas/l/` has no collector (section 14), and a release rolled back to republishes its own base tree anyway, so
+   now: `cas/l/` has no collector but that of the provider form's tree lists (section 14), and a release rolled back to republishes its own base tree anyway, so
    a deleted one would come back. When `cas/l/` gets a collector, a base tree's objects are collectable when it is
    neither the current nor the previous release's, has not been named in a job for longer than the longest wall limit
    plus the job service's retention, and no other live tree names them (a newer base tree names the same subtrees
@@ -376,8 +376,10 @@ content-bound. A failure is "no tree" for that job (4.6).
   (O15). A tree resolves on lookup (3.1); what kbf adds is a `hydrate` hold per job, released after the job ends, which
   warms the tree and records what failed while it held it (4.5, section 6).
 - **The manifests** stay in the store. tierstore never deletes a manifest or a blob, and the client must not delete one
-  a tree in use names (ts 6.1). kbf deletes nothing under `cas/l/` today (the `cas/b/` janitor never lists it); its
-  collection is an open point (section 14).
+  a tree in use names (ts 6.1). kbf deletes under `cas/l/` only the tree lists of the provider form
+  that its collector finds through their sidecars (`--executor-list-sweep-key-file`,
+  docs/design/one-file-action-tree.md, item 1e); the `cas/b/` janitor never lists it, and the collection of the rest
+  is an open point (section 14).
 - **A job cannot change a tree**: the manifests are the frontend's, written from `Directory` messages it read and
   checked, under keys that are their own SHA-256; the job's write grant covers only its own output prefix (5.2).
 
@@ -1198,8 +1200,9 @@ copies the inputs out of the tree instead of running on it.
 
 **Other open points:**
 
-- **Collecting `cas/l/`.** Nothing deletes there today, manifests and converted image files included. A collector
-  must not delete what a tree in use names (ts 6.1); it belongs with storage retention.
+- **Collecting `cas/l/`.** Only the provider form's tree lists are collected (one-file-action-tree.md, item 1e);
+  nothing deletes the rest there, manifests and converted image files included. A collector must not delete what a
+  tree in use names (ts 6.1); it belongs with storage retention.
 - **`kbf-task-pack` refused unknown fields** until item 8, which is why that reader ships a release before the writer
   (D13).
 - **The farm's virtual workers** bound kbf's in-flight work by configured shapes, not the pool's real capacity.

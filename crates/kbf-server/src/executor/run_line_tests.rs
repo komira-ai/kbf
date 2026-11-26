@@ -332,6 +332,7 @@ async fn a_taken_up_operation_writes_no_front_arrival() {
         job: old,
         key: None,
         whole_machine: false,
+        tree: None,
     };
     rig.rows("gone").put_op(OperationId(60), &row).expect("row");
     let running = crate::executor::Running::spawn(&rig.exec);

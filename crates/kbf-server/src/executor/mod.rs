@@ -418,6 +418,8 @@ mod dispatch_join_tests;
 #[cfg(test)]
 #[path = "dispatch_tests.rs"]
 mod dispatch_tests;
+// The rig and the state stores of the executor's tests; the collector of tree lists'
+// (`crate::frontend`'s `list_sweep`) runs its rows over `Faulty` too.
 #[cfg(test)]
 #[path = "mod_tests.rs"]
-mod tests;
+pub(crate) mod tests;

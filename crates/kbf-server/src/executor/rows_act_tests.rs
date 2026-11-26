@@ -45,6 +45,7 @@ fn first(action: &ActionKey) -> OpRow {
         job: "job".to_owned(),
         key: Some("cas/b/1/aa".to_owned()),
         whole_machine: false,
+        tree: None,
     }
 }
 

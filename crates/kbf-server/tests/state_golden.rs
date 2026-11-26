@@ -110,6 +110,7 @@ fn op_row(tag: u8) -> kbf_server::executor::rows::OpRow {
         job: format!("k0000000{tag}-op-0"),
         key: None,
         whole_machine: false,
+        tree: None,
     }
 }
 

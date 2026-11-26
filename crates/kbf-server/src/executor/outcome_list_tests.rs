@@ -3,7 +3,10 @@
 use js_proto::v1::{Job, JobResult, JobState, StartFailureCode};
 use tonic::Code;
 
-use super::{LIST_NOT_SUPPORTED, LIST_REFUSALS, RESUBMITS, Settled, Verdict, judge, list_refused};
+use super::{
+    LIST_ABSENT, LIST_NOT_SUPPORTED, LIST_REFUSALS, RESUBMITS, Settled, Verdict, judge,
+    list_refused,
+};
 use crate::executor::{LostObject, MissPath};
 
 fn failed_to_start(code: StartFailureCode, detail: &str) -> Job {
@@ -133,4 +136,32 @@ fn a_refused_list_is_unavailable_and_run_again() {
              manifests)",
         ]
     );
+}
+
+/// Catches a start whose tree list the collector deleted taken for an ordinary failure (an
+/// attempt spent, and the next attempt given the same missing list from the memo): tierstore's
+/// `no tree list at <key>`, anywhere in the detail and whatever the code, is a refused list; a
+/// near miss is not.
+#[test]
+fn a_list_the_store_no_longer_has_is_a_refused_list_whatever_the_code() {
+    let key = format!("cas/l/{}", "ab".repeat(32));
+    let detail = format!("prepare refused: no tree list at {key}");
+    assert!(detail.contains(LIST_ABSENT));
+    assert!(list_refused(&detail));
+    for code in [
+        StartFailureCode::Unspecified,
+        StartFailureCode::InputUnavailable,
+        StartFailureCode::AgentRefused,
+    ] {
+        let verdict = judge(&failed_to_start(code, &detail), &JobResult::default());
+        assert_eq!(verdict, Verdict::ListRefused, "{code:?}");
+    }
+    for near in [
+        "no tree list",
+        "no tree list at",
+        "No tree list at cas/l/ab",
+        "no tree lists at x",
+    ] {
+        assert!(!list_refused(near), "{near:?}");
+    }
 }

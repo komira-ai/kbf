@@ -124,7 +124,8 @@ scan of the state store has `job-tree/` in its prefix), so a rollback to an olde
 nothing.
 
 A frontend taken off the executor republishes nothing and deletes nothing: the objects under
-`cas/l/` and the `job-tree/` rows stay, nothing collects `cas/l/` yet, and a later start with the
+`cas/l/` and the `job-tree/` rows stay, nothing collects `cas/l/` but the provider form's tree lists (the
+collector of `--executor-list-sweep-key-file`), and a later start with the
 executor republishes its release's tree, finding most objects held.
 
 ## The farm agents' egress
