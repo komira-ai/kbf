@@ -32,6 +32,12 @@
 //!   --project <dir> --nonce <text>` ([`prove_farm`]): after the deploy, build a small Buck2 project against the
 //!   farm, remote only, and exit 1 unless some action ran remotely and none locally. An empty `--address` prints a
 //!   notice and exits 0.
+//! - `farm-config --address <A> --instance <I> --tls <true|false> --properties <P> --out <path>`
+//!   ([`farm_config`]): the farm lane's buckconfig, the address masked in the log first.
+//! - `farm-build --buck2 <path> --target <label>... --patch <path> --summary <path> --repo
+//!   <owner/name> --run-id <id>` ([`farm`]): the farm lane's build, refused unless the generated
+//!   build table is fresh and buck2 has worker properties, and failed unless every action ran on
+//!   the farm (`local: 0`).
 //! - `filer-presence-bench --filer <host:port> --filer-root </buckets/bucket> [--sample cas/l] [--keys
 //!   1,10,...] [--present 100,50,0] [--rounds 200] [--lag-store-endpoint <url> ...]`
 //!   ([`filer_presence_bench`]): by hand, against a real SeaweedFS filer: the p50 and p99 of its
@@ -160,6 +166,8 @@ pub mod darwin;
 pub mod debs;
 pub mod deploy_farm;
 pub mod entitlements;
+pub mod farm;
+pub mod farm_config;
 pub mod fetch;
 pub mod fetch_attested;
 pub mod filer_presence_bench;
@@ -210,6 +218,10 @@ pub enum Error {
     Refused(Vec<String>),
     #[error(transparent)]
     Fetch(#[from] fetch::Error),
+    #[error(transparent)]
+    Farm(#[from] farm::Error),
+    #[error(transparent)]
+    FarmConfig(#[from] farm_config::Error),
     #[error(transparent)]
     Debs(#[from] debs::Error),
     #[error(transparent)]
@@ -270,6 +282,10 @@ enum Verb {
     ProveFarm(prove_farm::Args),
     /// Run one Cargo command of this workspace on a Mac of the build farm, as one remote action.
     MacFarm(mac_farm::Args),
+    /// Write the farm lane's buckconfig from the farm's variables.
+    FarmConfig(farm_config::Args),
+    /// Build targets with buck2 on the build farm, local 0, the generated build table fresh.
+    FarmBuild(farm::Args),
     /// Time a SeaweedFS filer's batch lookup of present and absent keys, and the replication lag.
     FilerPresenceBench(filer_presence_bench::Args),
     /// Check that the runner's disk has the room the coverage run needs.
@@ -1036,6 +1052,8 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::DeployFarm(command) => deploy_farm::run_command(&command),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::MacFarm(args) => mac_farm::run(&args),
+        Verb::FarmConfig(args) => Ok(vec![farm_config::run(&args)?]),
+        Verb::FarmBuild(args) => Ok(vec![farm::run(&args)?]),
         Verb::FilerPresenceBench(args) => filer_presence_bench::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
         Verb::Debs(args) => Ok(debs::run(&args)?),

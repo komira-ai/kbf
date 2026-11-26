@@ -1,0 +1,9 @@
+# Written by `buildrules init`. Remote-only execution platform: the worker properties come
+# from `[buildrules_re]` in .buckconfig.local, so none is committed.
+load("@buildrules//rules:platforms.bzl", "buildrules_execution_platforms")
+
+buildrules_execution_platforms(
+    name = "exec",
+    linux_x86_64 = "buildrules//platforms:linux_x86_64",
+    visibility = ["PUBLIC"],
+)

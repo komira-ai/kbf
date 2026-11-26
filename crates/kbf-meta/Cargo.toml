@@ -13,3 +13,11 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.buildrules]
+# The farm lane's `//:ci` (docs/farm.md) checks the format of, builds and lints this package but
+# does not run its tests: tests/evict.rs holds an `#[ignore]`d test, and buildrules' test gate
+# refuses a test target with an ignored test. They run in ci.yml alone.
+
+[package.metadata.buildrules.actions]
+ci = ["fmt", "lint"]

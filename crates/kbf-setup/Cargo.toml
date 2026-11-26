@@ -54,3 +54,8 @@ serde_json.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.buildrules]
+# Its tests need a Postgres server, named by KBF_TEST_POSTGRES_URL as in ci.yml: on the farm each
+# test target runs with a private one that buildrules starts on a Unix socket (docs/farm.md).
+postgres = { url-env = "KBF_TEST_POSTGRES_URL" }

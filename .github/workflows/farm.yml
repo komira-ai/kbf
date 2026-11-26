@@ -1,0 +1,129 @@
+# The farm lane, a shadow of ci.yml: `buck2 build //:ci //:sync_check` of the Cargo workspace
+# through buildrules (BUCK, buildrules.bzl, .buckconfig), with every action run on the build farm or
+# taken from its cache (docs/farm.md). `//:ci` is every member's `:fmt` (rustfmt), `:lint` (clippy
+# with `-D warnings`) and `:test` (each test target run as a build action), but for the members
+# whose `[package.metadata.buildrules]` leaves a step to ci.yml; docs/farm.md says which and why.
+# `//:sync_check` runs `buildrules sync` as a farm action and is red unless it writes exactly the
+# committed build table.
+#
+# It is not a gate and not a required check. ci.yml stays the pull-request gate (its tests under
+# coverage, the 99% floors, the tests the farm cannot run), and the release stays plain cargo on
+# GitHub-hosted runners (artifacts.yml; the seed lint holds it there). A farm outage turns this
+# check red and holds nothing. The job never runs in the merge queue.
+#
+# A pull request that changes a Cargo file without the generated build table fails here before
+# the build, and the job hands over the fix: it runs the pinned `buildrules sync` itself and uploads
+# what it changed as the patch artifact `buildrules-sync`, with the one command that applies it in
+# the job summary. It does not push to the branch (docs/farm.md says why).
+#
+# The farm is reachable only on its Tailscale network. The job joins it after the xtask build (no
+# build script sees that network) as an ephemeral node with the run's OIDC token, as `tag:ci`
+# (workload identity federation: no stored secret). `cargo xtask farm-config` then writes the
+# farm's buckconfig under ~/.buckconfig.d from the organisation variables FARM_ADDRESS,
+# FARM_INSTANCE, FARM_TLS and FARM_LINUX_X86_64_PROPERTIES, masking the address first; this
+# repository holds no endpoint and no worker property set. The token is why the one job holds
+# `id-token: write` on a pull request, which the workflow lint allows to this job alone, under its
+# exact `if:` (crates/kbf-integration-test/tests/workflows/farm.rs): a push to main, or a pull
+# request from a branch of this repository that is not Dependabot's. A fork's pull request gets no
+# OIDC token and no variables, and is skipped.
+#
+# buck2 is the release buildrules is tested with (its tools/buck2), pinned by version and SHA-256
+# and installed by `cargo xtask fetch` only once its SHA-256 matches.
+name: farm
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+# A pull request's newer run replaces its older one; a push to main always runs to its end.
+concurrency:
+  group: farm-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    if: ${{ github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && !startsWith(github.head_ref, 'dependabot/')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      # For the tailnet join alone: the OIDC token the farm's network trusts.
+      id-token: write
+    env:
+      BUCK2_VERSION: 2026-09-15
+      BUCK2_SHA256: 1268fce33fb61273091dd5dd8c60b65de1521a3caa36b88983813e882b7ffd89
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # xtask is built on the runner (the one cargo build of this job); its own cache.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-farm-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-farm-
+      - run: cargo build -p xtask --locked
+      # Only a push to main writes the Cargo cache, and only when its exact key missed.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: buck2-cache
+        with:
+          path: ${{ runner.temp }}/pinned/buck2.zst
+          key: pinned-buck2-${{ env.BUCK2_VERSION }}-${{ env.BUCK2_SHA256 }}
+      - name: Install buck2 (pinned version and checksum)
+        run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --cache "$RUNNER_TEMP/pinned/buck2.zst" --out "$RUNNER_TEMP/bin/buck2" --extract zst
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.buck2-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/pinned/buck2.zst
+          key: ${{ steps.buck2-cache.outputs.cache-primary-key }}
+      - name: Join the farm's Tailscale network
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        with:
+          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+          tags: tag:ci
+      # One command (crates/xtask/src/farm_config.rs): it masks the address, refuses an empty or
+      # multi-line value, and writes the farm's buckconfig, which every buck2 of this job reads.
+      - name: Write the farm's buckconfig
+        env:
+          FARM_ADDRESS: ${{ vars.FARM_ADDRESS }}
+          FARM_INSTANCE: ${{ vars.FARM_INSTANCE }}
+          FARM_TLS: ${{ vars.FARM_TLS || 'false' }}
+          FARM_PROPERTIES: ${{ vars.FARM_LINUX_X86_64_PROPERTIES }}
+        run: cargo xtask farm-config --address "$FARM_ADDRESS" --instance "$FARM_INSTANCE" --tls "$FARM_TLS" --properties "$FARM_PROPERTIES" --out "$HOME/.buckconfig.d/farm.buckconfig"
+      # One command (crates/xtask/src/farm.rs): it refuses to build unless buck2 reads a worker
+      # property set for buildrules; builds the pinned `buildrules` command line on the farm and
+      # runs `buildrules check`, and when the generated build table is stale runs `buildrules sync`,
+      # writes what it changed as a patch, puts the stale inputs, the changed files and the command
+      # that applies the patch in this job's summary, and fails without building
+      # (crates/xtask/src/farm/table.rs); builds the targets with buck2's progress in this log,
+      # fails unless the summary line says `local: 0` (every action ran on the farm or came from its
+      # cache), and stops buck2's daemon however the build ended.
+      - name: buck2 build //:ci //:sync_check on the build farm, local 0
+        run: cargo xtask farm-build --buck2 "$RUNNER_TEMP/bin/buck2" --target //:ci --target //:sync_check --patch "$RUNNER_TEMP/buildrules-sync/buildrules-sync.patch" --summary "$GITHUB_STEP_SUMMARY" --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID"
+      # A stale table's fix, for the contributor to read and `git apply` (docs/farm.md). The file
+      # exists only when the build step wrote it; any other failure uploads nothing.
+      - name: Upload the regenerated build table as a patch
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buildrules-sync
+          path: ${{ runner.temp }}/buildrules-sync/buildrules-sync.patch
+          if-no-files-found: ignore
+          retention-days: 30

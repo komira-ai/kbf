@@ -37,6 +37,11 @@
 //!   docker-swarm-updater's `deploy.yml` from the release's `deploy` job ([`called::CALLABLE`])
 //!   and hostkeeper's `set-desired.yml` from `hostkeeper-desired.yml`'s `set-desired` job
 //!   ([`hostkeeper`]);
+//! - `id-token: write` is held on a pull request by one job alone: the job `build` of the workflow
+//!   named `farm` (`farm.yml`, the build-farm lane), under its exact `if:` (a push to main, or a pull
+//!   request from a branch of this repository that is not Dependabot's), because joining the
+//!   farm's Tailscale network uses the run's OIDC token. [`farm`] holds that file to its shape;
+//!   the same `if:` in another job or another workflow is refused like any other;
 //! - a step's `uses:` is not pinned to a full 40-character commit SHA followed on the
 //!   same line by a version comment, written as a plain (unquoted) scalar so the
 //!   comment's place is exact;
@@ -91,6 +96,7 @@
 //! anything else, so that review has less to catch.
 
 mod called;
+mod farm;
 mod hostkeeper;
 pub mod release_ifs;
 #[cfg(test)]
@@ -480,6 +486,7 @@ fn run(text: &str, repo: &Repo, check: impl FnOnce(&mut Lint<'_>, &Node)) -> Vec
         repo,
         out: Vec::new(),
         hostkeeper: hostkeeper::is_named(&root),
+        farm: farm::is_named(&root),
     };
     lint.every_node(&root);
     check(&mut lint, &root);
@@ -496,6 +503,8 @@ struct Lint<'a> {
     out: Vec<String>,
     /// Whether the workflow is the one that sets hostkeeper's desired version ([`hostkeeper`]).
     hostkeeper: bool,
+    /// Whether the workflow is the farm lane ([`farm`]).
+    farm: bool,
 }
 
 impl Lint<'_> {
@@ -734,7 +743,10 @@ impl Lint<'_> {
             if granted == "read" || granted == "none" {
                 continue;
             }
-            if name == DEPLOY_SCOPE && granted == "write" && self.deploy_scope_ok(key, condition) {
+            if name == DEPLOY_SCOPE
+                && granted == "write"
+                && (self.deploy_scope_ok(key, condition) || self.farm_scope_ok(key, condition))
+            {
                 continue;
             }
             let gate: &[&str] = if SIGNING_SCOPES.contains(&name) {

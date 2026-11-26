@@ -31,3 +31,7 @@ workspace = true
 zip.workspace = true
 # The zip crate's backend; the object itself is never compressed.
 flate2.workspace = true
+
+[package.metadata.buildrules]
+# Policy only: `actions = { name = ["lint", "test"] }`, `default-action`, `[package.metadata.buildrules.lint]`.
+# Absent keys inherit [workspace.metadata.buildrules]. See docs/contract.md.

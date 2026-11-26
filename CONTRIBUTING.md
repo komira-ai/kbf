@@ -108,6 +108,12 @@ kbf's dependencies": it opens it when there are advisories, rewrites its table w
 they change, and comments and closes it when none remain. The run itself is green
 whatever it finds; it fails only when cargo-deny or the GitHub API did.
 
+[.github/workflows/farm.yml](.github/workflows/farm.yml) is a shadow of CI, not part
+of it: it builds the same workspace with Buck2 through buildrules on the build farm
+and is not a required check ([docs/farm.md](docs/farm.md)). After a change to a
+`Cargo.toml` or `Cargo.lock`, its run hands over the regenerated build table as a
+patch to apply; a red farm run on its own holds nothing.
+
 A tool a job needs from outside the workspace (cargo-deny, cargo-llvm-cov,
 cargo-cyclonedx, Bazel, buck2) is pinned in the workflow by URL and SHA-256 and
 installed by `cargo xtask fetch`, which refuses a download whose SHA-256 differs

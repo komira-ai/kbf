@@ -3,7 +3,7 @@
 //! without building the server, `verify-assets attestations` without GitHub, and
 //! `sudo-test` without root or systemd.
 //!
-//! - Run under any name but `kbf-server`, `gh`, `sudo`, `syft`, `uname`, `id`, `systemd-sysusers` or
+//! - Run under any name but `kbf-server`, `gh`, `sudo`, `syft`, `uname`, `id`, `buck2`, `buildrules`, `systemd-sysusers` or
 //!   `systemd-tmpfiles`, it is cargo: it
 //!   appends its arguments as one line to `target/debug/cargo-args` in its working
 //!   directory, "builds" by hard-linking itself to `target/debug/kbf-server`, and
@@ -97,6 +97,25 @@
 //! - Run as `syft`, it prints the file `syft.json` next to it on stdout: what syft prints of an
 //!   image. (`pkg-image-sbom` runs it with an empty environment, so what it was given is tested
 //!   with `env` in `src/pkg_image_sbom/tests.rs`.)
+//! - Run as `buck2`, it is the buck2 of `farm-build`: it appends its arguments, joined by spaces, as
+//!   one line to `buck2.calls` of its working directory. `kill` then exits 0. Any other call answers
+//!   from the files `buck2-<key>.stdout`, `.stderr` and `.status` of the working directory, where
+//!   `<key>` is `tool` for the build of `buildrules//cli:buildrules` and the verb (`audit`, `build`)
+//!   for any other: it prints the first (when there is none: for `audit`, `{}`, buck2's answer for a
+//!   key that is not set; for `tool`, the line `buildrules//cli:buildrules <its own
+//!   directory>/buildrules`; for any other, nothing), prints the second on stderr, and exits with the
+//!   number in the third (0 when there is none).
+//! - Run as `buildrules`, it is the command line `farm-build` builds, over a table of its own: it
+//!   appends its arguments as one line to `buildrules.calls` of its working directory. `sync` writes
+//!   what a sync of the working directory writes: `buildrules.lock.bzl`, one line `<file> <sha256>`
+//!   for each of `Cargo.toml` and `Cargo.lock`, and `third_party/buildrules/git_archives.tsv` when
+//!   `Cargo.toml` has a `git = ` dependency (removed when it has none). `check` exits 1, with no
+//!   `STALE:` line, when there is no `buildrules.lock.bzl`; else with one `STALE:` line, in the real
+//!   command line's form, for each of the two files the table records another sha256 of, or when
+//!   they agree, for each generated file that is not what `sync` writes; else 0. Defects, from
+//!   `XTASK_FAKE_DEFECT` or the first line of a file `defect` next to the program: `sync-fails`
+//!   (sync exits 1 with a line), `sync-writes-nothing` (sync exits 0 and writes nothing),
+//!   `check-usage` (check exits 2 with a usage line). Both personas live in `xtask_fake/buck2.rs`.
 //! - Run as `systemd-sysusers` or `systemd-tmpfiles` (by name, from PATH, or by path), it
 //!   appends `<name> <arguments>` as one line to `systemd-args` next to the fake's own
 //!   file and exits 0: the host's systemd, as `packaging/install.sh` calls it.
@@ -124,6 +143,9 @@ use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use sha2::Digest;
+
+#[path = "xtask_fake/buck2.rs"]
+mod buck2;
 
 const OVERRIDE: &str = "KBF_BUILD_COMMIT_OVERRIDE";
 
@@ -897,6 +919,10 @@ fn main() -> ExitCode {
         syft(&argv0)
     } else if matches!(base, "systemd-sysusers" | "systemd-tmpfiles") {
         systemd(base, &rest)
+    } else if base == "buck2" {
+        buck2::buck2(Path::new(&argv0), &rest)
+    } else if base == "buildrules" {
+        buck2::buildrules(&rest)
     } else if argv0.ends_with("/rustc") {
         eprintln!("rustc: the toolchain is not installed");
         ExitCode::FAILURE

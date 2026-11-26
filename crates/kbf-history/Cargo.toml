@@ -32,3 +32,12 @@ kbf-state = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
+
+[package.metadata.buildrules]
+# The farm lane's `//:ci` (docs/farm.md) checks the format of, builds and lints this package but
+# does not run its tests: it holds tests the pull-request profile leaves out as slow
+# (.config/nextest.toml, `[profile.pr]`), and `:test` runs a whole test target, which cannot leave
+# one test out. They run in ci.yml alone.
+
+[package.metadata.buildrules.actions]
+ci = ["fmt", "lint"]
