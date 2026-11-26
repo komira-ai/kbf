@@ -1,4 +1,4 @@
-//! The input check over a store that is not in this process: [`walk`].
+//! The input check over a store that is not in this process: [`walk_told`].
 //!
 //! An Execute's input root names a tree of Directory blobs and, under it, files. Over a
 //! [`kbf_storage::Storage`] or a routed farm the frontend holds nothing of its own, so
@@ -82,16 +82,16 @@ use crate::input_tree::{Decoded, Walked, decode};
 use crate::known_dirs::{KnownDirs, keep_named};
 use crate::prepare_run::DirectoryCache;
 
-/// The most Directory blobs one [`walk`] reads from the store at once. The tree of a
+/// The most Directory blobs one [`walk_told`] reads from the store at once. The tree of a
 /// request is the only bound on its fan-out, so this is what keeps a few hundred
 /// Executes arriving together from opening a few hundred thousand reads.
 pub(crate) const DIRS_IN_FLIGHT: usize = 32;
 
-/// The most digests one FindMissing of [`walk`] names: a message well under the gRPC
+/// The most digests one FindMissing of [`walk_told`] names: a message well under the gRPC
 /// limit, with a call per few thousand files of a tree.
 pub(crate) const FILES_PER_ASK: usize = 4096;
 
-/// The most FindMissing calls of one [`walk`] open at once.
+/// The most FindMissing calls of one [`walk_told`] open at once.
 pub(crate) const ASKS_IN_FLIGHT: usize = 4;
 
 /// How long a verified Directory is believed. Shared with the router's closure check
@@ -380,10 +380,45 @@ impl Trees {
 /// reported absent and nothing under it is looked at; the report lists absent
 /// directories (sorted) before absent files (sorted), as `Cache::walk_inputs` does.
 ///
+/// `told` is told once every Directory the walk reads is read, as it goes on to ask about the
+/// files ([`DirsRead`]).
+///
 /// # Errors
 /// The store could not answer, or a Directory it holds does not decode.
+pub(crate) async fn walk_told(
+    storage: &dyn Blobs,
+    root: Digest,
+    trees: &Trees,
+    told: DirsRead,
+) -> Answer<Walked> {
+    walk_within(storage, root, DIRS_IN_FLIGHT, trees, told).await
+}
+
+/// [`walk_told`], with no one told.
+#[cfg(test)]
 pub(crate) async fn walk(storage: &dyn Blobs, root: Digest, trees: &Trees) -> Answer<Walked> {
-    walk_bounded(storage, root, DIRS_IN_FLIGHT, trees).await
+    walk_told(storage, root, trees, DirsRead::default()).await
+}
+
+/// Told once, when a walk has read (or taken from a cache) every Directory it reads, and goes
+/// on to ask the store about the files: the end of its Directory phase. A walk that fails
+/// before then, or that has no such phase (the cache in this process walks its own way), never
+/// tells; its receiver sees the sender dropped.
+#[derive(Debug, Default)]
+pub(crate) struct DirsRead(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl DirsRead {
+    /// Telling `sender`.
+    pub(crate) fn to(sender: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self(Some(sender))
+    }
+
+    /// Tells, the first time only.
+    fn tell(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
 }
 
 /// How a Directory came to a walk that did not find it cached.
@@ -489,11 +524,23 @@ impl Frontier {
 }
 
 /// [`walk`] with at most `reads_in_flight` Directory reads open (at least one).
+#[cfg(test)]
 pub(crate) async fn walk_bounded(
     storage: &dyn Blobs,
     root: Digest,
     reads_in_flight: usize,
     trees: &Trees,
+) -> Answer<Walked> {
+    walk_within(storage, root, reads_in_flight, trees, DirsRead::default()).await
+}
+
+/// [`walk_told`] with at most `reads_in_flight` Directory reads open (at least one).
+async fn walk_within(
+    storage: &dyn Blobs,
+    root: Digest,
+    reads_in_flight: usize,
+    trees: &Trees,
+    mut told: DirsRead,
 ) -> Answer<Walked> {
     let reads_in_flight = reads_in_flight.max(1);
     let begun = Instant::now();
@@ -593,6 +640,9 @@ pub(crate) async fn walk_bounded(
     {
         return Err(e);
     }
+    // Every Directory the walk reads is read: what the tree names is known, and only whether
+    // the store holds it is left to ask.
+    told.tell();
     // A Directory is asked about once whatever names it. The cached ones are asked about
     // with the files: a cached Directory is trusted only if the store still holds it.
     let mut asking: Vec<Digest> = found.files.iter().copied().collect();

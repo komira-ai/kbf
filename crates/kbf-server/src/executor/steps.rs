@@ -22,8 +22,10 @@
 //!   operation decoded, remembered, or, for an operation taken up from another process, read
 //!   from the CAS;
 //! - `put_dir`: the run's put directory from the frontend's preparation, with the input closure
-//!   collected when the action tree is not remembered (`action`, `walk` and `held` are its
-//!   parts), or the directory alone when it is;
+//!   collected when the action tree is neither remembered nor started by its Execute ahead of
+//!   the run (`action`, `walk` and `held` are its parts), or the directory alone when it is;
+//!   a tree started ahead of its run has its `action` and `walk` timed on the task that writes
+//!   it, whether or not a run takes it, and no `held` (the Execute's check stands in for it);
 //! - `action`: the closure's Action: next to nothing when it is the one the Execute decoded, a
 //!   read of the CAS when it is not;
 //! - `walk`: the closure's walk of the input root's `Directory` messages;

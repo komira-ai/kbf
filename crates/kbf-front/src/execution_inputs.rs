@@ -15,6 +15,14 @@
 //!
 //! The decoded Action and Command go to the dispatcher with the submission
 //! ([`Submission::decoded`]), so the run's preparation reads neither from the CAS again.
+//!
+//! The action tree's write starts before the walk ends ([`super::Dispatch::start_tree`]): once
+//! the Command is decoded and the walk has read every Directory, while the walk still asks the
+//! store whether the files are held, for an action whose platform is not refused and does not
+//! ask for a whole machine (no run of such an action writes a tree). The dispatcher is told the
+//! finding: held once the Command and every input are found held (just before the submit),
+//! and not held when the Execute ends any other way. The answer of the Execute does not change:
+//! it is still made after the walk, in the order above.
 
 use std::sync::Arc;
 
@@ -25,17 +33,20 @@ use kbf_proto::reapi::{Action, Command};
 use kbf_storage::StorageError;
 use kbf_types::{ActionKey, Digest};
 use prost::Message;
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tonic::Status;
 
 use super::{
-    DecodedAction, ExecutionService, Presubmit, REFUSED_LOGGED, Submission, missing, platform,
-    required, wants_whole_machine,
+    DecodedAction, Dispatch, ExecutionService, Presubmit, REFUSED_LOGGED, Submission, missing,
+    platform, required, wants_whole_machine,
 };
 use crate::described::Described;
+use crate::early_tree::inputs_held;
+use crate::input_walk::DirsRead;
 use crate::wire;
 
-impl<D> ExecutionService<D> {
+impl<D: Dispatch> ExecutionService<D> {
     /// The submission of `action`, whose bytes the Execute read (`None`: not held), once its
     /// inputs are all found held, with no call to record yet, and the Command digest the action
     /// names. The Command is read while the input tree is walked.
@@ -63,31 +74,56 @@ impl<D> ExecutionService<D> {
 
         // Before the Command is read and the walk begins: what the vouch below rests on.
         let reading = Instant::now();
+        let (told, dirs_read) = oneshot::channel();
         let walk = async {
             let walking = Instant::now();
-            let walked = self.cache.walk_inputs(root).await;
+            let walked = (self.cache)
+                .walk_inputs_telling(root, DirsRead::to(told))
+                .await;
             (walked, walking.elapsed())
         };
-        let (command, (walked, walk_took)) = join(self.read_input(&command_digest), walk).await;
+        let command = async {
+            let Some(bytes) = self.read_input(&command_digest).await? else {
+                return Ok(None);
+            };
+            let command = Command::decode(bytes).map_err(|e| {
+                Status::invalid_argument(format!("command {command_digest} does not decode: {e}"))
+            })?;
+            let both = Arc::new(DecodedAction {
+                action: decoded.clone(),
+                command,
+            });
+            // The tree's write starts once the walk has read every Directory too, beside its
+            // held-file check, for an action whose platform a run would take.
+            let runs = own.map_or_else(|| wants_whole_machine(&decoded, Some(&both.command)), Ok);
+            let held = match matches!(runs, Ok(false)) && dirs_read.await.is_ok() {
+                true => {
+                    let (held, finding) = inputs_held();
+                    self.dispatch.start_tree(action, Arc::clone(&both), finding);
+                    Some(held)
+                }
+                false => None,
+            };
+            Ok::<_, Status>(Some((both, held)))
+        };
+        let (command, (walked, walk_took)) = join(command, walk).await;
         window.walk = walk_took;
         self.cache
             .metrics()
             .execute_walk
             .observe_duration(window.walk);
         let mut absent = Vec::new();
-        let command = match command? {
-            Some(bytes) => Some(Command::decode(bytes).map_err(|e| {
-                Status::invalid_argument(format!("command {command_digest} does not decode: {e}"))
-            })?),
+        let (both, held) = match command? {
+            Some((both, held)) => (Some(both), held),
             None => {
                 absent.push(command_digest);
-                None
+                (None, None)
             }
         };
         // And a Command's platform, before anything the walk found is answered.
         let whole_machine = match own {
             Some(whole) => whole,
-            None => wants_whole_machine(&decoded, command.as_ref())?,
+            None => wants_whole_machine(&decoded, both.as_ref().map(|both| &both.command))?,
         };
         let walked = walked?;
         let (input_bytes, input_files) = (walked.input_bytes, walked.input_files);
@@ -115,18 +151,19 @@ impl<D> ExecutionService<D> {
             );
             return Err(missing(&absent));
         }
-        // The Command and every input held: the run's preparation need not ask again.
+        // The Command and every input held: the run's preparation need not ask again, and a
+        // tree written beside the check may be trusted.
         if let Some(at) = walked.held_since {
             self.cache.vouch(action, at.min(reading));
         }
+        if let Some(held) = held {
+            held.held();
+        }
         // The Command is here: an absent one returned MISSING above.
-        let described = command.clone().map(Described::of).unwrap_or_default();
-        let decoded = command.map(|command| {
-            Arc::new(DecodedAction {
-                action: decoded,
-                command,
-            })
-        });
+        let described = (both.as_ref())
+            .map(|both| Described::of(both.command.clone()))
+            .unwrap_or_default();
+        let decoded = both;
         let submission = Submission {
             key: ActionKey { instance, action },
             whole_machine,

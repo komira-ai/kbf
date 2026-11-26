@@ -96,7 +96,6 @@ does. Each member below says why in its `[package.metadata.buildrules]`, and its
 | member | why its tests stay hosted |
 |---|---|
 | `host-step` | `tests/fs_real.rs` holds an `#[ignore]`d test |
-| `kbf-estimator` | `tests/codec_golden.rs` holds an `#[ignore]`d test (golden regeneration) |
 | `kbf-front` | its library tests and `tests/measure_hit.rs` hold `#[ignore]`d tests; slow tests (`large_blobs`, `proxy`, `write_group`) |
 | `kbf-host` | its library tests hold an `#[ignore]`d test |
 | `kbf-host-install` | its `real_drop`, `real_linux_unit` and `update_rehearsal*` targets hold `#[ignore]`d tests (root, systemd) |
