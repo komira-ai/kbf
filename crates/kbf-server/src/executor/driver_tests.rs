@@ -28,6 +28,7 @@ fn row(tag: u8, job: &str, key: Option<&str>) -> OpRow {
         job: job.to_owned(),
         key: key.map(str::to_owned),
         whole_machine: false,
+        tree: None,
     }
 }
 

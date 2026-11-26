@@ -302,7 +302,7 @@ fn cases() -> Vec<(&'static str, Case)> {
             ),
         ),
         (
-            "failed to start, any code, its detail saying the host refused the job's tree list as not mountable (`tree list not supported: <reason>`)",
+            "failed to start, any code, its detail saying the host refused the job's tree list as not mountable (`tree list not supported: <reason>`) or found no list at its key (`no tree list at <key>`)",
             judged(
                 job(
                     JobState::FailedToStart,

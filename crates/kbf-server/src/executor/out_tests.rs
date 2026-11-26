@@ -1,6 +1,10 @@
-use js_proto::v1::{Layer, Mount, MountMode, MountPropagation, ProviderSource, layer, mount};
+use js_proto::v1::{
+    JobSpec, Layer, Mount, MountMode, MountPropagation, ProviderSource, layer, mount,
+};
 
-use super::{MAX_ROOT_BYTES, OUT_TARGET, PROVIDER, PutDirRoots, RootError, provider_layer};
+use super::{
+    MAX_ROOT_BYTES, OUT_TARGET, PROVIDER, PutDirRoots, RootError, provider_layer, tree_list_of,
+};
 
 /// Asserts that the trees are the directory beside the put root, under one mount point or `/`.
 #[test]
@@ -91,4 +95,57 @@ fn a_provider_layer_names_tierstore_and_the_tree_lists_key() {
         }
     );
     assert_ne!(provider_layer(&key), provider_layer("cas/l/other"));
+}
+
+/// Asserts which tree list a job reads, as its operation's row names it for the collector of
+/// tree lists: the ref of tierstore's provider in a layer (the provider form) or in a mount (a
+/// Mac job), and none for a tree of manifests, a job with no layer, or a provider of another
+/// name. Catches: a provider form's row that names no list, which the collector would then
+/// delete under a running job.
+#[test]
+fn a_jobs_tree_list_is_the_ref_tierstores_provider_is_given() {
+    let key = format!("cas/l/{}", "cd".repeat(32));
+    let roots = PutDirRoots::new("/mnt/ts/put").expect("roots");
+    let out = roots.mount("cas/b/7-8/0123");
+    let provider = JobSpec {
+        layers: vec![provider_layer(&key)],
+        mounts: vec![out.clone()],
+        ..JobSpec::default()
+    };
+    assert_eq!(tree_list_of(&provider), Some(key.as_str()));
+    let mac = JobSpec {
+        mounts: vec![
+            out.clone(),
+            Mount {
+                source: Some(mount::Source::Provider(ProviderSource {
+                    provider: PROVIDER.to_owned(),
+                    r#ref: key.clone(),
+                })),
+                ..out.clone()
+            },
+        ],
+        ..JobSpec::default()
+    };
+    assert_eq!(tree_list_of(&mac), Some(key.as_str()));
+    let manifests = JobSpec {
+        layers: vec![roots.layer(&"ab".repeat(32))],
+        mounts: vec![out.clone()],
+        ..JobSpec::default()
+    };
+    assert_eq!(tree_list_of(&manifests), None);
+    assert_eq!(tree_list_of(&JobSpec::default()), None);
+    let other = JobSpec {
+        layers: vec![Layer {
+            source: Some(layer::Source::Provider(ProviderSource {
+                provider: "another".to_owned(),
+                r#ref: key.clone(),
+            })),
+        }],
+        mounts: vec![Mount {
+            source: None,
+            ..out
+        }],
+        ..JobSpec::default()
+    };
+    assert_eq!(tree_list_of(&other), None);
 }

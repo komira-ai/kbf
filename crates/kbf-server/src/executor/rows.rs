@@ -5,7 +5,7 @@
 //! |---|---|---|
 //! | `meta/next_op` | the next free operation id, 8 bytes big-endian | a block of [`ID_BLOCK`] ids reserved by compare-and-set |
 //! | `exec/live/<instance>` | empty | by its process, every quarter of `--executor-live-secs`, with that time to live |
-//! | `exec/op/<operation>` | [`OpRow`] | before each attempt's submit; deleted when the operation finishes |
+//! | `exec/op/<operation>` | [`OpRow`], with the tree list its attempt's job reads when there is one | before each attempt's submit; deleted when the operation finishes |
 //! | `exec/act/<hash>-<size>/<instance, hex>` | the open operation of the action, version 1 and 8 bytes big-endian | with the first attempt's `exec/op/` row, in its transaction; deleted with it |
 //! | `done/<operation>` | `Finished::to_row` | when the operation finishes, for at least [`DONE_FLOOR`] |
 //! | `doneof/<operation>` | the action and instance (version 1, size, hash, instance) | beside `done/` |
@@ -43,6 +43,7 @@
 //! it and counts it ([`Rows::unknown_rows`]). A row never holds a file or environment value of
 //! a job.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -143,6 +144,12 @@ pub struct OpRow {
     /// The action's platform asks for a whole machine.
     #[serde(default)]
     pub whole_machine: bool,
+    /// The key of the tree list that attempt's job reads its tree from, `cas/l/<id>`: given in
+    /// the provider form and for every Mac job, `None` for a tree of manifests. Left out of the
+    /// row when `None`, so such a row has the bytes an earlier release wrote. The collector of
+    /// tree lists keeps every list an open operation's row names ([`Rows::named_lists`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
 }
 
 impl OpRow {
@@ -669,6 +676,27 @@ impl Rows {
             }
         }
         Ok(orphans)
+    }
+
+    /// The tree lists the open operations' rows name ([`OpRow::tree`]): what the collector of
+    /// tree lists must not delete, whatever their age.
+    ///
+    /// # Errors
+    /// The store cannot be read; or a row cannot be read, so what it names is not known: a row
+    /// that is not what it says, or one of a version this build does not know
+    /// ([`RowsError::Corrupt`] names it). A caller deletes nothing on an error.
+    pub fn named_lists(&self) -> Result<BTreeSet<String>, RowsError> {
+        let mut named = BTreeSet::new();
+        for (key, found) in self.store.scan_prefix(OP_PREFIX)? {
+            let Some(row) = decode(&key, &found.value)? else {
+                return Err(corrupt(
+                    &key,
+                    "a row of a version this build does not know: what it names is not known",
+                ));
+            };
+            named.extend(row.tree);
+        }
+        Ok(named)
     }
 
     /// Takes `orphan` up: its row is this process's from now on, if its owner is still gone and
