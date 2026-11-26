@@ -31,6 +31,7 @@
 mod ac;
 mod bytestream;
 mod cas;
+mod progress;
 mod uploads;
 
 use std::sync::Arc;
@@ -199,8 +200,10 @@ impl Stored {
                 .max_decoding_message_size(MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_MESSAGE_BYTES),
         )
-        .add_service(kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer::new(
-            bytestream,
+        // A Write counts its idle timeout from the last byte of its body, not the last whole
+        // message, so the service sees every frame arrive.
+        .add_service(progress::Watched(
+            kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer::new(bytestream),
         ))
         .add_service(
             kbf_proto::reapi::action_cache_server::ActionCacheServer::new(action_cache),
