@@ -5,12 +5,14 @@
 //! `pack<k>`, `L<i>`) into a put directory ([`kbf_task_pack::KeyLayout`]). When the
 //! pack is rejected, or the run fails after the write, nothing records it and nothing reads it:
 //! it is an orphan. [`Sweeper::sweep`] lists the prefix and deletes the orphans that are older
-//! than the grace period. Every delete is gated four ways: by the prefix (the listing is asked
+//! than the grace period. Every delete is gated five ways: by the prefix (the listing is asked
 //! for [`SWEPT_PREFIX`], and each key it returns is checked to be under it), by the age the key
-//! itself says, by the set of keys under verification, and by the pack index, which is asked
-//! again for the one key just before the delete. Between pages the sweep waits
+//! itself says, by the set of keys under verification, by the put directories open operations
+//! name ([`SweepGates::named`], read once a page just before its deletes), and by the pack
+//! index, which is asked again for the one key just before the delete. Between pages the sweep waits
 //! [`SweepConfig::pause`], which bounds how fast it lists and deletes.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -88,7 +90,49 @@ pub type ClaimOf = Box<dyn Fn(&str) -> Option<Claim> + Send + Sync>;
 /// When a key was minted, read from the key itself; `None` when the key does not say.
 pub type AgeOf = Box<dyn Fn(&str) -> Option<SystemTime> + Send + Sync>;
 
-/// The three questions a sweep asks of its caller.
+/// The put directories (`cas/b/<build>/<nonce>`) the open operations name, or why they cannot
+/// be read. It may block: the sweep calls it off the async worker threads.
+pub type NamedOf = Arc<dyn Fn() -> Result<BTreeSet<String>, String> + Send + Sync>;
+
+/// No operation names any put directory: the [`SweepGates::named`] of a process that runs no
+/// operations.
+#[must_use]
+pub fn none_named() -> NamedOf {
+    Arc::new(|| Ok(BTreeSet::new()))
+}
+
+/// Whether `key` is an object (`pack`, `pack<k>`, `L<i>`) of one of the put directories `named`
+/// ([`TaskPackKey::put_dir`]). A key of the presigned layout (`cas/b/<build>/<nonce>-<slot>`)
+/// is of no put directory, so no name keeps it.
+fn is_named(named: &BTreeSet<String>, key: &str) -> bool {
+    TaskPackKey::parse(key)
+        .ok()
+        .and_then(|key| key.put_dir())
+        .is_some_and(|dir| named.contains(&dir))
+}
+
+/// The keys among `orphans` that are objects of no put directory `named` answers, the others
+/// counted in `report`. `named` is asked only when there is an orphan, after the page's ages and
+/// the index's answer and just before its deletes: an operation opened before this read is seen,
+/// and one opened after it has a put directory minted after it, younger than the grace. Not a
+/// method of the generic [`Sweeper`], so it is one function whatever the store.
+async fn unnamed(
+    named: &NamedOf,
+    orphans: Vec<String>,
+    report: &mut SweepReport,
+) -> Result<Vec<String>, SweepError> {
+    if orphans.is_empty() {
+        return Ok(orphans);
+    }
+    let named = Arc::clone(named);
+    let named = offload(move || named()).await.map_err(SweepError::Named)?;
+    let (kept, unnamed): (Vec<String>, Vec<String>) =
+        orphans.into_iter().partition(|key| is_named(&named, key));
+    report.named += kept.len();
+    Ok(unnamed)
+}
+
+/// The questions a sweep asks of its caller.
 pub struct SweepGates {
     /// When the key was minted, read from the key; `None` for a key that does not say.
     pub age_of: AgeOf,
@@ -100,6 +144,11 @@ pub struct SweepGates {
     /// `None` when something is. The claim is held through the index's last answer and the
     /// delete, and while it is held nothing may begin to verify the key.
     pub claim: ClaimOf,
+    /// The put directories the open operations name: a key in one is kept whatever its age,
+    /// since its job may still write it or its ingest read it. Asked once for each page that has
+    /// keys the index does not record, after the index's answer and before the page's deletes;
+    /// an error stops the sweep with [`SweepError::Named`] before any of the page's deletes.
+    pub named: NamedOf,
 }
 
 /// What one sweep did.
@@ -115,6 +164,8 @@ pub struct SweepReport {
     pub referenced: usize,
     /// Keys kept because they are under verification.
     pub verifying: usize,
+    /// Keys kept because they lie in a put directory an open operation names.
+    pub named: usize,
     /// Keys under the prefix whose age the key does not say: reported, never deleted.
     pub strays: Vec<String>,
     /// Keys the listing returned that are not under [`SWEPT_PREFIX`] (a store that ignored the
@@ -139,6 +190,10 @@ pub enum SweepError {
     /// The index could not say which keys it records.
     #[error("sweep: the pack index failed: {0}")]
     Index(#[source] PackIndexError),
+    /// The open operations could not be read, so what they name is not known: the page's
+    /// deletes are not made.
+    #[error("sweep: the open operations could not be read: {0}")]
+    Named(String),
     /// The store answered a delete with 401 (a bad credential) or 403: the key may not delete under the prefix, and
     /// no other delete of the sweep would be allowed either.
     #[error("sweep: the store refused to let this key delete under {SWEPT_PREFIX}: {0}")]
@@ -193,8 +248,8 @@ impl<S: ObjectStore> Sweeper<S> {
     /// when the sweep stops with an error `report` says what it did before.
     ///
     /// # Errors
-    /// [`SweepError::List`], [`SweepError::Index`], [`SweepError::Denied`] or
-    /// [`SweepError::Failing`]: the sweep stops, and what it deleted before stays deleted.
+    /// [`SweepError::List`], [`SweepError::Index`], [`SweepError::Named`], [`SweepError::Denied`]
+    /// or [`SweepError::Failing`]: the sweep stops, and what it deleted before stays deleted.
     pub async fn sweep_into(
         &self,
         now: SystemTime,
@@ -254,7 +309,8 @@ impl<S: ObjectStore> Sweeper<S> {
         }
     }
 
-    /// Deletes the keys among `candidates` that the index does not record.
+    /// Deletes the keys among `candidates` that the index does not record and no open operation
+    /// names.
     async fn judge(
         &self,
         candidates: Vec<ObjectKey>,
@@ -268,6 +324,7 @@ impl<S: ObjectStore> Sweeper<S> {
         let names = candidates.iter().map(ToString::to_string).collect();
         let orphans = self.unreferenced(names).await?;
         report.referenced += asked.saturating_sub(orphans.len());
+        let orphans = unnamed(&self.gates.named, orphans, report).await?;
         for key in candidates {
             if !orphans.contains(&key.to_string()) {
                 continue;

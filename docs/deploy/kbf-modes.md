@@ -566,16 +566,20 @@ manifest and, given its action-tree writer, publishes each output directory as a
 manifest whose files point into the object, so a later input root holding the same directory
 reuses it.
 
-**The `cas/b/` janitor** (off by default; the `[task-runs]` table of `kbf.toml`). The packs and
+**The `cas/b/` janitor** (off by default, and a dry run until `--task-janitor-apply`; the
+`[task-runs]` table of `kbf.toml`). The packs and
 large objects tasks write under `cas/b/` are not all kept: a refused run, a run that failed after
 its write, the unused keys of a key set, and a large object the ingest has already copied into the
 CAS leave keys nothing refers to. With `--task-janitor-key-file` the leader (the server that holds
-its roles: the `leader` flag of `/readyz`) lists `cas/b/` every `--task-janitor-interval-secs` (default 900) and deletes
-a key that is older than `--task-janitor-grace-secs` (default 21600, which is also the least: the
+its roles: the `leader` flag of `/readyz`) lists `cas/b/` every `--task-janitor-interval-secs` (default 900) and,
+with `--task-janitor-apply`, deletes a key that is older than `--task-janitor-grace-secs` (default 21600, which is also the least: the
 18000 seconds at which an ingest refuses a key, the 4 hours the keys of a put directory are good for and an
 hour for the ingest, and an hour more as a margin between frontends), is not one an ingest is verifying
-right now, and is not recorded in the pack index (asked again for that key just before the
-delete; a pack the ingest recorded stays where it lies and is never deleted). The age is the
+right now, is not an object of a put directory an open operation's row names (the operations'
+rows, read once a page just before its deletes: a job that is queued or running keeps its
+directory whatever its age; a row that cannot be read stops the sweep before the page's deletes,
+counted in `..._sweep_errors_total`), and is not recorded in the pack index (asked again for that
+key just before the delete; a pack the ingest recorded stays where it lies and is never deleted). The age is the
 minute in the key's own name, for a pack (`-<k>`) and a large object (`-L<i>`) alike; a key under
 `cas/b/` whose name does not parse is kept and counted. It never lists or deletes under `cas/l/`
 (content-bound large objects), `cas/f/<writer>/` (frontend packs) or `cas/d/` (packs of the removed daemon). The
@@ -584,8 +588,12 @@ exactly `cas/b/`, owned by the server's user, mode 0600 or 0400; it signs the ja
 the store of `--pack-store-endpoint` (same endpoint, bucket and region), which the janitor needs,
 as it needs `--task-secret-file` and `--pack-index`. A sweep lists `--task-janitor-page-size`
 (default 500) keys at a time and waits `--task-janitor-page-pause-ms` (default 1000) after each
-page, which bounds how fast it lists and deletes. `--task-janitor-dry-run` counts and logs what a
-sweep would delete and deletes nothing. A key the janitor is about to delete is claimed in the
+page, which bounds how fast it lists and deletes. Without `--task-janitor-apply` a sweep counts and
+logs what it would delete (`kbf_cas_b_janitor_would_reap_total`) and deletes nothing, and
+`kbf_cas_b_janitor_apply` is 0: turn the janitor on, read what it would delete, then add
+`--task-janitor-apply`. An earlier release deleted by default unless `--task-janitor-dry-run`
+was given; that flag is still accepted and now says what the default says, and a frontend given
+it with `--task-janitor-apply` refuses to start. A key the janitor is about to delete is claimed in the
 registry the ingests hold their keys in, after the pack index's last answer and through the delete,
 and a claim and a hold on one key exclude each other: an ingest that has begun makes the janitor
 keep the key, and one that begins after the claim is refused (`claimed`) before it reads anything.
@@ -597,10 +605,11 @@ and a sweep that finds it lost stops (`..._abandoned_total`). A 401 or 403 on a 
 sweep at that key, and so do 5 deletes failing in a row; each is one `..._sweep_errors_total` and one log
 line. `GET /metrics` has `kbf_cas_b_janitor_listed_total`,
 `..._reaped_total`, `..._kept_young_total`, `..._kept_verifying_total`,
-`..._kept_referenced_total`, `..._kept_unparsed_total`, `..._kept_outside_total`,
+`..._kept_referenced_total`, `..._kept_named_total` (keys of a put directory an open operation
+names), `..._kept_unparsed_total`, `..._kept_outside_total`,
 `..._would_reap_total`, `..._reap_errors_total` (deletes the store refused, retried by the next
-sweep), `..._sweeps_total` and `..._sweep_errors_total` (sweeps the listing or the pack index
-stopped).
+sweep), `..._sweeps_total`, `..._sweep_errors_total` (sweeps the listing, the pack index or the
+read of the operations' rows stopped) and the gauge `kbf_cas_b_janitor_apply`.
 
 **The collector of tree lists** (off by default, and a dry run until told to delete; the
 `[executor]` table of `kbf.toml`). In the provider form (`--executor-input-tree provider`) and for
