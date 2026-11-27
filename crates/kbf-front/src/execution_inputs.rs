@@ -149,7 +149,7 @@ impl<D: Dispatch> ExecutionService<D> {
         // The Command and every input held: the run's preparation need not ask again, and a
         // tree written beside the check may be trusted.
         if let Some(at) = walked.held_since {
-            self.cache.vouch(action, at.min(reading));
+            self.cache.vouch(action, at.min(reading), walked.epoch);
         }
         if let Some(held) = held {
             held.held();

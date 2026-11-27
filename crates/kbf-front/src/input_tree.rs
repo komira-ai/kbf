@@ -413,6 +413,9 @@ pub(crate) struct Walked {
     /// any read or FindMissing its answer rests on (the oldest verification among the
     /// subtrees it skipped as remembered, else its own start). `None` for any other walk.
     pub(crate) held_since: Option<tokio::time::Instant>,
+    /// Of a walk over a store: the epoch it began under ([`crate::input_walk::Blobs::epoch`]),
+    /// which a finding that rests on it is believed under. `None` for any other walk.
+    pub(crate) epoch: Option<u64>,
 }
 
 /// The check of `digest` for this request: the request's own earlier start of it, a

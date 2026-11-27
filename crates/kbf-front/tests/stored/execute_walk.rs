@@ -22,7 +22,7 @@ use crate::rig::{Rig, SMALL, blob_of};
 
 /// An Action over a root that names the file `top` and a Directory `sub` naming the file
 /// `inner`: every blob of it, and the Action's digest. `tag` makes the tree distinct.
-fn action_tree(tag: &str) -> (Vec<(Digest, Bytes)>, Digest) {
+pub fn action_tree(tag: &str) -> (Vec<(Digest, Bytes)>, Digest) {
     let top = blob_of(format!("{tag} top").as_bytes());
     let inner = blob_of(format!("{tag} inner").as_bytes());
     let sub = blob_of(

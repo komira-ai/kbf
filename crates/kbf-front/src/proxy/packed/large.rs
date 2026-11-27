@@ -260,10 +260,18 @@ impl Reading {
     /// The failure of a blob whose object is other bytes than its digest: the row is dropped,
     /// so the blob is missing and a client uploads it again.
     async fn damaged(&self) -> Status {
-        self.packs.loss.damaged();
         let digest = to_index(&self.digest);
         let (index, pack_key) = (Arc::clone(&self.packs.index), self.pack_key.clone());
-        let dropped = offload(move || index.drop_location(&digest, &pack_key)).await;
+        let loss = Arc::clone(&self.packs.loss);
+        // Counted before the drop and again once it has returned, on the blocking call, so that
+        // a read dropped while it runs still counts its end (`kbf_pack::LossGuard::found`).
+        self.packs.loss.damaged();
+        let dropped = offload(move || {
+            let dropped = index.drop_location(&digest, &pack_key);
+            loss.damaged();
+            dropped
+        })
+        .await;
         self.packs.metrics.digest_mismatches.add(1);
         self.packs
             .metrics

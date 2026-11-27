@@ -538,9 +538,10 @@ impl Packs {
     }
 
     /// How many times a read or a check through these packs, or any clone of them, has found a
-    /// blob the index records absent from its pack, or other bytes than its digest
-    /// ([`LossGuard::found`]): each is counted before its pack is forgotten or its location
-    /// dropped, and this process removes a row of the index no other way. A walk of an input
+    /// blob the index records absent from its pack, or other bytes than its digest, and how
+    /// many forgets and drops of rows those ended in have returned ([`LossGuard::found`]): each
+    /// loss is counted before its pack is forgotten or its location dropped, and again once that
+    /// has returned, and this process removes a row of the index no other way. A walk of an input
     /// tree remembers what it found held only while this stays the same
     /// (`crate::input_walk::Blobs::epoch`). A row another process removes does not move it.
     pub(crate) fn losses(&self) -> u64 {

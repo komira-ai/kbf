@@ -33,3 +33,4 @@ mod lost;
 mod outage;
 mod rig;
 mod slow;
+mod wrong_memory;
