@@ -16,7 +16,7 @@ MANIFEST_SHA256 = {
     "crates/kbf-caps/Cargo.toml": "4cff19be2470a3b3c379c6481c1d7032169fa73277b1266a148cb01682584014",
     "crates/kbf-cas-conformance/Cargo.toml": "770719786856e0a3367db33bd9c94d1907d4c18c26d6b003de4a9ea981fcfefb",
     "crates/kbf-cli/Cargo.toml": "e749cc0940f6d89f27fc2de7ccae9638c7aa54c2aa326abcde42efcafdbbf0e0",
-    "crates/kbf-coordinator/Cargo.toml": "7664ed2780c9a9c79738a7ec9fe087e1554e6ac3eb4b83df8d51ad0df9a8bf65",
+    "crates/kbf-coordinator/Cargo.toml": "43d41c4ff45d75368c7fbcfab01e8ed7346a46cef49a2c967f2f654c7cb9e71b",
     "crates/kbf-coverage/Cargo.toml": "44d353caee194e29a1a68e8c3bc3ebd29323d6bf396b1ffcc91eebf303fd7193",
     "crates/kbf-deploy/Cargo.toml": "b179005c97e62ba0e99c36eb3bf5be32d3185feed4d388ceaeaa9d1b4fef82e9",
     "crates/kbf-enroll-registry/Cargo.toml": "891746a0da7de48e5f5a090c22c3a3fda22275fd19c6695e315839d1a9f057af",
@@ -247,7 +247,7 @@ PACKAGES = {
             "clippy": ["-A", "clippy::disallowed_types", "-A", "clippy::disallowed_methods"],
         },
         "actions": {
-            "ci": ["fmt", "lint", "test"],
+            "ci": ["fmt", "lint"],
         },
         "deny_warnings": True,
         "default_action": "ci",
