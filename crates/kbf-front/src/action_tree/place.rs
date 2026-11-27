@@ -389,3 +389,7 @@ impl Checked {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "place_tests.rs"]
+mod tests;
