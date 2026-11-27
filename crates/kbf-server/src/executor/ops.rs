@@ -1,5 +1,12 @@
 //! The operations a process holds: the open ones by id and by action, their callers' stage, the
 //! cancel of each, and the finished ones a `WaitExecution` may still ask for by name.
+//!
+//! A caller of an open operation is a receiver of its stage: each Execute and WaitExecution
+//! stream holds one for as long as it is open, and a GetOperation or CancelOperation for the
+//! length of the call. Every receiver is made here ([`Ops::open`], [`Ops::join`],
+//! [`Ops::ticket`]), and each one made after the first counts a join ([`Callers::joins`]), which
+//! is what wakes the watch that cancels an operation no caller is left on
+//! ([`crate::executor::callers`]).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -18,6 +25,19 @@ struct Open {
     stage: watch::Sender<Stage>,
     /// Set when a caller cancels it.
     cancel: watch::Sender<bool>,
+    /// How many receivers of `stage` were made after the first: dropped with the operation,
+    /// which ends the watch of its callers.
+    joins: watch::Sender<u64>,
+}
+
+impl Open {
+    /// A new receiver of the stage, counted as a join.
+    fn subscribe(&self) -> watch::Receiver<Stage> {
+        let stage = self.stage.subscribe();
+        self.joins
+            .send_modify(|joins| *joins = joins.wrapping_add(1));
+        stage
+    }
 }
 
 /// An operation another frontend runs, watched here for a caller that asked for it by name.
@@ -36,6 +56,27 @@ pub(crate) struct Ops {
     ended: VecDeque<(Instant, OperationId)>,
     /// The next id of a process with no state store.
     next: u64,
+}
+
+/// What the watch of an open operation's callers sees of it: how many receivers of its stage
+/// there are, and when another is made.
+pub(crate) struct Callers {
+    /// The stage, for its receivers alone: a watch holds it and sends nothing on it.
+    pub(crate) stage: watch::Sender<Stage>,
+    /// Changed at each join; closed once the operation is no longer open here (it finished, or
+    /// another process runs it now).
+    pub(crate) joins: watch::Receiver<u64>,
+}
+
+/// What [`Ops::cancel_unwatched`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unwatched {
+    /// The operation is not open here, or a caller cancelled it already.
+    Gone,
+    /// A caller is on it.
+    Watched,
+    /// No caller is on it: it is cancelled now.
+    Cancelled,
 }
 
 /// The operation a request joins: one already open for the same action.
@@ -84,7 +125,7 @@ impl Ops {
             .filter(|open| !*open.cancel.borrow())?;
         Some(Joined {
             operation,
-            stage: open.stage.subscribe(),
+            stage: open.subscribe(),
         })
     }
 
@@ -96,6 +137,7 @@ impl Ops {
     ) -> (watch::Receiver<Stage>, watch::Receiver<bool>) {
         let (stage, seen) = watch::channel(Stage::Queued);
         let (cancel, cancelled) = watch::channel(false);
+        let (joins, _) = watch::channel(0);
         // An operation taken up from the state store does not displace a live one of the same
         // action, which new requests go on joining; a cancelled one is displaced.
         let live = self
@@ -106,8 +148,48 @@ impl Ops {
         if !live {
             self.by_key.insert(key.clone(), operation);
         }
-        self.open.insert(operation, Open { key, stage, cancel });
+        self.open.insert(
+            operation,
+            Open {
+                key,
+                stage,
+                cancel,
+                joins,
+            },
+        );
         (seen, cancelled)
+    }
+
+    /// What the watch of the callers of the open `operation` sees of it; none when it is not
+    /// open here.
+    pub(crate) fn callers(&self, operation: OperationId) -> Option<Callers> {
+        self.open.get(&operation).map(|open| Callers {
+            stage: open.stage.clone(),
+            joins: open.joins.subscribe(),
+        })
+    }
+
+    /// Cancels the open `operation` if no caller is on it and no caller has cancelled it: the
+    /// same cancel as [`Ops::cancel`], which its task answers CANCELLED.
+    pub(crate) fn cancel_unwatched(&self, operation: OperationId) -> Unwatched {
+        let Some(open) = self.open.get(&operation) else {
+            return Unwatched::Gone;
+        };
+        if open.stage.receiver_count() > 0 {
+            return Unwatched::Watched;
+        }
+        if open.cancel.send_replace(true) {
+            Unwatched::Gone
+        } else {
+            Unwatched::Cancelled
+        }
+    }
+
+    /// How many callers of this process wait on the followed `operation`: its receivers.
+    pub(crate) fn followers(&self, operation: OperationId) -> usize {
+        self.followed
+            .get(&operation)
+            .map_or(0, |followed| followed.stage.receiver_count())
     }
 
     /// Shows `stage` to the callers of the open `operation`, if it is not what they see.
@@ -200,7 +282,7 @@ impl Ops {
             stage,
         };
         if let Some(open) = self.open.get(&operation) {
-            return Some(ticket(&open.key, open.stage.subscribe()));
+            return Some(ticket(&open.key, open.subscribe()));
         }
         if let Some(followed) = self.followed.get(&operation) {
             return Some(ticket(&followed.key, followed.stage.subscribe()));

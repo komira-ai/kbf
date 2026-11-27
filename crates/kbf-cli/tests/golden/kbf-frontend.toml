@@ -122,6 +122,8 @@ executor-max-run-secs = 3000
 # Removed with the executor's presigned path. Any value is refused at start
 # (not in --help)
 # executor-network = "VALUE"
+# How long an operation no Execute or WaitExecution waits on is left running for a client to come back, in seconds; then it is cancelled, as a CancelOperation would, and its job with it. A client that went silent is taken for gone only once the listener closes its connection (`--http2-keepalive-interval-secs` and `--http2-keepalive-timeout-secs` together), so keep this above those. Over a state store a caller on another frontend counts. 0 never cancels an operation for having no caller. Used only with `--executor js-agent`
+executor-no-caller-grace-secs = 600
 # Retired: no longer read, every Execute is a job of the job service
 # (not in --help)
 # executor-ownership = "MODE"

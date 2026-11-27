@@ -242,3 +242,76 @@ fn a_cancelled_operation_is_not_joined() {
         "its own callers still read it by name"
     );
 }
+
+// ---- the callers of an open operation
+
+/// Catches a receiver of the stage made without counting a join, or the first counted as one:
+/// the first caller's is not a join, each Execute that joins and each ticket by name is, and
+/// every one of them is a receiver.
+#[test]
+fn each_receiver_after_the_first_is_counted_as_a_join() {
+    let mut ops = Ops::new(None);
+    let (first, _cancel) = ops.open(OperationId(1), key(1));
+    let callers = ops.callers(OperationId(1)).expect("open");
+    assert_eq!(*callers.joins.borrow(), 0, "the first caller is no join");
+    let joined = ops.join(&key(1)).expect("joined");
+    assert_eq!(*callers.joins.borrow(), 1);
+    let named = ops.ticket(OperationId(1)).expect("a ticket");
+    assert_eq!(*callers.joins.borrow(), 2);
+    assert_eq!(callers.stage.receiver_count(), 3);
+    drop((first, joined, named));
+    assert_eq!(callers.stage.receiver_count(), 0);
+    assert!(ops.callers(OperationId(2)).is_none(), "not open");
+}
+
+/// Catches a cancel for want of a caller that cancels an operation a caller is on, that cancels
+/// one twice, or that counts one a caller cancelled: with a receiver it is watched and left
+/// alone; with none it is cancelled, once, and its task sees the cancel; an operation a caller
+/// cancelled, or one not open, is gone.
+#[test]
+fn an_operation_is_cancelled_for_want_of_a_caller_only_with_none_on_it() {
+    let mut ops = Ops::new(None);
+    let (stage, cancel) = ops.open(OperationId(1), key(1));
+    assert_eq!(ops.cancel_unwatched(OperationId(1)), Unwatched::Watched);
+    assert!(!*cancel.borrow(), "a watched operation is not cancelled");
+    drop(stage);
+    assert_eq!(ops.cancel_unwatched(OperationId(1)), Unwatched::Cancelled);
+    assert!(*cancel.borrow(), "its task sees the cancel");
+    assert_eq!(ops.cancel_unwatched(OperationId(1)), Unwatched::Gone);
+    let (theirs, _cancelled) = ops.open(OperationId(2), key(2));
+    drop(theirs);
+    assert!(ops.cancel(OperationId(2)));
+    assert_eq!(
+        ops.cancel_unwatched(OperationId(2)),
+        Unwatched::Gone,
+        "a caller cancelled it first"
+    );
+    assert_eq!(ops.cancel_unwatched(OperationId(3)), Unwatched::Gone);
+}
+
+/// Catches a watch left running on an operation that is no longer open here: the joins close
+/// when it finishes, and when it is handed over to another process.
+#[tokio::test(start_paused = true)]
+async fn the_joins_close_when_the_operation_finishes_or_is_handed_over() {
+    let mut ops = Ops::new(None);
+    let _first = ops.open(OperationId(1), key(1));
+    let _second = ops.open(OperationId(2), key(2));
+    let mut finished = ops.callers(OperationId(1)).expect("open");
+    let mut handed = ops.callers(OperationId(2)).expect("open");
+    ops.finish(OperationId(1), failed("done"), Instant::now());
+    ops.hand_over(OperationId(2));
+    assert!(finished.joins.changed().await.is_err());
+    assert!(handed.joins.changed().await.is_err());
+}
+
+/// The callers of a followed operation are its receivers; one not followed has none.
+#[test]
+fn a_followed_operations_callers_are_its_receivers() {
+    let mut ops = Ops::new(None);
+    let (one, _) = ops.follower(OperationId(7), key(1));
+    let (two, _) = ops.follower(OperationId(7), key(1));
+    assert_eq!(ops.followers(OperationId(7)), 2);
+    drop((one, two));
+    assert_eq!(ops.followers(OperationId(7)), 0);
+    assert_eq!(ops.followers(OperationId(8)), 0);
+}

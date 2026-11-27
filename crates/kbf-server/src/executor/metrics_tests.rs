@@ -86,7 +86,7 @@ type Counted<'a> = (&'a str, &'a dyn Fn(&Metrics), u32);
 #[test]
 fn each_plain_counter_renders_under_its_name_and_counts() {
     let metrics = Metrics::default();
-    let calls: [Counted<'_>; 6] = [
+    let calls: [Counted<'_>; 7] = [
         (
             "kbf_executor_jobs_submitted_total",
             &Metrics::job_submitted,
@@ -116,6 +116,11 @@ fn each_plain_counter_renders_under_its_name_and_counts() {
             "kbf_executor_host_silence_seen_total",
             &Metrics::host_silence,
             6,
+        ),
+        (
+            "kbf_executor_operations_cancelled_no_caller_total",
+            &Metrics::cancelled_no_caller,
+            7,
         ),
     ];
     for (_, call, times) in &calls {
@@ -173,4 +178,32 @@ fn a_refused_tree_list_is_counted_by_the_step_taken() {
     for path in [MissPath::Republish, MissPath::Manifests] {
         assert_eq!(RunEnd::of(&Settled::ListRefused(path)), RunEnd::ListRefused);
     }
+}
+
+/// Catches the gauge of operations with no caller rendered as a counter, or one that does not
+/// come down when a grace ends: it is the operations whose grace has started and not ended.
+#[test]
+fn the_operations_with_no_caller_are_a_gauge_that_comes_down() {
+    let metrics = Metrics::default();
+    let rendered = |metrics: &Metrics| {
+        let mut text = String::new();
+        metrics.render(&mut text);
+        text
+    };
+    let text = rendered(&metrics);
+    assert!(
+        text.contains(
+            "# TYPE kbf_executor_operations_no_caller gauge\nkbf_executor_operations_no_caller 0\n"
+        ),
+        "{text}"
+    );
+    for _ in 0..3 {
+        metrics.no_caller(true);
+    }
+    metrics.no_caller(false);
+    let text = rendered(&metrics);
+    assert!(
+        text.contains("\nkbf_executor_operations_no_caller 2\n"),
+        "{text}"
+    );
 }

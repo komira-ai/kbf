@@ -593,6 +593,36 @@ fn live_secs_defaults_to_the_executors_own_and_becomes_the_config() {
     }
 }
 
+/// Asserts the grace of an operation with no caller: with no flag it is
+/// `crate::executor::NO_CALLER_GRACE` (600 s), the flag's literal default and the executor's
+/// own; a given time is read in seconds into the config, zero among them (the cancel off); a
+/// time that is no number, or negative, is refused naming the flag.
+#[test]
+fn no_caller_grace_secs_defaults_to_the_executors_own_and_becomes_the_config() {
+    let grace = |more: &[&str]| {
+        let flags = js_with(more).expect("flags");
+        flags.executor.js.expect("js-agent").config.no_caller_grace
+    };
+    assert_eq!(grace(&[]), crate::executor::NO_CALLER_GRACE);
+    assert_eq!(grace(&[]), Duration::from_secs(600));
+    let given = grace(&["--executor-no-caller-grace-secs=900"]);
+    assert_eq!(given, Duration::from_secs(900));
+    assert_eq!(
+        grace(&["--executor-no-caller-grace-secs=0"]),
+        Duration::ZERO
+    );
+    for bad in [
+        "--executor-no-caller-grace-secs=soon",
+        "--executor-no-caller-grace-secs=-1",
+    ] {
+        let why = refused(&[bad]);
+        assert!(
+            why.contains("--executor-no-caller-grace-secs"),
+            "{bad}: {why}"
+        );
+    }
+}
+
 /// Asserts that the frontend's `--finished-retention-secs` is not an executor flag: the
 /// executor's flags carry the executor's own default until `build` is given the retention.
 #[test]
@@ -731,7 +761,11 @@ fn the_retired_flags_are_hidden_from_help() {
         assert!(arg.is_hide_set(), "{long}");
         assert!(arg.get_value_names().is_some(), "{long}");
     }
-    for kept in ["--executor-poll-ms", "--executor-live-secs"] {
+    for kept in [
+        "--executor-poll-ms",
+        "--executor-live-secs",
+        "--executor-no-caller-grace-secs",
+    ] {
         assert!(help.contains(kept), "{kept} in help");
     }
     for gone in [

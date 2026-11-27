@@ -81,7 +81,8 @@ that did not succeed, and the task tool exits 0 whenever the action ran). It is 
 the input (the agent's code or the path) and the host. The service at the pin cannot be asked to avoid a host, so the next
 job goes where it places it.
 
-`CancelOperation` cancels the job (`CancelJob`) and answers the callers `CANCELLED`. A stream that ends does not cancel.
+`CancelOperation` cancels the job (`CancelJob`) and answers the callers `CANCELLED`. A stream that ends does not cancel at
+once; an operation left with no stream for `--executor-no-caller-grace-secs` (600 s) is cancelled the same way (section 3).
 
 ## 3. Over a state store: answers by name, restarts and N frontends
 
@@ -91,6 +92,7 @@ job goes where it places it.
 | `exec/live/<instance>` | this process is alive; renewed every quarter of `--executor-live-secs` (20 s), with that time to live |
 | `exec/op/<operation>` | an unfinished operation: owner, instance, action, attempt, job id, put directory, and the tree list its job reads when it has one (version byte + JSON) |
 | `exec/act/<hash>-<size>/<instance, hex>` | the unfinished operation of an action (version byte + 8-byte id), written with the first attempt's `exec/op/` row and deleted with its answer |
+| `exec/watch/<operation>/<instance, hex>` | a caller of this process waits on an operation another process runs; renewed every quarter of `--executor-live-secs` while one does, with that time to live |
 | `done/<operation>`, `doneof/<operation>` | how it finished and what it ran (the format of earlier releases), at least 10 minutes |
 
 - **By name.** `WaitExecution` and `GetOperation` of `operations/<id>` are answered from memory, else from `done/`; an
@@ -104,13 +106,20 @@ job goes where it places it.
   by its `exec/act/` row) instead of submitting a job of its own, and is answered with its answer under its own name; the
   join of Executes within one process stays in memory. A follower whose operation its own callers cancelled runs the action
   itself. A row naming an operation that is no longer open (an earlier release finished it) is deleted and written again.
+- **No caller left.** An operation no Execute or WaitExecution stream has waited on for `--executor-no-caller-grace-secs`
+  (600 s) is cancelled as a `CancelOperation` would. A caller on another frontend counts: that frontend keeps the
+  operation's `exec/watch/` row of its own alive while it has one, and the owner reads those rows every
+  `--executor-live-secs` of the grace, each one found starting it again. An operation taken up with no caller has its grace
+  start at the take-up.
 - **Ownership.** Only the row's owner writes it, each write a compare-and-set on the version it read with itself as owner; an
   owner that lost the row stops running the operation and its callers follow the answer the new owner writes.
 
-What an earlier release loses by not knowing `exec/live/`, `exec/op/` and `exec/act/` (B8): nothing it reads; its own `op/` rows
+What an earlier release loses by not knowing `exec/live/`, `exec/op/`, `exec/act/` and `exec/watch/` (B8): nothing it reads; its own `op/` rows
 are not read by this release, so a client of an operation it left reattaches by Execute (a cache hit or a new run). It writes no
 `exec/act/` row, so an Execute on a frontend of this release does not join an operation an earlier release runs: the join across
-frontends is lost while both run, nothing else. The `exec/op/` row's `tree`, the key of the tree list the attempt's job
+frontends is lost while both run, nothing else. It writes no `exec/watch/` row and cancels nothing for want of a caller: a
+caller it holds on an operation this release runs is not seen, so once that operation's own callers have been gone for the grace
+it is cancelled and that caller answered `CANCELLED`, as a cut stream would have been, while both run. The `exec/op/` row's `tree`, the key of the tree list the attempt's job
 reads (the provider form, and every Mac job), is a field an earlier release ignores; it is left out of a row with no list, so
 such a row has an earlier release's bytes. A row an earlier release writes names no list (one it takes up and writes again
 loses the field), so the collector of tree lists protects that release's lists by their age alone.

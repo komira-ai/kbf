@@ -1,7 +1,8 @@
 //! What the executor counts, for `GET /metrics`: how the runs ended, what the ingest made of
 //! the packs, and what it asked of the job service: the jobs submitted, those submitted again
 //! after an answer was lost, the operations run again as a new attempt, the jobs cancelled for
-//! their callers, the operations taken up from the state store, and the jobs seen on a host that
+//! their callers, the operations cancelled because no caller was left on them and those with
+//! none now, the operations taken up from the state store, and the jobs seen on a host that
 //! missed its grace; how long the phases of a run ([`crate::executor::phases`]) and the
 //! steps of its preparation and submit ([`crate::executor::steps`]) took; and where the time of
 //! an action tree's writes went, and how many manifests each tree wrote
@@ -147,6 +148,9 @@ pub struct Metrics {
     jobs_resubmitted: AtomicU64,
     attempts: AtomicU64,
     jobs_cancelled: AtomicU64,
+    cancelled_no_caller: AtomicU64,
+    /// Open operations whose grace with no caller is running: a gauge.
+    no_caller: AtomicU64,
     reattached: AtomicU64,
     joined: AtomicU64,
     host_silence_seen: AtomicU64,
@@ -221,6 +225,21 @@ impl Metrics {
     /// The job service answered a cancel of a job, asked for by its operation's callers.
     pub(crate) fn job_cancelled(&self) {
         self.jobs_cancelled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An operation was cancelled because no caller had waited on it for the grace.
+    pub(crate) fn cancelled_no_caller(&self) {
+        self.cancelled_no_caller.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An open operation's last caller left (`true`), or its grace with no caller ended
+    /// (`false`): each `true` is followed by one `false`.
+    pub(crate) fn no_caller(&self, alone: bool) {
+        if alone {
+            self.no_caller.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.no_caller.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// An unfinished operation another process left in the state store was taken up.
@@ -306,8 +325,13 @@ impl Metrics {
             ),
             (
                 "kbf_executor_jobs_cancelled_total",
-                "Cancels of jobs, asked for by their operation's callers, the job service answered",
+                "Cancels of jobs, asked for by their operation's callers or for no caller left on it, the job service answered",
                 &self.jobs_cancelled,
+            ),
+            (
+                "kbf_executor_operations_cancelled_no_caller_total",
+                "Operations cancelled because no Execute or WaitExecution had waited on them for the grace",
+                &self.cancelled_no_caller,
             ),
             (
                 "kbf_executor_operations_reattached_total",
@@ -333,6 +357,14 @@ impl Metrics {
                 count.load(Ordering::Relaxed)
             );
         }
+        let _ = writeln!(
+            out,
+            "# HELP kbf_executor_operations_no_caller Open operations no Execute or \
+             WaitExecution waits on, whose grace before they are cancelled is running\n\
+             # TYPE kbf_executor_operations_no_caller gauge\n\
+             kbf_executor_operations_no_caller {}",
+            self.no_caller.load(Ordering::Relaxed)
+        );
         self.phases.render(out);
         self.steps.render(out);
         self.tree_writes.render(out);
