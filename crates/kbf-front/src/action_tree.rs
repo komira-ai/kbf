@@ -200,7 +200,8 @@ pub enum NoTree {
     /// The pack index and the presence checks did not answer within [`LOOKUP_DEADLINE`].
     #[error("where the blobs are was not found out within {LOOKUP_DEADLINE:?}")]
     Deadline,
-    /// `cas/l/` holds an object of another length than the blob's at the blob's key.
+    /// A create-only write of a blob to `cas/l/` found the blob's key taken by an object of
+    /// another length than the blob's (the next tree's write deletes it and writes the blob).
     #[error("cas/l/ holds an object of {length} bytes for {digest}")]
     WrongLength {
         /// The blob.

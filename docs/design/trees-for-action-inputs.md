@@ -298,7 +298,7 @@ returned value, to name a child (5.3). Entries come from the kept closure (`Kept
 3. **Neither:** the blob is written to `cas/l/<sha256>` through the existing hash-while-streaming writer (`place::write_whole`, B16: read once, no
    whole-file buffering), then as 2.
 
-An object of another length at `cas/l/<sha256>` stays `NoTree::WrongLength`. This reuses `place::locate` and `place::write_whole` unchanged;
+An object of another length at `cas/l/<sha256>` is a write the store kept cut short: it is deleted and the blob written as in 3. This reuses `place::locate` and `place::write_whole` unchanged;
 the manifest encoder (`encode.rs`) and `write_manifest` are what the `trees` mode stops calling.
 
 **Tree identity.** The node's tree digest covers names, kinds, modes, symlink targets and each file's `sha256` and `size`, and *not* `from` (tierstore
