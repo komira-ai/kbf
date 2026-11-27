@@ -39,7 +39,11 @@
 //!   over it asks the store nothing about it. And "held" is the pack index's row, never a
 //!   look at the object: an object that went away while its row stays, or a large object
 //!   (`cas/l/`) of another length than its row says, is not found by a walk, with the memory
-//!   or without it, but by the read of it, which fails. The memory is not a single flight
+//!   or without it, but by the read of it, which fails. A run over a tree a row of which
+//!   another frontend removed fails to write its action tree (the farm's failure, which the executor runs again);
+//!   its preparation takes the Execute's finding once, so the next one checks for itself and
+//!   answers the blob missing, as the Execute does when it finds the blob gone (another
+//!   Execute of the Action in between vouches again). The memory is not a single flight
 //!   either: the first walk of a tree is made by every Execute that reaches the tree before
 //!   one walk of it has ended, and a subtree a walk skips keeps the time of the walk that
 //!   verified it (a use does not extend it), so a shared subtree is walked again in full once

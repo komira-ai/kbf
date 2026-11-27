@@ -32,3 +32,4 @@ mod large;
 mod lost;
 mod rig;
 mod slow;
+mod wrong_memory;
