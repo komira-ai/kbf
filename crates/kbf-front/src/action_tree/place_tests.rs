@@ -166,12 +166,12 @@ async fn a_write_keeps_a_held_blob_and_deletes_an_object_of_another_length() {
         .await
         .expect("written");
     let short_key = large_key(&short).to_string();
-    assert_eq!(*locked(&bucket.deleted), [short_key.clone()]);
     let written: BTreeSet<String> = locked(&bucket.written).iter().cloned().collect();
     assert_eq!(
         written,
-        BTreeSet::from([short_key, large_key(&nowhere).to_string()])
+        BTreeSet::from([short_key.clone(), large_key(&nowhere).to_string()])
     );
+    assert_eq!(*locked(&bucket.deleted), [short_key]);
     assert_eq!(locked(&bucket.written).len(), 2);
     for digest in [held, short, nowhere] {
         assert_eq!(bucket.object(&digest), bucket.blobs.get(&digest).cloned());
