@@ -24,8 +24,10 @@
 //!
 //! What a grace does not touch: a job that ended before the grace ran out is read and its
 //! result written to the action cache when the action may be cached, as for any job, whether a
-//! caller is there to take the answer or not; and an operation that has been cancelled is not
-//! joined, so an Execute of its action after the cancel opens a new operation.
+//! caller is there to take the answer or not: while its pack is read (a Mac's waits for the
+//! store to have it) a grace that runs out cancels nothing and starts again
+//! ([`Unwatched::Reading`]). An operation that has been cancelled is not joined, so an Execute
+//! of its action after the cancel opens a new operation.
 
 use std::sync::Arc;
 
@@ -115,7 +117,9 @@ async fn alone_for(
             continue;
         }
         return match inner.ops().cancel_unwatched(operation) {
-            Unwatched::Watched => Grace::Joined,
+            // Watched again, or its job ended and its pack is being read: a new grace starts
+            // once the read is over or the caller leaves, if the operation is still open.
+            Unwatched::Watched | Unwatched::Reading => Grace::Joined,
             Unwatched::Gone => Grace::Over,
             Unwatched::Cancelled => {
                 inner.deps.metrics.cancelled_no_caller();

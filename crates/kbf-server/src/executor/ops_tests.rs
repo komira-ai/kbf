@@ -315,3 +315,23 @@ fn a_followed_operations_callers_are_its_receivers() {
     assert_eq!(ops.followers(OperationId(7)), 0);
     assert_eq!(ops.followers(OperationId(8)), 0);
 }
+
+/// Catches a grace that throws away the pack of a job that ended: while the pack is read the
+/// operation is not cancelled for want of a caller, and once the read is over it is.
+#[test]
+fn an_operation_whose_pack_is_read_is_not_cancelled_for_want_of_a_caller() {
+    let mut ops = Ops::new(None);
+    let (stage, cancel) = ops.open(OperationId(1), key(1));
+    drop(stage);
+    ops.reading(OperationId(1), true);
+    assert_eq!(ops.cancel_unwatched(OperationId(1)), Unwatched::Reading);
+    assert!(!*cancel.borrow());
+    ops.reading(OperationId(1), false);
+    assert_eq!(ops.cancel_unwatched(OperationId(1)), Unwatched::Cancelled);
+    ops.reading(OperationId(2), true);
+    assert_eq!(
+        ops.cancel_unwatched(OperationId(2)),
+        Unwatched::Gone,
+        "not open"
+    );
+}

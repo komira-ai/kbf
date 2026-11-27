@@ -71,6 +71,16 @@ fn code_of(finished: &Finished) -> i32 {
     }
 }
 
+/// The cancel reached the running `job`: its host, asked to stop it, stops it, and it ends
+/// cancelled.
+fn stopped(rig: &Rig, job: &str) {
+    assert!(
+        rig.fake.host_stopped(job),
+        "the host was not asked to stop {job}"
+    );
+    assert_eq!(job_state(rig, job), JobState::Cancelled);
+}
+
 fn job_state(rig: &Rig, job: &str) -> JobState {
     let jobs = rig.fake.jobs();
     jobs.iter().find(|j| j.id == job).expect("the job").state()
@@ -107,7 +117,7 @@ async fn the_only_callers_leaving_cancels_the_job_once_the_grace_runs_out() {
 
     rig.advance(Duration::from_millis(1)).await;
     assert_eq!(rig.calls_of("CancelJob"), 1);
-    assert_eq!(job_state(&rig, &job), JobState::Cancelled);
+    stopped(&rig, &job);
     assert_eq!(rig.counted(CANCELLED), 1);
     assert_eq!(rig.counted("kbf_executor_jobs_cancelled_total "), 1);
     assert_eq!(rig.counted(ALONE), 0);
@@ -155,7 +165,7 @@ async fn an_execute_inside_the_grace_joins_the_operation_and_keeps_its_job() {
     );
     rig.advance(Duration::from_millis(1)).await;
     assert_eq!(rig.calls_of("CancelJob"), 1);
-    assert_eq!(job_state(&rig, &job), JobState::Cancelled);
+    stopped(&rig, &job);
 }
 
 /// Catches a WaitExecution inside the grace that does not count as a caller: it keeps the job
@@ -282,9 +292,12 @@ async fn a_wait_execution_on_another_frontend_keeps_the_job() {
     let (caller, job) = running(&rig, 1).await;
     let other = rig.executor("p-other");
     let remote = Caller::of(other.wait(&caller.name).expect("followed from the store"));
-    rig.advance(rig.cfg.poll).await;
-    let watched = rig.rows("reader").watched(caller.operation());
-    assert_eq!(watched, Ok(true), "the other frontend wrote its row");
+    let reader = rig.rows("reader");
+    let operation = caller.operation();
+    rig.until("the other frontend wrote its row", || {
+        reader.watched(operation) == Ok(true)
+    })
+    .await;
     leaves(caller).await;
 
     pass(&rig, GRACE * 3).await;
@@ -297,7 +310,7 @@ async fn a_wait_execution_on_another_frontend_keeps_the_job() {
     drop(remote);
     rig.until("the job is cancelled", || rig.calls_of("CancelJob") == 1)
         .await;
-    assert_eq!(job_state(&rig, &job), JobState::Cancelled);
+    stopped(&rig, &job);
     assert_eq!(rig.counted(CANCELLED), 1);
 }
 
@@ -337,7 +350,7 @@ async fn an_unreadable_store_cancels_nothing_until_it_is_read() {
     store.reads_fail.store(false, Ordering::SeqCst);
     rig.until("the job is cancelled", || rig.calls_of("CancelJob") == 1)
         .await;
-    assert_eq!(job_state(&rig, &job), JobState::Cancelled);
+    stopped(&rig, &job);
 }
 
 /// The same with a read that breaks its task, which says nothing either.
@@ -370,9 +383,11 @@ async fn a_watch_row_names_one_operation_and_expires_unless_renewed() {
     assert_eq!(reader.watched(OperationId(1)), Ok(true));
     assert_eq!(reader.watched(OperationId(0x10)), Ok(false));
     assert_eq!(reader.watched(OperationId(0x100)), Ok(false));
-    rig.advance(rig.cfg.live - Duration::from_millis(1)).await;
+    // The fake store's clock also moves by the time of each sync, a few milliseconds a write:
+    // the bound is checked a second either side.
+    rig.advance(rig.cfg.live - Duration::from_secs(1)).await;
     assert_eq!(reader.watched(OperationId(1)), Ok(true));
-    rig.advance(Duration::from_millis(1)).await;
+    rig.advance(Duration::from_secs(1)).await;
     assert_eq!(reader.watched(OperationId(1)), Ok(false), "expired");
 }
 
@@ -426,7 +441,7 @@ async fn an_operation_taken_up_with_no_caller_is_cancelled_after_the_grace() {
     assert_eq!(rig.calls_of("CancelJob"), 0);
     rig.advance(Duration::from_millis(1)).await;
     assert_eq!(rig.calls_of("CancelJob"), 1);
-    assert_eq!(job_state(&rig, &job), JobState::Cancelled);
+    stopped(&rig, &job);
     running.stop().await;
 }
 

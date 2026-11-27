@@ -728,8 +728,10 @@ async fn watch_job(
             Ended::Again(settled, Some(output))
         }
         Verdict::Ingest => {
-            let ingested = ingest_ended(inner, run, &op.key, (&read, &submitted.key), cancel);
-            let Some(ingested) = ingested.await else {
+            inner.ops().reading(op.id, true);
+            let ingested = ingest_ended(inner, run, &op.key, (&read, &submitted.key), cancel).await;
+            inner.ops().reading(op.id, false);
+            let Some(ingested) = ingested else {
                 return Ended::Cancelled;
             };
             timeline.stamp(Mark::Done, Instant::now(), metrics);

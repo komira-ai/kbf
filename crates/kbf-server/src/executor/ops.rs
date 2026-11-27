@@ -28,6 +28,8 @@ struct Open {
     /// How many receivers of `stage` were made after the first: dropped with the operation,
     /// which ends the watch of its callers.
     joins: watch::Sender<u64>,
+    /// Whether the pack of a job that ended is being read: no caller is needed for that.
+    reading: bool,
 }
 
 impl Open {
@@ -75,6 +77,8 @@ pub(crate) enum Unwatched {
     Gone,
     /// A caller is on it.
     Watched,
+    /// Its job ended and its pack is being read, which a cancel would throw away.
+    Reading,
     /// No caller is on it: it is cancelled now.
     Cancelled,
 }
@@ -155,6 +159,7 @@ impl Ops {
                 stage,
                 cancel,
                 joins,
+                reading: false,
             },
         );
         (seen, cancelled)
@@ -178,10 +183,21 @@ impl Ops {
         if open.stage.receiver_count() > 0 {
             return Unwatched::Watched;
         }
+        if open.reading {
+            return Unwatched::Reading;
+        }
         if open.cancel.send_replace(true) {
             Unwatched::Gone
         } else {
             Unwatched::Cancelled
+        }
+    }
+
+    /// Marks the open `operation`'s job as ended with its pack being read (`true`), or the read
+    /// as over: while it is read, the operation is not cancelled for want of a caller.
+    pub(crate) fn reading(&mut self, operation: OperationId, reading: bool) {
+        if let Some(open) = self.open.get_mut(&operation) {
+            open.reading = reading;
         }
     }
 

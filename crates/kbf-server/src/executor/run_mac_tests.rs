@@ -197,3 +197,34 @@ async fn a_mac_operations_row_names_its_jobs_tree_list() {
     let row = rig.rows("reader").op(caller.operation()).expect("a read");
     assert_eq!(row.expect("open").tree, Some(key));
 }
+
+/// Catches a Mac job's result thrown away because its callers left while its pack was awaited:
+/// the grace for an operation with no caller runs out twice over during the wait and cancels
+/// nothing, and once the store has the pack the operation is answered from it.
+#[tokio::test(start_paused = true)]
+async fn a_mac_jobs_pack_awaited_with_no_caller_is_not_cancelled() {
+    let mut rig = rig(true).await;
+    rig.cfg.no_caller_grace = Duration::from_secs(30);
+    rig.exec = rig.executor(&rig.cfg.instance.clone());
+    absent_for(&rig, 1000);
+    let caller = rig.submit(1);
+    ends_well(&rig, &caller, 0, "mac-1").await;
+    rig.until("the first read", || keys_read(&rig).len() == 1)
+        .await;
+    let name = caller.name.clone();
+    drop(caller);
+    crate::executor::tests::settle().await;
+    for _ in 0..4 {
+        rig.advance(Duration::from_secs(20)).await;
+    }
+    assert_eq!(
+        rig.counted("kbf_executor_operations_cancelled_no_caller_total "),
+        0
+    );
+    assert_eq!(rig.exec.open(), 1, "the operation was ended");
+    rig.ingest.script.lock().expect("script").clear();
+    let kept = Caller::of(rig.exec.wait(&name).expect("open"));
+    let finished = rig.until_done(&kept).await;
+    assert!(matches!(finished, Finished::Ran(_)), "{finished:?}");
+    assert_eq!(rig.fake.jobs().len(), 1);
+}
