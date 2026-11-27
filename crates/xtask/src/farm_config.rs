@@ -14,8 +14,10 @@
 //!    exactly `true` or `false`, and the address is `host:port`, with or without a scheme such as
 //!    `grpc://`, and a numeric port.
 //! 3. `--out` is written, its directory made when missing ([`render`] says what it holds): the
-//!    farm's addresses, instance and TLS for buck2's remote execution client, and the worker
-//!    property set under buildrules' key `[buildrules_re] linux_x86_64_properties`.
+//!    farm's addresses, instance and TLS for buck2's remote execution client, the worker
+//!    property set under buildrules' key `[buildrules_re] linux_x86_64_properties`, and
+//!    `[komira_ci] farm_wait_seconds` ([`FARM_WAIT_SECONDS`]), which `assert_remote run` reads
+//!    from the same file (its `--farm-config`) with the farm's `engine_address`.
 //!
 //! The verb prints one line saying which file it wrote, never what it holds.
 //!
@@ -219,9 +221,18 @@ pub fn render(settings: &Settings<'_>) -> String {
          grpc_keepalive_timeout_secs = 60\n  \
          max_concurrent_uploads_per_action = 4\n\
          [buildrules_re]\n  \
-         linux_x86_64_properties = {properties}\n"
+         linux_x86_64_properties = {properties}\n\
+         [komira_ci]\n  \
+         farm_wait_seconds = {FARM_WAIT_SECONDS}\n"
     )
 }
+
+/// How long `assert_remote run` waits for the farm's port to answer before it runs a buck2 command
+/// again after a cut connection or a run its watchdog ended, in seconds: the `farm_wait_seconds`
+/// it reads under `[komira_ci]` of the file it is given as `--farm-config` (komira-ai/komira's
+/// `tools/build/ci/assert_remote/farm_wait.zig`). Without the key that tool starts no watchdog.
+/// `prove-farm` writes the same value into its project's configuration.
+pub const FARM_WAIT_SECONDS: u32 = 600;
 
 /// Writes `text` to `path`, making its directory.
 fn write(path: &Path, text: &str) -> Result<(), Error> {

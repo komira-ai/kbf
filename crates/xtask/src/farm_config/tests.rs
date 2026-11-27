@@ -14,6 +14,8 @@ const WHOLE: &str = "\
   max_concurrent_uploads_per_action = 4
 [buildrules_re]
   linux_x86_64_properties = OSFamily=Linux,ISA=x86-64
+[komira_ci]
+  farm_wait_seconds = 600
 ";
 
 const PORT: &str = "the port is not a number from 0 to 65535";

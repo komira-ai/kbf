@@ -76,6 +76,8 @@ fn the_file_is_written_whole_in_a_directory_made_for_it_and_only_its_name_is_pri
   max_concurrent_uploads_per_action = 4
 [buildrules_re]
   linux_x86_64_properties = OSFamily=Linux,ISA=x86-64
+[komira_ci]
+  farm_wait_seconds = 600
 "
     );
 }

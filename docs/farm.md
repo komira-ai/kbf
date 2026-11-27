@@ -182,3 +182,67 @@ place on the build farm's network. The job names no secret and holds no other wr
 A pull request's build and a build of `main` share the build farm's action cache, as every build of
 every repository on the build farm does. The cache is keyed by the action's digest, so a result is
 reused only for byte-identical inputs and command.
+
+## A build whose connection to the farm dies
+
+A connection to the farm can die without a word (an uplink that drops, a relay that goes away):
+buck2's remote execution client keeps the stream open and waits for an answer that never comes,
+and its `Waiting on ...` line looks the same for a running action and a lost one. Without help the
+step runs until its timeout.
+
+So every buck2 command that talks to the farm runs under komira-ai/komira's `assert_remote run`,
+the tool of komira's `buck2-farm` action: in this workflow `farm-build`'s two buck2 builds (the
+`buildrules` command line, then `//:ci`), and in `release.yml`'s `gamma` job the proof of
+`prove-farm`. While buck2 runs, the tool reads the runner's TCP connections to the farm (the
+`engine_address` of the buckconfig) from the kernel once a second. A live farm sends something on
+every connection at least every 30 s, and closes one that moved nothing for 150 s; when a
+connection has heard nothing from the farm for 300 s, the tool ends buck2 (SIGINT, then SIGKILL)
+and its daemon (`buck2 kill`), and treats the run like a cut connection: it waits for the farm's
+port to answer, up to `farm_wait_seconds` (600 s, written by `farm-config` and `prove-farm`), and
+runs the same command again, at most three runs in all. It never reads the log's silence and never
+bounds how long one action may run: a slow build on a live connection is never cut.
+
+What you see when it ends a run, in the job's log:
+
+```text
+buck2-farm: watchdog: the connection to the farm from local port 41022 has heard nothing from the farm for 5 min 1 s, past the bound of 5 min 0 s: the farm has closed it and buck2 would wait on it for ever; ending buck2 (SIGINT)
+buck2-farm: stopping buck2's daemon, which holds the dead connection (`./buck2 kill`)
+buck2-farm: the first run hung on a dead connection to the farm and was ended; waiting for the farm's port to answer, up to 10 min 0 s
+```
+
+then the next run's output, and one line in the job summary saying the run hung, how long the
+farm was silent and that the step ran again (run 2 of at most 3). If the third run hangs too, or
+the farm does not answer within the wait, the step fails with the tool's line saying so. The farm's
+address is never printed; the lines name the runner's local port.
+
+The tool is not copied here and no action of komira's is used (this repository allows only
+`actions/*` and `tailscale/github-action`): the job checks out komira's
+`tools/build/ci/assert_remote/` alone, at a full commit of komira main, into `buck-out/komira`
+(ignored by git and buck2), fetches Zig 0.15.2 (the release komira builds the tool with) pinned by
+SHA-256, and builds it with `zig build-exe` before the tailnet join. The workflow lint's
+`farm_steps` (`crates/kbf-integration-test/tests/workflows/farm_steps.rs`) holds every workflow to
+it: no step runs buck2 itself; each `cargo xtask farm-build` or `prove-farm` is given
+`--assert-remote "$RUNNER_TEMP/assert_remote"`, after a pinned checkout of the tool's sources and
+its build in the same job; and both workflows pin one komira commit.
+
+### Every step has its own bound
+
+In a workflow with a farm step (`farm.yml`, `release.yml`), every step has its own
+`timeout-minutes`, under its job's, and the lint holds that too: a step the watchdog does not watch
+(a fetch, a cache step, a cargo build) is cut by its own bound, never left to the job's. Each bound
+is three times the longest successful run of the step, or of a step with the same command in
+another job of the workflow, rounded up to 5, 10, 15 or 20 minutes, and never under 5 (the runs:
+the 13 successful `farm.yml` runs and the 80 latest successful `release.yml` runs as of the change,
+read from each run's job and step times). The exceptions are the watched steps and the new ones:
+
+| step | longest successful run | bound |
+|---|---|---|
+| `farm.yml` `buck2 build //:ci on the build farm, local 0` | 12.6 min (a cold build that later failed: 21 min) | 120, under the job's 150: three cold runs and two ended runs with their waits |
+| `release.yml` `gamma` `Prove the farm with a remote-only Buck2 build` | none in the window (the proof is off while `KBF_SETS_DESIRED` is unset) | 40: two ended runs (5 min each, 10 min wait) and a last run; the job's is raised to 135, the sum of its steps' |
+| the Zig fetch, the tar, the build of `assert_remote` | new | 15, 5, 10 |
+| the `-3` attempts of the apt jobs | none (never needed) | their first attempt's |
+
+What the watchdog does not cover: steps that do not run buck2. `macos-farm.yml` reaches the farm's
+Mac platform with `cargo xtask mac-farm`, its own REAPI client, not buck2; `buildrules sync`, run
+on the runner when the table is stale, runs buck2 itself, outside the tool. Those, and every other
+step, are cut by their own bound.

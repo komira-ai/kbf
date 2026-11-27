@@ -152,13 +152,17 @@ jobs:
     steps:
       # The whole history and every tag: the files changed since the highest release tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       - run: cargo build -p xtask --locked
+        timeout-minutes: 10
       - name: The next version, and what the push is
+        timeout-minutes: 5
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
@@ -180,20 +184,25 @@ jobs:
       package-version: ${{ steps.package.outputs.package-version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       # Built before any step holds a token, so no build script runs beside one.
       - run: cargo build -p xtask --locked
+        timeout-minutes: 10
       # Refuses a commit not on main, a pipeline run that is not the successful push run that
       # built it, and one that no longer holds every artifact a release needs. The files are
       # downloaded from that run, so the Beta record names the run that built them.
       - name: Refuse a commit not on main, or a build that lost an artifact
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask release locate --repo "$GITHUB_REPOSITORY" --commit "$COMMIT" --run-id "$PIPELINE_RUN"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           pattern: assets-*
           path: dist
@@ -201,6 +210,7 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: sha256sums
           path: dist
@@ -209,6 +219,7 @@ jobs:
       # The provenance bundle of each tarball (`<tarball>.sigstore.json`), which the sums do
       # not list: the attestation that made it signed the files they list.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           pattern: bundles-*
           path: dist
@@ -219,29 +230,38 @@ jobs:
       # assembling them must give the published SHA256SUMS, and removes them from dist (they
       # are not release assets).
       - name: Set the published SHA256SUMS aside
+        timeout-minutes: 5
         run: mkdir published
       - run: mv dist/SHA256SUMS published/SHA256SUMS
+        timeout-minutes: 5
       - name: Assemble SHA256SUMS, which must be the published one
+        timeout-minutes: 5
         run: cargo xtask sums assemble dist --expect published/SHA256SUMS
       - name: Check the files against SHA256SUMS
+        timeout-minutes: 5
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: Every file is listed once, matches, and is an asset of this commit, with its bundle
+        timeout-minutes: 5
         run: cargo xtask release check dist --commit "$COMMIT"
       - name: Fetch the Sigstore trusted root, for the offline check of the bundles
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
       - name: Verify every attestation as a deployment does, and every bundle as a host does
+        timeout-minutes: 20
         env:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml" --commit "$COMMIT" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
       # The Debian version of the native package, read from the control files of the two native
       # .debs, which must agree: the version every apt job below is given.
       - name: The version of the native package, from the two .debs
+        timeout-minutes: 5
         id: package
         run: cargo xtask channels apt version --debs dist --commit "$COMMIT" --output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         with:
           name: release-assets
           path: dist/
@@ -260,23 +280,29 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       # Built before any step holds a token, so no build script runs beside one.
       - run: cargo build -p xtask --locked
+        timeout-minutes: 10
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: release-assets
           path: dist
       # The Beta record is the tag's message, an audit record nothing gates on.
       - name: Write the Beta record
+        timeout-minutes: 5
         env:
           TAG: ${{ needs.plan.outputs.tag }}
         run: cargo xtask release verdict-write dist --commit "$COMMIT" --tag "$TAG" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --pipeline-run "$PIPELINE_RUN" --out verdict.json
       # The token of the release bot, for this repository alone and for contents only.
       - name: The release bot's token
+        timeout-minutes: 5
         id: bot
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -285,6 +311,7 @@ jobs:
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
       - name: Create the annotated tag at this commit (create-only)
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           TAG: ${{ needs.plan.outputs.tag }}
@@ -307,30 +334,39 @@ jobs:
       # The whole history, every branch and every tag: the annotated tag object (whose
       # message is the Beta record) and origin/main, which the tag check and the notes read.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       - run: cargo build -p xtask --locked
+        timeout-minutes: 10
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: release-assets
           path: dist
       - name: Check the files against SHA256SUMS
+        timeout-minutes: 5
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: Every file is listed once, matches, and is an asset of this commit, with its bundle
+        timeout-minutes: 5
         run: cargo xtask release check dist --commit "$COMMIT"
       - name: Fetch the Sigstore trusted root, for the offline check of the bundles
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
       - name: Verify every attestation as a deployment does, and every bundle as a host does
+        timeout-minutes: 20
         env:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml" --commit "$COMMIT" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
       - name: The tag names this commit, which is on main; the set of these files
+        timeout-minutes: 5
         id: verify-tag
         run: cargo xtask release verify dist --tag "$TAG" --commit "$COMMIT" --output "$GITHUB_OUTPUT"
       # What the release changes about going back (section 8.3) is read from the builds
@@ -340,19 +376,23 @@ jobs:
       # The release before is the nearest earlier tag with a published release: a tag whose
       # release run failed before it published has no files, and is passed over (and named).
       - name: The release before this one, if any
+        timeout-minutes: 5
         id: previous
         env:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask release previous --repo "$GITHUB_REPOSITORY" --tag "$TAG" --commit "$COMMIT" --output "$GITHUB_OUTPUT"
       - name: This release's identity, from the verified linux tarball
+        timeout-minutes: 5
         run: cargo xtask release identity dist --commit "$COMMIT" --out version.json
       - name: The previous release's files
+        timeout-minutes: 5
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
           PREVIOUS: ${{ steps.previous.outputs.previous }}
         run: gh release download "$PREVIOUS" --repo "$GITHUB_REPOSITORY" --dir previous
       - name: The previous release's files against its SHA256SUMS
+        timeout-minutes: 5
         if: ${{ steps.previous.outputs.previous != '' }}
         working-directory: previous
         run: sha256sum --check --strict SHA256SUMS
@@ -360,17 +400,20 @@ jobs:
       # and the facts and the CycloneDX SBOM of its task image, are all listed. No flag waives them
       # (the workflow lint refuses one on either `release check`).
       - name: Every one is an asset of the previous release's commit, with its bundle
+        timeout-minutes: 5
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
           PREVIOUS_COMMIT: ${{ steps.previous.outputs.previous-commit }}
         run: cargo xtask release check previous --commit "$PREVIOUS_COMMIT"
       - name: Verify the previous release's attestations as these were
+        timeout-minutes: 20
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
           PREVIOUS_COMMIT: ${{ steps.previous.outputs.previous-commit }}
         run: cargo xtask verify-assets attestations previous --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml" --commit "$PREVIOUS_COMMIT" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
       - name: The previous release's identity, from its verified linux tarball
+        timeout-minutes: 5
         if: ${{ steps.previous.outputs.previous != '' }}
         env:
           PREVIOUS_COMMIT: ${{ steps.previous.outputs.previous-commit }}
@@ -378,11 +421,13 @@ jobs:
       # Refuses (fail closed) when there is a previous release and no file for it (the path
       # is empty when there is none), and when the file names another build.
       - name: Write the release notes
+        timeout-minutes: 5
         env:
           PREVIOUS: ${{ steps.previous.outputs.previous }}
           PREVIOUS_IDENTITY: ${{ steps.previous.outputs.previous != '' && 'previous-version.json' || '' }}
         run: cargo xtask release notes dist --tag "$TAG" --commit "$COMMIT" --version-json version.json --previous "$PREVIOUS" --previous-version-json "$PREVIOUS_IDENTITY" --out release-notes.md
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         with:
           name: release-notes
           path: release-notes.md
@@ -400,24 +445,31 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       # Built before any step holds the token, so no build script runs beside it.
       - run: cargo build -p xtask --locked
+        timeout-minutes: 10
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: release-assets
           path: dist
       # The notes the notes job wrote: the release body.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: release-notes
       - name: Check the files against SHA256SUMS
+        timeout-minutes: 5
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: Create the release, or add the files it lacks
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.plan.outputs.tag }}
@@ -435,14 +487,18 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       # Built before any step holds a token, so no build script runs beside one.
       - run: cargo build -p xtask --locked
+        timeout-minutes: 10
       # The release bot's token for the internal repository alone: its contents and pull requests.
       - name: The release bot's token
+        timeout-minutes: 5
         id: bot
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -453,6 +509,7 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
       - name: Open the pull request that moves the internal repository's submodule to this release
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           VERSION: ${{ needs.plan.outputs.version }}
@@ -474,21 +531,27 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       - name: Token file of the rehearsal, readable by its owner alone
+        timeout-minutes: 5
         run: install -m 0600 /dev/null /var/tmp/kbf-update-rehearsal.token
       - name: Token of the rehearsal
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
         run: printf '%s' "$GH_TOKEN" > /var/tmp/kbf-update-rehearsal.token
       - name: The release the rehearsal updates to
+        timeout-minutes: 5
         env:
           TAG: ${{ needs.plan.outputs.tag }}
         run: printf '%s\n' "$TAG" > /var/tmp/kbf-update-rehearsal.to
       - run: cargo xtask sudo-test -p kbf-host-install --test update_rehearsal -- --exact the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next --nocapture
+        timeout-minutes: 10
 
   # The rehearsal of the control loop, which the gamma stage needs too: the host of the rehearsal
   # above is updated by the real agent that the real coordinator of this commit orders, after
@@ -506,23 +569,30 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       - name: Token file of the rehearsal, readable by its owner alone
+        timeout-minutes: 5
         run: install -m 0600 /dev/null /var/tmp/kbf-update-rehearsal.token
       - name: Token of the rehearsal
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
         run: printf '%s' "$GH_TOKEN" > /var/tmp/kbf-update-rehearsal.token
       - name: The release the rehearsal updates to
+        timeout-minutes: 5
         env:
           TAG: ${{ needs.plan.outputs.tag }}
         run: printf '%s\n' "$TAG" > /var/tmp/kbf-update-rehearsal.to
       - name: The coordinator of this commit
+        timeout-minutes: 5
         run: cargo build --locked -p kbf-coordinator
       - run: cargo xtask sudo-test -p kbf-host-install --test update_rehearsal_agent -- --exact the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release --nocapture
+        timeout-minutes: 10
 
   # deploy-digest and deploy: the frontend on Docker Swarm (docs/deploy/swarm-frontend.md). They
   # run only while the repository variables CP_DEPLOY_ENDPOINT and CP_DEPLOY_TAILSCALE_TAGS are
@@ -561,13 +631,17 @@ jobs:
       bundle-url: ${{ steps.image.outputs.bundle-url }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       # Built before any step holds a token, so no build script runs beside one.
       - run: cargo build -p xtask --locked
+        timeout-minutes: 10
       - name: The frontend image's manifest digest and the release's addresses of it and its bundle
+        timeout-minutes: 5
         id: image
         env:
           GH_TOKEN: ${{ github.token }}
@@ -609,20 +683,26 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       # Built before any step holds the token, so no build script runs beside it.
       - run: cargo build -p xtask --locked
+        timeout-minutes: 10
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: release-assets
           path: dist
       - name: Check the files against SHA256SUMS
+        timeout-minutes: 5
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: Push the macOS kbf-task bundle to the registry by digest
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.plan.outputs.tag }}
@@ -642,7 +722,7 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     # Every step has a timeout of its own, and the job's is at least their sum.
-    timeout-minutes: 90
+    timeout-minutes: 135
     environment: release
     permissions:
       contents: read
@@ -650,6 +730,10 @@ jobs:
     env:
       BUCK2_VERSION: 2026-10-01
       BUCK2_SHA256: 828aba01bf80e8ba50ed27d89be86efe0246b3807c3d040e1ea7b4810a55fb78
+      # The Zig komira builds assert_remote with (its toolchain `zig_next`), pinned by version and
+      # SHA-256.
+      ZIG_VERSION: 0.15.2
+      ZIG_SHA256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 5
@@ -667,6 +751,34 @@ jobs:
       - run: cargo build -p xtask --locked
         timeout-minutes: 30
         if: ${{ vars.KBF_SETS_DESIRED == 'true' }}
+      # komira-ai/komira's assert_remote, the tool of its buck2-farm action, which runs the proof's
+      # buck2: its watchdog ends a run whose connections to the farm have heard nothing for 300 s
+      # (a dead connection buck2 would wait on until the step's timeout) and runs it again once the
+      # farm answers, at most three runs (docs/farm.md). Its sources alone are checked out at a
+      # commit of komira main, into buck-out/ (ignored by git), and built here, before the network
+      # join, with the Zig release komira builds it with.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}
+        timeout-minutes: 5
+        with:
+          repository: komira-ai/komira
+          ref: b2080fe989248adf9b47d4bd14c0ecefa0802f79
+          path: buck-out/komira
+          persist-credentials: false
+          sparse-checkout: /tools/build/ci/assert_remote/
+          sparse-checkout-cone-mode: false
+      - name: Fetch Zig (pinned version and checksum), the compiler of assert_remote
+        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}
+        timeout-minutes: 15
+        run: cargo xtask fetch --url "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" --sha256 "$ZIG_SHA256" --out "$RUNNER_TEMP/zig.tar.xz"
+      - run: tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}
+        timeout-minutes: 5
+      - name: Build assert_remote
+        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}
+        timeout-minutes: 10
+        working-directory: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}
+        run: ./zig build-exe -OReleaseSafe -femit-bin="$RUNNER_TEMP/assert_remote" --cache-dir "$RUNNER_TEMP/zig-local-cache" --global-cache-dir "$RUNNER_TEMP/zig-global-cache" "$GITHUB_WORKSPACE/buck-out/komira/tools/build/ci/assert_remote/assert_remote.zig"
       # When the farm is reachable only on a Tailscale network: join it, after the build (its
       # scripts never see that network), as an ephemeral node. Tailscale's workload identity
       # federation takes this run's OIDC token, so the job still holds no secret. The client id and
@@ -691,8 +803,11 @@ jobs:
         timeout-minutes: 5
         if: ${{ vars.KBF_SETS_DESIRED == 'true' }}
         run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
+      # The build runs through assert_remote (`--assert-remote`): a run hung on a dead connection
+      # is ended after 300 s of silence and run again once the farm answers (up to 10 min), at
+      # most three runs, so the step's bound holds two such ends and a last run.
       - name: Prove the farm with a remote-only Buck2 build
-        timeout-minutes: 20
+        timeout-minutes: 40
         if: ${{ vars.KBF_SETS_DESIRED == 'true' }}
         env:
           FARM_ADDRESS: ${{ vars.FARM_ADDRESS }}
@@ -700,7 +815,7 @@ jobs:
           FARM_TLS: ${{ vars.FARM_TLS }}
           FARM_PROPERTIES: ${{ vars.FARM_LINUX_X86_64_PROPERTIES }}
           NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
-        run: cargo xtask prove-farm --address "$FARM_ADDRESS" --instance "$FARM_INSTANCE" --tls "$FARM_TLS" --properties "$FARM_PROPERTIES" --buck2 "$RUNNER_TEMP/tools/buck2" --project crates/kbf-integration-test/gamma/buck2 --nonce "$NONCE"
+        run: cargo xtask prove-farm --address "$FARM_ADDRESS" --instance "$FARM_INSTANCE" --tls "$FARM_TLS" --properties "$FARM_PROPERTIES" --buck2 "$RUNNER_TEMP/tools/buck2" --assert-remote "$RUNNER_TEMP/assert_remote" --log "$RUNNER_TEMP/buck2-farm.log" --summary "$GITHUB_STEP_SUMMARY" --project crates/kbf-integration-test/gamma/buck2 --nonce "$NONCE"
 
   # Builds the `xtask` binary that every apt read, index and write job runs. A job of its own so
   # that the build, whose scripts run code from the locked dependency set, is in no job that holds
@@ -714,12 +829,16 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       - run: cargo build -p xtask --locked --release
+        timeout-minutes: 15
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: target/release/xtask
@@ -760,12 +879,15 @@ jobs:
       enabled: ${{ steps.gate.outputs.enabled }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the settings of the apt repository, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
@@ -774,16 +896,19 @@ jobs:
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
         run: tool/xtask channels gate --label testing-apt-read --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - name: Assume the apt publish role through OIDC
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
         run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-testing-apt-read-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
       - name: Read the current index and the ETag of each object from S3, never through the CDN, which caches the index
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
         run: tool/xtask channels apt read --suite testing --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-current"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-current
@@ -806,12 +931,15 @@ jobs:
       PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the signing key and on the read, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           READ_ENABLED: ${{ needs.testing-apt-read.outputs.enabled }}
@@ -820,37 +948,44 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: tool/xtask channels gate --label testing-apt-index --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-current
           path: ${{ runner.temp }}/apt-current
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: release-assets
           path: dist
       - name: The files are exactly the assets of this run, and match SHA256SUMS
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Merge the .debs into the index that was read, the entries of every other product are kept
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           OWNER: ${{ github.repository_owner }}
         run: tool/xtask channels apt index --suite testing --current "$RUNNER_TEMP/apt-current" --out "$RUNNER_TEMP/apt-next" --debs dist --commit "$COMMIT" --version "$PACKAGE_VERSION" --origin "$OWNER" --label "$OWNER" --description "$OWNER packages"
       - name: Sign Release with the signing subkey, InRelease and Release.gpg, then remove the key
+        timeout-minutes: 5
         id: sign
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -859,6 +994,7 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: tool/xtask channels apt sign --dir "$RUNNER_TEMP/apt-next/dists/testing" --work "$RUNNER_TEMP/apt-sign" --fingerprint "$APT_GPG_FINGERPRINT" --key-env APT_GPG_PRIVATE_KEY --passphrase-env APT_GPG_PASSPHRASE --output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-next
@@ -883,12 +1019,15 @@ jobs:
       PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the settings of the apt repository and on the signed index, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           READ_ENABLED: ${{ needs.testing-apt-read.outputs.enabled }}
@@ -899,37 +1038,44 @@ jobs:
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
         run: tool/xtask channels gate --label testing-apt-write --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-next
           path: ${{ runner.temp }}/apt-next
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: release-assets
           path: dist
       - name: The files are exactly the assets of this run, and match SHA256SUMS
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Assume the apt publish role through OIDC
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
         run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-testing-apt-write-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
       - name: Upload the .debs once each, then write the signed index with If-Match on the ETags that were read, then invalidate /apt/dists/*
+        timeout-minutes: 5
         id: put
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -953,12 +1099,15 @@ jobs:
       enabled: ${{ steps.gate.outputs.enabled }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the settings of the apt repository, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
@@ -967,16 +1116,19 @@ jobs:
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
         run: tool/xtask channels gate --label testing-apt-read-2 --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - name: Assume the apt publish role through OIDC
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
         run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-testing-apt-read-2-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
       - name: Read the current index and the ETag of each object from S3, never through the CDN, which caches the index
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
         run: tool/xtask channels apt read --suite testing --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-current"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-current-2
@@ -999,12 +1151,15 @@ jobs:
       PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the signing key and on the read, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           READ_ENABLED: ${{ needs.testing-apt-read-2.outputs.enabled }}
@@ -1013,37 +1168,44 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: tool/xtask channels gate --label testing-apt-index-2 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-current-2
           path: ${{ runner.temp }}/apt-current
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: release-assets
           path: dist
       - name: The files are exactly the assets of this run, and match SHA256SUMS
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Merge the .debs into the index that was read, the entries of every other product are kept
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           OWNER: ${{ github.repository_owner }}
         run: tool/xtask channels apt index --suite testing --current "$RUNNER_TEMP/apt-current" --out "$RUNNER_TEMP/apt-next" --debs dist --commit "$COMMIT" --version "$PACKAGE_VERSION" --origin "$OWNER" --label "$OWNER" --description "$OWNER packages"
       - name: Sign Release with the signing subkey, InRelease and Release.gpg, then remove the key
+        timeout-minutes: 5
         id: sign
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1052,6 +1214,7 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: tool/xtask channels apt sign --dir "$RUNNER_TEMP/apt-next/dists/testing" --work "$RUNNER_TEMP/apt-sign" --fingerprint "$APT_GPG_FINGERPRINT" --key-env APT_GPG_PRIVATE_KEY --passphrase-env APT_GPG_PASSPHRASE --output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-next-2
@@ -1076,12 +1239,15 @@ jobs:
       PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the settings of the apt repository and on the signed index, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           READ_ENABLED: ${{ needs.testing-apt-read-2.outputs.enabled }}
@@ -1092,37 +1258,44 @@ jobs:
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
         run: tool/xtask channels gate --label testing-apt-write-2 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-next-2
           path: ${{ runner.temp }}/apt-next
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: release-assets
           path: dist
       - name: The files are exactly the assets of this run, and match SHA256SUMS
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Assume the apt publish role through OIDC
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
         run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-testing-apt-write-2-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
       - name: Upload the .debs once each, then write the signed index with If-Match on the ETags that were read, then invalidate /apt/dists/*
+        timeout-minutes: 5
         id: put
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1146,12 +1319,15 @@ jobs:
       enabled: ${{ steps.gate.outputs.enabled }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the settings of the apt repository, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
@@ -1160,16 +1336,19 @@ jobs:
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
         run: tool/xtask channels gate --label testing-apt-read-3 --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - name: Assume the apt publish role through OIDC
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
         run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-testing-apt-read-3-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
       - name: Read the current index and the ETag of each object from S3, never through the CDN, which caches the index
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
         run: tool/xtask channels apt read --suite testing --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-current"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-current-3
@@ -1192,12 +1371,15 @@ jobs:
       PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the signing key and on the read, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           READ_ENABLED: ${{ needs.testing-apt-read-3.outputs.enabled }}
@@ -1206,37 +1388,44 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: tool/xtask channels gate --label testing-apt-index-3 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-current-3
           path: ${{ runner.temp }}/apt-current
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: release-assets
           path: dist
       - name: The files are exactly the assets of this run, and match SHA256SUMS
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Merge the .debs into the index that was read, the entries of every other product are kept
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           OWNER: ${{ github.repository_owner }}
         run: tool/xtask channels apt index --suite testing --current "$RUNNER_TEMP/apt-current" --out "$RUNNER_TEMP/apt-next" --debs dist --commit "$COMMIT" --version "$PACKAGE_VERSION" --origin "$OWNER" --label "$OWNER" --description "$OWNER packages"
       - name: Sign Release with the signing subkey, InRelease and Release.gpg, then remove the key
+        timeout-minutes: 5
         id: sign
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1245,6 +1434,7 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: tool/xtask channels apt sign --dir "$RUNNER_TEMP/apt-next/dists/testing" --work "$RUNNER_TEMP/apt-sign" --fingerprint "$APT_GPG_FINGERPRINT" --key-env APT_GPG_PRIVATE_KEY --passphrase-env APT_GPG_PASSPHRASE --output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-next-3
@@ -1269,12 +1459,15 @@ jobs:
       PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the settings of the apt repository and on the signed index, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           READ_ENABLED: ${{ needs.testing-apt-read-3.outputs.enabled }}
@@ -1285,37 +1478,44 @@ jobs:
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
         run: tool/xtask channels gate --label testing-apt-write-3 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-next-3
           path: ${{ runner.temp }}/apt-next
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: release-assets
           path: dist
       - name: The files are exactly the assets of this run, and match SHA256SUMS
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Assume the apt publish role through OIDC
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
         run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-testing-apt-write-3-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
       - name: Upload the .debs once each, then write the signed index with If-Match on the ETags that were read, then invalidate /apt/dists/*
+        timeout-minutes: 5
         id: put
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1343,12 +1543,16 @@ jobs:
       PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       - run: cargo build -p xtask --locked
+        timeout-minutes: 10
       - name: Install kbf from the suite testing in a clean Ubuntu container
+        timeout-minutes: 5
         run: docker run --rm --volume "$PWD/target/debug/xtask:/usr/local/bin/xtask:ro" ubuntu@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 xtask channels check-apt --arch amd64 --version "$PACKAGE_VERSION" --commit "$COMMIT"
 
   check-apt-arm64:
@@ -1362,12 +1566,16 @@ jobs:
       PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - run: rustup toolchain install
+        timeout-minutes: 5
       - run: cargo build -p xtask --locked
+        timeout-minutes: 10
       - name: Install kbf from the suite testing in a clean Ubuntu container
+        timeout-minutes: 5
         run: docker run --rm --volume "$PWD/target/debug/xtask:/usr/local/bin/xtask:ro" ubuntu@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 xtask channels check-apt --arch arm64 --version "$PACKAGE_VERSION" --commit "$COMMIT"
 
   # PROMOTION, the apt repository: the same three jobs for the suite `stable`, after both install
@@ -1391,12 +1599,15 @@ jobs:
       enabled: ${{ steps.gate.outputs.enabled }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the settings of the apt repository, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           TESTING_ENABLED: ${{ needs.testing-apt-read.outputs.enabled }}
@@ -1406,21 +1617,25 @@ jobs:
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
         run: tool/xtask channels gate --label stable-apt-read --output "$GITHUB_OUTPUT" --require "TESTING_ENABLED=$TESTING_ENABLED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - name: Assume the apt publish role through OIDC
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
         run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-stable-apt-read-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
       - name: Read the index of testing, what is promoted, with the ETag of each object, from S3
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
         run: tool/xtask channels apt read --suite testing --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-read/testing"
       - name: Read the index of stable, what it is merged into, with the ETag of each object, from S3
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
         run: tool/xtask channels apt read --suite stable --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-read/stable"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-read
@@ -1443,12 +1658,15 @@ jobs:
       PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the signing key and on the read, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           READ_ENABLED: ${{ needs.stable-apt-read.outputs.enabled }}
@@ -1457,37 +1675,44 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: tool/xtask channels gate --label stable-apt-index --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-read
           path: ${{ runner.temp }}/apt-read
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: release-assets
           path: dist
       - name: The files are exactly the assets of this run, and match SHA256SUMS
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Promote the entries of this release that testing lists into the index of stable, held to the digests of SHA256SUMS, the entries of every other product are kept
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           OWNER: ${{ github.repository_owner }}
         run: tool/xtask channels apt promote --testing "$RUNNER_TEMP/apt-read/testing" --stable "$RUNNER_TEMP/apt-read/stable" --out "$RUNNER_TEMP/apt-next" --version "$PACKAGE_VERSION" --sums dist/SHA256SUMS --commit "$COMMIT" --origin "$OWNER" --label "$OWNER" --description "$OWNER packages"
       - name: Sign Release with the signing subkey, InRelease and Release.gpg, then remove the key
+        timeout-minutes: 5
         id: sign
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1496,6 +1721,7 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: tool/xtask channels apt sign --dir "$RUNNER_TEMP/apt-next/dists/stable" --work "$RUNNER_TEMP/apt-sign" --fingerprint "$APT_GPG_FINGERPRINT" --key-env APT_GPG_PRIVATE_KEY --passphrase-env APT_GPG_PASSPHRASE --output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-promoted
@@ -1518,12 +1744,15 @@ jobs:
       conflict: ${{ steps.put.outputs.conflict }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the settings of the apt repository and on the signed index, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           READ_ENABLED: ${{ needs.stable-apt-read.outputs.enabled }}
@@ -1534,16 +1763,19 @@ jobs:
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
         run: tool/xtask channels gate --label stable-apt-write --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-promoted
           path: ${{ runner.temp }}/apt-next
       - name: Assume the apt publish role through OIDC
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
         run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-stable-apt-write-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
       - name: Write the signed index of stable with If-Match on the ETags that were read, the packages are in the pool already, then invalidate /apt/dists/*
+        timeout-minutes: 5
         id: put
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1567,12 +1799,15 @@ jobs:
       enabled: ${{ steps.gate.outputs.enabled }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the settings of the apt repository, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
@@ -1581,21 +1816,25 @@ jobs:
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
         run: tool/xtask channels gate --label stable-apt-read-2 --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - name: Assume the apt publish role through OIDC
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
         run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-stable-apt-read-2-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
       - name: Read the index of testing, what is promoted, with the ETag of each object, from S3
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
         run: tool/xtask channels apt read --suite testing --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-read/testing"
       - name: Read the index of stable, what it is merged into, with the ETag of each object, from S3
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
         run: tool/xtask channels apt read --suite stable --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-read/stable"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-read-2
@@ -1618,12 +1857,15 @@ jobs:
       PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the signing key and on the read, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           READ_ENABLED: ${{ needs.stable-apt-read-2.outputs.enabled }}
@@ -1632,37 +1874,44 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: tool/xtask channels gate --label stable-apt-index-2 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-read-2
           path: ${{ runner.temp }}/apt-read
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: release-assets
           path: dist
       - name: The files are exactly the assets of this run, and match SHA256SUMS
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Promote the entries of this release that testing lists into the index of stable, held to the digests of SHA256SUMS, the entries of every other product are kept
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           OWNER: ${{ github.repository_owner }}
         run: tool/xtask channels apt promote --testing "$RUNNER_TEMP/apt-read/testing" --stable "$RUNNER_TEMP/apt-read/stable" --out "$RUNNER_TEMP/apt-next" --version "$PACKAGE_VERSION" --sums dist/SHA256SUMS --commit "$COMMIT" --origin "$OWNER" --label "$OWNER" --description "$OWNER packages"
       - name: Sign Release with the signing subkey, InRelease and Release.gpg, then remove the key
+        timeout-minutes: 5
         id: sign
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1671,6 +1920,7 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: tool/xtask channels apt sign --dir "$RUNNER_TEMP/apt-next/dists/stable" --work "$RUNNER_TEMP/apt-sign" --fingerprint "$APT_GPG_FINGERPRINT" --key-env APT_GPG_PRIVATE_KEY --passphrase-env APT_GPG_PASSPHRASE --output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-promoted-2
@@ -1693,12 +1943,15 @@ jobs:
       conflict: ${{ steps.put.outputs.conflict }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the settings of the apt repository and on the signed index, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           READ_ENABLED: ${{ needs.stable-apt-read-2.outputs.enabled }}
@@ -1709,16 +1962,19 @@ jobs:
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
         run: tool/xtask channels gate --label stable-apt-write-2 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-promoted-2
           path: ${{ runner.temp }}/apt-next
       - name: Assume the apt publish role through OIDC
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
         run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-stable-apt-write-2-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
       - name: Write the signed index of stable with If-Match on the ETags that were read, the packages are in the pool already, then invalidate /apt/dists/*
+        timeout-minutes: 5
         id: put
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1742,12 +1998,15 @@ jobs:
       enabled: ${{ steps.gate.outputs.enabled }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the settings of the apt repository, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           APT_PUBLISH_ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
@@ -1756,21 +2015,25 @@ jobs:
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
         run: tool/xtask channels gate --label stable-apt-read-3 --output "$GITHUB_OUTPUT" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - name: Assume the apt publish role through OIDC
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
         run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-stable-apt-read-3-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
       - name: Read the index of testing, what is promoted, with the ETag of each object, from S3
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
         run: tool/xtask channels apt read --suite testing --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-read/testing"
       - name: Read the index of stable, what it is merged into, with the ETag of each object, from S3
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           APT_BUCKET: ${{ vars.APT_BUCKET }}
         run: tool/xtask channels apt read --suite stable --bucket "$APT_BUCKET" --out "$RUNNER_TEMP/apt-read/stable"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-read-3
@@ -1793,12 +2056,15 @@ jobs:
       PACKAGE_VERSION: ${{ needs.verify.outputs.package-version }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the signing key and on the read, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           READ_ENABLED: ${{ needs.stable-apt-read-3.outputs.enabled }}
@@ -1807,37 +2073,44 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: tool/xtask channels gate --label stable-apt-index-3 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --setting "APT_GPG_FINGERPRINT=$APT_GPG_FINGERPRINT" --secret APT_GPG_PRIVATE_KEY --secret APT_GPG_PASSPHRASE
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-read-3
           path: ${{ runner.temp }}/apt-read
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: release-assets
           path: dist
       - name: The files are exactly the assets of this run, and match SHA256SUMS
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         working-directory: dist
         run: sha256sum --check --strict SHA256SUMS
       - name: The amd64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-x86_64.deb" --bundle "dist/kbf-native-$COMMIT-linux-x86_64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: The arm64 .deb is the one artifacts.yml attested, from main at this commit (from its bundle)
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: gh attestation verify "dist/kbf-native-$COMMIT-linux-arm64.deb" --bundle "dist/kbf-native-$COMMIT-linux-arm64.deb.sigstore.json" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/artifacts.yml" --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
       - name: Promote the entries of this release that testing lists into the index of stable, held to the digests of SHA256SUMS, the entries of every other product are kept
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           OWNER: ${{ github.repository_owner }}
         run: tool/xtask channels apt promote --testing "$RUNNER_TEMP/apt-read/testing" --stable "$RUNNER_TEMP/apt-read/stable" --out "$RUNNER_TEMP/apt-next" --version "$PACKAGE_VERSION" --sums dist/SHA256SUMS --commit "$COMMIT" --origin "$OWNER" --label "$OWNER" --description "$OWNER packages"
       - name: Sign Release with the signing subkey, InRelease and Release.gpg, then remove the key
+        timeout-minutes: 5
         id: sign
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
@@ -1846,6 +2119,7 @@ jobs:
           APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: tool/xtask channels apt sign --dir "$RUNNER_TEMP/apt-next/dists/stable" --work "$RUNNER_TEMP/apt-sign" --fingerprint "$APT_GPG_FINGERPRINT" --key-env APT_GPG_PRIVATE_KEY --passphrase-env APT_GPG_PASSPHRASE --output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-promoted-3
@@ -1868,12 +2142,15 @@ jobs:
       conflict: ${{ steps.put.outputs.conflict }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: deploy-tool
           path: tool
       - name: Make the tool executable
+        timeout-minutes: 5
         run: chmod +x tool/xtask
       - name: Gate on the settings of the apt repository and on the signed index, a job without them does nothing and ends green
+        timeout-minutes: 5
         id: gate
         env:
           READ_ENABLED: ${{ needs.stable-apt-read-3.outputs.enabled }}
@@ -1884,16 +2161,19 @@ jobs:
           APT_HOSTNAME: ${{ vars.APT_HOSTNAME }}
         run: tool/xtask channels gate --label stable-apt-write-3 --output "$GITHUB_OUTPUT" --require "READ_ENABLED=$READ_ENABLED" --require "INDEX_SIGNED=$INDEX_SIGNED" --setting "APT_PUBLISH_ROLE_ARN=$APT_PUBLISH_ROLE_ARN" --setting "APT_BUCKET=$APT_BUCKET" --setting "APT_DISTRIBUTION_ID=$APT_DISTRIBUTION_ID" --setting "APT_HOSTNAME=$APT_HOSTNAME"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         with:
           name: apt-promoted-3
           path: ${{ runner.temp }}/apt-next
       - name: Assume the apt publish role through OIDC
+        timeout-minutes: 5
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:
           ROLE_ARN: ${{ vars.APT_PUBLISH_ROLE_ARN }}
         run: tool/xtask channels assume --role-arn "$ROLE_ARN" --session-name "kbf-stable-apt-write-3-$GITHUB_RUN_ID" --region us-east-1 --env-file "$GITHUB_ENV" --token-url "$ACTIONS_ID_TOKEN_REQUEST_URL"
       - name: Write the signed index of stable with If-Match on the ETags that were read, the packages are in the pool already, then invalidate /apt/dists/*
+        timeout-minutes: 5
         id: put
         if: ${{ steps.gate.outputs.enabled == 'true' }}
         env:

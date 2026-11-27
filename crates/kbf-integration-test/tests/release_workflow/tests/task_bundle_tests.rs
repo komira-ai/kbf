@@ -144,7 +144,7 @@ fn the_sums_are_checked_before_the_push() {
     let text = real();
     let job_at = text.find("\n  task-bundle:\n").expect("the job");
     let region = &text[job_at..];
-    let check = "      - name: Check the files against SHA256SUMS\n        working-directory: dist\n        run: sha256sum --check --strict SHA256SUMS\n";
+    let check = "      - name: Check the files against SHA256SUMS\n        timeout-minutes: 5\n        working-directory: dist\n        run: sha256sum --check --strict SHA256SUMS\n";
     let push_at = region
         .find("      - name: Push the macOS kbf-task bundle")
         .expect("the push");

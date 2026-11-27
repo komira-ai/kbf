@@ -2,7 +2,9 @@
 //! (made below), with `--buck2` naming the stand-in (src/bin/xtask_fake/buck2.rs, linked as `buck2`),
 //! which answers each buck2 call from files of the working directory, names the stand-in linked as
 //! `buildrules` beside it as the command line it was asked to build, and records the calls it got
-//! (`buck2.calls`; the stand-in `buildrules` records its own in `buildrules.calls`). Each test reads
+//! (`buck2.calls`; the stand-in `buildrules` records its own in `buildrules.calls`). Each buck2
+//! command that talks to the farm reaches the stand-in buck2 through the stand-in linked as
+//! `assert_remote`, which records its calls in `assert_remote.calls`. Each test reads
 //! the verb's exit status and words, those calls, and for a stale table the patch and the job
 //! summary it wrote. Nothing here reaches a network or a build farm.
 
@@ -123,7 +125,7 @@ impl Rig {
         let repo = Repo::new(&format!("farm-{name}"));
         let bin = TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("cli-farm-bin-{name}"));
         let out = TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("cli-farm-out-{name}"));
-        for program in ["buck2", "buildrules"] {
+        for program in ["buck2", "buildrules", "assert_remote"] {
             std::fs::hard_link(FAKE, bin.join(program)).expect("link the stand-in");
         }
         let rig = Rig { repo, bin, out };
@@ -196,6 +198,16 @@ fn args(buck2: &Path, patch: &Path, summary: &Path) -> Vec<String> {
 fn args_for(targets: &[&str], buck2: &Path, patch: &Path, summary: &Path) -> Vec<String> {
     let path = |p: &Path| p.to_str().expect("utf-8").to_owned();
     let mut flags = vec!["farm-build".to_owned(), "--buck2".to_owned(), path(buck2)];
+    // The stand-in assert_remote beside the stand-in buck2, which keeps its logs in their directory.
+    let bin = buck2.parent().expect("the stand-ins' directory");
+    flags.extend([
+        "--assert-remote".to_owned(),
+        path(&bin.join("assert_remote")),
+        "--farm-config".to_owned(),
+        path(&bin.join("farm.buckconfig")),
+        "--log-dir".to_owned(),
+        path(bin),
+    ]);
     for target in targets {
         flags.extend(["--target".to_owned(), (*target).to_owned()]);
     }
@@ -518,6 +530,7 @@ fn a_command_line_that_cannot_be_built_named_or_run_fails_before_the_check() {
     let mut answers = PASSING.to_vec();
     answers.extend([
         ("buck2-tool.status", "3"),
+        ("buck2-tool.stdout", ""),
         ("buck2-tool.stderr", "no cell buildrules\n"),
     ]);
     let d = Rig::new("tool-fails", false, &answers);
@@ -765,6 +778,153 @@ fn a_buck2_that_cannot_start_fails_with_status_1_and_the_flags_are_required() {
         let o = xtask(&d.repo.dir, &without);
         assert_eq!(o.status.code(), Some(2), "{without:?}");
         assert!(stderr(&o).contains("required"), "{}", stderr(&o));
+    }
+    assert_eq!(calls(&d.repo.dir), Vec::<String>::new());
+}
+
+/// What the stand-in assert_remote prints for a run its watchdog ended (`xtask_fake/buck2.rs`).
+const CUT: &str = "\
+buck2-farm: watchdog: the connection to the farm from local port 41022 has heard nothing from the farm for 5 min 1 s, past the bound of 5 min 0 s: the farm has closed it and buck2 would wait on it for ever; ending buck2 (SIGINT)
+buck2-farm: stopping buck2's daemon, which holds the dead connection (`buck2 kill`)
+buck2-farm: the first run hung on a dead connection to the farm and was ended; waiting for the farm's port to answer, up to 10 min 0 s
+";
+
+/// The calls assert_remote got in `dir`.
+fn watched_calls(dir: &Path) -> Vec<String> {
+    calls_in(dir, "assert_remote.calls")
+}
+
+#[test]
+fn both_farm_builds_run_under_assert_remote_with_their_logs_the_summary_and_the_farm_config() {
+    // Catches: a buck2 command that talks to the farm run outside the watchdog (the build of the
+    // command line or the build), one given another log, job summary or farm config than the
+    // verb's, a command passed on with its words changed, and the audit or the daemon's stop
+    // (which reach no farm) sent through it.
+    let d = Rig::new("watched", false, &PASSING);
+    let o = d.farm_build();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let bin = d.bin.path();
+    let flags = format!(
+        "--summary {} --farm-config {} -- {}",
+        d.summary().display(),
+        bin.join("farm.buckconfig").display(),
+        d.buck2().display()
+    );
+    assert_eq!(
+        watched_calls(&d.repo.dir),
+        [
+            format!(
+                "run --log {} {flags} {TOOL}",
+                bin.join("buck2-farm-tool.log").display()
+            ),
+            format!(
+                "run --log {} {flags} build //:ci //:sync_check",
+                bin.join("buck2-farm.log").display()
+            ),
+        ]
+    );
+    assert_eq!(calls(&d.repo.dir), BUILT);
+}
+
+#[test]
+fn a_run_the_watchdog_ended_and_ran_again_passes_on_the_run_after_it_with_its_words_in_the_log() {
+    // Catches: the watchdog's lines kept out of the job's log, a build whose run again passed
+    // taken for a failure, or the summary of the run it ended read in place of the last run's.
+    let d = Rig::new("watchdog-cut", false, &PASSING);
+    d.defect("watchdog-cut");
+    let o = d.farm_build();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("{FARM}\n"));
+    assert_eq!(stderr(&o), format!("{CUT}{BUILD_LOG}"));
+    assert_eq!(
+        calls(&d.repo.dir),
+        [
+            AUDIT,
+            "kill",
+            TOOL,
+            "kill",
+            "build //:ci //:sync_check",
+            "kill"
+        ]
+    );
+}
+
+#[test]
+fn a_build_whose_every_run_hung_fails_with_status_1_and_still_stops_buck2() {
+    // Catches: assert_remote's failure after its last run read as a pass (its log holds no
+    // failed action and no summary), its words hidden, or the daemon left running after it.
+    let d = Rig::new("watchdog-gives-up", false, &PASSING);
+    d.defect("watchdog-gives-up");
+    let o = d.farm_build();
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(stdout(&o), "");
+    assert_eq!(
+        stderr(&o),
+        "buck2-farm: the third run hung on a dead connection to the farm too; not running it \
+         again\nxtask: `buck2 build //:ci //:sync_check` failed (exit status: 1)\n"
+    );
+    assert_eq!(calls(&d.repo.dir), [AUDIT, TOOL, "kill", "kill"]);
+}
+
+#[test]
+fn an_assert_remote_that_cannot_start_fails_before_the_check_and_stops_buck2() {
+    // Catches: a missing assert_remote taken for a fresh table or a passing build, or the build
+    // run without it.
+    let d = Rig::new("no-assert-remote", false, &PASSING);
+    let mut flags = args(&d.buck2(), &d.patch(), &d.summary());
+    let at = flags
+        .iter()
+        .position(|f| f == "--assert-remote")
+        .expect("the flag");
+    flags[at + 1] = "/nonexistent/assert_remote".to_owned();
+    let o = xtask(&d.repo.dir, &flags);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).starts_with("xtask: cannot run \"/nonexistent/assert_remote\": "),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(calls(&d.repo.dir), [AUDIT, "kill"]);
+    assert_eq!(tool_calls(&d.repo.dir), Vec::<String>::new());
+}
+
+#[test]
+fn the_stand_in_assert_remote_refuses_a_call_of_another_shape() {
+    // Catches: a stand-in that runs a command the verb never gave it in that shape (no `run`, a
+    // missing flag, no `--`), which would let a test pass on a call the real tool refuses.
+    let d = Rig::new("stand-in-usage", false, &[]);
+    let tool = d.bin.join("assert_remote");
+    for args in [
+        vec!["run", "--log", "l", "--summary", "s", "--farm-config", "c"],
+        vec![
+            "check",
+            "--log",
+            "l",
+            "--summary",
+            "s",
+            "--farm-config",
+            "c",
+            "--",
+            "buck2",
+        ],
+        vec!["run", "--log", "l", "--farm-config", "c", "--", "buck2"],
+        vec![
+            "run",
+            "--log",
+            "l",
+            "--summary",
+            "s",
+            "--farm-config",
+            "c",
+            "--",
+        ],
+    ] {
+        let o = Command::new(&tool)
+            .args(&args)
+            .current_dir(&d.repo.dir)
+            .output()
+            .expect("run the stand-in");
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
     }
     assert_eq!(calls(&d.repo.dir), Vec::<String>::new());
 }

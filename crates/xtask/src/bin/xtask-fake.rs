@@ -3,7 +3,7 @@
 //! without building the server, `verify-assets attestations` without GitHub, and
 //! `sudo-test` without root or systemd.
 //!
-//! - Run under any name but `kbf-server`, `gh`, `sudo`, `syft`, `uname`, `id`, `buck2`, `buildrules`, `systemd-sysusers` or
+//! - Run under any name but `kbf-server`, `gh`, `sudo`, `syft`, `uname`, `id`, `buck2`, `buildrules`, `assert_remote`, `systemd-sysusers` or
 //!   `systemd-tmpfiles`, it is cargo: it
 //!   appends its arguments as one line to `target/debug/cargo-args` in its working
 //!   directory, "builds" by hard-linking itself to `target/debug/kbf-server`, and
@@ -115,7 +115,13 @@
 //!   they agree, for each generated file that is not what `sync` writes; else 0. Defects, from
 //!   `XTASK_FAKE_DEFECT` or the first line of a file `defect` next to the program: `sync-fails`
 //!   (sync exits 1 with a line), `sync-writes-nothing` (sync exits 0 and writes nothing),
-//!   `check-usage` (check exits 2 with a usage line). Both personas live in `xtask_fake/buck2.rs`.
+//!   `check-usage` (check exits 2 with a usage line).
+//! - Run as `assert_remote`, it is komira's tool of that name as `farm-build` and `prove-farm` run it:
+//!   `run --log <file> --summary <file> --farm-config <file> -- <buck2> <args>` appends its arguments
+//!   as one line to `assert_remote.calls` of its working directory, runs the command with its two
+//!   streams on one pipe, copies what it printed to its standard output and to `--log`, and exits
+//!   with its status; defects `watchdog-cut` and `watchdog-gives-up` play a run its watchdog ended
+//!   (`xtask_fake/buck2.rs` says what each prints). The three personas live in that file.
 //! - Run as `systemd-sysusers` or `systemd-tmpfiles` (by name, from PATH, or by path), it
 //!   appends `<name> <arguments>` as one line to `systemd-args` next to the fake's own
 //!   file and exits 0: the host's systemd, as `packaging/install.sh` calls it.
@@ -923,6 +929,8 @@ fn main() -> ExitCode {
         buck2::buck2(Path::new(&argv0), &rest)
     } else if base == "buildrules" {
         buck2::buildrules(&rest)
+    } else if base == "assert_remote" {
+        buck2::assert_remote(&rest)
     } else if argv0.ends_with("/rustc") {
         eprintln!("rustc: the toolchain is not installed");
         ExitCode::FAILURE

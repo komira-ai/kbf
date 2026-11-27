@@ -685,7 +685,7 @@ fn checkouts(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         }
         let steps = workflows::job_steps(release, job)?;
         let mut seen = 0;
-        for step in steps.iter().filter(|s| uses(s, "actions/checkout@")) {
+        for step in steps.iter().filter(|s| gamma::of_the_build(job, s)) {
             seen += 1;
             for (key, _) in &step.with {
                 if !["fetch-depth", "persist-credentials", "ref"].contains(&key.as_str()) {

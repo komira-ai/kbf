@@ -97,6 +97,7 @@
 
 mod called;
 mod farm;
+pub mod farm_steps;
 mod hostkeeper;
 pub mod release_ifs;
 #[cfg(test)]

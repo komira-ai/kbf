@@ -16,6 +16,7 @@ use xtask::prove_farm::{
 };
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
+const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
 
 fn scratch(name: &str) -> TestDir {
     TestDir::under(
@@ -31,6 +32,9 @@ fn args(project: &Path) -> Args {
         tls: "true".to_owned(),
         properties: "OSFamily=linux,ISA=x86-64".to_owned(),
         buck2: "buck2".into(),
+        assert_remote: "assert_remote".into(),
+        log: "buck2-farm.log".into(),
+        summary: "summary.md".into(),
         project: project.to_owned(),
         nonce: "77-1".to_owned(),
     }
@@ -172,11 +176,12 @@ fn the_settings_are_checked_before_anything_is_written() {
 fn the_buckconfig_turns_remote_on_and_local_off_with_the_farm_and_the_nonce() {
     // Catches: local execution left on, the properties or nonce missing from the file the
     // platform rule reads, a TLS flag that does not follow the variable, an empty instance
-    // name written as a setting, and one of the three REAPI addresses forgotten.
+    // name written as a setting, one of the three REAPI addresses forgotten, and the wait
+    // assert_remote reads (without it, it starts no watchdog) left out.
     let settings = Settings::of(&args(Path::new("p"))).expect("valid");
     assert_eq!(
         render_buckconfig(&settings),
-        "[buck2_re_client]\n  engine_address = grpc://farm.example:8980\n  action_cache_address = grpc://farm.example:8980\n  cas_address = grpc://farm.example:8980\n  tls = true\n  instance_name = main\n\n[build]\n  execution_platforms = root//platforms:remote\n\n[kbf_gamma]\n  remote_enabled = true\n  local_enabled = false\n  properties = OSFamily=linux,ISA=x86-64\n  nonce = 77-1\n"
+        "[buck2_re_client]\n  engine_address = grpc://farm.example:8980\n  action_cache_address = grpc://farm.example:8980\n  cas_address = grpc://farm.example:8980\n  tls = true\n  instance_name = main\n\n[build]\n  execution_platforms = root//platforms:remote\n\n[kbf_gamma]\n  remote_enabled = true\n  local_enabled = false\n  properties = OSFamily=linux,ISA=x86-64\n  nonce = 77-1\n\n[komira_ci]\n  farm_wait_seconds = 600\n"
     );
     let mut plain = args(Path::new("p"));
     plain.tls = "false".to_owned();
@@ -356,6 +361,14 @@ fn an_unset_address_prints_a_notice_and_passes() {
         let output = Command::new(XTASK)
             .args(["prove-farm", "--address", address])
             .args(["--buck2", "buck2", "--project", "p", "--nonce", "1"])
+            .args([
+                "--assert-remote",
+                "assert_remote",
+                "--log",
+                "l",
+                "--summary",
+                "s",
+            ])
             .output()
             .expect("run");
         assert!(output.status.success(), "{output:?}");
@@ -365,41 +378,95 @@ fn an_unset_address_prints_a_notice_and_passes() {
     }
 }
 
+/// The stand-ins `assert_remote` and `buck2` (src/bin/xtask_fake/buck2.rs) in the directory `bin`:
+/// assert_remote records its call in `assert_remote.calls` of its working directory and runs the
+/// command; buck2 records its own in `buck2.calls` and prints no summary line.
+fn stand_ins(bin: &Path) {
+    for program in ["assert_remote", "buck2"] {
+        std::fs::hard_link(FAKE, bin.join(program)).expect("link the stand-in");
+    }
+}
+
+/// The calls a stand-in recorded in the file `name` of `dir`, one per line.
+fn calls_in(dir: &Path, name: &str) -> Vec<String> {
+    std::fs::read_to_string(dir.join(name))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
 #[test]
 fn the_binary_exits_1_for_a_bad_flag_and_for_a_build_without_counts() {
-    // Catches: the verb's errors not reaching the exit status, and the real process runner
-    // not reading a program's output (here `echo`, which prints no summary line).
+    // Catches: the verb's errors not reaching the exit status, the real process runner not
+    // reading a program's output (the stand-in buck2 prints no summary line), and a buck2 that
+    // cannot start taken for a pass.
     let dir = scratch("binary");
-    let base = |tls: &str, buck2: &str| {
+    let bin = scratch("binary-bin");
+    stand_ins(bin.path());
+    let base = |tls: &str, buck2: &Path| {
         Command::new(XTASK)
             .args(["prove-farm", "--address", "grpc://farm.example:8980"])
             .args(["--tls", tls, "--properties", "a=b", "--nonce", "1"])
-            .args(["--buck2", buck2, "--project"])
+            .arg("--buck2")
+            .arg(buck2)
+            .arg("--assert-remote")
+            .arg(bin.join("assert_remote"))
+            .arg("--log")
+            .arg(bin.join("buck2-farm.log"))
+            .arg("--summary")
+            .arg(bin.join("summary.md"))
+            .arg("--project")
             .arg(dir.path())
             .output()
             .expect("run")
     };
-    let bad = base("maybe", "/bin/echo");
+    let buck2 = bin.join("buck2");
+    let bad = base("maybe", &buck2);
     assert_eq!(bad.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&bad.stderr).contains("--tls"));
-    let none = base("false", "/bin/echo");
+    let none = base("false", &buck2);
     assert_eq!(none.status.code(), Some(1), "{none:?}");
-    assert!(String::from_utf8_lossy(&none.stdout).contains("build --console simple //:proof"));
+    assert_eq!(
+        calls_in(dir.path(), "buck2.calls"),
+        ["build --console simple //:proof"]
+    );
     assert!(String::from_utf8_lossy(&none.stderr).contains("no `Commands:` line"));
-    let missing = base("false", "/no/such/buck2");
+    let missing = base("false", Path::new("/no/such/buck2"));
     assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("buck2 build failed"));
 }
 
 #[test]
-fn the_process_runner_runs_the_program_in_the_project() {
+fn the_process_runner_runs_the_build_under_assert_remote_in_the_project() {
     // Catches: the build run in the runner's working directory instead of the project (it
-    // would not find the project's `.buckconfig`).
+    // would not find the project's `.buckconfig`), run outside the watchdog, or given another
+    // log, job summary or farm config than the project's own configuration, and an
+    // assert_remote that cannot start taken for a run.
     let dir = scratch("process");
-    let mut echo = process(Path::new("/bin/pwd"), dir.path());
-    let done = echo(&[]).expect("runs");
-    assert!(done.ok);
-    let printed = std::fs::canonicalize(done.stdout.trim()).expect("a path");
-    assert_eq!(printed, std::fs::canonicalize(dir.path()).expect("dir"));
-    let mut missing = process(Path::new("/no/such/program"), dir.path());
-    assert!(missing(&[]).is_err());
+    let bin = scratch("process-bin");
+    stand_ins(bin.path());
+    let mut a = args(dir.path());
+    a.buck2 = bin.join("buck2");
+    a.assert_remote = bin.join("assert_remote");
+    a.log = bin.join("buck2-farm.log");
+    a.summary = bin.join("summary.md");
+    let done = process(&a)(&build_args()).expect("runs");
+    assert!(done.ok, "{done:?}");
+    assert_eq!(
+        calls_in(dir.path(), "assert_remote.calls"),
+        [format!(
+            "run --log {} --summary {} --farm-config {} -- {} build --console simple //:proof",
+            a.log.display(),
+            a.summary.display(),
+            dir.path().join(CONFIG_FILE).display(),
+            a.buck2.display()
+        )]
+    );
+    assert_eq!(
+        calls_in(dir.path(), "buck2.calls"),
+        ["build --console simple //:proof"]
+    );
+    a.assert_remote = bin.join("no-such-program");
+    assert!(process(&a)(&build_args()).is_err());
 }

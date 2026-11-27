@@ -255,8 +255,8 @@ fn no_other_job_reads_the_deploy_variables() {
     red(&found, "the job `gamma` reads a `CP_DEPLOY_*` variable");
     let commented = plant(
         "gamma",
-        "    timeout-minutes: 90\n",
-        "    timeout-minutes: 90\n    # not CP_DEPLOY_ENDPOINT\n",
+        "    timeout-minutes: 135\n",
+        "    timeout-minutes: 135\n    # not CP_DEPLOY_ENDPOINT\n",
     );
     assert!(
         !commented.iter().any(|p| p.contains("CP_DEPLOY_")),

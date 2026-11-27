@@ -11,7 +11,7 @@ const BUILD: &str =
     "        timeout-minutes: 30\n        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}\n";
 const FETCH: &str = "        timeout-minutes: 5\n        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}\n        run: cargo xtask fetch";
 const PROVE: &str =
-    "        timeout-minutes: 20\n        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}\n";
+    "        timeout-minutes: 40\n        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}\n";
 const JOIN_LINE: &str = "        if: ${{ vars.KBF_SETS_DESIRED == 'true' && vars.TS_CLIENT_ID != '' && vars.FARM_ADDRESS != '' }}\n";
 const PROOF_NAME: &str = "      - name: Prove the farm with a remote-only Buck2 build\n";
 const JOIN_NAME: &str = "      - name: Join the farm's Tailscale network\n";
@@ -294,9 +294,35 @@ fn every_step_of_gamma_has_a_timeout_and_the_job_covers_them() {
     red(
         &plant(
             "gamma",
-            "    timeout-minutes: 90\n",
+            "    timeout-minutes: 135\n",
             "    timeout-minutes: 30\n",
         ),
         "is less than the sum of its steps'",
+    );
+}
+
+#[test]
+fn komiras_sources_are_checked_out_once_and_by_gamma_alone() {
+    // Catches: komira's code checked out in another job of the release (beside its tokens, or as a
+    // second checkout the one-checkout rule would otherwise refuse), a second checkout of it in
+    // `gamma`, and the proof left without the tool's sources.
+    let komira = "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        if: ${{ vars.KBF_SETS_DESIRED == 'true' }}\n        timeout-minutes: 5\n        with:\n          repository: komira-ai/komira\n          ref: b2080fe989248adf9b47d4bd14c0ecefa0802f79\n          path: buck-out/komira\n          persist-credentials: false\n          sparse-checkout: /tools/build/ci/assert_remote/\n          sparse-checkout-cone-mode: false\n";
+    let found = problems(&real()).expect("read");
+    assert!(found.is_empty(), "{found:#?}");
+    red(
+        &plant(
+            "bump",
+            "      - run: rustup toolchain install\n",
+            &format!("{komira}      - run: rustup toolchain install\n"),
+        ),
+        "the job `bump` checks out komira's sources: only `gamma`",
+    );
+    red(
+        &plant("gamma", komira, &format!("{komira}{komira}")),
+        "`gamma` checks out komira's sources 2 times, not once",
+    );
+    red(
+        &plant("gamma", komira, ""),
+        "`gamma` checks out komira's sources 0 times, not once",
     );
 }

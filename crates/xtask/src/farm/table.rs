@@ -8,7 +8,8 @@
 //! makes the fix itself:
 //!
 //! 1. `buck2 build buildrules//cli:buildrules --show-full-output` builds the command line on the
-//!    farm (it is a target of the cell `.buckconfig` pins) and names the file it was written to.
+//!    farm (it is a target of the cell `.buckconfig` pins) and names the file it was written to;
+//!    it runs through `assert_remote run` ([`Farm::command`]), its log [`TOOL_LOG`].
 //! 2. `buildrules check`: status 0 is a fresh table, and the build goes on. Status 1 is a table
 //!    that is stale or missing a generated file (its problems are what check printed); any other
 //!    status (a usage error) is the error, with what check printed.
@@ -27,12 +28,14 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
-use super::{Error as FarmError, output, start_error, tee};
+use super::{Error as FarmError, Farm, merged, output};
 
 /// The target of the `buildrules` command line in the pinned buildrules cell.
 pub const TOOL: &str = "buildrules//cli:buildrules";
+/// The name of the log of its build in [`Farm::log_dir`], without `.log`.
+pub const TOOL_LOG: &str = "buck2-farm-tool";
 /// The name of the artifact the workflow uploads the patch as.
 pub const PATCH_ARTIFACT: &str = "buildrules-sync";
 /// The patch's file name, in the artifact.
@@ -98,13 +101,14 @@ pub enum Error {
     Tool {
         /// How it ended.
         status: String,
-        /// What buck2 printed on its standard error, trimmed.
+        /// What the run printed, buck2's standard output and error and `assert_remote`'s lines,
+        /// trimmed.
         stderr: String,
     },
     /// The build of the command line named no file for it.
     #[error("`buck2 build {TOOL} --show-full-output` named no output of {TOOL}: {stdout:?}")]
     NoTool {
-        /// What buck2 printed on its standard output.
+        /// What the run printed, buck2's standard output and error and `assert_remote`'s lines.
         stdout: String,
     },
     /// `buildrules check` could not judge the table (a status other than 0 and 1).
@@ -231,21 +235,27 @@ pub fn stale_inputs(stderr: &str) -> Vec<String> {
 /// Fails unless the generated build table is fresh, leaving its fix where `handoff` says when
 /// it is stale.
 pub(super) fn ensure_fresh(
-    buck2: &Path,
+    farm: &Farm,
     handoff: &Handoff,
     log: &mut dyn Write,
 ) -> Result<(), FarmError> {
-    let built = output(buck2, &["build", TOOL, "--show-full-output"])?;
-    if !built.status.success() {
+    // Its words are kept for the error, not written to the log: the build of the command line is
+    // not the build the log is for.
+    let (status, printed) = merged(
+        farm.command(TOOL_LOG, &["build", TOOL, "--show-full-output"]),
+        &farm.assert_remote,
+        &mut std::io::sink(),
+    )?;
+    if !status.success() {
         return Err(Error::Tool {
-            status: built.status.to_string(),
-            stderr: trimmed(&built.stderr),
+            status: status.to_string(),
+            stderr: trimmed(&printed),
         }
         .into());
     }
-    let stdout = String::from_utf8_lossy(&built.stdout);
-    let tool = tool_path(&stdout).ok_or_else(|| Error::NoTool {
-        stdout: stdout.into_owned(),
+    let printed = String::from_utf8_lossy(&printed);
+    let tool = tool_path(&printed).ok_or_else(|| Error::NoTool {
+        stdout: printed.into_owned(),
     })?;
     let checked = output(&tool, &["check"])?;
     if checked.status.success() {
@@ -260,7 +270,7 @@ pub(super) fn ensure_fresh(
         .into());
     }
     let inputs = stale_inputs(&stderr);
-    sync(&tool, buck2, log)?;
+    sync(&tool, &farm.buck2, log)?;
     let again = output(&tool, &["check"])?;
     if !again.status.success() {
         return Err(Error::StillFails {
@@ -292,23 +302,9 @@ fn trimmed(bytes: &[u8]) -> String {
 
 /// `buildrules sync --buck2 <buck2>`, everything it prints written to `log` as it comes.
 fn sync(tool: &Path, buck2: &Path, log: &mut dyn Write) -> Result<(), FarmError> {
-    // One pipe for both of its streams, so its words reach the log in the order it wrote them.
-    let (reader, writer) = std::io::pipe().map_err(start_error(tool))?;
-    let mut child = {
-        let mut command = Command::new(tool);
-        command
-            .arg("sync")
-            .arg("--buck2")
-            .arg(buck2)
-            .stdin(Stdio::null())
-            .stdout(writer.try_clone().map_err(start_error(tool))?)
-            .stderr(writer);
-        // The command, and with it this process's ends of the pipe, is dropped at the end of the
-        // block, so the read below ends when sync and its children close theirs.
-        command.spawn().map_err(start_error(tool))?
-    };
-    tee(reader, log);
-    let status = child.wait().map_err(start_error(tool))?;
+    let mut command = Command::new(tool);
+    command.arg("sync").arg("--buck2").arg(buck2);
+    let (status, _) = merged(command, tool, log)?;
     if !status.success() {
         return Err(Error::Sync {
             status: status.to_string(),

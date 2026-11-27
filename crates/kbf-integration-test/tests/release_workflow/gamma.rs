@@ -13,15 +13,19 @@
 //! - **The tailnet join.** At most one step of [`TS_ACTION`], after the build of xtask and before
 //!   the proof, given exactly [`TS_WITH`] (variables and the tag; the run token, no secret). No
 //!   other job uses that action.
-//! - **The proof.** The pinned Buck2 is fetched (the fetch line of [`BUCK2_FETCH`], the one place
-//!   the job may name an `https://` address) and `cargo xtask prove-farm` runs once, given the
+//! - **The proof.** The pinned Buck2 is fetched (the fetch line of [`BUCK2_FETCH`]; it and the
+//!   fetch line of the pinned Zig [`ZIG_FETCH`], which builds komira's `assert_remote`, are the
+//!   places the job may name an `https://` address) and `cargo xtask prove-farm` runs once, given the
 //!   four organisation variables ([`FARM_VARS`]) through the step's `env:` and nothing else of
 //!   the environment but the run id and attempt as the nonce ([`NONCE`]); no other job reads a
 //!   `FARM_` variable, and no address is written.
+//! - **komira's sources.** `gamma` checks out komira's `assert_remote` sources once, the one
+//!   checkout besides that of the built commit ([`of_the_build`]), and no other job does.
 //! - **Time.** Every step has a `timeout-minutes` of its own and the job's is at least their
 //!   sum, so a step that hangs is cut by its own timeout.
 
 use super::{GAMMA, code, env_is, flag_is, job_text, lines, run_of, uses, workflows};
+use crate::workflows::farm_steps::is_komira_checkout;
 
 /// The condition of every step of `gamma` after the notice: the repository variable that says
 /// hostkeeper deploys the farm.
@@ -63,6 +67,11 @@ pub const NONCE: &str = "${{ github.run_id }}-${{ github.run_attempt }}";
 /// The step of `gamma` that fetches Buck2, exactly as `beta.yml` does.
 pub const BUCK2_FETCH: &str = "cargo xtask fetch --url \"https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst\" --sha256 \"$BUCK2_SHA256\" --out \"$RUNNER_TEMP/tools/buck2\" --extract zst";
 
+/// The step of `gamma` that fetches the Zig that builds komira's `assert_remote`, pinned by the
+/// job's `ZIG_VERSION` and `ZIG_SHA256`, from ziglang.org alone (`cargo xtask fetch` tries several
+/// addresses only with `--cache`, which this job does not keep).
+pub const ZIG_FETCH: &str = "cargo xtask fetch --url \"https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz\" --sha256 \"$ZIG_SHA256\" --out \"$RUNNER_TEMP/zig.tar.xz\"";
+
 /// The action `gamma` joins a Tailscale network with, pinned by commit.
 pub const TS_ACTION: &str = "tailscale/github-action@";
 
@@ -74,6 +83,14 @@ pub const TS_WITH: [(&str, &str); 3] = [
     ("audience", "${{ vars.TS_AUDIENCE }}"),
     ("tags", "tag:ci"),
 ];
+
+/// Whether `step` of the job `job` is a checkout the release's checkout rule holds to the commit
+/// the pipeline run built: every `actions/checkout` but `gamma`'s one of komira's `assert_remote`
+/// sources, which the workflow lint's `farm_steps` holds to its pinned shape and [`rules`] to
+/// `gamma` alone.
+pub fn of_the_build(job: &str, step: &workflows::Step) -> bool {
+    uses(step, "actions/checkout@") && !(job == GAMMA && is_komira_checkout(step))
+}
 
 /// The name of a step, for a message.
 fn name_of(step: &workflows::Step) -> &str {
@@ -111,15 +128,15 @@ pub fn rules(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             ));
         }
     }
-    // The pinned Buck2 download is the one address the job names.
+    // The pinned Buck2 and Zig downloads are the addresses the job names.
     let text: String = text
         .lines()
-        .filter(|l| !l.contains(BUCK2_FETCH))
+        .filter(|l| !l.contains(BUCK2_FETCH) && !l.contains(ZIG_FETCH))
         .collect::<Vec<_>>()
         .join("\n");
     if text.contains("http://") || text.contains("https://") {
         out.push(format!(
-            "the job `{job}` writes an address: nothing but the pinned Buck2 download is named"
+            "the job `{job}` writes an address: nothing but the pinned Buck2 and Zig downloads is named"
         ));
     }
     if text.contains("grpc://") || text.contains("grpcs://") {
@@ -132,10 +149,40 @@ pub fn rules(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             "the job `{job}` reads a secret: it holds the run's OIDC token and nothing else"
         ));
     }
+    komira_sources(release, &steps, out)?;
     notice_and_switch(&steps, out);
     let prove = prove_farm(&steps, out);
     tailnet_join(release, &steps, prove, out)?;
     time(release, &steps, out)
+}
+
+/// komira's `assert_remote` sources are checked out once, by `gamma`, whose proof runs under that
+/// tool, and by no other job of the release.
+fn komira_sources(
+    release: &str,
+    steps: &[workflows::Step],
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    for job in super::jobs().iter().filter(|j| j.as_str() != GAMMA) {
+        if super::deploy::calls(release, job)? {
+            continue;
+        }
+        if workflows::job_steps(release, job)?
+            .iter()
+            .any(is_komira_checkout)
+        {
+            out.push(format!(
+                "the job `{job}` checks out komira's sources: only `{GAMMA}`, whose proof runs under assert_remote, does"
+            ));
+        }
+    }
+    let count = steps.iter().filter(|s| is_komira_checkout(s)).count();
+    if count != 1 {
+        out.push(format!(
+            "`{GAMMA}` checks out komira's sources {count} times, not once"
+        ));
+    }
+    Ok(())
 }
 
 /// The notice is the second step, unconditional; every later step is under [`SETS_IF`], the

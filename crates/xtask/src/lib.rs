@@ -29,15 +29,15 @@
 //!   when blocked, stalled or out of time (an empty `--url`: a notice, exit 0). `deploy-farm restore --run <id>-<attempt>`
 //!   ([`deploy_farm::restore`]), the job's step after a failure, sets back the version the release replaced, and exits 1.
 //! - `prove-farm --address <grpc url> --instance <name> --tls <true|false> --properties <k=v,...> --buck2 <path>
-//!   --project <dir> --nonce <text>` ([`prove_farm`]): after the deploy, build a small Buck2 project against the
-//!   farm, remote only, and exit 1 unless some action ran remotely and none locally. An empty `--address` prints a
-//!   notice and exits 0.
+//!   --assert-remote <path> --log <path> --summary <path> --project <dir> --nonce <text>` ([`prove_farm`]): build a
+//!   small Buck2 project against the farm under komira's `assert_remote run` (a run hung on a dead connection is
+//!   ended and run again); exit 1 unless some action ran remotely and none locally. An empty `--address`: a notice.
 //! - `farm-config --address <A> --instance <I> --tls <true|false> --properties <P> --out <path>`
 //!   ([`farm_config`]): the farm lane's buckconfig, the address masked in the log first.
-//! - `farm-build --buck2 <path> --target <label>... --patch <path> --summary <path> --repo
-//!   <owner/name> --run-id <id>` ([`farm`]): the farm lane's build, refused unless the generated
-//!   build table is fresh and buck2 has worker properties, and failed unless every action ran on
-//!   the farm (`local: 0`).
+//! - `farm-build --buck2 <path> --assert-remote <path> --farm-config <path> --log-dir <dir> --target <label>...
+//!   --patch <path> --summary <path> --repo <owner/name> --run-id <id>` ([`farm`]): the farm lane's build, under
+//!   komira's `assert_remote run`, refused unless the generated build table is fresh and buck2 has worker
+//!   properties, and failed unless every action ran on the farm (`local: 0`).
 //! - `filer-presence-bench --filer <host:port> --filer-root </buckets/bucket> [--sample cas/l] [--keys
 //!   1,10,...] [--present 100,50,0] [--rounds 200] [--lag-store-endpoint <url> ...]`
 //!   ([`filer_presence_bench`]): by hand, against a real SeaweedFS filer: the p50 and p99 of its

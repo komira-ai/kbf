@@ -15,13 +15,21 @@
 //!    TLS and instance name, the execution platform (remote on, local off, the properties),
 //!    and the run's nonce, which every action of the project takes as an argument, so no
 //!    action of this run was ever run, or cached, before.
-//! 4. `buck2 build` runs in the project. Its output is printed, and its
-//!    `Commands: N (cached: C, remote: R, local: L)` line is read ([`parse_commands`]).
+//!    It also holds `[komira_ci] farm_wait_seconds` ([`crate::farm_config::FARM_WAIT_SECONDS`]),
+//!    which `assert_remote` reads from the same file.
+//! 4. `buck2 build` runs in the project, through komira-ai/komira's `assert_remote run --log
+//!    <log> --summary <summary> --farm-config <project>/.buckconfig.local -- <buck2> ...`
+//!    ([`process`]), the tool of komira's `buck2-farm` action, fetched and built at a pinned
+//!    commit by the workflow: while buck2 runs, its watchdog ends a run whose connection to the
+//!    farm has heard nothing for 300 s, with one line in the log and one in the job summary,
+//!    and runs it again once the farm answers, at most three runs in all. Its output is printed,
+//!    and the last `Commands: N (cached: C, remote: R, local: L)` line is read
+//!    ([`parse_commands`]).
 //!    The verb ends with 1 when the build fails, when the line is missing, when no action
 //!    ran remotely or when any ran locally.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use clap::Args as ClapArgs;
@@ -54,6 +62,15 @@ pub struct Args {
     /// The Buck2 program.
     #[arg(long)]
     pub buck2: PathBuf,
+    /// komira's `assert_remote`, which runs the build.
+    #[arg(long)]
+    pub assert_remote: PathBuf,
+    /// The file `assert_remote` writes the build's log to.
+    #[arg(long)]
+    pub log: PathBuf,
+    /// The job summary `assert_remote` appends its line for a run again to.
+    #[arg(long)]
+    pub summary: PathBuf,
     /// The Buck2 project to build.
     #[arg(long)]
     pub project: PathBuf,
@@ -191,7 +208,8 @@ impl Settings {
 }
 
 /// The text of `<project>/.buckconfig.local`: the farm, the one execution platform (remote
-/// on, local off, the properties the project's platform rule reads), and the nonce.
+/// on, local off, the properties the project's platform rule reads), the nonce, and the wait
+/// `assert_remote` reads.
 #[must_use]
 pub fn render_buckconfig(s: &Settings) -> String {
     let mut out = String::from("[buck2_re_client]\n");
@@ -211,6 +229,10 @@ pub fn render_buckconfig(s: &Settings) -> String {
     out.push_str("\n[kbf_gamma]\n  remote_enabled = true\n  local_enabled = false\n");
     out.push_str(&format!("  properties = {}\n", properties.join(",")));
     out.push_str(&format!("  nonce = {}\n", s.nonce));
+    out.push_str(&format!(
+        "\n[komira_ci]\n  farm_wait_seconds = {}\n",
+        crate::farm_config::FARM_WAIT_SECONDS
+    ));
     out
 }
 
@@ -270,10 +292,27 @@ pub fn build_args() -> Vec<String> {
 /// Runs the Buck2 program with `args`.
 pub type Buck2<'a> = dyn FnMut(&[String]) -> Result<Out, Error> + 'a;
 
-/// The closure that runs `buck2` in `project`.
-pub fn process(buck2: &Path, project: &Path) -> impl FnMut(&[String]) -> Result<Out, Error> {
-    let (buck2, project) = (buck2.to_owned(), project.to_owned());
-    move |args| spawn(Command::new(&buck2).args(args).current_dir(&project))
+/// The closure that runs `args.buck2` in `args.project` through `assert_remote run`, with the
+/// verb's log and job summary, and the project's [`CONFIG_FILE`] as the farm config.
+pub fn process(args: &Args) -> impl FnMut(&[String]) -> Result<Out, Error> + use<> {
+    let project = args.project.clone();
+    let program = args.assert_remote.clone();
+    let mut leading: Vec<std::ffi::OsString> = vec!["run".into(), "--log".into()];
+    leading.push(args.log.clone().into_os_string());
+    leading.push("--summary".into());
+    leading.push(args.summary.clone().into_os_string());
+    leading.push("--farm-config".into());
+    leading.push(project.join(CONFIG_FILE).into_os_string());
+    leading.push("--".into());
+    leading.push(args.buck2.clone().into_os_string());
+    move |buck2_args| {
+        spawn(
+            Command::new(&program)
+                .args(&leading)
+                .args(buck2_args)
+                .current_dir(&project),
+        )
+    }
 }
 
 fn failed(problem: &Problem) -> Error {
@@ -291,11 +330,7 @@ pub fn run(args: &Args) -> Result<Vec<String>, Error> {
                 .to_owned(),
         ]);
     }
-    run_with(
-        args,
-        &mut process(&args.buck2, &args.project),
-        &mut std::io::stdout().lock(),
-    )
+    run_with(args, &mut process(args), &mut std::io::stdout().lock())
 }
 
 /// The verb with the Buck2 program given; Buck2's output is written to `out`.

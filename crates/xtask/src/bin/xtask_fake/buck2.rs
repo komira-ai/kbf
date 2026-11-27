@@ -1,6 +1,7 @@
-//! The buck2 and buildrules personas of `xtask-fake` (see its docs), for the tests of `farm-build`.
+//! The buck2, buildrules and assert_remote personas of `xtask-fake` (see its docs), for the tests of
+//! `farm-build` and `prove-farm`.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -152,4 +153,78 @@ pub fn buildrules(args: &[String]) -> ExitCode {
         eprintln!("buildrules: STALE: {line}: {FIX}");
     }
     ExitCode::from(u8::from(!stale.is_empty()))
+}
+
+/// The lines the stand-in `assert_remote` prints for a first run its watchdog ended (defect
+/// `watchdog-cut`), the words of the real tool's.
+pub const CUT: &str = "\
+buck2-farm: watchdog: the connection to the farm from local port 41022 has heard nothing from the farm for 5 min 1 s, past the bound of 5 min 0 s: the farm has closed it and buck2 would wait on it for ever; ending buck2 (SIGINT)
+buck2-farm: stopping buck2's daemon, which holds the dead connection (`buck2 kill`)
+buck2-farm: the first run hung on a dead connection to the farm and was ended; waiting for the farm's port to answer, up to 10 min 0 s
+";
+
+/// The line the stand-in `assert_remote` prints when the build's every run hung (defect
+/// `watchdog-gives-up`), before it exits 1.
+pub const GAVE_UP: &str =
+    "buck2-farm: the third run hung on a dead connection to the farm too; not running it again\n";
+
+/// The fake `assert_remote run --log <file> --summary <file> --farm-config <file> -- <buck2>
+/// <args>`: records the call, then runs the command once with its standard output and error on
+/// one pipe, copied to its own standard output and to `--log`, and exits with the command's
+/// status. A call of another shape exits 2. Defects: `watchdog-cut` (every call first prints
+/// [`CUT`] and runs `<buck2> kill`, as after a run the watchdog ended, then runs the command) and
+/// `watchdog-gives-up` (a call that is not the build of the `buildrules` command line runs
+/// `<buck2> kill`, prints [`GAVE_UP`] and exits 1 without running the command).
+pub fn assert_remote(args: &[String]) -> ExitCode {
+    append(Path::new("assert_remote.calls"), &args.join(" "));
+    let Some(dash) = args.iter().position(|a| a == "--") else {
+        eprintln!("assert_remote: no `--` before the command");
+        return ExitCode::from(2);
+    };
+    let flag = |name: &str| {
+        args[..dash]
+            .windows(2)
+            .find(|w| w[0] == name)
+            .map(|w| w[1].clone())
+    };
+    let (Some("run"), Some(log), Some(_), Some(_), Some(program)) = (
+        args.first().map(String::as_str),
+        flag("--log"),
+        flag("--summary"),
+        flag("--farm-config"),
+        args.get(dash + 1),
+    ) else {
+        eprintln!(
+            "assert_remote: usage: run --log <file> --summary <file> --farm-config <file> -- <command>"
+        );
+        return ExitCode::from(2);
+    };
+    let command = &args[dash + 2..];
+    let defect = defect();
+    let kill = || {
+        let _ = std::process::Command::new(program).arg("kill").status();
+    };
+    if defect == "watchdog-gives-up" && !command.iter().any(|a| a == TOOL) {
+        kill();
+        print!("{GAVE_UP}");
+        return ExitCode::FAILURE;
+    }
+    if defect == "watchdog-cut" {
+        print!("{CUT}");
+        kill();
+    }
+    let (mut reader, writer) = std::io::pipe().expect("pipe");
+    let mut child = {
+        let mut run = std::process::Command::new(program);
+        run.args(command)
+            .stdout(writer.try_clone().expect("pipe"))
+            .stderr(writer);
+        run.spawn().expect("run the command")
+    };
+    let mut printed = Vec::new();
+    reader.read_to_end(&mut printed).expect("read the command");
+    let status = child.wait().expect("wait for the command");
+    std::io::stdout().write_all(&printed).expect("print");
+    std::fs::write(&log, &printed).expect("write the log");
+    ExitCode::from(u8::try_from(status.code().unwrap_or(2)).unwrap_or(2))
 }

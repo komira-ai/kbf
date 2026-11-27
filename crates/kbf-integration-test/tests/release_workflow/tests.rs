@@ -661,8 +661,8 @@ fn verify_reads_the_artifacts_of_the_pipeline_run_that_started_the_release() {
     red(
         &plant(
             "verify",
-            "      - name: Refuse a commit not on main, or a build that lost an artifact\n        env:",
-            "      - name: Refuse a commit not on main, or a build that lost an artifact\n        if: ${{ false }}\n        env:",
+            "      - name: Refuse a commit not on main, or a build that lost an artifact\n        timeout-minutes: 5\n        env:",
+            "      - name: Refuse a commit not on main, or a build that lost an artifact\n        timeout-minutes: 5\n        if: ${{ false }}\n        env:",
         ),
         "`release locate` step of `verify` is under `if:`",
     );
@@ -1101,8 +1101,8 @@ fn actions_stay_pinned_and_the_token_starts_empty() {
     red(
         &plant(
             "publish",
-            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1\n        with:\n          name: release-assets",
-            "actions/download-artifact@v8\n        with:\n          name: release-assets",
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1\n        timeout-minutes: 5\n        with:\n          name: release-assets",
+            "actions/download-artifact@v8\n        timeout-minutes: 5\n        with:\n          name: release-assets",
         ),
         "workflow lint:",
     );
@@ -1153,8 +1153,8 @@ fn a_binary_runs_only_after_its_files_are_attested() {
     red(
         &plant(
             "notes",
-            "      - name: Verify the previous release's attestations as these were\n        if: ${{ steps.previous.outputs.previous != '' }}\n",
-            "      - name: Verify the previous release's attestations as these were\n",
+            "      - name: Verify the previous release's attestations as these were\n        timeout-minutes: 20\n        if: ${{ steps.previous.outputs.previous != '' }}\n",
+            "      - name: Verify the previous release's attestations as these were\n        timeout-minutes: 20\n",
         ),
         "runs a binary unpacked from `previous/` without an earlier",
     );
