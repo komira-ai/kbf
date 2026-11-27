@@ -35,6 +35,8 @@ How to read the numbers:
   **248 / 2,023 ms** (joined, n = 17,343; measured), against 80 / 282 ms in light minutes.
   - Its p50 is the largest of any single start-path stage in a burst. The next are executor
     `start` at 216 ms and the host's provider wait at 153 ms.
+  - In light minutes the largest stage is instead the provider wait, 148 / 513 ms, against
+    REAPI prepare's 80 ms.
   - Where it is long, the input walk's store checks hold it (measured on the 77 Executes over
     10 s, below).
   - It is filed as komira-ai/kbf#2464.
