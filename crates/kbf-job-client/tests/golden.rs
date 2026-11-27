@@ -10,13 +10,17 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use js_proto::refusal::{refusal_of, refusal_status};
 use js_proto::v1::{
-    GetJobResponse, GetResultResponse, Job, JobResult, JobState, RefusalCode, SubmitJobRequest,
+    AttemptOutcome, CallbackState, GetJobResponse, GetResultResponse, Job, JobResult, JobSpec,
+    JobState, RefusalCode, SubmitJobRequest,
 };
 use kbf_job_client::Error;
 use kbf_job_client::fake::{Call, Fault};
 use prost::Message;
 use prost::encoding::{WireType, encode_key, encode_varint};
-use support::{fake, full_job, full_result, full_spec, golden_bytes, golden_text};
+use support::{
+    called_back_job, fake, full_job, full_result, full_spec, golden_bytes, golden_callback,
+    golden_text, retried_job,
+};
 use tonic::{Code, Status};
 
 const REFUSALS: [RefusalCode; 4] = [
@@ -55,6 +59,79 @@ fn golden_bodies_equal_what_the_pinned_js_proto_writes() {
     round_trips::<JobResult>("job_result.hex", &full_result());
     let details = refusal_status(RefusalCode::JobIdConflict, "job-1 names another job");
     assert_eq!(details.details(), golden_bytes("refusal_status.hex"));
+}
+
+/// The bytes of the golden `base` followed by those of the golden `added`: a message with the
+/// fields of `added` set encodes as the message without them, then those fields.
+fn appended(base: &[u8], added: &str) -> Vec<u8> {
+    let mut bytes = base.to_vec();
+    bytes.extend(golden_bytes(added));
+    bytes
+}
+
+/// Asserts the goldens of the fields the retry and callback work added, as the pinned
+/// `js-proto` writes them: a job with its attempts (`job_retry.hex`) and with its callback's
+/// delivery status (`job_callback.hex`), each after the bytes of `job.hex`, and a spec with a
+/// callback (`spec_callback.hex`) after the bytes of the golden submit's spec. Each decodes to
+/// the value the test builds, the attempts in order and each outcome typed. Catches a raise of
+/// the jobscheduler revision that renumbers or re-types a field kbf reads, and a field that
+/// loses its presence (a delivered time of 0, a deadline of 0).
+#[test]
+fn the_attempt_and_callback_goldens_equal_what_the_pinned_js_proto_writes() {
+    let job = golden_bytes("job.hex");
+    let retried = appended(&job, "job_retry.hex");
+    assert_eq!(retried_job().encode_to_vec(), retried);
+    let read = Job::decode(retried.as_slice()).unwrap();
+    assert_eq!(read, retried_job());
+    let outcomes: Vec<_> = read.attempt_history.iter().map(|a| a.outcome()).collect();
+    assert_eq!(
+        outcomes,
+        [
+            AttemptOutcome::StartFailed,
+            AttemptOutcome::HostLost,
+            AttemptOutcome::Failed
+        ]
+    );
+    assert_eq!((read.attempt, read.dropped_attempts), (3, 1));
+
+    let called = appended(&job, "job_callback.hex");
+    assert_eq!(called_back_job().encode_to_vec(), called);
+    let read = Job::decode(called.as_slice()).unwrap();
+    assert_eq!(read, called_back_job());
+    let status = read.callback_status.unwrap();
+    assert_eq!(status.state(), CallbackState::Pending);
+    assert_eq!(status.delivered_at_ms, Some(0));
+
+    let spec = full_spec("presigned-url-text").encode_to_vec();
+    let with_callback = appended(&spec, "spec_callback.hex");
+    let asked = JobSpec {
+        callback: Some(golden_callback()),
+        ..full_spec("presigned-url-text")
+    };
+    assert_eq!(asked.encode_to_vec(), with_callback);
+    assert_eq!(JobSpec::decode(with_callback.as_slice()).unwrap(), asked);
+    // The previous goldens are of a job and a spec without these fields: a read of them gives
+    // attempt 0 (which reads as 1), no history and no callback.
+    let old = Job::decode(job.as_slice()).unwrap();
+    assert_eq!(
+        (old.attempt, old.attempt_history.len(), old.callback_status),
+        (0, 0, None)
+    );
+}
+
+/// Asserts that a job with attempts and one with a callback status, served by the fake as a
+/// `GetJob` answer, come out of the client unchanged. Catches a client that drops the fields
+/// of a retried or called-back job on the way in.
+#[tokio::test]
+async fn attempts_and_callback_status_come_through_the_client_unchanged() {
+    let (server, client) = fake().await;
+    for job in [retried_job(), called_back_job()] {
+        let answer = GetJobResponse {
+            job: Some(job.clone()),
+        };
+        server.inject(Fault::Answer(answer.encode_to_vec().into()));
+        assert_eq!(client.get_job("job-1").await.unwrap(), job);
+    }
 }
 
 /// One refusal of `refusal_trailers.txt`: its name, the detail it was made with, and the

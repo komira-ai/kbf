@@ -10,8 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use js_proto::v1::{
-    Constraints, ExecMode, Job, JobFile, JobResult, JobSpec, JobState, JobTimes, Needs,
-    NetworkLevel, PortForward, ResourceUsage, ResultReason, Shape, StartFailureCode,
+    Attempt, AttemptOutcome, Callback, CallbackState, CallbackStatus, Constraints, ExecMode, Job,
+    JobFile, JobResult, JobSpec, JobState, JobTimes, Needs, NetworkLevel, PortForward,
+    ResourceUsage, ResultReason, Shape, StartFailureCode,
 };
 use kbf_job_client::fake::{FakeJobServer, Machine};
 use kbf_job_client::{Client, Config, Error};
@@ -147,6 +148,81 @@ pub fn full_job() -> Job {
         host_silent_since_ms: Some(T0 + 4000),
         cancel_requested: true,
         ..Job::default()
+    }
+}
+
+/// [`full_job`] with every attempt field set, as `tests/golden/job_retry.hex` pins (js-proto's
+/// `retried_job`): three ended attempts, the first a start failure and the second a lost host,
+/// both retried, and the third a failed run that was not.
+pub fn retried_job() -> Job {
+    let at = |queued, placed, started, ended| JobTimes {
+        queued_at_ms: queued,
+        placed_at_ms: placed,
+        started_at_ms: started,
+        ended_at_ms: ended,
+    };
+    Job {
+        attempt: 3,
+        attempt_history: vec![
+            Attempt {
+                number: 1,
+                host_id: "h".to_owned(),
+                outcome: AttemptOutcome::StartFailed.into(),
+                times: Some(at(5, Some(6), None, None)),
+                exit_code: None,
+                reason: ResultReason::Unspecified.into(),
+                start_failure: StartFailureCode::AgentRefused.into(),
+                start_failure_detail: "host-tainted".to_owned(),
+                retried: true,
+            },
+            Attempt {
+                number: 2,
+                host_id: "g".to_owned(),
+                outcome: AttemptOutcome::HostLost.into(),
+                times: Some(at(8, Some(9), Some(10), None)),
+                retried: true,
+                ..Attempt::default()
+            },
+            Attempt {
+                number: 3,
+                host_id: "h".to_owned(),
+                outcome: AttemptOutcome::Failed.into(),
+                times: Some(at(11, Some(12), Some(13), Some(14))),
+                exit_code: Some(2),
+                reason: ResultReason::Exit.into(),
+                retried: false,
+                ..Attempt::default()
+            },
+        ],
+        retry_not_before_ms: Some(15),
+        dropped_attempts: 1,
+        ..full_job()
+    }
+}
+
+/// [`full_job`] with its callback's delivery status set, as `tests/golden/job_callback.hex`
+/// pins (js-proto's `called_back_job`).
+pub fn called_back_job() -> Job {
+    Job {
+        callback_status: Some(CallbackStatus {
+            state: CallbackState::Pending.into(),
+            tries: 3,
+            last_try_at_ms: Some(4),
+            last_failure: "failed".to_owned(),
+            delivered_at_ms: Some(0),
+            deadline_at_ms: Some(6),
+        }),
+        ..full_job()
+    }
+}
+
+/// The callback `tests/golden/spec_callback.hex` pins: a URL, the 32 bytes 0x20 to 0x3f as its
+/// key, and a present deadline of 0.
+pub fn golden_callback() -> Callback {
+    Callback {
+        url: "https://h.example/r".to_owned(),
+        signing_key: (0x20..0x40).collect(),
+        deadline_seconds: Some(0),
     }
 }
 

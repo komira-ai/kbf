@@ -1,0 +1,19 @@
+# Copied unchanged from crates/js-proto/tests/golden/job_retry.hex of komira-ai/jobscheduler at the revision
+# the root Cargo.toml pins; the file names in the comments below are js-proto's own.
+# The bytes the attempt fields add to golden/job.hex: the encoding of common::job() with the
+# attempt fields of tests/retry.rs (retried_job) set, after the golden's bytes. A field the
+# previous schema has is not here; each line is one field.
+a8 02 03                                                # 37 attempt: 3
+b2 02 1f  08 01  12 01 68  18 04  22 04 08 05 10 06  38 04  42 0c 68 6f 73 74 2d 74 61 69 6e 74 65 64  48 01
+                                                        # 38 attempt_history[0]: number 1, host "h", outcome 4 (start failed),
+                                                        #    times (queued 5, placed 6), start_failure 4 (agent refused),
+                                                        #    detail "host-tainted", retried
+b2 02 11  08 02  12 01 67  18 03  22 06 08 08 10 09 18 0a  48 01
+                                                        # 38 attempt_history[1]: number 2, host "g", outcome 3 (host lost),
+                                                        #    times (queued 8, placed 9, started 10), retried
+b2 02 15  08 03  12 01 68  18 02  22 08 08 0b 10 0c 18 0d 20 0e  28 02  30 01
+                                                        # 38 attempt_history[2]: number 3, host "h", outcome 2 (failed),
+                                                        #    times (queued 11, placed 12, started 13, ended 14), exit_code 2,
+                                                        #    reason 1 (exit); not retried, so retried is not written
+b8 02 0f                                                # 39 retry_not_before_ms: 15
+c8 02 01                                                # 41 dropped_attempts: 1
