@@ -16,21 +16,41 @@
 //!   [`ASKS_IN_FLIGHT`] FindMissing calls; what the walk keeps is the digests of the tree
 //!   (the seen set, the queue and the files), not its blobs.
 //! - **Verified subtrees are remembered** ([`Trees`]). A walk that found a Directory and
-//!   everything under it held records the digests, with the time it began and the map
+//!   everything under it held records the digests, with the time it began and the
 //!   epoch ([`Blobs::epoch`]) it ran under; a later walk that reaches one of them within
 //!   [`VERIFIED_TTL`], under the same epoch, skips it: no read, no FindMissing. Content
 //!   addressing means an entry never goes stale in what it says a Directory contains;
 //!   only whether its blobs are still held can change, and that is bounded three ways: by
 //!   the time to live (the longest a blob that went away can still be taken for held,
 //!   as for the router's closure check), by the epoch (a new map generation or a
-//!   restarted member drops everything; over the frontend's packs, so does every blob a read
-//!   or check through them found lost or damaged, the only way this process removes a row of
-//!   the pack index, which is the whole epoch of a frontend with no storage node; a row another
-//!   frontend removes is believed for no longer than the time to live), and by [`Trees::distrust`]
-//!   (a walk that finds anything absent has seen a loss, so nothing verified before then is
-//!   believed).
+//!   restarted member drops everything; over the frontend's packs, so does every loss a read
+//!   through them is told of, and every forget of a lost pack and drop of a damaged blob's
+//!   location this process makes, the only ways it removes a row of the pack index: the packs'
+//!   loss guard counts each as it begins and again once it has returned, so what a walk
+//!   recorded while a removal ran is under an epoch the count has left by the time the row is
+//!   gone, and a walk still running then ends under another epoch than it began in and records
+//!   nothing), and by
+//!   [`Trees::distrust`] (a walk that finds anything absent has seen a loss, so nothing
+//!   verified before then is believed).
 //!   An entry is written only when the whole walk found nothing absent and nothing
 //!   failed, never from a partial result.
+//!
+//!   What only the time to live bounds. The epoch is this process's own: a pack another
+//!   frontend forgets, or a damaged blob's location another frontend drops, is not learned
+//!   here, and until [`VERIFIED_TTL`] after the walk that verified the tree a later Execute
+//!   over it asks the store nothing about it. And "held" is the pack index's row, never a
+//!   look at the object: an object that went away while its row stays, or a large object
+//!   (`cas/l/`) of another length than its row says, is not found by a walk, with the memory
+//!   or without it, but by the read of it, which fails. A run over a tree a row of which
+//!   another frontend removed fails to write its action tree (the farm's failure, which the
+//!   executor runs again); its preparation takes the Execute's finding once, so the next one
+//!   checks for itself and
+//!   answers the blob missing, as the Execute does when it finds the blob gone (another
+//!   Execute of the Action in between vouches again). The memory is not a single flight
+//!   either: the first walk of a tree is made by every Execute that reaches the tree before
+//!   one walk of it has ended, and a subtree a walk skips keeps the time of the walk that
+//!   verified it (a use does not extend it), so a shared subtree is walked again in full once
+//!   each [`VERIFIED_TTL`], by every Execute that reaches it while that walk runs.
 //! - **Directories are cached by content** ([`DirCache`]). A walk that reaches a Directory
 //!   whose decoded content it holds does not read it, and does not take it for held
 //!   either: the digest goes into the FindMissing calls the walk makes for its files
@@ -61,11 +81,12 @@
 //!   backend has given [`Trees::keep_into`] that cache, every Directory this walk reads is
 //!   also kept there, decoded with its names, so the preparation reads none of them again.
 //!   And when an Execute's check finds the Action's Command and every blob of its tree held,
-//!   it records when ([`Trees::vouch`], by the Action's digest); the preparation of that
-//!   Action takes the record ([`Trees::vouched`], once) and does not ask the store about the
-//!   Command and the files again if the record is younger than [`VERIFIED_TTL`], the same
-//!   bound as for the subtrees remembered above. A record nobody takes is pushed out by
-//!   newer ones ([`VOUCHED_ENTRIES`]).
+//!   it records when, and the epoch its walk began under ([`Trees::vouch`], by the Action's
+//!   digest); the preparation of that Action takes the record ([`Trees::vouched`], once) and
+//!   does not ask the store about the Command and the files again if the record is younger
+//!   than [`VERIFIED_TTL`] and the store's epoch is still the record's, the same bounds as for
+//!   the subtrees remembered above (a store that names no epoch, then and now, is believed by
+//!   the time alone). A record nobody takes is pushed out by newer ones ([`VOUCHED_ENTRIES`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -98,10 +119,12 @@ pub(crate) const FILES_PER_ASK: usize = 4096;
 /// The most FindMissing calls of one [`walk_told`] open at once.
 pub(crate) const ASKS_IN_FLIGHT: usize = 4;
 
-/// How long a verified Directory is believed. Shared with the router's closure check
-/// (`kbf_route::DEFAULT_CLOSURE_TTL`): a build's actions arrive within seconds of each
-/// other, so a toolchain tree is walked about once per this long, and a blob that went
-/// away is taken for held for no longer than this.
+/// How long a verified Directory is believed, from the start of the walk that verified it.
+/// Shared with the router's closure check (`kbf_route::DEFAULT_CLOSURE_TTL`). A walk that
+/// skips a Directory does not renew its time, and every Execute that reaches a tree before
+/// one walk of it has ended walks it too, so a tree a build's actions share is walked in full
+/// at least once per this long. A blob that went away in a way this process has not counted
+/// (see the module) is taken for held for no longer than this.
 pub(crate) const VERIFIED_TTL: Duration = Duration::from_secs(45);
 
 /// The most Directories [`Trees`] remembers (about 100 bytes each): a farm's worth of
@@ -153,8 +176,9 @@ pub(crate) struct Trees {
 /// The Executes' findings not yet taken, by the Action's digest, with the order they were
 /// made in: a finding made again for the same Action replaces the one before.
 struct Vouched {
-    /// action -> (when its inputs were found held, its place in `order`)
-    found: HashMap<Digest, (Instant, u64)>,
+    /// action -> (when its inputs were found held, the epoch the finding rests on, its place
+    /// in `order`)
+    found: HashMap<Digest, (Instant, Option<u64>, u64)>,
     /// Oldest first; a place whose finding was taken or replaced is passed over.
     order: VecDeque<(u64, Digest)>,
     next: u64,
@@ -171,12 +195,12 @@ impl Vouched {
         }
     }
 
-    /// Records that the inputs of `action` were found held at `at`, pushing out the oldest
-    /// places beyond the capacity.
-    fn put(&mut self, action: Digest, at: Instant) {
+    /// Records that the inputs of `action` were found held at `at`, under `epoch`, pushing
+    /// out the oldest places beyond the capacity.
+    fn put(&mut self, action: Digest, at: Instant, epoch: Option<u64>) {
         let place = self.next;
         self.next += 1;
-        self.found.insert(action, (at, place));
+        self.found.insert(action, (at, epoch, place));
         self.order.push_back((place, action));
         let over = |order: &mut VecDeque<(u64, Digest)>, capacity| {
             (order.len() > capacity)
@@ -187,16 +211,16 @@ impl Vouched {
             if self
                 .found
                 .get(&action)
-                .is_some_and(|(_, held)| *held == place)
+                .is_some_and(|(_, _, held)| *held == place)
             {
                 self.found.remove(&action);
             }
         }
     }
 
-    /// The finding for `action`, which is then gone.
-    fn take(&mut self, action: &Digest) -> Option<Instant> {
-        self.found.remove(action).map(|(at, _)| at)
+    /// The finding for `action` and its epoch, which is then gone.
+    fn take(&mut self, action: &Digest) -> Option<(Instant, Option<u64>)> {
+        self.found.remove(action).map(|(at, epoch, _)| (at, epoch))
     }
 }
 
@@ -355,25 +379,29 @@ impl Trees {
     }
 
     /// An Execute found the Command and every blob of the input tree of `action` held, by
-    /// reads and FindMissing calls that all began at `at` or later. A finding that began
-    /// before a walk saw something absent ([`Trees::distrust`]) is not believed, as for
-    /// [`Trees::record`].
-    pub(crate) fn vouch(&self, action: Digest, at: Instant) {
+    /// reads and FindMissing calls that all began at `at` or later, under the store's `epoch`
+    /// ([`Blobs::epoch`] as its walk began). A finding that began before a walk saw something
+    /// absent ([`Trees::distrust`]) is not believed, as for [`Trees::record`].
+    pub(crate) fn vouch(&self, action: Digest, at: Instant, epoch: Option<u64>) {
         // The floor is held while the finding is put, as `distrust` holds it while it clears.
         let inner = self.lock();
         if inner.floor.is_some_and(|floor| at < floor) {
             return;
         }
-        self.vouches().put(action, at);
+        self.vouches().put(action, at, epoch);
         drop(inner);
     }
 
-    /// Whether, at `now`, an Execute's finding for `action` is younger than the time a check
-    /// is believed for. The finding is taken: the next preparation of the Action, its next
-    /// attempt included, checks for itself unless another Execute has found it again.
-    pub(crate) fn vouched(&self, action: &Digest, now: Instant) -> bool {
+    /// Whether, at `now`, with the store at `epoch`, an Execute's finding for `action` is
+    /// younger than the time a check is believed for and was made under the same epoch (a
+    /// store that names no epoch, then and now, is believed by time alone). The finding is
+    /// taken: the next preparation of the Action, its next attempt included, checks for itself
+    /// unless another Execute has found it again.
+    pub(crate) fn vouched(&self, action: &Digest, now: Instant, epoch: Option<u64>) -> bool {
         let found = self.vouches().take(action);
-        found.is_some_and(|at| now.saturating_duration_since(at) < self.ttl)
+        found.is_some_and(|(at, under)| {
+            under == epoch && now.saturating_duration_since(at) < self.ttl
+        })
     }
 }
 
@@ -712,6 +740,7 @@ async fn walk_within(
         );
     }
     walked.held_since = absent.is_empty().then_some(verified_at);
+    walked.epoch = epoch;
     walked.absent = absent;
     walked.files_checked = found.files.len() as u64;
     walked.file_asks = asking.len().div_ceil(FILES_PER_ASK) as u64;

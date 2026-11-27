@@ -213,6 +213,14 @@ impl Plane for StoredPlane {
     fn trees(&self) -> Option<&Trees> {
         Some(&self.trees)
     }
+
+    fn epoch(&self) -> Option<u64> {
+        Layered {
+            packs: self.packs(),
+            rest: &Absent,
+        }
+        .epoch()
+    }
 }
 
 #[cfg(test)]
@@ -222,3 +230,7 @@ mod tests;
 #[cfg(test)]
 #[path = "stored_walk_tests.rs"]
 mod walk_tests;
+
+#[cfg(test)]
+#[path = "stored_loss_tests.rs"]
+mod loss_tests;

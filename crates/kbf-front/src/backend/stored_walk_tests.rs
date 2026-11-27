@@ -1,8 +1,9 @@
 //! The walk of an input tree over the plane of a frontend with no storage node, done again: a
 //! tree found held is remembered (`crate::input_walk`'s verified memory) under the packs' epoch
 //! ([`Packs::losses`](crate::Packs)), so the next Execute over it asks the pack index nothing,
-//! while what changed is still asked about, what is absent is still reported, and a loss the
-//! packs find makes every tree be asked about again.
+//! while what changed is still asked about, what is absent is still reported, and a loss this
+//! frontend's packs count makes every tree it remembers be asked about again (a loss another
+//! frontend finds does not: `crate::input_walk` says what bounds that).
 
 use bytes::Bytes;
 use kbf_types::Digest;
