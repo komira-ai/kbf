@@ -23,6 +23,7 @@ use kbf_types::{Digest, DigestFunction};
 use sha2::{Digest as _, Sha256};
 use tierstore::{EntryKind, TreeDigest, flatten};
 
+#[path = "base_publish/cells.rs"]
 mod cells;
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
