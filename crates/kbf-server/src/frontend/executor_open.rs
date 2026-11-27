@@ -18,6 +18,15 @@ pub(super) struct ExecutorParts {
     pub(super) probe: Arc<dyn crate::health::Probe>,
 }
 
+/// The route the job service calls the executor's jobs back at, on the operator API
+/// (`crate::executor::callback`); none without an executor. Without
+/// `--executor-callback-origin` no job asks for a call, and the route answers every call 404.
+pub(super) fn callback_routes(parts: Option<&ExecutorParts>) -> axum::Router {
+    parts.map_or_else(axum::Router::new, |parts| {
+        crate::executor::callback_routes(parts.executor.callbacks())
+    })
+}
+
 /// The executor `--executor js-agent` describes, with the metrics it counts into; none when
 /// `--executor` is left out, which builds nothing and contacts no job service. The seams are
 /// the frontend's own: the ingest of the packs, the CAS `backend` over the same packs, and the

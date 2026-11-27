@@ -155,6 +155,8 @@ struct Submitted {
     key: PackKey,
     /// The action's timeout: the deadline a refused start is placed again within.
     timeout: Duration,
+    /// Its completion call, which wakes the reads ([`super::callback`]); none when it has none.
+    woken: Option<super::callback::Armed>,
 }
 
 /// How one run ended.
@@ -411,7 +413,7 @@ async fn fresh(
         () = cancel_asked(cancel) => return Ended::Cancelled,
         prepared = timeout(inner.cfg.prepare_limit, prepare(&preparer, run, (&action, op.decoded.as_deref(), &op.sent), booking)) => prepared,
     };
-    let prepared = match prepared {
+    let mut prepared = match prepared {
         Ok(Ok(prepared)) => prepared,
         Ok(Err(settled)) => return Ended::Again(settled, None),
         Err(_) => {
@@ -422,6 +424,7 @@ async fn fresh(
     let ready = Instant::now();
     timeline.stamp(Mark::Prepared, ready, metrics);
     let (job, form) = (prepared.spec.job_id.clone(), prepared.form);
+    let woken = (inner.callbacks).arm(inner.cfg.callback_origin.as_ref(), &mut prepared.spec);
     let row = OpRow {
         owner: String::new(),
         instance: op.key.instance.clone(),
@@ -487,6 +490,7 @@ async fn fresh(
         job,
         key: prepared.key,
         timeout: prepared.timeout,
+        woken,
     };
     watch_job(inner, op, run, &submitted, cancel, timeline).await
 }
@@ -572,6 +576,7 @@ async fn resume(
         job: row.job,
         key: PackKey::new(key),
         timeout: inner.cfg.default_timeout,
+        woken: None,
     };
     watch_job(inner, op, run, &submitted, cancel, timeline).await
 }
@@ -642,6 +647,7 @@ async fn watch_job(
                 withdraw(inner, job).await;
                 return Ended::Cancelled;
             }
+            () = super::callback::woken(submitted.woken.as_ref()) => {}
             () = waited(pause) => {}
         }
         wait = Some(inner.cfg.poll);

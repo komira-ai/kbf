@@ -6,6 +6,7 @@ use std::time::Duration;
 use js_proto::v1::{Constraints, ExecMode, Isolation};
 use ring::rand::{SecureRandom, SystemRandom};
 
+use crate::executor::callback::CallbackOrigin;
 use crate::executor::mac::{MacPool, MacPoolError};
 use crate::executor::out::PutDirRoots;
 
@@ -109,6 +110,10 @@ pub struct Config {
     /// The Macs (`--executor-mac-*`): `None`, the default, refuses every action whose platform
     /// asks for macOS ([`crate::executor::mac`]).
     pub mac: Option<MacPool>,
+    /// The origin the job service calls this frontend back at when a job ends
+    /// (`--executor-callback-origin`, [`crate::executor::callback`]): `None`, the default,
+    /// asks for no call, and the runs read their jobs back by polling alone.
+    pub callback_origin: Option<CallbackOrigin>,
 }
 
 /// Why a [`Config`] is refused.
@@ -162,6 +167,7 @@ impl Config {
             live: LIVE,
             finished_retention: FINISHED_RETENTION,
             mac: None,
+            callback_origin: None,
         }
     }
 

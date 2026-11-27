@@ -823,3 +823,6 @@ fn an_unknown_input_tree_is_refused() {
         );
     }
 }
+
+#[path = "executor_flags_callback_tests.rs"]
+mod callback;

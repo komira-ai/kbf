@@ -28,7 +28,7 @@ sequenceDiagram
     X->>X: prepare the run: read the action, mint the key, write the tree
     X->>S: exec/op/<id> {owner, action, attempt, job, key}
     X->>J: SubmitJob(k<frontend hash>-<id>-<attempt>)  (no CPU, no memory; size-class and size-fallback labels)
-    loop at once, then 10 ms doubling to --executor-poll-ms while not started, then every --executor-poll-ms
+    loop at once, then 10 ms doubling to --executor-poll-ms while not started, then every --executor-poll-ms, or at once on a verified completion call
         X->>J: GetJob
     end
     X->>J: GetResult
@@ -54,6 +54,17 @@ sequenceDiagram
   longer between its calls, from the poll doubling to 40 polls (10 s at the default), one level for the whole frontend; no
   busy answer ends a run or spends an attempt, and a submit it did not take is sent again under the same id
   (`executor/busy.rs`).
+- **The completion call.** The job service has no watch call, but it can call a job's submitter back once the job reaches its
+  final state (jobscheduler's `docs/design/job-retry-and-completion-callback.md`, section 5.6). With `--executor-callback-origin`
+  each job asks for that call (`executor/callback.rs`): its URL is `<origin>/js-done/<reference>` and its key 32 bytes, both
+  minted for the job just before its first submit and held in the frontend's memory only, until the run stops watching the job;
+  a resend of the submit sends the same spec. kbf-proxy forwards `/js-done/<reference>`, POST only and with no credential, to
+  the operator API, where the call is answered 204 when its Standard Webhooks signature is the key's and its timestamp within
+  5 minutes, 401 when it is not (nothing changes), and 404 for a reference the frontend does not hold. A call that verifies
+  wakes the run's read at once; the read, not the call, says how the job ended. The reads above stay as they are and end every
+  run whose call never comes: a call lost or refused at every try, a frontend restarted (it holds no reference any more), an
+  operation taken up from another frontend (it polls only), and a job service that does not know the field. A job asks the
+  service for no retry policy: kbf reruns a job itself, under a new id (below).
 
 ## 2. Endings, retries and cancel
 

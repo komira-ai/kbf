@@ -88,6 +88,7 @@ const MAX_RUN: &str = "executor_max_run_secs";
 const DEFAULT_TIMEOUT: &str = "executor_default_timeout_secs";
 const CALL_TIMEOUT: &str = "executor_call_timeout_secs";
 const POLL: &str = "executor_poll_ms";
+const CALLBACK_ORIGIN: &str = "executor_callback_origin";
 const PREPARE_LIMIT: &str = "executor_prepare_limit_secs";
 const INPUT_TREE: &str = "executor_input_tree";
 const LIVE: &str = "executor_live_secs";
@@ -379,6 +380,17 @@ pub(super) fn args() -> Vec<Arg> {
                  10000. A job is read at once when submitted, and while it has not started \
                  again after 10 ms, doubling up to this. Used only with `--executor js-agent`",
             ),
+        text(
+            CALLBACK_ORIGIN,
+            "executor-callback-origin",
+            "URL",
+            "The https origin (https://HOST or https://HOST:PORT) the job service reaches this \
+             frontend's operator API at, through kbf-proxy: each job then asks the service to \
+             call <origin>/js-done/<reference> when it ends, signed with a key minted for the \
+             job, and the call makes the frontend read the job back at once. Polling stays, and \
+             ends a job whose call never comes. Unset, the default: no job asks for a call. Set \
+             it only once the job service takes callbacks. Used only with `--executor js-agent`",
+        ),
         number(
             PREPARE_LIMIT,
             "executor-prepare-limit-secs",
@@ -602,6 +614,10 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.default_timeout = secs(DEFAULT_TIMEOUT);
     config.call_timeout = secs(CALL_TIMEOUT);
     config.poll = Duration::from_millis(count(POLL));
+    config.callback_origin = (m.get_one::<String>(CALLBACK_ORIGIN))
+        .map(|origin| origin.parse::<crate::executor::CallbackOrigin>())
+        .transpose()
+        .map_err(|e| format!("--executor-callback-origin: {e}"))?;
     config.prepare_limit = secs(PREPARE_LIMIT);
     config.input_tree = match m.get_one::<String>(INPUT_TREE).map(String::as_str) {
         Some("provider") => InputTree::Provider,
