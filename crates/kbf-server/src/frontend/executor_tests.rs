@@ -469,8 +469,9 @@ async fn a_missing_bundle_for_the_configured_arch_fails_the_start_naming_the_fla
 
 /// Asserts that a publish the store fails fails the start naming the flag and the key, and the
 /// executor is never started: once with an object of the tree already in the store at another
-/// length, once with the store failing the first length check. Catches: a frontend that serves
-/// over a base tree it could not write, and a failure named by no key.
+/// length, an answer no retry changes; once with the store failing the first length check with a
+/// 500 and `--pack-store-start-wait-secs=0`, which retries nothing, as before the flag. Catches:
+/// a frontend that serves over a base tree it could not write, and a failure named by no key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_publish_that_fails_fails_the_start() {
     let s3 = FakeS3::start().await;
@@ -503,7 +504,8 @@ async fn a_publish_that_fails_fails_the_start() {
     assert!(fake.calls().is_empty(), "{:?}", fake.calls());
 
     let dir = scratch_dir("executor-base-tree-head");
-    let flags = self::flags(dir.path(), &s3, &fake, &js);
+    let no_wait = ["--executor=js-agent", "--pack-store-start-wait-secs=0"];
+    let flags = self::flags(dir.path(), &s3, &fake, &no_wait);
     s3.fail(Failure::Head(1));
     let (handle, _stop) = started(&flags, Some(source())).expect("starts");
 
@@ -512,4 +514,40 @@ async fn a_publish_that_fails_fails_the_start() {
     assert!(said.starts_with("--executor-base-tree: "), "{said}");
     assert!(said.contains("length check"), "{said}");
     assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+/// Asserts that a store that answers the first length check of the base tree's publish with a
+/// 500 (as a store that is restarting does) does not end the start: the check is asked again,
+/// the tree is published and recorded, and the frontend serves and stops. Catches: a frontend
+/// that exits at start on one busy answer of its store, which rolls a release's update back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_that_answers_a_length_check_500_once_does_not_end_the_start() {
+    let s3 = FakeS3::start().await;
+    let dir = scratch_dir("executor-base-tree-busy");
+    let fake = job_server(&["host-1"]).await;
+    let flags = flags(dir.path(), &s3, &fake, &["--executor=js-agent"]);
+    let bundled = bundle_dir(
+        &dir.path().join("base-tree"),
+        crate::BUILD_COMMIT_FULL,
+        &["linux-x86_64"],
+    );
+    let (store, state) = state_store();
+    s3.fail(Failure::Head(1));
+    let (handle, stop) = started_over(&flags, Some(source()), Some(state)).expect("starts");
+    let mut served = tokio::spawn(handle.serve());
+
+    tokio::select! {
+        () = tree_recorded(&store, &bundled.root) => {}
+        ended = &mut served => panic!("the start ended: {ended:?}"),
+    }
+
+    let held = large_keys(&s3);
+    for object in &bundled.objects {
+        assert!(
+            held.contains(&format!("cas/l/{object}")),
+            "{object} in {held:?}"
+        );
+    }
+    stop.send(()).expect("stopped");
+    served.await.expect("joined").expect("served");
 }

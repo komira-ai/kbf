@@ -436,3 +436,65 @@ fn a_frontend_process_with_a_postgres_state_store_is_ready_over_the_installers_s
         .expect("the installer's tables are there");
     assert!(front.stop().is_some_and(|status| status.success()));
 }
+
+/// Catches a frontend process that exits 2 at start, or waits for ever, when its pack store
+/// keeps failing with an answer that is retried: started over a Postgres state store with the
+/// installer's schema and a pack store on a loopback port nothing listens on (every request is
+/// refused, which is retried), with `--pack-store-start-wait-secs=2`, it tries the create-only
+/// check again until the bound, then exits 1 with a line that names the flag, says the store's
+/// last answer and how long it was tried, and that the bound was reached. Needs a Postgres
+/// server, as the test above.
+#[test]
+fn a_pack_store_that_keeps_refusing_ends_the_start_at_the_bound_with_exit_1() {
+    let database = kbf_state::postgres::TestDatabase::empty();
+    let url = database.url();
+    let config = kbf_state::postgres::PostgresConfig::parse(&url).expect("the URL parses");
+    let set = kbf_pack_index::schema::embedded();
+    kbf_state::postgres::schema::apply(&config, &set, kbf_pack_index::schema::latest())
+        .expect("the installer's step");
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-pack-store-down");
+    let keys = dir.join("pack-keys.json");
+    std::fs::write(&keys, r#"{"access_key_id": "k", "secret_access_key": "s"}"#).expect("keys");
+    std::fs::set_permissions(&keys, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("mode");
+    // A port the kernel gave and took back: nothing listens on it, so a connection is refused.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a loopback port")
+        .port();
+
+    let out = Command::new(BIN)
+        .args([
+            "frontend",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+            "--storage=http://127.0.0.1:1",
+            &format!("--state-store={}", without_password(&url)),
+            "--pack-index",
+            &format!("--pack-store-endpoint=http://127.0.0.1:{closed}"),
+            "--pack-store-bucket=kbf-test",
+            &format!("--pack-store-credentials-file={}", keys.display()),
+            "--pack-store-start-wait-secs=2",
+        ])
+        .output()
+        .expect("run kbf");
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    let line = err
+        .lines()
+        .find(|l| l.starts_with("kbf frontend: "))
+        .unwrap_or_else(|| panic!("no line of the frontend's end: {err}"));
+    assert!(
+        line.starts_with(
+            "kbf frontend: --pack-store-endpoint: object store: request to the store failed"
+        ),
+        "{line}"
+    );
+    assert!(line.contains(" (still failing after "), "{line}");
+    assert!(
+        line.ends_with(" s); gave up at --pack-store-start-wait-secs=2"),
+        "{line}"
+    );
+    assert!(err.contains("trying it again"), "{err}");
+}

@@ -95,6 +95,7 @@ pub struct Spy {
     inner: MemoryStore,
     claims: Capabilities,
     reject_puts: AtomicU32,
+    lose_puts: AtomicU32,
     reject_reads: AtomicU32,
     lose_reads: AtomicU32,
     reject_lens: AtomicU32,
@@ -155,6 +156,7 @@ impl Spy {
             inner: MemoryStore::new(behaves),
             claims,
             reject_puts: AtomicU32::new(0),
+            lose_puts: AtomicU32::new(0),
             reject_reads: AtomicU32::new(0),
             lose_reads: AtomicU32::new(0),
             reject_lens: AtomicU32::new(0),
@@ -283,6 +285,11 @@ impl Spy {
     /// The next `n` writes fail before they store anything.
     pub fn reject_puts(&self, n: u32) {
         self.reject_puts.store(n, SeqCst);
+    }
+
+    /// The next `n` whole writes store their object and then answer 500: the answer is lost.
+    pub fn lose_puts(&self, n: u32) {
+        self.lose_puts.store(n, SeqCst);
     }
 
     /// The next `n` range reads answer that the object is not there, whatever the store holds: a
@@ -435,7 +442,11 @@ impl ObjectStore for Spy {
         if fires(&self.reject_puts) {
             return Err(injected_with(self.put_status.load(SeqCst)));
         }
-        self.inner.put_new(key, body, retain_until).await
+        let stored = self.inner.put_new(key, body, retain_until).await;
+        match stored {
+            Ok(()) if fires(&self.lose_puts) => Err(injected_with(500)),
+            stored => stored,
+        }
     }
 
     async fn put_stream(

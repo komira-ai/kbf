@@ -85,7 +85,7 @@ enum Ending {
 async fn an_infrastructure_ending_is_run_again_and_leaves_no_pack_read_behind() {
     for ending in [
         Ending::Exits(12),
-        Ending::NotStarted(StartFailureCode::NoCapacity),
+        Ending::NotStarted(StartFailureCode::InputUnavailable),
         Ending::NotStarted(StartFailureCode::StartTimeout),
         Ending::NotStarted(StartFailureCode::ExclusiveNotReady),
         Ending::NotStarted(StartFailureCode::AgentRefused),

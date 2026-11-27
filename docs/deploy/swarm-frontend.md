@@ -55,6 +55,17 @@ no write of the new task is cut and the old process's open does not fail.
 What bounds the overlap is the service's health check: a new task that has not passed it by the
 end of its `start_period` and retries is replaced, and that counts as a failed update.
 
+A new task whose pack store is being restarted at the same moment (a release rolled to every host
+at once) does not fail its start for that: its calls to the store before it serves (the check
+that the store refuses to replace an object, and the writes of the kbf base tree) are made again
+while the store answers 503 `SlowDown`, a 5xx or refuses the connection, for
+`--pack-store-start-wait-secs` (default 120 s), and the task serves once they are done. Until then
+it answers nothing, so its health check of `/readyz` does not pass and no traffic is sent to it.
+The health check's `start_period` and retries must cover the waits a start can take: up to
+`--state-store-wait-secs` (default 300 s) for a state store that is not up, then up to
+`--pack-store-start-wait-secs` for each call to a pack store that keeps failing. A call still
+failing at the bound exits 1, and Swarm's restart policy starts the task again.
+
 With an `s3://` `--history-objects` (`conditional-put=true`, the key pair in
 `--history-credentials-file`) the old and the new task write the
 one store at once in the same way, each under its own writer id

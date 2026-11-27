@@ -22,6 +22,14 @@ pub const KEY_LIMIT: Duration = Duration::from_secs(4 * 3600);
 /// renewal, and so how soon after a process ends another takes up its unfinished operations.
 pub const LIVE: Duration = Duration::from_secs(20);
 
+/// The default of [`Config::no_caller_grace`]: how long an operation no client waits on is
+/// left running for one to come back. Above the listeners' limit on a silent connection (the
+/// PING interval and the keepalive timeout, two and a half minutes by default), which a client
+/// that went silent is only taken for gone after, and above the minutes a build whose
+/// connection was cut takes to fail and be run again; the same as the least time a finished
+/// operation's answer is kept in a state store for such a client.
+pub const NO_CALLER_GRACE: Duration = Duration::from_secs(600);
+
 /// The default of [`Config::finished_retention`]: how long a finished operation is answered
 /// by name from memory.
 pub const FINISHED_RETENTION: Duration = Duration::from_secs(600);
@@ -103,6 +111,10 @@ pub struct Config {
     /// (`--executor-live-secs`). It is renewed every quarter of it; once it has expired,
     /// another frontend of the store takes up the process's unfinished operations.
     pub live: Duration,
+    /// How long an open operation no Execute or WaitExecution waits on (none here, and over a
+    /// state store none on another frontend) is left running before it is cancelled
+    /// (`--executor-no-caller-grace-secs`); zero never cancels one.
+    pub no_caller_grace: Duration,
     /// How long a finished operation is answered by name from memory
     /// (`--finished-retention-secs`); over a state store its `done/` row answers it for at
     /// least ten minutes on every frontend.
@@ -165,6 +177,7 @@ impl Config {
             task_out: None,
             input_tree: InputTree::Manifests,
             live: LIVE,
+            no_caller_grace: NO_CALLER_GRACE,
             finished_retention: FINISHED_RETENTION,
             mac: None,
             callback_origin: None,

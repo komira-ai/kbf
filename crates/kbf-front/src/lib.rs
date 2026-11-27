@@ -93,6 +93,7 @@ mod recorder;
 mod request_metadata;
 mod routed;
 mod segments;
+pub mod start_retry;
 mod storage;
 pub mod store_metrics;
 pub mod store_wait;

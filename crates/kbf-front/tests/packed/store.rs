@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use kbf_front::start_retry::{Ended, StartRetry};
 use kbf_front::{MAX_PACKED_BLOB_BYTES, PackSettings, Packs};
 use kbf_pack::{FRONTEND_PACK_BYTES, PackError, PackKeys, ReadCache, WriterKind};
 use kbf_pack_index::{MAX_BATCH, PackIndex};
@@ -79,14 +80,116 @@ async fn a_store_without_create_only_writes_is_refused() {
 async fn the_create_only_check_tests_the_claim() {
     let honest = Arc::new(Spy::new());
     let packs = packs_over(&honest, PackSettings::default()).expect("packs");
-    let checked = packs.check_create_only().await;
+    let retry = StartRetry::new(Duration::from_secs(120));
+    let checked = packs.check_create_only(&retry).await;
     checked.expect("refuses a second write");
 
     let liar = Arc::new(Spy::replacing());
     let packs = packs_over(&liar, PackSettings::default()).expect("claims create-only");
-    let failed = packs.check_create_only().await;
-    let said = failed.expect_err("took a second write");
+    let failed = packs.check_create_only(&retry).await;
+    let said = failed.expect_err("took a second write").to_string();
     assert!(said.contains("second write"), "{said}");
+}
+
+/// Asserts that the startup check is made again while the store answers it with an error that
+/// says "not now" (a 500 to its first write): the second attempt passes. Catches: a frontend
+/// whose start ends at a store that is restarting.
+#[tokio::test(start_paused = true)]
+async fn the_create_only_check_is_made_again_after_a_500() {
+    let store = Arc::new(Spy::new());
+    let packs = packs_over(&store, PackSettings::default()).expect("packs");
+    store.reject_puts_with(1, 500);
+
+    let checked = packs
+        .check_create_only(&StartRetry::new(Duration::from_secs(120)))
+        .await;
+
+    checked.expect("passes on the second attempt");
+    assert_eq!(store.puts(), 3, "one refused write, then the check's two");
+}
+
+/// Asserts that an attempt of the check that finds its first write stored by the attempt before
+/// (whose answer was lost) passes: the store refusing to write the key again is the refusal the
+/// check asks for. Catches: a retried check that fails on its own earlier write.
+#[tokio::test(start_paused = true)]
+async fn a_check_whose_first_answer_was_lost_passes_on_the_next_attempt() {
+    let store = Arc::new(Spy::new());
+    let packs = packs_over(&store, PackSettings::default()).expect("packs");
+    store.lose_puts(1);
+
+    let checked = packs
+        .check_create_only(&StartRetry::new(Duration::from_secs(120)))
+        .await;
+
+    checked.expect("passes on the second attempt");
+    assert_eq!(
+        store.puts(),
+        2,
+        "the lost write, then the one the store refused"
+    );
+}
+
+/// Asserts that a key the check finds taken on its first attempt (left by an earlier start of
+/// the same boot id) is the check's failure, as before the retry: the store's answer, after one
+/// write. Catches: an `AlreadyExists` taken for a lost answer of an attempt that was never made.
+#[tokio::test]
+async fn a_key_taken_before_the_first_attempt_fails_the_check() {
+    let store = Arc::new(Spy::new());
+    let packs = packs_over(&store, PackSettings::default()).expect("packs");
+    let taken = keys().self_test_key();
+    kbf_objstore::ObjectStore::put_new(&*store, &taken, Bytes::from_static(b"left"), None)
+        .await
+        .expect("an earlier start's object");
+    let before = store.puts();
+
+    let checked = packs
+        .check_create_only(&StartRetry::new(Duration::from_secs(120)))
+        .await;
+
+    let Err(Ended::Refused(error)) = checked else {
+        panic!("not refused: {checked:?}");
+    };
+    assert_eq!(
+        error.to_string(),
+        format!("object store: object {taken} already exists")
+    );
+    assert_eq!(store.puts() - before, 1);
+}
+
+/// Asserts that a 403 to the check ends it at once, with no second attempt, and that a store
+/// that answers 500 for ever is given up at the bound, the error saying how long it was tried.
+/// Catches: a refusal held for the whole bound, and a retry with no end.
+#[tokio::test(start_paused = true)]
+async fn a_403_ends_the_check_at_once_and_a_500_for_ever_at_the_bound() {
+    let store = Arc::new(Spy::new());
+    let packs = packs_over(&store, PackSettings::default()).expect("packs");
+    let retry = StartRetry::new(Duration::from_secs(5));
+    store.reject_puts_with(1, 403);
+
+    let refused = packs.check_create_only(&retry).await;
+
+    let Err(Ended::Refused(error)) = refused else {
+        panic!("not refused: {refused:?}");
+    };
+    assert_eq!(
+        error.to_string(),
+        "object store: store answered 403 InternalError: injected"
+    );
+    assert_eq!(store.puts(), 1);
+
+    store.reject_puts_with(u32::MAX, 500);
+    let given_up = packs.check_create_only(&retry).await;
+
+    let Err(Ended::GaveUp(gave_up)) = given_up else {
+        panic!("not given up: {given_up:?}");
+    };
+    let said = gave_up.to_string();
+    let last = "object store: store answered 500 InternalError: injected";
+    assert!(
+        said.starts_with(&format!("{last} (still failing after ")),
+        "{said}"
+    );
+    assert!(said.ends_with(" attempts over 5.0 s)"), "{said}");
 }
 
 /// Asserts that a blob whose bytes are not its digest is refused INVALID_ARGUMENT before

@@ -27,6 +27,7 @@ use super::verifying::VerifyingKeys;
 use crate::cache::is_empty_blob;
 use crate::known_dirs::KnownDirs;
 use crate::large_backfill::LargeStore;
+use crate::start_retry::{Ended, StartRetry, retriable};
 use crate::store_wait::{Backoff, STORE_WAIT, StoreWaits};
 use crate::store_writes::{STORE_WRITES, StoreWrites, TREE_WRITES};
 
@@ -389,11 +390,24 @@ impl Packs {
     /// two writes of one key, the second of which must be refused. Run it once when the
     /// frontend starts and do not serve if it fails.
     ///
+    /// The check is a call of the start ([`crate::start_retry`]): made again as `retry` says
+    /// while the store answers it with an error that is retried. An attempt after one that
+    /// failed so may find the key written by the attempt before it, and the store refusing to
+    /// write it again is the refusal the check asks for.
+    ///
     /// # Errors
-    /// Why the check failed, as text.
-    pub async fn check_create_only(&self) -> Result<(), String> {
-        let checked = self.store.check_create_only().await;
-        checked.map_err(|error| error.to_string())
+    /// [`Ended::Refused`] with why the check failed; [`Ended::GaveUp`] when the store kept
+    /// failing it until the bound of `retry`.
+    pub async fn check_create_only(&self, retry: &StartRetry) -> Result<(), Ended<PackError>> {
+        let retried =
+            |error: &PackError| matches!(error, PackError::Store(source) if retriable(source));
+        let attempt = |attempt: u32| async move {
+            match self.store.check_create_only().await {
+                Err(PackError::Store(ObjectStoreError::AlreadyExists(_))) if attempt > 1 => Ok(()),
+                checked => checked,
+            }
+        };
+        retry.run("the create-only check", retried, attempt).await
     }
 
     /// The digests among `asked` that the index has no row for, in the order asked. The empty

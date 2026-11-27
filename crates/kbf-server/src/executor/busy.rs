@@ -7,7 +7,10 @@
 //! client's channel dials a new connection for the next call by itself. None of that says
 //! anything about a job, so a busy answer ([`busy`]) never settles a run and never spends an
 //! attempt: the call is sent again (a submit with the same spec under the same id, which the
-//! service takes once), after a wait.
+//! service takes once), after a wait. So is a status that says the service will not serve this
+//! frontend now (`UNAUTHENTICATED`, `PERMISSION_DENIED`, `UNIMPLEMENTED`): a token or a revision
+//! the whole farm shares, never the job's, and a run ended for it would be a fault the next
+//! attempt meets again.
 //!
 //! The wait is the executor's, not one operation's ([`Busy`]): every operation's task reads the
 //! same level, so a thousand operations that poll their jobs slow down together, and the
@@ -39,10 +42,13 @@ pub(crate) const MAX_POLLS: u32 = 40;
 /// call: no answer came (the call's deadline passed, the connection broke or reset), no
 /// connection could be made, or the service answered a status of its own load or of its
 /// stream (`RESOURCE_EXHAUSTED`, which is also how a GOAWAY `ENHANCE_YOUR_CALM` reads,
-/// `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `ABORTED`, `CANCELLED`, `UNKNOWN`, `INTERNAL`). A
-/// refusal, a status about the request or the caller (`INVALID_ARGUMENT`, `UNAUTHENTICATED`,
-/// `PERMISSION_DENIED`, `UNIMPLEMENTED`, `NOT_FOUND`, ...), an answer that cannot be decoded,
-/// and a request that could never be sent are not.
+/// `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `ABORTED`, `CANCELLED`, `UNKNOWN`, `INTERNAL`), or one that
+/// says it will not serve this frontend at all now (`UNAUTHENTICATED`, `PERMISSION_DENIED`: a
+/// token revoked or not yet accepted; `UNIMPLEMENTED`: a service of another revision behind the
+/// address), which says nothing of the call either: the readiness probe reads those as a service
+/// that cannot be reached too ([`answered`](super::api::answered)). A refusal, a status about the
+/// request (`INVALID_ARGUMENT`, `NOT_FOUND`, `FAILED_PRECONDITION`, ...), an answer that cannot be
+/// decoded, and a request that could never be sent are not.
 pub(crate) fn busy(error: &Error) -> bool {
     match error {
         Error::Transport(_) | Error::Unreachable(Unsent::Connect(_)) => true,
@@ -55,6 +61,9 @@ pub(crate) fn busy(error: &Error) -> bool {
                 | Code::Cancelled
                 | Code::Unknown
                 | Code::Internal
+                | Code::Unauthenticated
+                | Code::PermissionDenied
+                | Code::Unimplemented
         ),
         Error::Unreachable(Unsent::BadId(_) | Unsent::TooLarge { .. })
         | Error::Decode(_)

@@ -141,6 +141,7 @@ use futures::FutureExt as _;
 use futures::future::{AbortHandle, Abortable, BoxFuture};
 use kbf_auth::AuthenticateLayer;
 use kbf_front::prepare_run::PutDirPrep;
+use kbf_front::start_retry::StartRetry;
 use kbf_front::{
     Backend, Owner, Owners, Packs, Proxy, RECORDER_CHANNEL, Recorder, RequestMetadataLayer, Routed,
 };
@@ -297,6 +298,9 @@ pub struct FrontendFlags {
     /// `--state-store-wait-secs`: how long the start waits for a state store that is not up
     /// yet before it gives up and exits 1. Zero does not wait.
     pub state_store_wait: Duration,
+    /// `--pack-store-start-wait-secs`: how long each call of the start to the pack store is made
+    /// again while the store answers that it is busy or restarting. Zero retries nothing.
+    pub pack_store_start_wait: Duration,
     /// The flags of the removed handover and admin port, which are accepted and ignored
     /// ([`RetiredHandoverFlags`]).
     pub retired: RetiredHandoverFlags,
@@ -386,6 +390,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         handoff: handoff::from_matches(m),
         drain: drain_flags::from_matches(m),
         state_store_wait: state_wait::from_matches(m),
+        pack_store_start_wait: start_wait::from_matches(m),
         retired: RetiredHandoverFlags::from_arg_matches(m)?,
         packs,
         executor,
@@ -565,6 +570,8 @@ pub struct FrontendHandle {
     executor: Option<Executor>,
     /// The publishing of the kbf base tree, under `--executor js-agent`.
     base_tree: Option<base_tree::Start>,
+    /// How the calls of the start to the pack store are made again (`start_wait`).
+    start_retry: StartRetry,
 }
 
 impl FrontendHandle {
@@ -638,11 +645,11 @@ impl FrontendHandle {
     /// # Errors
     /// A listener fails while serving; or the pack store does not refuse to replace an object
     /// (or cannot be written to), or, with `--executor js-agent`, the kbf base tree of this release
-    /// cannot be published (`base_tree`): both are checked before anything is served.
+    /// cannot be published (`base_tree`): both are checked before anything is served, their
+    /// calls to the store made again while it answers that it is busy, up to
+    /// `--pack-store-start-wait-secs` ([`ServeError::StartWait`] past it; `start_wait`).
     pub async fn serve(self) -> Result<(), ServeError> {
-        if let Some(packs) = &self.packs {
-            packs.check_create_only().await.map_err(ServeError::Packs)?;
-        }
+        start_wait::check(self.packs.as_ref(), &self.start_retry).await?;
         // Held until the frontend stops: the executor's trees are written over it.
         let _base_tree = base_tree::publish_all(self.base_tree).await?;
         // Every probe asked once before the listeners serve, so the first `/readyz` has an
@@ -997,9 +1004,12 @@ impl<'a> Prepared<'a> {
                 timeout,
             ),
         };
+        let start_retry = StartRetry::new(flags.pack_store_start_wait);
         let base_tree = (flags.executor.js.as_ref())
             .zip(packs.clone())
-            .map(|(js, packs)| base_tree::Start::new(js, packs, state_store.clone()));
+            .map(|(js, packs)| {
+                base_tree::Start::new(js, packs, state_store.clone(), start_retry.clone())
+            });
 
         let (mut worker_server, peers, worker_tls) = worker_peers(
             keepalive(
@@ -1338,6 +1348,7 @@ impl<'a> Prepared<'a> {
             list_sweeps,
             executor: executor.map(|built| built.executor),
             base_tree,
+            start_retry,
         })
     }
 }
@@ -1478,7 +1489,7 @@ fn start_line(
 
 /// `kbf frontend`: the logs, a runtime the thread flags size, the start line on stdout,
 /// and serving until SIGINT or SIGTERM. Exit 2 for a start the frontend refuses, 1 for a state store that stayed unreachable
-/// for `--state-store-wait-secs`.
+/// for `--state-store-wait-secs` or a pack store that kept failing for `--pack-store-start-wait-secs`.
 #[must_use]
 pub fn run(flags: &FrontendFlags) -> ExitCode {
     crate::log_file::init(&flags.server);
@@ -1492,10 +1503,12 @@ pub fn run(flags: &FrontendFlags) -> ExitCode {
 }
 
 /// The exit code of a start that failed: 1 for a state store still not reachable when
-/// `--state-store-wait-secs` ran out (a start that was not refused, so a unit that
+/// `--state-store-wait-secs` ran out, or a pack store still failing a call when
+/// `--pack-store-start-wait-secs` ran out (a start that was not refused, so a unit that
 /// prevents a restart on exit 2 retries it), 2 for every refusal.
 fn exit_of(e: &(dyn Error + 'static)) -> ExitCode {
-    if e.is::<state_wait::NotReached>() {
+    let gave_up = matches!(e.downcast_ref(), Some(ServeError::StartWait { .. }));
+    if e.is::<state_wait::NotReached>() || gave_up {
         ExitCode::from(1)
     } else {
         ExitCode::from(2)
@@ -1530,6 +1543,7 @@ mod job_read;
 mod list_sweep;
 mod pack_flags;
 pub mod removed;
+mod start_wait;
 mod state_schema;
 mod state_wait;
 mod stored;

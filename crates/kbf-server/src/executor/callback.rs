@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -316,6 +317,21 @@ impl<'a> Call<'a> {
             .filter_map(|signature| signature.strip_prefix("v1,"))
             .filter_map(|encoded| STANDARD.decode(encoded).ok())
             .any(|tag| ring::hmac::verify(&key, &signed, &tag).is_ok())
+    }
+}
+
+/// Completes after `pause` (at once when there is none), or as soon as `armed`'s call has
+/// verified, whichever comes first: the wait of a run's reads between two polls.
+pub(super) async fn waited(pause: Option<Duration>, armed: Option<&Armed>) {
+    let paused = async {
+        if let Some(pause) = pause {
+            tokio::time::sleep(pause).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        () = woken(armed) => {}
+        () = paused => {}
     }
 }
 

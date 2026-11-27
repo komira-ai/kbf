@@ -152,7 +152,7 @@ async fn a_submit_sent_again_after_a_lost_answer_writes_one_line() {
     assert_eq!(number(written[0], "since_execute_ms"), waited);
 }
 
-/// Catches a line for a job the service did not take: a submit refused `PERMISSION_DENIED`
+/// Catches a line for a job the service did not take: a submit refused `FAILED_PRECONDITION`
 /// writes no line, and the next attempt's job, which the service takes, writes the only one.
 #[tokio::test(start_paused = true)]
 async fn a_refused_submit_writes_no_line() {
@@ -161,7 +161,7 @@ async fn a_refused_submit_writes_no_line() {
     rig.fake.inject_on(
         "SubmitJob",
         Fault::Status {
-            code: Code::PermissionDenied,
+            code: Code::FailedPrecondition,
             message: "no".to_owned(),
         },
     );

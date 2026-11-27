@@ -354,7 +354,11 @@ client                      kbf frontend                             job service
    written to the action cache *before* the callers are answered.
 
 `CancelOperation` cancels the job and answers the callers `CANCELLED`. A stream that ends does
-not cancel it, and nothing is cancelled when a frontend stops.
+not cancel it at once, and nothing is cancelled when a frontend stops; but an operation that no
+Execute or WaitExecution stream has waited on for `--executor-no-caller-grace-secs` (600 by
+default; over a state store, on any frontend) is cancelled the same way, since a client whose
+connection was cut does not come back for it. Within the grace, an Execute of the same action or
+a WaitExecution of the operation joins it as before.
 
 `WaitExecution` streams the same stages for an operation name that Execute returned, and
 `GetOperation` reads the stage the name's operation is at, once. A finished operation is
