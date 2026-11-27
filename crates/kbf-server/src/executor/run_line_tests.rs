@@ -3,8 +3,9 @@
 //! service refused or a run cancelled before its job was taken.
 
 use std::sync::atomic::Ordering;
+use std::time::UNIX_EPOCH;
 
-use kbf_front::{Arrival, Dispatch, Finished, Submission};
+use kbf_front::{Arrival, Dispatch, Finished, PresubmitSplit, Submission};
 use kbf_job_client::fake::Fault;
 use tonic::Code;
 
@@ -357,5 +358,89 @@ async fn a_taken_up_operation_writes_no_front_arrival() {
         number(written[0], "since_reapi_ms"),
         number(written[0], "since_execute_ms")
     );
+    for name in SPLIT {
+        assert_eq!(number(written[0], name), 0, "{name}");
+    }
     running.stop().await;
+}
+
+/// The fields of the line that split `presubmit_ms`.
+const SPLIT: [&str; 13] = [
+    "auth_ms",
+    "lookup_ms",
+    "inputs_ms",
+    "walk_ms",
+    "dirs_ms",
+    "files_ms",
+    "rest_ms",
+    "dir_reads",
+    "dirs_skipped",
+    "dir_cache_hits",
+    "dirs_present_checked",
+    "files_checked",
+    "file_asks",
+];
+
+/// Catches a line that leaves the front's time unsplit: an Execute that spent 80 ms at the front,
+/// 5 authorizing, 10 on the action-cache lookup and 50 reading its Command beside its walk (45 of
+/// them walking: 30 on Directories, 15 asking about files), writes each of those, the walk's
+/// counts as the front measured them, and the 15 ms left over as `rest_ms`.
+#[tokio::test(start_paused = true)]
+async fn the_line_splits_the_fronts_time_by_stage() {
+    let log = test_log::capture();
+    let rig = Rig::start().await;
+    let front = Instant::now();
+    rig.advance(Duration::from_millis(80)).await;
+    let ms = Duration::from_millis;
+    let submission = Submission {
+        presubmit: PresubmitSplit {
+            auth: ms(5),
+            lookup: ms(10),
+            inputs: ms(50),
+            walk: ms(45),
+            walk_dirs: ms(30),
+            walk_files: ms(15),
+            dir_reads: 3,
+            dirs_skipped: 4,
+            dir_cache_hits: 6,
+            dirs_present_checked: 2,
+            files_checked: 7,
+            file_asks: 1,
+        },
+        ..arrived(1, front, 0)
+    };
+    let caller = Caller::of(rig.exec.submit(submission).expect("taken"));
+    rig.submitted(&caller, 0).await;
+    until_lines(&rig, &log, 1).await;
+    let text = log.text();
+    let written = lines(&text);
+    assert_eq!(written.len(), 1, "{text}");
+    let figures: Vec<u128> = SPLIT.iter().map(|name| number(written[0], name)).collect();
+    assert_eq!(figures, [5, 10, 50, 45, 30, 15, 15, 3, 4, 6, 2, 7, 1]);
+    assert_eq!(number(written[0], "presubmit_ms"), 80);
+}
+
+/// Catches a `rest_ms` that wraps below zero: stages the front measured as longer than the time
+/// the executor counts from the arrival (a split handed in by a caller, as the executor cannot
+/// know how it was measured) leave `rest_ms` at 0.
+#[tokio::test(start_paused = true)]
+async fn a_split_longer_than_the_presubmit_leaves_no_rest() {
+    let log = test_log::capture();
+    let rig = Rig::start().await;
+    let submission = Submission {
+        presubmit: PresubmitSplit {
+            inputs: Duration::from_millis(40),
+            ..PresubmitSplit::default()
+        },
+        ..arrived(1, Instant::now(), 0)
+    };
+    let caller = Caller::of(rig.exec.submit(submission).expect("taken"));
+    rig.submitted(&caller, 0).await;
+    until_lines(&rig, &log, 1).await;
+    let text = log.text();
+    let written = lines(&text);
+    assert_eq!(written.len(), 1, "{text}");
+    assert_eq!(number(written[0], "presubmit_ms"), 0);
+    assert_eq!(number(written[0], "inputs_ms"), 40);
+    assert_eq!(number(written[0], "rest_ms"), 0);
 }

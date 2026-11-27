@@ -38,6 +38,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -139,6 +140,8 @@ pub struct LossGuard {
     rules: LossRules,
     clock: RwLock<LossClock>,
     state: Mutex<State>,
+    /// The losses the guard was told of ([`LossGuard::found`]).
+    found: AtomicU64,
 }
 
 #[derive(Default)]
@@ -185,7 +188,23 @@ impl LossGuard {
             rules,
             clock: RwLock::new(clock),
             state: Mutex::default(),
+            found: AtomicU64::new(0),
         }
+    }
+
+    /// How many losses the guard has been told of: each absence ([`LossGuard::absent`]) and
+    /// each damaged blob ([`LossGuard::damaged`]), counted as it is told and so before any pack
+    /// is forgotten or location dropped for it. A row of the index this process removes is
+    /// removed only after the count has moved.
+    #[must_use]
+    pub fn found(&self) -> u64 {
+        self.found.load(Ordering::SeqCst)
+    }
+
+    /// A read found a blob of a pack to be other bytes than its digest; its location is about to
+    /// be dropped from the index. Counted in [`LossGuard::found`].
+    pub fn damaged(&self) {
+        self.found.fetch_add(1, Ordering::SeqCst);
     }
 
     /// The guard's rules.
@@ -235,6 +254,7 @@ impl LossGuard {
         Fut: Future<Output = Result<Option<u64>, E>>,
         E: fmt::Display,
     {
+        self.found.fetch_add(1, Ordering::SeqCst);
         let now = self.now();
         if let Some(waits) = self.wait(key, end, now) {
             match &waits {

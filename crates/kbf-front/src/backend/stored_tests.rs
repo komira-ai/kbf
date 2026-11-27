@@ -15,7 +15,7 @@ use super::super::Backend;
 use super::*;
 use crate::PackSettings;
 
-fn stored() -> Arc<Stored> {
+pub(super) fn stored() -> Arc<Stored> {
     let create_only = Capabilities {
         conditional_put: true,
         object_lock: false,
@@ -28,12 +28,12 @@ fn stored() -> Arc<Stored> {
     Arc::new(stored.expect("stored"))
 }
 
-fn blob(text: &str) -> (Digest, Bytes) {
+pub(super) fn blob(text: &str) -> (Digest, Bytes) {
     let bytes = Bytes::from(text.to_owned());
     (kbf_segments::sha256(&bytes), bytes)
 }
 
-fn dir(files: &[Digest], dirs: &[Digest]) -> (Digest, Bytes) {
+pub(super) fn dir(files: &[Digest], dirs: &[Digest]) -> (Digest, Bytes) {
     let message = Directory {
         files: files
             .iter()

@@ -260,6 +260,7 @@ impl Reading {
     /// The failure of a blob whose object is other bytes than its digest: the row is dropped,
     /// so the blob is missing and a client uploads it again.
     async fn damaged(&self) -> Status {
+        self.packs.loss.damaged();
         let digest = to_index(&self.digest);
         let (index, pack_key) = (Arc::clone(&self.packs.index), self.pack_key.clone());
         let dropped = offload(move || index.drop_location(&digest, &pack_key)).await;

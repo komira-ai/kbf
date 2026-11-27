@@ -301,6 +301,7 @@ impl Rig {
             evidence: Default::default(),
             decoded: None,
             arrival: kbf_front::Arrival::now(),
+            presubmit: kbf_front::PresubmitSplit::default(),
         };
         let ticket = self.exec.submit(submission).expect("the executor takes it");
         Caller {

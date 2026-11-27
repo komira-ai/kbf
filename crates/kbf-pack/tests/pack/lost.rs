@@ -703,3 +703,31 @@ fn the_default_rules_are_the_published_constants() {
     assert_eq!(guard.rules(), rules);
     assert!(format!("{guard:?}").starts_with("LossGuard { rules: LossRules {"));
 }
+
+/// Asserts that the guard counts every loss it is told of as it is told, whatever the loss
+/// comes to: none at first; a first absence, which is only noted, is one; the second look that
+/// confirms it and forgets the pack is two; a damaged blob is three.
+#[tokio::test]
+async fn the_guard_counts_every_loss_it_is_told_of() {
+    let clock = Arc::new(ManualClock::default());
+    let index = index_with(&clock, KEY);
+    let guard = guard(&clock, Duration::ZERO);
+    let looks = AtomicU32::new(0);
+    let none = guard.found();
+
+    let noted = guard
+        .absent(&index, KEY, 10, looking(&looks, Ok(None)))
+        .await;
+    let after_note = guard.found();
+    clock.advance(CONFIRM_AFTER);
+    let forgotten = guard
+        .absent(&index, KEY, 10, looking(&looks, Ok(Some(9))))
+        .await;
+    let after_forget = guard.found();
+    guard.damaged();
+
+    assert_eq!(none, 0);
+    assert_eq!((noted, after_note), (Loss::Noted, 1));
+    assert_eq!((forgotten, after_forget), (Loss::Forgotten { rows: 1 }, 2));
+    assert_eq!(guard.found(), 3);
+}

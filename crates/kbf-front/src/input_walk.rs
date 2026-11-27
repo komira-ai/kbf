@@ -23,8 +23,12 @@
 //!   only whether its blobs are still held can change, and that is bounded three ways: by
 //!   the time to live (the longest a blob that went away can still be taken for held,
 //!   as for the router's closure check), by the epoch (a new map generation or a
-//!   restarted member drops everything), and by [`Trees::distrust`] (a walk that finds
-//!   anything absent has seen a loss, so nothing verified before then is believed).
+//!   restarted member drops everything; over the frontend's packs, so does every blob a read
+//!   or check through them found lost or damaged, the only way this process removes a row of
+//!   the pack index, which is the whole epoch of a frontend with no storage node; a row another
+//!   frontend removes is believed for no longer than the time to live), and by [`Trees::distrust`]
+//!   (a walk that finds anything absent has seen a loss, so nothing verified before then is
+//!   believed).
 //!   An entry is written only when the whole walk found nothing absent and nothing
 //!   failed, never from a partial result.
 //! - **Directories are cached by content** ([`DirCache`]). A walk that reaches a Directory

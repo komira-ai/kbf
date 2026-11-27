@@ -17,8 +17,8 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use kbf_auth::Authorizers;
 use kbf_front::{
-    Arrival, Cache, Dispatch, ExecutionService, MemoryMetaLog, Stage, Submission, Ticket,
-    VerifiedBlob,
+    Arrival, Cache, Dispatch, ExecutionService, MemoryMetaLog, PresubmitSplit, Stage, Submission,
+    Ticket, VerifiedBlob,
 };
 use kbf_meta::Retention;
 use kbf_objstore::{
@@ -87,6 +87,7 @@ impl ObjectStore for Store {
 struct Queue {
     submitted: Mutex<Vec<watch::Sender<Stage>>>,
     arrivals: Mutex<Vec<(Arrival, Instant)>>,
+    splits: Mutex<Vec<PresubmitSplit>>,
 }
 
 impl Dispatch for Queue {
@@ -102,6 +103,10 @@ impl Dispatch for Queue {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((submission.arrival, Instant::now()));
+        self.splits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(submission.presubmit);
         let key = submission.key.clone();
         Ok(Ticket {
             name,
@@ -487,5 +492,37 @@ async fn the_submission_carries_the_executes_arrival_from_before_its_reads() {
         submitted - arrival.at,
         Duration::from_millis(300),
         "the action's GET, then the walk's two with the command's beside them"
+    );
+}
+
+/// Catches a submission that leaves the front's stages out of the per-job line, or times one
+/// around the wrong span: the action's GET (100 ms) is the action-cache lookup's stage, the
+/// walk's two GETs with the Command's beside them (200 ms) are the inputs' stage and the walk's,
+/// authorizing takes no time with every caller allowed, and the walk read the two Directories.
+/// The cache in this process walks without the two phases of a walk over a store, so their
+/// times and its presence checks are zero.
+#[tokio::test(start_paused = true)]
+async fn the_submission_carries_the_split_of_the_fronts_time() {
+    let rig = Rig::new(GET).await;
+    let job = job("split", true);
+    rig.store(&job.blobs.iter().collect::<Vec<_>>()).await;
+    execute(&rig, &job).await.expect("joined").expect("Execute");
+    let splits = rig
+        .queue
+        .splits
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let ms = Duration::from_millis;
+    assert_eq!(
+        splits,
+        [PresubmitSplit {
+            auth: Duration::ZERO,
+            lookup: ms(100),
+            inputs: ms(200),
+            walk: ms(200),
+            dir_reads: 2,
+            ..PresubmitSplit::default()
+        }]
     );
 }

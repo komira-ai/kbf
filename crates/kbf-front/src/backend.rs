@@ -16,7 +16,8 @@
 //! between Executes. Over a map the same walk reads each Directory from its owners, and
 //! remembers the subtrees it found held for a short time, under the map's epoch, so the
 //! actions of one build, which share most of their inputs, read a shared subtree once
-//! (`input_walk` says what bounds the memory and how a loss invalidates it). Over either, the
+//! (`input_walk` says what bounds the memory and how a loss invalidates it); with no node at
+//! all it remembers them too, under the packs' epoch (`layered`). Over either, the
 //! check leaves the run it starts what it read and found (`handoff`), so the executor's
 //! preparation does not walk and ask again.
 //!

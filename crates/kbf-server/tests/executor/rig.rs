@@ -447,6 +447,7 @@ impl Rig {
                 evidence: Default::default(),
                 decoded: None,
                 arrival: kbf_front::Arrival::now(),
+                presubmit: kbf_front::PresubmitSplit::default(),
             })
             .expect("the executor takes the action");
         Caller {

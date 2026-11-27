@@ -93,10 +93,12 @@ use tracing::Instrument as _;
 use kbf_auth::AuthenticationMetadata;
 use kbf_invocation::{CallKind, Evidence, ExecuteAnswer};
 
+use self::presubmit::Presubmit;
+pub use self::presubmit::PresubmitSplit;
 use crate::backend::Backend;
 use crate::described::Described;
 use crate::early_tree::HeldFinding;
-use crate::metrics::{CacheMetrics, OpenExecute};
+use crate::metrics::OpenExecute;
 use crate::recorder::{ActionLabel, ExecuteCall, Recorder, listing};
 use crate::request_metadata::CallMetadata;
 use crate::wire;
@@ -134,6 +136,9 @@ pub struct Submission {
     /// read: the start of `kbf_execute_presubmit_seconds` (which ends later, at the call's first
     /// stream item). For the server's per-job line only.
     pub arrival: Arrival,
+    /// Where the Execute spent its time at the front before this submission. For the server's
+    /// per-job line only.
+    pub presubmit: PresubmitSplit,
 }
 
 /// The Action an Execute read and decoded, and its Command: the two messages a run's facts and
@@ -397,87 +402,6 @@ pub fn progress(every: Duration) -> (ProgressTicker, Progress) {
 /// An Execute that spends this long before its first stream item is logged at `WARN`.
 pub const PRESUBMIT_WARN: Duration = Duration::from_secs(10);
 
-/// One Execute's time before its first stream item, from the handler's start: observed
-/// in `kbf_execute_presubmit_seconds` when dropped, whether the call answered, failed
-/// or was dropped by its caller (a stalled call the client gave up on is the one the
-/// operator needs to see), and logged at `WARN` when it took [`PRESUBMIT_WARN`] or more. Its
-/// start is also the [`Submission`]'s [`Arrival`].
-struct Presubmit<'a> {
-    metrics: &'a CacheMetrics,
-    /// The handler's start, which the [`Submission`] carries as its [`Arrival`].
-    arrival: Arrival,
-    /// What the call is about, once its request is read; empty before (a call denied or
-    /// dropped while authorizing).
-    action: String,
-    instance: String,
-    invocation: String,
-    walk: Duration,
-    submit: Duration,
-    dir_reads: u64,
-    /// Of a walk over a store: Directories skipped as verified, the time reading
-    /// Directories and the time asking about files, the FindMissing calls and the files.
-    dirs_skipped: u64,
-    /// With the content cache: Directories taken without a read, and the cached ones
-    /// put to FindMissing.
-    dir_cache_hits: u64,
-    dirs_present_checked: u64,
-    dirs: Duration,
-    files: Duration,
-    file_asks: u64,
-    files_checked: u64,
-    _in_flight: crate::metrics::Raised<'a>,
-}
-
-impl<'a> Presubmit<'a> {
-    fn begin(metrics: &'a CacheMetrics) -> Self {
-        Self {
-            metrics,
-            arrival: Arrival::now(),
-            action: String::new(),
-            instance: String::new(),
-            invocation: String::new(),
-            walk: Duration::ZERO,
-            submit: Duration::ZERO,
-            dir_reads: 0,
-            dirs_skipped: 0,
-            dir_cache_hits: 0,
-            dirs_present_checked: 0,
-            dirs: Duration::ZERO,
-            files: Duration::ZERO,
-            file_asks: 0,
-            files_checked: 0,
-            _in_flight: metrics.execute_presubmit_in_flight.raise(),
-        }
-    }
-}
-
-impl Drop for Presubmit<'_> {
-    fn drop(&mut self) {
-        let elapsed = self.arrival.at.elapsed();
-        self.metrics.execute_presubmit.observe_duration(elapsed);
-        if elapsed < PRESUBMIT_WARN {
-            return;
-        }
-        tracing::warn!(
-            action = %self.action,
-            instance = %self.instance,
-            invocation = %self.invocation,
-            presubmit_ms = elapsed.as_millis(),
-            walk_ms = self.walk.as_millis(),
-            submit_ms = self.submit.as_millis(),
-            dir_reads = self.dir_reads,
-            dirs_skipped = self.dirs_skipped,
-            dir_cache_hits = self.dir_cache_hits,
-            dirs_present_checked = self.dirs_present_checked,
-            dirs_ms = self.dirs.as_millis(),
-            files_ms = self.files.as_millis(),
-            file_asks = self.file_asks,
-            files_checked = self.files_checked,
-            "Execute spent {PRESUBMIT_WARN:?} or more before its first operation"
-        );
-    }
-}
-
 /// The `Execution` service over a [`Backend`] (a cache, or a storage node) and a
 /// [`Dispatch`].
 #[derive(Debug)]
@@ -567,6 +491,7 @@ where
         authorize(&*self.authorizers.execute, &caller, EXECUTE, instance)
             .await
             .inspect_err(|_| open.fail())?;
+        window.split.auth = window.arrival.at.elapsed();
         let span = tracing::info_span!(
             "execute",
             instance,
@@ -650,7 +575,9 @@ where
                 false => self.cache.action_result(&action).await,
             }
         };
+        let looking = Instant::now();
         let (looked, read) = futures::future::join(lookup, self.read_input(&action)).await;
+        window.split.lookup = looking.elapsed();
         if let Some((stored, result)) = looked? {
             let name = format!(
                 "operations/cached/{}-{}",
@@ -904,6 +831,9 @@ fn operations(
 
 #[path = "execution_inputs.rs"]
 mod inputs;
+
+#[path = "execution_presubmit.rs"]
+mod presubmit;
 
 #[cfg(test)]
 #[path = "execution_progress_tests.rs"]

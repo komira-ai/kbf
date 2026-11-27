@@ -106,12 +106,14 @@ impl<D: Dispatch> ExecutionService<D> {
             };
             Ok::<_, Status>(Some((both, held)))
         };
+        let both_began = Instant::now();
         let (command, (walked, walk_took)) = join(command, walk).await;
-        window.walk = walk_took;
+        window.split.inputs = both_began.elapsed();
+        window.split.walk = walk_took;
         self.cache
             .metrics()
             .execute_walk
-            .observe_duration(window.walk);
+            .observe_duration(window.split.walk);
         let mut absent = Vec::new();
         let (both, held) = match command? {
             Some((both, held)) => (Some(both), held),
@@ -127,14 +129,7 @@ impl<D: Dispatch> ExecutionService<D> {
         };
         let walked = walked?;
         let (input_bytes, input_files) = (walked.input_bytes, walked.input_files);
-        window.dir_reads += walked.dirs_read;
-        window.dirs_skipped += walked.dirs_skipped;
-        window.dir_cache_hits += walked.dir_cache_hits;
-        window.dirs_present_checked += walked.dirs_present_checked;
-        window.dirs += walked.dirs_time;
-        window.files += walked.files_time;
-        window.file_asks += walked.file_asks;
-        window.files_checked += walked.files_checked;
+        window.split.walked(&walked);
         self.observe_phases(&walked);
         absent.extend(walked.absent);
         if !absent.is_empty() {
@@ -177,6 +172,7 @@ impl<D: Dispatch> ExecutionService<D> {
             },
             decoded,
             arrival: window.arrival,
+            presubmit: window.split,
         };
         Ok((submission, command_digest))
     }

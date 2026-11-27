@@ -279,6 +279,7 @@ impl Dispatch for Executor {
             decoded,
             described,
             arrival,
+            presubmit,
             ..
         } = submission;
         // An operation id of the state store is reserved with no lock held: once a block of
@@ -320,7 +321,7 @@ impl Dispatch for Executor {
                 key.clone(),
                 (whole_machine, decoded, described.label.clone()),
                 recorded,
-                Some(arrival),
+                Some((arrival, presubmit)),
             );
             run::spawn(Arc::clone(&self.inner), op, Start::Fresh, cancel);
             break (name, stage);
