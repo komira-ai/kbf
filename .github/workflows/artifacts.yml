@@ -85,8 +85,10 @@ on:
 
 permissions: {}
 
-# A merge-queue run shares the one group `artifacts-merge-queue` and a RUNNING build is never
-# cancelled (GitHub keeps one pending run per group). A pull request's label build is a build
+# A merge-queue run's group is its own run's, and it is never cancelled: one group for the whole
+# queue would keep one pending run and cancel the one before it whenever an entry joined (the
+# lint in crates/kbf-integration-test/tests/merge_queue refuses a group two queue entries
+# share, or a cancel that holds for one). A pull request's label build is a build
 # check, not the release pipeline: it has its own group per pull request, and a newer run of the
 # same pull request replaces its older one. Called from the pipeline, the group is the run's
 # own: what cancels a superseded push is the pipeline's group (pipeline.yml), so this one never
@@ -94,7 +96,7 @@ permissions: {}
 # `cancel-in-progress` is false, so neither cancels the other; the sign call waits for the build
 # call anyway (it needs it), so the group never holds it up.
 concurrency:
-  group: artifacts-${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || github.event_name == 'merge_group' && 'merge-queue' || github.run_id }}
+  group: artifacts-${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
