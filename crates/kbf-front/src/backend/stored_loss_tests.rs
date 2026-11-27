@@ -51,7 +51,11 @@ impl Gate {
     }
 
     fn wait(&self) {
-        let held = self.hold.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let held = self
+            .hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         if let Some(Held { began, go }) = held {
             began.send(()).expect("the test listens");
             go.recv().expect("the test lets it go");
@@ -289,4 +293,33 @@ async fn a_walk_during_a_damaged_large_read_is_not_believed_after_it() {
     assert!(during.absent.is_empty(), "the row was still there");
     assert_eq!(after.absent, vec![large.0]);
     assert_eq!(after.dirs_skipped, 0);
+}
+
+/// Catches an Execute's finding that the run's preparation still takes after a loss the packs
+/// counted (it would skip its own check of the files on the word of a walk made before the
+/// loss): two Actions are found held by one walk; one finding is taken before any loss and is
+/// believed; the packs are then told the pack of the file is absent (only noted: nothing is
+/// removed yet, but the epoch moves), and the other finding is no longer believed.
+#[tokio::test]
+async fn a_finding_made_before_a_loss_is_not_taken_after_it() {
+    let rig = Rig::new(PackSettings::default().max_blob_bytes);
+    let file = blob("a file whose pack the store is about to lose");
+    let key = "cas/f/fe1/soon/0000";
+    rig.row(key, &file, None).await;
+    let root = dir(&[file.0], &[]);
+    rig.packs().put(vec![root.clone()]).await.expect("packed");
+    let walked = rig.backend.walk_inputs(root.0).await.expect("walked");
+    let at = walked.held_since.expect("found held");
+    let (before, after) = (blob("action taken before").0, blob("action taken after").0);
+    rig.backend.vouch(before, at, walked.epoch);
+    rig.backend.vouch(after, at, walked.epoch);
+
+    let taken_before = rig.backend.vouched(&before);
+    let noted = rig.packs().absent(key, 0).await;
+    let taken_after = rig.backend.vouched(&after);
+
+    assert!(walked.epoch.is_some(), "the packs name an epoch");
+    assert!(taken_before);
+    assert_eq!(noted, Loss::Noted);
+    assert!(!taken_after, "the loss moved the epoch");
 }

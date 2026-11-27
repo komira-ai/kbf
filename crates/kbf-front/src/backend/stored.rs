@@ -213,6 +213,14 @@ impl Plane for StoredPlane {
     fn trees(&self) -> Option<&Trees> {
         Some(&self.trees)
     }
+
+    fn epoch(&self) -> Option<u64> {
+        Layered {
+            packs: self.packs(),
+            rest: &Absent,
+        }
+        .epoch()
+    }
 }
 
 #[cfg(test)]

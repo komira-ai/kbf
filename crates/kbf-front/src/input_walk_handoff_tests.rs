@@ -137,15 +137,41 @@ fn a_finding_is_taken_once_and_believed_until_the_time_to_live_ends() {
     let trees = Trees::default();
     let at = Instant::now();
     let (a, b, never) = (file("action a"), file("action b"), file("action c"));
-    trees.vouch(a, at);
-    trees.vouch(b, at);
-    assert!(trees.vouched(&a, at + VERIFIED_TTL - Duration::from_nanos(1)));
-    assert!(!trees.vouched(&a, at), "taken once");
+    trees.vouch(a, at, None);
+    trees.vouch(b, at, None);
+    assert!(trees.vouched(&a, at + VERIFIED_TTL - Duration::from_nanos(1), None));
+    assert!(!trees.vouched(&a, at, None), "taken once");
     assert!(
-        !trees.vouched(&b, at + VERIFIED_TTL),
+        !trees.vouched(&b, at + VERIFIED_TTL, None),
         "past its time to live"
     );
-    assert!(!trees.vouched(&never, at));
+    assert!(!trees.vouched(&never, at, None));
+}
+
+/// Catches a finding believed after the store's epoch moved (a loss counted since): a finding
+/// made under one epoch is believed under it, and not under the next, nor where the store now
+/// names no epoch; one made where the store named none is believed only where it names none.
+#[test]
+fn a_finding_is_believed_only_under_the_epoch_it_was_made_under() {
+    let trees = Trees::default();
+    let at = Instant::now();
+    let (same, moved, gone, never) = (
+        file("action same"),
+        file("action moved"),
+        file("action gone"),
+        file("action never"),
+    );
+    for action in [same, moved, gone] {
+        trees.vouch(action, at, Some(7));
+    }
+    trees.vouch(never, at, None);
+    assert!(trees.vouched(&same, at, Some(7)));
+    assert!(!trees.vouched(&moved, at, Some(8)), "the epoch moved");
+    assert!(
+        !trees.vouched(&gone, at, None),
+        "the store names no epoch now"
+    );
+    assert!(!trees.vouched(&never, at, Some(7)));
 }
 
 /// Catches a later finding for an Action that does not replace the earlier one: the newer
@@ -156,9 +182,9 @@ fn a_finding_made_again_replaces_the_one_before() {
     let older = Instant::now();
     let newer = older + VERIFIED_TTL;
     let action = file("action");
-    trees.vouch(action, older);
-    trees.vouch(action, newer);
-    assert!(trees.vouched(&action, newer + Duration::from_secs(1)));
+    trees.vouch(action, older, None);
+    trees.vouch(action, newer, None);
+    assert!(trees.vouched(&action, newer + Duration::from_secs(1), None));
 }
 
 /// Catches a finding that rests on reads begun before a loss was seen (`distrust`), and one
@@ -170,13 +196,13 @@ fn a_loss_drops_the_findings_and_refuses_one_that_began_before_it() {
     let before = Instant::now();
     let loss = before + Duration::from_secs(1);
     let (kept, dropped, late) = (file("kept"), file("dropped"), file("late"));
-    trees.vouch(dropped, before);
+    trees.vouch(dropped, before, None);
     trees.distrust(loss);
-    assert!(!trees.vouched(&dropped, loss), "dropped by the loss");
-    trees.vouch(late, before);
-    assert!(!trees.vouched(&late, loss), "began before the loss");
-    trees.vouch(kept, loss);
-    assert!(trees.vouched(&kept, loss));
+    assert!(!trees.vouched(&dropped, loss, None), "dropped by the loss");
+    trees.vouch(late, before, None);
+    assert!(!trees.vouched(&late, loss, None), "began before the loss");
+    trees.vouch(kept, loss, None);
+    assert!(trees.vouched(&kept, loss, None));
 }
 
 /// Catches findings that grow without bound, or a bound that pushes out a finding still waiting
@@ -188,11 +214,11 @@ fn findings_beyond_the_bound_push_out_the_oldest_still_waiting() {
     let at = Instant::now();
     let (a, b) = (file("action a"), file("action b"));
     let mut found = Vouched::new(1);
-    found.put(a, at);
-    assert_eq!(found.take(&a), Some(at));
-    found.put(a, at);
+    found.put(a, at, None);
+    assert_eq!(found.take(&a), Some((at, None)));
+    found.put(a, at, None);
     assert_eq!(found.found.len(), 1, "the old place is passed over");
-    found.put(b, at);
+    found.put(b, at, Some(1));
     assert_eq!(found.take(&a), None, "pushed out by the newer finding");
-    assert_eq!(found.take(&b), Some(at));
+    assert_eq!(found.take(&b), Some((at, Some(1))));
 }

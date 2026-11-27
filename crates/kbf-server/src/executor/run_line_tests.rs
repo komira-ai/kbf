@@ -444,3 +444,39 @@ async fn a_split_longer_than_the_presubmit_leaves_no_rest() {
     assert_eq!(number(written[0], "inputs_ms"), 40);
     assert_eq!(number(written[0], "rest_ms"), 0);
 }
+
+/// Catches a stage the front never reached that is left off the line instead of written as 0,
+/// and parts that do not add up to `presubmit_ms`: an Execute that spent 25 ms at the front, 7
+/// authorizing and 3 on the action-cache lookup, with no time and no count from a walk (as from
+/// the in-process cache's walk, which measures none), writes every field of the split, each
+/// stage not reached as 0, and `auth_ms + lookup_ms + inputs_ms + rest_ms` equal to
+/// `presubmit_ms`.
+#[tokio::test(start_paused = true)]
+async fn a_stage_not_reached_is_written_as_zero_and_the_parts_sum_to_the_presubmit() {
+    let log = test_log::capture();
+    let rig = Rig::start().await;
+    let front = Instant::now();
+    rig.advance(Duration::from_millis(25)).await;
+    let submission = Submission {
+        presubmit: PresubmitSplit {
+            auth: Duration::from_millis(7),
+            lookup: Duration::from_millis(3),
+            ..PresubmitSplit::default()
+        },
+        ..arrived(1, front, 0)
+    };
+    let caller = Caller::of(rig.exec.submit(submission).expect("taken"));
+    rig.submitted(&caller, 0).await;
+    until_lines(&rig, &log, 1).await;
+    let text = log.text();
+    let written = lines(&text);
+    assert_eq!(written.len(), 1, "{text}");
+    let figures: Vec<u128> = SPLIT.iter().map(|name| number(written[0], name)).collect();
+    assert_eq!(figures, [7, 3, 0, 0, 0, 0, 15, 0, 0, 0, 0, 0, 0]);
+    let parts: u128 = ["auth_ms", "lookup_ms", "inputs_ms", "rest_ms"]
+        .iter()
+        .map(|name| number(written[0], name))
+        .sum();
+    assert_eq!(parts, number(written[0], "presubmit_ms"));
+    assert_eq!(number(written[0], "presubmit_ms"), 25);
+}

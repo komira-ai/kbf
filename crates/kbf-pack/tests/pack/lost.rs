@@ -3,8 +3,9 @@
 //! store that fails to answer (a 503, a reset connection, a timeout) is never a look at all.
 //! Time is the rig's manual clock, which the index and the loss guard read.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use kbf_objstore::ObjectStore;
@@ -13,7 +14,9 @@ use kbf_pack::{
     MAX_NOTED, MIN_AGE, PackerConfig, ReadError, ReaderConfig,
 };
 use kbf_pack_index::memory::MemoryPackIndex;
-use kbf_pack_index::{BlobDigest, NewPack, PackBlob, PackIndex};
+use kbf_pack_index::{
+    BlobDigest, Forgot, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
+};
 use kbf_state::{Clock as _, ManualClock};
 
 use crate::reader::{found, packed, row};
@@ -704,11 +707,13 @@ fn the_default_rules_are_the_published_constants() {
     assert!(format!("{guard:?}").starts_with("LossGuard { rules: LossRules {"));
 }
 
-/// Asserts that the guard counts every loss it is told of as it is told, whatever the loss
-/// comes to: none at first; a first absence, which is only noted, is one; the second look that
-/// confirms it and forgets the pack is two; a damaged blob is three.
+/// Asserts that the guard counts a loss as it is told and again once the forget of its pack has
+/// returned, so a span that reads the same count at its start and end saw no removal begin or
+/// end: none at first; a first absence, only noted, is one; the second look of the next absence
+/// sees two (counted before the forget), and the forget that follows leaves three; a damaged
+/// blob, told by its reader before and after the drop of its location, is five.
 #[tokio::test]
-async fn the_guard_counts_every_loss_it_is_told_of() {
+async fn the_guard_counts_a_loss_before_and_after_its_row_goes() {
     let clock = Arc::new(ManualClock::default());
     let index = index_with(&clock, KEY);
     let guard = guard(&clock, Duration::ZERO);
@@ -720,14 +725,134 @@ async fn the_guard_counts_every_loss_it_is_told_of() {
         .await;
     let after_note = guard.found();
     clock.advance(CONFIRM_AFTER);
-    let forgotten = guard
-        .absent(&index, KEY, 10, looking(&looks, Ok(Some(9))))
-        .await;
+    let during_look = AtomicU64::new(0);
+    let look = || {
+        during_look.store(guard.found(), Ordering::SeqCst);
+        std::future::ready(Ok::<_, &'static str>(Some(9)))
+    };
+    let forgotten = guard.absent(&index, KEY, 10, look).await;
     let after_forget = guard.found();
+    guard.damaged();
     guard.damaged();
 
     assert_eq!(none, 0);
     assert_eq!((noted, after_note), (Loss::Noted, 1));
-    assert_eq!((forgotten, after_forget), (Loss::Forgotten { rows: 1 }, 2));
+    assert_eq!(
+        during_look.load(Ordering::SeqCst),
+        2,
+        "counted before the forget"
+    );
+    assert_eq!((forgotten, after_forget), (Loss::Forgotten { rows: 1 }, 3));
+    assert_eq!(guard.found(), 5);
+}
+
+/// Asserts that a forget counts its end whatever it came to: a pack confirmed absent but too
+/// young is not forgotten, and the count still moves before the forget and after it (a failed
+/// or refused forget is the same call, and a caller cannot tell from an error that nothing was
+/// removed).
+#[tokio::test]
+async fn a_forget_that_removes_nothing_still_counts_its_end() {
+    let clock = Arc::new(ManualClock::default());
+    let index = index_with(&clock, KEY);
+    let guard = guard(&clock, MIN_AGE);
+    let looks = AtomicU32::new(0);
+
+    let noted = guard
+        .absent(&index, KEY, 0, looking(&looks, Ok(None)))
+        .await;
+    clock.advance(CONFIRM_AFTER);
+    let young = guard
+        .absent(&index, KEY, 0, looking(&looks, Ok(None)))
+        .await;
+
+    assert_eq!((noted, young), (Loss::Noted, Loss::Young));
     assert_eq!(guard.found(), 3);
+    assert!(index.pack(KEY).expect("asked").is_some(), "kept");
+}
+
+/// An index whose next forget of a pack says it has begun and waits for the test to let it go.
+struct HeldForget {
+    inner: Arc<dyn PackIndex>,
+    began: SyncSender<()>,
+    go: Mutex<Receiver<()>>,
+}
+
+impl PackIndex for HeldForget {
+    fn record_pack(&self, pack: &NewPack) -> Result<Recorded, PackIndexError> {
+        self.inner.record_pack(pack)
+    }
+
+    fn pack(&self, key: &str) -> Result<Option<PackInfo>, PackIndexError> {
+        self.inner.pack(key)
+    }
+
+    fn locate(&self, digests: &[BlobDigest]) -> Result<Vec<Option<Location>>, PackIndexError> {
+        self.inner.locate(digests)
+    }
+
+    fn find_missing(&self, digests: &[BlobDigest]) -> Result<Vec<BlobDigest>, PackIndexError> {
+        self.inner.find_missing(digests)
+    }
+
+    fn touch(&self, digests: &[BlobDigest]) -> Result<usize, PackIndexError> {
+        self.inner.touch(digests)
+    }
+
+    fn dead_packs(&self, grace: Duration, limit: usize) -> Result<Vec<PackInfo>, PackIndexError> {
+        self.inner.dead_packs(grace, limit)
+    }
+
+    fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {
+        self.inner.unreferenced_keys(keys)
+    }
+
+    fn forget_pack(&self, pack_key: &str, min_age: Duration) -> Result<Forgot, PackIndexError> {
+        self.began.send(()).expect("the test listens");
+        let go = self.go.lock().unwrap_or_else(PoisonError::into_inner);
+        go.recv().expect("the test lets it go");
+        self.inner.forget_pack(pack_key, min_age)
+    }
+}
+
+/// Asserts that a forget counts its end when the read that asked for it is dropped while it
+/// runs (a client that hung up): the forget goes on on the blocking pool, and once it has
+/// returned the pack is forgotten and the count has moved after it too, though nothing awaited
+/// it. Counted only after the await, the count would stay at two with the row gone.
+#[test]
+fn a_forget_counts_its_end_when_the_read_that_asked_for_it_is_dropped() {
+    let clock = Arc::new(ManualClock::default());
+    let (began, begun) = sync_channel(1);
+    let (release, go) = sync_channel(1);
+    let index: Arc<dyn PackIndex> = Arc::new(HeldForget {
+        inner: index_with(&clock, KEY),
+        began,
+        go: Mutex::new(go),
+    });
+    let guard = Arc::new(guard(&clock, Duration::ZERO));
+    let gone = || std::future::ready(Ok::<_, &'static str>(None));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+
+    let (noted, during) = runtime.block_on(async {
+        let noted = guard.absent(&index, KEY, 0, gone).await;
+        clock.advance(CONFIRM_AFTER);
+        let (asking, at) = (Arc::clone(&guard), Arc::clone(&index));
+        let read = tokio::spawn(async move { asking.absent(&at, KEY, 0, gone).await });
+        let heard = tokio::task::spawn_blocking(move || begun.recv()).await;
+        heard.expect("joined").expect("the forget began");
+        read.abort();
+        let dropped = read.await.expect_err("dropped");
+        assert!(dropped.is_cancelled(), "{dropped}");
+        let during = guard.found();
+        release.send(()).expect("the forget waits");
+        (noted, during)
+    });
+    // Dropping the runtime waits for its blocking pool: the forget has returned.
+    drop(runtime);
+
+    assert_eq!((noted, during), (Loss::Noted, 2));
+    assert_eq!(guard.found(), 3);
+    assert_eq!(index.pack(KEY).expect("asked"), None, "forgotten");
 }

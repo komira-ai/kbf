@@ -140,8 +140,9 @@ pub struct LossGuard {
     rules: LossRules,
     clock: RwLock<LossClock>,
     state: Mutex<State>,
-    /// The losses the guard was told of ([`LossGuard::found`]).
-    found: AtomicU64,
+    /// The losses the guard was told of and the removals of rows they ended in
+    /// ([`LossGuard::found`]); shared with the blocking call of a forget, which counts its end.
+    found: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -188,23 +189,34 @@ impl LossGuard {
             rules,
             clock: RwLock::new(clock),
             state: Mutex::default(),
-            found: AtomicU64::new(0),
+            found: Arc::default(),
         }
     }
 
-    /// How many losses the guard has been told of: each absence ([`LossGuard::absent`]) and
-    /// each damaged blob ([`LossGuard::damaged`]), counted as it is told and so before any pack
-    /// is forgotten or location dropped for it. A row of the index this process removes is
-    /// removed only after the count has moved.
+    /// How many times the guard was told of a loss, or a removal of a row for one ended: each
+    /// absence ([`LossGuard::absent`]) is counted as it is told, and again once the forget of
+    /// its pack has returned, whatever it came to; each damaged blob is counted by its reader
+    /// ([`LossGuard::damaged`]) before the drop of its location and again once the drop has
+    /// returned. So a row this process removes goes with the count moved before and moving
+    /// again after: whoever reads the same count at the start and at the end of a span of time
+    /// saw no such removal begin or end in it. The count after a forget is taken on the
+    /// blocking call itself, so it is taken even when the read that asked for the forget is
+    /// dropped while it runs.
     #[must_use]
     pub fn found(&self) -> u64 {
         self.found.load(Ordering::SeqCst)
     }
 
-    /// A read found a blob of a pack to be other bytes than its digest; its location is about to
-    /// be dropped from the index. Counted in [`LossGuard::found`].
-    pub fn damaged(&self) {
+    fn count(&self) {
         self.found.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A read found a blob of a pack to be other bytes than its digest. Counted in
+    /// [`LossGuard::found`]. Its reader calls it twice: before it drops the blob's location
+    /// from the index, and again once the drop has returned (on the blocking call of the drop,
+    /// so that a read dropped while the drop runs still counts its end).
+    pub fn damaged(&self) {
+        self.count();
     }
 
     /// The guard's rules.
@@ -254,7 +266,7 @@ impl LossGuard {
         Fut: Future<Output = Result<Option<u64>, E>>,
         E: fmt::Display,
     {
-        self.found.fetch_add(1, Ordering::SeqCst);
+        self.count();
         let now = self.now();
         if let Some(waits) = self.wait(key, end, now) {
             match &waits {
@@ -279,7 +291,17 @@ impl LossGuard {
         let forget = Arc::clone(index);
         let pack = key.to_owned();
         let min_age = self.rules.min_age;
-        let loss = match offload(move || forget.forget_pack(&pack, min_age)).await {
+        let found = Arc::clone(&self.found);
+        let forgot = offload(move || {
+            let forgot = forget.forget_pack(&pack, min_age);
+            // Whatever it came to, the forget has returned: a walk that read the count before it
+            // began and reads it again now sees it moved (`LossGuard::found`). Counted here, not
+            // after the await, so that a read dropped while the forget runs still counts it.
+            found.fetch_add(1, Ordering::SeqCst);
+            forgot
+        })
+        .await;
+        let loss = match forgot {
             Ok(Forgot::Forgotten { rows }) => {
                 let mut state = self.state();
                 state.noted.remove(key);

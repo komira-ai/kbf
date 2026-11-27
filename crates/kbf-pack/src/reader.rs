@@ -393,10 +393,17 @@ impl<S: ObjectStore> Reader<S> {
                 continue;
             }
             let pack = again.pack.to_string();
-            let index = Arc::clone(&self.index);
-            let key = pack.clone();
+            let (index, key) = (Arc::clone(&self.index), pack.clone());
+            let loss = Arc::clone(&self.loss);
+            // Counted before the drop and again once it has returned, on the blocking call, so
+            // that a read dropped while it runs still counts its end (`LossGuard::found`).
             self.loss.damaged();
-            let dropped = offload(move || index.drop_location(&digest, &key)).await;
+            let dropped = offload(move || {
+                let dropped = index.drop_location(&digest, &key);
+                loss.damaged();
+                dropped
+            })
+            .await;
             match dropped {
                 Ok(dropped) => {
                     found.insert(digest, Fetch::Damaged { dropped });

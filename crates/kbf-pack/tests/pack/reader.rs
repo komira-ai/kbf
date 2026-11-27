@@ -483,9 +483,10 @@ async fn a_timed_read_names_the_steps_it_took() {
     assert_eq!(none, kbf_pack::ReadTimes::default());
 }
 
-/// Asserts that a read tells its loss guard of a damaged blob as the location goes: a reader
-/// over a shared guard reads a record whose bytes are not its digest, drops its location, and
-/// the guard has counted one loss; a read of an honest record beside it counts none.
+/// Asserts that a read tells its loss guard of a damaged blob around the drop of its location: a
+/// reader over a shared guard reads a record whose bytes are not its digest, drops its location,
+/// and the guard has counted it before the drop and after it, twice; a read of an honest record
+/// beside it counts nothing.
 #[tokio::test]
 async fn a_damaged_record_is_counted_by_the_readers_guard() {
     let (genuine, honest) = (blob("0123456789"), blob("abcdefghij"));
@@ -510,5 +511,5 @@ async fn a_damaged_record_is_counted_by_the_readers_guard() {
     assert_eq!(held, [found(&honest)]);
     assert_eq!(after_held, 0);
     assert_eq!(damaged, [Fetch::Damaged { dropped: true }]);
-    assert_eq!(guard.found(), 1);
+    assert_eq!(guard.found(), 2);
 }
