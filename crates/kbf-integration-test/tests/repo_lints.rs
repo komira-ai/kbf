@@ -62,6 +62,10 @@
 //!   pull request's macOS job holding a secret, an environment, an OIDC token or a write scope,
 //!   and `.github/workflows/macos-pr.yml` drifting from its shape (every pull request, no
 //!   condition) or from the steps of beta.yml's `native-macos` (module `macos_pr`);
+//! - a check `main` requires that would not report for a merge queue entry (its workflow without
+//!   an unfiltered `merge_group`, the job renamed, a matrix, behind a need, or skipped by its
+//!   `if:` in the queue), and a workflow that runs in the queue whose concurrency lets one queue
+//!   run cancel another, or that names a secret or calls another workflow (module `merge_queue`);
 //! - the job table of docs/design/gamma-cicd.md naming a job `.github/workflows/release.yml`
 //!   does not have, or omitting one it has (module `gamma_cicd_doc`);
 //! - the beta smoke workflow's Buck2 pin and its actions' commits drifting from
@@ -97,6 +101,7 @@ mod hostkeeper_desired;
 mod interpreters;
 mod kbf_spawns;
 mod macos_pr;
+mod merge_queue;
 mod pinned_debs;
 mod pipeline_workflow;
 mod release_artifacts;
