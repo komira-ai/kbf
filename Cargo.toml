@@ -84,9 +84,6 @@ js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528
 # its own that runs the whole CI, never along with other changes.
 objstore-s3 = { git = "https://github.com/komira-ai/tierstore", rev = "ad492f8121a0dd5ac0792d992c338b1aa85630e1" } # tierstore-list, the L2 tree list (komira-ai/tierstore#383; main at komira-ai/tierstore#390)
 tierstore = { git = "https://github.com/komira-ai/tierstore", rev = "ad492f8121a0dd5ac0792d992c338b1aa85630e1" } # tierstore-list, the L2 tree list (komira-ai/tierstore#383; main at komira-ai/tierstore#390)
-# The trees API's wire contract (TreesService: its proto and generated stubs), at the same
-# revision; members take its `client` feature, and kbf-trees-client's fake the `server` one.
-tierstore-trees-api = { git = "https://github.com/komira-ai/tierstore", rev = "ad492f8121a0dd5ac0792d992c338b1aa85630e1" } # tierstore-list, the L2 tree list (komira-ai/tierstore#383; main at komira-ai/tierstore#390)
 # The L2 tree list (tierstore's docs/design/fetch-cache-serve.md, section 3): the cell digests a
 # pack's bytes are hashed into as they are written, and the L2 sidecar of a version 2 tree list
 # (`cas/l2/<id>`), at the same revision.
@@ -234,7 +231,6 @@ kbf-storage = { path = "crates/kbf-storage" }
 kbf-store = { path = "crates/kbf-store" }
 kbf-task-pack = { path = "crates/kbf-task-pack" }
 kbf-tree-bundle = { path = "crates/kbf-tree-bundle" }
-kbf-trees-client = { path = "crates/kbf-trees-client" }
 kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-threads = { path = "crates/kbf-threads" }
 kbf-oidc = { path = "crates/kbf-oidc" }

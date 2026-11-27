@@ -1,7 +1,8 @@
-//! The retry of a create-only write to `cas/l/`: a connection that turns out to be dead is
-//! tried once more, a 503 is waited out within the configured total, a 503 `SlowDown`
-//! (back-pressure) is waited out past it, nothing else is repeated, and the waits are counted
-//! with the packs' when the retry is told to. The waits are recorded by a fake [`Sleeper`], never taken.
+//! The retry of a create-only write to `cas/l/`: a connection that turns out to be dead, and a
+//! blob's body tierstore saw stall (not a manifest's), are each tried once more, a 503 is waited
+//! out within the configured total, a 503 `SlowDown` (back-pressure) is waited out past it,
+//! nothing else is repeated, and the waits are counted with the packs' when the retry is told
+//! to. The waits are recorded by a fake [`Sleeper`], never taken.
 
 use kbf_front::action_tree::{DEFAULT_TOTAL, FIRST_WAIT, LONGEST_WAIT, Sleeper};
 
@@ -211,8 +212,32 @@ async fn a_zero_total_never_retries_a_503() {
     assert!(sleeps.waits().is_empty());
 }
 
-/// Catches: an answer that is not a connection failure or a 503 repeated: a 403, and a body
-/// whose bytes are not its digest's, are the failure on the first attempt.
+/// Catches: a 400 other than a stalled body's `RequestTimeout` repeated: a `BadDigest` is the
+/// failure on the first attempt, naming the store's answer.
+#[tokio::test]
+async fn a_400_other_than_request_timeout_is_not_repeated() {
+    let (rig, sleeps) = rig(DEFAULT_TOTAL).await;
+    let (root, key, _) = unlocated(&rig).await;
+    let bad = ObjectStoreError::Service {
+        status: 400,
+        code: "BadDigest".to_owned(),
+        message: "no".to_owned(),
+    };
+    script(&rig, &key, vec![bad]);
+    let failed = rig.write(&root).await.expect_err("no tree");
+    assert_eq!(
+        failed,
+        NoTree::Put {
+            key: key.clone(),
+            why: "store answered 400 BadDigest: no".to_owned()
+        }
+    );
+    assert_eq!(rig.farm.puts_of(&key["cas/l/".len()..]), 1);
+    assert!(sleeps.waits().is_empty());
+}
+
+/// Catches: an answer that is not a connection failure, a stalled body or a 503 repeated: a
+/// 403, and a body whose bytes are not its digest's, are the failure on the first attempt.
 #[tokio::test]
 async fn other_failures_are_not_repeated() {
     let (rig, sleeps) = rig(DEFAULT_TOTAL).await;
@@ -331,6 +356,42 @@ async fn a_slow_down_is_waited_out_with_a_zero_total() {
     let tree = rig.write(&root).await.expect("a tree");
     rig.farm.flatten(&tree).expect("every manifest is stored");
     assert_eq!(sleeps.waits(), [FIRST_WAIT, FIRST_WAIT * 2]);
+}
+
+/// Catches: a manifest's write that a stalled body made repeated, which would take an object of
+/// 0 bytes the store kept of the stalled write for the manifest (only a blob's write checks the
+/// key's length): the 400 `RequestTimeout` ends the tree on the first attempt, naming the key.
+#[tokio::test]
+async fn a_manifest_s_stalled_body_is_not_repeated() {
+    let (rig, sleeps) = rig(DEFAULT_TOTAL).await;
+    let packed = rig.farm.packed("packed", "cas/f/w/p0", 0).await;
+    let root = rig
+        .store(&directory(vec![file("p", &packed, false)], vec![], vec![]))
+        .await;
+    let manifest = format!(
+        r#"{{"v":1,"children":[{{"name":"p","kind":"file","sha256":"{}","size":6,"exec":false,"source":{{"key":"cas/f/w/p0","offset":0}}}}]}}"#,
+        packed.hash_hex()
+    );
+    let hex = TreeDigest::of(manifest.as_bytes()).to_string();
+    let key = whole_key(&hex);
+    let stalled = ObjectStoreError::Service {
+        status: 400,
+        code: "RequestTimeout".to_owned(),
+        message: "No byte of the request body arrived within 30s.".to_owned(),
+    };
+    script(&rig, &key, vec![stalled]);
+    let failed = rig.write(&root).await.expect_err("no tree");
+    assert_eq!(
+        failed,
+        NoTree::Put {
+            key,
+            why:
+                "store answered 400 RequestTimeout: No byte of the request body arrived within 30s."
+                    .to_owned()
+        }
+    );
+    assert_eq!(rig.farm.puts_of(&hex), 1);
+    assert!(sleeps.waits().is_empty());
 }
 
 /// Catches a tree's waits for the store that the scrape never shows: with the retry counted in

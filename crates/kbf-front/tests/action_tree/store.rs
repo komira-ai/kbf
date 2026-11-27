@@ -178,29 +178,6 @@ async fn a_refused_write_names_no_tree() {
     );
 }
 
-/// Catches: an object of another length at a blob's `cas/l/` key taken for the blob (a tree
-/// would read wrong bytes) or written over: it is `why=store`, naming the length found.
-#[tokio::test]
-async fn an_object_of_another_length_at_the_key_is_store() {
-    let rig = Rig::new().await;
-    let blob = rig.farm.cas("seven b").await;
-    rig.farm
-        .state()
-        .sized
-        .insert(whole_key(&blob.hash_hex()), blob.size_bytes + 1);
-    let root = root_of(&rig, &[blob]).await;
-    let refused = rig.write(&root).await.expect_err("no tree");
-    assert_eq!(
-        refused,
-        NoTree::WrongLength {
-            digest: blob,
-            length: blob.size_bytes + 1
-        }
-    );
-    assert_eq!(refused.why(), "store");
-    assert!(rig.farm.puts().is_empty());
-}
-
 /// Catches: a pack span of another length than the blob named as its source, and a blob the
 /// index gave no answer for taken as located: both are looked for in `cas/l/`, and written
 /// there when they are not.

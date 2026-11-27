@@ -7,6 +7,13 @@ host's tierstore after reading the job. It names the action tree, one tierstore 
 the job's layer names tierstore's mount provider, which the host's agent asks for the tree as soon as the job is
 assigned. What kbf builds is [actions-as-jobs.md](actions-as-jobs.md), 4.7; the rest of this file is kept as the
 record of the problem (sections 2 and 3).
+
+**The client is removed.** PR 4 of section 10.3 had landed: the crate `kbf-trees-client`, its in-process fake and its layering entry, which
+no kbf code ever called. tierstore's create-tree API, the one interface that crate spoke to, is not being built (komira-ai/tierstore#326 was
+closed as not planned, and komira-ai/tierstore#590 removes the unused front), so kbf no longer carries the crate, its fake, its tests or its
+layering test. The one-revision check for the tierstore crates that test also held stays, as `tierstore_one_revision` of
+`crates/kbf-integration-test/tests/layering.rs`. Job input trees work as before: kbf names one tree list and the job scheduler's mount
+provider asks tierstore for it. Where sections 1, 8 and 10 name `kbf-trees-client`, they describe the plan, not the code.
 Written against kbf `main` at `84086187e`, tierstore `main` at `b8ae6457` (its design
 [node-local-trees.md](https://github.com/komira-ai/tierstore/blob/main/docs/design/node-local-trees.md) merged as komira-ai/tierstore#320; the
 tracking issue is komira-ai/tierstore#326) and the jobscheduler revision kbf pins (`60b75be`). What this file says of today is marked **read**
@@ -298,7 +305,7 @@ returned value, to name a child (5.3). Entries come from the kept closure (`Kept
 3. **Neither:** the blob is written to `cas/l/<sha256>` through the existing hash-while-streaming writer (`place::write_whole`, B16: read once, no
    whole-file buffering), then as 2.
 
-An object of another length at `cas/l/<sha256>` stays `NoTree::WrongLength`. This reuses `place::locate` and `place::write_whole` unchanged;
+An object of another length at `cas/l/<sha256>` is a write the store kept cut short: it is deleted and the blob written as in 3. This reuses `place::locate` and `place::write_whole` unchanged;
 the manifest encoder (`encode.rs`) and `write_manifest` are what the `trees` mode stops calling.
 
 **Tree identity.** The node's tree digest covers names, kinds, modes, symlink targets and each file's `sha256` and `size`, and *not* `from` (tierstore
@@ -814,7 +821,7 @@ stage**.
 | 1 | kbf | the three models of section 9 as tests | 0 |
 | 2 | tierstore | the proto crate and the trees API (tasks of section 11), released | tierstore #326 |
 | 3 | kbf | raise of the tierstore pin to that release, **alone** (whole CI) | 2 |
-| 4 | kbf | `kbf-trees-client` with its fake, layering entry and pin lint | 3 |
+| 4 | kbf | `kbf-trees-client` with its fake, layering entry and pin lint (landed, then removed: see the top) | 3 |
 | 5 | kbf | `TreeRequest`: entries from the kept closure and the spans, and the base tree's entries from its bundle (pure, golden requests); memo; no digest; no behaviour change | 3 |
 | 5b | kbf | the chain check of a one-pass ZIP at ingest (5.4), its own behaviour change | 0 |
 | 6 | kbf | the flags (`--executor-input-tree` and the keys of 4.2, default `manifests`), the `Inputs` seam that parks a request in place of a digest, the `ListJobs` read with its filter (7.1), metrics for the intervals; no behaviour change in `manifests` | 4, 5 |
