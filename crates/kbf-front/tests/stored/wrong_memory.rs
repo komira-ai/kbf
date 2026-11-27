@@ -39,6 +39,9 @@ const SLACK: Duration = Duration::from_secs(600);
 /// run takes the finding and asks nothing either, and `top` is not found where the tree would
 /// be written from; the next preparation asks, and answers `top` missing. Uploaded again, the
 /// run is prepared.
+// Tokio's clock is not paused: the memory's 45 s is the real one, and the test makes no wait.
+// A paused clock moves on by itself while the index's blocking calls run, which could take it
+// past the 45 s.
 #[tokio::test]
 async fn a_pack_another_frontend_forgot_costs_one_attempt_and_is_then_missing() {
     let rig = Rig::new().await;

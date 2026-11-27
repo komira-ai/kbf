@@ -26,8 +26,10 @@
 //!   restarted member drops everything; over the frontend's packs, so does every loss a read
 //!   through them is told of, and every forget of a lost pack and drop of a damaged blob's
 //!   location this process makes, the only ways it removes a row of the pack index: the packs'
-//!   loss guard counts each as it begins and again once it has returned, so a walk that
-//!   overlaps one ends under another epoch than it began in and records nothing), and by
+//!   loss guard counts each as it begins and again once it has returned, so what a walk
+//!   recorded while a removal ran is under an epoch the count has left by the time the row is
+//!   gone, and a walk still running then ends under another epoch than it began in and records
+//!   nothing), and by
 //!   [`Trees::distrust`] (a walk that finds anything absent has seen a loss, so nothing
 //!   verified before then is believed).
 //!   An entry is written only when the whole walk found nothing absent and nothing
@@ -40,8 +42,9 @@
 //!   look at the object: an object that went away while its row stays, or a large object
 //!   (`cas/l/`) of another length than its row says, is not found by a walk, with the memory
 //!   or without it, but by the read of it, which fails. A run over a tree a row of which
-//!   another frontend removed fails to write its action tree (the farm's failure, which the executor runs again);
-//!   its preparation takes the Execute's finding once, so the next one checks for itself and
+//!   another frontend removed fails to write its action tree (the farm's failure, which the
+//!   executor runs again); its preparation takes the Execute's finding once, so the next one
+//!   checks for itself and
 //!   answers the blob missing, as the Execute does when it finds the blob gone (another
 //!   Execute of the Action in between vouches again). The memory is not a single flight
 //!   either: the first walk of a tree is made by every Execute that reaches the tree before

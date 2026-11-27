@@ -773,8 +773,19 @@ async fn a_forget_that_removes_nothing_still_counts_its_end() {
 /// An index whose next forget of a pack says it has begun and waits for the test to let it go.
 struct HeldForget {
     inner: Arc<dyn PackIndex>,
-    began: SyncSender<()>,
+    /// Taken by the forget that tells of its start, or by a test that gives up on it.
+    began: Mutex<Option<SyncSender<()>>>,
     go: Mutex<Receiver<()>>,
+}
+
+impl HeldForget {
+    /// Drops the sender no forget took, so a test listening for one stops.
+    fn disarm(&self) {
+        self.began
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
 }
 
 impl PackIndex for HeldForget {
@@ -807,7 +818,15 @@ impl PackIndex for HeldForget {
     }
 
     fn forget_pack(&self, pack_key: &str, min_age: Duration) -> Result<Forgot, PackIndexError> {
-        self.began.send(()).expect("the test listens");
+        let began = self
+            .began
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        began
+            .expect("one forget")
+            .send(())
+            .expect("the test listens");
         let go = self.go.lock().unwrap_or_else(PoisonError::into_inner);
         go.recv().expect("the test lets it go");
         self.inner.forget_pack(pack_key, min_age)
@@ -823,11 +842,12 @@ fn a_forget_counts_its_end_when_the_read_that_asked_for_it_is_dropped() {
     let clock = Arc::new(ManualClock::default());
     let (began, begun) = sync_channel(1);
     let (release, go) = sync_channel(1);
-    let index: Arc<dyn PackIndex> = Arc::new(HeldForget {
+    let held = Arc::new(HeldForget {
         inner: index_with(&clock, KEY),
-        began,
+        began: Mutex::new(Some(began)),
         go: Mutex::new(go),
     });
+    let index: Arc<dyn PackIndex> = Arc::clone(&held) as _;
     let guard = Arc::new(guard(&clock, Duration::ZERO));
     let gone = || std::future::ready(Ok::<_, &'static str>(None));
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -839,9 +859,16 @@ fn a_forget_counts_its_end_when_the_read_that_asked_for_it_is_dropped() {
         let noted = guard.absent(&index, KEY, 0, gone).await;
         clock.advance(CONFIRM_AFTER);
         let (asking, at) = (Arc::clone(&guard), Arc::clone(&index));
-        let read = tokio::spawn(async move { asking.absent(&at, KEY, 0, gone).await });
-        let heard = tokio::task::spawn_blocking(move || begun.recv()).await;
-        heard.expect("joined").expect("the forget began");
+        let mut read = tokio::spawn(async move { asking.absent(&at, KEY, 0, gone).await });
+        let heard = tokio::task::spawn_blocking(move || begun.recv());
+        tokio::select! {
+            heard = heard => heard.expect("joined").expect("the forget began"),
+            ended = &mut read => {
+                // Disarmed, so the listener's receive ends and nothing is left waiting.
+                held.disarm();
+                panic!("the read ended without a forget: {ended:?}");
+            }
+        }
         read.abort();
         let dropped = read.await.expect_err("dropped");
         assert!(dropped.is_cancelled(), "{dropped}");

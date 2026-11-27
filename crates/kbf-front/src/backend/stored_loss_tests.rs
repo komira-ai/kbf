@@ -15,10 +15,10 @@ use futures::StreamExt as _;
 use kbf_objstore::{Capabilities, MemoryStore, ObjectKey, ObjectStore as _};
 use kbf_pack::{CONFIRM_AFTER, Loss, MIN_AGE, PackKeys, WriterKind};
 use kbf_pack_index::action::ActionStore;
+use kbf_pack_index::directory::NewDirectory;
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_pack_index::{
-    BlobDigest, Forgot, Location, NewDirectory, NewPack, PackBlob, PackIndex, PackIndexError,
-    PackInfo, Recorded,
+    BlobDigest, Forgot, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
 };
 use kbf_state::{Clock as _, ManualClock};
 use kbf_types::Digest;
@@ -203,11 +203,16 @@ impl Rig {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let (begun, release) = self.gate.arm();
-        let removing = tokio::spawn(removal);
-        tokio::task::spawn_blocking(move || begun.recv())
-            .await
-            .expect("joined")
-            .expect("the removal reached the index");
+        let mut removing = tokio::spawn(removal);
+        let heard = tokio::task::spawn_blocking(move || begun.recv());
+        tokio::select! {
+            heard = heard => heard.expect("joined").expect("the removal reached the index"),
+            ended = &mut removing => {
+                // Disarmed, so the listener's receive ends and nothing is left waiting.
+                self.gate.hold.lock().unwrap_or_else(PoisonError::into_inner).take();
+                panic!("the removal ended without reaching the index: {ended:?}");
+            }
+        }
         let during = self.backend.walk_inputs(root).await.expect("walked");
         release.send(()).expect("the removal waits");
         removing.await.expect("the removal ended");
