@@ -350,7 +350,7 @@ fn cases() -> Vec<(&'static str, Case)> {
         (
             "refused at submit otherwise",
             Refused(Error::Status {
-                code: Code::PermissionDenied,
+                code: Code::FailedPrecondition,
                 message: "no".to_owned(),
             }),
         ),
@@ -495,7 +495,10 @@ fn a_start_failure_detail_never_reaches_the_answer_or_the_log() {
         ),
         (
             "exec-failed",
-            status(Code::Unavailable, "the host refused to start the job"),
+            status(
+                Code::Unavailable,
+                "exec-failed: the host refused to start the job",
+            ),
         ),
     ] {
         let detail = format!("{code}: {quoted}");

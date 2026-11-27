@@ -249,27 +249,35 @@ Each attempt of an operation is one job, whose id is made from the frontend id, 
 the attempt (`k<8 hex digits of the sha256 of the frontend id>-<operation>-<attempt>`): a submit sent again after its
 answer was lost, and a frontend that takes the operation up, name the job already made, so no
 action is submitted twice. A job service that is busy or cannot be reached (no answer within the
-call timeout, a broken or reset connection, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`) never fails an
-action and spends no attempt: a submit it did not take is sent again, the same spec under the same
+call timeout, a broken or reset connection, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`), or that will not
+serve this frontend now (`UNAUTHENTICATED`, `PERMISSION_DENIED`, `UNIMPLEMENTED`: a revoked token,
+another revision behind the address), never fails an action and spends no attempt: a submit it did not take is sent again, the same spec under the same
 id, until it takes it or the caller cancels, and the reads of a job are repeated. While it stays
 busy every operation of the frontend waits longer between its calls, from the poll doubling to
 40 polls (10 s at the default `--executor-poll-ms`), so a stalled service is not sent a call per
 operation per poll; the frontend logs once when the service turns busy and once when it answers
-again. `CancelOperation` is a cancel of the job, sent again until the service answers it. How a job ends is mapped to
+again. A token the job service no longer accepts so holds the frontend's Executes waiting, not
+failing, until it is fixed: `/readyz` reports the frontend unready meanwhile, and a caller's
+cancel or its own deadline ends an Execute. `CancelOperation` is a cancel of the job, sent again until the service answers it. How a job ends is mapped to
 failure classes as the table in `crates/kbf-server/src/executor/outcome.rs` says: a job
 stopped at its wall limit is the action's own timeout, answered `DEADLINE_EXCEEDED` at once; one
 killed for memory, a lost job (the host's fault) and any other ending of the farm's are submitted again as
-the next attempt, a new job and a new key, at most 2 times, after which the callers are answered
+the next attempt, a new job and a new key, at most 2 times, each after a wait (8 polls before the first,
+doubling, at most 80 polls: 2 s and 20 s at the default `--executor-poll-ms`; each lengthened by
+up to half again by jitter) that must end before the
+action's deadline, after which the callers are answered
 `UNAVAILABLE` (`FAILED_PRECONDITION` with reason `ACTION_OUT_OF_MEMORY` for memory). A job its
-host would not start now (no room, `no-capacity`; the host held while it is drained for an update,
+host would not start now (no room, `no-capacity`, the agent's or the job service's own, its queue
+wait run out; the host held while it is drained for an update,
 `host-held`; or tainted, `host-tainted`) is not the action's failure: it is submitted again after a
 wait (the poll, doubling up to 30 s) and spends none of those attempts, while the next job would be
 submitted before the action's deadline (its timeout, from when it was asked for) and at most 100
 times in an operation; past that the callers are answered `UNAVAILABLE` naming every refusal and how
 many times it came. That is the agent's bare code, which a job service passes on without placing
 the job again; a code followed by the hosts that refused it means the job service placed the job
-again itself until it gave up, and, like its own `no-capacity` (its queue wait ran out), it is an
-ordinary infrastructure ending that spends an attempt, so a start is not retried twice over. A
+again itself until it gave up, and it is an ordinary infrastructure ending that spends an attempt,
+so a start is not retried twice over. A start failure of a code kbf does not name is answered with
+that code (the agent's leading code, or `start-failure-<n>`) leading the message. A
 submit the service refuses because no host could ever run it
 (`no-capable-host`), and a start a host refuses as `platform-mismatch`, end the action as invalid at
 once, naming the refusal. A job's pack is read, and its outputs
@@ -328,7 +336,8 @@ to `kbf-l2-backfill` (docs/deploy/l2-backfill.md). The miss path above reads eac
 
 **Over a state store.** With `--state-store` the executor keeps the rows `exec/op/<operation>` (owner,
 action, attempt, job id), `exec/act/` (the open operation of each action, so an Execute of an action
-another frontend runs follows it and submits no second job), `exec/live/<instance>` and `done/`, `doneof/` that
+another frontend runs follows it and submits no second job), `exec/watch/` (the callers an operation
+another frontend runs has here, below), `exec/live/<instance>` and `done/`, `doneof/` that
 [direct-js.md](../design/direct-js.md) section 3 lists, and the operation ids come from the store's
 shared counter. Any frontend of the store answers `WaitExecution` and `GetOperation` of any operation by name,
 and a process whose liveness row has expired (`--executor-live-secs`, default 20 seconds after its
@@ -338,6 +347,22 @@ where it is. A job that commits into a put directory is finished from it; one th
 presigned url, which only the process that held the url can finish, is cancelled and run again.
 Clients reattach with `WaitExecution`. Without a `--state-store` a restart loses the open operations, and its
 clients' builds fail. Every frontend of a farm may run the executor.
+
+**An operation no client waits on is cancelled.** A client whose connection was cut (Buck2 among
+them) does not come back for its operation: it fails the action, and its next build runs it again.
+So an operation that no Execute or WaitExecution stream has waited on for
+`--executor-no-caller-grace-secs` (default 600) is cancelled as a `CancelOperation` would: its job is
+cancelled at the job service and the operation answered `CANCELLED`, with one log line and
+`kbf_executor_operations_cancelled_no_caller_total` counted. An Execute of the same action, or a
+`WaitExecution` or `GetOperation` of the operation, inside the grace joins it as before, and the
+grace starts again when the last caller leaves. A client that goes silent is taken for gone only once
+its connection is closed, after `--http2-keepalive-interval-secs` plus
+`--http2-keepalive-timeout-secs` (150 seconds by default), so the grace is set well above that. Over a
+state store a caller on another frontend counts: that frontend keeps an `exec/watch/` row of the
+operation alive while one of its streams waits on it. An operation taken up from a gone frontend
+has no caller until one comes back: its grace starts when it is taken up. A job that ends before
+the grace runs out is read and its result written to the action cache as always. `0` turns the
+cancel off; `kbf_executor_operations_no_caller` is how many operations are in their grace now.
 
 The executor prepares each job with the frontend's **task runs** (below), so
 `--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with

@@ -91,6 +91,7 @@ const POLL: &str = "executor_poll_ms";
 const PREPARE_LIMIT: &str = "executor_prepare_limit_secs";
 const INPUT_TREE: &str = "executor_input_tree";
 const LIVE: &str = "executor_live_secs";
+const NO_CALLER_GRACE: &str = "executor_no_caller_grace_secs";
 const MAC_BUNDLE: &str = "executor_mac_task_bundle";
 const MAC_OS_VERSION: &str = "executor_mac_os_version";
 const MAC_OUT_ROOT: &str = "executor_mac_task_out_root";
@@ -117,6 +118,10 @@ const RETIRED: [(&str, &str, &str); 7] = [
 /// The default of `--executor-live-secs` as clap takes it, a literal; the default-flags test
 /// checks it against [`LIVE`].
 const DEFAULT_LIVE_SECS: &str = "20";
+
+/// The default of `--executor-no-caller-grace-secs` as clap takes it, a literal; the
+/// default-flags test checks it against [`crate::executor::NO_CALLER_GRACE`].
+const DEFAULT_NO_CALLER_GRACE_SECS: &str = "600";
 
 /// The default of `--executor-poll-ms` as clap takes it.
 const DEFAULT_POLL_MS: &str = "250";
@@ -409,6 +414,21 @@ pub(super) fn args() -> Vec<Arg> {
              with `--state-store`. Used only with `--executor js-agent`",
             DEFAULT_LIVE_SECS,
         ),
+        Arg::new(NO_CALLER_GRACE)
+            .long("executor-no-caller-grace-secs")
+            .value_name("SECONDS")
+            .value_parser(clap::value_parser!(u64))
+            .default_value(DEFAULT_NO_CALLER_GRACE_SECS)
+            .help(
+                "How long an operation no Execute or WaitExecution waits on is left running \
+                 for a client to come back, in seconds; then it is cancelled, as a \
+                 CancelOperation would, and its job with it. A client that went silent is \
+                 taken for gone only once the listener closes its connection \
+                 (`--http2-keepalive-interval-secs` and `--http2-keepalive-timeout-secs` \
+                 together), so keep this above those. Over a state store a caller on another \
+                 frontend counts. 0 never cancels an operation for having no caller. Used only \
+                 with `--executor js-agent`",
+            ),
         text(
             MAC_BUNDLE,
             "executor-mac-task-bundle",
@@ -608,6 +628,7 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
         _ => InputTree::Manifests,
     };
     config.live = secs(LIVE);
+    config.no_caller_grace = secs(NO_CALLER_GRACE);
     config.mac = mac_pool(m)?;
     Ok(JsAgentFlags {
         config,

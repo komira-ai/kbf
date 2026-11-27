@@ -167,6 +167,23 @@ fn the_defaults_name_the_live_time_the_retention_and_the_poll() {
     assert_eq!(config.frontend, "front-1");
 }
 
+/// Catches a grace for operations with no caller that drifts down to or below the time the
+/// listeners take a silent client for gone (the PING interval and the keepalive timeout, 150 s
+/// by default): ten minutes, and it is no bound `validate` refuses at zero, which turns it off.
+#[test]
+fn the_grace_for_an_operation_with_no_caller_is_ten_minutes_and_zero_is_valid() {
+    let config = base();
+    assert_eq!(config.no_caller_grace, Duration::from_secs(600));
+    assert_eq!(config.no_caller_grace, crate::executor::NO_CALLER_GRACE);
+    let silent = crate::serve::StreamTiming::default();
+    assert!(config.no_caller_grace > silent.keepalive_interval + silent.keepalive_timeout);
+    let off = Config {
+        no_caller_grace: Duration::ZERO,
+        ..base()
+    };
+    assert_eq!(off.validate(), Ok(()));
+}
+
 /// Catches an operator message that names the wrong setting: the text of the bounds refusal and
 /// of the key-ceiling refusals, whole.
 #[test]

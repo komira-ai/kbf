@@ -7,14 +7,25 @@
 //! | `exec/live/<instance>` | empty | by its process, every quarter of `--executor-live-secs`, with that time to live |
 //! | `exec/op/<operation>` | [`OpRow`], with the tree list its attempt's job reads when there is one | before each attempt's submit; deleted when the operation finishes |
 //! | `exec/act/<hash>-<size>/<instance, hex>` | the open operation of the action, version 1 and 8 bytes big-endian | with the first attempt's `exec/op/` row, in its transaction; deleted with it |
+//! | `exec/watch/<operation>/<instance, hex>` | empty | by a process a caller of which waits on the operation another process runs, every quarter of `--executor-live-secs`, with that time to live |
 //! | `done/<operation>` | `Finished::to_row` | when the operation finishes, for at least [`DONE_FLOOR`] |
 //! | `doneof/<operation>` | the action and instance (version 1, size, hash, instance) | beside `done/` |
 //!
 //! `meta/next_op`, `done/` and `doneof/` keep the format of earlier releases, so a frontend of
 //! the release before and one of this release over one store never give one id twice and each
-//! answers by name an operation the other finished. The `exec/live/`, `exec/op/` and
-//! `exec/act/` families are new: no scan of an earlier release reads a prefix of them (B8: it
-//! loses nothing by not knowing them, they are this executor's own bookkeeping).
+//! answers by name an operation the other finished. The `exec/live/`, `exec/op/`,
+//! `exec/act/` and `exec/watch/` families are new: no scan of an earlier release reads a prefix
+//! of them (B8: it loses nothing by not knowing them, they are this executor's own bookkeeping).
+//!
+//! **Callers on another frontend.** A process cancels an operation it runs once no caller has
+//! waited on it for `--executor-no-caller-grace-secs` ([`crate::executor::callers`]). A caller
+//! that waits on it through another frontend (a WaitExecution there, or an Execute there that
+//! joined it) is that frontend's: while it has one, it keeps the operation's `exec/watch/` row of
+//! its own alive ([`Rows::watch`]), and the process that runs the operation counts any such row
+//! as a caller ([`Rows::watched`]). A release before this one writes none and reads none: a
+//! caller it holds on an operation this release runs is not seen, and is answered CANCELLED once
+//! the operation's own callers have been gone for the grace; an operation that release runs is
+//! never cancelled for want of a caller.
 //!
 //! **One job per action across frontends.** An Execute of an action another frontend of the
 //! store is running joins that operation instead of submitting a second job (a rebuild): the
@@ -66,6 +77,10 @@ pub const OP_PREFIX: &str = "exec/op/";
 
 /// The prefix of the action rows: `exec/act/<hash>-<size>/<instance, hex>`.
 pub const ACT_PREFIX: &str = "exec/act/";
+
+/// The prefix of the rows of callers on other processes: `exec/watch/<operation, 16 hex
+/// digits>/<instance, hex>`.
+pub const WATCH_PREFIX: &str = "exec/watch/";
 
 /// The version byte every `exec/op/` value begins with.
 pub const VERSION: u8 = 1;
@@ -219,16 +234,26 @@ pub fn op_key(operation: OperationId) -> String {
     format!("{OP_PREFIX}{:016x}", operation.0)
 }
 
+/// The prefix of the `exec/watch/` rows of `operation`.
+fn watch_prefix(operation: OperationId) -> String {
+    format!("{WATCH_PREFIX}{:016x}/", operation.0)
+}
+
+/// `instance`, in hex: a name may hold any character, a slash too.
+fn hex(instance: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(instance.len() * 2);
+    for byte in instance.as_bytes() {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// The key of the row that names the open operation of `instance`'s action `hash`, `size`.
 /// The instance is spelled in hex: a name may hold any character, a slash too.
 #[must_use]
 pub fn act_key(instance: &str, hash: &str, size: u64) -> String {
-    use std::fmt::Write as _;
-    let mut key = format!("{ACT_PREFIX}{hash}-{size}/");
-    for byte in instance.as_bytes() {
-        let _ = write!(key, "{byte:02x}");
-    }
-    key
+    format!("{ACT_PREFIX}{hash}-{size}/{}", hex(instance))
 }
 
 /// The value of an `exec/act/` row naming `operation`.
@@ -397,6 +422,25 @@ impl Rows {
     pub fn leave(&self) -> Result<(), RowsError> {
         let key = format!("{LIVE_PREFIX}{}", self.instance);
         self.commit(Txn::new().delete(key, Cond::Any))
+    }
+
+    /// Says for `live`, on the store's clock, that a caller of this process waits on
+    /// `operation`, which another process runs.
+    ///
+    /// # Errors
+    /// The store cannot be written.
+    pub(crate) fn watch(&self, operation: OperationId, live: Duration) -> Result<(), RowsError> {
+        let key = format!("{}{}", watch_prefix(operation), hex(&self.instance));
+        self.commit(Txn::new().put_ttl(key, Vec::new(), live, Cond::Any))
+    }
+
+    /// Whether a caller of another process waits on `operation`: an `exec/watch/` row of it has
+    /// not expired.
+    ///
+    /// # Errors
+    /// The store cannot be read.
+    pub(crate) fn watched(&self, operation: OperationId) -> Result<bool, RowsError> {
+        Ok(!self.store.scan_prefix(&watch_prefix(operation))?.is_empty())
     }
 
     /// The condition a write of the row at `key` by this process holds to: that it is still

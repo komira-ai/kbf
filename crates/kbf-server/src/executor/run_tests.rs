@@ -203,7 +203,7 @@ async fn a_busy_service_that_does_not_take_a_submit_spends_no_attempt() {
 }
 
 /// Catches a submit status that is not the service's load waited on as a busy one: a submit
-/// refused `PERMISSION_DENIED` ends the run as `infra`, and the operation's next attempt, under
+/// refused `FAILED_PRECONDITION` ends the run as `infra`, and the operation's next attempt, under
 /// a new id, runs the action.
 #[tokio::test(start_paused = true)]
 async fn a_submit_refused_for_a_reason_that_is_not_load_runs_the_next_attempt() {
@@ -211,7 +211,7 @@ async fn a_submit_refused_for_a_reason_that_is_not_load_runs_the_next_attempt() 
     rig.fake.inject_on(
         "SubmitJob",
         Fault::Status {
-            code: Code::PermissionDenied,
+            code: Code::FailedPrecondition,
             message: "no".to_owned(),
         },
     );
@@ -353,7 +353,7 @@ async fn every_operation_reads_less_often_while_the_service_is_busy() {
 
 /// Catches an error that is not the service's load either ending the run or taken for a busy
 /// service: a submit answered with a body that cannot be decoded is sent again under the same
-/// id, and reads of the job and of its result answered `PERMISSION_DENIED` are read again; the
+/// id, and reads of the job and of its result answered `FAILED_PRECONDITION` are read again; the
 /// one job runs, and no attempt is spent.
 #[tokio::test(start_paused = true)]
 async fn errors_that_are_not_the_services_load_are_repeated_and_spend_no_attempt() {
@@ -363,7 +363,7 @@ async fn errors_that_are_not_the_services_load_are_repeated_and_spend_no_attempt
         Fault::Answer(bytes::Bytes::from_static(b"\xff\xff")),
     );
     let denied = || Fault::Status {
-        code: Code::PermissionDenied,
+        code: Code::FailedPrecondition,
         message: "no".to_owned(),
     };
     rig.fake.inject_on("GetJob", denied());
@@ -643,21 +643,18 @@ async fn a_cancel_on_a_busy_service_is_sent_again_until_it_is_answered() {
     assert_eq!(rig.calls_of("CancelJob"), 7, "none after the answer");
 }
 
-/// Catches a cancel sent for ever when the service will not take it from this client: a cancel
-/// refused `PERMISSION_DENIED` is sent three times in all, and the callers are answered
-/// CANCELLED.
+/// Catches a cancel sent for ever when the service's answer to it is neither an answer about the
+/// job nor the service's load: a cancel answered with a body that cannot be decoded is sent three
+/// times in all, and the callers are answered CANCELLED.
 #[tokio::test(start_paused = true)]
-async fn a_cancel_the_service_refuses_is_sent_three_times() {
+async fn a_cancel_whose_answer_cannot_be_read_is_sent_three_times() {
     let rig = Rig::start().await;
     let caller = rig.submit(1);
     rig.submitted(&caller, 0).await;
     for _ in 0..5 {
         rig.fake.inject_on(
             "CancelJob",
-            Fault::Status {
-                code: Code::PermissionDenied,
-                message: "no".to_owned(),
-            },
+            Fault::Answer(bytes::Bytes::from_static(b"\xff\xff")),
         );
     }
     assert!(rig.exec.cancel(&caller.name));

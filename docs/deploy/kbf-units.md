@@ -308,7 +308,8 @@ it out on its own health check and its connections' GOAWAY (the order and each p
    Nothing is cancelled by the drain, nor by a stop: the jobs of the operations still open run on
    in the job service, and the frontend waits for each to end. A stream that a forced stop cuts is
    ended `UNAVAILABLE`, and its job is left to run; over a state store another frontend takes the
-   operation up ([direct-js.md](../design/direct-js.md) section 3).
+   operation up ([direct-js.md](../design/direct-js.md) section 3), and cancels it if no client
+   comes back for it within `--executor-no-caller-grace-secs`.
 5. The worker streams that are left end `UNAVAILABLE` (storage nodes register with another
    frontend through the load balancer), and the process exits 0. Only a forced stop
    (below) leaves client streams open at this step, and ends them `UNAVAILABLE`; it logs a

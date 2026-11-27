@@ -336,6 +336,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "executor-mac-task-out-root",
             "executor-max-run-secs",
             "executor-network",
+            "executor-no-caller-grace-secs",
             "executor-ownership",
             "executor-poll-ms",
             "executor-prepare-concurrency",
