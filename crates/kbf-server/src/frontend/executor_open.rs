@@ -75,3 +75,40 @@ pub(super) fn executor_of(
         probe,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower_service::Service as _;
+
+    use super::*;
+    use crate::executor::tests::Rig;
+
+    /// Asserts that the operator API serves the completion route only for a frontend with an
+    /// executor: a GET of `/js-done/<reference>` is 405 (the route takes POST) with one, and
+    /// 404 (no such route) without. Catches the route left off the operator API.
+    #[tokio::test(start_paused = true)]
+    async fn the_completion_route_is_served_only_with_an_executor() {
+        let rig = Rig::start().await;
+        let parts = ExecutorParts {
+            executor: rig.exec.clone(),
+            metrics: Arc::clone(&rig.metrics),
+            probe: Arc::new(rig.exec.probe(Duration::from_secs(1))),
+        };
+        for (parts, status) in [
+            (Some(&parts), StatusCode::METHOD_NOT_ALLOWED),
+            (None, StatusCode::NOT_FOUND),
+        ] {
+            let request = Request::builder()
+                .uri("/js-done/0123")
+                .body(Body::empty())
+                .expect("a request");
+            let answer = callback_routes(parts)
+                .call(request)
+                .await
+                .expect("an answer");
+            assert_eq!(answer.status(), status);
+        }
+    }
+}

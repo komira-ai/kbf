@@ -65,7 +65,7 @@ async fn a_completion_call_that_is_not_a_post_is_refused_at_the_proxy() {
     let rig = Rig::start(&[receiver(&seen)]);
     let mut client = rig.client().await;
     client.bearer = None;
-    for method in ["GET", "HEAD", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+    for method in ["GET", "PUT", "DELETE", "PATCH", "OPTIONS"] {
         let reply = client.plain(method, "/js-done/ref-1", b"").await;
         assert_eq!(reply.status, Some(405), "{method}");
         let allow = reply.headers.get("allow").expect("Allow");

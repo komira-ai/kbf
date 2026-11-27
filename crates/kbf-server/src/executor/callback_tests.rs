@@ -26,6 +26,11 @@ fn fill_fails(_: &mut [u8]) -> bool {
     false
 }
 
+/// Fills the key and fails for the reference.
+fn fill_reference_fails(bytes: &mut [u8]) -> bool {
+    bytes.len() == KEY_BYTES
+}
+
 fn origin() -> CallbackOrigin {
     "https://kbf.example".parse().expect("an origin")
 }
@@ -152,31 +157,32 @@ fn arming_mints_the_callback_and_holds_it_until_dropped() {
     );
 }
 
-/// Asserts that a random source that fails arms nothing: the spec keeps no callback, no run
-/// waits, and one warning names the job and not a key. Catches a job submitted with a key of
+/// Asserts that a random source that fails, for the key or for the reference, arms nothing:
+/// the spec keeps no callback, no run waits, and one warning each names the job and not a key. Catches a job submitted with a key of
 /// zeros, which anyone could sign with.
 #[test]
 fn a_failed_random_source_arms_nothing() {
     crate::test_log::install();
     let log = capture_at(Level::WARN);
-    let callbacks = Callbacks::with_sources(fill_fails, fixed_now);
-    let mut spec = JobSpec {
-        job_id: "job-1".to_owned(),
-        ..JobSpec::default()
-    };
-    assert!(callbacks.arm(Some(&origin()), &mut spec).is_none());
-    assert_eq!(spec.callback, None);
-    assert_eq!(callbacks.waiting_count(), 0);
+    let sources: [fn(&mut [u8]) -> bool; 2] = [fill_fails, fill_reference_fails];
+    for fill in sources {
+        let callbacks = Callbacks::with_sources(fill, fixed_now);
+        let mut spec = JobSpec {
+            job_id: "job-1".to_owned(),
+            ..JobSpec::default()
+        };
+        assert!(callbacks.arm(Some(&origin()), &mut spec).is_none());
+        assert_eq!(spec.callback, None);
+        assert_eq!(callbacks.waiting_count(), 0);
+    }
     let lines = log.text();
     let lines: Vec<_> = lines
         .lines()
         .filter_map(|line| line.split_once("kbf_server::executor::callback: "))
         .map(|(_, message)| message)
         .collect();
-    assert_eq!(
-        lines,
-        ["the random source failed: the job is watched by polling alone job=job-1"]
-    );
+    let line = "the random source failed: the job is watched by polling alone job=job-1";
+    assert_eq!(lines, [line, line]);
 }
 
 /// Asserts the signature rule against two references: the Standard Webhooks specification's

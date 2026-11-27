@@ -13,7 +13,7 @@
 //! Once the job has reached its final state, the service POSTs to the URL with an empty body,
 //! signed by the Standard Webhooks rule: `webhook-signature` is `v1,` and the base64 of
 //! HMAC-SHA256 under the key of `<webhook-id>.<webhook-timestamp>.<body>`. [`routes`] serves
-//! that path on the operator API, which kbf-proxy forwards it to; the call is answered:
+//! that path on the operator API, which kbf-proxy forwards to; the call is answered:
 //!
 //! - **204** when it verifies: the reference is held, the signature is the key's, and the
 //!   timestamp is within [`TOLERANCE_SECONDS`] of this host's clock. The run is woken and
@@ -25,6 +25,8 @@
 //!   over. The service tries a refused call again, with a doubling wait, until the callback's
 //!   deadline ([`DEADLINE_SECONDS`] after the job's end), so a call that reached another
 //!   frontend of the pool can still reach this one.
+//! - **405** for a method other than POST, and **413** for a body over [`MAX_BODY`] bytes (the
+//!   service sends none).
 //!
 //! Nothing here decides an outcome. A wake is a read, and the read decides, as a poll does. A
 //! call that never comes ends the run by polling, as before callbacks: a lost call, one
@@ -51,15 +53,15 @@ use tokio::sync::Notify;
 use zeroize::Zeroizing;
 
 /// The path of the completion calls, under the operator API.
-pub const PATH: &str = "/js-done/{reference}";
+const PATH: &str = "/js-done/{reference}";
 
 /// How long after a job's end the service keeps trying its call, in seconds. Polling ends the
 /// run well within it; a call past it would wake nothing.
-pub const DEADLINE_SECONDS: u32 = 600;
+const DEADLINE_SECONDS: u32 = 600;
 
 /// How far a call's `webhook-timestamp` may be from this host's clock, either way, in seconds:
 /// the Standard Webhooks tolerance, so a call recorded once cannot be played again later.
-pub const TOLERANCE_SECONDS: u64 = 300;
+const TOLERANCE_SECONDS: u64 = 300;
 
 /// The bytes of a minted signing key.
 const KEY_BYTES: usize = 32;
@@ -128,7 +130,7 @@ impl fmt::Display for CallbackOrigin {
 
 /// The completion calls this process waits for, by reference. Cloned, it is the same set.
 #[derive(Clone)]
-pub struct Callbacks {
+pub(crate) struct Callbacks {
     shared: Arc<Shared>,
 }
 
@@ -172,7 +174,7 @@ struct Call<'a> {
 impl Callbacks {
     /// An empty set over the operating system's random source and this host's clock.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_sources(system_fill, system_now)
     }
 
@@ -237,14 +239,14 @@ impl Callbacks {
 
     /// How many runs wait for a call.
     #[must_use]
-    pub fn waiting_count(&self) -> usize {
+    pub(crate) fn waiting_count(&self) -> usize {
         self.waiting().len()
     }
 
     /// The answer to a call for `reference` with `headers` and `body`, waking its run when it
     /// verifies (see the module documentation).
     #[must_use]
-    pub fn called(&self, reference: &str, headers: &HeaderMap, body: &[u8]) -> StatusCode {
+    pub(crate) fn called(&self, reference: &str, headers: &HeaderMap, body: &[u8]) -> StatusCode {
         let mut waiting = self.waiting();
         let Some(waiter) = waiting.get_mut(reference) else {
             return StatusCode::NOT_FOUND;
@@ -272,12 +274,6 @@ impl Callbacks {
             waiter.wake.notify_one();
         }
         StatusCode::NO_CONTENT
-    }
-}
-
-impl Default for Callbacks {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -334,7 +330,7 @@ pub(super) async fn woken(armed: Option<&Armed>) {
 
 /// The route of the completion calls, `POST` [`PATH`], answered from `callbacks`. Merged into
 /// the operator API of a frontend with an executor.
-pub fn routes(callbacks: Callbacks) -> Router {
+pub(crate) fn routes(callbacks: Callbacks) -> Router {
     Router::new()
         .route(PATH, post(called))
         .layer(DefaultBodyLimit::max(MAX_BODY))

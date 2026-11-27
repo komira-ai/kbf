@@ -91,10 +91,8 @@ use ops::{Joined, Ops};
 use rows::Rows;
 use run::{Op, Start};
 
-pub use callback::{
-    CallbackOrigin, CallbackOriginError, Callbacks, DEADLINE_SECONDS, PATH as CALLBACK_PATH,
-    TOLERANCE_SECONDS, routes as callback_routes,
-};
+pub use callback::{CallbackOrigin, CallbackOriginError};
+pub(crate) use callback::{Callbacks, routes as callback_routes};
 pub use config::{Config, ConfigError, FINISHED_RETENTION, InputTree, LIVE};
 pub use driver::Running;
 pub use front::{
@@ -228,7 +226,7 @@ impl Executor {
     /// The completion calls this executor's runs wait for: what [`callback_routes`] answers
     /// from.
     #[must_use]
-    pub fn callbacks(&self) -> Callbacks {
+    pub(crate) fn callbacks(&self) -> Callbacks {
         self.inner.callbacks.clone()
     }
 

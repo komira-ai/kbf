@@ -1,5 +1,6 @@
-//! HTTP/1.1 on the public port: for `/v1/*`, the update API and the probes, and nothing else
-//! (design note decision C4).
+//! HTTP/1.1 on the public port: for `/v1/*`, the update API, the probes, the web UI (`/ui`)
+//! and the job service's completion calls (`/js-done/<reference>`), and nothing else (design
+//! note decision C4).
 //!
 //! HTTP/1.1 cannot multiplex, so a gRPC service (REAPI, worker sessions, enrollment) is not
 //! served on it: such a path is `426 Upgrade Required`, naming `h2`. What is served is parsed
