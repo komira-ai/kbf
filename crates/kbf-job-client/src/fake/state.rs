@@ -144,6 +144,12 @@ fn view(record: &Record, hosts: &BTreeMap<String, Host>) -> Job {
         attempts: 0,
         events: Vec::new(),
         dropped_events: 0,
+        // The fake never retries a job: it has one attempt, which 0 names.
+        attempt: 0,
+        attempt_history: Vec::new(),
+        retry_not_before_ms: None,
+        callback_status: None,
+        dropped_attempts: 0,
     }
 }
 
@@ -505,6 +511,7 @@ impl State {
             times: Some(record.times),
             usage: None,
             input_failure: record.input_failure.clone(),
+            attempt: 0,
         })
     }
 

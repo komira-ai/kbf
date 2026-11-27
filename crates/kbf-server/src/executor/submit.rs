@@ -394,6 +394,9 @@ fn put_dir_spec(
         priority: 0,
         labels: labels(ctx, booking.class(class)),
         history_key: history_key(booking.class(class), sent),
+        // kbf reruns a job itself, under a new id (`outcome`): the service is asked for none.
+        retry: None,
+        callback: None,
     }
 }
 

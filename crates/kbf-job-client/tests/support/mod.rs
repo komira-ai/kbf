@@ -129,6 +129,8 @@ pub fn full_spec(contents: &str) -> JobSpec {
         layers: Vec::new(),
         mounts: Vec::new(),
         history_key: String::new(),
+        retry: None,
+        callback: None,
     }
 }
 
@@ -174,6 +176,7 @@ pub fn full_result() -> JobResult {
             gpus: 1,
         }),
         input_failure: None,
+        attempt: 0,
     }
 }
 
