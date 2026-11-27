@@ -222,3 +222,7 @@ mod tests;
 #[cfg(test)]
 #[path = "stored_walk_tests.rs"]
 mod walk_tests;
+
+#[cfg(test)]
+#[path = "stored_loss_tests.rs"]
+mod loss_tests;
