@@ -7,6 +7,7 @@
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -197,6 +198,9 @@ pub struct Packs {
     /// When a pack a read found absent is taken for lost: shared by the reader of the blobs,
     /// the reads of large blobs, an action tree's check and a job's report of an absent object.
     pub(super) loss: Arc<LossGuard>,
+    /// How many times a read or a check through these packs (any clone) found a blob the index
+    /// records lost or damaged ([`Packs::losses`]).
+    losses: Arc<AtomicU64>,
     /// The writer the packs are recorded under, which a large object is recorded under too.
     pub(super) writer: String,
     /// [`PackSettings::store_writes`].
@@ -270,6 +274,7 @@ impl Packs {
             verifying: Arc::default(),
             clock: Arc::new(SystemTime::now),
             loss,
+            losses: Arc::default(),
             writer,
             store_writes: settings.store_writes,
             known: Arc::default(),
@@ -465,6 +470,7 @@ impl Packs {
     /// first, and the pack is old enough. Returns what it came to; a forget is counted in
     /// [`PackMetrics::lost_forgotten`].
     pub async fn absent(&self, key: &str, end: u64) -> Loss {
+        self.saw_loss();
         let look = || self.object_len(key);
         let loss = self.loss.absent(&self.index, key, end, look).await;
         self.metrics.lost_forgotten.add(u64::from(loss.forgotten()));
@@ -484,9 +490,25 @@ impl Packs {
             self.loss.held(key, whole);
             return Ok(false);
         }
+        self.saw_loss();
         let look = || std::future::ready(Ok::<_, Status>(length));
         let loss = self.loss.absent(&self.index, key, end, look).await;
         Ok(loss.forgotten())
+    }
+
+    /// How many times a read or a check through these packs, or any clone of them, has found a
+    /// blob the index records absent from its pack, or other bytes than its digest: each such
+    /// finding may come before its row is gone ([`Packs::absent`]'s forget, a damaged blob's
+    /// dropped location), and a row can go no other way through these packs. A walk of an
+    /// input tree remembers what it found held only while this stays the same
+    /// (`crate::input_walk::Blobs::epoch`).
+    pub(crate) fn losses(&self) -> u64 {
+        self.losses.load(Ordering::SeqCst)
+    }
+
+    /// Counts a finding of [`Packs::losses`].
+    pub(super) fn saw_loss(&self) {
+        self.losses.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Writes `blobs` into packs and records them. They are in the pack index, and the packs
@@ -666,6 +688,7 @@ impl Packs {
                 Ok(None)
             }
             Fetch::Lost { forgotten } => {
+                self.saw_loss();
                 // When the reader's guard confirmed the loss and the index forgot the pack, the
                 // index no longer has a row for the digest: FindMissingBlobs lists it, so a
                 // client uploads it again.
@@ -679,6 +702,7 @@ impl Packs {
                 Ok(None)
             }
             Fetch::Damaged { dropped } => {
+                self.saw_loss();
                 // This read is refused. When the reader dropped the location, the index no
                 // longer has a row for the digest, so the next read of it finds no pack and
                 // falls back as for any blob the index lacks.

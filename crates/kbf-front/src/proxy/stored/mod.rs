@@ -252,6 +252,12 @@ impl Blobs for Absent {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>> {
         Box::pin(futures::future::ready(Ok(digests.to_vec())))
     }
+
+    /// One epoch, always: nothing is ever held here, so no answer resting on it can change.
+    /// Over packs, the walk's epoch is then the packs' own ([`Packs::losses`]).
+    fn epoch(&self) -> Option<u64> {
+        Some(0)
+    }
 }
 
 /// The index's form of a digest.

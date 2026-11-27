@@ -29,6 +29,10 @@ pub(super) fn unavailable(status: Status) -> StorageError {
     StorageError::Unavailable(Arc::new(status))
 }
 
+/// What one loss of the packs moves a [`Layered`] epoch by: odd, so distinct counts of losses
+/// are distinct epochs.
+const LOSS_EPOCH_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// `packs` first, then `rest`.
 pub(crate) struct Layered<'a> {
     pub packs: &'a Packs,
@@ -85,8 +89,14 @@ impl Blobs for Layered<'_> {
         })
     }
 
+    /// The epoch of `rest`, moved on by every loss the packs have found ([`Packs::losses`]):
+    /// a "held" answer rests on a row of the pack index as much as on `rest`, and a row goes
+    /// only after a read or a check through the packs found its blob lost or damaged. `None`
+    /// when `rest` cannot say. Every count of losses is a distinct epoch over one epoch of
+    /// `rest` (an odd multiplier is one to one).
     fn epoch(&self) -> Option<u64> {
-        self.rest.epoch()
+        let losses = self.packs.losses().wrapping_mul(LOSS_EPOCH_STEP);
+        self.rest.epoch().map(|epoch| epoch ^ losses)
     }
 }
 

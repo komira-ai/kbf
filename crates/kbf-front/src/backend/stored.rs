@@ -218,3 +218,7 @@ impl Plane for StoredPlane {
 #[cfg(test)]
 #[path = "stored_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "stored_walk_tests.rs"]
+mod walk_tests;
