@@ -254,3 +254,73 @@ async fn the_frontend_retry_waits_on_the_tokio_timer() {
     assert_eq!(answer.expect("succeeds"), 2);
     assert_eq!(format!("{retry:?}"), "StartRetry { bound: 120s, .. }");
 }
+
+/// Where the log of [`each_retry_is_logged_with_its_reason_and_the_success_with_its_time`]
+/// goes.
+#[derive(Clone, Default)]
+struct Log(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Log {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut log = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        log.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Asserts what a retried call logs: one warning for each retry, naming the call, the attempt,
+/// the wait and the store's answer, and one line when it succeeds, saying after how many
+/// attempts and how long. Catches: retries that leave no trace of why a start was slow, and a
+/// success that does not say how long it took.
+#[tokio::test]
+async fn each_retry_is_logged_with_its_reason_and_the_success_with_its_time() {
+    let log = Log::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+    let (retry, _) = retry_within(120);
+
+    let answer = retry
+        .run("cas/l/a", retriable, |attempt| async move {
+            match attempt {
+                1..=2 => Err(slow_down()),
+                _ => Ok(()),
+            }
+        })
+        .await;
+
+    answer.expect("succeeds");
+    let text = String::from_utf8(log.0.lock().expect("not poisoned").clone()).expect("UTF-8");
+    let retries: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("trying it again"))
+        .collect();
+    assert_eq!(retries.len(), 2, "{text}");
+    for (line, (attempt, wait)) in retries.iter().zip([(1, "0.5"), (2, "1.0")]) {
+        assert!(line.contains(" WARN "), "{line}");
+        assert!(line.contains("call=\"cas/l/a\""), "{line}");
+        assert!(line.contains(&format!("attempt={attempt} ")), "{line}");
+        assert!(line.contains(&format!("wait_seconds={wait} ")), "{line}");
+        assert!(
+            line.contains("reason=store answered 503 SlowDown: busy"),
+            "{line}"
+        );
+    }
+    let done: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("after it was retried"))
+        .collect();
+    assert_eq!(done.len(), 1, "{text}");
+    assert!(done[0].contains(" INFO "), "{}", done[0]);
+    assert!(done[0].contains("attempts=3 "), "{}", done[0]);
+    assert!(done[0].contains("seconds=1.5"), "{}", done[0]);
+}

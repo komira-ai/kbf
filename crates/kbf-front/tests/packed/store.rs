@@ -129,6 +129,33 @@ async fn a_check_whose_first_answer_was_lost_passes_on_the_next_attempt() {
     );
 }
 
+/// Asserts that a key the check finds taken on its first attempt (left by an earlier start of
+/// the same boot id) is the check's failure, as before the retry: the store's answer, after one
+/// write. Catches: an `AlreadyExists` taken for a lost answer of an attempt that was never made.
+#[tokio::test]
+async fn a_key_taken_before_the_first_attempt_fails_the_check() {
+    let store = Arc::new(Spy::new());
+    let packs = packs_over(&store, PackSettings::default()).expect("packs");
+    let taken = keys().self_test_key();
+    kbf_objstore::ObjectStore::put_new(&*store, &taken, Bytes::from_static(b"left"), None)
+        .await
+        .expect("an earlier start's object");
+    let before = store.puts();
+
+    let checked = packs
+        .check_create_only(&StartRetry::new(Duration::from_secs(120)))
+        .await;
+
+    let Err(Ended::Refused(error)) = checked else {
+        panic!("not refused: {checked:?}");
+    };
+    assert_eq!(
+        error.to_string(),
+        format!("object store: object {taken} already exists")
+    );
+    assert_eq!(store.puts() - before, 1);
+}
+
 /// Asserts that a 403 to the check ends it at once, with no second attempt, and that a store
 /// that answers 500 for ever is given up at the bound, the error saying how long it was tried.
 /// Catches: a refusal held for the whole bound, and a retry with no end.

@@ -24,11 +24,12 @@
 //! Nothing is served while the calls are made: the listeners are bound and answer nothing, so
 //! `/readyz` is not ready (a health check that asks it gets no answer) until the calls are done.
 //!
-//! The default, 120 s, is twice the 60 s within which the frontend's other calls ride out a store
-//! that answers 503 ([`kbf_front::store_wait::STORE_WAIT`]). With the default 300 s of
-//! `--state-store-wait-secs` before it, a start that waits out both takes up to 420 s, which the
-//! start period and retries of a health check of `/readyz` have to cover for the check to not
-//! take a waiting frontend for a failed one.
+//! The bound is each call's own, not the start's: every call has its own deadline from its first
+//! attempt, so a start whose calls each recover within the bound can wait longer than it in all
+//! (the create-only check, then each object of the base tree in turn). What the bound limits is
+//! how long one call is tried: a store that stays down ends the start at the first call that
+//! reaches it. The default, 120 s, is twice the 60 s within which the frontend's other calls ride
+//! out a store that answers 503 ([`kbf_front::store_wait::STORE_WAIT`]).
 
 use std::fmt::Display;
 use std::time::Duration;

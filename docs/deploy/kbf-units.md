@@ -220,7 +220,7 @@ store that is being restarted, often at the same moment as the frontend, answers
 503 `SlowDown` or refuses the connection for a while. Each of those calls is made again on a 503,
 a 500, 502 or 504, a 400 `RequestTimeout`, a refused or reset connection or a request that timed
 out, after jittered waits from about 0.5 s doubling to 8 s, for `--pack-store-start-wait-secs`
-(default 120, from the call's first attempt; the `pack-store-start-wait-secs` key of
+(default 120, each call's own, from its first attempt; the `pack-store-start-wait-secs` key of
 `[packs]`). Each retry is logged as a warning with the call, the attempt, the wait and the answer,
 and a call that succeeds after retries is logged with how long it took. Any other answer (a 403, a
 body that failed its digest check, an object of another length) is not retried and exits 2 at
