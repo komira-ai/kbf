@@ -4,10 +4,16 @@
 //!   `source: {key, offset}`. The index is asked in chunks of [`LOCATE_CHUNK`] digests, at most
 //!   [`ASKS_IN_FLIGHT`] chunks at once.
 //! - **Whole**: tierstore holds `cas/l/<sha256>` of the blob's length (a HEAD each, at most
-//!   [`HEADS_IN_FLIGHT`] at once); the manifest names no source. An object of another length
-//!   there is a store fault: it is not the blob, and a create-only write cannot replace it.
+//!   [`HEADS_IN_FLIGHT`] at once); the manifest names no source.
 //! - **Unlocated**: neither. The blob is read from the frontend's CAS and written to
-//!   `cas/l/<sha256>` with a create-only PUT ([`write_whole`]); then it is whole.
+//!   `cas/l/<sha256>` with a create-only PUT ([`write_whole`]); then it is whole. An object of
+//!   another length under the key is not the blob: it is a write the store kept cut short (the
+//!   SeaweedFS behind tierstore keeps a PUT whose body failed before its first byte as an object
+//!   of 0 bytes), and the blob is unlocated too. Each attempt of a write asks the key's length
+//!   first: an object of the blob's length is the blob, and nothing is sent; one of another
+//!   length is deleted, and the create-only PUT that follows stores the blob. A PUT that finds
+//!   the key taken asks its length again: an object of another length there ends the tree
+//!   ([`NoTree::WrongLength`]), and the next tree's write deletes it.
 //!
 //! The lookups (the index asks and the HEADs) answer within [`LOOKUP_DEADLINE`] together, or the
 //! tree is not made. A HEAD waits out a store that answers 503 for up to
@@ -15,7 +21,8 @@
 //! that wait and 30 s more: a store that fails over while a tree is looked up delays the tree,
 //! and does not end it. A write streams the blob through a SHA-256 check and holds its last chunk
 //! back until the whole has hashed to the digest, so a store never receives all of a blob whose
-//! bytes are wrong: the body ends in an error instead, and the store keeps nothing.
+//! bytes are wrong: the body ends in an error instead. A store keeps nothing of it, or, like the
+//! SeaweedFS above, an object shorter than the blob, which the next write deletes.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -69,7 +76,7 @@ pub(super) enum Place {
 ///
 /// # Errors
 /// [`NoTree`]: the index or a presence check failed or did not answer within
-/// [`LOOKUP_DEADLINE`], or `cas/l/` holds an object of another length for a blob.
+/// [`LOOKUP_DEADLINE`].
 pub(super) async fn locate(
     source: &dyn BlobSource,
     blobs: &[Digest],
@@ -123,10 +130,11 @@ async fn lookups(
     let mut unlocated = Vec::new();
     for (digest, length) in lengths {
         match length {
-            Some(length) if length != digest.size_bytes => {
-                return Err(NoTree::WrongLength { digest, length });
+            Some(length) if length == digest.size_bytes => {}
+            Some(length) => {
+                tracing::warn!(blob = %digest, length, "cas/l/ holds an object of another length than the blob: it is written again");
+                unlocated.push(digest);
             }
-            Some(_) => {}
             None => unlocated.push(digest),
         }
         places.insert(digest, Place::Whole);
@@ -135,11 +143,13 @@ async fn lookups(
 }
 
 /// Writes each of `blobs` to `cas/l/<sha256>`, read from `source` and checked on the way, at
-/// most [`WRITES_IN_FLIGHT`] at once. An existing key is success: the key is content-bound.
+/// most [`WRITES_IN_FLIGHT`] at once. An object of the blob's length under the key is success:
+/// the key is content-bound. One of another length is deleted and the blob written over it.
 ///
 /// # Errors
-/// [`NoTree`]: a blob could not be read, its bytes are not its digest's, or the store refused
-/// the write.
+/// [`NoTree`]: a blob could not be read, its bytes are not its digest's, the store refused
+/// the write, the length check or the delete, or a write found the key taken by an object of
+/// another length ([`NoTree::WrongLength`]).
 pub(super) async fn write_whole(
     (source, store): (&dyn BlobSource, &dyn LargeStore),
     retry: &PutRetry,
@@ -181,8 +191,16 @@ async fn written_blob(
     hashed: &Arc<Mutex<Option<ObjectCells>>>,
 ) -> Result<(), NoTree> {
     let key = large_key(&digest);
-    // An attempt reads the blob again: a body is gone once a write has taken it.
+    // An attempt reads the blob again: a body is gone once a write has taken it. It asks what
+    // the key holds first, so that an attempt after one whose body stalled (which a store may
+    // have kept as an object of 0 bytes) deletes what that one left.
     retrying(retry, &key, || async {
+        if made_way(store, &key, digest.size_bytes)
+            .await
+            .map_err(Failed::<NoTree>::Store)?
+        {
+            return Ok(());
+        }
         let read = source.read_stream(&digest).await.map_err(|error| {
             Failed::Other(NoTree::Read {
                 digest,
@@ -201,14 +219,54 @@ async fn written_blob(
             hashed: Arc::clone(hashed),
         }
         .into_body();
-        put(store, &key, digest.size_bytes, body)
-            .await
-            .map_err(|error| {
+        match store.put(&key, digest.size_bytes, body).await {
+            Ok(()) => Ok(()),
+            Err(ObjectStoreError::AlreadyExists(_)) => taken(store, &key, digest).await,
+            Err(error) => {
                 let mut failure = failure.lock().unwrap_or_else(PoisonError::into_inner);
-                failure.take().map_or(Failed::Store(error), Failed::Other)
-            })
+                Err(failure.take().map_or(Failed::Store(error), Failed::Other))
+            }
+        }
     })
     .await
+}
+
+/// Whether `key` holds an object of `len` bytes already: the blob, since the key is
+/// content-bound. An object of another length is deleted, so that a create-only write can store
+/// the blob: it is not the blob, but a write the store kept cut short.
+///
+/// # Errors
+/// The store's answer to the length check or the delete.
+async fn made_way(
+    store: &dyn LargeStore,
+    key: &ObjectKey,
+    len: u64,
+) -> Result<bool, ObjectStoreError> {
+    match store.len(key).await? {
+        Some(found) if found == len => Ok(true),
+        Some(found) => {
+            tracing::warn!(%key, found, len, "deleting an object of another length than the blob its key names, to write the blob");
+            store.delete(key).await?;
+            Ok(false)
+        }
+        None => Ok(false),
+    }
+}
+
+/// A create-only write of `digest` found `key` taken. An object of the blob's length is the
+/// blob, and one the store does not show yet is a write still being made (a store shows an
+/// object only once it is whole): both are success. One of another length is not the blob.
+///
+/// # Errors
+/// [`NoTree::WrongLength`]: the key holds an object of another length; the store's answer to
+/// the length check.
+async fn taken(store: &dyn LargeStore, key: &ObjectKey, digest: Digest) -> Result<(), Failed> {
+    match store.len(key).await.map_err(Failed::<NoTree>::Store)? {
+        Some(length) if length != digest.size_bytes => {
+            Err(Failed::Other(NoTree::WrongLength { digest, length }))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Writes `bytes` to `key`, create-only: an existing key is success, since every key this
@@ -331,3 +389,7 @@ impl Checked {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "place_tests.rs"]
+mod tests;

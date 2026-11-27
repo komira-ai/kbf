@@ -104,6 +104,17 @@ pub trait LargeStore: Send + Sync {
             "a store the large objects are written to that is not read",
         ))))
     }
+
+    /// Deletes the object `key`; an absent key is success. An action tree's write of a blob
+    /// deletes an object of another length than the blob's under the blob's key, so that its
+    /// create-only write can store the blob. The default answers
+    /// [`ObjectStoreError::Unsupported`]: a store the large objects are not deleted from.
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
+        let _ = key;
+        Box::pin(std::future::ready(Err(ObjectStoreError::Unsupported(
+            "deletes of large objects",
+        ))))
+    }
 }
 
 /// The key of the large blob `digest`: `cas/l/<hex>`.
@@ -400,6 +411,18 @@ mod tests {
                 answer
             })
         }
+    }
+
+    /// Catches: a store that does not delete answering as if it had: the default delete of a
+    /// [`LargeStore`] is refused as unsupported, by name.
+    #[tokio::test]
+    async fn a_store_that_does_not_delete_refuses_a_delete() {
+        let key = ObjectKey::new("cas/l/k").expect("a key");
+        let refused = Recorder::default().delete(&key).await.expect_err("refused");
+        assert_eq!(
+            refused.to_string(),
+            "the store does not support deletes of large objects"
+        );
     }
 
     fn backfill() -> (LargeBackfill, Arc<Recorder>) {
