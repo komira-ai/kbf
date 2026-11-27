@@ -175,7 +175,7 @@ fn a_farm_step_with_no_build_of_the_tool_before_it_is_refused() {
         "{LANE}: no earlier step builds assert_remote with `build-exe` and `-femit-bin=\"$RUNNER_TEMP/assert_remote\"`"
     );
     let text = with(FARM, emit, "-femit-bin=\"$RUNNER_TEMP/bin/assert_remote\"");
-    assert_eq!(problems(&text), [missing.clone()]);
+    assert_eq!(problems(&text), std::slice::from_ref(&missing));
     let real = read(FARM);
     let start = real
         .find("      - name: Build assert_remote\n")
