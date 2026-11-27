@@ -249,27 +249,35 @@ Each attempt of an operation is one job, whose id is made from the frontend id, 
 the attempt (`k<8 hex digits of the sha256 of the frontend id>-<operation>-<attempt>`): a submit sent again after its
 answer was lost, and a frontend that takes the operation up, name the job already made, so no
 action is submitted twice. A job service that is busy or cannot be reached (no answer within the
-call timeout, a broken or reset connection, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`) never fails an
-action and spends no attempt: a submit it did not take is sent again, the same spec under the same
+call timeout, a broken or reset connection, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`), or that will not
+serve this frontend now (`UNAUTHENTICATED`, `PERMISSION_DENIED`, `UNIMPLEMENTED`: a revoked token,
+another revision behind the address), never fails an action and spends no attempt: a submit it did not take is sent again, the same spec under the same
 id, until it takes it or the caller cancels, and the reads of a job are repeated. While it stays
 busy every operation of the frontend waits longer between its calls, from the poll doubling to
 40 polls (10 s at the default `--executor-poll-ms`), so a stalled service is not sent a call per
 operation per poll; the frontend logs once when the service turns busy and once when it answers
-again. `CancelOperation` is a cancel of the job, sent again until the service answers it. How a job ends is mapped to
+again. A token the job service no longer accepts so holds the frontend's Executes waiting, not
+failing, until it is fixed: `/readyz` reports the frontend unready meanwhile, and a caller's
+cancel or its own deadline ends an Execute. `CancelOperation` is a cancel of the job, sent again until the service answers it. How a job ends is mapped to
 failure classes as the table in `crates/kbf-server/src/executor/outcome.rs` says: a job
 stopped at its wall limit is the action's own timeout, answered `DEADLINE_EXCEEDED` at once; one
 killed for memory, a lost job (the host's fault) and any other ending of the farm's are submitted again as
-the next attempt, a new job and a new key, at most 2 times, after which the callers are answered
+the next attempt, a new job and a new key, at most 2 times, each after a wait (8 polls before the first,
+doubling, at most 80 polls: 2 s and 20 s at the default `--executor-poll-ms`; each lengthened by
+up to half again by jitter) that must end before the
+action's deadline, after which the callers are answered
 `UNAVAILABLE` (`FAILED_PRECONDITION` with reason `ACTION_OUT_OF_MEMORY` for memory). A job its
-host would not start now (no room, `no-capacity`; the host held while it is drained for an update,
+host would not start now (no room, `no-capacity`, the agent's or the job service's own, its queue
+wait run out; the host held while it is drained for an update,
 `host-held`; or tainted, `host-tainted`) is not the action's failure: it is submitted again after a
 wait (the poll, doubling up to 30 s) and spends none of those attempts, while the next job would be
 submitted before the action's deadline (its timeout, from when it was asked for) and at most 100
 times in an operation; past that the callers are answered `UNAVAILABLE` naming every refusal and how
 many times it came. That is the agent's bare code, which a job service passes on without placing
 the job again; a code followed by the hosts that refused it means the job service placed the job
-again itself until it gave up, and, like its own `no-capacity` (its queue wait ran out), it is an
-ordinary infrastructure ending that spends an attempt, so a start is not retried twice over. A
+again itself until it gave up, and it is an ordinary infrastructure ending that spends an attempt,
+so a start is not retried twice over. A start failure of a code kbf does not name is answered with
+that code (the agent's leading code, or `start-failure-<n>`) leading the message. A
 submit the service refuses because no host could ever run it
 (`no-capable-host`), and a start a host refuses as `platform-mismatch`, end the action as invalid at
 once, naming the refusal. A job's pack is read, and its outputs

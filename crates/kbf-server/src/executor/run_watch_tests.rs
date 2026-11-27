@@ -118,7 +118,7 @@ async fn a_job_that_waits_is_read_a_bounded_number_of_times() {
 }
 
 /// Catches a failed read of a job that has not started tried again at a step, not the poll: the
-/// first read is answered `PERMISSION_DENIED`, and the next one waits a whole poll; the job,
+/// first read is answered `FAILED_PRECONDITION`, and the next one waits a whole poll; the job,
 /// queued then, is read at the steps from there.
 #[tokio::test(start_paused = true)]
 async fn a_failed_first_read_waits_the_poll_and_the_steps_follow() {
@@ -126,7 +126,7 @@ async fn a_failed_first_read_waits_the_poll_and_the_steps_follow() {
     rig.fake.inject_on(
         "GetJob",
         Fault::Status {
-            code: Code::PermissionDenied,
+            code: Code::FailedPrecondition,
             message: "no".to_owned(),
         },
     );
