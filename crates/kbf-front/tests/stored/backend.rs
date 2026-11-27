@@ -83,7 +83,7 @@ async fn read_blob_is_whole_for_small_blobs_and_refused_for_large_ones() {
 /// NotFound; and a failure of the object store after the stream began is an error item.
 #[tokio::test]
 async fn read_stream_is_the_blob_whole() {
-    let rig = Rig::new().await;
+    let rig = Rig::unretried().await;
     let ((small, small_bytes), (large, large_bytes)) = uploaded(&rig).await;
     let (never, _) = blob_len(5000, 9);
     let collect = |digest: Digest| {

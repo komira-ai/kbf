@@ -69,6 +69,13 @@ impl RetryClock for TokioClock {
     }
 }
 
+/// The [`RetryClock`] of a running frontend, for every retry of the pack store's calls.
+pub(crate) fn tokio_clock() -> Arc<dyn RetryClock> {
+    Arc::new(TokioClock {
+        origin: tokio::time::Instant::now(),
+    })
+}
+
 /// How the start-time calls to the pack store are retried, as the module says. Cheap to clone.
 #[derive(Clone)]
 pub struct StartRetry {
@@ -89,9 +96,7 @@ impl StartRetry {
     /// Retries within `bound`, waiting on the tokio timer, jittered.
     #[must_use]
     pub fn new(bound: Duration) -> Self {
-        let clock = Arc::new(TokioClock {
-            origin: tokio::time::Instant::now(),
-        });
+        let clock = tokio_clock();
         Self {
             bound,
             clock,

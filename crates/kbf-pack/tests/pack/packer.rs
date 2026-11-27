@@ -242,56 +242,70 @@ async fn when_every_key_is_taken_the_call_fails_and_records_nothing() {
     assert_eq!(rig.index.find_missing(&[x.digest]).unwrap(), [x.digest]);
 }
 
-/// Asserts that a write that fails records nothing and is tried again under the next key, and
-/// that the pack is recorded once, after the store holds it.
+/// Asserts that a write that fails (not a taken key) is not made again by the packer: the store
+/// is asked once, the call fails with one attempt, and nothing is stored or recorded. Catches a
+/// packer that retries on top of the store's own retries.
 #[tokio::test]
-async fn a_failed_write_is_retried_under_a_new_key() {
+async fn a_failed_write_is_not_made_again_and_fails_the_call() {
     let rig = Rig::new();
     rig.store.reject_puts(1);
-    let packer = rig.packer(PackerConfig::default());
-
-    let packed = pack_all(&packer, &[blob("x")]).await;
-
-    assert_eq!(packed.packs[0].key, pack_key(1));
-    assert!(!rig.store.holds(&pack_key(0)).await);
-    assert_eq!(rig.index.held_at_record(), [true]);
-}
-
-/// Asserts that when every attempt to write fails the call fails with the last key tried,
-/// the store holds nothing, and the index has no row for the blob.
-#[tokio::test]
-async fn when_every_write_fails_nothing_is_stored_or_recorded() {
-    let rig = Rig::new();
-    rig.store.reject_puts(3);
     let packer = rig.packer(PackerConfig::default());
     let x = blob("x");
 
     let error = packer.pack(vec![x.clone()]).await.unwrap_err();
 
-    assert!(matches!(error, PackError::Put { attempts: 3, .. }));
-    assert!(error.to_string().contains(&pack_key(2)), "{error}");
+    assert!(
+        matches!(error, PackError::Put { attempts: 1, .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains(&pack_key(0)), "{error}");
+    assert_eq!(rig.store.puts(), 1);
     assert!(rig.store.keys_under("cas/").await.is_empty());
     assert!(rig.index.held_at_record().is_empty());
     assert_eq!(rig.index.find_missing(&[x.digest]).unwrap(), [x.digest]);
 }
 
-/// Asserts that a write that reports a failure after it stored the object leaves nothing
-/// behind: the packer deletes the attempt before it tries the next key.
+/// Asserts that a failed write is discarded: the packer deletes the key once, and a later call
+/// of the same packer writes under the next key. Catches a failed write whose key is not
+/// deleted.
 #[tokio::test]
-async fn a_write_that_landed_but_failed_is_deleted_before_the_retry() {
+async fn a_failed_write_deletes_its_key() {
+    let rig = Rig::new();
+    rig.store.reject_puts(1);
+    let packer = rig.packer(PackerConfig::default());
+
+    packer.pack(vec![blob("x")]).await.unwrap_err();
+
+    assert_eq!(rig.store.deletes(), 1);
+    let packed = pack_all(&packer, &[blob("x")]).await;
+    assert_eq!(packed.packs[0].key, pack_key(1));
+}
+
+/// Asserts that a write that reports a failure after it stored the object leaves nothing
+/// behind: the packer deletes it, fails the call with one attempt, and records nothing. Catches
+/// an object of a failed write left in the store.
+#[tokio::test]
+async fn a_write_that_landed_but_failed_is_deleted() {
     let rig = Rig::new();
     rig.store.lose_puts(1);
     let packer = rig.packer(PackerConfig::default());
+    let x = blob("x");
 
-    let packed = pack_all(&packer, &[blob("x")]).await;
+    let error = packer.pack(vec![x.clone()]).await.unwrap_err();
 
-    assert_eq!(packed.packs[0].key, pack_key(1));
+    assert!(
+        matches!(error, PackError::Put { attempts: 1, .. }),
+        "{error}"
+    );
+    assert_eq!(rig.store.puts(), 1);
     assert!(!rig.store.holds(&pack_key(0)).await);
-    assert_eq!(rig.store.keys_under("cas/").await, [pack_key(1)]);
+    assert!(rig.store.keys_under("cas/").await.is_empty());
+    assert!(rig.index.held_at_record().is_empty());
 }
 
-/// Asserts that when the delete of a failed attempt fails too, the call still goes on, and the
-/// attempt is an object no row points at, which the index's unreferenced query returns.
+/// Asserts that when the delete of a failed write fails too, the call still fails with the
+/// write's error, and the object is one no row points at, which the index's unreferenced query
+/// returns.
 #[tokio::test]
 async fn a_failed_cleanup_leaves_an_unreferenced_pack() {
     let rig = Rig::new();
@@ -299,13 +313,97 @@ async fn a_failed_cleanup_leaves_an_unreferenced_pack() {
     rig.store.fail_deletes(1);
     let packer = rig.packer(PackerConfig::default());
 
-    let packed = pack_all(&packer, &[blob("x")]).await;
+    let error = packer.pack(vec![blob("x")]).await.unwrap_err();
 
-    assert_eq!(packed.packs[0].key, pack_key(1));
+    assert!(
+        matches!(error, PackError::Put { attempts: 1, .. }),
+        "{error}"
+    );
     assert!(rig.store.holds(&pack_key(0)).await);
     let listed = rig.store.keys_under("cas/").await;
     let unreferenced = rig.index.unreferenced_keys(&listed).unwrap();
     assert_eq!(unreferenced, [pack_key(0)]);
+}
+
+/// Asserts that a taken key is not deleted: the packer moves on without a delete, and the write
+/// lands on the first free key after taken ones, with the taken objects untouched.
+#[tokio::test]
+async fn taken_keys_are_passed_over_without_a_delete() {
+    let rig = Rig::new();
+    rig.store.seed(&pack_key(0), b"one").await;
+    rig.store.seed(&pack_key(1), b"two").await;
+    let packer = rig.packer(PackerConfig::default());
+
+    let packed = pack_all(&packer, &[blob("x")]).await;
+
+    assert_eq!(packed.packs[0].key, pack_key(2));
+    assert_eq!(rig.store.puts(), 3);
+    assert_eq!(rig.store.deletes(), 0);
+    assert_eq!(rig.store.keys_under("cas/").await.len(), 3);
+}
+
+/// Asserts that the keys tried are as many as `put_attempts` says: with two attempts and two
+/// taken keys the call fails with two attempts and the third key is not asked for; nothing is
+/// deleted.
+#[tokio::test]
+async fn the_keys_tried_are_the_put_attempts_of_the_config() {
+    let rig = Rig::new();
+    rig.store.seed(&pack_key(0), b"one").await;
+    rig.store.seed(&pack_key(1), b"two").await;
+    let config = PackerConfig {
+        put_attempts: 2,
+        ..PackerConfig::default()
+    };
+    let packer = rig.packer(config);
+
+    let error = packer.pack(vec![blob("x")]).await.unwrap_err();
+
+    assert!(
+        matches!(error, PackError::Put { attempts: 2, .. }),
+        "{error}"
+    );
+    assert_eq!(rig.store.puts(), 2);
+    assert_eq!(rig.store.deletes(), 0);
+    assert!(!rig.store.holds(&pack_key(2)).await);
+}
+
+/// Asserts that a taken key followed by a failed write fails at the failure with two attempts,
+/// deletes only the key that failed, and leaves the taken object alone.
+#[tokio::test]
+async fn a_failed_write_after_a_taken_key_deletes_only_its_own_key() {
+    let rig = Rig::new();
+    rig.store.seed(&pack_key(0), b"one").await;
+    rig.store.reject_puts_after(1, 1);
+    let packer = rig.packer(PackerConfig::default());
+
+    let error = packer.pack(vec![blob("x")]).await.unwrap_err();
+
+    assert!(
+        matches!(error, PackError::Put { attempts: 2, .. }),
+        "{error}"
+    );
+    assert_eq!(rig.store.deletes(), 1);
+    assert_eq!(rig.store.keys_under("cas/").await, [pack_key(0)]);
+}
+
+/// Asserts that a record that fails is tried `put_attempts` times, under its one key: with
+/// two attempts and three failures the call fails with the record error, the store holds the
+/// one pack, and the store was written once.
+#[tokio::test]
+async fn a_record_is_tried_put_attempts_times() {
+    let rig = Rig::new();
+    rig.index.fail_record(2);
+    let config = PackerConfig {
+        put_attempts: 2,
+        ..PackerConfig::default()
+    };
+    let packer = rig.packer(config);
+
+    let error = packer.pack(vec![blob("x")]).await.unwrap_err();
+
+    assert!(matches!(error, PackError::Record { .. }), "{error}");
+    assert_eq!(rig.store.puts(), 1);
+    assert_eq!(rig.store.keys_under("cas/").await, [pack_key(0)]);
 }
 
 /// Asserts that a record that fails once after the write is tried again with the same pack:
@@ -447,16 +545,20 @@ async fn an_index_that_fails_the_lookup_fails_the_call_before_any_write() {
     assert!(rig.store.keys_under("cas/").await.is_empty());
 }
 
-/// Asserts that a blob too big for a pack, whose pack cannot be written, fails the call.
+/// Asserts that a blob too big for a pack, whose pack cannot be written, fails the call at the
+/// first failed write.
 #[tokio::test]
 async fn a_big_blob_whose_write_fails_fails_the_call() {
     let rig = Rig::new();
-    rig.store.reject_puts(3);
+    rig.store.reject_puts(1);
     let packer = rig.packer(limits(2_000, 100));
 
     let error = packer.pack(vec![filler(3_000, 1)]).await.unwrap_err();
 
-    assert!(matches!(error, PackError::Put { attempts: 3, .. }));
+    assert!(
+        matches!(error, PackError::Put { attempts: 1, .. }),
+        "{error}"
+    );
 }
 
 /// Asserts that when a pack in the middle of a call cannot be written the call fails, the packs
@@ -464,13 +566,16 @@ async fn a_big_blob_whose_write_fails_fails_the_call() {
 #[tokio::test]
 async fn a_pack_that_cannot_be_written_mid_call_leaves_the_earlier_packs_recorded() {
     let rig = Rig::new();
-    rig.store.reject_puts_after(1, 3);
+    rig.store.reject_puts_after(1, 1);
     let packer = rig.packer(limits(PackerConfig::default().pack_bytes, 1));
     let blobs = [filler(10, 1), filler(10, 2), filler(10, 3)];
 
     let error = packer.pack(blobs.to_vec()).await.unwrap_err();
 
-    assert!(matches!(error, PackError::Put { attempts: 3, .. }));
+    assert!(
+        matches!(error, PackError::Put { attempts: 1, .. }),
+        "{error}"
+    );
     let missing = rig.index.find_missing(&digests(&blobs)).unwrap();
     assert_eq!(missing, [blobs[1].digest, blobs[2].digest]);
 
@@ -522,6 +627,47 @@ async fn the_self_test_reports_a_failed_first_write() {
 
     assert!(matches!(error, PackError::Store(_)), "{error}");
     assert!(error.to_string().starts_with("object store: "), "{error}");
+}
+
+/// Asserts that the self test whose first write finds its own bytes under the key (what a store
+/// that retries its writes finds when the first attempt landed and its answer was lost) goes on
+/// to the second write, passes, and deletes the key. Catches: a frontend whose start refuses the
+/// store for an answer the store's own retry lost.
+#[tokio::test]
+async fn the_self_test_takes_its_own_first_write_found_under_the_key() {
+    let rig = Rig::new();
+    let key = keys().self_test_key();
+    rig.store
+        .put_new(&key, Bytes::from_static(b"first"), None)
+        .await
+        .unwrap();
+
+    check_create_only(&*rig.store, &keys()).await.unwrap();
+
+    assert_eq!(rig.store.len(&key).await.unwrap(), None);
+}
+
+/// Asserts that the self test whose first write finds other bytes under the key (left by another
+/// writer) fails with the store's `AlreadyExists`, as a key that is taken. Catches: a taken key
+/// taken for the check's own write.
+#[tokio::test]
+async fn the_self_test_fails_on_a_key_that_holds_other_bytes() {
+    let rig = Rig::new();
+    let key = keys().self_test_key();
+    rig.store
+        .put_new(&key, Bytes::from_static(b"other"), None)
+        .await
+        .unwrap();
+
+    let error = check_create_only(&*rig.store, &keys()).await.unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            PackError::Store(kbf_objstore::ObjectStoreError::AlreadyExists(_))
+        ),
+        "{error}"
+    );
 }
 
 /// Asserts that a failure of the self test's second write is the store's error too, not a store

@@ -96,6 +96,7 @@ mod segments;
 pub mod start_retry;
 mod storage;
 pub mod store_metrics;
+pub mod store_retry;
 pub mod store_wait;
 mod store_writes;
 mod wire;

@@ -293,7 +293,7 @@ async fn a_missing_large_object_is_incomplete() {
 /// so and not as a refusal, and that nothing is indexed or cached.
 #[tokio::test]
 async fn a_large_object_the_store_cannot_read_is_unavailable() {
-    let farm = Multi::new().await;
+    let farm = Multi::unretried().await;
     let (_, zero) = farm.large_run();
     farm.put(farm.pack_key(0), &zero).await;
     farm.put(farm.large_key(0), &large().0).await;
@@ -353,7 +353,7 @@ async fn a_node_that_fails_after_the_last_byte_is_unavailable() {
 /// `Unavailable`, and no byte of the object is read.
 #[tokio::test]
 async fn a_failing_length_of_a_large_object_is_unavailable() {
-    let farm = Multi::new().await;
+    let farm = Multi::unretried().await;
     let (_, zero) = farm.large_run();
     farm.put(farm.pack_key(0), &zero).await;
     farm.rig.store.reject_large_lens(1);

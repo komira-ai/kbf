@@ -124,6 +124,8 @@ fn the_flags_make_the_setting() {
             store_writes: kbf_front::STORE_WRITES,
             writer: "frontend".to_owned(),
             cache: None,
+            retry: RetryPolicy::DEFAULT,
+            input_walk: kbf_front::PackSettings::default().input_walk,
         }
     );
     let mut more = STORE.to_vec();
@@ -280,6 +282,8 @@ fn flags(dir: &Path) -> PackFlags {
         store_writes: NonZeroUsize::MIN.saturating_add(2),
         writer: "fe1".to_owned(),
         cache: None,
+        retry: RetryPolicy::DEFAULT,
+        input_walk: Duration::from_secs(120),
     }
 }
 
@@ -303,6 +307,8 @@ fn the_flags_open_into_packs_or_are_refused_by_flag() {
     assert_eq!(packs.inflight_bytes(), 1 << 20);
     assert_eq!(packs.upload_idle_timeout(), Duration::from_secs(5));
     assert_eq!(packs.store_writes().get(), 3);
+    assert_eq!(packs.store_retry(), RetryPolicy::DEFAULT);
+    assert_eq!(packs.input_walk(), Duration::from_secs(120));
     assert!(dir.path().join("cache").is_dir());
 
     let mut tls = flags(dir.path());

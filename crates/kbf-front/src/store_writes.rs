@@ -11,7 +11,7 @@
 //!   which take one of [`TREE_WRITES`] slots of their own instead. A write past its bound waits
 //!   for a slot before it makes its request, so a burst of uploads queues at the frontend, where
 //!   it costs the callers time, instead of at the store, which answers `SlowDown` to all of them.
-//!   A write holds its slot until it ends, its waits for `SlowDown` included. Reads, lengths,
+//!   A write holds its slot until it ends, its retries' waits included. Reads, lengths,
 //!   deletes and listings take no slot.
 //! - **A tree's writes do not queue behind the uploads.** A tree's manifests, root and list are
 //!   small, and a run waits for them before it is submitted; with every one of the
@@ -29,12 +29,11 @@
 //!   keeps sending slowly keeps it. As many such uploads as there are slots leave none for the
 //!   other writers of those slots until one ends; a tree's manifests, root and list are not held
 //!   back by them.
-//! - **The store's 503s.** Under the slots, every call waits out a store that answers 503
-//!   ([`Waiting`], as [`crate::store_wait`] says): a whole write waits holding its slot, its
-//!   `SlowDown` for as long as the store answers it and any other 503 for at most
-//!   [`STORE_WAIT`](crate::store_wait::STORE_WAIT); a read, a length, a delete or a listing waits
-//!   holding none. A streamed write ([`ObjectStore::put_stream`]) reads a body that cannot be
-//!   read twice, so it is made once, and the store's answer is its caller's.
+//! - **The store's failures.** Under the slots, every call is retried while the store fails in a
+//!   way that may pass ([`Waiting`], as [`crate::store_wait`] says), within the packs' retry
+//!   budget: a whole write retries holding its slot; a read, a length, a delete or a listing
+//!   holds none. A streamed write ([`ObjectStore::put_stream`]) reads a body that cannot be read
+//!   twice, so it is made once, and the store's answer is its caller's.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -61,7 +60,7 @@ pub const STORE_WRITES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(63);
 pub(crate) const TREE_WRITES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(31);
 
 /// An object store whose writes share a fixed number of slots, a tree's manifests, roots and
-/// lists another, and whose calls wait out its 503s.
+/// lists another, and whose calls are retried while the store fails in a way that may pass.
 pub(crate) struct StoreWrites<S> {
     inner: Waiting<S>,
     slots: Semaphore,
@@ -70,7 +69,7 @@ pub(crate) struct StoreWrites<S> {
 
 impl<S: ObjectStore> StoreWrites<S> {
     /// `inner`, with at most `slots` writes at it at once and `tree_slots` writes of a tree's
-    /// manifests, root and list besides, each call waiting out its 503s as `backoff` says.
+    /// manifests, root and list besides, each call retried as `backoff` says.
     pub(crate) fn new(
         inner: Arc<S>,
         slots: NonZeroUsize,

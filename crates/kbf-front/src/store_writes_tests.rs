@@ -2,7 +2,7 @@
 //! their own, a `SlowDown` of a write whose body is in hand is waited out holding the slot, and a
 //! streamed write is made once. (The waits for a store's
 //! other 503s are tested with [`Waiting`](crate::store_wait::Waiting), in `store_wait_tests`.)
-//! The waits are recorded by a fake [`Sleeper`] (or held by one until a test lets them end),
+//! The waits are recorded by a fake [`RetryClock`] (or held by one until a test lets them end),
 //! never taken, and every bound is checked by counting the calls the store saw.
 
 use std::collections::VecDeque;
@@ -15,8 +15,9 @@ use kbf_objstore::MemoryStore;
 use tokio::sync::{Semaphore, oneshot, watch};
 
 use super::*;
-use crate::action_tree::{FIRST_WAIT, Sleeper};
-use crate::store_wait::{STORE_WAIT, no_jitter};
+use crate::action_tree::FIRST_WAIT;
+use crate::start_retry::RetryClock;
+use crate::store_retry::RetryPolicy;
 use std::future::Future;
 use std::time::Duration;
 
@@ -153,8 +154,8 @@ impl ObjectStore for Fake {
     }
 }
 
-/// A [`Sleeper`] that records each wait, and returns at once or, when held, once the test lets
-/// one wait end.
+/// A [`RetryClock`] that stands at time zero, records each wait, and returns at once or, when
+/// held, once the test lets one wait end.
 struct Sleeps {
     waits: watch::Sender<Vec<Duration>>,
     ends: Semaphore,
@@ -196,7 +197,11 @@ impl Sleeps {
     }
 }
 
-impl Sleeper for Sleeps {
+impl RetryClock for Sleeps {
+    fn now(&self) -> Duration {
+        Duration::ZERO
+    }
+
     fn sleep(&self, wait: Duration) -> BoxFuture<'_, ()> {
         self.waits.send_modify(|w| w.push(wait));
         Box::pin(async move {
@@ -242,8 +247,12 @@ fn over_with(
     trees: usize,
     sleeps: &Arc<Sleeps>,
 ) -> Arc<StoreWrites<Fake>> {
-    let sleeper = Arc::clone(sleeps) as Arc<dyn Sleeper>;
-    let backoff = Backoff::with(STORE_WAIT, sleeper, no_jitter(), Arc::default());
+    let clock = Arc::clone(sleeps) as Arc<dyn RetryClock>;
+    let policy = RetryPolicy {
+        jitter_percent: 0,
+        ..RetryPolicy::DEFAULT
+    };
+    let backoff = Backoff::with(policy, clock, Arc::default());
     Arc::new(StoreWrites::new(
         Arc::clone(fake),
         slots(n),
@@ -290,16 +299,16 @@ async fn a_slow_down_is_waited_out_with_doubling_waits() {
     assert_eq!(held.expect("read"), Bytes::from_static(b"abc"));
 }
 
-/// Catches a writer that repeats or swallows an answer other than a 503: a 500, a 403, a dead
-/// connection and a refusal to replace an object are each the write's answer on its first
-/// attempt, with no wait.
+/// Catches a writer that repeats or swallows an answer the store gives for good: a 403, a 400
+/// that is not `RequestTimeout` and a 404 are each the write's answer on its first attempt, with
+/// no wait; and a refusal to replace an object is too. (A 500 and a dead connection are retried
+/// now: see `a_failure_the_store_may_recover_from_is_waited_out_whatever_its_kind`.)
 #[tokio::test]
 async fn every_other_answer_is_the_write_s_at_once() {
-    let dead = || ObjectStoreError::Transport(Arc::new(std::io::Error::other("broken pipe")));
     let answers = [
-        service(500, "InternalError"),
         service(403, "AccessDenied"),
-        dead(),
+        service(400, "InvalidArgument"),
+        service(404, "NoSuchBucket"),
     ];
     for (n, answer) in answers.into_iter().enumerate() {
         let fake = Arc::new(Fake::open());
@@ -332,6 +341,36 @@ async fn every_other_answer_is_the_write_s_at_once() {
     );
     assert_eq!(fake.writes(), 2);
     assert!(sleeps.waits().is_empty());
+}
+
+/// Catches a write that gives up on a failure other than a 503: a 500, a 502, a 504, a 400
+/// `RequestTimeout` and a dead connection are each waited for once (the first wait, 0.5 s) and the
+/// write is then made again and stored.
+#[tokio::test]
+async fn a_failure_the_store_may_recover_from_is_waited_out_whatever_its_kind() {
+    let dead = || ObjectStoreError::Transport(Arc::new(std::io::Error::other("broken pipe")));
+    let answers = [
+        service(500, "InternalError"),
+        service(502, "BadGateway"),
+        service(504, "GatewayTimeout"),
+        service(400, "RequestTimeout"),
+        dead(),
+    ];
+    for (n, answer) in answers.into_iter().enumerate() {
+        let fake = Arc::new(Fake::open());
+        let sleeps = Sleeps::at_once();
+        let store = over(&fake, 4, &sleeps);
+        let said = answer.to_string();
+        fake.answer([answer]);
+
+        store
+            .put_new(&key("b"), Bytes::from_static(b"b"), None)
+            .await
+            .expect("stored");
+
+        assert_eq!(fake.writes(), 2, "{said} (answer {n})");
+        assert_eq!(sleeps.waits(), [FIRST_WAIT], "{said} (answer {n})");
+    }
 }
 
 /// Catches a streamed write made again after a `SlowDown`, which would send a body that was

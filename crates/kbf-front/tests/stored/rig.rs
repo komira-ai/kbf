@@ -278,6 +278,19 @@ impl Rig {
         Self::with(settings).await
     }
 
+    /// [`Rig::new`], but the packs do not retry their calls to the store (a budget of zero), so
+    /// that a failure the store answers, a 500 among them, is the call's own failure: for a test
+    /// of what the frontend does with a store that fails.
+    pub async fn unretried() -> Self {
+        let settings = PackSettings {
+            max_blob_bytes: SMALL,
+            store_retry: kbf_front::store_retry::RetryPolicy::DEFAULT
+                .with_budget(std::time::Duration::ZERO),
+            ..PackSettings::default()
+        };
+        Self::with(settings).await
+    }
+
     /// Packs as `settings` say, over a store that claims and keeps create-only writes.
     pub async fn with(settings: PackSettings) -> Self {
         Self::over(Spy::new(), settings, Authorizers::allow_all()).await

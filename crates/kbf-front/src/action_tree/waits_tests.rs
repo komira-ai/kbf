@@ -18,7 +18,7 @@ async fn write(slot: Duration, request: Duration, wait: Duration) -> &'static st
         waited_for_slot(slot);
         tokio::time::sleep(request).await;
         tokio::time::sleep(wait).await;
-        waited_out_503(wait);
+        waited_to_retry(wait);
     }
     "the write's answer"
 }

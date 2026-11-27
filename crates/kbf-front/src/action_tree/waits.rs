@@ -10,18 +10,19 @@
 //! - **the store slot**: the waits for one of the pack store's slots for tree writes
 //!   (`crate::store_writes::TREE_WRITES`, shared by every tree the frontend writes, and not with
 //!   the pack uploads, which take one of `--pack-store-writes`), one wait per attempt, added up;
-//! - **the 503 waits**: the waits between attempts for a store that answered 503, `SlowDown`
-//!   or not ([`super::retry`]), added up;
+//! - **the retry waits** (`store_503`, the name kept from when only a 503 was retried): the waits
+//!   between attempts for a store that failed in a way the retry takes (a 503, `SlowDown` or
+//!   not, a 5xx, a stalled body, a dead connection: [`super::retry`]), added up;
 //! - **the request**: the rest of the write, from its first attempt to its answer, the store
-//!   slot's waits and the 503 waits taken out: the attempts at the store.
+//!   slot's waits and the retry waits taken out: the attempts at the store.
 //!
 //! The store slot is taken below the writer, in the pack store, which every writer shares. The
 //! tree's write runs its attempts under a tally of its own ([`tallied`]), a tokio task-local
 //! carried by the write's future; the pack store takes a tree slot for a write under a tally
 //! ([`in_tree_write`]), and the slot's wait is added to the tally of the write that waited
 //! ([`waited_for_slot`]). A write under no tally (a pack upload, a blob of the tree's first
-//! stage, a list's sidecar) takes one of `--pack-store-writes` and adds nothing. The 503 waits
-//! are added the same way ([`waited_out_503`]). Tallies are never nested: each write of a
+//! stage, a list's sidecar) takes one of `--pack-store-writes` and adds nothing. The retry waits
+//! are added the same way ([`waited_to_retry`]). Tallies are never nested: each write of a
 //! manifest, the root or the list is tallied once, by the one place that makes it (the writes in
 //! flight, [`super::flight`], and the list's write).
 
@@ -42,7 +43,8 @@ pub struct WriteWaits {
     pub manifest_slot: Duration,
     /// The waits for one of the pack store's slots for tree writes, one per attempt, added up.
     pub store_slot: Duration,
-    /// The waits between attempts for a store that answered 503, added up.
+    /// The waits between attempts for a store that failed in a way the retry takes (a 503, a
+    /// 5xx, a stalled body, a dead connection), added up.
     pub store_503: Duration,
     /// The attempts at the store: the rest of the write.
     pub request: Duration,
@@ -122,8 +124,9 @@ pub(crate) fn waited_for_slot(took: Duration) {
     let _ = TALLY.try_with(|tally| Tally::add(&tally.store_slot, took));
 }
 
-/// A write waited `took` before it tried again after a 503: added to its tally, if it has one.
-pub(super) fn waited_out_503(took: Duration) {
+/// A write waited `took` before it tried again after a failure the store's retry takes: added
+/// to its tally, if it has one.
+pub(super) fn waited_to_retry(took: Duration) {
     let _ = TALLY.try_with(|tally| Tally::add(&tally.store_503, took));
 }
 

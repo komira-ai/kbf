@@ -108,9 +108,10 @@ async fn the_create_only_check_is_made_again_after_a_500() {
     assert_eq!(store.puts(), 3, "one refused write, then the check's two");
 }
 
-/// Asserts that an attempt of the check that finds its first write stored by the attempt before
-/// (whose answer was lost) passes: the store refusing to write the key again is the refusal the
-/// check asks for. Catches: a retried check that fails on its own earlier write.
+/// Asserts that a check whose first write was stored but whose answer was lost passes: the packs'
+/// retry makes the write again, the store refuses it (`AlreadyExists`), the check finds its own
+/// bytes under the key and goes on, and the store refuses its second write, the refusal the check
+/// asks for. Catches: a check that fails on its own earlier write.
 #[tokio::test(start_paused = true)]
 async fn a_check_whose_first_answer_was_lost_passes_on_the_next_attempt() {
     let store = Arc::new(Spy::new());
@@ -121,11 +122,11 @@ async fn a_check_whose_first_answer_was_lost_passes_on_the_next_attempt() {
         .check_create_only(&StartRetry::new(Duration::from_secs(120)))
         .await;
 
-    checked.expect("passes on the second attempt");
+    checked.expect("passes");
     assert_eq!(
         store.puts(),
-        2,
-        "the lost write, then the one the store refused"
+        3,
+        "the lost write, its retry the store refused, then the second write it refused"
     );
 }
 
@@ -158,11 +159,12 @@ async fn a_key_taken_before_the_first_attempt_fails_the_check() {
 
 /// Asserts that a 403 to the check ends it at once, with no second attempt, and that a store
 /// that answers 500 for ever is given up at the bound, the error saying how long it was tried.
-/// Catches: a refusal held for the whole bound, and a retry with no end.
+/// The packs do not retry their own calls here (a budget of zero), so that the check's retry is
+/// the one at work. Catches: a refusal held for the whole bound, and a retry with no end.
 #[tokio::test(start_paused = true)]
 async fn a_403_ends_the_check_at_once_and_a_500_for_ever_at_the_bound() {
     let store = Arc::new(Spy::new());
-    let packs = packs_over(&store, PackSettings::default()).expect("packs");
+    let packs = packs_over(&store, crate::multi::unretried()).expect("packs");
     let retry = StartRetry::new(Duration::from_secs(5));
     store.reject_puts_with(1, 403);
 
@@ -185,11 +187,37 @@ async fn a_403_ends_the_check_at_once_and_a_500_for_ever_at_the_bound() {
     };
     let said = gave_up.to_string();
     let last = "object store: store answered 500 InternalError: injected";
+    // The packs' own retry has no budget here, so the first answer is the call's, and it is
+    // said so; the check's retry then says how long it tried.
+    let unretried = "(not retried: a call to the store spent its budget of 0 s still failing, and no call since was answered)";
     assert!(
-        said.starts_with(&format!("{last} (still failing after ")),
+        said.starts_with(&format!("{last} {unretried} (still failing after ")),
         "{said}"
     );
     assert!(said.ends_with(" attempts over 5.0 s)"), "{said}");
+}
+
+/// Asserts that a store that answers 500 for ever to the packs' own retries (a budget of 120 s)
+/// ends the check at the check's bound of 5 s, the error saying that the store did not answer
+/// within it: the write in flight is cut at the bound, never held for its own budget. Catches: a
+/// check that outlasts its bound because the packs' retry is longer.
+#[tokio::test(start_paused = true)]
+async fn a_500_for_ever_ends_the_check_at_its_bound_though_the_packs_budget_is_longer() {
+    let store = Arc::new(Spy::new());
+    let packs = packs_over(&store, PackSettings::default()).expect("packs");
+    store.reject_puts_with(u32::MAX, 500);
+
+    let given_up = packs
+        .check_create_only(&StartRetry::new(Duration::from_secs(5)))
+        .await;
+
+    let Err(Ended::GaveUp(gave_up)) = given_up else {
+        panic!("not given up: {given_up:?}");
+    };
+    assert_eq!(
+        gave_up.to_string(),
+        "the create-only check: the pack store did not answer within 5.0 s"
+    );
 }
 
 /// Asserts that a blob whose bytes are not its digest is refused INVALID_ARGUMENT before

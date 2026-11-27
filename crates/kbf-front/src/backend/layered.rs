@@ -11,6 +11,7 @@
 //! is held.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -23,6 +24,7 @@ use tonic::Status;
 use super::Answer;
 use crate::input_walk::Blobs;
 use crate::proxy::Packs;
+use crate::store_wait::StoreWaits;
 
 /// A refusal of the packs as the store's: it could not answer.
 pub(super) fn unavailable(status: Status) -> StorageError {
@@ -97,6 +99,12 @@ impl Blobs for Layered<'_> {
     fn epoch(&self) -> Option<u64> {
         let losses = self.packs.losses().wrapping_mul(LOSS_EPOCH_STEP);
         self.rest.epoch().map(|epoch| epoch ^ losses)
+    }
+
+    /// The packs' deadline of a walk ([`Packs::input_walk`]), a cut walk counted with the
+    /// packs' retries.
+    fn walk_deadline(&self) -> Option<(Duration, Arc<StoreWaits>)> {
+        Some((self.packs.input_walk(), self.packs.store_waits()))
     }
 }
 

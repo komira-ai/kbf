@@ -16,13 +16,21 @@
 //!   ([`NoTree::WrongLength`]), and the next tree's write deletes it.
 //!
 //! The lookups (the index asks and the HEADs) answer within [`LOOKUP_DEADLINE`] together, or the
-//! tree is not made. A HEAD waits out a store that answers 503 for up to
+//! tree is not made. A HEAD is retried within the pack store's budget, by default
 //! [`STORE_WAIT`](crate::store_wait::STORE_WAIT) ([`crate::store_wait`]), so the deadline is
-//! that wait and 30 s more: a store that fails over while a tree is looked up delays the tree,
-//! and does not end it. A write streams the blob through a SHA-256 check and holds its last chunk
+//! that budget and 30 s more: a store that restarts or fails over while a tree is looked up
+//! delays the tree, and does not end it. A write streams the blob through a SHA-256 check and holds its last chunk
 //! back until the whole has hashed to the digest, so a store never receives all of a blob whose
 //! bytes are wrong: the body ends in an error instead. A store keeps nothing of it, or, like the
 //! SeaweedFS above, an object shorter than the blob, which the next write deletes.
+//!
+//! A manifest's, a tree list's or a sidecar's write ([`store_object`]) has its bytes in hand and
+//! sends them whole. A create-only PUT of it that finds the key taken asks the key's length: an
+//! object of the bytes' length is the object (the key is content-bound), as is one the store does
+//! not show yet (it shows an object only once it is whole); one of another length is a cut write
+//! the store kept (such as the 0-byte object above, left by an earlier attempt whose body
+//! stalled), which is deleted and the bytes written again. So no write takes a cut object for
+//! its own, and a reader never finds one under a key a write reported stored.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -58,8 +66,7 @@ pub const HEADS_IN_FLIGHT: usize = 16;
 pub(super) const WRITES_IN_FLIGHT: usize = 16;
 
 /// How long the lookups of one tree may take together: the index asks and the presence checks.
-/// It is longer than the most a presence check waits for a store that answers 503
-/// ([`STORE_WAIT`]), by 30 s.
+/// It is longer than the default budget of a presence check's retries ([`STORE_WAIT`]), by 30 s.
 pub const LOOKUP_DEADLINE: Duration = STORE_WAIT.saturating_add(Duration::from_secs(30));
 
 /// Where a blob's bytes are, as a manifest names them.
@@ -269,8 +276,9 @@ async fn taken(store: &dyn LargeStore, key: &ObjectKey, digest: Digest) -> Resul
     }
 }
 
-/// Writes `bytes` to `key`, create-only: an existing key is success, since every key this
-/// writer writes is named by its content.
+/// Writes `bytes` to `key`, create-only: an existing key of the bytes' length is success, since
+/// every key this writer writes is named by its content; one of another length is deleted and
+/// the bytes written again (as the module says).
 ///
 /// # Errors
 /// [`NoTree::Put`]: the store refused it.
@@ -298,10 +306,8 @@ pub(super) async fn store_object(
     key: &ObjectKey,
     bytes: Bytes,
 ) -> Result<(), ObjectStoreError> {
-    let length = bytes.len() as u64;
     let stored = repeating::<Infallible, _, _>(retry, || async {
-        let body = stream::once(std::future::ready(Ok(bytes.clone()))).boxed();
-        put(store, key, length, body).await.map_err(Failed::Store)
+        put(store, key, &bytes).await.map_err(Failed::Store)
     })
     .await;
     stored.map_err(|failed| {
@@ -310,14 +316,24 @@ pub(super) async fn store_object(
     })
 }
 
-/// One create-only write; an existing key is success.
+/// One create-only write of `bytes`; an existing key of their length (or one the store does not
+/// show yet) is success, and one of another length is deleted and the bytes written again.
 async fn put(
     store: &dyn LargeStore,
     key: &ObjectKey,
-    length: u64,
-    body: BodyStream,
+    bytes: &Bytes,
 ) -> Result<(), ObjectStoreError> {
-    match store.put(key, length, body).await {
+    let length = bytes.len() as u64;
+    let body = || stream::once(std::future::ready(Ok(bytes.clone()))).boxed();
+    match store.put(key, length, body()).await {
+        Err(ObjectStoreError::AlreadyExists(_)) => {}
+        other => return other,
+    }
+    if made_way(store, key, length).await? {
+        return Ok(());
+    }
+    match store.put(key, length, body()).await {
+        // Another writer stored the object between the delete and this write: the same bytes.
         Err(ObjectStoreError::AlreadyExists(_)) => Ok(()),
         other => other,
     }

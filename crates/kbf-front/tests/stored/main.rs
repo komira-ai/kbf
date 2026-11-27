@@ -30,5 +30,6 @@ mod execute_walk;
 mod failover;
 mod large;
 mod lost;
+mod outage;
 mod rig;
 mod slow;

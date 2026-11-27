@@ -134,7 +134,7 @@ impl ContentAddressableStorage for StoredCas {
                 "batch asks for {total} bytes; at most {MAX_BATCH_TOTAL_BYTES} are allowed"
             )));
         }
-        // Within the call's deadline: a read waits out a store that answers 503.
+        // Within the call's deadline: a read is retried while the store fails in a way that may pass.
         let read = async { Ok(packed::read_many(self.stored.packs(), &request.digests).await) };
         let served = deadline::within_read(deadline, read).await?;
         let responses = stream::iter(request.digests)

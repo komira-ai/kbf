@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use kbf_auth::Authorizers;
+use kbf_front::store_metrics::Op;
+use kbf_front::store_retry::{Cause, RetryPolicy};
 use kbf_front::{Owner, Owners, PackSettings, Proxy};
 use kbf_proto::reapi;
 use kbf_types::Digest;
@@ -48,17 +50,19 @@ async fn an_upload_is_one_pack_and_in_the_index_when_it_is_acknowledged() {
     assert_eq!(metrics.written_blobs.get(), 3);
 }
 
-/// Asserts that a pack the store refuses fails the upload and records nothing: every item is
-/// UNAVAILABLE, the index has no row, the store holds no pack, and the failure is counted; the
-/// same upload sent again, once the store takes writes, is acknowledged.
+/// Asserts that a pack the store refuses (its calls not retried here: a budget of zero) fails
+/// the upload and records nothing, with no second write by the packer: every item is UNAVAILABLE,
+/// the store saw one write, the index has no row, the store holds no pack, and the failure is
+/// counted; the same upload sent again, once the store takes writes, is acknowledged.
 #[tokio::test]
 async fn a_pack_put_that_fails_fails_the_upload_and_records_nothing() {
-    let rig = Rig::new().await;
+    let rig = Rig::with(crate::multi::unretried()).await;
     let blobs = [blob("one"), blob("two")];
     rig.store.reject_puts(10);
 
     assert_eq!(update(&rig.front, &blobs).await, [UNAVAILABLE, UNAVAILABLE]);
 
+    assert_eq!(rig.store.puts(), 1, "the packer wrote the pack once");
     assert!(rig.store.keys().await.is_empty());
     assert!(rig.index.has_none(&digests(&blobs)));
     assert!(rig.index.held_at_record().is_empty());
@@ -66,6 +70,62 @@ async fn a_pack_put_that_fails_fails_the_upload_and_records_nothing() {
     rig.store.reject_puts(0);
     assert_eq!(update(&rig.front, &blobs).await, [OK, OK]);
     assert!(rig.index.has_all(&digests(&blobs)));
+}
+
+/// The packs' retry with no jitter, so that the waits are the nominal 0.5 s doubling to 8 s.
+fn unjittered() -> PackSettings {
+    PackSettings {
+        store_retry: RetryPolicy {
+            jitter_percent: 0,
+            ..RetryPolicy::DEFAULT
+        },
+        ..PackSettings::default()
+    }
+}
+
+/// Asserts that a pack the store answers 500 three times is stored by the packs' own retry:
+/// both items are acknowledged OK and held, the store saw four writes (the packer wrote the pack
+/// once, the retry made the others), the three retries are counted as server errors, and no write
+/// failure is counted. Catches: a 500 that fails the upload instead of being waited out.
+#[tokio::test(start_paused = true)]
+async fn a_pack_put_the_store_fails_with_a_500_a_few_times_is_retried_and_stored() {
+    let rig = Rig::new().await;
+    let blobs = [blob("one"), blob("two")];
+    rig.store.reject_puts(3);
+
+    assert_eq!(update(&rig.front, &blobs).await, [OK, OK]);
+
+    assert_eq!(rig.store.puts(), 4);
+    assert!(rig.index.has_all(&digests(&blobs)));
+    let waits = rig.packs.store_waits();
+    assert_eq!(waits.retries(Op::Put, Cause::ServerError), 3);
+    assert_eq!(waits.exhausted(Op::Put), 0);
+    assert_eq!(rig.packs.metrics().write_failures.get(), 0);
+}
+
+/// Asserts that a store that answers 500 to every write ends the upload UNAVAILABLE once the
+/// 120 s budget is spent, and not before: with no jitter the store saw 19 writes (the waits of
+/// 0.5, 1, 2 and 4 s, then fourteen of 8 s, 119.5 s in all, the next not fitting), the call is
+/// counted exhausted once, the failure is counted once (the packer does not write the pack
+/// again), and nothing is stored or recorded. Catches: a retry with no end, one cut short of
+/// its budget, and a packer that multiplies the store's own retries.
+#[tokio::test(start_paused = true)]
+async fn a_pack_put_the_store_keeps_failing_ends_the_upload_when_the_budget_is_spent() {
+    let rig = Rig::with(unjittered()).await;
+    let blobs = [blob("one"), blob("two")];
+    rig.store.reject_puts(u32::MAX);
+
+    assert_eq!(update(&rig.front, &blobs).await, [UNAVAILABLE, UNAVAILABLE]);
+
+    assert_eq!(rig.store.puts(), 19);
+    let waits = rig.packs.store_waits();
+    assert_eq!(waits.waits(Op::Put).count(), 18);
+    assert_eq!(waits.waits(Op::Put).sum(), 119_500_000_000);
+    assert_eq!(waits.retries(Op::Put, Cause::ServerError), 18);
+    assert_eq!(waits.exhausted(Op::Put), 1);
+    assert_eq!(rig.packs.metrics().write_failures.get(), 1);
+    assert!(rig.store.keys().await.is_empty());
+    assert!(rig.index.has_none(&digests(&blobs)));
 }
 
 /// Asserts that an index that cannot record the pack fails the upload: the items are

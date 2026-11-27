@@ -385,7 +385,7 @@ impl RawByteStream {
             return answered.map_err(|unanswered| unanswered.status);
         }
         if let Some(packs) = &self.packs {
-            // Within the call's deadline: a read waits out a store that answers 503.
+            // Within the call's deadline: a read is retried while the store fails in a way that may pass.
             let read = packed::read_stream(packs, &name, &resource.digest, &request);
             let answered =
                 deadline::within_read(deadline::of_headers(&parts.headers), read).await?;

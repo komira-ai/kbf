@@ -352,11 +352,12 @@ async fn a_write_that_breaks_the_rules_is_refused_and_packs_nothing() {
     assert_eq!(rig.packs.metrics().write_failures.get(), 0);
 }
 
-/// Asserts that a pack the store refuses fails the Write UNAVAILABLE and records nothing, and
-/// that the same Write is acknowledged once the store takes writes.
+/// Asserts that a pack the store refuses (its calls not retried here: a budget of zero) fails the
+/// Write UNAVAILABLE and records nothing, and that the same Write is acknowledged once the store
+/// takes writes.
 #[tokio::test]
 async fn a_write_whose_pack_cannot_be_stored_is_unavailable() {
-    let (rig, _fake) = rig_over_fake(PackSettings::default()).await;
+    let (rig, _fake) = rig_over_fake(crate::multi::unretried()).await;
     let (digest, bytes) = blob("will be stored later");
     rig.store.reject_puts(10);
 
