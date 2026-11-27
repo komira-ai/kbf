@@ -12,3 +12,7 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.buildrules]
+# Policy only: `actions = { name = ["lint", "test"] }`, `default-action`, `[package.metadata.buildrules.lint]`.
+# Absent keys inherit [workspace.metadata.buildrules]. See docs/contract.md.

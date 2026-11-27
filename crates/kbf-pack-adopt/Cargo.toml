@@ -49,3 +49,12 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true
+
+[package.metadata.buildrules]
+# The farm lane's `//:ci` (docs/farm.md) checks the format of, builds and lints this package but
+# does not run its tests: they need a Postgres server with synchronous_commit on, which the state
+# store requires, and buildrules' Postgres runs with it off (komira-ai/buildrules#166). They run in
+# ci.yml alone.
+
+[package.metadata.buildrules.actions]
+ci = ["fmt", "lint"]

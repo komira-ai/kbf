@@ -42,6 +42,14 @@ stages:
     after: []
     result: suite green
     events: [push, workflow_call]
+  # farm.yml, the farm lane, started by a pull request and by a push to main: `buck2 build //:ci`
+  # of the Cargo workspace on the build farm. Advisory beside ci.yml, which stays the gate, and no
+  # stage waits for it. It never runs in the merge queue.
+  - name: farm
+    runs: actions
+    after: []
+    result: farm build green
+    events: [pull_request, push]
   # artifacts.yml builds, tests and (on a push to main, called by the pipeline) attests the files
   # every later stage uses. It also runs for pull requests and the merge queue, which attest
   # nothing.
@@ -156,6 +164,12 @@ jobs:
   # may.
   - job: macos-farm.yml#macos-farm
     stage: suite
+    signing: true
+  # Joins the farm's Tailscale network with the run's OIDC token (on a pull request too, under the
+  # exact `if:` the workflow lint of farm.yml holds it to) and signs nothing: the row is
+  # `signing: true` because the job holds `id-token: write`, which only a signing row may.
+  - job: farm.yml#build
+    stage: farm
     signing: true
   - job: release.yml#plan
     stage: prod

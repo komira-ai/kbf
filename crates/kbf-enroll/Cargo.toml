@@ -44,3 +44,11 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "syn
 
 [lints]
 workspace = true
+
+[package.metadata.buildrules]
+# The farm lane's `//:ci` (docs/farm.md) checks the format of, builds and lints this package but
+# does not run its tests: a config test expects /proc/self to be a symlink root owns, which it is
+# not inside a farm action. They run in ci.yml alone.
+
+[package.metadata.buildrules.actions]
+ci = ["fmt", "lint"]

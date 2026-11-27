@@ -1,0 +1,13 @@
+load("//:buildrules.bzl", "cargo_package")
+
+# What this package reads beyond what buildrules gives each of its units (a library src/ and
+# build.rs, a test target tests/), which a Buck2 action sees only when declared: its library
+# includes kbf-coordinator's service tables and the host agent's unit file.
+cargo_package(
+    path = ".",
+    extra_srcs = [
+        "//crates/kbf-coordinator:src/kbf.services.toml",
+        "//crates/kbf-coordinator:src/tierstore.services.toml",
+        "//:packaging/host-agent/linux/kbf-host-local.service",
+    ],
+)

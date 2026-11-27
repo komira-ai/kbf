@@ -34,3 +34,11 @@ x509-parser = { workspace = true, features = ["verify"] }
 
 [lints]
 workspace = true
+
+[package.metadata.buildrules]
+# The farm lane's `//:ci` (docs/farm.md) checks the format of, builds and lints this package but
+# does not run its tests: they bind Unix sockets below the test's temporary directory, and on the
+# farm those paths are longer than a Unix socket's path may be. They run in ci.yml alone.
+
+[package.metadata.buildrules.actions]
+ci = ["fmt", "lint"]

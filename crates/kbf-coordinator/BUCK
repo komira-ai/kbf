@@ -1,0 +1,25 @@
+load("//:buildrules.bzl", "cargo_package")
+
+# What this package reads beyond what buildrules gives each of its units (a library src/ and
+# build.rs, a test target tests/), which a Buck2 action sees only when declared: its library
+# includes docs/deploy/kbf-updater.md.
+cargo_package(
+    path = ".",
+    extra_srcs = [
+        "//:docs/deploy/kbf-updater.md",
+    ],
+)
+
+# Read by other members (their extra_srcs); exported by reference, so each stays at its path.
+export_file(
+    name = "src/kbf.services.toml",
+    src = "src/kbf.services.toml",
+    mode = "reference",
+    visibility = ["PUBLIC"],
+)
+export_file(
+    name = "src/tierstore.services.toml",
+    src = "src/tierstore.services.toml",
+    mode = "reference",
+    visibility = ["PUBLIC"],
+)

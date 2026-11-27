@@ -1,0 +1,6 @@
+# Written by `buildrules init`. One call: the pinned toolchains (everything by sha256).
+load("@buildrules//rules/rust:toolchain.bzl", "rust_toolchains")
+load(":rust_pins.bzl", "EXTRA_RUST_VERSIONS")
+
+# Every Rust version buildrules pins, plus the ones buildrules-pins.toml adds (rust_pins.bzl, written by `buildrules sync`).
+rust_toolchains(extra = EXTRA_RUST_VERSIONS)

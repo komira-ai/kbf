@@ -54,3 +54,12 @@ xtask.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.buildrules]
+# The farm lane's `//:ci` (docs/farm.md) checks the format of, builds and lints this package but
+# does not run its tests: the binary's tests start it against the host's trusted root certificates,
+# which a farm action has none of, and tests/container_unit.rs reads the container's unit file and
+# Dockerfile from the repository's packaging. They run in ci.yml alone.
+
+[package.metadata.buildrules.actions]
+ci = ["fmt", "lint"]

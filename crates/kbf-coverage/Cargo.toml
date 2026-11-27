@@ -13,3 +13,11 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.buildrules]
+# The farm lane's `//:ci` (docs/farm.md) checks the format of, builds and lints this package but
+# does not run its tests: its command-line tests run git and read the repository's coverage-floors,
+# and a farm action has neither git nor the repository. They run in ci.yml alone.
+
+[package.metadata.buildrules.actions]
+ci = ["fmt", "lint"]

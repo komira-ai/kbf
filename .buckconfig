@@ -1,0 +1,49 @@
+# Written by `buildrules init`. buildrules is the cell `buildrules`; the cell name is
+# part of every output path, so it is not renamed. Where actions run is NOT here: a
+# remote-execution endpoint lives in .buckconfig.local (gitignored); see
+# .buckconfig.local.example.
+
+[cells]
+  kbf = .
+  prelude = prelude
+  toolchains = toolchains
+  none = none
+  # A git external cell needs no directory; nothing is checked out at this path.
+  buildrules = buildrules-ext
+
+[cell_aliases]
+  config = prelude
+  ovr_config = prelude
+  fbcode = none
+  fbsource = none
+  fbcode_macros = none
+  buck = none
+
+[external_cells]
+  prelude = bundled
+  buildrules = git
+
+[external_cell_buildrules]
+  git_origin = https://github.com/komira-ai/buildrules
+  commit_hash = f8a85377a9d390417d1f873ec954fbda7ca5fa85
+
+[buildfile]
+  name = BUCK
+
+[parser]
+  target_platform_detector_spec = target:kbf//...->buildrules//platforms:linux_x86_64 target:toolchains//...->buildrules//platforms:linux_x86_64 target:buildrules//...->buildrules//platforms:linux_x86_64
+
+[build]
+  execution_platforms = kbf//platforms:exec
+
+[buck2]
+  materializations = deferred
+  sqlite_materializer_state = true
+  defer_write_actions = true
+
+[http]
+  connect_timeout_ms = 30000
+  read_timeout_ms = 120000
+
+[project]
+  ignore = buck-out, .git
