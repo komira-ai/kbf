@@ -16,6 +16,15 @@ use super::*;
 use crate::executor::outcome::RESUBMITS;
 use crate::executor::tests::{Caller, Rig};
 
+/// The rig's poll, the executor's default.
+const POLL: Duration = Duration::from_millis(250);
+
+/// The wait before a first rerun at [`POLL`], without jitter.
+const FIRST_WAIT: Duration = Duration::from_secs(2);
+
+/// The longest wait at [`POLL`], without jitter.
+const WAIT_CAP: Duration = Duration::from_secs(20);
+
 /// How far the clock moves between two looks at the fake: finer than any wait asserted.
 const STEP: Duration = Duration::from_millis(10);
 
@@ -48,7 +57,7 @@ fn millis(wait: Duration) -> u64 {
 /// one after, held at [`WAIT_CAP`] from the fifth on and however many reruns came before.
 #[test]
 fn the_wait_doubles_from_the_first_up_to_the_cap() {
-    let waits: Vec<Duration> = (0..7).map(|reruns| wait(reruns, 0.0)).collect();
+    let waits: Vec<Duration> = (0..7).map(|reruns| wait(POLL, reruns, 0.0)).collect();
     let secs = Duration::from_secs;
     assert_eq!(
         waits,
@@ -62,9 +71,24 @@ fn the_wait_doubles_from_the_first_up_to_the_cap() {
             secs(20)
         ]
     );
-    assert_eq!(wait(31, 0.0), WAIT_CAP);
-    assert_eq!(wait(32, 0.0), WAIT_CAP);
-    assert_eq!(wait(u32::MAX, 0.0), WAIT_CAP);
+    assert_eq!(wait(POLL, 31, 0.0), WAIT_CAP);
+    assert_eq!(wait(POLL, 32, 0.0), WAIT_CAP);
+    assert_eq!(wait(POLL, u32::MAX, 0.0), WAIT_CAP);
+}
+
+/// Asserts the waits are counted in polls: at a poll of 5 ms the first is 40 ms and the cap
+/// 400 ms; and a poll so long its waits do not fit a `Duration` gives the longest one, and no
+/// deadline is met by it.
+#[test]
+fn the_waits_are_counted_in_polls() {
+    let fast = Duration::from_millis(5);
+    assert_eq!(wait(fast, 0, 0.0), Duration::from_millis(40));
+    assert_eq!(wait(fast, 1, 0.0), Duration::from_millis(80));
+    assert_eq!(wait(fast, 9, 0.0), Duration::from_millis(400));
+    assert_eq!(wait(Duration::MAX, 0, 0.5), Duration::MAX);
+    let now = Instant::now();
+    let far = now + Duration::from_secs(3600);
+    assert_eq!(before((Duration::MAX, 0, 0.0), now, far), None);
 }
 
 /// Asserts the jitter: a unit of `u` lengthens a wait by `u / 2` of it, so a wait is never
@@ -72,16 +96,16 @@ fn the_wait_doubles_from_the_first_up_to_the_cap() {
 /// `[0, 1)` (1, a negative, NaN, infinity) is read as 0 and gives the base.
 #[test]
 fn the_jitter_lengthens_a_wait_by_up_to_half() {
-    assert_eq!(wait(0, 0.5), Duration::from_millis(2500));
-    assert_eq!(wait(1, 0.25), Duration::from_millis(4500));
-    assert_eq!(wait(9, 0.5), Duration::from_secs(25));
-    let almost = wait(0, 0.999_999);
+    assert_eq!(wait(POLL, 0, 0.5), Duration::from_millis(2500));
+    assert_eq!(wait(POLL, 1, 0.25), Duration::from_millis(4500));
+    assert_eq!(wait(POLL, 9, 0.5), Duration::from_secs(25));
+    let almost = wait(POLL, 0, 0.999_999);
     assert!(
         almost >= FIRST_WAIT && almost < FIRST_WAIT.mul_f64(1.5),
         "{almost:?}"
     );
     for unit in [1.0, -0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        assert_eq!(wait(0, unit), FIRST_WAIT, "{unit}");
+        assert_eq!(wait(POLL, 0, unit), FIRST_WAIT, "{unit}");
     }
 }
 
@@ -90,12 +114,12 @@ fn the_jitter_lengthens_a_wait_by_up_to_half() {
 #[test]
 fn a_wait_that_would_end_at_or_after_the_deadline_is_not_given() {
     let now = Instant::now();
-    let first = wait(0, 0.0);
+    let first = wait(POLL, 0, 0.0);
     let just_after = now + first + Duration::from_millis(1);
-    assert_eq!(before(0, 0.0, now, just_after), Some(first));
-    assert_eq!(before(0, 0.0, now, now + first), None);
-    assert_eq!(before(0, 0.0, now, now), None);
-    assert_eq!(before(1, 0.0, now, now + first + first), None);
+    assert_eq!(before((POLL, 0, 0.0), now, just_after), Some(first));
+    assert_eq!(before((POLL, 0, 0.0), now, now + first), None);
+    assert_eq!(before((POLL, 0, 0.0), now, now), None);
+    assert_eq!(before((POLL, 1, 0.0), now, now + first + first), None);
 }
 
 /// Asserts the message of a run the deadline left no rerun after: the run's own message, then

@@ -50,7 +50,8 @@ sequenceDiagram
   then, while the job is queued, placed or starting, after 10 ms, doubling up to `--executor-poll-ms` (250 ms by default), so a
   job that starts at once is not seen a poll late; once it runs, every `--executor-poll-ms` until it ends, then reads its
   result once. A job read running is read at the poll from then on. While the service is busy or cannot be reached (no answer
-  within the call timeout, a reset connection, `RESOURCE_EXHAUSTED` and the other codes of its load), every operation waits
+  within the call timeout, a reset connection, `RESOURCE_EXHAUSTED` and the other codes of its load, or `UNAUTHENTICATED`,
+  `PERMISSION_DENIED` and `UNIMPLEMENTED`, a service that will not serve this frontend now), every operation waits
   longer between its calls, from the poll doubling to 40 polls (10 s at the default), one level for the whole frontend; no
   busy answer ends a run or spends an attempt, and a submit it did not take is sent again under the same id
   (`executor/busy.rs`).
@@ -60,7 +61,7 @@ sequenceDiagram
 `executor/outcome.rs` keeps the table of how a job ends. A clean result (succeeded, exit 0) is ingested and answers the callers.
 An ending of the farm's (the host lost, the job unknown to the service, failed at its start, the task tool failing, a pack the
 ingest refuses, killed at its memory limit) runs the operation again as its next attempt, a new job and a new key, at most
-**2** times (`RESUBMITS`), each after a wait that grows from 2 s, doubling, at most 20 s, jittered up by up to half,
+**2** times (`RESUBMITS`), each after a wait that grows from 8 polls (2 s at the default), doubling, at most 80 polls, jittered up by up to half,
 and ends before the action's deadline (`executor/rerun.rs`); then the callers are answered `UNAVAILABLE` (or, for memory, `FAILED_PRECONDITION` with
 `ACTION_OUT_OF_MEMORY`). The action's own timeout is `DEADLINE_EXCEEDED`, and an action that cannot run here
 `INVALID_ARGUMENT`, at once (a Mac action on an executor with no Macs is one). A start its host would not make now (`no-capacity`, the agent's or the job service's own, `host-held` while the host is drained for

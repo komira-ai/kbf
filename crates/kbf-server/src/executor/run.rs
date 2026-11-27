@@ -341,8 +341,9 @@ pub(crate) async fn run(
                 let spent = attempt.saturating_sub(free_runs + refusals.placed_again());
                 let again = free || (settled.retried() && spent < RESUBMITS);
                 let deadline = op.created + timeout;
+                let draw = (inner.cfg.poll, reruns, (inner.unit)());
                 let wait = again
-                    .then(|| rerun::before(reruns, (inner.unit)(), Instant::now(), deadline))
+                    .then(|| rerun::before(draw, Instant::now(), deadline))
                     .flatten();
                 if let Some(wait) = wait {
                     (free_runs, reruns) = (free_runs + u32::from(free), reruns + 1);

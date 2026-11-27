@@ -249,18 +249,22 @@ Each attempt of an operation is one job, whose id is made from the frontend id, 
 the attempt (`k<8 hex digits of the sha256 of the frontend id>-<operation>-<attempt>`): a submit sent again after its
 answer was lost, and a frontend that takes the operation up, name the job already made, so no
 action is submitted twice. A job service that is busy or cannot be reached (no answer within the
-call timeout, a broken or reset connection, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`) never fails an
-action and spends no attempt: a submit it did not take is sent again, the same spec under the same
+call timeout, a broken or reset connection, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`), or that will not
+serve this frontend now (`UNAUTHENTICATED`, `PERMISSION_DENIED`, `UNIMPLEMENTED`: a revoked token,
+another revision behind the address), never fails an action and spends no attempt: a submit it did not take is sent again, the same spec under the same
 id, until it takes it or the caller cancels, and the reads of a job are repeated. While it stays
 busy every operation of the frontend waits longer between its calls, from the poll doubling to
 40 polls (10 s at the default `--executor-poll-ms`), so a stalled service is not sent a call per
 operation per poll; the frontend logs once when the service turns busy and once when it answers
-again. `CancelOperation` is a cancel of the job, sent again until the service answers it. How a job ends is mapped to
+again. A token the job service no longer accepts so holds the frontend's Executes waiting, not
+failing, until it is fixed: `/readyz` reports the frontend unready meanwhile, and a caller's
+cancel or its own deadline ends an Execute. `CancelOperation` is a cancel of the job, sent again until the service answers it. How a job ends is mapped to
 failure classes as the table in `crates/kbf-server/src/executor/outcome.rs` says: a job
 stopped at its wall limit is the action's own timeout, answered `DEADLINE_EXCEEDED` at once; one
 killed for memory, a lost job (the host's fault) and any other ending of the farm's are submitted again as
-the next attempt, a new job and a new key, at most 2 times, each after a wait (2 s before the first,
-doubling, at most 20 s, each lengthened by up to half again by jitter) that must end before the
+the next attempt, a new job and a new key, at most 2 times, each after a wait (8 polls before the first,
+doubling, at most 80 polls: 2 s and 20 s at the default `--executor-poll-ms`; each lengthened by
+up to half again by jitter) that must end before the
 action's deadline, after which the callers are answered
 `UNAVAILABLE` (`FAILED_PRECONDITION` with reason `ACTION_OUT_OF_MEMORY` for memory). A job its
 host would not start now (no room, `no-capacity`, the agent's or the job service's own, its queue
