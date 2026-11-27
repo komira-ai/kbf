@@ -643,21 +643,18 @@ async fn a_cancel_on_a_busy_service_is_sent_again_until_it_is_answered() {
     assert_eq!(rig.calls_of("CancelJob"), 7, "none after the answer");
 }
 
-/// Catches a cancel sent for ever when the service answers it with an error that is neither an
-/// answer about the job nor the service's load: a cancel refused `DATA_LOSS` is sent three times
-/// in all, and the callers are answered CANCELLED.
+/// Catches a cancel sent for ever when the service's answer to it is neither an answer about the
+/// job nor the service's load: a cancel answered with a body that cannot be decoded is sent three
+/// times in all, and the callers are answered CANCELLED.
 #[tokio::test(start_paused = true)]
-async fn a_cancel_the_service_refuses_is_sent_three_times() {
+async fn a_cancel_whose_answer_cannot_be_read_is_sent_three_times() {
     let rig = Rig::start().await;
     let caller = rig.submit(1);
     rig.submitted(&caller, 0).await;
     for _ in 0..5 {
         rig.fake.inject_on(
             "CancelJob",
-            Fault::Status {
-                code: Code::DataLoss,
-                message: "no".to_owned(),
-            },
+            Fault::Answer(bytes::Bytes::from_static(b"\xff\xff")),
         );
     }
     assert!(rig.exec.cancel(&caller.name));
