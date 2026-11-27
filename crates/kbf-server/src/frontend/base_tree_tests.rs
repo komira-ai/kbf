@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_front::action_tree::BaseTree;
+use kbf_front::start_retry::StartRetry;
 use kbf_front::{PackSettings, Packs};
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectKey, ObjectStore as _, PageSize};
 use kbf_pack::{PackKeys, WriterKind};
@@ -17,6 +18,7 @@ use kbf_tree_bundle::{Dir, Facts, Node, Writer, file_name};
 use sha2::{Digest as _, Sha256};
 
 use super::Start;
+use crate::frontend::start_wait::tests::{Busy, on_clock, service};
 use crate::job_tree;
 use crate::job_tree::tests::Refusing;
 use crate::serve::ServeError;
@@ -135,7 +137,13 @@ fn start(dir: &Path, packs: Packs, state: Option<Arc<dyn Store>>) -> Start {
         slot: Arc::new(std::sync::OnceLock::new()),
         list: false,
         republish: Arc::default(),
+        retry: retry(),
     }
+}
+
+/// The retry of a frontend's start: the stores of these tests answer nothing it retries.
+fn retry() -> StartRetry {
+    StartRetry::new(Duration::from_secs(120))
 }
 
 fn key_of(hex: &str) -> ObjectKey {
@@ -430,7 +438,7 @@ fn a_start_downloads_under_the_executors_instance_id() {
     let mut config = crate::executor::Config::new("front-1");
     config.instance = "fe-a".to_owned();
 
-    let start = Start::new(&js_flags(config), packs().0, None);
+    let start = Start::new(&js_flags(config), packs().0, None, retry());
 
     assert_eq!(start.cache.instance, "fe-a");
 }
@@ -454,9 +462,9 @@ fn a_start_lists_the_base_only_for_tree_lists() {
         roots: None,
     });
 
-    assert!(!Start::new(&js_flags(manifests), packs().0, None).list);
-    assert!(Start::new(&js_flags(provider), packs().0, None).list);
-    assert!(Start::new(&js_flags(macs), packs().0, None).list);
+    assert!(!Start::new(&js_flags(manifests), packs().0, None, retry()).list);
+    assert!(Start::new(&js_flags(provider), packs().0, None, retry()).list);
+    assert!(Start::new(&js_flags(macs), packs().0, None, retry()).list);
 }
 
 /// Asserts that a start told to list publishes a listed base into the slot, and one not told
@@ -479,6 +487,93 @@ async fn a_start_told_to_list_publishes_a_listed_base() {
         assert_eq!(published.base.is_listed(), list);
         assert_eq!(slot.get().map(BaseTree::is_listed), Some(list));
     }
+}
+
+/// Asserts that a start whose pack store answers 503 `SlowDown` to three writes of the base
+/// tree publishes it: each write is made again after waits of 0.5, 1 and 2 s, every object is
+/// written and the tree recorded. Catches: the start that ended at one `SlowDown` of a store
+/// that was restarting, and so rolled the frontend's update back.
+#[tokio::test]
+async fn a_start_answered_slow_down_three_times_publishes_the_tree() {
+    let dir = scratch_dir("base-tree-slow-down");
+    let bundled = bundle_dir(&dir, COMMIT, &["linux-x86_64"]);
+    let slow_down = || service(503, "SlowDown", "busy");
+    let objects = Busy::new([slow_down(), slow_down(), slow_down()], None);
+    let store = state();
+    let (retry, clock) = on_clock(120);
+    let mut ready = start(&dir, objects.packs(), Some(store.clone()));
+    ready.retry = retry;
+
+    let published = ready.publish_as(COMMIT, now).await.expect("published");
+
+    assert_eq!(published.written, bundled.objects.len() as u64);
+    assert_eq!(clock.waits(), [0.5, 1.0, 2.0].map(Duration::from_secs_f64));
+    assert_eq!(objects.writes(), bundled.objects.len() + 3);
+    let row = store.get(&format!("{}{}", job_tree::PREFIX, bundled.root));
+    assert!(row.expect("a read").is_some());
+}
+
+/// Asserts that a start whose pack store answers 503 `SlowDown` for ever fails when the bound
+/// of 30 s has passed, with exit 1 and a line that names the flag, the key, the store's last
+/// answer, the attempts and the 30 s; nothing is recorded. Catches: a start held for ever by a
+/// store that stays down, and a give-up that does not say how long it tried.
+#[tokio::test]
+async fn a_start_answered_slow_down_for_ever_fails_at_the_bound() {
+    let dir = scratch_dir("base-tree-slow-down-for-ever");
+    let bundled = bundle_dir(&dir, COMMIT, &["linux-x86_64"]);
+    let objects = Busy::new([], Some(service(503, "SlowDown", "busy")));
+    let store = state();
+    let (retry, clock) = on_clock(30);
+    let mut ready = start(&dir, objects.packs(), Some(store.clone()));
+    ready.retry = retry;
+
+    let error = ready.publish_as(COMMIT, now).await.expect_err("given up");
+
+    assert!(matches!(error, ServeError::StartWait { .. }), "{error}");
+    let first = &bundled.objects[0];
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "--executor-base-tree: cas/l/{first}: the store failed the write: store answered 503 \
+             SlowDown: busy (still failing after 7 attempts over 30.0 s); gave up at \
+             --pack-store-start-wait-secs=30"
+        )
+    );
+    let waits = [0.5, 1.0, 2.0, 4.0, 8.0, 8.0, 6.5].map(Duration::from_secs_f64);
+    assert_eq!(clock.waits(), waits);
+    assert!(
+        store
+            .scan_prefix(job_tree::PREFIX)
+            .expect("a scan")
+            .is_empty()
+    );
+}
+
+/// Asserts that a start whose pack store answers a write of the base tree 403 fails at once, as
+/// before the retry: no wait, one write, the line naming the flag, the key and the answer.
+/// Catches: a refusal retried for the whole bound, which holds a start that cannot succeed.
+#[tokio::test]
+async fn a_start_answered_403_fails_at_once() {
+    let dir = scratch_dir("base-tree-denied");
+    let bundled = bundle_dir(&dir, COMMIT, &["linux-x86_64"]);
+    let objects = Busy::new([service(403, "AccessDenied", "no")], None);
+    let (retry, clock) = on_clock(120);
+    let mut ready = start(&dir, objects.packs(), None);
+    ready.retry = retry;
+
+    let error = ready.publish_as(COMMIT, now).await.expect_err("refused");
+
+    let first = &bundled.objects[0];
+    assert!(matches!(error, ServeError::BaseTree(_)), "{error}");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "--executor-base-tree: cas/l/{first}: the store failed the write: store answered 403 \
+             AccessDenied: no"
+        )
+    );
+    assert!(clock.waits().is_empty(), "{:?}", clock.waits());
+    assert_eq!(objects.writes(), 1);
 }
 
 fn js_flags(config: crate::executor::Config) -> super::super::JsAgentFlags {

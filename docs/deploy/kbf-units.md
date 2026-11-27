@@ -213,6 +213,25 @@ database cannot be reached, which `Restart=on-failure` starts again. The fronten
 container beside the unit, see
 [single-host.md](single-host.md#waiting-for-postgres).
 
+**A pack store that is busy or restarting.** Before it serves, a frontend with
+`--pack-store-endpoint` checks that the store refuses to replace an object, and with `--executor
+js-agent` writes the kbf base tree to it (a length check and a create-only write per object). A
+store that is being restarted, often at the same moment as the frontend, answers those calls
+503 `SlowDown` or refuses the connection for a while. Each of those calls is made again on a 503,
+a 500, 502 or 504, a 400 `RequestTimeout`, a refused or reset connection or a request that timed
+out, after jittered waits from about 0.5 s doubling to 8 s, for `--pack-store-start-wait-secs`
+(default 120, from the call's first attempt; the `pack-store-start-wait-secs` key of
+`[packs]`). Each retry is logged as a warning with the call, the attempt, the wait and the answer,
+and a call that succeeds after retries is logged with how long it took. Any other answer (a 403, a
+body that failed its digest check, an object of another length) is not retried and exits 2 at
+once. A call still failing at the bound exits **1**, with a line that says the store's last answer,
+the attempts and the seconds they took, so `Restart=on-failure` starts the frontend again.
+`--pack-store-start-wait-secs=0` retries nothing and exits 2, as before the flag. As during the
+state store's wait, the listeners are bound and answer nothing: `/readyz` is not ready until the
+calls are done. A start that waits out both a state store that is not up and a pack store that
+keeps failing can pass the unit's `TimeoutStartSec=420`; with either wait raised, raise it in a
+drop-in.
+
 The unit gives no `--handover-socket` (nor a `RuntimeDirectory=` for one): `kbf frontend` has
 no handover any more, and the flag, like `--instance`, is accepted and ignored with a
 warning. The proxy of `docs/design/frontend-proxy.md` swaps nothing in its place: it balances

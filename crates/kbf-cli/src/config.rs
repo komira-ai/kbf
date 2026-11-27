@@ -230,6 +230,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "pack-store-credentials-file",
             "pack-store-endpoint",
             "pack-store-region",
+            "pack-store-start-wait-secs",
             "pack-store-writes",
             "pack-upload-idle-timeout",
             "pack-writer",
