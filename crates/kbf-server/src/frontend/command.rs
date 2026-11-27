@@ -7,7 +7,7 @@ use clap::{Arg, Command};
 
 use super::{
     ALLOWED, RetiredHandoverFlags, SECRETS_DIR, TLS, drain_flags, executor_flags, handoff, janitor,
-    job_read, list_sweep, pack_flags, state_wait, task_flags,
+    job_read, list_sweep, pack_flags, start_wait, state_wait, task_flags,
 };
 
 /// The command line of `kbf frontend`: [`Args`]'s, those it takes shown and the rest
@@ -76,6 +76,7 @@ pub fn command() -> Command {
     .args(drain_flags::args())
     .args(state_wait::args())
     .args(pack_flags::args())
+    .args(start_wait::args())
     .args(job_read::args())
     .args(task_flags::args())
     .args(janitor::args())

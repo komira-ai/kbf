@@ -317,11 +317,14 @@ async fn a_frontend_exports_the_fronts_metrics_and_none_of_the_removed_scheduler
 }
 
 /// Asserts that a frontend whose pack store cannot be written to does not serve: the start check
-/// fails and `serve` says so naming the flag.
+/// fails and `serve` says so naming the flag. The bound of the start's retries is 0, so the
+/// refused connection is the check's answer at once (`start_wait_tests` has the retries).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pack_store_that_cannot_be_written_fails_the_start_check() {
     let dir = scratch_dir("pack-unreachable");
-    let flags = flags_of(&pack_flags("http://127.0.0.1:1", dir.path()));
+    let mut more = pack_flags("http://127.0.0.1:1", dir.path());
+    more.push("--pack-store-start-wait-secs=0".to_owned());
+    let flags = flags_of(&more);
     let handle = started(&flags, Some(index())).expect("binds");
 
     let failed = handle.serve().await;

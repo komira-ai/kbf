@@ -175,6 +175,13 @@ pub enum ServeError {
     /// The kbf base tree of this release could not be published at the start.
     #[error("--executor-base-tree: {0}")]
     BaseTree(String),
+    /// A call of the start to the pack store still failing at `--pack-store-start-wait-secs`.
+    #[error("{flag}: {why}; gave up at --pack-store-start-wait-secs={secs}")]
+    StartWait {
+        flag: &'static str,
+        why: String,
+        secs: u64,
+    },
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves

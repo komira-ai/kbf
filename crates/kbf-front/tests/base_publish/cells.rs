@@ -42,9 +42,17 @@ async fn a_publish_given_sidecars_records_the_cells_of_every_object_once() {
     let store = Arc::new(Bucket::default());
     let (index, sidecars) = sidecars_over(&store);
 
-    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), true, Some(&sidecars))
-        .await
-        .expect("published");
+    let published = publish(
+        &dir,
+        COMMIT,
+        PLATFORM,
+        store.clone(),
+        true,
+        &retry(),
+        Some(&sidecars),
+    )
+    .await
+    .expect("published");
 
     assert_eq!(published.cells_recorded, release.objects.len());
     let keys: Vec<String> = release.objects.iter().map(|(hex, _)| key(hex)).collect();
@@ -53,9 +61,17 @@ async fn a_publish_given_sidecars_records_the_cells_of_every_object_once() {
         .collect();
     assert_eq!(index.object_cells(&keys).expect("cells"), expected);
 
-    let again = publish(&dir, COMMIT, PLATFORM, store.clone(), true, Some(&sidecars))
-        .await
-        .expect("published again");
+    let again = publish(
+        &dir,
+        COMMIT,
+        PLATFORM,
+        store.clone(),
+        true,
+        &retry(),
+        Some(&sidecars),
+    )
+    .await
+    .expect("published again");
 
     assert_eq!(again.cells_recorded, 0, "every object has its cells");
     assert_eq!(index.object_cells(&keys).expect("cells"), expected);
@@ -119,9 +135,17 @@ async fn an_index_that_fails_the_cells_never_fails_the_publish() {
     let store = Arc::new(Bucket::default());
     let sidecars = Sidecars::new(Arc::new(NoCells), store.clone());
 
-    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), true, Some(&sidecars))
-        .await
-        .expect("published");
+    let published = publish(
+        &dir,
+        COMMIT,
+        PLATFORM,
+        store.clone(),
+        true,
+        &retry(),
+        Some(&sidecars),
+    )
+    .await
+    .expect("published");
 
     assert_eq!(published.cells_recorded, 0);
     assert_eq!(published.written, release.objects.len() as u64);

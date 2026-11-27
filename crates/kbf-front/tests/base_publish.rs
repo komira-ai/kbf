@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -16,6 +17,7 @@ use futures::future::BoxFuture;
 use kbf_front::action_tree::{BaseFacts, BaseTree, BaseTreeError};
 use kbf_front::base_publish::{PublishError, SUMS, publish};
 use kbf_front::large_backfill::LargeStore;
+use kbf_front::start_retry::StartRetry;
 use kbf_objstore::{BodyStream, ObjectKey, ObjectStoreError};
 use kbf_testkit::dir::TestDir;
 use kbf_tree_bundle::{Built, Dir, Facts, Node, Writer, file_name};
@@ -23,6 +25,8 @@ use kbf_types::{Digest, DigestFunction};
 use sha2::{Digest as _, Sha256};
 use tierstore::{EntryKind, TreeDigest, flatten};
 
+#[path = "base_publish/busy.rs"]
+mod busy;
 #[path = "base_publish/cells.rs"]
 mod cells;
 
@@ -298,11 +302,16 @@ fn scratch(name: &str) -> TestDir {
     TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
+/// The start's retry of a frontend: the stores here answer nothing it retries.
+fn retry() -> StartRetry {
+    StartRetry::new(Duration::from_secs(120))
+}
+
 async fn run(
     dir: &Path,
     store: &Arc<Bucket>,
 ) -> Result<kbf_front::base_publish::Published, PublishError> {
-    publish(dir, COMMIT, PLATFORM, store.clone(), true, None).await
+    publish(dir, COMMIT, PLATFORM, store.clone(), true, &retry(), None).await
 }
 
 /// Asserts that a first publish writes every object of the bundle to `cas/l/<sha256>` with its
@@ -680,7 +689,7 @@ async fn an_empty_commit_is_refused() {
     install(&dir, &release);
     let store = Arc::new(Bucket::default());
 
-    let error = publish(&dir, "", PLATFORM, store.clone(), true, None)
+    let error = publish(&dir, "", PLATFORM, store.clone(), true, &retry(), None)
         .await
         .expect_err("refused");
 
@@ -943,7 +952,7 @@ async fn a_publish_not_asked_to_list_leaves_the_base_unlisted() {
     install(&dir, &release);
     let store = Arc::new(Bucket::default());
 
-    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), false, None)
+    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), false, &retry(), None)
         .await
         .expect("published");
 
@@ -965,9 +974,17 @@ async fn a_publish_not_asked_to_list_leaves_the_base_unlisted() {
     let bytes = writer.finish().expect("finished");
     install_as(&lacking, &file_name(COMMIT, PLATFORM), &bytes, &bytes);
     let other = Arc::new(Bucket::default());
-    let published = publish(&lacking, COMMIT, PLATFORM, other.clone(), false, None)
-        .await
-        .expect("published unlisted");
+    let published = publish(
+        &lacking,
+        COMMIT,
+        PLATFORM,
+        other.clone(),
+        false,
+        &retry(),
+        None,
+    )
+    .await
+    .expect("published unlisted");
     assert!(!published.base.is_listed());
     assert!(other.object(&release.built.root).is_some());
 }

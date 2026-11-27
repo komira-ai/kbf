@@ -12,7 +12,10 @@
 //! flag says.
 //!
 //! A failure at any step fails the start ([`ServeError::BaseTree`]), naming the flag and the
-//! cause. The [`Published`] tree is held by `FrontendHandle::serve` until it ends, and its base
+//! cause. A length check or a write the pack store answers with an error that says it is busy
+//! or restarting is made again first, up to `--pack-store-start-wait-secs`
+//! ([`super::start_wait`]); one still failing then fails the start with
+//! [`ServeError::StartWait`]. The [`Published`] tree is held by `FrontendHandle::serve` until it ends, and its base
 //! ([`BaseTree`]) is set in the slot the executor writes its action trees over
 //! (`--task-out-mode put-dir`) before the executor is started.
 //!
@@ -28,11 +31,13 @@ use std::time::SystemTime;
 use futures::FutureExt as _;
 use kbf_front::Packs;
 use kbf_front::action_tree::{BaseTree, Sidecars};
-use kbf_front::base_publish::{Published, publish};
+use kbf_front::base_publish::{PublishError, Published, publish};
+use kbf_front::start_retry::StartRetry;
 use kbf_state::Store;
 
 use super::JsAgentFlags;
 use super::base_fetch::Cache;
+use super::start_wait::gave_up_at;
 use crate::executor::{InputTree, Republish};
 use crate::job_tree::{self, Recorded};
 use crate::serve::ServeError;
@@ -50,12 +55,20 @@ pub(super) struct Start {
     list: bool,
     /// Where the publish again is set for the executor.
     republish: Arc<OnceLock<Republish>>,
+    /// How the length checks and writes the store answers "not now" are made again.
+    retry: StartRetry,
 }
 
 impl Start {
-    /// The publish `js` describes, into `packs`, with `state` for the record, setting the
-    /// published base in `js`'s slot for the executor ([`JsAgentFlags::published`]).
-    pub(super) fn new(js: &JsAgentFlags, packs: Packs, state: Option<Arc<dyn Store>>) -> Self {
+    /// The publish `js` describes, into `packs` with its calls made again as `retry` says, with
+    /// `state` for the record, setting the published base in `js`'s slot for the executor
+    /// ([`JsAgentFlags::published`]).
+    pub(super) fn new(
+        js: &JsAgentFlags,
+        packs: Packs,
+        state: Option<Arc<dyn Store>>,
+        retry: StartRetry,
+    ) -> Self {
         Self {
             cache: Cache {
                 dir: js.base_tree.clone(),
@@ -73,6 +86,7 @@ impl Start {
             // `--executor-input-tree` says, so a frontend with Macs lists its base too.
             list: js.config.input_tree == InputTree::Provider || js.config.mac.is_some(),
             republish: Arc::clone(&js.republish),
+            retry,
         }
     }
 
@@ -104,10 +118,14 @@ impl Start {
             &self.platform,
             store,
             self.list,
+            &self.retry,
             cells.as_ref(),
         )
-        .await
-        .map_err(|why| refused(&why))?;
+        .await;
+        let published = published.map_err(|why| match why {
+            PublishError::GaveUp(_) => gave_up_at("--executor-base-tree", &self.retry, &why),
+            why => refused(&why),
+        })?;
         let root = published.root.hash_hex();
         tracing::info!(
             root,
@@ -129,29 +147,52 @@ impl Start {
         }
         // A frontend publishes once; a slot set already holds the same release's base.
         let _ = self.slot.set(published.base.clone());
-        let again = again(self.cache, commit, self.platform, packs, self.list);
+        let again = again(
+            self.cache,
+            commit,
+            self.platform,
+            packs,
+            (self.list, self.retry),
+        );
         let _ = self.republish.set(again);
         Ok(published)
     }
 }
 
 /// The publish of the bundle of `commit` for `platform` into `packs` again, as [`Start`] made it
-/// the first time: the bundle from the cache, and each of its objects the store lacks written.
-/// Nothing is recorded: the tree is the one recorded the first time.
-fn again(cache: Cache, commit: &str, platform: String, packs: Arc<Packs>, list: bool) -> Republish {
+/// the first time (listed if `list` says so, its calls made again as `retry` says): the bundle
+/// from the cache, and each of its objects the store lacks written. Nothing is recorded: the
+/// tree is the one recorded the first time.
+fn again(
+    cache: Cache,
+    commit: &str,
+    platform: String,
+    packs: Arc<Packs>,
+    (list, retry): (bool, StartRetry),
+) -> Republish {
     let commit = commit.to_owned();
     Republish::new(move || {
-        let (cache, commit, platform, packs) = (
+        let (cache, commit, platform, packs, retry) = (
             cache.clone(),
             commit.clone(),
             platform.clone(),
             Arc::clone(&packs),
+            retry.clone(),
         );
         async move {
             let (dir, _) = (cache.ensure(&commit, &platform).await).map_err(|e| e.to_string())?;
             let cells = cells_of(&packs, list);
             let store: Arc<Packs> = packs;
-            let published = publish(&dir, &commit, &platform, store, list, cells.as_ref()).await;
+            let published = publish(
+                &dir,
+                &commit,
+                &platform,
+                store,
+                list,
+                &retry,
+                cells.as_ref(),
+            )
+            .await;
             let published = published.map_err(|e| e.to_string())?;
             tracing::warn!(
                 root = published.root.hash_hex(),
@@ -176,7 +217,8 @@ fn cells_of(packs: &Packs, list: bool) -> Option<Sidecars> {
 ///
 /// # Errors
 /// [`ServeError::BaseTree`]: the bundle cannot be used, the pack store refused a write, or the
-/// state store failed the record.
+/// state store failed the record; [`ServeError::StartWait`]: the pack store kept failing a
+/// length check or a write until `--pack-store-start-wait-secs` passed.
 pub(super) async fn publish_all(start: Option<Start>) -> Result<Option<Published>, ServeError> {
     match start {
         Some(start) => start.publish().await.map(Some),

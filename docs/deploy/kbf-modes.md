@@ -101,7 +101,10 @@ action again. With no pack flags the nodes check the entry alone, as before.
 the blobs read from packs on a local disk. A build's job commits its pack into its put directory
 and the frontend records it after re-hashing it; no other caller commits a pack. `--pack-commit-sample` is retired: accepted, ignored
 and warned about at start, for one release. At start the frontend checks that the store
-refuses to replace an object, and does not serve if it does not. `GET /metrics` gains the
+refuses to replace an object, and does not serve if it does not; a store that answers the check
+(or the writes of the kbf base tree) that it is busy or restarting is asked again for
+`--pack-store-start-wait-secs` (default 120; [kbf-units.md](kbf-units.md) says which answers, and
+the exit codes). `GET /metrics` gains the
 `kbf_pack_*` families. Left out, no object store is built or contacted and the frontend
 serves exactly as before.
 
