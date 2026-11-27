@@ -683,3 +683,7 @@ async fn a_download_its_client_drops_counts_client_cancel() {
 
     assert_eq!(counted(&closes, "Read").await, one(Cause::ClientCancel));
 }
+
+// The same keepalive under a WaitExecution stream, and the caller of its operation it holds.
+#[path = "serve_keepalive_wait_tests.rs"]
+mod wait;

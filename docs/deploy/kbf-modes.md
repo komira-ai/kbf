@@ -330,7 +330,8 @@ names an object with none recorded is stored without a sidecar and recorded unli
 
 **Over a state store.** With `--state-store` the executor keeps the rows `exec/op/<operation>` (owner,
 action, attempt, job id), `exec/act/` (the open operation of each action, so an Execute of an action
-another frontend runs follows it and submits no second job), `exec/live/<instance>` and `done/`, `doneof/` that
+another frontend runs follows it and submits no second job), `exec/watch/` (the callers an operation
+another frontend runs has here, below), `exec/live/<instance>` and `done/`, `doneof/` that
 [direct-js.md](../design/direct-js.md) section 3 lists, and the operation ids come from the store's
 shared counter. Any frontend of the store answers `WaitExecution` and `GetOperation` of any operation by name,
 and a process whose liveness row has expired (`--executor-live-secs`, default 20 seconds after its
@@ -340,6 +341,22 @@ where it is. A job that commits into a put directory is finished from it; one th
 presigned url, which only the process that held the url can finish, is cancelled and run again.
 Clients reattach with `WaitExecution`. Without a `--state-store` a restart loses the open operations, and its
 clients' builds fail. Every frontend of a farm may run the executor.
+
+**An operation no client waits on is cancelled.** A client whose connection was cut (Buck2 among
+them) does not come back for its operation: it fails the action, and its next build runs it again.
+So an operation that no Execute or WaitExecution stream has waited on for
+`--executor-no-caller-grace-secs` (default 600) is cancelled as a `CancelOperation` would: its job is
+cancelled at the job service and the operation answered `CANCELLED`, with one log line and
+`kbf_executor_operations_cancelled_no_caller_total` counted. An Execute of the same action, or a
+`WaitExecution` or `GetOperation` of the operation, inside the grace joins it as before, and the
+grace starts again when the last caller leaves. A client that goes silent is taken for gone only once
+its connection is closed, after `--http2-keepalive-interval-secs` plus
+`--http2-keepalive-timeout-secs` (150 seconds by default), so the grace is set well above that. Over a
+state store a caller on another frontend counts: that frontend keeps an `exec/watch/` row of the
+operation alive while one of its streams waits on it. An operation taken up from a gone frontend
+has no caller until one comes back: its grace starts when it is taken up. A job that ends before
+the grace runs out is read and its result written to the action cache as always. `0` turns the
+cancel off; `kbf_executor_operations_no_caller` is how many operations are in their grace now.
 
 The executor prepares each job with the frontend's **task runs** (below), so
 `--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with

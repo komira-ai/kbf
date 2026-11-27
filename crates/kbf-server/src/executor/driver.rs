@@ -142,14 +142,17 @@ async fn keep(inner: &Arc<Inner>, sweep: bool) {
                 continue;
             }
         };
-        let cancel = {
+        let (cancel, callers) = {
             let mut ops = inner.ops();
             if ops.is_open(operation) {
                 continue;
             }
-            ops.open(operation, key.clone()).1
+            let cancel = ops.open(operation, key.clone()).1;
+            (cancel, ops.callers(operation))
         };
         inner.deps.metrics.reattached();
+        // No caller is on it yet: its grace starts now.
+        super::callers::spawn(inner, operation, key.clone(), callers);
         // Taken up from the state store: its runs read the Action and the Command from the CAS.
         let op = Op::new(
             operation,

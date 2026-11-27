@@ -202,7 +202,7 @@ async fn cancel_asked(cancel: &mut watch::Receiver<bool>) {
 }
 
 /// Runs `f` on the state store's rows off the runtime's threads: the store's calls block.
-async fn on_rows<T: Send + 'static>(
+pub(crate) async fn on_rows<T: Send + 'static>(
     inner: &Arc<Inner>,
     f: impl FnOnce(&Rows) -> T + Send + 'static,
 ) -> Option<T> {
@@ -753,8 +753,10 @@ async fn watch_job(
             Ended::Again(settled, Some(output))
         }
         Verdict::Ingest => {
-            let ingested = ingest_ended(inner, run, &op.key, (&read, &submitted.key), cancel);
-            let Some(ingested) = ingested.await else {
+            inner.ops().reading(op.id, true);
+            let ingested = ingest_ended(inner, run, &op.key, (&read, &submitted.key), cancel).await;
+            inner.ops().reading(op.id, false);
+            let Some(ingested) = ingested else {
                 return Ended::Cancelled;
             };
             timeline.stamp(Mark::Done, Instant::now(), metrics);
@@ -928,14 +930,16 @@ async fn follow_other(
 }
 
 /// Reads the state store every poll until it has `operation`'s answer, and shows it to the
-/// operation's followers. An operation whose row and answer are both gone is answered
+/// operation's followers, keeping their row alive for the process that runs it meanwhile. An operation whose row and answer are both gone is answered
 /// UNAVAILABLE: its answer is past its retention.
 async fn follow_task(inner: Arc<Inner>, operation: OperationId) {
+    let mut renewed = None;
     loop {
         sleep(inner.cfg.poll).await;
         if !inner.ops().is_followed(operation) {
             return;
         }
+        super::callers::follow_watched(&inner, operation, &mut renewed).await;
         let looked = on_rows(&inner, move |rows| rows.look(operation)).await;
         let unavailable = |message: &str| {
             Finished::Failed(rpc::Status {

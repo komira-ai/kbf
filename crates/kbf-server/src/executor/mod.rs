@@ -25,7 +25,9 @@
 //! written again with its sidecar, then the tree as manifests); anything else, and the last
 //! attempt, answers the operation's callers ([`outcome`]). A job that ended well has its pack
 //! read by the frontend ([`Ingest`]), which writes the action cache. `CancelOperation` cancels
-//! the job and answers the callers `CANCELLED` ([`kbf_front::Dispatch::cancel`]).
+//! the job and answers the callers `CANCELLED` ([`kbf_front::Dispatch::cancel`]); so does an
+//! operation no Execute or WaitExecution has waited on for `--executor-no-caller-grace-secs`
+//! ([`callers`]), a client whose connection was cut being one that never comes back.
 //!
 //! # Over a state store
 //!
@@ -34,7 +36,8 @@
 //! of the store answers `WaitExecution` and `GetOperation` of any operation from the rows, and a
 //! frontend takes up the unfinished operations of a process whose liveness row has expired,
 //! reading their jobs back where they are ([`Running`]). A restart is such a process: the new
-//! one takes up the old one's jobs. Nothing is cancelled when a frontend ends.
+//! one takes up the old one's jobs. Nothing is cancelled when a frontend ends; an operation taken
+//! up with no caller to come back for it is cancelled once its grace runs out ([`callers`]).
 //!
 //! The frontend builds one only for `--executor js-agent` (`frontend/executor_flags.rs`), over
 //! [`Front`], which implements the two seams ([`Ingest`], [`Inputs`]) with the
@@ -43,6 +46,7 @@
 
 mod api;
 mod busy;
+mod callers;
 mod config;
 mod driver;
 mod front;
@@ -83,7 +87,7 @@ use ops::{Joined, Ops};
 use rows::Rows;
 use run::{Op, Start};
 
-pub use config::{Config, ConfigError, FINISHED_RETENTION, InputTree, LIVE};
+pub use config::{Config, ConfigError, FINISHED_RETENTION, InputTree, LIVE, NO_CALLER_GRACE};
 pub use driver::Running;
 pub use front::{
     Front, FrontParts, MintedDir, PrepareError, PreparedPutDir, PutDirParts, Republish, RunPrepare,
@@ -329,6 +333,7 @@ impl Dispatch for Executor {
                 Some((arrival, presubmit)),
             );
             run::spawn(Arc::clone(&self.inner), op, Start::Fresh, cancel);
+            callers::spawn(&self.inner, operation, key.clone(), ops.callers(operation));
             break (name, stage);
         };
         Ok(Ticket {
