@@ -27,7 +27,7 @@ use std::time::SystemTime;
 
 use futures::FutureExt as _;
 use kbf_front::Packs;
-use kbf_front::action_tree::BaseTree;
+use kbf_front::action_tree::{BaseTree, Sidecars};
 use kbf_front::base_publish::{Published, publish};
 use kbf_state::Store;
 
@@ -97,14 +97,23 @@ impl Start {
             .map_err(|why| refused(&why))?;
         tracing::info!(dir = %dir.display(), ?origin, "the kbf base tree bundle is ready");
         let store: Arc<Packs> = Arc::clone(&packs);
-        let published = publish(&dir, commit, &self.platform, store, self.list)
-            .await
-            .map_err(|why| refused(&why))?;
+        let cells = cells_of(&packs, self.list);
+        let published = publish(
+            &dir,
+            commit,
+            &self.platform,
+            store,
+            self.list,
+            cells.as_ref(),
+        )
+        .await
+        .map_err(|why| refused(&why))?;
         let root = published.root.hash_hex();
         tracing::info!(
             root,
             written = published.written,
             held = published.held,
+            cells_recorded = published.cells_recorded,
             entries = published.facts.entries,
             depth = published.facts.depth,
             platform = self.platform,
@@ -140,8 +149,9 @@ fn again(cache: Cache, commit: &str, platform: String, packs: Arc<Packs>, list: 
         );
         async move {
             let (dir, _) = (cache.ensure(&commit, &platform).await).map_err(|e| e.to_string())?;
+            let cells = cells_of(&packs, list);
             let store: Arc<Packs> = packs;
-            let published = publish(&dir, &commit, &platform, store, list).await;
+            let published = publish(&dir, &commit, &platform, store, list, cells.as_ref()).await;
             let published = published.map_err(|e| e.to_string())?;
             tracing::warn!(
                 root = published.root.hash_hex(),
@@ -153,6 +163,12 @@ fn again(cache: Cache, commit: &str, platform: String, packs: Arc<Packs>, list: 
         }
         .boxed()
     })
+}
+
+/// What the cells of a base tree published over `packs` are recorded with: the packs' sidecars
+/// when the tree is listed (`list`), since only a tree list's sidecar is made from them.
+fn cells_of(packs: &Packs, list: bool) -> Option<Sidecars> {
+    list.then(|| packs.sidecars())
 }
 
 /// Publishes the base tree `start` describes, if the frontend has one to publish (it runs

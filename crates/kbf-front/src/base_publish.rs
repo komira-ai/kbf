@@ -32,6 +32,14 @@
 //!    manifests. A tree that cannot be listed is refused before its root is written. Not asked,
 //!    nothing is kept and the base tree is not listed.
 //!
+//! 6. **records the cells** of every object, when it is given [`Sidecars`] to (a frontend that
+//!    lists its base): the SHA-256 of each 1 MiB of the object, hashed on the reader's thread
+//!    from the bytes it read, which the L2 sidecar of a tree list naming the object is made from.
+//!    Once the root is checked, the cells of each object the pack index has none of are recorded
+//!    ([`Sidecars::record_missing`]): every tree list names the whole base tree, so a list's
+//!    sidecar is written at its write only once the base's cells are. A failure to record is
+//!    logged and never fails the publish (the sidecars' fill reads what is missing).
+//!
 //! A second release on the same pin writes only its `kbf-task`, its `.kbf-tools` manifest and
 //! its root: every other object costs one length check.
 //!
@@ -49,13 +57,14 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream;
 use kbf_objstore::ObjectStoreError;
+use kbf_pack_index::cells::ObjectCells;
 use kbf_tree_bundle::{BundleError, Facts, Item, ReadError, file_name};
 use kbf_types::{Digest, DigestFunction};
 use sha2::{Digest as _, Sha256};
 use tierstore::MAX_MANIFEST_BYTES;
 use tokio::sync::mpsc;
 
-use crate::action_tree::{BaseFacts, BaseTree, BaseTreeError};
+use crate::action_tree::{BaseFacts, BaseTree, BaseTreeError, Sidecars};
 use crate::large_backfill::{LargeStore, large_key};
 
 /// The release's sums file, in the directory of its bundles: `sha256sum`'s lines.
@@ -85,6 +94,9 @@ pub struct Published {
     pub written: u64,
     /// The objects the store held already (or whose key was taken while this call wrote).
     pub held: u64,
+    /// The objects whose cells this call recorded, as the pack index had none (0 when it was
+    /// given no [`Sidecars`], or the record failed).
+    pub cells_recorded: usize,
 }
 
 /// Why the base tree was not published. Each names what failed.
@@ -229,7 +241,8 @@ pub enum PublishError {
 }
 
 /// Publishes the kbf base tree of the release `commit` for `platform` (`linux-x86_64` or
-/// `linux-arm64`) from the bundle in `dir`, into `store`, and lists it if `list` says so.
+/// `linux-arm64`) from the bundle in `dir`, into `store`, lists it if `list` says so, and with
+/// `cells` records the cells of its objects there.
 ///
 /// # Errors
 /// A [`PublishError`], which names what failed: the commit is not known, the sums file or the
@@ -243,6 +256,7 @@ pub async fn publish(
     platform: &str,
     store: Arc<dyn LargeStore>,
     list: bool,
+    cells: Option<&Sidecars>,
 ) -> Result<Published, PublishError> {
     if commit.is_empty() {
         return Err(PublishError::NoCommit);
@@ -260,14 +274,23 @@ pub async fn publish(
     };
     let (send, receive) = mpsc::channel(CHANNEL);
     let reading = {
-        let bundle = bundle.clone();
-        blocking(move || hand_over(file, &bundle, &send))
+        let (bundle, hash) = (bundle.clone(), cells.is_some());
+        blocking(move || hand_over(file, &bundle, hash, &send))
     };
     let writing = write_all(receive, &*store, &bundle, (commit, platform), list);
     let (read, written) = futures::future::join(reading, writing).await;
     // A bundle that is not one is the cause of whatever the writer then found missing.
     read?;
-    written
+    let (mut published, held) = written?;
+    if let Some(sidecars) = cells {
+        match sidecars.record_missing(held).await {
+            Ok(recorded) => published.cells_recorded = recorded,
+            Err(error) => {
+                tracing::warn!(%error, "the cells of the base tree's objects were not recorded: the sidecars' fill reads them");
+            }
+        }
+    }
+    Ok(published)
 }
 
 /// The name of the bundle of `commit` for `platform` in a release's directory.
@@ -384,11 +407,27 @@ fn checked_file(bundle: &Path, sums: &Path, listed: &str) -> Result<File, Publis
     Ok(file)
 }
 
-/// Reads `file` (the bundle at `path`) and sends each item to `send`, until the bundle ends or
-/// the writer has gone (it stopped on an error of its own, which it reports).
-fn hand_over(file: File, path: &Path, send: &mpsc::Sender<Item>) -> Result<(), PublishError> {
+/// Reads `file` (the bundle at `path`) and sends each item to `send`, with the cells of each
+/// object's bytes if `hash` says so, until the bundle ends or the writer has gone (it stopped on
+/// an error of its own, which it reports).
+fn hand_over(
+    file: File,
+    path: &Path,
+    hash: bool,
+    send: &mpsc::Sender<(Item, Option<ObjectCells>)>,
+) -> Result<(), PublishError> {
     let read = kbf_tree_bundle::read(BufReader::new(file), |item| {
-        send.blocking_send(item).map_err(|_| ())
+        let cells = match &item {
+            Item::Object { bytes, .. } if hash => {
+                let cells = tierstore_list::PackCells::of(bytes);
+                Some(ObjectCells {
+                    size: cells.size,
+                    digests: cells.digests,
+                })
+            }
+            _ => None,
+        };
+        send.blocking_send((item, cells)).map_err(|_| ())
     });
     match read {
         Ok(()) | Err(ReadError::Stopped(())) => Ok(()),
@@ -400,15 +439,16 @@ fn hand_over(file: File, path: &Path, send: &mpsc::Sender<Item>) -> Result<(), P
 }
 
 /// Takes the facts and then the objects from `items`, checks the facts against `commit` and
-/// `platform` and writes the objects to `store`.
+/// `platform` and writes the objects to `store`; and the cells `items` came with, by each
+/// object's key.
 async fn write_all(
-    mut items: mpsc::Receiver<Item>,
+    mut items: mpsc::Receiver<(Item, Option<ObjectCells>)>,
     store: &dyn LargeStore,
     path: &Path,
     (commit, platform): (&str, &str),
     list: bool,
-) -> Result<Published, PublishError> {
-    let Some(Item::Facts(facts)) = items.recv().await else {
+) -> Result<(Published, BTreeMap<String, ObjectCells>), PublishError> {
+    let Some((Item::Facts(facts), _)) = items.recv().await else {
         return Err(PublishError::NoFacts {
             path: path.to_owned(),
         });
@@ -430,8 +470,12 @@ async fn write_all(
     let (mut written, mut held) = (0, 0);
     let mut root = None;
     let mut manifests: BTreeMap<String, Bytes> = BTreeMap::new();
-    while let Some(Item::Object { sha256, bytes }) = items.recv().await {
+    let mut held_cells = BTreeMap::new();
+    while let Some((Item::Object { sha256, bytes }, cells)) = items.recv().await {
         let digest = Digest::new(DigestFunction::Sha256, hash_of(&sha256), bytes.len() as u64);
+        if let Some(cells) = cells {
+            held_cells.insert(large_key(&digest).to_string(), cells);
+        }
         let bytes = Bytes::from(bytes);
         if list && bytes.len() <= MAX_MANIFEST_BYTES && bytes.starts_with(MANIFEST_HEAD) {
             manifests.insert(sha256.clone(), bytes.clone());
@@ -470,13 +514,15 @@ async fn write_all(
             root: facts.root,
         });
     };
-    Ok(Published {
+    let published = Published {
         base,
         root,
         facts,
         written,
         held,
-    })
+        cells_recorded: 0,
+    };
+    Ok((published, held_cells))
 }
 
 /// Writes the object `bytes` (of `digest`) to its key unless the store holds it; whether it was

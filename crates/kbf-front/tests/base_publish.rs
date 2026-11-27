@@ -23,6 +23,8 @@ use kbf_types::{Digest, DigestFunction};
 use sha2::{Digest as _, Sha256};
 use tierstore::{EntryKind, TreeDigest, flatten};
 
+mod cells;
+
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const PLATFORM: &str = "linux-x86_64";
 const TOOL: &[u8] = b"tool-bytes\n";
@@ -299,7 +301,7 @@ async fn run(
     dir: &Path,
     store: &Arc<Bucket>,
 ) -> Result<kbf_front::base_publish::Published, PublishError> {
-    publish(dir, COMMIT, PLATFORM, store.clone(), true).await
+    publish(dir, COMMIT, PLATFORM, store.clone(), true, None).await
 }
 
 /// Asserts that a first publish writes every object of the bundle to `cas/l/<sha256>` with its
@@ -677,7 +679,7 @@ async fn an_empty_commit_is_refused() {
     install(&dir, &release);
     let store = Arc::new(Bucket::default());
 
-    let error = publish(&dir, "", PLATFORM, store.clone(), true)
+    let error = publish(&dir, "", PLATFORM, store.clone(), true, None)
         .await
         .expect_err("refused");
 
@@ -940,7 +942,7 @@ async fn a_publish_not_asked_to_list_leaves_the_base_unlisted() {
     install(&dir, &release);
     let store = Arc::new(Bucket::default());
 
-    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), false)
+    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), false, None)
         .await
         .expect("published");
 
@@ -962,7 +964,7 @@ async fn a_publish_not_asked_to_list_leaves_the_base_unlisted() {
     let bytes = writer.finish().expect("finished");
     install_as(&lacking, &file_name(COMMIT, PLATFORM), &bytes, &bytes);
     let other = Arc::new(Bucket::default());
-    let published = publish(&lacking, COMMIT, PLATFORM, other.clone(), false)
+    let published = publish(&lacking, COMMIT, PLATFORM, other.clone(), false, None)
         .await
         .expect("published unlisted");
     assert!(!published.base.is_listed());

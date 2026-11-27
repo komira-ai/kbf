@@ -4,8 +4,14 @@ A tree list is written at `cas/l/<id>`, `<id>` the SHA-256 of its bytes. With du
 (tierstore's `docs/design/fetch-cache-serve.md`, 3.5) the frontend also writes its L2 sidecar at
 `cas/l2/<id>`, made from the SHA-256 of every 1 MiB cell of every object the list names. The
 frontend writes a sidecar from cells the pack index already holds. When an object the list names
-has no recorded cells (it was written before cells were recorded), the sidecar is not written and
-the tree is recorded **unlisted** in the pack index.
+has no recorded cells (it was written before cells were recorded, or by a writer that records none:
+a large blob a client uploaded, a whole object found in the store, a pack adopted), the sidecar is
+not written and the tree is recorded **unlisted** in the pack index. The frontend then fills it
+itself: one task reads the list's objects that have no cells, once each, records them, writes the
+sidecar and drops the row (`kbf_l2_sidecar_fills_total`). The trees left unlisted are those it could
+not fill: its queue was full (`dropped`), an object was lost, the store or index failed, or the
+frontend stopped first. The frontend records the cells of the kbf base tree's objects as it
+publishes the tree.
 
 Only trees a frontend of this release wrote are recorded: a list written by an earlier release has
 no row, and gets its sidecar when a frontend writes its list again (the next run of its action
