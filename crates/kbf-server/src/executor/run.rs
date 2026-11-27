@@ -107,8 +107,8 @@ pub(crate) struct Op {
     /// When that Execute reached the front, before its inputs were read; none for an
     /// operation taken up from the state store. For the line only.
     reapi: Option<Arrival>,
-    /// Where that Execute spent its time at the front; all zero taken up from the store. For
-    /// the line only.
+    /// Where that Execute spent its time at the front; all zero for an operation taken up from
+    /// the state store. For the line only.
     presubmit: PresubmitSplit,
 }
 

@@ -28,8 +28,9 @@ use crate::executor::task::RunId;
 ///   FindMissing calls about `files_checked` files and `dirs_present_checked` cached
 ///   Directories); `dirs_skipped` counts the subtrees an earlier walk verified, which cost none
 ///   of these;
-/// - `rest_ms`, what is left of `presubmit_ms`: the decoding after the walk, the dispatcher's id
-///   for the operation and the time before the call was handled.
+/// - `rest_ms`, what is left of `presubmit_ms`: the decoding after the walk, the dispatcher's
+///   submit up to the operation's opening (its id included) and the small steps between the
+///   stages above.
 ///
 /// The submit time is the Execute's wall-clock time plus the executor's own measure of the time
 /// since, so the two times differ by exactly `since_execute_ms` even if the wall clock steps.

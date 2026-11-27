@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use kbf_pack::{Blob, Fetch, PackerConfig, ReadCache, ReadError, ReaderConfig};
+use kbf_pack::{
+    Blob, Fetch, LossGuard, LossRules, PackerConfig, ReadCache, ReadError, Reader, ReaderConfig,
+};
 use kbf_pack_index::{MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError};
 
 use crate::support::{Rig, blob, cache_dir, digests, filler, limits, pack_all, pack_key};
@@ -479,4 +481,34 @@ async fn a_timed_read_names_the_steps_it_took() {
     let (got, none) = reader.read_timed(&[]).await.unwrap();
     assert!(got.is_empty());
     assert_eq!(none, kbf_pack::ReadTimes::default());
+}
+
+/// Asserts that a read tells its loss guard of a damaged blob as the location goes: a reader
+/// over a shared guard reads a record whose bytes are not its digest, drops its location, and
+/// the guard has counted one loss; a read of an honest record beside it counts none.
+#[tokio::test]
+async fn a_damaged_record_is_counted_by_the_readers_guard() {
+    let (genuine, honest) = (blob("0123456789"), blob("abcdefghij"));
+    let rig = Rig::new();
+    rig.store.seed("cas/x/forged", b"ABCDEFGHIJ").await;
+    rig.store.seed("cas/x/honest", b"abcdefghij").await;
+    rig.index
+        .record_pack(&row("cas/x/forged", 10, &genuine, 0))
+        .unwrap();
+    rig.index
+        .record_pack(&row("cas/x/honest", 10, &honest, 0))
+        .unwrap();
+    let guard = Arc::new(LossGuard::new(LossRules::default(), rig.loss_clock()));
+    let index: Arc<dyn PackIndex> = rig.index.clone();
+    let reader = Reader::new(Arc::clone(&rig.store), index, None, ReaderConfig::default())
+        .with_loss_guard(Arc::clone(&guard));
+
+    let held = reader.read(&[honest.digest]).await.unwrap();
+    let after_held = guard.found();
+    let damaged = reader.read(&[genuine.digest]).await.unwrap();
+
+    assert_eq!(held, [found(&honest)]);
+    assert_eq!(after_held, 0);
+    assert_eq!(damaged, [Fetch::Damaged { dropped: true }]);
+    assert_eq!(guard.found(), 1);
 }

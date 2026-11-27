@@ -395,6 +395,7 @@ impl<S: ObjectStore> Reader<S> {
             let pack = again.pack.to_string();
             let index = Arc::clone(&self.index);
             let key = pack.clone();
+            self.loss.damaged();
             let dropped = offload(move || index.drop_location(&digest, &key)).await;
             match dropped {
                 Ok(dropped) => {

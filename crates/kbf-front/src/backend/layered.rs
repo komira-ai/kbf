@@ -90,10 +90,10 @@ impl Blobs for Layered<'_> {
     }
 
     /// The epoch of `rest`, moved on by every loss the packs have found ([`Packs::losses`]):
-    /// a "held" answer rests on a row of the pack index as much as on `rest`, and a row goes
-    /// only after a read or a check through the packs found its blob lost or damaged. `None`
-    /// when `rest` cannot say. Every count of losses is a distinct epoch over one epoch of
-    /// `rest` (an odd multiplier is one to one).
+    /// a "held" answer rests on a row of the pack index as much as on `rest`, and this process
+    /// removes a row only after a read or a check through the packs found its blob lost or
+    /// damaged, and counted it. `None` when `rest` cannot say. For one epoch of `rest`, every
+    /// count of losses is a distinct epoch (an odd multiplier is one to one).
     fn epoch(&self) -> Option<u64> {
         let losses = self.packs.losses().wrapping_mul(LOSS_EPOCH_STEP);
         self.rest.epoch().map(|epoch| epoch ^ losses)
