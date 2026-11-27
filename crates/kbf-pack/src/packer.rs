@@ -363,8 +363,10 @@ fn add(writer: &mut SegmentWriter, blob: &Blob) -> Result<bool, PackError> {
 /// every start makes the keys of one start differ from those of the next.
 ///
 /// # Errors
-/// [`PackError::Store`] when the first write fails; [`PackError::CreateOnlySelfTest`] when
-/// the second is not refused as an object that exists.
+/// [`PackError::Store`] when the first write fails, or the second fails with anything but
+/// [`ObjectStoreError::AlreadyExists`] (a store that answered 503 or dropped the connection has
+/// not said whether it replaces); [`PackError::CreateOnlySelfTest`] when the second write
+/// succeeds.
 pub async fn check_create_only<S: ObjectStore>(
     store: &S,
     keys: &PackKeys,
@@ -380,6 +382,7 @@ pub async fn check_create_only<S: ObjectStore>(
     let _ = store.delete(&key).await;
     match second {
         Err(ObjectStoreError::AlreadyExists(_)) => Ok(()),
-        _ => Err(PackError::CreateOnlySelfTest),
+        Err(error) => Err(PackError::Store(error)),
+        Ok(()) => Err(PackError::CreateOnlySelfTest),
     }
 }

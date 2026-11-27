@@ -17,7 +17,10 @@
 //!    last: the length of the key is asked first (an object of its length is held, nothing is
 //!    sent; one of another length is refused, not replaced), and an absent key gets a
 //!    create-only write, where an existing key ([`ObjectStoreError::AlreadyExists`]) is success,
-//!    since the key is bound to its content;
+//!    since the key is bound to its content. The length check and the write of an object are one
+//!    call of the start to the store, made again as [`StartRetry`] says while the store answers
+//!    that it is busy or restarting (a 503 `SlowDown`, a 5xx, a refused connection), up to its
+//!    bound: a retry asks the length again, so a write an earlier attempt did store is held;
 //! 4. **checks the root**: the object the facts name is read by [`BaseTree::new`] before it is
 //!    written, so a root tierstore cannot read or that holds a name an action tree keeps
 //!    ([`BaseTreeError::Reserved`]) is never written, and a bundle with no such object is
@@ -57,6 +60,7 @@ use tokio::sync::mpsc;
 
 use crate::action_tree::{BaseFacts, BaseTree, BaseTreeError};
 use crate::large_backfill::{LargeStore, large_key};
+use crate::start_retry::{Ended, GaveUp, StartRetry, retriable};
 
 /// The release's sums file, in the directory of its bundles: `sha256sum`'s lines.
 pub const SUMS: &str = "SHA256SUMS";
@@ -196,6 +200,10 @@ pub enum PublishError {
         #[source]
         source: ObjectStoreError,
     },
+    /// The store kept failing a call, with answers that are retried, until the bound of the
+    /// [`StartRetry`] passed.
+    #[error("{0}")]
+    GaveUp(Box<GaveUp<PublishError>>),
     /// An object of another length than its content is held at its key.
     #[error("{key}: the store holds {held} bytes where the object is {want}")]
     Length {
@@ -235,14 +243,16 @@ pub enum PublishError {
 /// A [`PublishError`], which names what failed: the commit is not known, the sums file or the
 /// bundle is missing, the sums file does not list the bundle or lists other bytes, the bundle is
 /// not one or is of another commit or platform, an object's length at its key is not its own,
-/// the store failed, or the root is missing or not a base tree, or, with `list`, the tree
-/// cannot be listed.
+/// the store failed (at once, or with answers `retry` retries until its bound:
+/// [`PublishError::GaveUp`]), or the root is missing or not a base tree, or, with `list`, the
+/// tree cannot be listed.
 pub async fn publish(
     dir: &Path,
     commit: &str,
     platform: &str,
     store: Arc<dyn LargeStore>,
     list: bool,
+    retry: &StartRetry,
 ) -> Result<Published, PublishError> {
     if commit.is_empty() {
         return Err(PublishError::NoCommit);
@@ -263,7 +273,7 @@ pub async fn publish(
         let bundle = bundle.clone();
         blocking(move || hand_over(file, &bundle, &send))
     };
-    let writing = write_all(receive, &*store, &bundle, (commit, platform), list);
+    let writing = write_all(receive, (&*store, retry), &bundle, (commit, platform), list);
     let (read, written) = futures::future::join(reading, writing).await;
     // A bundle that is not one is the cause of whatever the writer then found missing.
     read?;
@@ -403,7 +413,7 @@ fn hand_over(file: File, path: &Path, send: &mpsc::Sender<Item>) -> Result<(), P
 /// `platform` and writes the objects to `store`.
 async fn write_all(
     mut items: mpsc::Receiver<Item>,
-    store: &dyn LargeStore,
+    (store, retry): (&dyn LargeStore, &StartRetry),
     path: &Path,
     (commit, platform): (&str, &str),
     list: bool,
@@ -458,7 +468,7 @@ async fn write_all(
             manifests.clear();
             root = Some((base, digest));
         }
-        if put_new(store, &digest, bytes).await? {
+        if put_new(store, retry, &digest, bytes).await? {
             written += 1;
         } else {
             held += 1;
@@ -480,27 +490,49 @@ async fn write_all(
 }
 
 /// Writes the object `bytes` (of `digest`) to its key unless the store holds it; whether it was
-/// written.
+/// written. The length check and the write are made again, as `retry` says, while the store
+/// answers either with an error it retries.
 async fn put_new(
     store: &dyn LargeStore,
+    retry: &StartRetry,
     digest: &Digest,
     bytes: Bytes,
 ) -> Result<bool, PublishError> {
     let key = large_key(digest);
+    let attempt = |_| put_once(store, &key, digest.size_bytes, bytes.clone());
+    let retried = |error: &PublishError| matches!(error, PublishError::Store { source, .. } if retriable(source));
+    let written = retry.run(key.as_str(), retried, attempt).await;
+    written.map_err(|ended| match ended {
+        Ended::Refused(error) => error,
+        Ended::GaveUp(gave_up) => PublishError::GaveUp(Box::new(gave_up)),
+    })
+}
+
+/// One attempt of [`put_new`]: the length check of `key`, and the write of `bytes` (`size`
+/// long) if the key is absent.
+async fn put_once(
+    store: &dyn LargeStore,
+    key: &kbf_objstore::ObjectKey,
+    size: u64,
+    bytes: Bytes,
+) -> Result<bool, PublishError> {
     let failed = |call| {
-        let key = key.to_string();
-        move |source| PublishError::Store { key, call, source }
+        move |source| PublishError::Store {
+            key: key.to_string(),
+            call,
+            source,
+        }
     };
-    match store.len(&key).await.map_err(failed("length check"))? {
-        Some(held) if held == digest.size_bytes => Ok(false),
+    match store.len(key).await.map_err(failed("length check"))? {
+        Some(held) if held == size => Ok(false),
         Some(held) => Err(PublishError::Length {
             key: key.to_string(),
             held,
-            want: digest.size_bytes,
+            want: size,
         }),
         None => {
             let body = stream::once(async move { Ok(bytes) }).boxed();
-            match store.put(&key, digest.size_bytes, body).await {
+            match store.put(key, size, body).await {
                 Ok(()) => Ok(true),
                 Err(ObjectStoreError::AlreadyExists(_)) => Ok(false),
                 Err(source) => Err(failed("write")(source)),

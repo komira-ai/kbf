@@ -524,6 +524,21 @@ async fn the_self_test_reports_a_failed_first_write() {
     assert!(error.to_string().starts_with("object store: "), "{error}");
 }
 
+/// Asserts that a failure of the self test's second write is the store's error too, not a store
+/// that replaces objects: a store that failed the write has not said whether it would have taken
+/// it. Catches: a busy store's answer to the second write reported as a store that does not
+/// refuse to replace, which the frontend's start would not try again.
+#[tokio::test]
+async fn the_self_test_reports_a_failed_second_write_as_the_stores() {
+    let rig = Rig::new();
+    rig.store.reject_puts_after(1, 1);
+
+    let error = check_create_only(&*rig.store, &keys()).await.unwrap_err();
+
+    assert!(matches!(error, PackError::Store(_)), "{error}");
+    assert!(error.to_string().starts_with("object store: "), "{error}");
+}
+
 /// Asserts that a packer given no limits has these: the farm's segment limit, a footer
 /// of under 1 MiB, and three attempts; and that a frontend packs client uploads in 32 MiB.
 #[test]
