@@ -286,12 +286,6 @@ impl Backoff {
         self.policy
     }
 
-    /// Where this engine's retries are counted.
-    #[must_use]
-    pub fn counted(&self) -> Arc<StoreWaits> {
-        Arc::clone(&self.counted)
-    }
-
     /// The retries of one call of `op`, its first attempt about to be made.
     pub(crate) fn call(&self, op: Op) -> Waits<'_> {
         Waits {
@@ -388,9 +382,7 @@ impl Waits<'_> {
     /// long, or that it was not retried, the store being taken as down. An answer that is not
     /// retried is returned as it is.
     pub(crate) fn exhausted(&self, error: ObjectStoreError) -> ObjectStoreError {
-        if Cause::of(&error).is_none() {
-            return error;
-        }
+        let retried = Cause::of(&error).is_some();
         let why = match (self.attempts, self.down) {
             (_, true) => format!(
                 " (not retried: a call to the store spent its budget of {} s still failing, and \
@@ -409,7 +401,7 @@ impl Waits<'_> {
                 status,
                 code,
                 message,
-            } => ObjectStoreError::Service {
+            } if retried => ObjectStoreError::Service {
                 status,
                 code,
                 message: format!("{message}{why}"),
@@ -417,7 +409,8 @@ impl Waits<'_> {
             ObjectStoreError::Transport(source) => {
                 ObjectStoreError::Transport(Arc::new(Retried { source, why }))
             }
-            // `Cause::of` takes only a service answer or a transport failure.
+            // An answer that is not retried, after retries of others (a 503, then a 404): the
+            // store's answer, as it gave it.
             other => other,
         }
     }

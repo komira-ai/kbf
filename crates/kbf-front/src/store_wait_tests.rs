@@ -795,3 +795,152 @@ async fn any_answer_of_the_store_takes_it_as_up() {
     );
     assert!(!waits.down());
 }
+
+/// Catches a call already being retried cut short when another call takes the store as down: a
+/// call whose first failure was waited for is still retried after the mark is set, within its own
+/// budget, and is not counted as exhausted; only a call's first failure is answered at once.
+#[tokio::test]
+async fn a_call_already_retrying_keeps_its_budget_when_the_store_is_taken_as_down() {
+    let clock = Arc::new(Clock::default());
+    let counted = Arc::new(StoreWaits::default());
+    let backoff = Backoff::with(
+        policy_without_jitter(Duration::from_secs(120)),
+        Arc::clone(&clock) as Arc<dyn RetryClock>,
+        Arc::clone(&counted),
+    );
+    let mut call = backoff.call(Op::Get);
+
+    assert_eq!(call.after(&unavailable()).await, Next::Again);
+    counted.down.store(true, Ordering::Relaxed);
+    assert_eq!(call.after(&unavailable()).await, Next::Again);
+
+    assert_eq!(counted.exhausted(Op::Get), 0);
+    assert_eq!(clock.waits(), [secs(0.5), secs(1.0)]);
+    assert_eq!(
+        format!("{backoff:?}"),
+        format!(
+            "Backoff {{ policy: {:?}, .. }}",
+            policy_without_jitter(Duration::from_secs(120))
+        )
+    );
+}
+
+/// Catches an answer given for good after retries of others dressed as one that kept failing:
+/// a read the store answers 503 twice and then 404 (no such object) is the store's 404 as it gave
+/// it, with no word of the attempts, after the two retries counted under their cause.
+#[tokio::test]
+async fn an_answer_given_for_good_after_retries_is_the_store_s_as_it_is() {
+    let clock = Arc::new(Clock::default());
+    let store = Failing::new(&clock, secs(1.5), unavailable);
+    let waits = Arc::new(StoreWaits::default());
+    let over = waiting(&store, &clock, Duration::from_secs(120), &waits);
+
+    let range = ByteRange::new(0, 1).expect("a range");
+    let error = over
+        .get_range(&key("absent"), range)
+        .await
+        .expect_err("absent");
+
+    assert!(matches!(error, ObjectStoreError::NotFound(_)), "{error:?}");
+    let as_given = store.inner.get_range(&key("absent"), range).await;
+    assert_eq!(error.to_string(), as_given.expect_err("absent").to_string());
+    assert_eq!(waits.retries(Op::Get, Cause::Unavailable), 2);
+    assert_eq!(waits.exhausted(Op::Get), 0);
+}
+
+/// A transport failure with a cause of its own, as the store client gives one (the request's
+/// error, then the socket's).
+#[derive(Debug)]
+struct Outer(std::io::Error);
+
+impl std::fmt::Display for Outer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the request failed")
+    }
+}
+
+impl Error for Outer {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn reset_with_cause() -> ObjectStoreError {
+    ObjectStoreError::Transport(Arc::new(Outer(std::io::Error::other("connection reset"))))
+}
+
+/// Catches the causes of a transport failure lost once it was retried: the answer of a call that
+/// kept failing so says each cause of the failure, in order, then the attempts.
+#[tokio::test]
+async fn a_retried_transport_failure_says_each_of_its_causes() {
+    let clock = Arc::new(Clock::default());
+    let store = Failing::new(&clock, Duration::MAX, reset_with_cause);
+    let waits = Arc::new(StoreWaits::default());
+    let over = waiting(&store, &clock, Duration::from_secs(1), &waits);
+
+    let error = over.len(&key("gone")).await.expect_err("failed");
+
+    assert!(matches!(error, ObjectStoreError::Transport(_)), "{error:?}");
+    assert_eq!(
+        error.to_string(),
+        "request to the store failed: the request failed: connection reset (still failing after \
+         2 attempts over 0.5 s, the budget being 1 s)"
+    );
+}
+
+/// Where the log of [`each_retry_is_logged_with_its_call_its_cause_and_its_wait`] goes.
+#[derive(Clone, Default)]
+struct Log(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Log {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("not poisoned")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Catches a retry that leaves no trace of why a call was slow: each retry is logged at DEBUG
+/// with the call's op, the cause of the failure, the attempt it follows and the wait.
+#[tokio::test]
+async fn each_retry_is_logged_with_its_call_its_cause_and_its_wait() {
+    let log = Log::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+    let clock = Arc::new(Clock::default());
+    let store = Failing::new(&clock, secs(0.5), unavailable);
+    let waits = Arc::new(StoreWaits::default());
+    let over = waiting(&store, &clock, Duration::from_secs(120), &waits);
+
+    over.len(&key("k")).await.expect("answered");
+
+    let text = String::from_utf8(log.0.lock().expect("not poisoned").clone()).expect("UTF-8");
+    let retries: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("a call to the pack store failed; trying it again"))
+        .collect();
+    assert_eq!(retries.len(), 1, "{text}");
+    let line = retries[0];
+    for field in [
+        " DEBUG ",
+        "op=\"head\"",
+        "cause=\"unavailable\"",
+        "attempt=1",
+        "wait=500ms",
+        "error=store answered 503 ServiceUnavailable: injected",
+    ] {
+        assert!(line.contains(field), "{field}: {line}");
+    }
+}
