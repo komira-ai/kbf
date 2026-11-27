@@ -48,6 +48,11 @@ pub enum Route {
     /// The read-only web UI: `/ui` and `/ui/...`, forwarded to a member's operator listener
     /// ([`Target::Operator`]). Open: [`AuthClass::Ui`] asks for no credential.
     Ui,
+    /// A job's completion call from the job service: `/js-done/<reference>`, one segment,
+    /// forwarded to a member's operator listener ([`Target::Operator`]). Open:
+    /// [`AuthClass::Callback`] asks for no credential, the child checks the call's signature,
+    /// and the proxy admits only POST on it (see [`callback_method_allowed`]).
+    Callback,
     /// Served by the proxy: `/v1/update/frontend*`.
     Update,
     /// `/healthz`.
@@ -90,6 +95,10 @@ pub enum AuthClass {
     /// class and never the operator's: nothing under `/v1` takes it, and the proxy admits
     /// only GET and HEAD on it (see [`ui_method_allowed`]).
     Ui,
+    /// Open to anyone who can reach the port, for the job service's completion calls
+    /// (`/js-done/<reference>`): the child answers only a call signed with the key it minted
+    /// for the job. Its own class, never the operator's, and POST only.
+    Callback,
 }
 
 /// How long a stream may sit silent before the proxy closes it.
@@ -124,6 +133,7 @@ const ENROLL_PREFIX: &str = "/kbf.enroll.v1.Enroll/";
 const UPDATE_PREFIX: &str = "/v1/update/frontend";
 const BYTESTREAM_PREFIX: &str = "/google.bytestream.ByteStream/";
 const UI_PREFIX: &str = "/ui";
+const CALLBACK_PREFIX: &str = "/js-done/";
 const WAIT_EXECUTION: &str = "/build.bazel.remote.execution.v2.Execution/WaitExecution";
 
 /// The path with any query string removed.
@@ -168,10 +178,32 @@ pub fn ui_method_allowed(method: &http::Method) -> bool {
     matches!(*method, http::Method::GET | http::Method::HEAD)
 }
 
+/// Whether the proxy lets `method` through to a completion call: `POST` only, the one method
+/// the job service sends.
+#[must_use]
+pub fn callback_method_allowed(method: &http::Method) -> bool {
+    *method == http::Method::POST
+}
+
+/// Whether `path` is a completion call's: [`CALLBACK_PREFIX`] and one segment of letters,
+/// digits, `-` and `_` (a reference the child minted), and nothing else.
+fn is_callback(path: &str) -> bool {
+    path.strip_prefix(CALLBACK_PREFIX).is_some_and(|reference| {
+        !reference.is_empty()
+            && reference.len() <= 128
+            && reference
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
+}
+
 /// The route of `path`.
 #[must_use]
 pub fn route_of(path: &str) -> Route {
     let path = bare(path);
+    if is_callback(path) {
+        return Route::Callback;
+    }
     if at_boundary(path, UI_PREFIX) {
         return if ui_path_is_plain(path) {
             Route::Ui
@@ -211,6 +243,7 @@ pub const fn auth_class(route: Route) -> Option<AuthClass> {
         Route::Child(Target::Operator) => Some(AuthClass::Operator),
         Route::Child(Target::Enroll) => Some(AuthClass::Enroll),
         Route::Ui => Some(AuthClass::Ui),
+        Route::Callback => Some(AuthClass::Callback),
         Route::Update => Some(AuthClass::Update),
         Route::Health | Route::Ready => Some(AuthClass::Probe),
         Route::Metrics => Some(AuthClass::Operator),
@@ -271,6 +304,7 @@ mod tests {
         assert!(route_of(reapi).grpc());
         for route in [
             Route::Ui,
+            Route::Callback,
             Route::Update,
             Route::Health,
             Route::Ready,
@@ -333,6 +367,52 @@ mod tests {
         ] {
             assert_eq!(route_of(p), Route::Unknown, "{p}");
             assert_eq!(auth_class(route_of(p)), None);
+        }
+    }
+
+    /// Asserts the completion calls' route: `/js-done/` and one segment of letters, digits, `-`
+    /// and `_`, of 1 to 128 bytes (a query is not part of the path), is [`Route::Callback`],
+    /// forwarded to the operator listener under its own open class, and POST only; the prefix
+    /// alone, a second segment, a walk out (`..`, an encoded slash), a longer reference and a
+    /// near miss of the prefix are not in the table. Catches a callback path that reaches
+    /// another operator route without the operator token, and a write method let through.
+    #[test]
+    fn a_completion_call_is_one_segment_under_js_done_and_post_only() {
+        let longest = format!("/js-done/{}", "a".repeat(128));
+        for p in [
+            "/js-done/0123456789abcdef0123456789abcdef",
+            "/js-done/a",
+            "/js-done/A-z_9",
+            "/js-done/ref?x=1",
+            longest.as_str(),
+        ] {
+            assert_eq!(route_of(p), Route::Callback, "{p}");
+            assert_eq!(auth_class(route_of(p)), Some(AuthClass::Callback), "{p}");
+        }
+        let too_long = format!("/js-done/{}", "a".repeat(129));
+        for p in [
+            "/js-done",
+            "/js-done/",
+            "/js-done/a/b",
+            "/js-done/..",
+            "/js-done/a%2fb",
+            "/js-done/a.b",
+            "/js-donex/a",
+            "/v1/js-done/a",
+            too_long.as_str(),
+        ] {
+            assert_ne!(route_of(p), Route::Callback, "{p}");
+        }
+        assert_eq!(route_of("/js-done/a/b"), Route::Unknown);
+        assert_eq!(route_of("/v1/js-done/a"), Route::Child(Target::Operator));
+        assert!(callback_method_allowed(&http::Method::POST));
+        for method in [
+            http::Method::GET,
+            http::Method::HEAD,
+            http::Method::PUT,
+            http::Method::DELETE,
+        ] {
+            assert!(!callback_method_allowed(&method), "{method}");
         }
     }
 

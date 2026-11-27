@@ -3,6 +3,7 @@
 //! on a wall clock.
 
 mod bypass;
+mod callback;
 mod flood;
 mod frames;
 mod h1;

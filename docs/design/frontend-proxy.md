@@ -116,6 +116,12 @@ hook signals after both files are in place.
   `ui = false` makes `/ui` a 404. The class is its own: every `/v1` path, `/metrics`, the worker
   and the REAPI paths keep the class they had. The proxy adds no security header to a UI answer;
   the server's pass through unchanged.
+- **The job service's completion calls (`/js-done/<reference>`) are open** too, to `POST` only
+  (any other method is a 405 naming `POST`): the job service holds no farm credential, and the
+  frontend answers only a call signed with the key it minted for the job
+  (`crates/kbf-server/src/executor/callback.rs`). The reference is one segment of letters,
+  digits, `-` and `_`, at most 128 bytes; anything else under `/js-done` is a 404. The class is
+  its own, like the UI's, and the call is forwarded to a frontend's operator listener.
 - mTLS therefore authenticates who (which node, which role), not only "trusted".
 
 **Identity to the child.** The proxy strips every inbound `x-kbf-*` header, then sets
@@ -162,8 +168,8 @@ hook signals after both files are in place.
 
 **Routing.** The six REAPI paths, ByteStream and `google.longrunning.Operations` (GetOperation)
 go to the REAPI port of a frontend, worker and `Membership` paths to its worker port, the
-enrollment service to its enrollment port, and every other `/v1/*` and `/ui` path to its
-operator port. A path that matches nothing is answered by the proxy and never forwarded.
+enrollment service to its enrollment port, and every other `/v1/*`, `/ui` and `/js-done/*` path
+to its operator port. A path that matches nothing is answered by the proxy and never forwarded.
 `/v1/update/frontend*` is a path of the proxy's own: once the operator token is checked, the
 built-in handler answers 503, because the proxy has no update API. `/metrics` is the proxy's own
 series (the pool's members among them); `/healthz` and `/readyz` are the proxy's view, `/readyz`
