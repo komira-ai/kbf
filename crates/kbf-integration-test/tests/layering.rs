@@ -69,17 +69,15 @@
 //!   `kbf-lease-client` (in `scheduler_server_crates`).
 //! - a scheduler package (`kbf-sched`, `js-sched`, `js-whole`) in `Cargo.lock` (in
 //!   `no_scheduler_package`): kbf schedules nothing, the job service does.
-//! - the tierstore trees client (`kbf-trees-client`, in `trees_client_layer`) reaching a kbf
-//!   crate or a tierstore crate other than `tierstore-trees-api`, or being depended on by any
-//!   crate of this workspace (no user yet); and a crate of the tierstore repository at a second
-//!   revision, or `tierstore`, `objstore-s3` or `tierstore-trees-api` taken from elsewhere.
+//! - a crate of the tierstore repository at a second revision, or `objstore-s3`, `tierstore` or
+//!   `tierstore-list` taken from elsewhere or missing (in `tierstore_one_revision`).
 
 mod job_client_layer;
 mod l2_backfill_layer;
 mod no_scheduler_package;
 mod scheduler_server_crates;
 mod step_runner_layer;
-mod trees_client_layer;
+mod tierstore_one_revision;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
 
