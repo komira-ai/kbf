@@ -933,8 +933,8 @@ async fn each_retry_is_logged_with_its_call_its_cause_and_its_wait() {
         .collect();
     assert_eq!(retries.len(), 1, "{text}");
     let line = retries[0];
+    assert!(line.starts_with("DEBUG "), "{line}");
     for field in [
-        " DEBUG ",
         "op=\"head\"",
         "cause=\"unavailable\"",
         "attempt=1",
