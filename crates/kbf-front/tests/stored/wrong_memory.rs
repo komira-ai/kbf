@@ -26,9 +26,14 @@ use crate::execute_walk::action_tree;
 use crate::rig::{Rig, SMALL};
 
 const LEASE: &str = "00000000000000010000000000000002";
-const MINT_SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 const WALL: Duration = Duration::from_secs(7_200);
 const SLACK: Duration = Duration::from_secs(600);
+
+/// The secret of this test's mint of pack keys: 32 bytes made from a name, nothing a real
+/// frontend holds.
+fn mint_secret() -> [u8; 32] {
+    kbf_segments::sha256(b"the mint of the wrong memory test").hash
+}
 
 /// Catches a wrong memory believed by more than one preparation of a run, or one that ends in
 /// anything but the blob missing once a preparation checks: another frontend uploads an
@@ -80,7 +85,7 @@ async fn a_pack_another_frontend_forgot_costs_one_attempt_and_is_then_missing() 
     };
     let prep = PutDirPrep::new(
         rig.backend.clone(),
-        PackKeyMint::new(MINT_SECRET).expect("a mint"),
+        PackKeyMint::new(&mint_secret()).expect("a mint"),
         SLACK,
         ClosureLimits::DEFAULT,
     );
