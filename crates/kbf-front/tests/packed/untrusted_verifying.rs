@@ -9,7 +9,9 @@ use kbf_front::{
     Backend, Claimed, Ingested, IssuedKeySet, PackKeyMint, Packs, RejectReason, UntrustedLimits,
     VerifyingKeys, ingest_set,
 };
-use kbf_pack::{MIN_GRACE, Slot, SweepConfig, SweepGates, SweepReport, Sweeper, task_key_age};
+use kbf_pack::{
+    MIN_GRACE, Slot, SweepConfig, SweepGates, SweepReport, Sweeper, none_named, task_key_age,
+};
 use kbf_pack_index::PackIndex as _;
 use kbf_types::Digest;
 
@@ -85,6 +87,7 @@ fn sweeper(rig: &Rig) -> Sweeper<Spy> {
                 .claim(key)
                 .map(|claim| Box::new(claim) as kbf_pack::Claim)
         }),
+        named: none_named(),
     };
     let index: Arc<dyn kbf_pack_index::PackIndex> = rig.index.clone();
     let config = SweepConfig {

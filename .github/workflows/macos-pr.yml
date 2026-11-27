@@ -4,7 +4,7 @@
 # - `macos-test` runs the tests of the macOS crates as an ordinary user: the steps of beta.yml's
 #   `native-macos` that need no root, the task runner's tests (ci.yml's `task-macos` runs them
 #   after the merge), and the other crates whose tests pass on a Mac (the sandbox profile writer,
-#   the update types).
+#   the update types, the updater's registration server).
 # - `macos-device` runs the rest of `native-macos`: the pinned gh against a real attestation.
 #
 # A macOS action itself runs as a js-agent job (docs/design/actions-as-jobs.md section 14); no
@@ -58,11 +58,18 @@ jobs:
       # a full backlog is refused at once, a connect that succeeds leaves the rest only what is left,
       # and a missing or stale socket is a connect error (crates/update-register/src/tests.rs).
       - run: cargo test -p update-register --locked -- --exact tests::a_listener_whose_backlog_is_full_is_refused_at_once tests::the_deadline_left_after_the_connect_is_all_that_follows_gets tests::a_socket_left_by_a_listener_that_is_gone_is_refused tests::a_missing_socket_names_its_path tests::a_deadline_already_passed_does_not_connect
+      # The registration client reads the answer of an updater that closed first (`busy`): on a Mac
+      # the read's timeout is refused on such a socket, and the answer is read without it.
+      - run: cargo test -p update-register --locked -- --exact tests::the_answer_of_a_peer_that_closed_is_still_read
       # The task runner's tests without its test-only feature: they run the Command under the
       # macOS confine for real (ci.yml's `task-macos`, which runs them after the merge).
       - run: cargo test -p kbf-task --locked --no-fail-fast
       # The crates whose tests pass on a Mac: the sandbox profile writer and the update types.
       - run: cargo test --locked --no-fail-fast -p kbf-seatbelt -p kbf-update
+      # The registration server's tests (kbf-step-runner): off Linux it reads no peer's user id
+      # (`SO_PEERCRED` is Linux's) and admits no peer, which a test of its own holds; each test
+      # that needs a peer admitted is ignored here with that reason.
+      - run: cargo test -p kbf-step-runner --locked --no-fail-fast --test register --test register_client --test register_disk
 
   macos-device:
     runs-on: macos-15

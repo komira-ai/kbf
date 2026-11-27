@@ -380,13 +380,16 @@ task-closure-max-digests = 500000
 # task-directory-cache-bytes = "BYTES"
 # A directory this process owns where the input Directories the closure walk decodes are kept on disk, one file each by digest, checked by SHA-256 on every read, so that a restart or a Directory pushed out of memory is read from the disk and not from the store. At most `--task-directory-cache-bytes` of them are kept, the least recently used removed first. One process per directory: nothing else may write there. Needs `--task-directory-cache-bytes`. Left out, the Directories are kept in memory only (256 MiB). Used only with `--task-secret-file`
 # task-directory-cache-dir = "DIR"
-# Log and count the keys the janitor would delete, and delete none. Used only with `--task-janitor-key-file`
+# Delete what the janitor of `cas/b/` finds. Left out, each sweep is a dry run: it counts and logs what it would delete, and deletes nothing. Needs `--task-janitor-key-file`
+task-janitor-apply = false
+# Accepted from earlier releases: a sweep is a dry run unless `--task-janitor-apply` is given, which this is refused beside
+# (not in --help)
 task-janitor-dry-run = false
 # How old a key must be, in seconds, before the janitor may delete it, by the minute its name says it was minted in. At least 21600 (the 18000 seconds at which an ingest refuses a key, and an hour more as a margin for hosts with different clocks and for an old leader still ingesting) and at most 604800. Used only with `--task-janitor-key-file`
 task-janitor-grace-secs = 21600
 # How often, in seconds, the janitor starts a sweep of `cas/b/`, at least 1 and at most 86400. Used only with `--task-janitor-key-file`
 task-janitor-interval-secs = 900
-# Turns on the janitor of `cas/b/`: it deletes the task packs and large objects nothing recorded (a refused run, an unused key, a large object already copied into the CAS) once they are older than `--task-janitor-grace-secs`, are not under verification and are not in the pack index. The file is the tier store's GC key, `{"access_key_id": "...", "secret_access_key": "...", "prefix": "cas/b/"}` (the prefix must be exactly `cas/b/`), owned by this user and readable by it alone (mode 0600 or 0400); it is used against `--pack-store-endpoint`'s store, which this needs. The janitor never lists or deletes under `cas/l/`, `cas/f/` or `cas/d/`. Runs on the leader only. Needs `--task-secret-file` and `--pack-store-endpoint`. Left out, nothing is deleted
+# Turns on the janitor of `cas/b/`: it deletes the task packs and large objects nothing recorded (a refused run, an unused key, a large object already copied into the CAS) once they are older than `--task-janitor-grace-secs`, are not under verification, are not in a put directory an open operation names and are not in the pack index; without `--task-janitor-apply` it only counts them. The file is the tier store's GC key, `{"access_key_id": "...", "secret_access_key": "...", "prefix": "cas/b/"}` (the prefix must be exactly `cas/b/`), owned by this user and readable by it alone (mode 0600 or 0400); it is used against `--pack-store-endpoint`'s store, which this needs. The janitor never lists or deletes under `cas/l/`, `cas/f/` or `cas/d/`. Runs on the leader only. Needs `--task-secret-file` and `--pack-store-endpoint`. Left out, nothing is listed or deleted
 # task-janitor-key-file = "PATH"
 # How long, in milliseconds, the janitor waits after each page before it lists the next, at most 60000: with `--task-janitor-page-size`, the most keys a second it lists and deletes. Used only with `--task-janitor-key-file`
 task-janitor-page-pause-ms = 1000

@@ -754,6 +754,50 @@ fn the_named_lists_are_those_of_the_open_rows() {
     );
 }
 
+/// Asserts that the put directories the janitor of `cas/b/` keeps are those the open
+/// operations' rows name, whoever owns the row: a row with no key adds none, a finished
+/// operation's directory is no longer named, and a later attempt's row names its own directory
+/// instead of the earlier one's; and that a row of a version this build does not know stops the
+/// scan, naming the row, so the janitor deletes nothing.
+#[test]
+fn the_named_put_dirs_are_those_of_the_open_rows() {
+    let env = env();
+    let (a, b) = (env.rows("a"), env.rows("b"));
+    assert_eq!(a.named_put_dirs(), Ok(BTreeSet::new()));
+    let dir = |tag: u8| format!("cas/b/{tag}-1/aa");
+    a.put_op(op(1), &row(1)).expect("row");
+    b.put_op(op(2), &row(2)).expect("row");
+    a.put_op(
+        op(3),
+        &OpRow {
+            key: None,
+            ..row(3)
+        },
+    )
+    .expect("a row with no key");
+    let named = |rows: &Rows| rows.named_put_dirs().expect("a scan");
+    assert_eq!(named(&a), BTreeSet::from([dir(1), dir(2)]));
+    assert_eq!(named(&b), named(&a), "whoever reads");
+    a.finish(op(1), &action(1), &ran(0), DAY).expect("finished");
+    assert_eq!(named(&a), BTreeSet::from([dir(2)]));
+    let later = OpRow {
+        attempt: 2,
+        key: Some("cas/b/2-2/bb".to_owned()),
+        ..row(2)
+    };
+    b.put_op(op(2), &later).expect("the next attempt");
+    assert_eq!(named(&a), BTreeSet::from(["cas/b/2-2/bb".to_owned()]));
+    env.put(&op_key(op(4)), &[VERSION + 1, b'{', b'}']);
+    assert_eq!(
+        a.named_put_dirs(),
+        Err(RowsError::Corrupt {
+            key: op_key(op(4)),
+            why: "a row of a version this build does not know: what it names is not known"
+                .to_owned(),
+        })
+    );
+}
+
 /// Asserts that a row whose list cannot be known stops the scan, naming the row: one of a
 /// version this build does not know, and one that is not what it says; and that a store that
 /// fails is an error too. The collector then deletes nothing. Catches: such a row skipped as

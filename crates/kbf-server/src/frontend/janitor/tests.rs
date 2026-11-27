@@ -1,15 +1,13 @@
 //! The `cas/b/` janitor: what it deletes and what it keeps, over an in-memory store and pack index
-//! with the real key names and the real age rule; its flags and key file; and a frontend started
-//! with the flags, which sweeps a store on loopback. No test reads the clock: the sweeps are
-//! judged at a time the test gives, and keys name their minute.
+//! with the real key names and the real age rule (its flags, key file and a frontend started with
+//! them are `flag_tests`). No test reads the clock: the sweeps are judged at a time the test
+//! gives, and keys name their minute.
 
-use std::os::unix::fs::PermissionsExt as _;
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use bytes::Bytes;
-use clap::error::ErrorKind;
-use kbf_objstore::s3::fake::FakeS3;
 use kbf_objstore::{
     ByteRange, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStoreError,
 };
@@ -19,9 +17,6 @@ use kbf_pack_index::{BlobDigest, NewPack, PackBlob};
 use kbf_state::ManualClock;
 
 use super::*;
-use crate::frontend::pack_tests::{flags_of, index, pack_flags, scrape, started};
-use crate::frontend::{self, FrontendFlags};
-use crate::test_dir::scratch_dir;
 
 /// The minute the sweeps run at, as a number of minutes after the epoch.
 const NOW_MINUTE: u32 = 100_000;
@@ -35,10 +30,24 @@ fn at(minute: u32) -> SystemTime {
 }
 
 /// The task pack key of `slot` minted at `minute`, as the frontend writes it.
-fn key(minute: u32, slot: Slot) -> String {
+pub(super) fn key(minute: u32, slot: Slot) -> String {
     TaskPackKey::new("lease1", [0xab; 16], minute, slot)
         .expect("a key")
         .to_string()
+}
+
+/// The object `slot` of the put directory with nonce byte `n` minted at `minute`, as a task
+/// commits it.
+pub(super) fn in_dir(n: u8, minute: u32, slot: Slot) -> String {
+    TaskPackKey::in_put_dir("lease1", [n; 16], minute, slot)
+        .expect("a key")
+        .to_string()
+}
+
+/// The put directory of `key`: what an open operation's row names.
+pub(super) fn dir_of(key: &str) -> String {
+    let key = TaskPackKey::parse(key).expect("a key");
+    key.put_dir().expect("a put directory key")
 }
 
 /// A memory object store whose deletes of chosen keys, and whose listings, fail when told to.
@@ -171,6 +180,8 @@ struct Rig {
     index: Arc<MemoryPackIndex>,
     verifying: Arc<VerifyingKeys>,
     leader: Arc<AtomicBool>,
+    /// What the gate of the open operations answers: no directory, until a test says.
+    named: Arc<Mutex<Result<BTreeSet<String>, String>>>,
     metrics: Arc<JanitorMetrics>,
     janitor: Janitor,
 }
@@ -185,6 +196,7 @@ impl Rig {
         let index = Arc::new(MemoryPackIndex::new(Arc::new(ManualClock::default())));
         let verifying = Arc::new(VerifyingKeys::default());
         let leader = Arc::new(AtomicBool::new(true));
+        let named = Arc::new(Mutex::new(Ok(BTreeSet::new())));
         let janitor = Janitor::new(
             Arc::clone(&store),
             Arc::clone(&index) as Arc<dyn PackIndex>,
@@ -195,6 +207,10 @@ impl Rig {
                 let leader = Arc::clone(&leader);
                 move || leader.load(Ordering::SeqCst)
             }),
+            {
+                let named = Arc::clone(&named);
+                Arc::new(move || named.lock().expect("lock").clone())
+            },
             Arc::new(|| at(NOW_MINUTE)),
         );
         let metrics = janitor.metrics();
@@ -203,9 +219,15 @@ impl Rig {
             index,
             verifying,
             leader,
+            named,
             metrics,
             janitor,
         }
+    }
+
+    /// From now on the open operations answer `named`.
+    fn name(&self, named: Result<BTreeSet<String>, String>) {
+        *self.named.lock().expect("lock") = named;
     }
 
     /// The count of `family` now.
@@ -473,7 +495,8 @@ async fn a_failed_listing_is_counted_and_retried() {
     assert_eq!(rig.count("sweep_errors"), 1);
 }
 
-/// Asserts that a dry run deletes nothing and counts what it would have.
+/// Asserts that a dry run deletes nothing and counts what it would have, a key an open operation
+/// names not among them, and says on its gauge that it deletes nothing.
 #[tokio::test]
 async fn a_dry_run_counts_and_deletes_nothing() {
     let rig = Rig::with(SweepConfig {
@@ -482,12 +505,19 @@ async fn a_dry_run_counts_and_deletes_nothing() {
     });
     rig.store.seed(&key(OLD, Slot::Pack(0))).await;
     rig.store.seed(&key(OLD, Slot::Large(0))).await;
+    let named = in_dir(1, OLD, Slot::Pack(0));
+    rig.store.seed(&named).await;
+    rig.name(Ok(BTreeSet::from([dir_of(&named)])));
 
     rig.janitor.sweep_once().await;
 
-    assert_eq!(rig.store.keys().await.len(), 2);
+    assert_eq!(rig.store.keys().await.len(), 3);
     assert_eq!(rig.count("would_reap"), 2);
+    assert_eq!(rig.count("kept_named"), 1);
     assert_eq!(rig.count("reaped"), 0);
+    let mut text = String::new();
+    rig.metrics.render(&mut text);
+    assert!(text.contains("\nkbf_cas_b_janitor_apply 0\n"), "{text}");
 }
 
 /// Asserts that the janitor sweeps again every interval: the loop is run until it has swept
@@ -513,14 +543,64 @@ async fn the_loop_sweeps_on_every_interval() {
     looping.abort();
 }
 
-/// Asserts that every family is rendered once as a counter with the value counted, under the
-/// `kbf_cas_b_janitor_` names.
+/// Asserts that the old objects of a put directory an open operation names are kept and counted
+/// `kept_named` while an old one of a directory no operation names is deleted, and that once the
+/// operation is closed the next sweep deletes them.
+#[tokio::test]
+async fn a_key_an_open_operation_names_is_kept_until_it_closes() {
+    let rig = Rig::new();
+    let named = [
+        in_dir(1, OLD, Slot::Pack(0)),
+        in_dir(1, OLD, Slot::Large(1)),
+    ];
+    let orphan = in_dir(2, OLD, Slot::Pack(0));
+    for key in named.iter().chain([&orphan]) {
+        rig.store.seed(key).await;
+    }
+    rig.name(Ok(BTreeSet::from([dir_of(&named[0])])));
+
+    rig.janitor.sweep_once().await;
+
+    assert_eq!(rig.store.keys().await.len(), 2);
+    assert!(!rig.store.keys().await.contains(&orphan));
+    assert_eq!((rig.count("kept_named"), rig.count("reaped")), (2, 1));
+    rig.name(Ok(BTreeSet::new()));
+    rig.janitor.sweep_once().await;
+    assert!(rig.store.keys().await.is_empty());
+    assert_eq!((rig.count("kept_named"), rig.count("reaped")), (2, 3));
+}
+
+/// Asserts that when the open operations cannot be read the sweep deletes nothing and is
+/// counted as an error, after counting what it listed; and that the next sweep, which can read
+/// them, deletes.
+#[tokio::test]
+async fn unreadable_operations_stop_the_sweep_and_are_counted() {
+    let rig = Rig::new();
+    rig.store.seed(&in_dir(2, OLD, Slot::Pack(0))).await;
+    rig.name(Err("exec rows: a row is corrupt".to_owned()));
+
+    rig.janitor.sweep_once().await;
+
+    assert_eq!(rig.store.keys().await.len(), 1);
+    assert_eq!(rig.store.deletes.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.count("sweep_errors"), 1);
+    assert_eq!((rig.count("listed"), rig.count("sweeps")), (1, 0));
+    rig.name(Ok(BTreeSet::new()));
+    rig.janitor.sweep_once().await;
+    assert!(rig.store.keys().await.is_empty());
+}
+
+/// Asserts that every family is rendered once with the value counted, under the
+/// `kbf_cas_b_janitor_` names: the counters, and the gauge that says the sweeps delete.
 #[tokio::test]
 async fn the_metrics_render_every_family() {
     let rig = Rig::new();
     rig.store.seed(&key(OLD, Slot::Pack(0))).await;
     rig.store.seed(&key(YOUNG, Slot::Pack(1))).await;
     rig.store.seed("cas/b/lease1/garbage").await;
+    let named = in_dir(1, OLD, Slot::Pack(0));
+    rig.store.seed(&named).await;
+    rig.name(Ok(BTreeSet::from([dir_of(&named)])));
 
     rig.janitor.sweep_once().await;
 
@@ -529,10 +609,11 @@ async fn the_metrics_render_every_family() {
     let families = [
         ("sweeps", 1),
         ("sweep_errors", 0),
-        ("listed", 3),
+        ("listed", 4),
         ("kept_young", 1),
         ("kept_verifying", 0),
         ("kept_referenced", 0),
+        ("kept_named", 1),
         ("kept_unparsed", 1),
         ("kept_outside", 0),
         ("abandoned", 0),
@@ -548,396 +629,14 @@ async fn the_metrics_render_every_family() {
             "{name}: {text}"
         );
     }
-    assert_eq!(text.matches("# TYPE").count(), families.len());
+    let apply = "# HELP kbf_cas_b_janitor_apply 1 when the sweeps delete (--task-janitor-apply), \
+                 0 when each is a dry run.\n# TYPE kbf_cas_b_janitor_apply gauge\n\
+                 kbf_cas_b_janitor_apply 1\n";
+    assert!(text.starts_with(apply), "{text}");
+    assert_eq!(text.matches("# TYPE").count(), families.len() + 1);
     for (name, value) in families {
         assert_eq!(rig.count(name), value, "{name}");
     }
-}
-
-// Flags.
-
-/// What a frontend needs of the command line apart from the janitor flags.
-const BASE: [&str; 5] = [
-    "frontend",
-    "--storage=http://127.0.0.1:1",
-    "--listen=127.0.0.1:0",
-    "--worker-listen=127.0.0.1:0",
-    "--api-listen=127.0.0.1:0",
-];
-
-/// The flags the task switch needs.
-const TASK: [&str; 2] = [
-    "--task-secret-file=/etc/kbf/task.secret",
-    "--task-out-root=/mnt/ts/put",
-];
-
-/// The flags the packs need.
-const PACKS: [&str; 5] = [
-    "--state-store=postgres:///kbf?host=/run/postgresql",
-    "--pack-index",
-    "--pack-store-endpoint=http://127.0.0.1:9000",
-    "--pack-store-bucket=tiers",
-    "--pack-store-credentials-file=/etc/kbf/pack.json",
-];
-
-const KEY_FILE: &str = "--task-janitor-key-file=/etc/kbf/gc.json";
-
-fn parsed(more: &[&str]) -> Result<FrontendFlags, clap::Error> {
-    let argv = BASE.iter().chain(more).copied();
-    frontend::parse(&frontend::command().try_get_matches_from(argv)?)
-}
-
-/// The task and pack flags the janitor needs, then `janitor`.
-fn with<'a>(janitor: &[&'a str]) -> Vec<&'a str> {
-    let mut all: Vec<&str> = TASK.iter().chain(&PACKS).copied().collect();
-    all.extend(janitor);
-    all
-}
-
-fn refused(more: &[&str]) -> ErrorKind {
-    parsed(more).expect_err("refused").kind()
-}
-
-/// Asserts that no janitor exists without the key file, whatever its companions say, and that
-/// the key file needs the task switch (clap) and the packs (the parse).
-#[test]
-fn the_janitor_is_off_unless_the_key_file_is_given() {
-    let companions = [
-        "--task-janitor-interval-secs=5",
-        "--task-janitor-grace-secs=21600",
-        "--task-janitor-page-size=10",
-        "--task-janitor-page-pause-ms=0",
-        "--task-janitor-dry-run",
-    ];
-    assert_eq!(parsed(&companions).expect("parses").janitor, None);
-    assert_eq!(parsed(&with(&[])).expect("parses").janitor, None);
-    assert_eq!(
-        refused(&[KEY_FILE]),
-        ErrorKind::MissingRequiredArgument,
-        "the key file needs the task switch"
-    );
-    let tasks: Vec<&str> = TASK.iter().copied().chain([KEY_FILE]).collect();
-    let said = parsed(&tasks).expect_err("refused");
-    assert_eq!(said.kind(), ErrorKind::ArgumentConflict);
-    assert!(said.to_string().contains("--pack-store-endpoint"), "{said}");
-}
-
-/// Asserts that the flags make the setting they say and that the defaults are the constants:
-/// the grace of the sweep, 15 minutes between sweeps, pages of 500 and a second between them.
-#[test]
-fn the_flags_make_the_setting_and_the_defaults_are_the_constants() {
-    let set = parsed(&with(&[KEY_FILE])).expect("parses");
-    let set = set.janitor.expect("janitor flags");
-    assert_eq!(set.key_file, PathBuf::from("/etc/kbf/gc.json"));
-    assert_eq!(set.interval, Duration::from_secs(DEFAULT_INTERVAL_SECS));
-    assert_eq!(set.grace, DEFAULT_GRACE);
-    assert_eq!(set.page.get(), DEFAULT_PAGE_SIZE);
-    assert_eq!(set.pause, Duration::from_millis(DEFAULT_PAGE_PAUSE_MS));
-    assert!(!set.dry_run);
-
-    let every = [
-        KEY_FILE,
-        "--task-janitor-interval-secs=30",
-        "--task-janitor-grace-secs=21600",
-        "--task-janitor-page-size=7",
-        "--task-janitor-page-pause-ms=0",
-        "--task-janitor-dry-run",
-    ];
-    let set = parsed(&with(&every)).expect("parses").janitor;
-    let set = set.expect("janitor flags");
-    assert_eq!(set.interval, Duration::from_secs(30));
-    assert_eq!(set.grace, Duration::from_secs(21_600));
-    assert_eq!(set.page.get(), 7);
-    assert_eq!(set.pause, Duration::ZERO);
-    assert!(set.dry_run);
-}
-
-/// Asserts the bounds: a grace under 6 hours (the age an ingest refuses a key at, and an hour of
-/// margin for a fenced old leader that is still ingesting) is refused, and the least is exactly
-/// that; as are an interval of 0, a page of 0 or over 1000, and a pause over a minute.
-#[test]
-fn the_flags_hold_to_their_bounds() {
-    let margin = Duration::from_secs(3_600);
-    assert_eq!(MIN_GRACE_SECS, (kbf_pack::MIN_GRACE + margin).as_secs());
-    let bad = [
-        "--task-janitor-grace-secs=21599",
-        "--task-janitor-grace-secs=604801",
-        "--task-janitor-interval-secs=0",
-        "--task-janitor-interval-secs=86401",
-        "--task-janitor-page-size=0",
-        "--task-janitor-page-size=1001",
-        "--task-janitor-page-pause-ms=60001",
-    ];
-    for flag in bad {
-        assert_eq!(
-            refused(&with(&[KEY_FILE, flag])),
-            ErrorKind::ValueValidation,
-            "{flag}"
-        );
-    }
-    let edges = [
-        "--task-janitor-grace-secs=21600",
-        "--task-janitor-page-size=1000",
-        "--task-janitor-page-size=1",
-    ];
-    for flag in edges {
-        assert!(parsed(&with(&[KEY_FILE, flag])).is_ok(), "{flag}");
-    }
-}
-
-/// The file called `name` in `dir` of this text and mode.
-fn file(dir: &Path, name: &str, text: &str, mode: u32) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, text).expect("written");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("mode set");
-    path
-}
-
-const GC_KEY: &str =
-    r#"{"access_key_id": "pack-gc", "secret_access_key": "hunter2", "prefix": "cas/b/"}"#;
-
-/// What reading the key file at `path` says, as text.
-fn said(path: &Path) -> String {
-    match read_key(path) {
-        Ok(_) => "accepted".to_owned(),
-        Err(error) => error.to_string(),
-    }
-}
-
-/// Asserts what the key file must be: the JSON of exactly the three fields of the tier store's
-/// GC key, with the prefix exactly `cas/b/` (the janitor is given no other reach), owned by this
-/// user and private; and that a refusal names the flag and the file and never the secret.
-#[test]
-fn the_key_file_is_the_gc_key_of_cas_b_and_private() {
-    let dir = scratch_dir("janitor-key");
-    assert_eq!(
-        said(&file(dir.path(), "ok.json", GC_KEY, 0o600)),
-        "accepted"
-    );
-    assert_eq!(
-        said(&file(dir.path(), "ro.json", GC_KEY, 0o400)),
-        "accepted"
-    );
-
-    let other = |prefix: &str| {
-        let body = format!(
-            r#"{{"access_key_id": "k", "secret_access_key": "hunter2", "prefix": "{prefix}"}}"#
-        );
-        said(&file(dir.path(), "prefix.json", &body, 0o600))
-    };
-    for prefix in ["cas/", "cas/l/", "cas/b", "cas/b/x/", ""] {
-        let text = other(prefix);
-        assert!(text.contains("must be exactly"), "{prefix:?}: {text}");
-        assert!(!text.contains("hunter2"));
-    }
-    let bad = [
-        ("open.json", GC_KEY, 0o644, "mode"),
-        ("empty.json", "", 0o600, "exactly access_key_id"),
-        (
-            "extra.json",
-            r#"{"access_key_id": "k", "secret_access_key": "hunter2", "prefix": "cas/b/", "x": 1}"#,
-            0o600,
-            "exactly access_key_id",
-        ),
-        (
-            "no-id.json",
-            r#"{"access_key_id": "", "secret_access_key": "hunter2", "prefix": "cas/b/"}"#,
-            0o600,
-            "exactly access_key_id",
-        ),
-        (
-            "no-secret.json",
-            r#"{"access_key_id": "k", "secret_access_key": "", "prefix": "cas/b/"}"#,
-            0o600,
-            "exactly access_key_id",
-        ),
-        (
-            "no-prefix.json",
-            r#"{"access_key_id": "k", "secret_access_key": "hunter2"}"#,
-            0o600,
-            "exactly access_key_id",
-        ),
-    ];
-    for (name, body, mode, want) in bad {
-        let text = said(&file(dir.path(), name, body, mode));
-        assert!(text.starts_with("--task-janitor-key-file "), "{text}");
-        assert!(text.contains(name), "{text}");
-        assert!(text.contains(want), "{name}: {text}");
-        assert!(!text.contains("hunter2"), "{text}");
-    }
-    let missing = said(&dir.path().join("none.json"));
-    assert!(missing.starts_with("--task-janitor-key-file "), "{missing}");
-}
-
-/// The janitor flags with a key file in `dir`, a sweep every minute, nothing paused.
-fn janitor_flags(dir: &Path) -> JanitorFlags {
-    JanitorFlags {
-        key_file: file(dir, "gc.json", GC_KEY, 0o600),
-        interval: Duration::from_secs(60),
-        grace: DEFAULT_GRACE,
-        page: PageSize::new(2).expect("a page"),
-        pause: Duration::ZERO,
-        dry_run: false,
-    }
-}
-
-/// Pack flags for the S3 service at `endpoint`, and packs over them.
-fn packs_at(endpoint: &str, dir: &Path) -> (PackFlags, Packs) {
-    let flags = flags_of(&pack_flags(endpoint, dir))
-        .packs
-        .expect("pack flags");
-    let packs = flags.open(index()).expect("packs");
-    (flags, packs)
-}
-
-/// Asserts that the janitor opened from the flags signs its requests with the key file's key and
-/// no other, against the pack store: a store that takes that key alone has its old orphan
-/// deleted and a `cas/l/` key beside it kept; a store that takes another key refuses the sweep,
-/// which is counted, and keeps both.
-#[tokio::test]
-async fn the_janitor_signs_with_the_key_file_against_the_pack_store() {
-    let dir = scratch_dir("janitor-open");
-    let s3 = FakeS3::start().await;
-    let seeded = s3.store(Capabilities::default());
-    let orphan = key(1, Slot::Pack(0));
-    let large = key(1, Slot::Large(0));
-    let content = format!("cas/l/{}", "cd".repeat(32));
-    for name in [&orphan, &large, &content] {
-        let name = ObjectKey::new(name.as_str()).expect("a key");
-        seeded
-            .put_new(&name, Bytes::from_static(b"x"), None)
-            .await
-            .expect("seeded");
-    }
-    let (pack_flags, packs) = packs_at(s3.endpoint(), dir.path());
-    let flags = janitor_flags(dir.path());
-    let open = || {
-        let readiness = Arc::new(Readiness::default());
-        flags.open(&pack_flags, &packs, index(), readiness)
-    };
-
-    s3.require_credentials("another-key", "another-secret");
-    let wrong = open().expect("opens");
-    wrong.sweep_once().await;
-    assert_eq!(wrong.metrics().get("sweep_errors"), 1);
-    assert_eq!(s3.keys().len(), 3);
-
-    s3.require_credentials("pack-gc", "hunter2");
-    let right = open().expect("opens");
-    right.sweep_once().await;
-    assert_eq!(right.metrics().get("reaped"), 2);
-    assert_eq!(s3.keys(), [content]);
-}
-
-/// Asserts what opening refuses: a key file that is missing, and an endpoint that is no URL; and
-/// that with no janitor flags nothing is opened, and with them but no packs or index it is an
-/// error that names the flags.
-#[tokio::test]
-async fn opening_refuses_what_cannot_work() {
-    let dir = scratch_dir("janitor-refuse");
-    let s3 = FakeS3::start().await;
-    let (pack_flags, packs) = packs_at(s3.endpoint(), dir.path());
-    let readiness = Arc::new(Readiness::default());
-    let mut flags = janitor_flags(dir.path());
-
-    flags.key_file = dir.path().join("none.json");
-    let error = flags.open(&pack_flags, &packs, index(), Arc::clone(&readiness));
-    assert!(matches!(error, Err(JanitorFlagError::Key { .. })));
-
-    let flags = janitor_flags(dir.path());
-    let mut broken = pack_flags.clone();
-    broken.endpoints = vec!["not a url".to_owned()];
-    let error = flags.open(&broken, &packs, index(), Arc::clone(&readiness));
-    let error = error.err().expect("refused").to_string();
-    assert!(error.starts_with("--pack-store-endpoint "), "{error}");
-
-    let index = index();
-    let none = super::open(None, None, None, None, &readiness).expect("opens");
-    assert!(none.is_none());
-    let asked = Some(&flags);
-    let error = super::open(asked, None, None, Some(&index), &readiness);
-    let error = error.err().expect("refused").to_string();
-    assert!(error.contains("--task-janitor-key-file needs"), "{error}");
-    let opened = super::open(
-        asked,
-        Some(&pack_flags),
-        Some(&packs),
-        Some(&index),
-        &readiness,
-    );
-    assert!(opened.expect("opens").is_some());
-}
-
-/// Asserts the whole path from the flags: a frontend started with the janitor flags over a store
-/// on loopback sweeps it as it serves, deleting the old orphan pack and large object under
-/// `cas/b/` and leaving a `cas/l/` key, and counts it on `GET /metrics`. The orphans carry the
-/// minute 1, so they are old at any time the sweep runs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_with_the_janitor_flags_sweeps_the_store_as_it_serves() {
-    let s3 = FakeS3::start().await;
-    let dir = scratch_dir("janitor-frontend");
-    let seeded = s3.store(Capabilities::default());
-    let content = format!("cas/l/{}", "ef".repeat(32));
-    let names = [
-        key(1, Slot::Pack(0)),
-        key(1, Slot::Large(0)),
-        content.clone(),
-    ];
-    for name in &names {
-        let name = ObjectKey::new(name.as_str()).expect("a key");
-        let body = Bytes::from_static(b"x");
-        seeded.put_new(&name, body, None).await.expect("seeded");
-    }
-    let secret = file(
-        dir.path(),
-        "task.secret",
-        "0123456789abcdef0123456789abcdef",
-        0o600,
-    );
-    let gc = file(dir.path(), "gc.json", GC_KEY, 0o600);
-    let mut more = pack_flags(s3.endpoint(), dir.path());
-    more.extend([
-        format!("--task-secret-file={}", secret.display()),
-        "--task-out-root=/mnt/ts/put".to_owned(),
-        format!("--task-janitor-key-file={}", gc.display()),
-        "--task-janitor-interval-secs=1".to_owned(),
-    ]);
-    let flags = flags_of(&more);
-    assert!(flags.janitor.is_some());
-    let handle = started(&flags, Some(index())).expect("starts");
-    let api = handle.api.expect("the operator API");
-    let mut sweeps = handle.janitor_sweeps().expect("a janitor");
-    let served = tokio::spawn(handle.serve());
-
-    // Each sweep that ends is told, so the scrape is repeated per sweep and not per time.
-    let mut text = scrape(api).await;
-    while !text.contains("kbf_cas_b_janitor_reaped_total 2\n") {
-        sweeps.changed().await.expect("the janitor runs");
-        text = scrape(api).await;
-    }
-
-    assert!(s3.keys().contains(&content), "{:?}", s3.keys());
-    assert!(!s3.keys().contains(&names[0]));
-    assert!(!s3.keys().contains(&names[1]));
-    assert!(text.contains("kbf_cas_b_janitor_sweeps_total"), "{text}");
-    served.abort();
-}
-
-/// Asserts that a frontend without the janitor flags exposes no janitor family and sweeps nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_without_the_janitor_flags_has_no_janitor() {
-    let s3 = FakeS3::start().await;
-    let dir = scratch_dir("janitor-off");
-    let flags = flags_of(&pack_flags(s3.endpoint(), dir.path()));
-    assert_eq!(flags.janitor, None);
-    let handle = started(&flags, Some(index())).expect("starts");
-    let api = handle.api.expect("the operator API");
-    let served = tokio::spawn(handle.serve());
-
-    let text = scrape(api).await;
-
-    assert!(!text.contains("kbf_cas_b_janitor_"), "{text}");
-    served.abort();
 }
 
 /// Asserts that leadership lost as a delete is made stops the next delete of the same page: one

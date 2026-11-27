@@ -7,7 +7,9 @@
 //!   `cached_result` set, and nothing runs;
 //! - the `Action`, its `Command` and its whole input tree must be in the CAS (the Command is
 //!   read while the tree is walked, `execution_inputs.rs`); every blob that is not is listed
-//!   in one FAILED_PRECONDITION, a `MISSING` violation each;
+//!   in one FAILED_PRECONDITION, a `MISSING` violation each. Once the walk has read every
+//!   Directory and the Command is decoded, the [`Dispatch`] is asked to start the action
+//!   tree's write ([`Dispatch::start_tree`]) while the walk asks whether the files are held;
 //! - the request goes to the [`Dispatch`], which joins a running twin (in-flight dedup) or
 //!   starts a new operation;
 //! - the call streams the operation: `QUEUED`, `EXECUTING` once its job has started, then
@@ -93,6 +95,7 @@ use kbf_invocation::{CallKind, Evidence, ExecuteAnswer};
 
 use crate::backend::Backend;
 use crate::described::Described;
+use crate::early_tree::HeldFinding;
 use crate::metrics::{CacheMetrics, OpenExecute};
 use crate::recorder::{ActionLabel, ExecuteCall, Recorder, listing};
 use crate::request_metadata::CallMetadata;
@@ -230,6 +233,18 @@ pub trait Dispatch: Send + Sync + 'static {
     /// Asks the job of the unfinished operation called `name` to stop; its callers are then
     /// answered CANCELLED. False when no unfinished operation has that name.
     fn cancel(&self, name: &str) -> bool;
+
+    /// Starts writing the action tree of `action`, whose Action and Command are `decoded`,
+    /// before its Execute has finished its input check: the Execute has read every Directory of
+    /// the tree and is still asking the store whether the files are held. No operation is opened
+    /// and nothing is recorded: the run that a later [`Dispatch::submit`] of the action starts
+    /// takes the write instead of writing the tree itself. `finding` says whether the Execute
+    /// found every input held; until it says so, nothing the write did may be trusted by a later
+    /// run without a check. Called on the Execute's own task, so it must not block. By default
+    /// nothing is started, and each run writes its own tree.
+    fn start_tree(&self, action: Digest, decoded: Arc<DecodedAction>, finding: HeldFinding) {
+        let _ = (action, decoded, finding);
+    }
 }
 
 /// `f` of `dispatch`, on the runtime's blocking pool: a dispatcher may read or write the state

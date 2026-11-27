@@ -124,7 +124,7 @@ fn fixture(text: &str) -> Value {
     serde_json::from_str(text).expect("the fixture is JSON")
 }
 
-// The wrapper crates `kbf-caps`, `kbf-estimator`, `kbf-sim`, `kbf-state` and `kbf-usage` keep
+// The wrapper crates `kbf-caps`, `kbf-sim` and `kbf-state` keep
 // their `js-*` dependencies, so they are not checked here: only the scheduler's server crates and
 // the lease client are. That no scheduler package is in the lock file at all is `no_scheduler_package`.
 /// Asserts that no workspace member reaches `js-server-core` or `js-store` through a normal, dev

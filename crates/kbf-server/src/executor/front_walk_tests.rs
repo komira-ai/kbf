@@ -7,11 +7,12 @@
 //! the Command the Execute decoded, which its submission carries, so each is read once per
 //! Execute; a run with no decode (an operation taken up from another process) reads them.
 
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use kbf_auth::Authorizers;
 use kbf_front::prepare_run::{ClosureLimits, DIRECTORY_MEMORY_BYTES, DirectoryCache};
-use kbf_front::{Closer, Dispatch, ExecutionService, Stage, Submission, Ticket};
+use kbf_front::{Closer, Dispatch, ExecutionService, HeldFinding, Stage, Submission, Ticket};
 use kbf_meta::{ActionRecord, Role};
 use kbf_proto::reapi::execution_server::Execution as _;
 use kbf_proto::reapi::{ActionResult, DirectoryNode, ExecuteRequest};
@@ -138,13 +139,24 @@ impl Storage for Recording {
     }
 }
 
-/// The frontend's own preparation, made by the rig once it has its backend.
+/// The frontend's own preparation, made by the rig once it has its backend, counting the runs
+/// it prepared with their closure and the closures it collected ahead of their runs.
 #[derive(Default)]
-struct Real(OnceLock<PutDirPrep>);
+struct Real(OnceLock<PutDirPrep>, AtomicUsize, AtomicUsize);
 
 impl Real {
     fn prep(&self) -> &PutDirPrep {
         self.0.get().expect("the rig made it")
+    }
+
+    /// The runs prepared with their closure so far.
+    fn prepared(&self) -> usize {
+        self.1.load(Ordering::SeqCst)
+    }
+
+    /// The closures collected ahead of their runs so far.
+    fn collected(&self) -> usize {
+        self.2.load(Ordering::SeqCst)
     }
 }
 
@@ -158,7 +170,17 @@ impl RunPrepare for Real {
         now: SystemTime,
         wall: Duration,
     ) -> Result<PreparedPutDir, PrepareError> {
+        self.1.fetch_add(1, Ordering::SeqCst);
         RunPrepare::prepare_put_dir(self.prep(), run, action, decoded, now, wall).await
+    }
+
+    async fn collect_unchecked(
+        &self,
+        action: &kbf_types::Digest,
+        decoded: &Action,
+    ) -> Result<(KeptClosure, PrepareTook), PrepareError> {
+        self.2.fetch_add(1, Ordering::SeqCst);
+        RunPrepare::collect_unchecked(self.prep(), action, decoded).await
     }
 
     async fn mint_put_dir(
@@ -172,10 +194,18 @@ impl RunPrepare for Real {
     }
 }
 
-/// A dispatch that takes every submission, keeps it, and runs nothing: the executor's part here
-/// is the facts and the mint the test asks for itself.
+/// A dispatch that takes every submission, keeps it, and runs nothing, and keeps the tree write
+/// each Execute starts without starting it: the executor's part here is the facts, the mint and
+/// the tree's start the test asks for itself.
 #[derive(Default)]
-struct Taken(Mutex<Vec<Submission>>);
+struct Taken(Mutex<Vec<Submission>>, Mutex<Vec<Started>>);
+
+/// A tree write an Execute started: its action, its decode and the finding it is told.
+type Started = (
+    kbf_types::Digest,
+    Arc<kbf_front::DecodedAction>,
+    HeldFinding,
+);
 
 impl Taken {
     /// The decode the one submission taken carries.
@@ -208,6 +238,16 @@ impl Dispatch for Taken {
     fn cancel(&self, _name: &str) -> bool {
         false
     }
+
+    fn start_tree(
+        &self,
+        action: kbf_types::Digest,
+        decoded: Arc<kbf_front::DecodedAction>,
+        finding: HeldFinding,
+    ) {
+        let mut started = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        started.push((action, decoded, finding));
+    }
 }
 
 /// The rig over the recording node, its Execution service over the same backend, and the log.
@@ -216,6 +256,7 @@ struct Walking {
     service: ExecutionService<Taken>,
     taken: Arc<Taken>,
     log: Arc<Log>,
+    real: Arc<Real>,
     _closer: Closer,
 }
 
@@ -225,7 +266,7 @@ fn walking() -> Walking {
     let stash: Arc<OnceLock<Backend>> = Arc::new(OnceLock::new());
     let (made, stashed, recording) = (Arc::clone(&real), Arc::clone(&stash), Arc::clone(&log));
     let rig = Rig::reading_through(
-        real,
+        Arc::clone(&real) as Arc<dyn RunPrepare>,
         move |packs, backend| {
             let prep = PutDirPrep::new(
                 backend.clone(),
@@ -261,6 +302,7 @@ fn walking() -> Walking {
         service,
         taken,
         log,
+        real,
         _closer: closer,
     }
 }
@@ -463,3 +505,6 @@ async fn a_run_with_no_decode_reads_the_action_and_the_command_itself() {
         "the facts read both, the closure the Action"
     );
 }
+
+#[path = "front_early_tests.rs"]
+mod early;

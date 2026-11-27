@@ -432,7 +432,7 @@ ranges are queued as reads ahead of the job, so its files are fetched while the 
 | 2 | js-agent 0.1.250 or later (komira-ai/jobscheduler#899) | done: those nodes run js-agent 0.1.401 |
 | 3 | the node's tierstore serves the provider socket, and its agent is started with it | done on all six build nodes, by the deploy record; the files are root-only and were not re-read for this page |
 | 4 | each agent reports the capability `mount-provider.tierstore` | not checked: the job service's list of agents needs an operator's token |
-| 5 | the frontend's `executor-input-tree = "provider"` | not done: Linux jobs use the default, `manifests` |
+| 5 | the frontend's `executor-input-tree = "provider"` | done after this page was written: the whole frontend, not one lane; measured in [`docs/measurements/provider-input-tree-linux.md`](../measurements/provider-input-tree-linux.md) |
 
 **Measured so far.**
 - **At kbf:** the executor's `start_ms` p50 was 184 ms for a Mac job, which is always the list form
@@ -440,7 +440,8 @@ ranges are queued as reads ahead of the job, so its files are fetched while the 
   join of the morning of 2026-11-25, over starts of at most 5 s. The forms differ in more than the tree,
   so 60 ms bounds what the list form adds at kbf; it does not measure it.
 - **At the host:** `Prepare`'s time has not been measured on Linux, and the Macs' agent logs were not
-  in the join. No Linux job has run in the provider form on the farm.
+  in the join. No Linux job had run in the provider form on the farm when this page was written;
+  item 1a's measurement is in `docs/measurements/provider-input-tree-linux.md`.
 
 **What blocks the switch, in order:**
 1. **Step 4**, which an operator can read in a minute from the job service's list of agents. A node
@@ -978,6 +979,6 @@ on today's code. No test asserts timing (T10): waits are shown with gates and ex
 | the size of real tree lists on the farm, and the base tree's entry count | the Mac lists were not sampled |
 | SHA extensions on the farm's Linux hosts | taken as absent, the slower case |
 | the network rate for a multi-MB fill | given as a range in 4.7 |
-| `Prepare`, the placement and the agent's mount on Linux | no Linux job has run in the provider form; the Macs' agent logs were not in the join (item 1a) |
+| `Prepare`, the placement and the agent's mount on Linux | no Linux job had run in the provider form; the Macs' agent logs were not in the join. Measured since, as the agent's wait on them, in `docs/measurements/provider-input-tree-linux.md` (item 1a) |
 | step 4 of 4.3, each agent's capability | the job service's list of agents needs an operator's token |
 | how many jobs a host runs at once, and so how many lists are held | not in the per-attach line |

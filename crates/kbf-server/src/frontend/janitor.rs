@@ -17,7 +17,15 @@
 //!    hours);
 //! 2. is not under verification: every key of the key set an ingest is working on is held in the
 //!    packs' [`kbf_front::VerifyingKeys`] until the ingest ends; and
-//! 3. is not recorded in the pack index, asked again for that one key just before its delete.
+//! 3. is not an object of a put directory an open operation's row names
+//!    ([`crate::executor::rows::OpRow::key`], read once a page after the pack index's answer and
+//!    before the page's deletes): an operation whose job is queued or running, or is taken up
+//!    again by another frontend, keeps its directory whatever its age; and
+//! 4. is not recorded in the pack index, asked again for that one key just before its delete.
+//!
+//! A row of the operations that cannot be read (corrupt, or of a later release) stops the sweep
+//! before the page's deletes and is counted in `sweep_errors`: what it names is not known. A
+//! frontend with no state store runs no operations, and nothing is named.
 //!
 //! **The invariant that makes a delete safe.** The janitor takes a claim on the key in the same
 //! registry the ingests hold keys in, after the index's last answer for the page and held through
@@ -56,8 +64,13 @@
 //! **The pace.** A sweep lists `--task-janitor-page-size` keys at a time and waits
 //! `--task-janitor-page-pause-ms` after each page, so it deletes at most that many keys in that
 //! long; a sweep starts every `--task-janitor-interval-secs`, on the leader only (the server
-//! that holds the scheduler role). `--task-janitor-dry-run` counts and logs what a sweep would
-//! delete and deletes nothing.
+//! that holds the scheduler role).
+//!
+//! **A dry run by default.** Without `--task-janitor-apply` a sweep deletes nothing: it counts
+//! and logs what it would delete (`kbf_cas_b_janitor_would_reap_total`), and
+//! `kbf_cas_b_janitor_apply` is 0. `--task-janitor-dry-run`, which earlier releases took to
+//! turn deletes off, is still accepted, says the same as leaving `--task-janitor-apply` out, and
+//! is refused beside it.
 //!
 //! Off unless `--task-janitor-key-file` is given.
 
@@ -75,12 +88,14 @@ use kbf_front::{Packs, VerifyingKeys};
 use kbf_objstore::s3::Credentials;
 use kbf_objstore::{Capabilities, ObjectStore, PageSize};
 use kbf_pack::{
-    SWEPT_PREFIX, SweepConfig, SweepError, SweepGates, SweepReport, Sweeper, task_key_age,
+    NamedOf, SWEPT_PREFIX, SweepConfig, SweepError, SweepGates, SweepReport, Sweeper, none_named,
+    task_key_age,
 };
 use kbf_pack_index::PackIndex;
 use zeroize::Zeroizing;
 
 use super::pack_flags::PackFlags;
+use crate::executor::rows::Rows;
 use crate::health::Readiness;
 use crate::token::read_owner_only;
 
@@ -90,6 +105,7 @@ const GRACE: &str = "task_janitor_grace_secs";
 const PAGE_SIZE: &str = "task_janitor_page_size";
 const PAGE_PAUSE: &str = "task_janitor_page_pause_ms";
 const DRY_RUN: &str = "task_janitor_dry_run";
+const APPLY: &str = "task_janitor_apply";
 const SECRET: &str = "task_secret_file";
 
 /// The margin above the age an ingest refuses a key at that the grace must have: holds and
@@ -143,8 +159,8 @@ const MAX_FILE_BYTES: usize = 4096;
 /// What a key file that is not the JSON of a GC key is told.
 const NOT_KEY: &str = "not JSON of exactly access_key_id, secret_access_key and prefix";
 
-/// The six flags.
-pub(super) fn args() -> [Arg; 6] {
+/// The seven flags.
+pub(super) fn args() -> [Arg; 7] {
     [
         Arg::new(KEY_FILE)
             .long("task-janitor-key-file")
@@ -155,13 +171,16 @@ pub(super) fn args() -> [Arg; 6] {
                 "Turns on the janitor of `cas/b/`: it deletes the task packs and large objects \
                  nothing recorded (a refused run, an unused key, a large object already copied \
                  into the CAS) once they are older than `--task-janitor-grace-secs`, are not \
-                 under verification and are not in the pack index. The file is the tier \
+                 under verification, are not in a put directory an open operation names and \
+                 are not in the pack index; without `--task-janitor-apply` it only counts them. \
+                 The file is the tier \
                  store's GC key, `{\"access_key_id\": \"...\", \"secret_access_key\": \"...\", \
                  \"prefix\": \"cas/b/\"}` (the prefix must be exactly `cas/b/`), owned by this \
                  user and readable by it alone (mode 0600 or 0400); it is used against \
                  `--pack-store-endpoint`'s store, which this needs. The janitor never lists or \
                  deletes under `cas/l/`, `cas/f/` or `cas/d/`. Runs on the leader only. Needs \
-                 `--task-secret-file` and `--pack-store-endpoint`. Left out, nothing is deleted",
+                 `--task-secret-file` and `--pack-store-endpoint`. Left out, nothing is listed \
+                 or deleted",
             ),
         Arg::new(INTERVAL)
             .long("task-janitor-interval-secs")
@@ -203,12 +222,26 @@ pub(super) fn args() -> [Arg; 6] {
                  the next, at most 60000: with `--task-janitor-page-size`, the most keys a \
                  second it lists and deletes. Used only with `--task-janitor-key-file`",
             ),
+        Arg::new(APPLY)
+            .long("task-janitor-apply")
+            .action(clap::ArgAction::SetTrue)
+            .requires(KEY_FILE)
+            .help(
+                "Delete what the janitor of `cas/b/` finds. Left out, each sweep is a dry run: \
+                 it counts and logs what it would delete, and deletes nothing. Needs \
+                 `--task-janitor-key-file`",
+            ),
+        // Taken by earlier releases to turn deletes off, which is now the default: still
+        // accepted, so a config file that says it still loads, and refused beside the flag that
+        // says the opposite.
         Arg::new(DRY_RUN)
             .long("task-janitor-dry-run")
             .action(clap::ArgAction::SetTrue)
+            .conflicts_with(APPLY)
+            .hide(true)
             .help(
-                "Log and count the keys the janitor would delete, and delete none. Used only \
-                 with `--task-janitor-key-file`",
+                "Accepted from earlier releases: a sweep is a dry run unless \
+                 `--task-janitor-apply` is given, which this is refused beside",
             ),
     ]
 }
@@ -226,8 +259,8 @@ pub struct JanitorFlags {
     pub page: PageSize,
     /// `--task-janitor-page-pause-ms`.
     pub pause: Duration,
-    /// `--task-janitor-dry-run`.
-    pub dry_run: bool,
+    /// `--task-janitor-apply`: the sweeps delete; without it they only count.
+    pub apply: bool,
 }
 
 /// The setting the flags in `m` make: `None` unless `--task-janitor-key-file` is given.
@@ -243,7 +276,7 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<JanitorFlags> {
         grace: secs(GRACE),
         page: PageSize::new(page).unwrap_or(PageSize::MAX),
         pause: Duration::from_millis(pause),
-        dry_run: m.get_flag(DRY_RUN),
+        apply: m.get_flag(APPLY),
     })
 }
 
@@ -322,12 +355,15 @@ pub(super) fn read_gc_key(path: &Path, prefix: &str, sweeper: &str) -> Result<Cr
 /// `kbf_cas_b_janitor_...`; each one's `# HELP` line says what it counts.
 #[derive(Debug, Default)]
 pub struct JanitorMetrics {
+    /// The sweeps delete (`--task-janitor-apply`).
+    apply: bool,
     sweeps: AtomicU64,
     sweep_errors: AtomicU64,
     listed: AtomicU64,
     kept_young: AtomicU64,
     kept_verifying: AtomicU64,
     kept_referenced: AtomicU64,
+    kept_named: AtomicU64,
     kept_unparsed: AtomicU64,
     kept_outside: AtomicU64,
     reaped: AtomicU64,
@@ -359,6 +395,7 @@ impl JanitorMetrics {
         add(&self.kept_young, report.young);
         add(&self.kept_verifying, report.verifying);
         add(&self.kept_referenced, report.referenced);
+        add(&self.kept_named, report.named);
         add(&self.kept_unparsed, report.strays.len());
         add(&self.kept_outside, report.outside);
         add(&self.reaped, report.deleted);
@@ -396,6 +433,7 @@ impl JanitorMetrics {
             "kept_young" => &self.kept_young,
             "kept_verifying" => &self.kept_verifying,
             "kept_referenced" => &self.kept_referenced,
+            "kept_named" => &self.kept_named,
             "kept_unparsed" => &self.kept_unparsed,
             "kept_outside" => &self.kept_outside,
             "abandoned" => &self.abandoned,
@@ -408,6 +446,13 @@ impl JanitorMetrics {
 
     /// Appends the families to `out` in the Prometheus text format.
     pub fn render(&self, out: &mut String) {
+        let apply = "kbf_cas_b_janitor_apply";
+        let _ = writeln!(
+            out,
+            "# HELP {apply} 1 when the sweeps delete (--task-janitor-apply), 0 when each is a \
+             dry run.\n# TYPE {apply} gauge\n{apply} {}",
+            u8::from(self.apply)
+        );
         let counters = [
             (
                 "sweeps",
@@ -417,8 +462,8 @@ impl JanitorMetrics {
             ),
             (
                 "sweep_errors",
-                "Sweeps stopped by an error: the listing or the pack index failed, a delete was \
-                 refused with 401 or 403, or deletes failed several times in a row",
+                "Sweeps stopped by an error: the listing, the pack index or the read of the open \
+                 operations failed, a delete was refused with 401 or 403, or deletes failed several times in a row",
                 &self.sweep_errors,
             ),
             (
@@ -440,6 +485,11 @@ impl JanitorMetrics {
                 "kept_referenced",
                 "Keys kept because the pack index records a pack under them",
                 &self.kept_referenced,
+            ),
+            (
+                "kept_named",
+                "Keys kept because they lie in a put directory an open operation names",
+                &self.kept_named,
             ),
             (
                 "kept_unparsed",
@@ -498,7 +548,12 @@ pub struct Janitor {
 
 impl Janitor {
     /// A janitor over `store` and `index` that sweeps with `config` every `interval`, only while
-    /// `is_leader` says so, never deleting a key `verifying` holds, judging ages by `clock`.
+    /// `is_leader` says so, never deleting a key `verifying` holds or one in a put directory
+    /// `named` answers, judging ages by `clock`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each is one gate or setting of the sweep, named at the one call that opens it"
+    )]
     pub fn new<S: ObjectStore>(
         store: Arc<S>,
         index: Arc<dyn PackIndex>,
@@ -506,6 +561,7 @@ impl Janitor {
         interval: Duration,
         verifying: Arc<VerifyingKeys>,
         is_leader: Box<dyn Fn() -> bool + Send + Sync>,
+        named: NamedOf,
         clock: Clock,
     ) -> Self {
         let gates = SweepGates {
@@ -521,7 +577,12 @@ impl Janitor {
                     .claim(key)
                     .map(|claim| Box::new(claim) as kbf_pack::Claim)
             }),
+            named,
         };
+        let metrics = Arc::new(JanitorMetrics {
+            apply: !config.dry_run,
+            ..JanitorMetrics::default()
+        });
         let sweeper = Arc::new(Sweeper::new(store, index, config, gates));
         let pass: Pass = Box::new(move |now| {
             let sweeper = Arc::clone(&sweeper);
@@ -535,7 +596,7 @@ impl Janitor {
             pass,
             interval,
             clock,
-            metrics: Arc::default(),
+            metrics,
         }
     }
 
@@ -571,8 +632,9 @@ impl Janitor {
 
 impl JanitorFlags {
     /// The janitor these flags describe, over the pack store `store` names with the GC key of
-    /// the key file, asking `index`, never deleting what `packs`' ingests are verifying, and
-    /// sweeping only while `readiness` says this server is the leader. Nothing is sent.
+    /// the key file, asking `index`, never deleting what `packs`' ingests are verifying or a put
+    /// directory an open operation of `rows` names (none without `rows`), and sweeping only while
+    /// `readiness` says this server is the leader. Nothing is sent.
     ///
     /// # Errors
     /// [`JanitorFlagError`]: the key file is missing, not private, not the JSON of a GC key or of
@@ -582,6 +644,7 @@ impl JanitorFlags {
         store: &PackFlags,
         packs: &Packs,
         index: Arc<dyn PackIndex>,
+        rows: Option<Arc<Rows>>,
         readiness: Arc<Readiness>,
     ) -> Result<Janitor, JanitorFlagError> {
         let credentials = read_key(&self.key_file)?;
@@ -593,7 +656,7 @@ impl JanitorFlags {
         let config = SweepConfig {
             grace: self.grace,
             page: self.page,
-            dry_run: self.dry_run,
+            dry_run: !self.apply,
             pause: self.pause,
             ..SweepConfig::default()
         };
@@ -604,20 +667,28 @@ impl JanitorFlags {
             self.interval,
             packs.verifying_keys(),
             Box::new(move || readiness.is_leader()),
+            rows.map_or_else(none_named, named_of),
             Arc::new(SystemTime::now),
         ))
     }
+}
+
+/// The put directories the open operations of `rows` name, read for each page.
+fn named_of(rows: Arc<Rows>) -> NamedOf {
+    Arc::new(move || rows.named_put_dirs().map_err(|error| error.to_string()))
 }
 
 /// The janitor the flags ask for, if they ask for one.
 ///
 /// # Errors
 /// The janitor is on and there are no packs or no pack index, or as [`JanitorFlags::open`].
+/// Without a state store there are no operations, so none names a put directory.
 pub(super) fn open(
     flags: Option<&JanitorFlags>,
     pack_flags: Option<&PackFlags>,
     packs: Option<&Packs>,
     index: Option<&Arc<dyn PackIndex>>,
+    state: Option<&Arc<dyn kbf_state::Store>>,
     readiness: &Arc<Readiness>,
 ) -> Result<Option<Janitor>, Box<dyn Error>> {
     let Some(flags) = flags else {
@@ -626,9 +697,18 @@ pub(super) fn open(
     let (Some(pack_flags), Some(packs), Some(index)) = (pack_flags, packs, index) else {
         return Err("--task-janitor-key-file needs --pack-store-endpoint and --pack-index".into());
     };
-    let janitor = flags.open(pack_flags, packs, Arc::clone(index), Arc::clone(readiness))?;
+    let rows = state.map(|state| Arc::new(Rows::new(Arc::clone(state), "janitor")));
+    let janitor = flags.open(
+        pack_flags,
+        packs,
+        Arc::clone(index),
+        rows,
+        Arc::clone(readiness),
+    )?;
     Ok(Some(janitor))
 }
 
+#[cfg(test)]
+mod flag_tests;
 #[cfg(test)]
 mod tests;

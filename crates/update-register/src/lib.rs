@@ -340,7 +340,10 @@ fn answer(stream: &UnixStream, end: Instant, now: Clock<'_>) -> Result<(), Error
     let mut chunk = [0u8; 128];
     while !text.contains(&b'\n') && text.len() < MAX_ANSWER {
         let read = with_what_is_left(end, now, &mut |wait| {
+            #[cfg(not(target_vendor = "apple"))]
             stream.set_read_timeout(Some(wait))?;
+            #[cfg(target_vendor = "apple")]
+            bound_reads_on_a_mac(stream, wait)?;
             (&*stream).read(&mut chunk)
         });
         match read {
@@ -361,6 +364,21 @@ fn answer(stream: &UnixStream, end: Instant, now: Clock<'_>) -> Result<(), Error
         _ => Err(Error::BadAnswer(
             String::from_utf8_lossy(&text).into_owned(),
         )),
+    }
+}
+
+/// Bounds each read of `stream` by `wait`, on a Mac.
+///
+/// macOS refuses the timeout (`SO_RCVTIMEO`) with `EINVAL` on a socket that is shut down both
+/// ways, which the peer closing does, although what the peer sent before it closed is still
+/// there to read. A read of such a socket cannot wait: it gives that, then the end. So there the
+/// read is made without the bound. `std` refuses a zero timeout as `InvalidInput` too, but
+/// `wait` is never zero ([`remaining`]).
+#[cfg(target_vendor = "apple")]
+fn bound_reads_on_a_mac(stream: &UnixStream, wait: Duration) -> io::Result<()> {
+    match stream.set_read_timeout(Some(wait)) {
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        set => set,
     }
 }
 

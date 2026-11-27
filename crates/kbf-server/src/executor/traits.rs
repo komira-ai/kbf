@@ -8,10 +8,11 @@
 //! fields it does not have, and the frontend's reasons for [`RejectReason`]. The tests have fakes.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::executor::task::RunId;
-use kbf_front::DecodedAction;
+use kbf_front::{DecodedAction, HeldFinding};
 use kbf_proto::reapi::{ActionResult, Digest};
 
 use crate::executor::config::InputTree;
@@ -191,6 +192,24 @@ pub trait Ingest: Send + Sync {
     async fn list_refused(&self, action: &Digest) -> MissPath {
         let _ = action;
         MissPath::Manifests
+    }
+
+    /// Starts writing the action tree of `action` ahead of its run, while the Execute that
+    /// decoded `decoded` still asks the store whether its inputs are held
+    /// ([`kbf_front::Dispatch::start_tree`]): in the form its run will be minted in (a Mac's tree
+    /// list, else [`Ingest::input_tree`] of `configured`). The next [`Ingest::mint`] of `action`
+    /// in that form takes the write instead of collecting a closure and writing the tree itself,
+    /// and its run waits for the write's last object as for its own ([`Ingest::stored`]). The
+    /// tree is remembered for later runs only once every write succeeded and `finding` says the
+    /// Execute found every input held. Must not block. The default starts nothing.
+    fn start_tree(
+        &self,
+        action: &Digest,
+        decoded: Arc<DecodedAction>,
+        configured: InputTree,
+        finding: HeldFinding,
+    ) {
+        let _ = (action, decoded, configured, finding);
     }
 
     /// The form the tree of the next run of `action` is written and mounted in: `configured`,

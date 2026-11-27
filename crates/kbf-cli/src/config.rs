@@ -263,6 +263,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "task-closure-max-digests",
             "task-directory-cache-bytes",
             "task-directory-cache-dir",
+            "task-janitor-apply",
             "task-janitor-dry-run",
             "task-janitor-grace-secs",
             "task-janitor-interval-secs",

@@ -769,6 +769,33 @@ impl PutDirPrep {
         .await
     }
 
+    /// The closure of `action`, whose Action is `decoded`, every `Directory` kept, for an action
+    /// tree written before its Execute's input check has ended: the walk of
+    /// [`PutDirPrep::prepare_put_dir`] without its held check (neither the Execute's finding,
+    /// which is left for a run to take, nor a FindMissing of the Command and the files), and no
+    /// put directory. What is written from it may not be trusted by a later run until the
+    /// Execute found every input held.
+    ///
+    /// # Errors
+    /// [`PrepareError::Closure`]: a Directory is absent, cannot be read or does not decode, or
+    /// the closure is over budget.
+    pub async fn collect_unchecked(
+        &self,
+        action: &Digest,
+        decoded: &reapi::Action,
+    ) -> Result<(KeptClosure, PrepareTook), PrepareError> {
+        let walk = Walk {
+            backend: &self.backend,
+            limits: self.limits,
+            keep: true,
+            cache: self.directories.as_ref(),
+            writes: &self.writes,
+            decoded: Some(decoded),
+            check_held: false,
+        };
+        Ok(keeping_through(&walk, action).await?)
+    }
+
     /// The put directory of the run alone: the checks of [`PutDirPrep::prepare_put_dir`] (the
     /// lease, the expiry, the clock, the mint) and no closure, so nothing is read from the store.
     ///
@@ -831,6 +858,7 @@ async fn put_dir_run(
         cache: directories,
         writes,
         decoded: run.decoded,
+        check_held: true,
     };
     let (kept, took) = keeping_through(&walk, run.action).await?;
     let dir = mint.mint_put_dir(run.lease, run.action, run.now)?;
