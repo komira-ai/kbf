@@ -78,7 +78,7 @@ async fn a_callback_is_answered_without_its_key_and_with_its_status() {
         .list_all_jobs(ListJobsRequest::default())
         .await
         .unwrap();
-    assert_eq!(listed, [read.clone()]);
+    assert_eq!(listed, std::slice::from_ref(&read));
     assert_eq!(server.jobs(), [read]);
 
     let plain = client.submit_job(spec("plain")).await.unwrap();

@@ -384,7 +384,7 @@ pub(super) fn args() -> Vec<Arg> {
             CALLBACK_ORIGIN,
             "executor-callback-origin",
             "URL",
-            "The https origin (https://HOST or https://HOST:PORT) the job service reaches this \
+            "The https origin (https://host or https://host:port) the job service reaches this \
              frontend's operator API at, through kbf-proxy: each job then asks the service to \
              call <origin>/js-done/<reference> when it ends, signed with a key minted for the \
              job, and the call makes the frontend read the job back at once. Polling stays, and \

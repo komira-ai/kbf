@@ -90,7 +90,7 @@ fn the_callback_origin_is_an_https_host_and_port_only() {
     for (given, kept) in [
         ("https://kbf.example", "https://kbf.example"),
         ("HTTPS://kbf.example:8443", "https://kbf.example:8443"),
-        ("https://10.0.0.7:1", "https://10.0.0.7:1"),
+        ("https://192.0.2.7:1", "https://192.0.2.7:1"),
         ("https://[fd00::7]", "https://[fd00::7]"),
         ("https://[fd00::7]:65535", "https://[fd00::7]:65535"),
     ] {
@@ -543,8 +543,15 @@ async fn the_key_and_the_reference_are_in_no_log_line() {
 
     let text = log.text();
     let url = format!("https://kbf.example/js-done/{reference}");
-    for secret in [hex::encode(&key), STANDARD.encode(&key), reference, url] {
-        assert!(!text.contains(&secret), "{secret} is in the log:\n{text}");
+    // A failure names which form leaked, and prints neither the secret nor the log that holds it.
+    let forms = [
+        ("the key in hex", hex::encode(&key)),
+        ("the key in base64", STANDARD.encode(&key)),
+        ("the reference", reference),
+        ("the URL", url),
+    ];
+    for (form, secret) in forms {
+        assert!(!text.contains(&secret), "{form} is in a log line");
     }
     let own: Vec<_> = text
         .lines()
