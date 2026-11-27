@@ -333,10 +333,10 @@ pub fn blob_of(bytes: &[u8]) -> (Digest, Bytes) {
     (kbf_segments::sha256(&bytes), bytes)
 }
 
-/// A blob of `len` bytes that no other of a different `salt` or length shares.
-pub fn blob_len(len: usize, salt: u8) -> (Digest, Bytes) {
+/// A blob of `len` bytes that no other of a different `seed` or length shares.
+pub fn blob_len(len: usize, seed: u8) -> (Digest, Bytes) {
     let bytes: Vec<u8> = (0..len)
-        .map(|i| (i % 251) as u8 ^ salt.wrapping_mul(31))
+        .map(|i| (i % 251) as u8 ^ seed.wrapping_mul(31))
         .collect();
     blob_of(&bytes)
 }

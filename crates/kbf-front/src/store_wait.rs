@@ -336,6 +336,10 @@ impl Waits<'_> {
             self.answered();
             return Next::Answer;
         };
+        if unretried_here() {
+            // A caller with a retry of its own around this call (the start's) makes it again.
+            return Next::Answer;
+        }
         let counted = &self.backoff.counted;
         let op = self.op as usize;
         if counted.down() && self.attempts == 1 {
@@ -417,6 +421,25 @@ impl Waits<'_> {
             other => other,
         }
     }
+}
+
+tokio::task_local! {
+    /// Set while a caller that retries its calls itself makes one attempt ([`unretried`]).
+    static UNRETRIED: ();
+}
+
+/// Runs `attempt` with the retry of the store's calls off: every call to the store under it is
+/// made once, and its first failure is its answer, neither counted as exhausted nor taking the
+/// store as down. For a caller that has a retry of its own around the attempt, with its own
+/// bound (the start's, [`crate::start_retry`]), so that one call is retried by one policy, not
+/// by one inside the other.
+pub(crate) async fn unretried<T>(attempt: impl std::future::Future<Output = T>) -> T {
+    UNRETRIED.scope((), attempt).await
+}
+
+/// Whether the call being made is under [`unretried`].
+fn unretried_here() -> bool {
+    UNRETRIED.try_with(|()| ()).is_ok()
 }
 
 /// A request that got no answer on its last attempt, after the call was retried.
