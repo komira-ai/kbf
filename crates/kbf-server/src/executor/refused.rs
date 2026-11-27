@@ -5,7 +5,8 @@
 //! for an update (`host-held`), or it is tainted (`host-tainted`). None of these says anything of
 //! the action: another host, or the same one later, starts the same job. When the job service
 //! passes the agent's bare code on, it ended the job failed to start without placing it again,
-//! so the executor
+//! and when it ends the job with its own no-capacity, no host had room within the pool's queue
+//! wait: in both cases the executor
 //! submits the operation's next job ([`Verdict::Refused`](super::outcome::Verdict::Refused)),
 //! spending none of the attempts of [`RESUBMITS`](super::outcome::RESUBMITS).
 //!
@@ -35,7 +36,8 @@ pub(crate) const REFUSED_WAIT_CAP: Duration = Duration::from_secs(30);
 /// Why a host would not start a job now: not the action's failure, and not for ever.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Refusal {
-    /// No room: the host's agent found the job does not fit what is free on it.
+    /// No room: the host's agent found the job does not fit what is free on it, or the job
+    /// service found no host with room within the pool's queue wait.
     NoCapacity,
     /// The host is held: drained for an update, or its update halted.
     HostHeld,

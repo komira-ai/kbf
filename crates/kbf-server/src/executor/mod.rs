@@ -59,6 +59,7 @@ mod phases;
 mod probe;
 mod record;
 mod refused;
+mod rerun;
 pub mod rows;
 mod run;
 mod size_class;
@@ -153,6 +154,9 @@ pub(crate) struct Inner {
     pub(crate) ops: Mutex<Ops>,
     /// Whether the job service is busy, and how long the operations wait for it ([`busy`]).
     pub(crate) busy: busy::Busy,
+    /// A number in `[0, 1)` for each wait's jitter: the busy level's ([`busy`]) and a rerun's
+    /// ([`rerun`]).
+    pub(crate) unit: fn() -> f64,
 }
 
 impl Inner {
@@ -185,7 +189,7 @@ impl Executor {
     }
 
     /// [`Executor::new`], with `unit` as the source of the jitter of the waits on a busy job
-    /// service ([`busy`]).
+    /// service ([`busy`]) and before a rerun ([`rerun`]).
     pub(crate) fn with_jitter(
         cfg: Config,
         deps: Deps,
@@ -205,6 +209,7 @@ impl Executor {
                 rows,
                 ops: Mutex::new(ops),
                 busy,
+                unit,
             }),
         })
     }

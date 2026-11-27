@@ -250,11 +250,12 @@ async fn a_job_is_placed_on_a_host_that_reports_no_disk() {
 }
 
 /// Catches the refusal rule swallowing every failure of a submit: a status that is not about
-/// the job (the token is refused, or may not make the call) is still the farm's to run again,
-/// and ends as UNAVAILABLE once its attempts are spent, after three submits.
+/// the job and not the service's load or its refusal to serve this frontend
+/// (`FAILED_PRECONDITION`, `OUT_OF_RANGE`) is still the farm's to run again, and ends as
+/// UNAVAILABLE once its attempts are spent, after three submits.
 #[tokio::test]
 async fn a_refusal_that_is_not_about_the_job_is_still_infrastructure() {
-    for refused in [Code::Unauthenticated, Code::PermissionDenied] {
+    for refused in [Code::FailedPrecondition, Code::OutOfRange] {
         let rig = Rig::start(&[HOST], |_| {}).await;
         for _ in 0..4 {
             rig.fake.inject_on(

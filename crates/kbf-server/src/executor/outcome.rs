@@ -35,7 +35,7 @@
 //! | failed to start quota-unavailable | `lost` | the host's scratch quota is out of order: rerun |
 //! | failed to start files-unsupported | `infra` | `UNAVAILABLE`: the host cannot write the files of a job, rerun |
 //! | failed to start invalid-file | `invalid` | `INVALID_ARGUMENT`: a file of the job is ours to fix |
-//! | failed to start no-capacity (the job service's code: no room within the pool's queue wait) | `infra` | `UNAVAILABLE`: the job service waited for room already, rerun |
+//! | failed to start no-capacity (the job service's code: no room within the pool's queue wait) | `refused` | placed again, spending no attempt, within the action's deadline |
 //! | failed to start, its detail the agent's code no-capacity alone (the job does not fit what is free on the host) | `refused` | placed again, spending no attempt, within the action's deadline ([`refused`](super::refused)) |
 //! | failed to start, its detail host-held alone (the host is drained for an update, or its update halted) | `refused` | placed again, spending no attempt, within the action's deadline |
 //! | failed to start host-tainted | `refused` | placed again, spending no attempt, within the action's deadline |
@@ -48,7 +48,7 @@
 //! | failed to start, any code, its detail naming an object of its tree the store answered 404 for | `infra` | `UNAVAILABLE`: the frontend drops what its memos say of the object and tells its packs of the absence, and the next attempt's tree is checked against the store, rerun |
 //! | failed to start, any code, its detail saying the host refused the job's tree list as not mountable (`tree list not supported: <reason>`) or found no list at its key (`no tree list at <key>`) | `list-refused` | `UNAVAILABLE`: the frontend takes its miss path, and the next attempt's tree is written again (the first time) or as manifests (after); the run is rerun without spending an attempt, up to [`LIST_REFUSALS`] times in an operation |
 //! | failed to start egress-unchecked | `infra` | `UNAVAILABLE`: the host's agent could not check the limits of the job's network, rerun |
-//! | failed to start, any other code or detail | `infra` | `UNAVAILABLE`: rerun |
+//! | failed to start, any other code or detail | `infra` | `UNAVAILABLE`, its message led by the code ([`unnamed`]): rerun |
 //! | in a state this server does not know | `infra` | `UNAVAILABLE`: rerun |
 //! | refused at submit no-capable-host | `invalid` | `INVALID_ARGUMENT`: nothing could ever run it |
 //! | refused at submit wall-time-not-positive | `invalid` | `INVALID_ARGUMENT`: nothing could ever run it |
@@ -60,16 +60,19 @@
 //!
 //! A submit the job service did not take because it is busy or cannot be reached (no answer
 //! within the call's limit, a broken or reset connection, `RESOURCE_EXHAUSTED` or another status
-//! of its load: [`busy`](super::busy)) is not in the table: it decides nothing, and the same
+//! of its load, or a status that it will not serve this frontend now, `UNAUTHENTICATED`,
+//! `PERMISSION_DENIED` or `UNIMPLEMENTED`: [`busy`](super::busy)) is not in the table: it decides nothing, and the same
 //! submit is sent again, under the same id, until the service answers or a caller cancels; it
 //! spends no attempt.
 //!
 //! Every `infra`, `input-failed` and `lost` row is run again, as the operation's next attempt, at most
-//! [`RESUBMITS`] times; then the callers are answered `UNAVAILABLE`. So is `out-of-memory`, and
+//! [`RESUBMITS`] times, each after a wait ([`rerun`](super::rerun)); then the callers are answered
+//! `UNAVAILABLE`. So is `out-of-memory`, and
 //! the callers are answered as the table says. A `list-refused` row is run again too, but its
 //! first [`LIST_REFUSALS`] in an operation spend none of those attempts. A `refused` row (a host
 //! that would not start the job now: no room, or held for an update, or tainted, given as the
-//! agent's bare code, which a job service passes on without placing the job again) is not the
+//! agent's bare code, which a job service passes on without placing the job again; or the job
+//! service's own no-capacity, no host having had room within the pool's queue wait) is not the
 //! action's failure and spends no attempt: the operation places its job again, with a wait
 //! between, while the next job would be submitted before the action's own deadline and at most
 //! [`REFUSED_STARTS`](super::refused::REFUSED_STARTS) times; then the callers are answered
@@ -79,6 +82,14 @@
 //! carries the arguments and the mounts. The agent's detail of a start it refused is a
 //! code (`quota-unavailable`, ...) or text that can quote those: only the code is
 //! read, from the start of the detail, and only the detail's length is logged.
+//!
+//! **A code this server does not name.** A start that failed on a code of the agent's this table
+//! does not name, or on a start-failure code of the job service's this server does not know, is
+//! an `infra` ending whose message (to the callers, and in the log) is led by that code, so two
+//! such failures can be told apart ([`unnamed`]): the agent's leading code
+//! (`some-new-code: the host refused to start the job`) or the job service's number
+//! (`start-failure-12: the job failed to start`), at most [`CODE_BYTES`] of it, and nothing else
+//! of the detail.
 //!
 //! **A lost object.** The detail of a start that failed on any code is also read for one thing
 //! more: 64 lower-case hex digits right before `: upstream 404`, which is how tierstore says the
@@ -494,7 +505,7 @@ fn failed_to_start(job: &Job, result: &JobResult) -> Verdict {
         return verdict;
     }
     match job.start_failure() {
-        StartFailureCode::NoCapacity => infra(job, "the job failed to start: no-capacity"),
+        StartFailureCode::NoCapacity => not_now(job, Refusal::NoCapacity),
         StartFailureCode::StartTimeout => infra(job, "the job failed to start: start-timeout"),
         StartFailureCode::ExclusiveNotReady => {
             infra(job, "the job failed to start: exclusive-not-ready")
@@ -528,9 +539,29 @@ fn failed_to_start(job: &Job, result: &JobResult) -> Verdict {
                 "the host refused to start the job: its agent could not check the limits of \
                  the job's network (egress-unchecked)",
             ),
-            _ => infra(job, "the host refused to start the job"),
+            code => infra(job, &unnamed(code, "the host refused to start the job")),
         },
-        StartFailureCode::Unspecified => infra(job, "the job failed to start"),
+        StartFailureCode::Unspecified => {
+            let number = match job.start_failure {
+                0 => String::new(),
+                number => format!("start-failure-{number}"),
+            };
+            infra(job, &unnamed(&number, "the job failed to start"))
+        }
+    }
+}
+
+/// The most bytes of a code this server does not name that lead a message ([`unnamed`]).
+pub(super) const CODE_BYTES: usize = 64;
+
+/// `what`, led by `code` (a run of lower-case letters, digits and dashes, as [`agent_code`]
+/// reads one, or the job service's number of a code) cut to [`CODE_BYTES`]: what the callers of a
+/// start that failed on a code this server does not name are answered, and what is logged.
+/// `what` alone when `code` is empty.
+fn unnamed(code: &str, what: &str) -> String {
+    match code.get(..CODE_BYTES).unwrap_or(code) {
+        "" => what.to_owned(),
+        code => format!("{code}: {what}"),
     }
 }
 
@@ -561,8 +592,9 @@ pub(super) fn forgotten() -> Settled {
 }
 
 /// What a submit that failed with `error` comes to; `None` when nothing is decided, because
-/// nothing was sent, the answer was lost, or the service is busy ([`busy`]: a
-/// `RESOURCE_EXHAUSTED` among them), and the same submit is sent again.
+/// nothing was sent, the answer was lost, or the service is busy or will not serve this frontend
+/// now ([`busy`]: a `RESOURCE_EXHAUSTED` and an `UNAUTHENTICATED` among them), and the same
+/// submit is sent again.
 pub(super) fn refused(error: &Error) -> Option<Settled> {
     match error {
         error if busy(error) => None,

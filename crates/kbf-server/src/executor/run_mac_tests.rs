@@ -107,10 +107,14 @@ async fn a_mac_jobs_pack_is_read_again_until_the_store_has_it() {
 /// Asserts that a Mac job whose pack is still absent once [`PACK_WAIT`] has passed is the farm's
 /// failure: the action runs again as the next attempt, under a new key, and its caller is
 /// answered from that attempt. Catches a wait that never ends, holding the operation for a pack
-/// its Mac never stores.
+/// its Mac never stores. The action's timeout is the executor's longest, so its deadline leaves
+/// room for the rerun after [`PACK_WAIT`].
 #[tokio::test(start_paused = true)]
 async fn a_mac_jobs_pack_still_absent_after_the_wait_runs_the_action_again() {
     let rig = rig(true).await;
+    if let Ok(facts) = rig.inputs.facts.lock().expect("facts").as_mut() {
+        facts.timeout = Some(rig.cfg.max_run);
+    }
     absent_for(&rig, 2);
     let caller = rig.submit(1);
     ends_well(&rig, &caller, 0, "mac-1").await;

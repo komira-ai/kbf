@@ -31,9 +31,10 @@ fn busy_answer() -> Result<(), Error> {
 }
 
 /// Catches a busy job service read as an answer about the call, and a definite answer read
-/// as a busy service: a lost or reset answer, a connection never made, and the codes of the
-/// service's load are busy; a refusal, a status about the request or the caller, an answer that
-/// cannot be decoded and a request that could never be sent are not.
+/// as a busy service: a lost or reset answer, a connection never made, the codes of the
+/// service's load, and those of a service that will not serve this frontend now
+/// (`UNAUTHENTICATED`, `PERMISSION_DENIED`, `UNIMPLEMENTED`) are busy; a refusal, a status about
+/// the request, an answer that cannot be decoded and a request that could never be sent are not.
 #[test]
 fn a_busy_service_is_told_from_an_answer_about_the_call() {
     let lost = Error::Transport(Broken::Deadline(Duration::from_secs(5)));
@@ -50,6 +51,9 @@ fn a_busy_service_is_told_from_an_answer_about_the_call() {
         Code::Cancelled,
         Code::Unknown,
         Code::Internal,
+        Code::Unauthenticated,
+        Code::PermissionDenied,
+        Code::Unimplemented,
     ] {
         assert!(busy(&status(code)), "{code:?}");
     }
@@ -57,10 +61,7 @@ fn a_busy_service_is_told_from_an_answer_about_the_call() {
         Code::InvalidArgument,
         Code::NotFound,
         Code::AlreadyExists,
-        Code::PermissionDenied,
         Code::FailedPrecondition,
-        Code::Unimplemented,
-        Code::Unauthenticated,
         Code::OutOfRange,
         Code::DataLoss,
     ] {

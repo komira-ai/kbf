@@ -164,9 +164,13 @@ async fn a_cancel_while_a_later_attempt_waits_for_its_tree_submits_nothing_more(
 
 /// Catches tree writes that never end holding a run for good: the wait is held to the
 /// preparation's limit, after which the operation runs again, with no job of the first attempt.
+/// The action's timeout is 600 s, so its deadline leaves room for the rerun after that limit.
 #[tokio::test(start_paused = true)]
 async fn tree_writes_that_never_end_are_held_to_the_preparation_limit() {
     let rig = Rig::start().await;
+    if let Ok(facts) = rig.inputs.facts.lock().expect("facts").as_mut() {
+        facts.timeout = Some(Duration::from_secs(600));
+    }
     rig.ingest.hold_stored.store(true, Ordering::SeqCst);
     let caller = rig.submit(1);
     rig.until("the run waits for its tree", || asked(&rig).len() == 1)

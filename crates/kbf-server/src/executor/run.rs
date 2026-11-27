@@ -18,7 +18,8 @@
 //! because its host could not read a declared input
 //! ([`Ingest::unreadable_input`](super::Ingest::unreadable_input)), which is an ending of the
 //! farm's; an ending of the farm's submits the
-//! operation's next attempt, while it has one ([`RESUBMITS`]); a job its host would not start now
+//! operation's next attempt, while it has one ([`RESUBMITS`]), after a wait that grows, within the
+//! action's deadline ([`super::rerun`]); a job its host would not start now
 //! (no room, the host held for an update, or tainted) is submitted again as the next attempt
 //! after a wait, spending none of those attempts, while the next job would be submitted before
 //! the action's deadline and at most [`REFUSED_STARTS`](super::refused::REFUSED_STARTS) times in
@@ -77,6 +78,7 @@ use super::pace::Pace;
 use super::phases::{Mark, Phase, Timeline};
 use super::record;
 use super::refused::{Refusal, Refusals};
+use super::rerun;
 use super::rows::{Look, OpRow, Opened, Rows, RowsError};
 use super::steps::Step;
 use super::submit::{Booking, Preparer, not_minted, prepare};
@@ -273,13 +275,20 @@ pub(crate) async fn run(
     let mut free_runs = 0_u32;
     // The starts hosts refused for now, each placed again with no attempt spent: from zero too.
     let mut refusals = Refusals::default();
+    // The farm's endings run again after a wait, the n-th waiting after n - 1 others: from zero.
+    let mut reruns = 0_u32;
+    // The action's timeout, which bounds those waits: the default until a run is prepared.
+    let mut timeout = inner.cfg.default_timeout;
     let answer = loop {
         let run = RunId::new(op.id, attempt);
         let mut timeline = Timeline::default();
         timeline.stamp(Mark::Seen, began, &metrics);
         let ended = match attached.take() {
             Some(row) => resume(&inner, &op, run, row, &mut cancel, &mut timeline).await,
-            None => fresh(&inner, &op, run, began, &mut cancel, &mut timeline).await,
+            None => {
+                let marks = (began, &mut timeline);
+                fresh(&inner, &op, run, marks, &mut cancel, &mut timeout).await
+            }
         };
         match ended {
             Ended::Answer(finished) => break Some((run, finished)),
@@ -330,18 +339,31 @@ pub(crate) async fn run(
                 metrics.run_ended(RunEnd::of(&settled));
                 let free = matches!(settled, Settled::ListRefused(_)) && free_runs < LIST_REFUSALS;
                 let spent = attempt.saturating_sub(free_runs + refusals.placed_again());
-                if free || (settled.retried() && spent < RESUBMITS) {
-                    free_runs += u32::from(free);
-                    tracing::warn!(operation = %op.id, %run, ?settled, free, "the run ended for a reason of the farm's: the operation runs again");
+                let again = free || (settled.retried() && spent < RESUBMITS);
+                let deadline = op.created + timeout;
+                let wait = again
+                    .then(|| rerun::before(reruns, (inner.unit)(), Instant::now(), deadline))
+                    .flatten();
+                if let Some(wait) = wait {
+                    (free_runs, reruns) = (free_runs + u32::from(free), reruns + 1);
+                    tracing::warn!(operation = %op.id, %run, ?settled, free, ?wait, "the run ended for a reason of the farm's: the operation runs again after a wait");
                     metrics.attempt_resubmitted();
                     if op.recorded {
                         record::requeued(&inner.deps.recorder, run);
+                    }
+                    tokio::select! {
+                        biased;
+                        () = cancel_asked(&mut cancel) => break Some((run, cancelled())),
+                        () = sleep(wait) => {}
                     }
                     attempt += 1;
                     began = Instant::now();
                     continue;
                 }
                 let mut status = settled.status();
+                if again {
+                    rerun::past_deadline(&mut status, timeout);
+                }
                 if let Some(output) = output {
                     output.attach(&mut status);
                 }
@@ -388,14 +410,15 @@ async fn finish(inner: &Arc<Inner>, op: &Op, run: RunId, finished: Finished) {
     inner.ops().finish(op.id, finished, Instant::now());
 }
 
-/// Runs `run` from its preparation; `began` is when the run was first seen ([`Mark::Seen`]).
+/// Runs `run` from its preparation, setting `timeout_of` to the action's timeout once it is
+/// prepared; `began` is when the run was first seen ([`Mark::Seen`]), stamped on `timeline`.
 async fn fresh(
     inner: &Arc<Inner>,
     op: &Op,
     run: RunId,
-    began: Instant,
+    (began, timeline): (Instant, &mut Timeline),
     cancel: &mut watch::Receiver<bool>,
-    timeline: &mut Timeline,
+    timeout_of: &mut Duration,
 ) -> Ended {
     let metrics = &inner.deps.metrics;
     let action = reapi_digest(&op.key.action);
@@ -419,6 +442,7 @@ async fn fresh(
             return Ended::Again(Settled::Infra(why), None);
         }
     };
+    *timeout_of = prepared.timeout;
     let ready = Instant::now();
     timeline.stamp(Mark::Prepared, ready, metrics);
     let (job, form) = (prepared.spec.job_id.clone(), prepared.form);
