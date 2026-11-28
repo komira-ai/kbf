@@ -40,13 +40,17 @@ use tonic::Code;
 use tonic::codegen::http;
 
 /// The size of each large answer: more than the frontend's connection and the sockets between
-/// it and the client hold at once (hyper keeps 400 KiB of a stream's data, a loopback socket a
-/// few MiB), so while the client is held the frontend still has part of each answer to write.
+/// it and the client hold at once (hyper keeps 400 KiB of a stream's data, the client's
+/// socket [`RECEIVE_BUFFER`]), so while the client is held the frontend still has part of
+/// each answer to write.
 const LARGE: usize = 8 << 20;
 
 /// The flow-control windows the slow client gives, stream and connection: larger than both
 /// answers, so only the client's reading holds an answer back, never the window.
 const WINDOW: u32 = 64 << 20;
+
+/// The slow client's socket receive buffer.
+const RECEIVE_BUFFER: u32 = 64 << 10;
 
 /// What the slow client reads at most at a time, fast and slow, and how long it waits after
 /// each read.
@@ -132,7 +136,13 @@ async fn slow_client(
     held: &Arc<AtomicBool>,
     fast_for: usize,
 ) -> h2::client::SendRequest<Bytes> {
-    let tcp = TcpStream::connect(reapi).await.expect("connect");
+    // A small receive buffer, set before the connection, so the kernel holds little of an
+    // answer the client has not read and the rest stays with the frontend, whose exit loses it.
+    let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+    socket
+        .set_recv_buffer_size(RECEIVE_BUFFER)
+        .expect("a receive buffer size");
+    let tcp: TcpStream = socket.connect(reapi).await.expect("connect");
     let io = Slow {
         tcp,
         held: Arc::clone(held),

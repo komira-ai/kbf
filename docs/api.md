@@ -517,7 +517,8 @@ over a state store (`kbf frontend` requires one):
    handed to its connection, which may still hold part of a large answer (a `BatchReadBlobs`,
    a ByteStream read) for a client that reads it slowly, and a connection sent GOAWAY closes
    only once everything it holds is written. A client that answers nothing at all is closed
-   by the keep-alive (`--http2-keepalive-interval-secs` and `--http2-keepalive-timeout-secs`).
+   by the keep-alive (`--http2-keepalive-interval-secs` and `--http2-keepalive-timeout-secs`);
+   with the keep-alive off, it holds the drain until the operator's hard stop.
    Buck2 sends a cut write again
    from its first byte, on a new connection, at most five times within about two seconds, and
    never asks `QueryWriteStatus`; the frontend accepts a write only from offset 0, and a cut

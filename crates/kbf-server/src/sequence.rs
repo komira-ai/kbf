@@ -22,7 +22,8 @@
 //!    handed to the connection, which may still hold bytes of it for a client that reads
 //!    slowly (a large `BatchReadBlobs`), and a connection sent GOAWAY closes only once all it
 //!    holds is written. A client that answers nothing is closed by the keep-alive
-//!    (`--http2-keepalive-interval-secs`, `--http2-keepalive-timeout-secs`).
+//!    (`--http2-keepalive-interval-secs`, `--http2-keepalive-timeout-secs`); with the keep-alive
+//!    off, it holds the drain until the operator's hard stop.
 //!    A [`DrainTiming::deadline`] (`--drain-deadline`, none by default)
 //!    that passes with executions or calls open does not end the wait or any stream: it logs a
 //!    WARN with the counts and sets `deadline_passed` in the drain status, and the wait goes on.
