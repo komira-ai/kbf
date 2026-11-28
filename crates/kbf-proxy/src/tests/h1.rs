@@ -1,5 +1,6 @@
-//! HTTP/1.1 on the TLS listener: served for `/v1/*`, the update API and the probes, refused
-//! for gRPC, bounded in its head, and made to look like HTTP/2 to the child.
+//! HTTP/1.1 on the TLS listener: served for `/v1/*`, the update API, the probes and the job
+//! service's completion calls, refused for gRPC, bounded in its head, and made to look like
+//! HTTP/2 to the child.
 
 use std::time::Duration;
 
@@ -59,6 +60,28 @@ async fn http11_serves_probes_and_operator_paths() {
 
     let refused = h1(&rig, &pki, &get(OPERATOR, "")).await;
     assert!(status_of(&refused).starts_with("HTTP/1.1 401"), "{refused}");
+    assert_eq!(rig.a().state.dispatches(), 1);
+}
+
+/// Asserts that a completion call over HTTP/1.1, as the job service's sender makes it (a
+/// POST with no body and no credential), reaches the child once, and that another method on
+/// the same path is a 405 there. Catches the completion route refused on HTTP/1.1, which is
+/// the only protocol the job service's sender speaks.
+#[tokio::test(start_paused = true)]
+async fn a_completion_call_is_served_over_http11() {
+    let (rig, pki, _) = tls_rig("h1-callback", Buck2Auth::None).await;
+    let post = "POST /js-done/ref-1 HTTP/1.1\r\nHost: frontend.test\r\nContent-Length: 0\r\n\
+                webhook-id: msg_1\r\nConnection: close\r\n\r\n";
+    let served = h1(&rig, &pki, post).await;
+    assert!(status_of(&served).starts_with("HTTP/1.1 200"), "{served}");
+    let seen = rig.a().state.headers_of("/js-done/ref-1");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].get("webhook-id").map(|v| v.as_bytes()),
+        Some(&b"msg_1"[..])
+    );
+    let read = h1(&rig, &pki, &get("/js-done/ref-1", "")).await;
+    assert!(status_of(&read).starts_with("HTTP/1.1 405"), "{read}");
     assert_eq!(rig.a().state.dispatches(), 1);
 }
 

@@ -158,7 +158,7 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server}
 
 pub use self::command::command;
 pub use self::executor_flags::{ExecutorFlags, JsAgentFlags};
-use self::executor_open::executor_of;
+use self::executor_open::{callback_routes, executor_of};
 pub use self::janitor::{Janitor, JanitorFlagError, JanitorFlags, JanitorMetrics};
 pub use self::job_read::{JobReadError, JobReadFlags, JobTls};
 pub use self::list_sweep::ListSweepFlags;
@@ -1137,6 +1137,7 @@ impl<'a> Prepared<'a> {
             executor.is_some(),
             members.as_ref(),
         ))
+        .merge(callback_routes(executor.as_ref()))
         .merge(metrics_route(
             backend.clone(),
             history.as_ref().map(crate::history::History::stats),

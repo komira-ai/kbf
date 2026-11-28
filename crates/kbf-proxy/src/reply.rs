@@ -175,6 +175,18 @@ pub(crate) fn from_update(reply: UpdateReply) -> Response<ProxyBody> {
     response
 }
 
+/// 405 to a completion call (`/js-done/...`) that is not a POST.
+pub(crate) fn post_only() -> Response<ProxyBody> {
+    let mut response = text(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "a completion call is a POST",
+    );
+    response
+        .headers_mut()
+        .insert(header::ALLOW, HeaderValue::from_static("POST"));
+    response
+}
+
 /// The answer to a method the read-only UI does not take: 405, naming the two it does.
 pub(crate) fn method_not_allowed() -> Response<ProxyBody> {
     let mut response = text(StatusCode::METHOD_NOT_ALLOWED, "the UI is read-only");

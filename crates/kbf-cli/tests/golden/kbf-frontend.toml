@@ -64,6 +64,8 @@ executor-base-tree-timeout-secs = 60
 executor-base-tree-url = "https://api.github.com/repos/komira-ai/kbf/releases"
 # How long one call to the job service may take before it counts as unanswered, in seconds. Used only with `--executor js-agent`
 executor-call-timeout-secs = 5
+# The https origin (https://host or https://host:port) the job service reaches this frontend's operator API at, through kbf-proxy: each job then asks the service to call <origin>/js-done/<reference> when it ends, signed with a key minted for the job, and the call makes the frontend read the job back at once. Polling stays, and ends a job whose call never comes. Unset, the default: no job asks for a call. Set it only once the job service takes callbacks. Used only with `--executor js-agent`
+# executor-callback-origin = "URL"
 # The timeout, in seconds, of an action that names none: at most `--executor-max-run-secs`. Used only with `--executor js-agent`
 executor-default-timeout-secs = 3000
 # The most bytes of a failed job's standard error the frontend writes to its log, at WARN: the end of the stream. 0 writes none. The whole output (up to 8 KiB with standard output) goes with the result either way. Used only with `--executor js-agent`

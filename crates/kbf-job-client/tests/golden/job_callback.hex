@@ -1,0 +1,8 @@
+# Copied unchanged from crates/js-proto/tests/golden/job_callback.hex of komira-ai/jobscheduler at the revision
+# the root Cargo.toml pins; the file names in the comments below are js-proto's own.
+# The bytes the callback status adds to golden/job.hex: the encoding of common::job() with
+# the callback_status of tests/callback.rs (called_back_job) set, after the golden's bytes.
+c2 02 12  08 02  10 03  18 04  22 06 66 61 69 6c 65 64  28 00  30 06
+                                                        # 40 callback_status: state 2 (pending), tries 3, last_try_at_ms 4,
+                                                        #    last_failure "failed", delivered_at_ms 0 (present, so written),
+                                                        #    deadline_at_ms 6

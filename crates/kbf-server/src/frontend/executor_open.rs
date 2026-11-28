@@ -18,6 +18,15 @@ pub(super) struct ExecutorParts {
     pub(super) probe: Arc<dyn crate::health::Probe>,
 }
 
+/// The route the job service calls the executor's jobs back at, on the operator API
+/// (`crate::executor::callback`); none without an executor. Without
+/// `--executor-callback-origin` no job asks for a call, and the route answers every call 404.
+pub(super) fn callback_routes(parts: Option<&ExecutorParts>) -> axum::Router {
+    parts.map_or_else(axum::Router::new, |parts| {
+        crate::executor::callback_routes(parts.executor.callbacks())
+    })
+}
+
 /// The executor `--executor js-agent` describes, with the metrics it counts into; none when
 /// `--executor` is left out, which builds nothing and contacts no job service. The seams are
 /// the frontend's own: the ingest of the packs, the CAS `backend` over the same packs, and the
@@ -65,4 +74,41 @@ pub(super) fn executor_of(
         metrics,
         probe,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower_service::Service as _;
+
+    use super::*;
+    use crate::executor::tests::Rig;
+
+    /// Asserts that the operator API serves the completion route only for a frontend with an
+    /// executor: a GET of `/js-done/<reference>` is 405 (the route takes POST) with one, and
+    /// 404 (no such route) without. Catches the route left off the operator API.
+    #[tokio::test(start_paused = true)]
+    async fn the_completion_route_is_served_only_with_an_executor() {
+        let rig = Rig::start().await;
+        let parts = ExecutorParts {
+            executor: rig.exec.clone(),
+            metrics: Arc::clone(&rig.metrics),
+            probe: Arc::new(rig.exec.probe(Duration::from_secs(1))),
+        };
+        for (parts, status) in [
+            (Some(&parts), StatusCode::METHOD_NOT_ALLOWED),
+            (None, StatusCode::NOT_FOUND),
+        ] {
+            let request = Request::builder()
+                .uri("/js-done/0123")
+                .body(Body::empty())
+                .expect("a request");
+            let answer = callback_routes(parts)
+                .call(request)
+                .await
+                .expect("an answer");
+            assert_eq!(answer.status(), status);
+        }
+    }
 }

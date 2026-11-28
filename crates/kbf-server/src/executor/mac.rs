@@ -353,6 +353,9 @@ pub(super) fn mac_spec(job: MacJob<'_>) -> JobSpec {
         priority: 0,
         labels: job.labels,
         history_key: job.history_key,
+        // kbf reruns a job itself, under a new id (`outcome`): the service is asked for none.
+        retry: None,
+        callback: None,
     }
 }
 

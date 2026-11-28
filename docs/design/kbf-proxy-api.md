@@ -73,7 +73,7 @@ const STREAM_WINDOW_BYTES: u32;              // 256 KiB
 const HEADER_BYTES: u64;                     // 16 KiB, outside the window
 
 // route and auth: pure.
-pub fn route_of(path: &str) -> Route;        // Child(Target) | Ui | Update | Health | Ready | Metrics | Unknown
+pub fn route_of(path: &str) -> Route;        // Child(Target) | Ui | Callback | Update | Health | Ready | Metrics | Unknown
 pub const fn auth_class(r: Route) -> Option<AuthClass>;
 pub fn idle_of(path: &str) -> Idle;          // Never for Execute and WaitExecution, else 7200 s
 pub fn decide(c: AuthClass, m: Buck2Auth, t: &Tokens, p: Presented<'_>) -> Result<(), Refusal>;
@@ -238,6 +238,7 @@ operator token and the Buck2 key are read at start; only the TLS files reload.
 | Update | `/v1/update/frontend*` | operator token; then the built-in handler answers 503 |
 | Probe | `/healthz`, `/readyz` | open |
 | Ui | `/ui`, `/ui/...` | open: no certificate, no token; `GET` and `HEAD` only |
+| Callback | `/js-done/<reference>` (one segment of letters, digits, `-` and `_`, at most 128 bytes) | open: no certificate, no token; `POST` only; the child checks the call's signature |
 | Enroll | `/kbf.enroll.v1.Enroll/` | no certificate and no token at the proxy, in every mode; the child checks the enrollment token |
 
 The modes do not combine. In `bearer` mode a certificate is neither required nor sufficient, and a

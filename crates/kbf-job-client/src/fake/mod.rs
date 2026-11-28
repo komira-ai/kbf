@@ -40,6 +40,13 @@
 //!   job submitted without one is answered with `NETWORK_LEVEL_NONE`, and the two are the same
 //!   job to a repeated submit.
 //! - **File contents are never returned**: every job a call answers has them empty.
+//! - **A callback's key is never returned either**: a job submitted with a `callback` is
+//!   answered with its URL and deadline and an empty `signing_key`, and with a
+//!   `callback_status` of `ARMED` while it is live and `PENDING` once it has ended. The fake
+//!   sends no call. Of the service's checks at submit it keeps two, each `INVALID_ARGUMENT`
+//!   with the service's text: an `https` URL, and a key of 32 to 64 bytes.
+//! - **No job is retried**: every job has one attempt, answered as attempt 0 (which reads as
+//!   1), with no attempt history. A `retry` policy is kept and compared, and never acted on.
 //! - **The bearer token ([`TOKEN`]) is required** on every call, else `UNAUTHENTICATED`. It
 //!   is the service's `default` client: every job a call answers names it in `Job.client`.
 //!
@@ -47,6 +54,7 @@
 //! [`calls`](FakeJobServer::calls) is every request the service handled, decoded; no
 //! authorization value is in it.
 
+mod callback;
 mod http;
 mod service;
 mod state;

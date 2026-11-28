@@ -120,11 +120,13 @@ fn live(state: JobState) -> bool {
 /// token the fake takes (`Job.client`).
 pub const CLIENT: &str = "default";
 
-/// The job as a read answers it: the file contents empty, the host's silence shown while
-/// the job holds the host, and the client that submitted it.
+/// The job as a read answers it: the file contents and the callback's key empty, the
+/// callback's delivery status, the host's silence shown while the job holds the host, and the
+/// client that submitted it.
 fn view(record: &Record, hosts: &BTreeMap<String, Host>) -> Job {
     let mut spec = record.spec.clone();
     spec.files.iter_mut().for_each(|file| file.contents.clear());
+    let callback_status = super::callback::shown(&mut spec, live(record.state));
     let silent = hosts
         .get(&record.host)
         .and_then(|host| host.silent_since_ms)
@@ -144,6 +146,12 @@ fn view(record: &Record, hosts: &BTreeMap<String, Host>) -> Job {
         attempts: 0,
         events: Vec::new(),
         dropped_events: 0,
+        // The fake never retries a job: it has one attempt, which 0 names.
+        attempt: 0,
+        attempt_history: Vec::new(),
+        retry_not_before_ms: None,
+        callback_status,
+        dropped_attempts: 0,
     }
 }
 
@@ -354,6 +362,7 @@ impl State {
         if let Some((_, broken)) = rules.into_iter().find(|(kept, _)| !kept) {
             return Err(Status::invalid_argument(broken));
         }
+        super::callback::check(&spec)?;
         let wall = spec.wall_limit_seconds.unwrap_or(0);
         if wall == 0 {
             let detail = "the job has no wall limit";
@@ -505,6 +514,7 @@ impl State {
             times: Some(record.times),
             usage: None,
             input_failure: record.input_failure.clone(),
+            attempt: 0,
         })
     }
 

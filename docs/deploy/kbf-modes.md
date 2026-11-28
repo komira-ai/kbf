@@ -197,7 +197,13 @@ kbf does not schedule. The job is submitted at once, with no count, queue or cap
 many jobs run, where and when is the job service's. The frontend reads each job back as soon as it
 is submitted; while the job is queued, placed or starting, again after 10 ms, then 20, 40 and so on,
 doubling up to `--executor-poll-ms` (250 ms; 100 to 10000); once it runs, every `--executor-poll-ms`
-until it ends, and answers the operation. Stopping the
+until it ends, and answers the operation. With `--executor-callback-origin` (unset by default) each
+job also asks the job service to call `<origin>/js-done/<reference>` when it ends, signed with a key
+the frontend minted for the job and keeps only in memory; kbf-proxy forwards that path, POST only, to
+the operator API, and a call that verifies makes the frontend read the job back at once instead of
+at its next poll. The reads stay, and end a job whose call never comes. Set it only once the job
+service takes callbacks (jobscheduler's accept release): an earlier one that knows the field refuses
+every such job. No job asks the service for a retry policy. Stopping the
 frontend cancels nothing: its jobs run on, and over a `--state-store` another frontend, or the same
 one restarted, takes the operations up (below). A Linux job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
 the job's arguments are the tool's flags and nothing is mounted into the container. It names no
@@ -402,7 +408,7 @@ adds to the action's timeout), `--executor-failed-stderr-log-bytes` (512, at mos
 none: the end of a failed job's standard error is one WARN line
 of the frontend's log, `the end of the standard error of a job that did not end well`; the whole
 output goes with the result as before), `--executor-max-run-secs` and `--executor-default-timeout-secs`
-(3000), `--executor-call-timeout-secs` (5), `--executor-poll-ms` (250, from 100 to 10000: how often each operation's running job is read back from the job service, and the longest wait between the reads of a job that has not started, which begin 10 ms apart and double), `--executor-prepare-limit-secs` (300: how long a run's input
+(3000), `--executor-call-timeout-secs` (5), `--executor-poll-ms` (250, from 100 to 10000: how often each operation's running job is read back from the job service, and the longest wait between the reads of a job that has not started, which begin 10 ms apart and double), `--executor-callback-origin` (unset: the `https://HOST[:PORT]` the job service calls a job's end back at, through kbf-proxy), `--executor-prepare-limit-secs` (300: how long a run's input
 tree may take to publish). A job is given no network, whatever a `kbf.toml` of the releases before
 said with `--executor-network`. A setting that breaks a rule the executor's safety rests on is
 refused at start, exit status 2. A server that has more than

@@ -43,9 +43,18 @@
 //! [`Front`], which implements the two seams ([`Ingest`], [`Inputs`]) with the
 //! frontend's own packs, CAS, key mint and run preparation. A frontend with no executor answers
 //! every Execute that is not a cache hit `FAILED_PRECONDITION`.
+//!
+//! # The completion callback
+//!
+//! With [`Config::callback_origin`], each job also asks the job service to call this frontend
+//! when it ends ([`callback`]): the call wakes the run's reads, which then read the job at once
+//! instead of at the next poll. The reads stay as they are without it, and they alone end a run
+//! whose call never comes. No job asks the service for a retry policy: kbf reruns a job
+//! itself, under a new id.
 
 mod api;
 mod busy;
+mod callback;
 mod callers;
 mod config;
 mod driver;
@@ -87,6 +96,8 @@ use ops::{Joined, Ops};
 use rows::Rows;
 use run::{Op, Start};
 
+pub use callback::{CallbackOrigin, CallbackOriginError};
+pub(crate) use callback::{Callbacks, routes as callback_routes};
 pub use config::{Config, ConfigError, FINISHED_RETENTION, InputTree, LIVE, NO_CALLER_GRACE};
 pub use driver::Running;
 pub use front::{
@@ -161,6 +172,8 @@ pub(crate) struct Inner {
     /// A number in `[0, 1)` for each wait's jitter: the busy level's ([`busy`]) and a rerun's
     /// ([`rerun`]).
     pub(crate) unit: fn() -> f64,
+    /// The completion calls the runs wait for ([`callback`]).
+    pub(crate) callbacks: Callbacks,
 }
 
 impl Inner {
@@ -214,8 +227,16 @@ impl Executor {
                 ops: Mutex::new(ops),
                 busy,
                 unit,
+                callbacks: Callbacks::new(),
             }),
         })
+    }
+
+    /// The completion calls this executor's runs wait for: what [`callback_routes`] answers
+    /// from.
+    #[must_use]
+    pub(crate) fn callbacks(&self) -> Callbacks {
+        self.inner.callbacks.clone()
     }
 
     /// The job service as a readiness check asks about it: one read of a job no one made, which

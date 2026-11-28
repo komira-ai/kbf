@@ -73,12 +73,12 @@ hyper-util = { version = "0.1.21", default-features = false }
 # (a lease id, say) is the same type in every kbf crate; a test in kbf-integration-test
 # reads Cargo.lock and refuses a second source. The revision is raised by a commit of its
 # own, holding only the raise and the fixes it forces, and the whole CI runs on it.
-js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
-js-proto = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
-js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
-js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
-js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
-js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "7b5563528ec3aa60fae06df2b1af915701351c48" }
+js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "9d647477428178877a24f8c43ae3dcf9646c43a5" }
+js-proto = { git = "https://github.com/komira-ai/jobscheduler", rev = "9d647477428178877a24f8c43ae3dcf9646c43a5" }
+js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "9d647477428178877a24f8c43ae3dcf9646c43a5" }
+js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "9d647477428178877a24f8c43ae3dcf9646c43a5" }
+js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "9d647477428178877a24f8c43ae3dcf9646c43a5" }
+js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "9d647477428178877a24f8c43ae3dcf9646c43a5" }
 # tierstore and objstore-s3 moved to the tierstore repository (https://github.com/komira-ai/tierstore).
 # Both are taken from it at this one revision. The revision is raised by a pull request of
 # its own that runs the whole CI, never along with other changes.

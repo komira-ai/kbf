@@ -230,7 +230,7 @@ pub fn decide(
     presented: Presented<'_>,
 ) -> Result<(), Refusal> {
     match class {
-        AuthClass::Probe | AuthClass::Enroll | AuthClass::Ui => Ok(()),
+        AuthClass::Probe | AuthClass::Enroll | AuthClass::Ui | AuthClass::Callback => Ok(()),
         AuthClass::Operator | AuthClass::Update => token_ok(tokens.operator.as_ref(), presented),
         AuthClass::Worker => match presented.identity {
             None => Err(Refusal::Unauthenticated),
@@ -261,7 +261,11 @@ pub const fn checks_token(class: AuthClass, mode: Buck2Auth) -> bool {
     match class {
         AuthClass::Operator | AuthClass::Update => true,
         AuthClass::Reapi => matches!(mode, Buck2Auth::Bearer),
-        AuthClass::Worker | AuthClass::Enroll | AuthClass::Probe | AuthClass::Ui => false,
+        AuthClass::Worker
+        | AuthClass::Enroll
+        | AuthClass::Probe
+        | AuthClass::Ui
+        | AuthClass::Callback => false,
     }
 }
 
@@ -495,9 +499,14 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_probes_and_the_ui_take_no_credential() {
+    fn enrollment_probes_the_ui_and_completion_calls_take_no_credential() {
         for mode in [Buck2Auth::None, Buck2Auth::Mtls, Buck2Auth::Bearer] {
-            for class in [AuthClass::Enroll, AuthClass::Probe, AuthClass::Ui] {
+            for class in [
+                AuthClass::Enroll,
+                AuthClass::Probe,
+                AuthClass::Ui,
+                AuthClass::Callback,
+            ] {
                 let none = Tokens::default();
                 assert_eq!(decide(class, mode, &none, Presented::default()), Ok(()));
             }
@@ -555,6 +564,7 @@ mod tests {
             AuthClass::Enroll,
             AuthClass::Probe,
             AuthClass::Ui,
+            AuthClass::Callback,
         ] {
             assert!(!checks_token(class, Buck2Auth::Bearer));
         }

@@ -244,6 +244,7 @@ impl Client {
             from_offset: None,
             max_bytes: None,
             follow: None,
+            attempt: None,
         };
         self.call(GET_LOGS, request).await
     }

@@ -29,8 +29,10 @@ use crate::core::{Core, now};
 use crate::limits::h2_server_builder;
 use crate::metrics::Metrics;
 use crate::pool::BoxIo;
-use crate::reply::{from_update, is_grpc, method_not_allowed, refused, text, unknown};
-use crate::route::{Route, Target, auth_class, route_of, ui_method_allowed};
+use crate::reply::{from_update, is_grpc, method_not_allowed, post_only, refused, text, unknown};
+use crate::route::{
+    Route, Target, auth_class, callback_method_allowed, route_of, ui_method_allowed,
+};
 use crate::stream::proxy_child;
 use crate::tls::{Acceptor, Peer, Proto};
 
@@ -123,6 +125,10 @@ impl<U: UpdateHandler + 'static> Service<U> {
         if route == Route::Ui && !ui_method_allowed(request.method()) {
             return method_not_allowed();
         }
+        // A completion call is a POST: anything else is turned away before the child is asked.
+        if route == Route::Callback && !callback_method_allowed(request.method()) {
+            return post_only();
+        }
         // Who may call it, before the call is counted or forwarded.
         if let Err(refused) = admit(&self.core, route, &request, peer) {
             return *refused;
@@ -136,7 +142,7 @@ impl<U: UpdateHandler + 'static> Service<U> {
                 let identity = peer.identity.clone();
                 proxy_child(core, pending, target, request, identity, peer.ip).await
             }
-            Route::Ui => {
+            Route::Ui | Route::Callback => {
                 let core = Arc::clone(&self.core);
                 let target = Target::Operator;
                 let identity = peer.identity.clone();

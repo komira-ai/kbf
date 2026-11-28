@@ -13,7 +13,8 @@ Reads answer anyone who reaches the address: bind it where only operators do. (B
 exceptions are the [enrollment routes](#v1enrolltokens-and-v1enrollnodes), which pass every
 gate of a write even to be read, and the build pages, [`GET /v1/invocations/{id}`](#get-v1invocationsid-and-below)
 and below, and [`GET /v1/blobs`](#get-v1blobsdigest), which run the REAPI policy and are
-off without it. Writes need a token (see [Who may write](#who-may-write)). The roles of
+off without it. Writes need a token (see [Who may write](#who-may-write)), but for the job
+service's [completion calls](#post-js-donereference), which carry a signature instead. The roles of
 [fleet-updates-security.md](design/fleet-updates-security.md) section S9 (`admin` for
 operators, a short-lived `rollout` for CI) are **planned**; the token is the one
 operator credential until they land.
@@ -2025,6 +2026,24 @@ there is nothing to mount it on.
   proxy's address and so share one bound. A path longer than 2048 bytes, or a query longer
   than 4096, is `414`; a path segment longer than 256 bytes, or one that decodes to a
   control character, is `400`.
+
+## `POST /js-done/{reference}`
+
+The job service's completion call of a job the executor submitted, on a frontend started with
+`--executor-callback-origin` ([direct-js.md](design/direct-js.md), "The completion call"). It
+takes no token: kbf-proxy forwards it to the operator listener under an open class of its own,
+`POST` only. The body is empty; the call is authenticated by its Standard Webhooks headers
+(`webhook-id`, `webhook-timestamp`, `webhook-signature`: `v1,` and the base64 of HMAC-SHA256,
+under the key the frontend minted for the job, of `<id>.<timestamp>.<body>`).
+
+- `204`: the reference is one this frontend holds, a signature is the key's and the timestamp is
+  within 5 minutes of the frontend's clock. The job is read back at once. A `webhook-id` already
+  answered for the reference is `204` again and changes nothing.
+- `401`: a header is missing, given twice, empty or not text, the timestamp is out of the
+  tolerance or not a number, or no signature verifies. Nothing changes.
+- `404`: a reference this frontend does not hold (another frontend's, or a job no longer
+  watched). The job service tries again until the call's deadline, 600 s after the job's end.
+- `405` for any other method, `413` for a body over 4096 bytes.
 
 ## `STALE_MAP` on a storage node's gRPC calls
 

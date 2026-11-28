@@ -150,7 +150,8 @@ js-agent`, the only value) with no CPU or memory, the build target and what runs
 the action's kind (what runs) as its size-fallback label.
 kbf does not schedule: how many jobs run, where and when is the job service's. The executor
 reads each job back at once, then while it has not started at waits from 10 ms doubling up to
-`--executor-poll-ms` (250 ms), and every `--executor-poll-ms` until it ends
+`--executor-poll-ms` (250 ms), and every `--executor-poll-ms` until it ends; with
+`--executor-callback-origin` the job service's signed completion call wakes that read at once
 ([direct-js.md](docs/design/direct-js.md)). The job is the
 `kbf-task` tool (crate `kbf-task`), which runs the action's Command and commits its outputs
 into a put directory that the frontend then reads once, hashes and records. With no

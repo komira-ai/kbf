@@ -132,6 +132,17 @@ default, `--ui=false` turns them off. Open: no gate, whatever the REAPI policy s
 | the same, with a trailing slash | `GET /ui/` | [F] | none (open) |
 | every other page and the stylesheet (`/ui/builds`, `/ui/builds/{id}`, `/ui/static/kbf.css`) | `GET /ui/{*rest}` | [F] | none (open) |
 
+### Job completion calls
+
+The job service's call when a job of the executor ends, on a frontend started with
+`--executor-callback-origin` ([api.md](../api.md#post-js-donereference)). No token: the call is
+signed with the key the frontend minted for the job, and kbf-proxy forwards it under an open class
+of its own, POST only.
+
+| Verb | Method and route | Status | Gate |
+|---|---|---|---|
+| wake the read of an ended job | `POST /js-done/{reference}` | [F] | the job's signing key (Standard Webhooks signature, timestamp within 5 minutes) |
+
 ### Health
 
 | Verb | Method and route | Status | Gate |
