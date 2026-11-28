@@ -1,4 +1,4 @@
-//! The job service, as the executor calls it: the five calls it makes, every one bounded.
+//! The job service, as the executor calls it: the six calls it makes, every one bounded.
 //!
 //! The client gives a call its connect timeout and then 30 s. A job service that accepts and
 //! never answers would hold an operation's task for that long a read. Each call here gives up
@@ -39,6 +39,13 @@ impl Api<'_> {
     /// `GetJob`.
     pub(crate) async fn get_job(&self, id: &str) -> Result<Job, Error> {
         self.within(self.client.get_job(id)).await
+    }
+
+    /// Every job of the process `instance` that has not ended, by `ListJobs` page after page
+    /// ([`follow`](super::follow)), the whole listing within the limit of one call.
+    pub(crate) async fn list_live(&self, instance: &str) -> Result<Vec<Job>, Error> {
+        let filter = super::follow::live_jobs(instance);
+        self.within(self.client.list_all_jobs(filter)).await
     }
 
     /// `CancelJob`: idempotent on the job.

@@ -4,7 +4,8 @@
 //! says the job is queued, placed or starting, the next read waits [`FIRST_STEP`], then twice
 //! that, doubling up to the poll ([`Config::poll`](super::Config::poll)); once the job is read
 //! running, or the steps have reached the poll, every read waits the poll, and the steps do not
-//! start again for that job. A job that starts at once is so seen running without a poll's wait,
+//! start again for that job: those reads are the executor's listing of all its jobs, not a read
+//! of this one ([`super::follow`]). A job that starts at once is so seen running without a poll's wait,
 //! and a job that waits for a host is read at most `1 + ceil(log2(poll / FIRST_STEP))` times
 //! before its reads are a poll apart: 6 at the default poll of 250 ms, where the reads go out at
 //! 0, 10, 30, 70, 150 and 310 ms, then every 250 ms.

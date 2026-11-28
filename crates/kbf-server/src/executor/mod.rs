@@ -12,7 +12,8 @@
 //!
 //! Each operation is driven by a task of its own ([`run`]): the job is read back at once, then,
 //! while it has not started, at steps that double up to [`Config::poll`] ([`pace`]), and every
-//! [`Config::poll`] while it runs, until it ends (and less often while the job service is busy or cannot be
+//! [`Config::poll`] while it runs, until it ends, once past its steps by one listing a poll of every
+//! job of the process rather than a read of each ([`follow`]) (and less often while the job service is busy or cannot be
 //! reached, which never ends a run: [`busy`]); an ending of the farm's (the host lost, the job service
 //! restarted, the job failed at its start) submits the operation again as its next attempt, a
 //! new job with a new key, at most [`outcome::RESUBMITS`] times; a job a host would not start now
@@ -49,6 +50,7 @@ mod busy;
 mod callers;
 mod config;
 mod driver;
+mod follow;
 mod front;
 mod front_cache;
 mod histogram;
@@ -158,6 +160,8 @@ pub(crate) struct Inner {
     pub(crate) ops: Mutex<Ops>,
     /// Whether the job service is busy, and how long the operations wait for it ([`busy`]).
     pub(crate) busy: busy::Busy,
+    /// The jobs followed by one listing each poll, not by a read each ([`follow`]).
+    pub(crate) follower: follow::Follower,
     /// A number in `[0, 1)` for each wait's jitter: the busy level's ([`busy`]) and a rerun's
     /// ([`rerun`]).
     pub(crate) unit: fn() -> f64,
@@ -213,6 +217,7 @@ impl Executor {
                 rows,
                 ops: Mutex::new(ops),
                 busy,
+                follower: follow::Follower::default(),
                 unit,
             }),
         })

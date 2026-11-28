@@ -49,7 +49,11 @@ sequenceDiagram
 - **Watching.** The pinned job service has no watch call; each operation's task reads its job as soon as it is submitted,
   then, while the job is queued, placed or starting, after 10 ms, doubling up to `--executor-poll-ms` (250 ms by default), so a
   job that starts at once is not seen a poll late; once it runs, every `--executor-poll-ms` until it ends, then reads its
-  result once. A job read running is read at the poll from then on. While the service is busy or cannot be reached (no answer
+  result once. A job read running is read at the poll from then on. Once a job's reads are a poll apart, the process
+  reads all of its jobs that have not ended with one `ListJobs` a poll (the four live states and its `kbf-instance` label,
+  `crates/kbf-server/src/executor/follow.rs`), not a `GetJob` each; a job not in a listing that started after it was handed
+  over is read once with `GetJob`, as is every job when a listing fails other than for the service's load. A job taken up
+  from another process carries that process's label and is read with `GetJob` each poll until it ends. While the service is busy or cannot be reached (no answer
   within the call timeout, a reset connection, `RESOURCE_EXHAUSTED` and the other codes of its load, or `UNAUTHENTICATED`,
   `PERMISSION_DENIED` and `UNIMPLEMENTED`, a service that will not serve this frontend now), every operation waits
   longer between its calls, from the poll doubling to 40 polls (10 s at the default), one level for the whole frontend; no

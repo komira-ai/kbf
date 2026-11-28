@@ -284,25 +284,30 @@ async fn a_cancel_while_the_service_is_busy_answers_cancelled_and_cancels_the_jo
     );
 }
 
+/// The reads of jobs the job service was sent: its `GetJob` and its `ListJobs`
+/// ([`crate::executor::follow`]).
+fn reads(rig: &Rig) -> usize {
+    rig.calls_of("GetJob") + rig.calls_of("ListJobs")
+}
+
 /// Catches reads of a job on a busy service that end the run or spend an attempt: reads that
-/// hang past the call's limit and reads answered `RESOURCE_EXHAUSTED` or `UNAVAILABLE` are read
-/// again, and the job's own ending answers the callers.
+/// hang past the call's limit and reads answered `RESOURCE_EXHAUSTED` or `UNAVAILABLE`, the
+/// job's own or the listing's, are read again, and the job's own ending answers the callers.
 #[tokio::test(start_paused = true)]
 async fn reads_of_a_job_on_a_busy_service_spend_no_attempt() {
     let rig = Rig::start().await;
     let caller = rig.submit(1);
     let job = rig.submitted(&caller, 0).await;
     rig.host_runs(&job);
-    let reads = rig.calls_of("GetJob");
-    rig.fake.inject_on("GetJob", Fault::Hang);
-    rig.fake.inject_on("GetJob", Fault::Hang);
+    let before = reads(&rig);
+    // The next calls are reads, whichever form they take.
+    rig.fake.inject(Fault::Hang);
+    rig.fake.inject(Fault::Hang);
     for fault in busy_faults(8) {
-        rig.fake.inject_on("GetJob", fault);
+        rig.fake.inject(fault);
     }
-    rig.until("the faults are spent", || {
-        rig.calls_of("GetJob") >= reads + 11
-    })
-    .await;
+    rig.until("the faults are spent", || reads(&rig) >= before + 11)
+        .await;
     assert!(rig.fake.finish(&job, 0));
     assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));
     assert_eq!(rig.fake.jobs().len(), 1);
@@ -313,11 +318,11 @@ async fn reads_of_a_job_on_a_busy_service_spend_no_attempt() {
     }
 }
 
-/// Catches operations that keep polling a busy service at the poll: the level is the
-/// executor's, so while reads are answered `RESOURCE_EXHAUSTED` every operation reads its job
-/// less often. At the poll, two operations would be sent twelve busy answers in six polls;
-/// backing off together, they take more than three times as long. When the service answers,
-/// they read at the poll again.
+/// Catches reads that keep polling a busy service at the poll: the level is the executor's, so
+/// while reads are answered `RESOURCE_EXHAUSTED` the jobs are read less often, the two jobs'
+/// own reads and the listing that follows both. At the poll, twelve busy answers would take
+/// twelve polls at most; backing off, they take more than eighteen. When the service answers,
+/// both jobs are read by one listing a poll again.
 #[tokio::test(start_paused = true)]
 async fn every_operation_reads_less_often_while_the_service_is_busy() {
     let rig = Rig::start().await;
@@ -328,23 +333,24 @@ async fn every_operation_reads_less_often_while_the_service_is_busy() {
     rig.host_runs(&second);
     let faults = 12;
     for fault in busy_faults(faults) {
-        rig.fake.inject_on("GetJob", fault);
+        rig.fake.inject(fault);
     }
-    let before = rig.calls_of("GetJob");
+    let before = reads(&rig);
     let mut polls = 0;
-    while rig.calls_of("GetJob") < before + faults {
+    while reads(&rig) < before + faults {
         rig.advance(rig.cfg.poll).await;
         polls += 1;
         assert!(polls < 400, "the faults were never spent");
     }
     assert!(polls > 18, "twelve busy answers in {polls} polls");
     rig.until("both read at the poll again", || {
-        rig.calls_of("GetJob") >= before + faults + 2
+        reads(&rig) >= before + faults + 2
     })
     .await;
-    let settled = rig.calls_of("GetJob");
+    let settled = reads(&rig);
     rig.advance(rig.cfg.poll).await;
-    assert_eq!(rig.calls_of("GetJob"), settled + 2, "one read each a poll");
+    assert_eq!(reads(&rig), settled + 1, "one listing a poll for both");
+    assert_eq!(rig.exec.inner().follower.following(), 2);
     assert!(rig.fake.finish(&first, 0));
     assert!(rig.fake.finish(&second, 0));
     assert!(matches!(rig.until_done(&one).await, Finished::Ran(_)));
