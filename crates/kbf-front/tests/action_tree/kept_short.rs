@@ -2,9 +2,12 @@
 //! kept cut short (a PUT whose body failed before its first byte, kept as an object of 0 bytes).
 //! It is never named in a tree: the blob's write deletes it and stores the blob, in the same
 //! tree when the write's own attempt left it (a stalled body, tried once more) and in the next
-//! tree when an earlier write did. A store that will not delete it, or a key a create-only
+//! tree when an earlier write did. A stalled body is retried within the write's budget, each
+//! retry waiting on tokio's paused clock. A store that will not delete it, or a key a create-only
 //! write finds taken by one, makes no tree, by name.
 
+use kbf_front::action_tree::PutRetry;
+use kbf_front::store_retry::RetryPolicy;
 use kbf_front::{PackSettings, Packs};
 use kbf_objstore::{Capabilities, MemoryStore, ObjectStore as _};
 use kbf_pack::{PackKeys, WriterKind};
@@ -56,9 +59,9 @@ fn names_the_whole_blob(rig: &Rig, tree: &ActionTree, key: &str, bytes: &Bytes) 
 
 /// Catches: a write whose body stalled, which tierstore answers 400 `RequestTimeout` and its
 /// store keeps as an object of 0 bytes, ending the tree (and every later tree of the blob
-/// finding that object): the write is tried once more, which deletes the object of 0 bytes
-/// and stores the blob, and the tree is made.
-#[tokio::test]
+/// finding that object): the write is retried after the first wait, which deletes the object of
+/// 0 bytes and stores the blob, and the tree is made.
+#[tokio::test(start_paused = true)]
 async fn a_stalled_write_kept_at_0_bytes_is_deleted_and_written_again() {
     let rig = Rig::new().await;
     let (root, blob, key, bytes) = unlocated(&rig).await;
@@ -85,28 +88,48 @@ async fn an_object_of_another_length_at_the_key_is_deleted_and_the_blob_written(
     }
 }
 
-/// Catches: a write that stalls twice tried without end, or a tree that names a blob whose
-/// write failed: the second `RequestTimeout` ends the tree, `why=store`, naming the key and the
-/// store's answer, with the object of 0 bytes left; the next tree deletes it and writes the
-/// blob.
-#[tokio::test]
-async fn a_write_that_stalls_twice_makes_no_tree_and_the_next_tree_repairs_it() {
+/// Catches: a write that stalls twice failing the tree, as when a second stall was final: each
+/// stall is retried within the budget, each retry deleting the object of 0 bytes the stall
+/// left, and the third attempt stores the blob; the tree is made and names it.
+#[tokio::test(start_paused = true)]
+async fn a_write_that_stalls_twice_is_retried_and_the_tree_is_made() {
     let rig = Rig::new().await;
     let (root, blob, key, bytes) = unlocated(&rig).await;
     keeps(&rig, &key, vec![stalled(), stalled()]);
+    let tree = rig.write(&root).await.expect("a tree");
+    names_the_whole_blob(&rig, &tree, &key, &bytes);
+    assert_eq!(rig.farm.puts_of(&blob.hash_hex()), 3);
+    assert_eq!(deletes(&rig), [key.clone(), key]);
+}
+
+/// Catches: a write that stalls without end tried without end, or a tree that names a blob whose
+/// write failed: under a budget of 5 s, the fourth `RequestTimeout` (waits of 0.5, 1 and 2 s
+/// before it) ends the tree, `why=store`, naming the key, the store's answer, the attempts, the
+/// time they took and the budget, with the object of 0 bytes left; the next tree deletes it and
+/// writes the blob.
+#[tokio::test(start_paused = true)]
+async fn a_write_that_keeps_stalling_makes_no_tree_and_the_next_tree_repairs_it() {
+    let policy = RetryPolicy {
+        jitter_percent: 0,
+        ..RetryPolicy::DEFAULT
+    }
+    .with_budget(Duration::from_secs(5));
+    let rig = Rig::with_memo_retry(None, Some(PutRetry::new(policy))).await;
+    let (root, blob, key, bytes) = unlocated(&rig).await;
+    keeps(&rig, &key, (0..4).map(|_| stalled()).collect());
     let refused = rig.write(&root).await.expect_err("no tree");
     assert_eq!(
         refused.to_string(),
         format!(
-            "the write of {key} failed: store answered 400 RequestTimeout: No byte of the request body arrived within 30s."
+            "the write of {key} failed: store answered 400 RequestTimeout: No byte of the request body arrived within 30s. (still failing after 4 attempts over 3.5 s, the budget being 5 s)"
         )
     );
     assert_eq!(refused.why(), "store");
     assert_eq!(rig.farm.object(&key), Some(Bytes::new()));
-    assert_eq!(rig.farm.puts_of(&blob.hash_hex()), 2);
+    assert_eq!(rig.farm.puts_of(&blob.hash_hex()), 4);
     let tree = rig.write(&root).await.expect("a tree");
     names_the_whole_blob(&rig, &tree, &key, &bytes);
-    assert_eq!(deletes(&rig), [key.clone(), key]);
+    assert_eq!(deletes(&rig), [key.clone(), key.clone(), key.clone(), key]);
 }
 
 /// Catches: a create-only write that finds its key taken trusting whatever is there: an object

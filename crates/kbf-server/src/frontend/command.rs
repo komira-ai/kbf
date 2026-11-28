@@ -76,6 +76,7 @@ pub fn command() -> Command {
     .args(drain_flags::args())
     .args(state_wait::args())
     .args(pack_flags::args())
+    .args(pack_flags::retry::args())
     .args(start_wait::args())
     .args(job_read::args())
     .args(task_flags::args())

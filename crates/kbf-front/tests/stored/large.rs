@@ -254,7 +254,7 @@ async fn an_object_already_under_the_key_is_trusted_by_length_only() {
 /// UNAVAILABLE, rather than writing blind.
 #[tokio::test]
 async fn a_store_that_cannot_say_what_is_under_the_key_fails_the_write() {
-    let rig = Rig::new().await;
+    let rig = Rig::unretried().await;
     let (digest, bytes) = blob_len(5000, 11);
     rig.store.fail_len_of(&large_key(&digest));
 
@@ -326,7 +326,7 @@ async fn an_object_that_is_not_its_digest_is_not_served_and_its_row_is_dropped()
 /// object the store cannot read does too, and the same read is served once the store can.
 #[tokio::test]
 async fn an_object_that_cannot_be_read_whole_fails_the_read_unavailable() {
-    let rig = Rig::new().await;
+    let rig = Rig::unretried().await;
     let (digest, bytes) = blob_len(5000, 15);
     let (cut, _) = blob_len(5000, 16);
     rig.store.seed(&large_key(&cut), &bytes[..100]).await;
@@ -353,7 +353,7 @@ async fn an_object_that_cannot_be_read_whole_fails_the_read_unavailable() {
 /// does not end as if it were whole.
 #[tokio::test]
 async fn a_read_that_fails_after_its_first_window_ends_with_the_failure() {
-    let rig = Rig::new().await;
+    let rig = Rig::unretried().await;
     let window = READ_WINDOW_BYTES as usize;
     let (digest, bytes) = blob_len(window + 5000, 17);
     write(&rig, pieces(&digest, &bytes, 1 << 20))

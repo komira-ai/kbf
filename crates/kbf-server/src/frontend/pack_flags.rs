@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Arg, ArgAction, ArgMatches};
 use kbf_front::store_metrics::{Counted, StoreMetrics};
+use kbf_front::store_retry::RetryPolicy;
 use kbf_front::{PackSettings, Packs};
 use kbf_objstore::Capabilities;
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store, S3Tuning};
@@ -179,13 +180,13 @@ pub(super) fn args() -> [Arg; 11] {
                  manifests, roots and lists take 32 slots of their own instead, so they never \
                  wait behind the uploads. A write past it waits at the frontend for one to \
                  end, so a burst queues here and not at the store. A \
-                 pack the store answers 503 SlowDown (it is taking as many uploads as it can) \
-                 is written again after jittered waits that double from about 0.5 s to 8 s, \
-                 holding its slot, for as long as the store answers it; any other 503, to any \
-                 call of the store, is waited out the same way for at most 60 s. The client \
-                 sees the time it takes, and a call whose grpc-timeout passes first is ended \
+                 pack the store fails in a way that may pass (a 503, SlowDown among them, a \
+                 5xx, a dead connection) is written again as `--pack-store-retry-*` say, \
+                 holding its slot, as is every other call of the store. The client sees the \
+                 time it takes, and a call whose grpc-timeout passes first is ended \
                  DEADLINE_EXCEEDED. A streamed upload of a client blob over 64 MiB cannot be \
-                 sent twice, so a 503 fails it. Used only with `--pack-store-endpoint`",
+                 sent twice, so the store's failure fails it UNAVAILABLE, which the client \
+                 makes again. Used only with `--pack-store-endpoint`",
             ),
         Arg::new(WRITER)
             .long("pack-writer")
@@ -240,6 +241,10 @@ pub struct PackFlags {
     pub writer: String,
     /// `--pack-cache-dir` and `--pack-cache-bytes`, both or neither.
     pub cache: Option<(PathBuf, u64)>,
+    /// `--pack-store-retry-*`: how every call to the store is retried once the frontend serves.
+    pub retry: RetryPolicy,
+    /// `--pack-input-walk-secs`: the deadline of an Execute's walk of its input tree.
+    pub input_walk: Duration,
 }
 
 /// The setting the flags in `m` make: `None` unless `--pack-store-endpoint` is given.
@@ -253,6 +258,7 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<PackFlags> {
     let store_writes = m.get_one::<u64>(STORE_WRITES).copied();
     // clap holds the flag to 1..=4096, which every usize holds.
     let store_writes = store_writes.and_then(|n| usize::try_from(n).ok());
+    let (retry, input_walk) = retry::from_matches(m);
     Some(PackFlags {
         endpoints,
         bucket: text(BUCKET),
@@ -272,6 +278,8 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<PackFlags> {
             .get_one::<PathBuf>(CACHE_DIR)
             .cloned()
             .zip(m.get_one::<u64>(CACHE_BYTES).copied()),
+        retry,
+        input_walk,
     })
 }
 
@@ -324,6 +332,8 @@ impl PackFlags {
             upload_idle_timeout: self.upload_idle_timeout,
             cache: cache.map(Arc::new),
             store_writes: self.store_writes,
+            store_retry: self.retry,
+            input_walk: self.input_walk,
             ..PackSettings::default()
         };
         let counted = Arc::new(StoreMetrics::packs());
@@ -420,6 +430,8 @@ fn boot_id() -> String {
     let micros = since.map_or(0, |since| since.as_micros());
     format!("{micros:x}-{:x}", std::process::id())
 }
+
+pub(super) mod retry;
 
 #[cfg(test)]
 mod tests;

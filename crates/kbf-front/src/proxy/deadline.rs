@@ -1,12 +1,12 @@
 //! The deadline of a client's upload into the packs: the `grpc-timeout` the client sent, less a
 //! margin, from when the handler began.
 //!
-//! A write to the store waits out the store's `SlowDown` and waits for one of the frontend's
-//! store-write slots (`crate::store_writes`), for as long as it takes, and a read or a write
-//! waits out the store's other 503s for up to `crate::store_wait::STORE_WAIT`. What bounds that
-//! first is the client: a call whose deadline passes is ended DEADLINE_EXCEEDED, which drops
-//! its request to the store, its wait and its slot, so a store that is busy or failing over is
-//! latency for the client and never UNAVAILABLE. A call without a `grpc-timeout` has no
+//! A write to the store waits for one of the frontend's store-write slots
+//! (`crate::store_writes`), for as long as it takes, and a read or a write is retried while the
+//! store fails in a way that may pass, within the packs' retry budget (`crate::store_wait`). What
+//! bounds that first is the client: a call whose deadline passes is ended DEADLINE_EXCEEDED,
+//! which drops its request to the store, its wait and its slot, so a store that is busy or
+//! restarting is latency for the client, and UNAVAILABLE only once the budget is spent. A call without a `grpc-timeout` has no
 //! deadline and waits for the store. Uploads are bounded with [`within`], and reads (a
 //! `BatchReadBlobs`, and a ByteStream `Read` until its first bytes) with [`within_read`].
 //!

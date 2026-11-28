@@ -11,6 +11,7 @@
 //! is held.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -23,6 +24,7 @@ use tonic::Status;
 use super::Answer;
 use crate::input_walk::Blobs;
 use crate::proxy::Packs;
+use crate::store_wait::StoreWaits;
 
 /// A refusal of the packs as the store's: it could not answer.
 pub(super) fn unavailable(status: Status) -> StorageError {
@@ -89,14 +91,22 @@ impl Blobs for Layered<'_> {
         })
     }
 
-    /// The epoch of `rest`, moved on by every loss the packs have found ([`Packs::losses`]):
+    /// The epoch of `rest`, moved on by every loss the packs have counted ([`Packs::losses`]):
     /// a "held" answer rests on a row of the pack index as much as on `rest`, and this process
-    /// removes a row only after a read or a check through the packs found its blob lost or
-    /// damaged, and counted it. `None` when `rest` cannot say. For one epoch of `rest`, every
-    /// count of losses is a distinct epoch (an odd multiplier is one to one).
+    /// removes a row only by a forget or a drop the packs' loss guard counts as it begins and
+    /// again once it has returned, so a span that sees one epoch at both ends saw no such
+    /// removal begin or end. A row another frontend removes does not move it. `None` when
+    /// `rest` cannot say. For one epoch of `rest`, every count of losses is a distinct epoch (an
+    /// odd multiplier is one to one).
     fn epoch(&self) -> Option<u64> {
         let losses = self.packs.losses().wrapping_mul(LOSS_EPOCH_STEP);
         self.rest.epoch().map(|epoch| epoch ^ losses)
+    }
+
+    /// The packs' deadline of a walk ([`Packs::input_walk`]), a cut walk counted with the
+    /// packs' retries.
+    fn walk_deadline(&self) -> Option<(Duration, Arc<StoreWaits>)> {
+        Some((self.packs.input_walk(), self.packs.store_waits()))
     }
 }
 
@@ -112,5 +122,23 @@ impl Blobs for Primary<'_> {
 
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>> {
         Box::pin(Router::find_missing(self.0, digests))
+    }
+}
+
+/// The blobs of a farm, routed by its map. A file is missing when no owner a read would
+/// try holds it ([`Router::find_missing_anywhere`]), not when its primary lacks it: a
+/// primary that has just joined holds nothing of what it now owns, and refusing the run
+/// for that would refuse every action whose inputs the client no longer uploads.
+impl Blobs for Router {
+    fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>> {
+        Box::pin(Router::read_blob(self, digest))
+    }
+
+    fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>> {
+        Box::pin(Router::find_missing_anywhere(self, digests))
+    }
+
+    fn epoch(&self) -> Option<u64> {
+        Router::epoch(self)
     }
 }

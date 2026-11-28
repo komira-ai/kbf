@@ -102,9 +102,9 @@ pub(in crate::proxy) async fn read(
 ///
 /// # Errors
 /// INVALID_ARGUMENT for a stream that breaks the rules of an upload or whose bytes are not the
-/// digest; UNAVAILABLE when the packs could not be written (a 503 `SlowDown` is not a failure: the
-/// pack is written again after a wait, for as long as the store answers it, and the caller's
-/// deadline is what ends that); RESOURCE_EXHAUSTED when the blob
+/// digest; UNAVAILABLE when the packs could not be written (a failure of the store that may pass is not
+/// one until the packs' retry budget is spent: the pack is written again after a wait, and the
+/// caller's deadline may end that first); RESOURCE_EXHAUSTED when the blob
 /// alone is over all of the room; DEADLINE_EXCEEDED when no byte of `body` arrived for
 /// [`Packs::upload_idle_timeout`] once the room was taken; or the client's own error if its
 /// request broke.

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kbf_front::start_retry::{Ended, StartRetry};
+use kbf_front::store_metrics::Op;
 use kbf_front::{MAX_PACKED_BLOB_BYTES, PackSettings, Packs};
 use kbf_pack::{FRONTEND_PACK_BYTES, PackError, PackKeys, ReadCache, WriterKind};
 use kbf_pack_index::{MAX_BATCH, PackIndex};
@@ -108,9 +109,10 @@ async fn the_create_only_check_is_made_again_after_a_500() {
     assert_eq!(store.puts(), 3, "one refused write, then the check's two");
 }
 
-/// Asserts that an attempt of the check that finds its first write stored by the attempt before
-/// (whose answer was lost) passes: the store refusing to write the key again is the refusal the
-/// check asks for. Catches: a retried check that fails on its own earlier write.
+/// Asserts that a check whose first write was stored but whose answer was lost passes: the
+/// check's retry makes it again, the store refuses the first write (`AlreadyExists`), the check
+/// finds its own bytes under the key and goes on, and the store refuses its second write, the
+/// refusal the check asks for. Catches: a check that fails on its own earlier write.
 #[tokio::test(start_paused = true)]
 async fn a_check_whose_first_answer_was_lost_passes_on_the_next_attempt() {
     let store = Arc::new(Spy::new());
@@ -121,11 +123,11 @@ async fn a_check_whose_first_answer_was_lost_passes_on_the_next_attempt() {
         .check_create_only(&StartRetry::new(Duration::from_secs(120)))
         .await;
 
-    checked.expect("passes on the second attempt");
+    checked.expect("passes");
     assert_eq!(
         store.puts(),
-        2,
-        "the lost write, then the one the store refused"
+        3,
+        "the lost write, then the second attempt's two, both refused"
     );
 }
 
@@ -190,6 +192,38 @@ async fn a_403_ends_the_check_at_once_and_a_500_for_ever_at_the_bound() {
         "{said}"
     );
     assert!(said.ends_with(" attempts over 5.0 s)"), "{said}");
+}
+
+/// Asserts that the check is retried by its own retry alone, though the packs' retry has a
+/// longer budget (120 s): with the store answering 500 for ever, the check is given up at its
+/// bound of 5 s with the store's own answer, and the packs neither waited, nor counted a call
+/// as exhausted, nor took the store as down. Catches: the packs' retry nested inside the
+/// start's, which holds an attempt for the packs' budget and hides the store's answer.
+#[tokio::test(start_paused = true)]
+async fn a_check_is_retried_by_its_own_bound_alone_though_the_packs_budget_is_longer() {
+    let store = Arc::new(Spy::new());
+    let packs = packs_over(&store, PackSettings::default()).expect("packs");
+    store.reject_puts_with(u32::MAX, 500);
+
+    let given_up = packs
+        .check_create_only(&StartRetry::new(Duration::from_secs(5)))
+        .await;
+
+    let Err(Ended::GaveUp(gave_up)) = given_up else {
+        panic!("not given up: {given_up:?}");
+    };
+    let said = gave_up.to_string();
+    assert!(
+        said.starts_with(
+            "object store: store answered 500 InternalError: injected (still failing after "
+        ),
+        "{said}"
+    );
+    assert!(said.ends_with(" attempts over 5.0 s)"), "{said}");
+    let waits = packs.store_waits();
+    assert_eq!(waits.waits(Op::Put).count(), 0);
+    assert_eq!(waits.exhausted(Op::Put), 0);
+    assert!(!waits.down());
 }
 
 /// Asserts that a blob whose bytes are not its digest is refused INVALID_ARGUMENT before

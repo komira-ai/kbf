@@ -28,7 +28,8 @@ use crate::cache::is_empty_blob;
 use crate::known_dirs::KnownDirs;
 use crate::large_backfill::LargeStore;
 use crate::start_retry::{Ended, StartRetry, retriable};
-use crate::store_wait::{Backoff, STORE_WAIT, StoreWaits};
+use crate::store_retry::RetryPolicy;
+use crate::store_wait::{Backoff, StoreWaits};
 use crate::store_writes::{STORE_WRITES, StoreWrites, TREE_WRITES};
 
 /// The largest blob a frontend puts in a pack or serves from one by default: 64 MiB, the
@@ -64,9 +65,20 @@ pub struct PackSettings {
     /// The most writes at the store at once, of every writer through the packs together but for
     /// an action tree's manifests, roots and lists, which have slots of their own
     /// (`crate::store_writes`): a write past it waits for one to end. A write whose body is in
-    /// hand waits out the store's 503 `SlowDown` holding its slot.
+    /// hand waits for its retries ([`PackSettings::store_retry`]) holding its slot.
     pub store_writes: NonZeroUsize,
+    /// How every call to the store through the packs is retried (`crate::store_retry`).
+    pub store_retry: RetryPolicy,
+    /// How long an Execute's walk of its input tree over the packs may take before it is
+    /// answered UNAVAILABLE, the reads it has in flight dropped ([`INPUT_WALK`] by default).
+    pub input_walk: Duration,
 }
+
+/// The default of [`PackSettings::input_walk`]: the default budget of one call to the store
+/// ([`RetryPolicy::DEFAULT`]), so a walk whose reads ride out a restart ends, and one whose store
+/// stays down is answered within the budget of a single read, under the 150 s a frontend's
+/// listener waits on a connection that moves no byte.
+pub const INPUT_WALK: Duration = RetryPolicy::DEFAULT.budget;
 
 impl Default for PackSettings {
     fn default() -> Self {
@@ -77,6 +89,8 @@ impl Default for PackSettings {
             upload_idle_timeout: DEFAULT_UPLOAD_IDLE_TIMEOUT,
             cache: None,
             store_writes: STORE_WRITES,
+            store_retry: RetryPolicy::DEFAULT,
+            input_walk: INPUT_WALK,
         }
     }
 }
@@ -191,8 +205,12 @@ pub struct Packs {
     pub(super) metrics: Arc<PackMetrics>,
     /// What the packs' object store has been asked ([`Packs::with_store_metrics`]).
     store_metrics: Arc<crate::store_metrics::StoreMetrics>,
-    /// The waits of every call to the store for its 503s ([`crate::store_wait`]).
+    /// The retries of every call to the store ([`crate::store_wait`]).
     waits: Arc<StoreWaits>,
+    /// [`PackSettings::store_retry`].
+    store_retry: RetryPolicy,
+    /// [`PackSettings::input_walk`].
+    input_walk: Duration,
     pub(super) verifying: Arc<VerifyingKeys>,
     clock: Clock,
     /// When a pack a read found absent is taken for lost: shared by the reader of the blobs,
@@ -236,7 +254,7 @@ impl Packs {
         };
         let writer = keys.writer();
         let waits = Arc::<StoreWaits>::default();
-        let backoff = Backoff::new(STORE_WAIT, Arc::clone(&waits));
+        let backoff = Backoff::new(settings.store_retry, Arc::clone(&waits));
         let store = Arc::new(StoreWrites::new(
             store,
             settings.store_writes,
@@ -268,6 +286,8 @@ impl Packs {
             metrics,
             store_metrics: Arc::new(crate::store_metrics::StoreMetrics::packs()),
             waits,
+            store_retry: settings.store_retry,
+            input_walk: settings.input_walk,
             verifying: Arc::default(),
             clock: Arc::new(SystemTime::now),
             loss,
@@ -360,12 +380,26 @@ impl Packs {
         self.waits.render(out);
     }
 
-    /// The waits of these packs' calls to their store for its 503s. Another caller of the same
-    /// store (an action tree's writes, the janitor) records its own waits here too, so that the
-    /// scrape counts every wait for the store once.
+    /// The retries of these packs' calls to their store. Another caller of the same store (an
+    /// action tree's writes, the janitor) records its own retries here too, so that the scrape
+    /// counts every retry of the store once, and a store one caller found down is down for all.
     #[must_use]
     pub fn store_waits(&self) -> Arc<StoreWaits> {
         Arc::clone(&self.waits)
+    }
+
+    /// How these packs' calls to their store are retried ([`PackSettings::store_retry`]): the
+    /// policy another caller of the same store takes too.
+    #[must_use]
+    pub const fn store_retry(&self) -> RetryPolicy {
+        self.store_retry
+    }
+
+    /// How long an Execute's walk of its input tree over these packs may take
+    /// ([`PackSettings::input_walk`]).
+    #[must_use]
+    pub const fn input_walk(&self) -> Duration {
+        self.input_walk
     }
 
     /// Appends the pack families of `packs`, if a frontend has them, to `out`; without packs
@@ -392,8 +426,9 @@ impl Packs {
     ///
     /// The check is a call of the start ([`crate::start_retry`]): made again as `retry` says
     /// while the store answers it with an error that is retried. An attempt after one that
-    /// failed so may find the key written by the attempt before it, and the store refusing to
-    /// write it again is the refusal the check asks for.
+    /// failed so may find the key written by the attempt before it: the check takes an object of
+    /// its own bytes there for its first write (`kbf_pack::check_create_only`), and one of other
+    /// bytes for a key that is taken.
     ///
     /// # Errors
     /// [`Ended::Refused`] with why the check failed; [`Ended::GaveUp`] when the store kept
@@ -401,12 +436,7 @@ impl Packs {
     pub async fn check_create_only(&self, retry: &StartRetry) -> Result<(), Ended<PackError>> {
         let retried =
             |error: &PackError| matches!(error, PackError::Store(source) if retriable(source));
-        let attempt = |attempt: u32| async move {
-            match self.store.check_create_only().await {
-                Err(PackError::Store(ObjectStoreError::AlreadyExists(_))) if attempt > 1 => Ok(()),
-                checked => checked,
-            }
-        };
+        let attempt = |_: u32| self.store.check_create_only();
         retry.run("the create-only check", retried, attempt).await
     }
 
@@ -504,9 +534,10 @@ impl Packs {
     }
 
     /// How many times a read or a check through these packs, or any clone of them, has found a
-    /// blob the index records absent from its pack, or other bytes than its digest
-    /// ([`LossGuard::found`]): each is counted before its pack is forgotten or its location
-    /// dropped, and this process removes a row of the index no other way. A walk of an input
+    /// blob the index records absent from its pack, or other bytes than its digest, and how
+    /// many forgets and drops of rows those ended in have returned ([`LossGuard::found`]): each
+    /// loss is counted before its pack is forgotten or its location dropped, and again once that
+    /// has returned, and this process removes a row of the index no other way. A walk of an input
     /// tree remembers what it found held only while this stays the same
     /// (`crate::input_walk::Blobs::epoch`). A row another process removes does not move it.
     pub(crate) fn losses(&self) -> u64 {
@@ -524,8 +555,8 @@ impl Packs {
     ///
     /// # Errors
     /// INVALID_ARGUMENT when a blob's bytes are not its digest; UNAVAILABLE when the store
-    /// or the index failed (a 503 `SlowDown` is not a failure: the pack is written again after a
-    /// wait, for as long as the store answers it, until the caller drops the call);
+    /// or the index failed (a failure of the store that may pass, a 503 `SlowDown` among them, is
+    /// not one until the retry's budget is spent: the pack is written again after a wait);
     /// RESOURCE_EXHAUSTED when the blobs together are over all of the room.
     pub async fn put(&self, blobs: Vec<(Digest, Bytes)>) -> Result<(), Status> {
         let bytes = blobs.iter().map(|(_, data)| data.len() as u64).sum();

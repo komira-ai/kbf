@@ -138,6 +138,16 @@ impl Farm {
         Self::build(Bytes::from_static(b"an action nobody stored"), false).await
     }
 
+    /// A farm over packs whose calls to the store are not retried ([`crate::multi::unretried`]).
+    pub(crate) async fn unretried() -> Self {
+        Self::over(
+            Rig::with(crate::multi::unretried()).await,
+            action_bytes(false),
+            true,
+        )
+        .await
+    }
+
     /// A farm over a store that replaces an object it holds (a task that writes again).
     async fn replacing() -> Self {
         Self::over(Rig::replacing().await, action_bytes(false), true).await
@@ -901,11 +911,12 @@ async fn a_manifest_with_inputs_is_ingested() {
 
 /// Asserts that a store or an index that fails is `Unavailable`, counted as neither a refusal nor
 /// an ingest, and that the same key ingests once they answer: a length that fails, a read that
-/// fails, an index that cannot record.
+/// fails, an index that cannot record. The packs here do not retry their calls to the store, so
+/// that the store's failure is the call's.
 #[tokio::test]
 async fn a_failing_store_or_index_is_unavailable_and_retried_on_the_same_key() {
     for what in ["len", "read", "record"] {
-        let farm = Farm::new().await;
+        let farm = Farm::unretried().await;
         farm.put(&farm.pack(0)).await;
         match what {
             "len" => farm.rig.store.reject_lens(1),

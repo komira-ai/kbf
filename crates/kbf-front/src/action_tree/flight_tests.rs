@@ -17,7 +17,8 @@ use kbf_objstore::{
 use tokio::sync::oneshot;
 
 use super::*;
-use crate::store_wait::{Backoff, STORE_WAIT};
+use crate::store_retry::RetryPolicy;
+use crate::store_wait::Backoff;
 use crate::store_writes::StoreWrites;
 
 /// The pack store as the tree writer sees it, as the frontend's packs put it.
@@ -52,7 +53,7 @@ async fn a_manifest_write_is_told_its_wait_for_a_tree_slot() {
         conditional_put: true,
         object_lock: false,
     });
-    let backoff = Backoff::new(STORE_WAIT, Arc::default());
+    let backoff = Backoff::new(RetryPolicy::DEFAULT, Arc::default());
     let store = Arc::new(StoreWrites::new(
         Arc::new(memory),
         NonZeroUsize::MIN,

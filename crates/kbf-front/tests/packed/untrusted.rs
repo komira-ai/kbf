@@ -567,7 +567,7 @@ async fn a_replay_with_other_contents_is_a_conflict() {
 #[tokio::test]
 async fn a_store_that_fails_makes_the_commit_unavailable() {
     let (bytes, manifest) = segment_of(&[FIRST]);
-    let rig = Rig::new().await;
+    let rig = Rig::with(crate::multi::unretried()).await;
     rig.store.seed(KEY, &bytes).await;
     rig.store.reject_reads(1);
 
@@ -581,6 +581,29 @@ async fn a_store_that_fails_makes_the_commit_unavailable() {
     assert!(recorded.expect("recorded").created);
 }
 
+/// Asserts that a store that fails a read once (a 500) is not the commit's fault either, and is
+/// not even seen by it: the packs wait the failure out, the commit is recorded, the refusal
+/// counter does not move, and the one retry is counted as a read retried for a server error.
+/// Catches a failure of the store that the packs retry failing the commit.
+#[tokio::test(start_paused = true)]
+async fn a_store_that_fails_a_read_once_is_retried_and_the_commit_is_recorded() {
+    let (bytes, manifest) = segment_of(&[FIRST]);
+    let rig = Rig::new().await;
+    rig.store.seed(KEY, &bytes).await;
+    rig.store.reject_reads(1);
+
+    let recorded = commit(&rig, manifest).await;
+
+    assert!(recorded.expect("recorded").created);
+    assert_eq!(rig.packs.metrics().commit_rejects.get(), 0);
+    let waits = rig.packs.store_waits();
+    let retried = waits.retries(
+        kbf_front::store_metrics::Op::Get,
+        kbf_front::store_retry::Cause::ServerError,
+    );
+    assert_eq!(retried, 1);
+}
+
 /// Asserts that a store that fails while a record is read, after the trailer and the footer were
 /// read, is not the commit's fault either: the commit is unavailable, nothing is recorded and the
 /// refusal counter does not move. Catches a store failure on a record reported as a mismatch of
@@ -588,7 +611,7 @@ async fn a_store_that_fails_makes_the_commit_unavailable() {
 #[tokio::test]
 async fn a_store_that_fails_on_a_record_makes_the_commit_unavailable() {
     let (bytes, manifest) = segment_of(&[FIRST]);
-    let rig = Rig::new().await;
+    let rig = Rig::with(crate::multi::unretried()).await;
     rig.store.seed(KEY, &bytes).await;
     rig.store.reject_read_after(2);
 
@@ -672,11 +695,11 @@ async fn two_zero_size_records_at_one_offset_are_refused() {
 /// and nothing else is: one commit for each of forbidden (a key not issued), shape (records with
 /// a gap), missing (no object), footer (a footer that is not the manifest), mismatch (a record
 /// whose CRC is not its bytes) and conflict (a key recorded with other contents) moves its own
-/// label by one; a store that fails (unavailable) moves none; the pack that is recorded is
-/// counted as recorded, and its replay is not counted again; the daemons' shared counters still
-/// move for each refusal. Catches a reason counted under another, a refusal not counted, a
+/// label by one; a store that keeps failing past its retries (unavailable) moves none; the
+/// pack that is recorded is counted as recorded, and its replay is not counted again; the
+/// daemons' shared counters still move for each refusal. Catches a reason counted under another, a refusal not counted, a
 /// failure of the store counted as a refusal, and a scrape that does not carry the labels.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_untrusted_commit_counts_by_reason() {
     let rig = Rig::replacing().await;
     let scrape = || {
@@ -736,11 +759,13 @@ async fn an_untrusted_commit_counts_by_reason() {
     reason(&scrape(), "mismatch", 1);
 
     rig.store.seed(KEY, &honest).await;
-    rig.store.reject_reads(1);
+    // Read after read fails, past the packs' budget of retries (on the paused clock).
+    rig.store.reject_reads(u32::MAX);
     let failed = commit(&rig, manifest.clone())
         .await
         .expect_err("unavailable");
     assert!(matches!(failed, CommitError::Unavailable(_)), "{failed:?}");
+    rig.store.reject_reads(0);
     let text = scrape();
     assert!(
         text.contains("kbf_pack_untrusted_commits_total 0\n"),

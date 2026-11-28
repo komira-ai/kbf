@@ -278,6 +278,19 @@ impl Rig {
         Self::with(settings).await
     }
 
+    /// [`Rig::new`], but the packs do not retry their calls to the store (a budget of zero), so
+    /// that a failure the store answers, a 500 among them, is the call's own failure: for a test
+    /// of what the frontend does with a store that fails.
+    pub async fn unretried() -> Self {
+        let settings = PackSettings {
+            max_blob_bytes: SMALL,
+            store_retry: kbf_front::store_retry::RetryPolicy::DEFAULT
+                .with_budget(std::time::Duration::ZERO),
+            ..PackSettings::default()
+        };
+        Self::with(settings).await
+    }
+
     /// Packs as `settings` say, over a store that claims and keeps create-only writes.
     pub async fn with(settings: PackSettings) -> Self {
         Self::over(Spy::new(), settings, Authorizers::allow_all()).await
@@ -320,10 +333,10 @@ pub fn blob_of(bytes: &[u8]) -> (Digest, Bytes) {
     (kbf_segments::sha256(&bytes), bytes)
 }
 
-/// A blob of `len` bytes that no other of a different `salt` or length shares.
-pub fn blob_len(len: usize, salt: u8) -> (Digest, Bytes) {
+/// A blob of `len` bytes that no other of a different `seed` or length shares.
+pub fn blob_len(len: usize, seed: u8) -> (Digest, Bytes) {
     let bytes: Vec<u8> = (0..len)
-        .map(|i| (i % 251) as u8 ^ salt.wrapping_mul(31))
+        .map(|i| (i % 251) as u8 ^ seed.wrapping_mul(31))
         .collect();
     blob_of(&bytes)
 }

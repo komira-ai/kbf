@@ -566,3 +566,83 @@ async fn a_walk_through_packs_reports_the_index_lookup_and_pack_read_of_each_rea
     );
     assert_eq!(walked.depth, 2);
 }
+
+/// A map of one member: a routed backend over it is still on its bootstrap node.
+struct Alone(Trio);
+
+impl MapSource for Alone {
+    fn current(&self) -> Option<MapView> {
+        let member = self.0.map.members()[1].clone();
+        let map = Map::new(1, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("map");
+        Some(MapView {
+            map: Arc::new(map),
+            previous: None,
+            earlier: Vec::new(),
+        })
+    }
+    fn refetch(&self, at_least: u64) -> BoxFuture<'_, Result<MapView, RefetchError>> {
+        self.0.refetch(at_least)
+    }
+}
+
+/// Catches a routed backend whose Execute findings are not believed under the epoch their walk
+/// read (each finding would be refused, or kept across a loss): over a booted map with packs,
+/// a finding is believed while nothing changed and not once the packs counted a loss; over the
+/// map without packs, a finding is believed under the router's epoch; over a map still on its
+/// bootstrap node, whose walk names no epoch, a finding is believed by its time alone.
+#[tokio::test]
+async fn a_routed_finding_is_believed_under_the_epoch_its_walk_read() {
+    let trio = Arc::new(Trio::new().booted());
+    let file = blob("a routed file held in a pack");
+    let root = dir(&[file.0], &[]);
+    let (kept, lost, plain, alone) = (
+        blob("kept").0,
+        blob("lost").0,
+        blob("plain").0,
+        blob("alone").0,
+    );
+
+    let packs = packs_holding(&[&file, &root]).await;
+    let routed = Arc::new(Routed::new(trio.clone(), trio.clone(), trio.clone()));
+    let first = Arc::clone(&trio.nodes[&MemberId(1)]);
+    let layered = Backend::routed_over(routed, first, Some(packs.clone()));
+    let walked = layered.walk_inputs(root.0).await.expect("walk");
+    let at = walked.held_since.expect("found held");
+    layered.vouch(kept, at, walked.epoch);
+    layered.vouch(lost, at, walked.epoch);
+    let kept_believed = layered.vouched(&kept);
+    let noted = packs.absent("cas/f/fe1/gone/0000", 0).await;
+    let lost_believed = layered.vouched(&lost);
+
+    trio.store(&file).await;
+    trio.store(&root).await;
+    let (bare, _) = trio.backends();
+    let bare_walk = bare.walk_inputs(root.0).await.expect("walk");
+    bare.vouch(
+        plain,
+        bare_walk.held_since.expect("found held"),
+        bare_walk.epoch,
+    );
+
+    let small = Arc::new(Alone(Trio::new()));
+    let routed = Arc::new(Routed::new(small, trio.clone(), trio.clone()));
+    let first = Arc::clone(&trio.nodes[&MemberId(1)]);
+    let packs = packs_holding(&[&file, &root]).await;
+    let bootstrap = Backend::routed_over(Arc::clone(&routed), first, Some(packs));
+    let boot_walk = bootstrap.walk_inputs(root.0).await.expect("walk");
+    bootstrap.vouch(
+        alone,
+        boot_walk.held_since.expect("found held"),
+        boot_walk.epoch,
+    );
+
+    assert!(walked.epoch.is_some(), "a booted map names an epoch");
+    assert!(kept_believed);
+    assert_eq!(noted, kbf_pack::Loss::Noted);
+    assert!(!lost_believed, "the loss moved the epoch");
+    assert!(bare_walk.epoch.is_some());
+    assert!(bare.vouched(&plain), "under the router's epoch");
+    assert!(!routed.active());
+    assert_eq!(boot_walk.epoch, None);
+    assert!(bootstrap.vouched(&alone), "by its time alone");
+}

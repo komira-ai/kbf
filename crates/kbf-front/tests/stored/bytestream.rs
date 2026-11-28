@@ -272,7 +272,7 @@ async fn a_blob_already_held_is_acknowledged_without_its_data() {
 /// the same upload sent again, once the store takes it, is stored.
 #[tokio::test]
 async fn a_write_the_store_refuses_is_unavailable_and_can_be_sent_again() {
-    let rig = Rig::new().await;
+    let rig = Rig::unretried().await;
     let (digest, bytes) = blob_len(100, 7);
     rig.store.reject_puts(8);
 

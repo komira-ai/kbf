@@ -153,6 +153,11 @@ trait Plane: Send + Sync {
     fn trees(&self) -> Option<&Trees> {
         None
     }
+    /// What a "held" answer of [`Plane::walk_inputs`] rests on now ([`Blobs::epoch`]); `None`
+    /// for a plane that cannot say, or keeps no memory.
+    fn epoch(&self) -> Option<u64> {
+        None
+    }
 }
 
 type Answer<T> = Result<T, StorageError>;
@@ -893,6 +898,21 @@ impl Plane for RoutedPlane {
     fn trees(&self) -> Option<&Trees> {
         Some(&self.trees)
     }
+
+    fn epoch(&self) -> Option<u64> {
+        // Not `routing`, which counts a call taken by the bootstrap node: this one is not.
+        if !self.routed.active() {
+            return None;
+        }
+        let router = self.routed.router();
+        match &self.packs {
+            None => router.epoch(),
+            Some(packs) => Blobs::epoch(&Layered {
+                packs,
+                rest: router,
+            }),
+        }
+    }
 }
 
 /// A streamed put's answer as the write's: the blob is stored when the store says it stored
@@ -964,24 +984,6 @@ impl Blobs for Held<'_> {
 
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>> {
         self.0.find_missing(digests)
-    }
-}
-
-/// The blobs of a farm, routed by its map. A file is missing when no owner a read would
-/// try holds it ([`Router::find_missing_anywhere`]), not when its primary lacks it: a
-/// primary that has just joined holds nothing of what it now owns, and refusing the run
-/// for that would refuse every action whose inputs the client no longer uploads.
-impl Blobs for Router {
-    fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>> {
-        Box::pin(Router::read_blob(self, digest))
-    }
-
-    fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>> {
-        Box::pin(Router::find_missing_anywhere(self, digests))
-    }
-
-    fn epoch(&self) -> Option<u64> {
-        Router::epoch(self)
     }
 }
 

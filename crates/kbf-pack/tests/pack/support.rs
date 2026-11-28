@@ -62,6 +62,7 @@ pub struct FaultyStore {
     fail_deletes: AtomicU32,
     deny_deletes: AtomicU32,
     delete_calls: AtomicU32,
+    put_calls: AtomicU32,
     pass_gets: AtomicU32,
     pass_lists: AtomicU32,
     fail_lists: AtomicU32,
@@ -99,6 +100,7 @@ impl FaultyStore {
             fail_deletes: AtomicU32::new(0),
             deny_deletes: AtomicU32::new(0),
             delete_calls: AtomicU32::new(0),
+            put_calls: AtomicU32::new(0),
             pass_gets: AtomicU32::new(0),
             pass_lists: AtomicU32::new(0),
             fail_lists: AtomicU32::new(0),
@@ -195,6 +197,11 @@ impl FaultyStore {
         self.deny_deletes.store(status, Ordering::SeqCst);
     }
 
+    /// The create-only writes asked of the store so far, failed and refused ones included.
+    pub fn puts(&self) -> u32 {
+        self.put_calls.load(Ordering::SeqCst)
+    }
+
     /// The deletes asked of the store so far, refused ones included.
     pub fn deletes(&self) -> u32 {
         self.delete_calls.load(Ordering::SeqCst)
@@ -254,6 +261,7 @@ impl ObjectStore for FaultyStore {
         body: Bytes,
         retain_until: Option<SystemTime>,
     ) -> Result<(), ObjectStoreError> {
+        self.put_calls.fetch_add(1, Ordering::SeqCst);
         let passes = fires(&self.pass_puts);
         if !passes && fires(&self.reject_puts) {
             return Err(injected());

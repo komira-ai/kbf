@@ -83,7 +83,7 @@ use std::time::{Duration, SystemTime};
 
 use clap::{Arg, ArgMatches};
 use futures::future::BoxFuture;
-use kbf_front::store_wait::{Backoff, STORE_WAIT, Waiting};
+use kbf_front::store_wait::{Backoff, Waiting};
 use kbf_front::{Packs, VerifyingKeys};
 use kbf_objstore::s3::Credentials;
 use kbf_objstore::{Capabilities, ObjectStore, PageSize};
@@ -649,9 +649,9 @@ impl JanitorFlags {
     ) -> Result<Janitor, JanitorFlagError> {
         let credentials = read_key(&self.key_file)?;
         let store = store.store(credentials, Capabilities::default())?;
-        // The sweep's listings and deletes wait out a store that answers 503, as the packs'
-        // calls do, and their waits are counted with the packs'.
-        let backoff = Backoff::new(STORE_WAIT, packs.store_waits());
+        // The sweep's listings and deletes are retried as the packs' calls are, and their
+        // retries are counted with the packs'.
+        let backoff = Backoff::new(packs.store_retry(), packs.store_waits());
         let store = Waiting::new(Arc::new(store), backoff);
         let config = SweepConfig {
             grace: self.grace,

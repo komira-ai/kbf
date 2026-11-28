@@ -13,7 +13,9 @@
 use std::pin::pin;
 
 use futures::poll;
-use kbf_front::action_tree::{FIRST_WAIT, Sleeper, WriteStage, WriteTimed, WriteWaits};
+use kbf_front::action_tree::{FIRST_WAIT, WriteStage, WriteTimed, WriteWaits};
+use kbf_front::start_retry::RetryClock;
+use kbf_front::store_retry::RetryPolicy;
 
 use super::listing::listed_base;
 use super::memo::{holding, link_root};
@@ -63,14 +65,28 @@ async fn two_deep(rig: &Rig) -> KeptClosure {
     rig.kept(&root).await
 }
 
-/// A [`Sleeper`] on tokio's clock, not jittered: on a paused clock, each wait is exactly the
-/// nominal one.
-struct OnTokio;
+/// A [`RetryClock`] on tokio's clock: on a paused clock, each wait is exactly the nominal one
+/// (the policy of [`retry`] has no jitter).
+struct OnTokio(tokio::time::Instant);
 
-impl Sleeper for OnTokio {
+impl RetryClock for OnTokio {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+
     fn sleep(&self, wait: Duration) -> BoxFuture<'_, ()> {
         Box::pin(tokio::time::sleep(wait))
     }
+}
+
+/// A retry with a budget of 60 s and no jitter, waiting on tokio's clock.
+fn retry() -> PutRetry {
+    let policy = RetryPolicy {
+        jitter_percent: 0,
+        ..RetryPolicy::DEFAULT
+    }
+    .with_budget(Duration::from_secs(60));
+    PutRetry::with_clock(policy, Arc::new(OnTokio(tokio::time::Instant::now())))
 }
 
 /// Catches a write of a tree not told, told twice or under another stage, a manifests stage
@@ -145,8 +161,7 @@ async fn the_wait_for_a_manifest_slot_is_told_apart_from_the_request() {
 /// three writes, and its stage is the sum of both.
 #[tokio::test(start_paused = true)]
 async fn the_503_waits_of_a_write_are_told_apart_from_its_request() {
-    let retry = PutRetry::with_sleeper(Duration::from_secs(60), Arc::new(OnTokio));
-    let rig = Rig::with_memo_retry(None, Some(retry)).await;
+    let rig = Rig::with_memo_retry(None, Some(retry())).await;
     rig.farm.state().faults.delay = Some(WRITE);
     let kept = rig.kept(&link_root(&rig, "a").await).await;
     let farm = Arc::clone(&rig.farm);
@@ -330,8 +345,7 @@ async fn a_refused_tree_lists_write_is_told_before_its_stage() {
 /// stage takes the longer of the two.
 #[tokio::test(start_paused = true)]
 async fn a_manifests_503_wait_is_told_apart_from_its_request() {
-    let retry = PutRetry::with_sleeper(Duration::from_secs(60), Arc::new(OnTokio));
-    let rig = Rig::with_memo_retry(None, Some(retry)).await;
+    let rig = Rig::with_memo_retry(None, Some(retry())).await;
     rig.farm.state().faults.delay = Some(WRITE);
     rig.farm.state().faults.any = VecDeque::from([ObjectStoreError::Service {
         status: 503,

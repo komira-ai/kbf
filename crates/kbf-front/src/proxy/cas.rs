@@ -212,7 +212,7 @@ impl ContentAddressableStorage for ProxyCas {
             )));
         }
         // With packs the batch is read from them together, within the call's deadline (a read
-        // waits out a store that answers 503); what they do not serve is asked of the nodes
+        // is retried while the store fails in a way that may pass); what they do not serve is asked of the nodes
         // below, item by item.
         let served = match &self.packs {
             Some(packs) => {

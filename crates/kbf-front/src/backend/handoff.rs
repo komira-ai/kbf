@@ -49,18 +49,20 @@ impl Backend {
     }
 
     /// An Execute found the Command and every blob of the input tree of `action` held, by
-    /// reads and FindMissing calls that all began at `at` or later.
-    pub(crate) fn vouch(&self, action: Digest, at: Instant) {
+    /// reads and FindMissing calls that all began at `at` or later, under the store's `epoch`.
+    pub(crate) fn vouch(&self, action: Digest, at: Instant, epoch: Option<u64>) {
         let trees = self.0.trees().into_iter();
-        trees.for_each(|trees| trees.vouch(action, at));
+        trees.for_each(|trees| trees.vouch(action, at, epoch));
     }
 
-    /// Whether an Execute over this backend found the inputs of `action` held recently enough
-    /// that its run's preparation need not ask the store again; the finding is used up.
+    /// Whether an Execute over this backend found the inputs of `action` held recently enough,
+    /// and under the store's epoch now, that its run's preparation need not ask the store
+    /// again; the finding is used up.
     pub(crate) fn vouched(&self, action: &Digest) -> bool {
         let now = Instant::now();
+        let epoch = self.0.epoch();
         self.0
             .trees()
-            .is_some_and(|trees| trees.vouched(action, now))
+            .is_some_and(|trees| trees.vouched(action, now, epoch))
     }
 }

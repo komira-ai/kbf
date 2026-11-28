@@ -29,9 +29,9 @@
 //!   `POST /v1/frontend/drain` begins the drain and answers the same status. A frontend over
 //!   a state store runs the drain sequence ([`crate::sequence`]): `/readyz` goes false at
 //!   once while everything is still served, new Execute calls are refused after
-//!   `--drain-lb-wait`, every listener is sent GOAWAY, open executions run until they
-//!   are done, however long (`--drain-deadline`, if set, only reports when it passes), and
-//!   the process exits 0. Any other server drains at
+//!   `--drain-lb-wait`, every listener is sent GOAWAY, open executions and calls run until
+//!   they are done and the REAPI connections have closed, however long (`--drain-deadline`,
+//!   if set, only reports when it passes), and the process exits 0. Any other server drains at
 //!   once ([`crate::drain`]): new Execute calls are refused, `/readyz` goes false, the REAPI
 //!   listener is sent GOAWAY, open streams run until their action is done, and the server
 //!   exits when they have. It is not undone: a drained frontend is restarted.

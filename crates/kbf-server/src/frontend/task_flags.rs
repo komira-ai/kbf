@@ -66,8 +66,8 @@ const PUT_DIR: &str = "put-dir";
 #[cfg(test)]
 const DEFAULT_URL_SLACK_SECS: u64 = 600;
 
-/// The total wait for a 503 when `--task-put-retry-secs` is left out: 60 seconds (test-only, as
-/// above).
+/// The budget of a tree write's retry when `--task-put-retry-secs` is left out: 60 seconds
+/// (test-only, as above).
 #[cfg(test)]
 const DEFAULT_PUT_RETRY_SECS: u64 = 60;
 
@@ -167,7 +167,7 @@ fn live() -> [Arg; 14] {
             // DEFAULT_PUT_RETRY_SECS, as above.
             .default_value("60")
             .help(
-                "The most seconds the waits add up to before a create-only write of an action tree to the tier store (`cas/l/<sha256>`) gives up on a 503 (\"retry later\", which the store answers while it registers: 10 to 40 s), so the lease fails only after this long. A write whose connection turns out to be dead is made once more at once, whatever this says. 0 never waits for a 503. A 503 `SlowDown` (the store taking as many uploads as it can) is back-pressure and is waited out past this, until the run's preparation limit. Used only with `--task-secret-file` and `--task-out-mode put-dir`",
+                "The budget, in seconds from its first attempt, of the retry of one create-only write of an action tree to the tier store (`cas/l/<sha256>`): a write the store fails with a dead or reset connection, a 503 (SlowDown among them), a 500, 502 or 504, or a 400 RequestTimeout is made again, its body made again, after waits that are those of `--pack-store-retry-*`, until the next attempt would begin past this; then the store's last answer fails the write, so the lease fails only after this long. 0 retries nothing. Used only with `--task-secret-file` and `--task-out-mode put-dir`",
             ),
         Arg::new(MANIFEST_WRITES)
             .long("task-manifest-writes")

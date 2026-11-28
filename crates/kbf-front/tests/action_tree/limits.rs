@@ -429,7 +429,7 @@ fn every_refusal_says_what_and_why() {
         ),
         (
             NoTree::Deadline,
-            "where the blobs are was not found out within 90s".to_owned(),
+            "where the blobs are was not found out within 150s".to_owned(),
             "store",
         ),
         (
