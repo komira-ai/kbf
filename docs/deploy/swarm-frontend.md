@@ -85,7 +85,9 @@ An update cuts no build that is in flight on the old task. From the stop signal 
   runs on; if the farm loses it, the operation's next attempt is still submitted. The answer, a
   result or a failure, goes to the client on the same stream.
 - answers every ByteStream read or write, cache call and Execute still being prepared.
-- exits only when nothing is left to answer, however long that takes.
+- exits only when nothing is left to answer and every one of its REAPI connections has closed,
+  each answer on it written to the client, however long that takes: a large `BatchReadBlobs`
+  a client reads slowly is written to its end, and not cut by the exit.
 
 The test `sigterm_answers_an_open_execute_whose_job_ends_during_the_drain`
 (`crates/kbf-cli/tests/frontend_shutdown.rs`) holds a real frontend to this. It sends SIGTERM
@@ -98,10 +100,21 @@ Only these end a stream that is still open:
 
 | what | why |
 |---|---|
-| a second stop signal, or `--shutdown-timeout-secs` running out (none by default) | the operator's hard stop: the streams left end UNAVAILABLE |
+| a second stop signal, or `--shutdown-timeout-secs` running out (none by default) | the operator's hard stop: the streams left end UNAVAILABLE, and every other call still open is answered UNAVAILABLE, which a client makes again; then the REAPI connections get two seconds to write those answers |
 | the service's `stop_grace_period` running out | Swarm kills the old task. Give it longer than the longest action and its queue wait; one hour serves a farm whose actions take minutes |
 | a load balancer in front that closes a draining task's connections | it must stop sending new connections to a task whose `/readyz` answers 503, and leave its open ones to end. A TCP proxy needs no idle timeout and must not close connections when a health check fails |
 | a connection that moves nothing either way for `--http2-keepalive-interval-secs` plus `--http2-keepalive-timeout-secs` (30 + 120 s by default) | the frontend closes it, draining or not, since its client is taken for gone |
+
+A call the client never sent is not the frontend's to answer. The drain's GOAWAY tells a
+client to open no new call on the connection, and an HTTP/2 client built on hyper (Buck2's,
+through tonic) learns that only when it next hands the connection a call: that call is
+dropped in the client, never sent, and fails with `hyper::Error(Canceled, "connection
+closed")` (gRPC CANCELLED, `operation was canceled`). The connection stays open after the
+GOAWAY for as long as a stream on it runs, so the dropped call can come minutes into the
+drain, when the first call after a long action is made (the download of its outputs). The
+frontend has no record of such a call, and it is not a cut: a cut is the WARN below, or a
+closed-call line of `kbf_reapi_calls_closed_total` for the call. hyper returns the call
+unsent so that its caller can send it again on a new connection, which the client must do.
 
 The last row has nothing to do with an update. When the network path between clients and the
 frontends drops established connections, every stream on them fails, whichever task they reach,

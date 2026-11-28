@@ -387,7 +387,8 @@ where
 {
     let OpenStreams { closing, progress } = streams;
     let backend = backend.into();
-    let calls = CallsLayer::new(Arc::clone(&backend.metrics().execute));
+    // The close ends the calls it finds UNAVAILABLE, the Execute streams by their own service.
+    let calls = CallsLayer::new(Arc::clone(&backend.metrics().execute), closing.clone());
     let operations = OperationsService::new(Arc::clone(&dispatch), Arc::clone(&authorizers));
     let service =
         ExecutionService::with_authorizers(backend, dispatch, closing, Arc::clone(&authorizers))

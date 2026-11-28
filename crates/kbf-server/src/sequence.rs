@@ -17,12 +17,21 @@
 //!    takes: every operation this frontend runs goes on until its job ends and its callers
 //!    are answered ([`crate::executor`]), and a ByteStream write or read, a cache call or an
 //!    Execute still being prepared (`kbf_front_open_calls`) is answered, not cut by the
-//!    exit. A [`DrainTiming::deadline`] (`--drain-deadline`, none by default)
+//!    exit. Then it waits until every connection of the REAPI listener has closed
+//!    ([`Drain::reapi_closed`]): a call leaves the count once the last frame of its answer is
+//!    handed to the connection, which may still hold bytes of it for a client that reads
+//!    slowly (a large `BatchReadBlobs`), and a connection sent GOAWAY closes only once all it
+//!    holds is written. A client that answers nothing is closed by the keep-alive
+//!    (`--http2-keepalive-interval-secs`, `--http2-keepalive-timeout-secs`); with the keep-alive
+//!    off, it holds the drain until the operator's hard stop.
+//!    A [`DrainTiming::deadline`] (`--drain-deadline`, none by default)
 //!    that passes with executions or calls open does not end the wait or any stream: it logs a
 //!    WARN with the counts and sets `deadline_passed` in the drain status, and the wait goes on.
 //! 5. It stands down as a retire does ([`Stand::release`]), closes the client streams that are
-//!    left ([`Drain::close`]) and, after a short grace for the clients to take their status
-//!    when there was a stream to close, ends the drain ([`Drain::sequence_ended`]); the serving
+//!    left ([`Drain::close`]: a call still open is answered UNAVAILABLE, `kbf_front::calls`)
+//!    and, after a short grace for the clients to take their status when there was a stream
+//!    to close (with none, until the REAPI connections have closed, at most that grace), ends
+//!    the drain ([`Drain::sequence_ended`]); the serving
 //!    future returns and the process exits 0. Its log line says why it stands down: nothing
 //!    was left to answer, or the drain was ended by force; in that case [`Drain::close`] has
 //!    said in a WARN how many streams of how many builds it cut.
@@ -190,19 +199,28 @@ impl Sequence {
         self.stand.release().await;
         drain.close();
         // The clients that were ended get a moment to take their status before the process
-        // goes; with nothing to end, it goes at once.
+        // goes. With no stream to end, it goes once the REAPI connections have closed (at once
+        // when nothing was ended), or when that moment is over.
+        let grace = tokio::time::sleep(CLOSE_GRACE);
         if streams > 0 {
-            tokio::time::sleep(CLOSE_GRACE).await;
+            grace.await;
+        } else {
+            tokio::select! {
+                () = drain.reapi_closed() => {}
+                () = grace => {}
+            }
         }
     }
 
-    /// Completes once no execution is open and no call is being answered: a ByteStream
-    /// write or a cache call in flight is answered before the frontend stands down, and is
-    /// not cut when the process exits.
+    /// Completes once no execution is open, no call is being answered and every connection
+    /// of the REAPI listener has closed: a ByteStream write or a cache call in flight is
+    /// answered before the frontend stands down, and the bytes of an answer still being
+    /// written to a slow client are not cut when the process exits.
     async fn until_idle(&self) {
         while self.stand.busy() {
             tokio::time::sleep(OPEN_LOOK).await;
         }
+        self.stand.drain.reapi_closed().await;
     }
 }
 

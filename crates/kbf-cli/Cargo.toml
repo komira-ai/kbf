@@ -102,6 +102,9 @@ kbf-objstore = { workspace = true, features = ["testkit"] }
 # The kbf base tree bundle of this build's release that `--executor-base-tree` names.
 kbf-tree-bundle.workspace = true
 prost.workspace = true
+# tests/frontend_shutdown_calls.rs: an HTTP/2 client that reads its connection as slowly as a
+# test needs, to stop a frontend while its answers are still being written.
+h2.workspace = true
 
 # The farm of real `kbf` processes the rehearsal (tests/rehearsal_in_a_box.rs) drives.
 [target.'cfg(target_os = "linux")'.dev-dependencies]

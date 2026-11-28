@@ -1234,6 +1234,9 @@ impl<'a> Prepared<'a> {
 
         let shutdown = shutdown()?;
         let stopper = Arc::clone(&drain);
+        // Given once every REAPI connection has closed after GOAWAY, each answer on it
+        // written: the drain sequence stands down only then (`Drain::reapi_closed`).
+        let reapi_closed = drain.serves_reapi();
         let serving = async move {
             let history = crate::history::spawn(history);
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
@@ -1246,6 +1249,7 @@ impl<'a> Prepared<'a> {
             // UNAVAILABLE), not when the REAPI listener has nothing left to answer.
             let reapi_serve = async {
                 let served = reapi_listening.await;
+                reapi_closed.fire();
                 if stopper.is_sequenced() {
                     stopper.sequence_finished().await;
                 }

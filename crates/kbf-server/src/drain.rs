@@ -119,6 +119,9 @@ pub struct Drain {
     deadline_reported: AtomicBool,
     /// Where the open streams and calls are counted ([`Drain::counts_with`]).
     counts: OnceLock<Arc<ExecuteMetrics>>,
+    /// Given by the server that serves the REAPI listener once every connection of it has
+    /// closed ([`Drain::serves_reapi`]); unset when no such server said it serves one.
+    reapi: OnceLock<Stop>,
     /// A close has said what it cuts.
     cut_told: AtomicBool,
 }
@@ -150,6 +153,7 @@ impl Drain {
             deadline_over: Stop::new(),
             deadline_reported: AtomicBool::new(false),
             counts: OnceLock::new(),
+            reapi: OnceLock::new(),
             cut_told: AtomicBool::new(false),
         };
         (drain, begun)
@@ -316,6 +320,23 @@ impl Drain {
     /// none runs.
     pub(crate) async fn sequence_finished(&self) {
         self.finished.fired().await;
+    }
+
+    /// The signal the server that serves the REAPI listener gives once every connection the
+    /// listener accepted has closed: after GOAWAY a connection closes only when each answer on
+    /// it is written, so its last bytes are not still in its send buffer when the process
+    /// exits. Asked once, before the listener serves; the drain sequence then waits for it
+    /// ([`Drain::reapi_closed`]).
+    pub(crate) fn serves_reapi(&self) -> Stop {
+        self.reapi.get_or_init(Stop::new).clone()
+    }
+
+    /// Completes once every connection of the REAPI listener has closed
+    /// ([`Drain::serves_reapi`]), and at once when no server said it serves one.
+    pub(crate) async fn reapi_closed(&self) {
+        if let Some(closed) = self.reapi.get() {
+            closed.fired().await;
+        }
     }
 
     /// Sends the REAPI listener GOAWAY: it stops accepting and the serving future
