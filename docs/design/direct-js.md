@@ -52,7 +52,8 @@ sequenceDiagram
   result once. A job read running is read at the poll from then on. Once a job's reads are a poll apart, the process
   reads all of its jobs that have not ended with one `ListJobs` a poll (the four live states and its `kbf-instance` label,
   `crates/kbf-server/src/executor/follow.rs`), not a `GetJob` each; a job not in a listing that started after it was handed
-  over is read once with `GetJob`, as is every job when a listing fails other than for the service's load. A job taken up
+  over is read once with `GetJob`; when a listing fails other than for the service's load, each job it followed is read with
+  `GetJob` from then on, as before. Each page of a listing has the limit of one call. A job taken up
   from another process carries that process's label and is read with `GetJob` each poll until it ends. While the service is busy or cannot be reached (no answer
   within the call timeout, a reset connection, `RESOURCE_EXHAUSTED` and the other codes of its load, or `UNAUTHENTICATED`,
   `PERMISSION_DENIED` and `UNIMPLEMENTED`, a service that will not serve this frontend now), every operation waits

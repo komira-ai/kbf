@@ -105,7 +105,8 @@ async fn a_busy_service_that_does_not_take_a_submit_spends_no_attempt() {
 }
 
 /// Catches a job service that stops answering for a while ending the operation, or making a
-/// second job for it: its reads of the job fail twenty times, the operation is neither answered
+/// second job for it: its reads of the job (the listing that follows it) fail twenty times, the
+/// operation is neither answered
 /// nor submitted again, and once the service answers the job's end is the caller's answer.
 #[tokio::test]
 async fn a_job_service_that_is_down_for_a_while_loses_nothing() {
@@ -113,7 +114,7 @@ async fn a_job_service_that_is_down_for_a_while_loses_nothing() {
     let mut caller = rig.submit(1);
     let job = rig.first_job(1).await;
     rig.host_runs(job.id(), HOST);
-    unavailable(&rig, "GetJob", 20);
+    unavailable(&rig, "ListJobs", 20);
     assert!(rig.fake.finish(job.id(), 0));
     assert!(matches!(caller.done().await, Finished::Ran(_)));
     assert_eq!(rig.jobs_of(1).len(), 1, "a second job was made");
@@ -121,15 +122,16 @@ async fn a_job_service_that_is_down_for_a_while_loses_nothing() {
 }
 
 /// Catches a job service that accepts a request and never answers holding the operation for
-/// the client's own timeout a call, or giving it up: the read gives up after the call timeout,
-/// the next read is made, and the job goes on being tracked to its end.
+/// the client's own timeout a call, or giving it up: the read (the listing that follows the
+/// running job) gives up after the call timeout, the next read is made, and the job goes on
+/// being tracked to its end.
 #[tokio::test]
 async fn a_job_service_that_never_answers_a_read_does_not_hold_the_operation() {
     let rig = Rig::start(&[HOST], |cfg| cfg.call_timeout = Duration::from_millis(100)).await;
     let mut caller = rig.submit(1);
     let job = rig.first_job(1).await;
     rig.host_runs(job.id(), HOST);
-    rig.fake.inject_on("GetJob", Fault::Hang);
+    rig.fake.inject_on("ListJobs", Fault::Hang);
     rig.fake.hung().await;
     assert!(rig.fake.finish(job.id(), 0));
     assert!(matches!(caller.done().await, Finished::Ran(_)));

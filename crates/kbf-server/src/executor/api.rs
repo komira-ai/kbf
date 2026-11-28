@@ -8,11 +8,12 @@
 //!
 //! [`Config::call_timeout`]: super::Config::call_timeout
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
 use js_proto::v1::{Job, JobResult, JobSpec};
-use kbf_job_client::{Broken, Client, Error};
+use kbf_job_client::{Broken, Client, Error, Stuck};
 
 use crate::executor::output::Tail;
 
@@ -42,10 +43,27 @@ impl Api<'_> {
     }
 
     /// Every job of the process `instance` that has not ended, by `ListJobs` page after page
-    /// ([`follow`](super::follow)), the whole listing within the limit of one call.
+    /// ([`follow`](super::follow)), each page within the limit of one call. As
+    /// [`Client::list_all_jobs`], it stops with [`Error::TooMany`] past [`Client::MAX_LISTED`]
+    /// jobs and with [`Error::Stuck`] at a page token given twice.
     pub(crate) async fn list_live(&self, instance: &str) -> Result<Vec<Job>, Error> {
-        let filter = super::follow::live_jobs(instance);
-        self.within(self.client.list_all_jobs(filter)).await
+        let mut filter = super::follow::live_jobs(instance);
+        let (mut jobs, mut tokens) = (Vec::new(), BTreeSet::new());
+        loop {
+            let page = self.within(self.client.list_jobs(filter.clone())).await?;
+            jobs.extend(page.jobs);
+            if jobs.len() > Client::MAX_LISTED {
+                return Err(Error::TooMany(Client::MAX_LISTED));
+            }
+            let next = page.next_page_token;
+            if next.is_empty() {
+                return Ok(jobs);
+            }
+            if !tokens.insert(next.clone()) {
+                return Err(Error::Stuck(Stuck::RepeatedToken(next)));
+            }
+            filter.page_token = next;
+        }
     }
 
     /// `CancelJob`: idempotent on the job.

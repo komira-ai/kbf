@@ -286,7 +286,7 @@ async fn a_cancel_while_the_service_is_busy_answers_cancelled_and_cancels_the_jo
 
 /// The reads of jobs the job service was sent: its `GetJob` and its `ListJobs`
 /// ([`crate::executor::follow`]).
-fn reads(rig: &Rig) -> usize {
+fn read_calls(rig: &Rig) -> usize {
     rig.calls_of("GetJob") + rig.calls_of("ListJobs")
 }
 
@@ -299,14 +299,14 @@ async fn reads_of_a_job_on_a_busy_service_spend_no_attempt() {
     let caller = rig.submit(1);
     let job = rig.submitted(&caller, 0).await;
     rig.host_runs(&job);
-    let before = reads(&rig);
+    let before = read_calls(&rig);
     // The next calls are reads, whichever form they take.
     rig.fake.inject(Fault::Hang);
     rig.fake.inject(Fault::Hang);
     for fault in busy_faults(8) {
         rig.fake.inject(fault);
     }
-    rig.until("the faults are spent", || reads(&rig) >= before + 11)
+    rig.until("the faults are spent", || read_calls(&rig) >= before + 11)
         .await;
     assert!(rig.fake.finish(&job, 0));
     assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));
@@ -335,21 +335,21 @@ async fn every_operation_reads_less_often_while_the_service_is_busy() {
     for fault in busy_faults(faults) {
         rig.fake.inject(fault);
     }
-    let before = reads(&rig);
+    let before = read_calls(&rig);
     let mut polls = 0;
-    while reads(&rig) < before + faults {
+    while read_calls(&rig) < before + faults {
         rig.advance(rig.cfg.poll).await;
         polls += 1;
         assert!(polls < 400, "the faults were never spent");
     }
     assert!(polls > 18, "twelve busy answers in {polls} polls");
     rig.until("both read at the poll again", || {
-        reads(&rig) >= before + faults + 2
+        read_calls(&rig) >= before + faults + 2
     })
     .await;
-    let settled = reads(&rig);
+    let settled = read_calls(&rig);
     rig.advance(rig.cfg.poll).await;
-    assert_eq!(reads(&rig), settled + 1, "one listing a poll for both");
+    assert_eq!(read_calls(&rig), settled + 1, "one listing a poll for both");
     assert_eq!(rig.exec.inner().follower.following(), 2);
     assert!(rig.fake.finish(&first, 0));
     assert!(rig.fake.finish(&second, 0));

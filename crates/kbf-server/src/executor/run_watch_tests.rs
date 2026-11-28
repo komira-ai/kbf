@@ -29,7 +29,7 @@ async fn submitted_now(rig: &Rig, caller: &Caller) -> String {
 }
 
 /// The reads of jobs the job service was sent: its `GetJob` and its `ListJobs`.
-fn reads(rig: &Rig) -> usize {
+fn read_calls(rig: &Rig) -> usize {
     rig.calls_of("GetJob") + rig.calls_of("ListJobs")
 }
 
@@ -37,12 +37,12 @@ fn reads(rig: &Rig) -> usize {
 /// steps after which the job service had been sent more reads of a job; `at` runs before each
 /// step with the milliseconds passed so far.
 async fn reads_over(rig: &Rig, ticks: u64, mut at: impl FnMut(u64)) -> Vec<u64> {
-    let mut seen = reads(rig);
+    let mut seen = read_calls(rig);
     let mut reads = Vec::new();
     for tick in 1..=ticks {
         at((tick - 1) * 10);
         rig.advance(TICK).await;
-        let now = reads(rig);
+        let now = read_calls(rig);
         assert!(now <= seen + 1, "two reads in one step at {} ms", tick * 10);
         if now > seen {
             reads.push(tick * 10);
@@ -116,7 +116,7 @@ async fn a_job_that_waits_is_read_a_bounded_number_of_times() {
         reads,
         [10, 30, 70, 150, 310, 560, 810, 1060, 1310, 1560, 1810]
     );
-    assert_eq!(reads(&rig), 12, "the first read and the eleven after");
+    assert_eq!(read_calls(&rig), 12, "the first read and the eleven after");
     assert_eq!(
         rig.calls_of("GetJob"),
         6,

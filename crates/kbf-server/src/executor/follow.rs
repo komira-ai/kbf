@@ -16,13 +16,17 @@
 //!   operation reads it once on its own: it has ended, or the service no longer knows it, or (a
 //!   state this server does not know) it may still be live, and then it is followed again.
 //! - **Unlisted**: the listing failed with an error that is not the service's load (a page token
-//!   refused, more than [`Client::MAX_LISTED`](kbf_job_client::Client::MAX_LISTED) jobs, an answer
-//!   that cannot be decoded). Each operation reads its job once on its own.
+//!   refused or given twice, more than [`Client::MAX_LISTED`](kbf_job_client::Client::MAX_LISTED)
+//!   jobs, an answer that cannot be decoded). Each operation reads its job on its own at once,
+//!   and from then on at its own waits, until it ends: a listing that cannot be had is not sent
+//!   again each poll on top of the reads, and the jobs' reads are not bunched at its answer.
 //!
 //! A listing that fails because the service is busy or cannot be reached tells no job anything:
 //! the jobs wait for the next listing, which waits as long as any call on a busy service
 //! ([`Busy::pause_or`](super::busy::Busy::pause_or)). A lost connection is so retried and never
-//! ends a run. The follower waits a poll after each listing's answer, as an operation waited a
+//! ends a run. Each page of a listing has the limit of one call
+//! ([`Config::call_timeout`](super::Config::call_timeout)), so a listing of many pages is not cut
+//! for its length. The follower waits a poll after each listing's answer, as an operation waited a
 //! poll after each read, so no job waits longer between two looks at it than before. A cancel
 //! is heard while the job waits for the listing, as it was while it waited for its own read.
 //!
@@ -197,6 +201,8 @@ pub(crate) struct Follow {
     heard: Option<watch::Receiver<Option<News>>>,
     /// Whether the last read of the job names this process in its `kbf-instance` label.
     ours: bool,
+    /// Whether a listing could not be had, and the job is read on its own until it ends.
+    alone: bool,
 }
 
 impl Follow {
@@ -207,6 +213,7 @@ impl Follow {
             job: job.to_owned(),
             heard: None,
             ours: false,
+            alone: false,
         }
     }
 
@@ -217,7 +224,8 @@ impl Follow {
     /// loses nothing.
     pub(crate) async fn read(&mut self, wait: Option<Duration>) -> Result<Job, Error> {
         let poll = self.inner.cfg.poll;
-        if self.heard.is_none() && self.ours && wait.is_some_and(|wait| wait >= poll) {
+        let due = wait.is_some_and(|wait| wait >= poll);
+        if self.heard.is_none() && self.ours && !self.alone && due {
             let (heard, start) = self.inner.follower.registry().join(&self.job);
             if start {
                 tokio::spawn(rounds(Arc::clone(&self.inner)));
@@ -225,11 +233,15 @@ impl Follow {
             self.heard = Some(heard);
         }
         match self.heard.as_mut() {
-            Some(heard) => {
-                if let Some(News::Listed(job)) = news(heard).await {
-                    return Ok(*job);
+            Some(heard) => match news(heard).await {
+                Some(News::Listed(job)) => return Ok(*job),
+                Some(News::Missing) => {}
+                // No listing can be had: read on its own, now and until it ends.
+                Some(News::Unlisted) | None => {
+                    self.inner.follower.registry().leave(&self.job);
+                    (self.heard, self.alone) = (None, true);
                 }
-            }
+            },
             None => waited(wait.map(|quiet| self.inner.busy.pause_or(quiet))).await,
         }
         let read = self.inner.api().get_job(&self.job).await;

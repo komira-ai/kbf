@@ -5,12 +5,14 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use js_proto::v1::{Job, JobSpec, JobState};
-use kbf_front::Finished;
-use kbf_job_client::fake::Fault;
+use js_proto::v1::{Job, JobSpec, JobState, ListJobsResponse};
+use kbf_front::{Dispatch as _, Finished};
+use kbf_job_client::fake::{Call, Fault};
+use kbf_job_client::{Client, Error, Stuck};
+use prost::Message as _;
 use tonic::Code;
 
-use super::{Follow, LIVE, News, PAGE, Registry, live_jobs, names, news};
+use super::{LIVE, News, PAGE, Registry, live_jobs, names, news};
 use crate::executor::submit::INSTANCE_LABEL;
 use crate::executor::tests::Rig;
 
@@ -47,6 +49,27 @@ fn job(id: &str, state: JobState, instance: Option<&str>) -> Job {
         }),
         ..Job::default()
     }
+}
+
+/// The answer of one `ListJobs` page holding `jobs`, with `next` as its next page token.
+fn page(jobs: Vec<Job>, next: &str) -> Fault {
+    let page = ListJobsResponse {
+        jobs,
+        next_page_token: next.to_owned(),
+    };
+    Fault::Answer(bytes::Bytes::from(page.encode_to_vec()))
+}
+
+/// The page tokens of the listings the job service was sent, in order.
+fn tokens(rig: &Rig) -> Vec<String> {
+    rig.fake
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::ListJobs(request) => Some(request.page_token),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The news `heard` holds now.
@@ -201,9 +224,10 @@ async fn listings_on_a_busy_service_end_no_run() {
 }
 
 /// Catches a listing refused for a reason other than the service's load leaving its jobs
-/// unread: each followed job is read on its own at once, and followed again.
+/// unread, or sent again each poll on top of their reads: each followed job is read on its own
+/// at once, is no longer followed, and is read on its own a poll later, with no listing.
 #[tokio::test(start_paused = true)]
-async fn a_listing_refused_otherwise_reads_each_job_on_its_own() {
+async fn a_listing_refused_otherwise_sends_each_job_back_to_its_own_reads() {
     let rig = Rig::start().await;
     let (one, two) = (rig.submit(1), rig.submit(2));
     let first = rig.submitted(&one, 0).await;
@@ -224,15 +248,20 @@ async fn a_listing_refused_otherwise_reads_each_job_on_its_own() {
     assert_eq!(
         rig.calls_of("GetJob"),
         reads + 2,
-        "each job read on its own"
+        "each job read on its own at once"
     );
-    assert_eq!(following(&rig), 2, "and followed again");
-    let reads = rig.calls_of("GetJob");
-    next_listing(&rig).await;
+    assert_eq!(following(&rig), 0, "and no longer followed");
+    let (reads, listed) = (rig.calls_of("GetJob"), rig.calls_of("ListJobs"));
+    rig.advance(rig.cfg.poll).await;
     assert_eq!(
         rig.calls_of("GetJob"),
-        reads,
-        "the next listing is the read"
+        reads + 2,
+        "read on its own a poll later"
+    );
+    assert_eq!(
+        rig.calls_of("ListJobs"),
+        listed,
+        "no listing with no job followed"
     );
     assert!(rig.fake.finish(&first, 0));
     assert!(rig.fake.finish(&second, 0));
@@ -364,35 +393,6 @@ fn the_listing_asks_for_the_live_jobs_of_this_process() {
     assert_eq!(request.client, None);
 }
 
-/// Catches reads that found no job handing one to the follower, or reads never handed over
-/// that stop the follower following another job when dropped: a read the service answers
-/// `NOT_FOUND` follows nothing, and dropping it leaves the followed job followed.
-#[tokio::test(start_paused = true)]
-async fn reads_that_found_no_job_hand_nothing_over() {
-    let rig = Rig::start().await;
-    let caller = rig.submit(1);
-    let job = rig.submitted(&caller, 0).await;
-    rig.host_runs(&job);
-    rig.until("the job is followed", || following(&rig) == 1)
-        .await;
-    let inner = rig.exec.inner();
-    let mut reads = Follow::new(inner, "k-other");
-    let read = reads.read(Some(TICK)).await;
-    assert!(read.is_err(), "a job the service does not have");
-    let next = reads.read(Some(rig.cfg.poll)).await;
-    assert!(next.is_err(), "read on its own again");
-    assert_eq!(
-        following(&rig),
-        1,
-        "a read that found nothing hands nothing over"
-    );
-    drop(reads);
-    assert_eq!(following(&rig), 1, "the followed job is still followed");
-    assert!(rig.fake.finish(&job, 0));
-    assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));
-    assert_eq!(following(&rig), 0);
-}
-
 /// Catches a job whose follower can send no more news waiting for ever: with the sender gone it
 /// hears none at once, and so reads on its own; with news sent it hears the latest.
 #[tokio::test]
@@ -403,4 +403,52 @@ async fn a_job_hears_the_latest_news_or_none_once_no_more_can_come() {
     assert_eq!(news(&mut heard).await, Some(News::Unlisted));
     drop(sender);
     assert_eq!(news(&mut heard).await, None);
+}
+
+/// Catches a listing that stops at its first page, or asks for the next one from the start: the
+/// jobs of every page are listed, and each page is asked for from the token the last one gave.
+#[tokio::test(start_paused = true)]
+async fn a_listing_follows_its_pages_from_token_to_token() {
+    let rig = Rig::start().await;
+    let first = job("a", JobState::Running, Some("me"));
+    let second = job("b", JobState::Queued, Some("me"));
+    rig.fake
+        .inject_on("ListJobs", page(vec![first.clone()], "t1"));
+    rig.fake
+        .inject_on("ListJobs", page(vec![second.clone()], ""));
+    let listed = rig.exec.inner().api().list_live("me").await;
+    assert_eq!(listed.expect("listed"), [first, second]);
+    assert_eq!(tokens(&rig), ["", "t1"]);
+}
+
+/// Catches a listing that asks for ever when the service gives a page token a second time: it
+/// stops with that token.
+#[tokio::test(start_paused = true)]
+async fn a_listing_stops_at_a_page_token_given_twice() {
+    let rig = Rig::start().await;
+    rig.fake.inject_on("ListJobs", page(Vec::new(), "t1"));
+    rig.fake.inject_on("ListJobs", page(Vec::new(), "t1"));
+    let listed = rig.exec.inner().api().list_live("me").await;
+    assert!(
+        matches!(&listed, Err(Error::Stuck(Stuck::RepeatedToken(token))) if token == "t1"),
+        "{listed:?}"
+    );
+    assert_eq!(tokens(&rig), ["", "t1"]);
+}
+
+/// Catches a listing that holds an unbounded number of jobs: past the most a listing holds it
+/// stops, at the cap.
+#[tokio::test(start_paused = true)]
+async fn a_listing_stops_past_the_most_jobs_it_holds() {
+    let rig = Rig::start().await;
+    let many = (0..=Client::MAX_LISTED)
+        .map(|n| job(&format!("j{n}"), JobState::Running, None))
+        .collect();
+    rig.fake.inject_on("ListJobs", page(many, "t1"));
+    let listed = rig.exec.inner().api().list_live("me").await;
+    assert!(
+        matches!(listed, Err(Error::TooMany(cap)) if cap == Client::MAX_LISTED),
+        "a listing over the cap"
+    );
+    assert_eq!(tokens(&rig), [""], "no page after the cap");
 }
