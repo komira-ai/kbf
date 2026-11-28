@@ -6,11 +6,14 @@
 //! pack index. A row of the index therefore never points at a pack the store does not hold.
 //! Failures leave only what is harmless:
 //!
-//! - a write that fails records nothing; the packer deletes what the failed attempt may have
-//!   left and tries again under the next sequence number, up to [`PackerConfig::put_attempts`]
-//!   times;
-//! - a key that is taken (a create-only write refused) belongs to someone else and is left
-//!   alone; the packer tries the next sequence number;
+//! - a write that fails records nothing; the packer deletes what the failed write may have left
+//!   and the call fails. The packer does not make a failed write again itself: the store it
+//!   writes through retries every call that may pass (in a frontend, `kbf_front::store_wait`,
+//!   with its waits and its budget), so a failure that reaches the packer is one that retrying
+//!   at once would not change, and a second retry here would multiply the first;
+//! - a key that is taken (a create-only write refused) is left alone: it holds someone else's
+//!   object, or this write's own from an attempt whose answer the store's retry lost. The packer
+//!   tries the next sequence number, up to [`PackerConfig::put_attempts`] keys;
 //! - a record that fails after the write is tried again, with the same pack and key, up to
 //!   [`PackerConfig::put_attempts`] times, as the index takes a repeat of a record as a no-op;
 //!   an error for which a repeat gets the same answer ([`PackIndexError::is_final`]: a refusal)
@@ -24,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use kbf_objstore::{ObjectKey, ObjectStore, ObjectStoreError};
+use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_pack_index::cells::ObjectCells;
 use kbf_pack_index::{
     BlobDigest, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError, Recorded,
@@ -48,7 +51,8 @@ pub const FRONTEND_PACK_BYTES: u64 = 32 << 20;
 /// it under 1 MiB.
 pub const DEFAULT_MAX_BLOBS: usize = 16_384;
 
-/// How many times a pack is written before the packer gives up, each under a new key.
+/// How many keys a pack is written under before the packer gives up when each is taken, and
+/// how many times its record is tried.
 pub const DEFAULT_PUT_ATTEMPTS: u32 = 3;
 
 /// How the packer cuts packs and retries writes.
@@ -59,9 +63,10 @@ pub struct PackerConfig {
     pub pack_bytes: u64,
     /// The most blobs in a pack. At least one is used.
     pub max_blobs: usize,
-    /// How many times a pack is written, each under a new key, before the call fails; and how
-    /// many times the record of a written pack is tried, under its one key. At least one is
-    /// used.
+    /// How many keys a pack is written under, the next tried when one is taken, before the call
+    /// fails; and how many times the record of a written pack is tried, under its one key. A
+    /// write that fails any other way is not made again here (as the module says). At least one
+    /// is used.
     pub put_attempts: u32,
 }
 
@@ -305,7 +310,8 @@ impl<S: ObjectStore> Packer<S> {
         }
     }
 
-    /// Writes `segment` under a key no object has, trying new keys as the config says.
+    /// Writes `segment` under a key no object has, trying new keys while keys are taken, as the
+    /// config says.
     async fn write_pack(&self, segment: &Bytes) -> Result<ObjectKey, PackError> {
         let mut attempt = 1;
         loop {
@@ -315,11 +321,14 @@ impl<S: ObjectStore> Packer<S> {
                 Ok(()) => return Ok(key),
                 Err(error) => error,
             };
-            // A key that is taken holds someone else's object: it is not ours to delete.
-            if !matches!(error, ObjectStoreError::AlreadyExists(_)) {
+            // A key that is taken holds an object that is not ours to delete. Any other failure
+            // is the store's last answer after its own retries: what it may have left is deleted,
+            // and the call fails.
+            let taken = matches!(error, ObjectStoreError::AlreadyExists(_));
+            if !taken {
                 self.discard(&key).await;
             }
-            if attempt >= self.config.put_attempts {
+            if !taken || attempt >= self.config.put_attempts {
                 return Err(PackError::Put {
                     key: key.to_string(),
                     attempts: attempt,
@@ -363,7 +372,9 @@ fn add(writer: &mut SegmentWriter, blob: &Blob) -> Result<bool, PackError> {
 /// every start makes the keys of one start differ from those of the next.
 ///
 /// # Errors
-/// [`PackError::Store`] when the first write fails, or the second fails with anything but
+/// [`PackError::Store`] when the first write fails (a key that holds anything but the bytes the
+/// check writes is taken: the check's own first write, found by a store that retried it after
+/// its answer was lost, is not), or the second fails with anything but
 /// [`ObjectStoreError::AlreadyExists`] (a store that answered 503 or dropped the connection has
 /// not said whether it replaces); [`PackError::CreateOnlySelfTest`] when the second write
 /// succeeds.
@@ -372,9 +383,26 @@ pub async fn check_create_only<S: ObjectStore>(
     keys: &PackKeys,
 ) -> Result<(), PackError> {
     let key = keys.self_test_key();
-    store
-        .put_new(&key, Bytes::from_static(b"first"), None)
-        .await?;
+    let first = Bytes::from_static(b"first");
+    match store.put_new(&key, first.clone(), None).await {
+        Ok(()) => {}
+        // A store that retries its writes (a frontend's) may find the first write's own object
+        // when its answer was lost: the key holds the bytes this check writes. A key that holds
+        // anything else is taken, and the check fails as it says.
+        Err(taken @ ObjectStoreError::AlreadyExists(_)) => {
+            let own = match ByteRange::new(0, first.len() as u64) {
+                Some(range) => store
+                    .get_range(&key, range)
+                    .await
+                    .is_ok_and(|bytes| bytes == first),
+                None => false,
+            };
+            if !own {
+                return Err(PackError::Store(taken));
+            }
+        }
+        Err(error) => return Err(PackError::Store(error)),
+    }
     let second = store
         .put_new(&key, Bytes::from_static(b"second"), None)
         .await;

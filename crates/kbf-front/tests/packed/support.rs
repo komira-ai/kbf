@@ -40,6 +40,9 @@ use tonic::transport::{Channel, Endpoint, Server};
 
 use crate::harness;
 
+#[path = "outage_faults.rs"]
+pub mod outage_faults;
+
 /// Counts an armed failure down; true while one is left.
 fn fires(armed: &AtomicU32) -> bool {
     let down = |n: u32| n.checked_sub(1);
@@ -122,6 +125,8 @@ pub struct Spy {
     /// The end of a failover on the runtime's clock: until then every call is answered 503.
     failover: Mutex<Option<tokio::time::Instant>>,
     failover_refusals: AtomicU32,
+    /// The outage that is on until an instant of the runtime's clock, if one is.
+    outage: Mutex<Option<outage_faults::Outage>>,
     gate: Semaphore,
     inside: watch::Sender<usize>,
     most_inside: AtomicUsize,
@@ -181,6 +186,7 @@ impl Spy {
             slow_downs: AtomicU32::new(0),
             failover: Mutex::new(None),
             failover_refusals: AtomicU32::new(0),
+            outage: Mutex::new(None),
             gate: Semaphore::new(Semaphore::MAX_PERMITS),
             inside: watch::Sender::new(0),
             most_inside: AtomicUsize::new(0),
@@ -437,6 +443,7 @@ impl ObjectStore for Spy {
     ) -> Result<(), ObjectStoreError> {
         self.puts.fetch_add(1, SeqCst);
         self.failing_over()?;
+        self.in_outage().await?;
         let (_inside, entered) = self.enter().await;
         entered?;
         if fires(&self.reject_puts) {
@@ -458,10 +465,18 @@ impl ObjectStore for Spy {
         self.puts.fetch_add(1, SeqCst);
         self.stream_puts.fetch_add(1, SeqCst);
         self.failing_over()?;
+        self.in_outage().await?;
         let (_inside, entered) = self.enter().await;
         entered?;
         if fires(&self.reject_puts) {
             return Err(injected_with(self.put_status.load(SeqCst)));
+        }
+        if self.dies_mid_stream() {
+            let _ = body.next().await;
+            return Err(outage_faults::transport(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset",
+            ));
         }
         let mut out = BytesMut::new();
         while let Some(piece) = body.next().await {
@@ -493,6 +508,7 @@ impl ObjectStore for Spy {
             .push(asked);
         let number = self.reads.fetch_add(1, SeqCst);
         self.failing_over()?;
+        self.in_outage_of(key).await?;
         if fires(&self.reject_reads) || number == self.fail_read_at.load(SeqCst) {
             return Err(injected());
         }
@@ -507,11 +523,13 @@ impl ObjectStore for Spy {
 
     async fn may_hold(&self, key: &ObjectKey) -> Result<bool, ObjectStoreError> {
         self.failing_over()?;
+        self.in_outage().await?;
         self.inner.may_hold(key).await
     }
 
     async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
         self.failing_over()?;
+        self.in_outage().await?;
         let hook = self
             .on_len
             .lock()
@@ -582,6 +600,7 @@ impl ObjectStore for Spy {
             hook(key.to_string()).await;
         }
         self.failing_over()?;
+        self.in_outage().await?;
         self.inner.delete(key).await
     }
 
@@ -592,6 +611,7 @@ impl ObjectStore for Spy {
         max_keys: PageSize,
     ) -> Result<ListPage, ObjectStoreError> {
         self.failing_over()?;
+        self.in_outage().await?;
         self.inner.list(prefix, after, max_keys).await
     }
 }

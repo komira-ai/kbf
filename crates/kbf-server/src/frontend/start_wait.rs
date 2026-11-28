@@ -28,8 +28,8 @@
 //! attempt, so a start whose calls each recover within the bound can wait longer than it in all
 //! (the create-only check, then each object of the base tree in turn). What the bound limits is
 //! how long one call is tried: a store that stays down ends the start at the first call that
-//! reaches it. The default, 120 s, is twice the 60 s within which the frontend's other calls ride
-//! out a store that answers 503 ([`kbf_front::store_wait::STORE_WAIT`]).
+//! reaches it. The default, 120 s, is the budget within which the frontend's other calls ride
+//! out a store that fails ([`kbf_front::store_wait::STORE_WAIT`]).
 
 use std::fmt::Display;
 use std::time::Duration;

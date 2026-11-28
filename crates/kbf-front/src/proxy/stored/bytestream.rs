@@ -107,8 +107,8 @@ impl ByteStream for StoredByteStream {
             n => digest.size_bytes.min(offset.saturating_add(n)),
         };
         let packs = self.stored.packs();
-        // The first bytes come within the call's deadline: a read waits out a store that
-        // answers 503.
+        // The first bytes come within the call's deadline: a read is retried while the store
+        // fails in a way that may pass.
         let windows: Windows = if digest.size_bytes <= packs.max_blob_bytes() {
             match deadline::within_read(deadline, packs.read(&digest)).await? {
                 Some(blob) => {

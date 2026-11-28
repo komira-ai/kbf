@@ -1,6 +1,6 @@
 //! A store that fails over its metadata, as a client of a frontend with no storage node sees it:
 //! while the store answers every call 503 for 30 s, the uploads, reads and lookups in flight wait
-//! and then succeed, the waits counted; a store that stays down past the bound of the waits ends
+//! and then succeed, the waits counted; a store that stays down past the budget of the waits ends
 //! the call UNAVAILABLE, saying so, which the client repeats; and a call whose `grpc-timeout`
 //! passes first is ended DEADLINE_EXCEEDED. The clock is the runtime's, paused, so a window of
 //! 30 s passes while nothing else can run, not by waiting; what is asserted is each call's
@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use kbf_front::PackSettings;
 use kbf_front::store_metrics::Op;
+use kbf_front::store_retry::RetryPolicy;
 use kbf_front::store_wait::STORE_WAIT;
 use kbf_proto::google::bytestream::ReadRequest;
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
@@ -31,7 +33,18 @@ const FAILOVER: Duration = Duration::from_secs(30);
 
 /// A rig holding the blobs `small` (packed) and `large` (an object of its own, past [`SMALL`]).
 async fn holding() -> (Arc<Rig>, (Digest, Bytes), (Digest, Bytes)) {
-    let rig = Arc::new(Rig::new().await);
+    holding_with(PackSettings::default()).await
+}
+
+/// [`holding`] over packs as `settings` say, but taking blobs of at most [`SMALL`] bytes.
+async fn holding_with(settings: PackSettings) -> (Arc<Rig>, (Digest, Bytes), (Digest, Bytes)) {
+    let rig = Arc::new(
+        Rig::with(PackSettings {
+            max_blob_bytes: SMALL,
+            ..settings
+        })
+        .await,
+    );
     let small = blob_of(b"held before the failover");
     let large = blob_len(3 * SMALL as usize, 7);
     let stored = update(&rig, vec![item(&small.0, &small.1)]).await;
@@ -106,15 +119,29 @@ async fn every_call_in_flight_succeeds_through_a_failover_of_30_seconds() {
     assert_eq!(rig.stored.packs().metrics().write_failures.get(), 0);
 }
 
-/// Catches a store down for good that hangs a call, costs each of its store calls the whole bound,
-/// or ends it in a way a client does not repeat: with the store answering 503 for an hour, a
-/// batch upload with no `grpc-timeout` answers its blob UNAVAILABLE, naming the 503 and saying it
-/// was not waited for past the bound, and a batch read after it answers UNAVAILABLE at once; all
-/// their calls to the store (the pack's writes under each key, the deletes of the failed keys,
-/// the read) waited 60 s in all, once. When the store is back, the same upload is stored.
+/// The packs of a rig whose waits are not jittered: the nominal 0.5 s doubling to 8 s, so that
+/// the waits of a budget are one sum.
+fn unjittered() -> PackSettings {
+    PackSettings {
+        store_retry: RetryPolicy {
+            jitter_percent: 0,
+            ..RetryPolicy::DEFAULT
+        },
+        ..PackSettings::default()
+    }
+}
+
+/// Catches a store down for good that hangs a call, costs each of its store calls the whole
+/// budget, or ends it in a way a client does not repeat: with the store answering 503 for an
+/// hour, a batch upload with no `grpc-timeout` answers its blob UNAVAILABLE, naming the 503 and
+/// saying it was still failing after 19 attempts over 119.5 s, the budget being 120 s (waits of
+/// 0.5, 1, 2 and 4 s, then 8 s fourteen times, the next not fitting), and a batch read after it
+/// answers UNAVAILABLE at once; all their calls to the store (the pack's write, the delete of
+/// the failed key, the read) waited 119.5 s in all, once, and the store is taken as down. When
+/// the store is back, the same upload is stored.
 #[tokio::test(start_paused = true)]
-async fn a_store_down_past_the_bound_is_unavailable_saying_so() {
-    let (rig, held, _) = holding().await;
+async fn a_store_down_past_the_budget_is_unavailable_saying_so() {
+    let (rig, held, _) = holding_with(unjittered()).await;
     let fresh = blob_of(b"never stored");
     rig.store.fail_over_for(Duration::from_secs(3600));
     let refused_before = rig.store.failover_refusals();
@@ -126,15 +153,16 @@ async fn a_store_down_past_the_bound_is_unavailable_saying_so() {
     assert!(
         upload
             .message
-            .contains("store answered 503 ServiceUnavailable: injected (not waited for: the store answered 503 past the bound of 60 s of waits, and no call since)"),
+            .contains("store answered 503 ServiceUnavailable: injected (still failing after 19 attempts over 119.5 s, the budget being 120 s)"),
         "{}",
         upload.message
     );
     assert_eq!(read[0].0, UNAVAILABLE);
     let waits = rig.stored.packs().store_waits();
     let waited: u64 = Op::ALL.iter().map(|op| waits.waits(*op).sum()).sum();
-    assert_eq!(waited, STORE_WAIT.as_nanos() as u64);
-    assert!(waits.exhausted(Op::Put) >= 2);
+    assert_eq!(waited, Duration::from_millis(119_500).as_nanos() as u64);
+    assert!(STORE_WAIT > Duration::from_millis(119_500));
+    assert_eq!(waits.exhausted(Op::Put), 1);
     assert_eq!(waits.exhausted(Op::Get), 1);
     assert!(waits.down());
     assert!(rig.store.failover_refusals() > refused_before);
@@ -143,6 +171,35 @@ async fn a_store_down_past_the_bound_is_unavailable_saying_so() {
     let again = update_answer(&rig, &fresh).await;
     assert_eq!(again.code, OK, "{}", again.message);
     assert!(!waits.down());
+}
+
+/// Catches a call made after a call spent its budget waiting its own budget out again, or
+/// failing without saying why: with the store taken as down by a first upload, the second
+/// upload of the blob is answered UNAVAILABLE at once, its message saying it was not retried
+/// because a call to the store spent its budget of 120 s and none since was answered, and the
+/// waits stay those of the first.
+#[tokio::test(start_paused = true)]
+async fn a_call_while_the_store_is_taken_as_down_is_answered_at_once_saying_so() {
+    let (rig, _, _) = holding_with(unjittered()).await;
+    let fresh = blob_of(b"never stored either");
+    rig.store.fail_over_for(Duration::from_secs(3600));
+    let first = update_answer(&rig, &fresh).await;
+    assert_eq!(first.code, UNAVAILABLE);
+    let waits = rig.stored.packs().store_waits();
+    let waited_first: u64 = Op::ALL.iter().map(|op| waits.waits(*op).sum()).sum();
+
+    let second = update_answer(&rig, &fresh).await;
+
+    assert_eq!(second.code, UNAVAILABLE);
+    assert!(
+        second
+            .message
+            .contains("store answered 503 ServiceUnavailable: injected (not retried: a call to the store spent its budget of 120 s still failing, and no call since was answered)"),
+        "{}",
+        second.message
+    );
+    let waited: u64 = Op::ALL.iter().map(|op| waits.waits(*op).sum()).sum();
+    assert_eq!(waited, waited_first);
 }
 
 /// The status of the one blob of a BatchUpdateBlobs of `blob`.

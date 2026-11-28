@@ -222,6 +222,17 @@ impl Storage for Watching {
     }
 }
 
+/// Default packs whose calls to the store are not retried: a budget of zero, so that a failure
+/// the store answers (a 500 among them) is the call's own failure, as the tests of what the
+/// packs do with a failing store need.
+pub(crate) fn unretried() -> kbf_front::PackSettings {
+    kbf_front::PackSettings {
+        store_retry: kbf_front::store_retry::RetryPolicy::DEFAULT
+            .with_budget(std::time::Duration::ZERO),
+        ..kbf_front::PackSettings::default()
+    }
+}
+
 /// The frontend with packs, a backend over a storage node that watches, the Action of the lease and
 /// the key set issued for it: three pack keys and two large keys unless said.
 pub(crate) struct Multi {
@@ -239,8 +250,19 @@ impl Multi {
         Self::sized(3, 2).await
     }
 
+    /// [`Multi::new`] over packs whose calls to the store are not retried ([`unretried`]): a
+    /// failure the store answers is the call's failure.
+    pub(crate) async fn unretried() -> Self {
+        Self::sized_with(3, 2, unretried()).await
+    }
+
     pub(crate) async fn sized(packs: u8, large_keys: u8) -> Self {
-        let rig = Rig::new().await;
+        Self::sized_with(packs, large_keys, kbf_front::PackSettings::default()).await
+    }
+
+    /// [`Multi::sized`] over packs as `settings` say.
+    async fn sized_with(packs: u8, large_keys: u8, settings: kbf_front::PackSettings) -> Self {
+        let rig = Rig::with(settings).await;
         let bytes = action_bytes(false);
         let action = sha256(&bytes);
         assert_eq!(update(&rig.front, &[(action, bytes)]).await, [0]);

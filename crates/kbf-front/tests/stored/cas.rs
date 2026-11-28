@@ -171,7 +171,7 @@ async fn a_batch_read_answers_each_blob_alone() {
 /// are served.
 #[tokio::test]
 async fn a_pack_that_cannot_be_read_fails_unavailable_not_not_found() {
-    let rig = Rig::new().await;
+    let rig = Rig::unretried().await;
     let (held, held_bytes) = blob_of(b"held");
     update(&rig, vec![item(&held, &held_bytes)])
         .await
@@ -185,11 +185,35 @@ async fn a_pack_that_cannot_be_read_fails_unavailable_not_not_found() {
     assert_eq!(served, vec![(OK, held_bytes.to_vec())]);
 }
 
+/// Asserts that a pack read the store fails once (a 500) is read again after the packs' first
+/// wait: the batch is served whole with no failure, and the one retry is counted as a read
+/// retried for a server error. Catches: a failure of the store that the packs wait out reaching
+/// the client.
+#[tokio::test(start_paused = true)]
+async fn a_pack_read_the_store_fails_once_is_retried_and_the_batch_is_served() {
+    let rig = Rig::new().await;
+    let (held, held_bytes) = blob_of(b"held");
+    update(&rig, vec![item(&held, &held_bytes)])
+        .await
+        .expect("stored");
+    rig.store.reject_reads(1);
+
+    let served = read(&rig, &[held]).await.expect("answered");
+
+    assert_eq!(served, vec![(OK, held_bytes.to_vec())]);
+    let waits = rig.stored.packs().store_waits();
+    let retried = waits.retries(
+        kbf_front::store_metrics::Op::Get,
+        kbf_front::store_retry::Cause::ServerError,
+    );
+    assert_eq!(retried, 1);
+}
+
 /// Asserts that when the object store refuses the pack, every blob of the batch that was to be
 /// in it fails UNAVAILABLE and none is held afterwards.
 #[tokio::test]
 async fn a_pack_the_store_refuses_leaves_no_blob_held() {
-    let rig = Rig::new().await;
+    let rig = Rig::unretried().await;
     let (one, one_bytes) = blob_of(b"one");
     let (two, two_bytes) = blob_of(b"two");
     rig.store.reject_puts(8);

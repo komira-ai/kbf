@@ -1,4 +1,31 @@
-# HELP kbf_pack_store_wait_seconds Waits for the packs' object store after it answered 503, by op
+# HELP kbf_pack_store_retries_total Calls to the packs' object store made again, by op and by the cause of the failure retried
+# TYPE kbf_pack_store_retries_total counter
+kbf_pack_store_retries_total{op="get",cause="connection"} 0
+kbf_pack_store_retries_total{op="get",cause="slow_down"} 0
+kbf_pack_store_retries_total{op="get",cause="unavailable"} 0
+kbf_pack_store_retries_total{op="get",cause="server_error"} 0
+kbf_pack_store_retries_total{op="get",cause="request_timeout"} 0
+kbf_pack_store_retries_total{op="head",cause="connection"} 0
+kbf_pack_store_retries_total{op="head",cause="slow_down"} 0
+kbf_pack_store_retries_total{op="head",cause="unavailable"} 0
+kbf_pack_store_retries_total{op="head",cause="server_error"} 0
+kbf_pack_store_retries_total{op="head",cause="request_timeout"} 0
+kbf_pack_store_retries_total{op="put",cause="connection"} 0
+kbf_pack_store_retries_total{op="put",cause="slow_down"} 0
+kbf_pack_store_retries_total{op="put",cause="unavailable"} 0
+kbf_pack_store_retries_total{op="put",cause="server_error"} 0
+kbf_pack_store_retries_total{op="put",cause="request_timeout"} 0
+kbf_pack_store_retries_total{op="delete",cause="connection"} 0
+kbf_pack_store_retries_total{op="delete",cause="slow_down"} 0
+kbf_pack_store_retries_total{op="delete",cause="unavailable"} 0
+kbf_pack_store_retries_total{op="delete",cause="server_error"} 0
+kbf_pack_store_retries_total{op="delete",cause="request_timeout"} 0
+kbf_pack_store_retries_total{op="list",cause="connection"} 0
+kbf_pack_store_retries_total{op="list",cause="slow_down"} 0
+kbf_pack_store_retries_total{op="list",cause="unavailable"} 0
+kbf_pack_store_retries_total{op="list",cause="server_error"} 0
+kbf_pack_store_retries_total{op="list",cause="request_timeout"} 0
+# HELP kbf_pack_store_wait_seconds Waits before a call to the packs' object store was made again, by op
 # TYPE kbf_pack_store_wait_seconds histogram
 kbf_pack_store_wait_seconds_bucket{op="get",le="0.001"} 0
 kbf_pack_store_wait_seconds_bucket{op="get",le="0.0025"} 0
@@ -90,10 +117,13 @@ kbf_pack_store_wait_seconds_bucket{op="list",le="60"} 0
 kbf_pack_store_wait_seconds_bucket{op="list",le="+Inf"} 0
 kbf_pack_store_wait_seconds_sum{op="list"} 0
 kbf_pack_store_wait_seconds_count{op="list"} 0
-# HELP kbf_pack_store_waits_exhausted_total Calls to the packs' object store that still answered 503 when their waits reached the bound, or while it was taken as down, by op
+# HELP kbf_pack_store_waits_exhausted_total Calls to the packs' object store that were still failing when no retry was left in their budget, or while it was taken as down, by op
 # TYPE kbf_pack_store_waits_exhausted_total counter
 kbf_pack_store_waits_exhausted_total{op="get"} 0
 kbf_pack_store_waits_exhausted_total{op="head"} 0
 kbf_pack_store_waits_exhausted_total{op="put"} 0
 kbf_pack_store_waits_exhausted_total{op="delete"} 0
 kbf_pack_store_waits_exhausted_total{op="list"} 0
+# HELP kbf_pack_input_walks_cut_total Executes whose walk of their input tree over the packs did not end within its deadline, answered UNAVAILABLE
+# TYPE kbf_pack_input_walks_cut_total counter
+kbf_pack_input_walks_cut_total 0

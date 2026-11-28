@@ -7,9 +7,8 @@
 //!   ended, stored or failed, of each of its parts ([`WriteWaits`]): `manifest_slot` (the wait
 //!   for one of the writer's manifest slots, shared by every tree), `store_slot` (the waits for
 //!   one of the pack store's slots for tree writes, shared by every tree and not with the pack
-//!   uploads, added up over the attempts),
-//!   `store_503` (the waits between attempts for a store that answered 503) and `request` (the
-//!   rest: the attempts at the store). `stage` is the stage the write was made in, as the step
+//!   uploads, added up over the attempts), `store_503` (the waits between attempts for a store
+//!   that failed in a way that may pass) and `request` (the rest: the attempts at the store). `stage` is the stage the write was made in, as the step
 //!   family names it: `tree_manifests` (one observation per manifest, `.kbf` among them),
 //!   `tree_root` (the root) and `tree_list` (a tree list's one write, which takes no manifest
 //!   slot, so it has no `manifest_slot`). The stage names the form, so there is no `form`
@@ -66,7 +65,8 @@ enum Part {
     ManifestSlot,
     /// The waits for a slot of the pack store.
     StoreSlot,
-    /// The waits between attempts for a store that answered 503.
+    /// The waits between attempts for a store that failed in a way the retry takes (a 503, a
+    /// 5xx, a stalled body, a dead connection).
     Store503,
     /// The attempts at the store.
     Request,
@@ -119,7 +119,8 @@ impl Series for WritePart {
     const HELP: &'static str = "Where the time of each write an action tree made went, by the \
                                 stage it was made in and by part: the wait for a manifest slot, \
                                 the waits for a slot of the pack store, the waits between \
-                                attempts for a store that answered 503, and the attempts";
+                                attempts for a store that failed in a way that may pass, and \
+                                the attempts";
     const ALL: &'static [Self] = &Self::ALL;
 
     fn labels(self) -> String {

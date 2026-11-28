@@ -269,7 +269,10 @@ async fn a_stream_left_after_its_last_byte_never_completes_the_write() {
 /// is cached.
 #[tokio::test]
 async fn a_failing_length_question_is_followed_by_the_put() {
-    let farm = farm_with_large().await;
+    let farm = Multi::unretried().await;
+    let (_, zero) = farm.large_run();
+    farm.put(farm.pack_key(0), &zero).await;
+    farm.put(farm.large_key(0), &large().0).await;
     let (bytes, digest) = large();
     farm.rig.store.fail_len_of(&key_of(digest));
 

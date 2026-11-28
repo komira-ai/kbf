@@ -21,8 +21,9 @@
 //!   given up there, and an attempt still unanswered when the bound passes is dropped (every
 //!   call retried here is create-only, so an attempt dropped half-way leaves nothing another
 //!   attempt trips on but an object it wrote whole). The bound counts the time inside the
-//!   attempts too, the waits of the packs' store for its 503s
-//!   ([`crate::store_wait`]) among them, so a call never takes longer than the bound. A bound
+//!   attempts too, so a call never takes longer than the bound. Each attempt is made with the
+//!   packs' own retry off ([`crate::store_wait`]'s `unretried`): the start's call is retried by
+//!   this retry alone, and the store's answer to each attempt is the one it sees. A bound
 //!   of zero retries nothing: the first answer is the call's answer, as before the bound.
 //! - **What is logged.** One warning for each retry, with the call, the attempt, the wait and
 //!   the answer it is a retry of; one line when a call that was retried succeeds, saying how
@@ -39,7 +40,7 @@ use futures::future::{BoxFuture, Either, select};
 use kbf_objstore::ObjectStoreError;
 
 use crate::action_tree::{FIRST_WAIT, LONGEST_WAIT};
-use crate::store_wait::{Jitter, no_jitter, spread};
+use crate::store_wait::{Jitter, no_jitter, spread, unretried};
 
 /// The default bound of a start-time call to the pack store.
 pub const DEFAULT_BOUND: Duration = Duration::from_secs(120);
@@ -69,6 +70,13 @@ impl RetryClock for TokioClock {
     }
 }
 
+/// The [`RetryClock`] of a running frontend, for every retry of the pack store's calls.
+pub(crate) fn tokio_clock() -> Arc<dyn RetryClock> {
+    Arc::new(TokioClock {
+        origin: tokio::time::Instant::now(),
+    })
+}
+
 /// How the start-time calls to the pack store are retried, as the module says. Cheap to clone.
 #[derive(Clone)]
 pub struct StartRetry {
@@ -89,9 +97,7 @@ impl StartRetry {
     /// Retries within `bound`, waiting on the tokio timer, jittered.
     #[must_use]
     pub fn new(bound: Duration) -> Self {
-        let clock = Arc::new(TokioClock {
-            origin: tokio::time::Instant::now(),
-        });
+        let clock = tokio_clock();
         Self {
             bound,
             clock,
@@ -135,7 +141,7 @@ impl StartRetry {
         Fut: Future<Output = Result<T, E>>,
     {
         if self.bound.is_zero() {
-            return attempt(1).await.map_err(Ended::Refused);
+            return unretried(attempt(1)).await.map_err(Ended::Refused);
         }
         let started = self.clock.now();
         let deadline = started + self.bound;
@@ -145,10 +151,11 @@ impl StartRetry {
         loop {
             attempts += 1;
             let left = deadline.saturating_sub(self.clock.now());
-            let answered = match select(pin!(attempt(attempts)), self.clock.sleep(left)).await {
-                Either::Left((answer, _)) => Some(answer),
-                Either::Right(((), _)) => None,
-            };
+            let answered =
+                match select(pin!(unretried(attempt(attempts))), self.clock.sleep(left)).await {
+                    Either::Left((answer, _)) => Some(answer),
+                    Either::Right(((), _)) => None,
+                };
             let tried = self.clock.now().saturating_sub(started);
             let error = match answered {
                 Some(Ok(value)) => {

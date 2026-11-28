@@ -1,41 +1,26 @@
-//! The retry of a create-only write to `cas/l/<sha256>`: what a tree's write does when tierstore
-//! answers "retry later" or a pooled connection turns out to be dead.
+//! The retry of a create-only write to `cas/l/<sha256>`: what a tree's write does when the
+//! store fails it in a way that may pass (a restart, a stall, a dead connection).
 //!
 //! Every write of a tree is create-only and content-bound (the same key always gets the same
 //! bytes), so repeating one is safe: an object an earlier attempt did store is `AlreadyExists`,
-//! which the write counts as done (a blob's write asks the key's length first and after such an
-//! answer: [`super::place`]). Four answers are repeated, and no other:
+//! which the write takes as done once the object's length is the bytes' ([`super::place`]: a
+//! write that finds an object of another length under its key, such as one of 0 bytes that a
+//! store kept of a cut write, deletes it and writes the object again). The body is made again
+//! for each attempt: a blob's is read from its source again, a manifest's, a tree list's or a
+//! sidecar's is in hand.
 //!
-//! - **A connection-level failure** ([`ObjectStoreError::Transport`]: a pooled connection the
-//!   store had closed, "connection closed before message completed", "Broken pipe"): once, at
-//!   once, on the connection the client makes next. A second failure is the failure.
-//! - **A stalled body** ([`ObjectStoreError::Service`] with status 400 and the code
-//!   `RequestTimeout`: tierstore had no byte of the body for its idle timeout, and closed the
-//!   connection), for a blob's write only ([`retrying`]): once, at once, with the body read
-//!   again. A second one is the failure. The store may have kept the stalled write as an object
-//!   of 0 bytes, which only a blob's write checks for (by the key's length) and deletes; a write
-//!   of a manifest, a tree list or a sidecar would take that object for its own, so a stalled
-//!   body is its failure.
-//! - **A 503** ([`ObjectStoreError::Service`] with status 503: the store is not taking writes
-//!   for a while, typically 10 to 40 s while it registers or fails over its metadata): after a
-//!   wait that starts at about [`FIRST_WAIT`] and doubles up to [`LONGEST_WAIT`], each jittered
-//!   to between half and all of it, until the waits add up to [`PutRetry::total`]
-//!   (`--task-put-retry-secs`, [`DEFAULT_TOTAL`] by default); the wait that would pass the total
-//!   is cut to end there, and when the waits have added up to it, the 503 is the failure, its
-//!   message saying how long the write waited. A total of zero never retries a 503. The waits
-//!   are those of the frontend's other calls to the store ([`Backoff`]), and are counted with
-//!   them once the retry is [`PutRetry::counted_in`] the packs' waits.
-//! - **A 503 `SlowDown`** (the store is taking as many uploads as it can: back-pressure, not a
-//!   fault): with the same waits, for as long as the store answers it; its waits do not count
-//!   toward the total. What ends it is the caller: a preparation that runs out of its limit
-//!   drops the write, and with it the retry.
+//! The retry is the pack store's ([`crate::store_retry`], run by [`Backoff`]): a request that
+//! got no answer, a 503 (`SlowDown` among them), a 500, 502 or 504 and a 400 `RequestTimeout`
+//! are made again after jittered waits that grow from the policy's first wait to its longest,
+//! until the budget ([`PutRetry::policy`], `--task-put-retry-secs`, [`DEFAULT_TOTAL`] by
+//! default), counted from the write's first attempt, would pass before the next attempt began;
+//! then the store's last answer is the failure, its message saying how many attempts were made
+//! and over how long. A budget of zero retries nothing. The retries are counted with the packs'
+//! once the retry is [`PutRetry::counted_in`] the packs' waits, as writes. Every other answer (a
+//! 403, a body that failed its digest check) is reported on the first attempt.
 //!
 //! The waits a write of the tree's manifests, root or list makes are added to that write's tally
-//! ([`super::waits`]), as its 503 waits.
-//!
-//! Every other answer (a 403, a 500, a body that failed its digest check) is reported on the
-//! first attempt. A write whose body is read from a source is made again by reading the source
-//! again: the attempt is a function that builds its own body.
+//! ([`super::waits`]), as its `store_503` waits.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -46,64 +31,54 @@ use kbf_objstore::{ObjectKey, ObjectStoreError};
 use tokio::time::Instant;
 
 use super::NoTree;
-use super::waits::waited_out_503;
+use super::waits::waited_to_retry;
+use crate::start_retry::RetryClock;
 use crate::store_metrics::Op;
-use crate::store_wait::{Backoff, Next, StoreWaits, no_jitter, spread};
+use crate::store_retry::RetryPolicy;
+use crate::store_wait::{Backoff, Next, StoreWaits};
 
-/// The default of `--task-put-retry-secs`: how long the waits before the retries of one write
-/// of a tree may add up to.
+/// The default of `--task-put-retry-secs`: the budget of one write of a tree.
 pub const DEFAULT_TOTAL: Duration = Duration::from_secs(60);
 
-/// The wait before the first retry of a 503.
-pub const FIRST_WAIT: Duration = Duration::from_millis(500);
+/// The wait before the first retry, by default ([`RetryPolicy::DEFAULT`]).
+pub const FIRST_WAIT: Duration = RetryPolicy::DEFAULT.first;
 
-/// The longest wait before one retry of a 503: the wait doubles up to this.
-pub const LONGEST_WAIT: Duration = Duration::from_secs(8);
+/// The longest wait before one retry, by default ([`RetryPolicy::DEFAULT`]).
+pub const LONGEST_WAIT: Duration = RetryPolicy::DEFAULT.longest;
 
-/// How the retry waits: the tokio timer in a frontend, a recording fake in a test.
+/// How a wait is taken: the tokio timer in a process, a recording fake in a test. The retries of
+/// the pack store's calls read a [`RetryClock`] instead; this paces other waits (the L2
+/// backfill's).
 pub trait Sleeper: Send + Sync {
     /// Completes after `wait`.
     fn sleep(&self, wait: Duration) -> BoxFuture<'_, ()>;
 }
 
-/// The [`Sleeper`] of a running frontend.
-struct TokioSleeper;
-
-impl Sleeper for TokioSleeper {
-    fn sleep(&self, wait: Duration) -> BoxFuture<'_, ()> {
-        Box::pin(tokio::time::sleep(wait))
-    }
-}
-
-/// The [`Sleeper`] of a running frontend, for another writer that waits out the store.
-pub(crate) fn tokio_sleeper() -> Arc<dyn Sleeper> {
-    Arc::new(TokioSleeper)
-}
-
 /// How a tree's writes are repeated. Cheap to clone.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PutRetry {
     backoff: Backoff,
 }
 
 impl PutRetry {
-    /// A retry whose waits for 503s add up to at most `total`, waiting on the tokio timer,
-    /// jittered, and counted nowhere until [`PutRetry::counted_in`].
+    /// A retry as `policy` says, waiting on the tokio timer, and counted nowhere until
+    /// [`PutRetry::counted_in`].
     #[must_use]
-    pub fn new(total: Duration) -> Self {
-        let backoff = Backoff::with(total, tokio_sleeper(), spread(), Arc::default());
-        Self { backoff }
+    pub fn new(policy: RetryPolicy) -> Self {
+        Self {
+            backoff: Backoff::new(policy, Arc::default()),
+        }
     }
 
-    /// [`PutRetry::new`] waiting with `sleeper` and not jittered (a test records the nominal
-    /// waits instead).
+    /// [`PutRetry::new`] reading and waiting on `clock` (a test's virtual clock).
     #[must_use]
-    pub fn with_sleeper(total: Duration, sleeper: Arc<dyn Sleeper>) -> Self {
-        let backoff = Backoff::with(total, sleeper, no_jitter(), Arc::default());
-        Self { backoff }
+    pub fn with_clock(policy: RetryPolicy, clock: Arc<dyn RetryClock>) -> Self {
+        Self {
+            backoff: Backoff::with(policy, clock, Arc::default()),
+        }
     }
 
-    /// This retry, its waits counted in `waits` (the packs' [`Packs::store_waits`](crate::Packs::store_waits)),
+    /// This retry, its retries counted in `waits` (the packs' [`Packs::store_waits`](crate::Packs::store_waits)),
     /// as writes.
     #[must_use]
     pub fn counted_in(self, waits: Arc<StoreWaits>) -> Self {
@@ -112,16 +87,16 @@ impl PutRetry {
         }
     }
 
-    /// The most the waits before the retries of one write add up to.
+    /// The policy of the retry of one write.
     #[must_use]
-    pub const fn total(&self) -> Duration {
-        self.backoff.total()
+    pub const fn policy(&self) -> RetryPolicy {
+        self.backoff.policy()
     }
 }
 
 impl Default for PutRetry {
     fn default() -> Self {
-        Self::new(DEFAULT_TOTAL)
+        Self::new(RetryPolicy::DEFAULT.with_budget(DEFAULT_TOTAL))
     }
 }
 
@@ -134,20 +109,9 @@ pub(super) enum Failed<E = NoTree> {
     Other(E),
 }
 
-/// Whether `error` is the store's back-pressure: a 503 `SlowDown`.
-pub(crate) fn is_slow_down(error: &ObjectStoreError) -> bool {
-    matches!(error, ObjectStoreError::Service { status: 503, code, .. } if code == "SlowDown")
-}
-
-/// Whether `error` is the store's answer to a body of which no byte came for its idle timeout:
-/// a 400 `RequestTimeout`.
-fn is_stalled(error: &ObjectStoreError) -> bool {
-    matches!(error, ObjectStoreError::Service { status: 400, code, .. } if code == "RequestTimeout")
-}
-
 /// Runs `attempt` (one create-only write of the blob `key`, which checks what the key holds
-/// before it writes), and again after a connection-level failure (once), a stalled body (once),
-/// a 503 (within the total) or a 503 `SlowDown` (for as long as the store answers it).
+/// before it writes) until it succeeds, fails in a way that is not retried, or no retry fits in
+/// the budget.
 ///
 /// # Errors
 /// [`NoTree::Put`] with the store's last answer, or the [`Failed::Other`] of an attempt.
@@ -160,7 +124,7 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<(), Failed>>,
 {
-    repeated(retry, true, attempt)
+    repeating(retry, attempt)
         .await
         .map_err(|failed| match failed {
             Failed::Store(error) => NoTree::Put {
@@ -171,9 +135,9 @@ where
         })
 }
 
-/// [`retrying`] but for a stalled body, which is the failure: for a write whose `attempt` does not
-/// check what the key holds (a manifest's, a tree list's, a sidecar's). The failure is as the
-/// attempt gave it: the store's last answer, or the [`Failed::Other`] of an attempt.
+/// Runs `attempt` until it succeeds, fails in a way that is not retried, or no retry fits in
+/// the budget. The failure is as the attempt gave it: the store's last answer, or the
+/// [`Failed::Other`] of an attempt.
 ///
 /// # Errors
 /// The last attempt's [`Failed`].
@@ -182,38 +146,19 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<(), Failed<E>>>,
 {
-    repeated(retry, false, attempt).await
-}
-
-/// The loop of [`retrying`] and [`repeating`]: a stalled body is repeated once with `resend`.
-async fn repeated<E, F, Fut>(retry: &PutRetry, resend: bool, attempt: F) -> Result<(), Failed<E>>
-where
-    F: Fn() -> Fut,
-    Fut: Future<Output = Result<(), Failed<E>>>,
-{
-    let mut reconnected = false;
-    let mut resent = !resend;
     let mut waits = retry.backoff.call(Op::Put);
     loop {
         let error = match attempt().await {
-            Ok(()) | Err(Failed::Store(ObjectStoreError::AlreadyExists(_))) => {
+            Ok(()) => {
                 waits.answered();
                 return Ok(());
             }
             Err(Failed::Other(failure)) => return Err(Failed::Other(failure)),
             Err(Failed::Store(error)) => error,
         };
-        if matches!(error, ObjectStoreError::Transport(_)) && !reconnected {
-            reconnected = true;
-            continue;
-        }
-        if is_stalled(&error) && !resent {
-            resent = true;
-            continue;
-        }
         let asked = Instant::now();
-        let next = waits.after(&error, true).await;
-        waited_out_503(asked.elapsed());
+        let next = waits.after(&error).await;
+        waited_to_retry(asked.elapsed());
         if next == Next::Again {
             continue;
         }

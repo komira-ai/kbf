@@ -87,6 +87,12 @@
 //!   than [`VERIFIED_TTL`] and the store's epoch is still the record's, the same bounds as for
 //!   the subtrees remembered above (a store that names no epoch, then and now, is believed by
 //!   the time alone). A record nobody takes is pushed out by newer ones ([`VOUCHED_ENTRIES`]).
+//! - **A deadline.** A walk over the packs ([`Blobs::walk_deadline`]) ends within
+//!   `--pack-input-walk-secs`: each of its reads is retried while the store fails in a way that
+//!   may pass, within its own budget ([`crate::store_wait`]), and a walk still running at the
+//!   deadline is dropped, its reads with it, and answered UNAVAILABLE ([`walk_cut`]), which the
+//!   client makes again: a store that stays down costs an Execute the deadline, never more, and
+//!   never ends it as the action's own failure.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -106,6 +112,7 @@ use crate::dir_cache::{DirCache, Lookup};
 use crate::input_tree::{Decoded, Walked, decode};
 use crate::known_dirs::{KnownDirs, keep_named};
 use crate::prepare_run::DirectoryCache;
+use crate::store_wait::StoreWaits;
 
 /// The most Directory blobs one [`walk_told`] reads from the store at once. The tree of a
 /// request is the only bound on its fan-out, so this is what keeps a few hundred
@@ -154,6 +161,13 @@ pub(crate) trait Blobs: Send + Sync {
     /// (see `kbf_route::Router::epoch`); `None` when the store cannot say, and nothing
     /// is then remembered.
     fn epoch(&self) -> Option<u64> {
+        None
+    }
+
+    /// How long a walk over these blobs may take, and where a walk cut at it is counted: the
+    /// packs' deadline for a walk that reads them, which call a store that may fail for a while
+    /// ([`crate::store_wait`]); `None`, no deadline, for one that reads none.
+    fn walk_deadline(&self) -> Option<(Duration, Arc<StoreWaits>)> {
         None
     }
 }
@@ -423,7 +437,28 @@ pub(crate) async fn walk_told(
     trees: &Trees,
     told: DirsRead,
 ) -> Answer<Walked> {
-    walk_within(storage, root, DIRS_IN_FLIGHT, trees, told).await
+    let walk = walk_within(storage, root, DIRS_IN_FLIGHT, trees, told);
+    let Some((deadline, counted)) = storage.walk_deadline() else {
+        return walk.await;
+    };
+    let Ok(walked) = tokio::time::timeout(deadline, walk).await else {
+        // The reads in flight are dropped with the walk: each is a read, which nothing else
+        // waits on, and a walk that failed vouches for nothing.
+        counted.walk_cut();
+        return Err(walk_cut(root, deadline));
+    };
+    walked
+}
+
+/// The failure of a walk of `root` that did not end within `deadline`: UNAVAILABLE, which a
+/// client makes again, as for a store that could not answer; never the action's own failure.
+pub(crate) fn walk_cut(root: Digest, deadline: Duration) -> StorageError {
+    let message = format!(
+        "the walk of the input tree {root} did not end within {} s (--pack-input-walk-secs): \
+         the pack store is failing or slow; try again",
+        deadline.as_secs()
+    );
+    StorageError::Unavailable(Arc::new(tonic::Status::unavailable(message)))
 }
 
 /// [`walk_told`], with no one told.

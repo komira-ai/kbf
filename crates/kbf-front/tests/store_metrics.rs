@@ -470,8 +470,8 @@ async fn the_cache_renders_the_handle_it_is_given() {
 }
 
 /// Catches: packs that render no store families, or a handle other than the one they were
-/// given: zero lines before any request (the store's four families, then its waits for 503s),
-/// and the store's counts once it has served one.
+/// given: zero lines before any request (the store's four families, then its retries, waits and
+/// exhausted calls, and the input walks cut), and the store's counts once it has served one.
 #[tokio::test]
 async fn packs_render_the_pack_store_families() {
     let create_only = Capabilities {

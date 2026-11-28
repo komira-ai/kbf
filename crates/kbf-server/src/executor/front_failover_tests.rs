@@ -4,6 +4,7 @@
 //! the bound of the waits makes the run unavailable (the farm's, retried), saying so. The clock
 //! is the runtime's, paused: a window of 30 s passes while nothing else can run.
 
+use kbf_front::action_tree::LONGEST_WAIT;
 use kbf_front::store_metrics::Op;
 use kbf_front::store_wait::STORE_WAIT;
 
@@ -81,9 +82,10 @@ async fn a_run_is_prepared_and_ingested_through_a_failover_of_30_seconds() {
 
 /// Catches a store down for good that hangs a run, or fails it as the caller's: with the store
 /// answering 503 for an hour, the run's preparation is unavailable (the farm's, which the
-/// executor runs again), its reason naming the store's 503 and saying it was still answered
-/// after the waits; and the ingest of a committed pack after it is unavailable, not a refusal,
-/// at once, the store being taken as down: the two waited 60 s in all, once.
+/// executor runs again), its reason naming the store's 503 and saying it was still failing when
+/// the retry's budget was spent; and the ingest of a committed pack after it is unavailable, not
+/// a refusal, at once, the store being taken as down: the two waited one budget in all, once
+/// (with the jitter, between the budget less the longest wait and the budget).
 #[tokio::test(start_paused = true)]
 async fn a_store_down_past_the_bound_makes_the_run_unavailable_saying_so() {
     let rig = rig();
@@ -110,11 +112,12 @@ async fn a_store_down_past_the_bound_makes_the_run_unavailable_saying_so() {
 
     assert!(
         matches!(&down, Err(MintError::Unavailable(why))
-            if why.contains("store answered 503 ServiceUnavailable: failing over (still so after")),
+            if why.contains("store answered 503 ServiceUnavailable: failing over (still failing after")
+                && why.contains("the budget being 120 s)")),
         "{down:?}"
     );
     assert!(
-        matches!(&ingested, Ingested::Unavailable(why) if why.contains("(not waited for")),
+        matches!(&ingested, Ingested::Unavailable(why) if why.contains("(not retried: ")),
         "{ingested:?}"
     );
     let exhausted: u64 = Op::ALL.iter().map(|op| rig.waits.exhausted(*op)).sum();
@@ -123,9 +126,10 @@ async fn a_store_down_past_the_bound_makes_the_run_unavailable_saying_so() {
         "the preparation and the ingest each ran out: {exhausted}"
     );
     let waited: u64 = Op::ALL.iter().map(|op| rig.waits.waits(*op).sum()).sum();
-    assert_eq!(
-        waited,
-        STORE_WAIT.as_nanos() as u64,
-        "the bound was waited more than once"
+    let budget = STORE_WAIT.as_nanos() as u64;
+    let least = STORE_WAIT.saturating_sub(LONGEST_WAIT).as_nanos() as u64;
+    assert!(
+        (least..=budget).contains(&waited),
+        "the budget was not waited once: {waited} ns"
     );
 }

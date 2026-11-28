@@ -176,7 +176,7 @@ async fn a_store_answering_absent_for_a_while_loses_no_pack_and_a_young_one_neve
 /// absence; and the blob stays held for FindMissingBlobs.
 #[tokio::test]
 async fn reads_the_store_fails_forget_nothing() {
-    let rig = Rig::new().await;
+    let rig = Rig::unretried().await;
     let (large, bytes) = blob_len(3000, 17);
     upload(&rig, &large, &bytes).await;
     lose(&rig, &large).await;
@@ -311,7 +311,7 @@ async fn a_lost_large_blob_is_forgotten_and_its_upload_under_the_same_key_is_rec
 /// that merely failed to answer says is taken for a loss.
 #[tokio::test]
 async fn a_loss_the_store_cannot_confirm_forgets_nothing() {
-    let rig = Rig::new().await;
+    let rig = Rig::unretried().await;
     let (large, bytes) = blob_len(3000, 11);
     upload(&rig, &large, &bytes).await;
     let key = lose(&rig, &large).await;
