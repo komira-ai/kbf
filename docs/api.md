@@ -512,7 +512,13 @@ over a state store (`kbf frontend` requires one):
 4. **Wait for the executions and the calls.** The wait lasts until `open_executions` is 0
    and no REAPI call is being answered (`kbf_front_open_calls`: a ByteStream write or read, a
    cache call, an Execute still being prepared, from its arrival until its answer has been
-   sent), however long that takes, so the exit cuts no upload. Buck2 sends a cut write again
+   sent), however long that takes, so the exit cuts no upload. Then it waits until every
+   REAPI connection has closed: a call stops counting once the last frame of its answer is
+   handed to its connection, which may still hold part of a large answer (a `BatchReadBlobs`,
+   a ByteStream read) for a client that reads it slowly, and a connection sent GOAWAY closes
+   only once everything it holds is written. A client that answers nothing at all is closed
+   by the keep-alive (`--http2-keepalive-interval-secs` and `--http2-keepalive-timeout-secs`).
+   Buck2 sends a cut write again
    from its first byte, on a new connection, at most five times within about two seconds, and
    never asks `QueryWriteStatus`; the frontend accepts a write only from offset 0, and a cut
    write leaves no blob that a read could find. There is no default deadline, and the drain never ends a stream because
@@ -529,8 +535,12 @@ over a state store (`kbf frontend` requires one):
    stops, so each storage node dials another frontend through the load balancer. No Execute or WaitExecution stream is open by now unless a
    second signal or `--shutdown-timeout-secs` forced the stop; the ones that are end
    `UNAVAILABLE` (an action that was still running fails, as Buck2 does not recover a
-   stream), and a WARN says how many streams of how many builds were cut (a build is a
-   `RequestMetadata` `tool_invocation_id`) and how many other calls. The INFO line of the
+   stream), every other call still open is answered `UNAVAILABLE` (in headers alone when
+   its handler had not answered, in place of the next frame of an answer being sent), which a
+   client makes again, rather than being cut by the exit, and a WARN says how many streams
+   of how many builds were cut (a build is a
+   `RequestMetadata` `tool_invocation_id`) and how many other calls. The REAPI connections
+   then get a grace of two seconds to write those answers. The INFO line of the
    stand-down says why: `nothing is left to answer`, or `ended by force`. Phase `closing`, a
    few seconds long, and the process exits 0. For a worker
    listener behind a load balancer that passes TCP through, GOAWAY reaches the storage node's

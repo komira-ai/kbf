@@ -1254,6 +1254,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "h2",
  "js-proto",
  "kbf-ca",
  "kbf-cas-conformance",

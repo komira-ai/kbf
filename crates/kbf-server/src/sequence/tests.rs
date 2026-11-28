@@ -11,6 +11,7 @@ use super::*;
 use crate::drain::Phase;
 use crate::health::Readiness;
 
+mod connections;
 mod stand_down;
 
 /// The two waits, in seconds.
