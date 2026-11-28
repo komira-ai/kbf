@@ -8,12 +8,12 @@ use crate::rig::{HOST, Rig, cancels, submits};
 
 /// Catches an executor that does not use the job service the way its design says: over actions
 /// that run, a whole-machine action refused, a submit whose answer is lost, a caller that cancels and a
-/// job that did not end well, every call it makes is one of `SubmitJob`, `GetJob`, `CancelJob`,
-/// `GetResult` and `GetLogs`, and each of them is made (so the check is not about an empty
-/// list). The lost answer makes one job, sent twice; the whole-machine action makes none; and the
+/// job that did not end well, every call it makes is one of `SubmitJob`, `GetJob`, `ListJobs`
+/// (the listing that follows the running jobs), `CancelJob`, `GetResult` and `GetLogs`, and each
+/// of them is made (so the check is not about an empty list). The lost answer makes one job, sent twice; the whole-machine action makes none; and the
 /// cancel is made for the one job of the cancelled operation.
 #[tokio::test]
-async fn the_traffic_with_the_job_service_is_the_five_calls_of_its_design() {
+async fn the_traffic_with_the_job_service_is_the_six_calls_of_its_design() {
     let rig = Rig::start(&[HOST], |_| {}).await;
 
     // Two actions run and exit 0, and are ingested.
@@ -83,7 +83,14 @@ async fn the_traffic_with_the_job_service_is_the_five_calls_of_its_design() {
     assert!(matches!(failing.done().await, Finished::Ran(_)));
 
     let methods = rig.methods();
-    let known = ["SubmitJob", "GetJob", "CancelJob", "GetResult", "GetLogs"];
+    let known = [
+        "SubmitJob",
+        "GetJob",
+        "ListJobs",
+        "CancelJob",
+        "GetResult",
+        "GetLogs",
+    ];
     for method in &methods {
         assert!(known.contains(method), "{method} in {methods:?}");
     }

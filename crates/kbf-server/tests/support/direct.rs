@@ -8,8 +8,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use js_proto::v1::{
-    ExecMode, GetJobResponse, GetResultResponse, Job, JobResult, JobState, ResultReason, Shape,
+    ExecMode, GetJobResponse, GetResultResponse, Job, JobResult, JobState, ListJobsResponse,
+    ResultReason, Shape,
 };
+
+/// The states of a job that has not ended: what the executor's listing of its jobs asks for.
+const LIVE: [JobState; 4] = [
+    JobState::Queued,
+    JobState::Placed,
+    JobState::Starting,
+    JobState::Running,
+];
 use kbf_front::{Cache, DecodedAction, Recorder, VerifiedBlob};
 use kbf_job_client::fake::{FakeJobServer, Fault, Machine};
 use kbf_proto::reapi::{ActionResult, Digest, OutputFile};
@@ -297,7 +306,8 @@ impl Direct {
     }
 
     /// Runs the first attempt of `action` and has it end at the wall limit the job asked for,
-    /// which is the action's timeout: the next reads of the job and of its result say so.
+    /// which is the action's timeout: the next reads of the job and of its result say so, and the
+    /// next listing of the live jobs leaves it out, so a job the listing follows is read.
     pub async fn time_out(&self, action: &Blob) -> String {
         let job = self.run(action).await;
         let mut ended = self
@@ -314,6 +324,18 @@ impl Direct {
         let result_answer = GetResultResponse {
             result: Some(result),
         };
+        // A job the listing follows is read on its own once a listing has it no more.
+        let live = ListJobsResponse {
+            jobs: self
+                .fake
+                .jobs()
+                .into_iter()
+                .filter(|listed| listed.id != job && LIVE.contains(&listed.state()))
+                .collect(),
+            next_page_token: String::new(),
+        };
+        self.fake
+            .inject_on("ListJobs", Fault::Answer(live.encode_to_vec().into()));
         self.fake
             .inject_on("GetJob", Fault::Answer(job_answer.encode_to_vec().into()));
         self.fake.inject_on(

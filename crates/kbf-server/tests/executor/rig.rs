@@ -11,9 +11,17 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use js_proto::v1::{
-    ExecMode, GetJobResponse, GetResultResponse, Job, JobResult, JobSpec, JobState, ResultReason,
-    Shape,
+    ExecMode, GetJobResponse, GetResultResponse, Job, JobResult, JobSpec, JobState,
+    ListJobsResponse, ResultReason, Shape,
 };
+
+/// The states of a job that has not ended: what the executor's listing of its jobs asks for.
+const LIVE: [JobState; 4] = [
+    JobState::Queued,
+    JobState::Placed,
+    JobState::Starting,
+    JobState::Running,
+];
 use kbf_auth::AuthenticationMetadata;
 use kbf_front::{
     ActionLabel, CallMetadata, DecodedAction, Described, Dispatch, ExecuteCall, Finished,
@@ -600,7 +608,8 @@ impl Rig {
 
     /// The next read of the job `id` and of its result are answered as a job that ended in
     /// `job_state` and a result of `result_state`, for `reason`, with `exit_code`, whatever the
-    /// job service holds.
+    /// job service holds; the next listing of the live jobs leaves it out, so a job the listing
+    /// follows is read.
     pub fn script_ending(
         &self,
         id: &str,
@@ -626,6 +635,18 @@ impl Rig {
                 ..JobResult::default()
             }),
         };
+        // A job the listing follows is read on its own once a listing has it no more.
+        let live = ListJobsResponse {
+            jobs: self
+                .fake
+                .jobs()
+                .into_iter()
+                .filter(|listed| listed.id != id && LIVE.contains(&listed.state()))
+                .collect(),
+            next_page_token: String::new(),
+        };
+        self.fake
+            .inject_on("ListJobs", Fault::Answer(Bytes::from(live.encode_to_vec())));
         self.fake
             .inject_on("GetJob", Fault::Answer(Bytes::from(job.encode_to_vec())));
         self.fake.inject_on(

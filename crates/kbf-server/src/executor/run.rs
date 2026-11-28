@@ -13,7 +13,8 @@
 //! placed and a tree not yet in the store fails the job's start; a failed write ends the run
 //! with no job submitted, and a cancel then ends it with nothing to withdraw. The job is then read
 //! back at once, while it has not started at steps that double up to the poll
-//! ([`super::pace`]), and every poll while it runs, until it ends ([`outcome::judge`](super::outcome)): a job that ended well has
+//! ([`super::pace`]), and every poll while it runs, until it ends ([`outcome::judge`](super::outcome)),
+//! once past its steps by one listing of all the process's jobs ([`super::follow`]): a job that ended well has
 //! its pack ingested and answers the callers with the result, unless the action exited nonzero
 //! because its host could not read a declared input
 //! ([`Ingest::unreadable_input`](super::Ingest::unreadable_input)), which is an ending of the
@@ -67,6 +68,7 @@ use tonic::Code;
 use super::Inner;
 use super::InputTree;
 use super::api::{answered, not_found, note};
+use super::follow::Follow;
 use super::mac::{PACK_WAIT, is_mac};
 use super::metrics::{IngestEnd, RunEnd};
 use super::outcome::{
@@ -656,21 +658,19 @@ async fn watch_job(
     let metrics = &inner.deps.metrics;
     let job = submitted.job.as_str();
     let (mut running, mut silence) = (false, false);
-    let mut pace = Pace::new(inner.cfg.poll);
+    let (mut pace, mut follow) = (Pace::new(inner.cfg.poll), Follow::new(inner, job));
     // No wait before the first read; a read that fails, or a result not read, waits a poll.
     let mut wait = None;
     let (read, result) = loop {
-        let pause = wait.map(|quiet| inner.busy.pause_or(quiet));
-        tokio::select! {
+        let read = tokio::select! {
             biased;
             () = cancel_asked(cancel) => {
                 withdraw(inner, job).await;
                 return Ended::Cancelled;
             }
-            () = waited(pause) => {}
-        }
+            read = follow.read(wait) => read,
+        };
         wait = Some(inner.cfg.poll);
-        let read = inner.api().get_job(job).await;
         let busy = inner.busy.saw("reading a job", &read).busy();
         let read = match read {
             Ok(read) => read,
@@ -782,13 +782,6 @@ async fn watch_job(
                 }
             }
         }
-    }
-}
-
-/// Completes after `pause`, or at once when there is none.
-async fn waited(pause: Option<Duration>) {
-    if let Some(pause) = pause {
-        sleep(pause).await;
     }
 }
 

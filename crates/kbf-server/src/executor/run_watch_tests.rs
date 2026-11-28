@@ -1,6 +1,8 @@
 //! How soon a job is read back: at once when it is submitted, at doubling steps while it has
-//! not started, and a poll apart once it runs. Time moves only when a test advances it (the
-//! rig's paused clock), so every read below is counted at the step of the clock it went out at.
+//! not started, and a poll apart once it runs or its steps reach the poll, then by the
+//! executor's listing of its jobs ([`crate::executor::follow`]). A read is a `GetJob` or a
+//! listing. Time moves only when a test advances it (the rig's paused clock), so every read
+//! below is counted at the step of the clock it went out at.
 
 use std::time::Duration;
 
@@ -26,16 +28,21 @@ async fn submitted_now(rig: &Rig, caller: &Caller) -> String {
     panic!("{job} was not submitted before the clock moved");
 }
 
+/// The reads of jobs the job service was sent: its `GetJob` and its `ListJobs`.
+fn read_calls(rig: &Rig) -> usize {
+    rig.calls_of("GetJob") + rig.calls_of("ListJobs")
+}
+
 /// Moves the clock `ticks` steps of [`TICK`] and lists, in milliseconds since the first, the
 /// steps after which the job service had been sent more reads of a job; `at` runs before each
 /// step with the milliseconds passed so far.
 async fn reads_over(rig: &Rig, ticks: u64, mut at: impl FnMut(u64)) -> Vec<u64> {
-    let mut seen = rig.calls_of("GetJob");
+    let mut seen = read_calls(rig);
     let mut reads = Vec::new();
     for tick in 1..=ticks {
         at((tick - 1) * 10);
         rig.advance(TICK).await;
-        let now = rig.calls_of("GetJob");
+        let now = read_calls(rig);
         assert!(now <= seen + 1, "two reads in one step at {} ms", tick * 10);
         if now > seen {
             reads.push(tick * 10);
@@ -69,7 +76,7 @@ async fn a_job_running_at_its_first_read_is_seen_before_the_clock_moves() {
 
 /// Catches a job that starts while it waits seen only at the next poll: read queued at once and
 /// at 10 and 30 ms, it runs at 30 ms and is seen running at the next step, 70 ms, and not
-/// before; from then it is read a poll apart (320 ms), not at the steps.
+/// before; from then it is read a poll apart (320 ms), not at the steps, by the listing.
 #[tokio::test(start_paused = true)]
 async fn a_job_that_starts_after_three_steps_is_seen_at_the_next_step() {
     let rig = Rig::start().await;
@@ -95,8 +102,9 @@ async fn a_job_that_starts_after_three_steps_is_seen_at_the_next_step() {
 
 /// Catches reads of a job that waits for a host that do not slow down to the poll, which would
 /// multiply the job service's reads in a burst of starts: over two seconds queued the job is
-/// read 12 times (at once, then 10, 30, 70, 150 and 310 ms, then a poll apart), where reads a
-/// poll apart from the submit are 8: the steps add at most 5 reads a job at the default poll.
+/// read 12 times (at once, then 10, 30, 70, 150 and 310 ms by `GetJob`, then a poll apart by the
+/// listing), where reads a poll apart from the submit are 8: the steps add at most 5 reads a job
+/// at the default poll.
 #[tokio::test(start_paused = true)]
 async fn a_job_that_waits_is_read_a_bounded_number_of_times() {
     let rig = Rig::start().await;
@@ -108,10 +116,11 @@ async fn a_job_that_waits_is_read_a_bounded_number_of_times() {
         reads,
         [10, 30, 70, 150, 310, 560, 810, 1060, 1310, 1560, 1810]
     );
+    assert_eq!(read_calls(&rig), 12, "the first read and the eleven after");
     assert_eq!(
         rig.calls_of("GetJob"),
-        12,
-        "the first read and the eleven after"
+        6,
+        "the first read and the five steps"
     );
     rig.host_finishes(&job, 0);
     assert!(matches!(rig.until_done(&caller).await, Finished::Ran(_)));

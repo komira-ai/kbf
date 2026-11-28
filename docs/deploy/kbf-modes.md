@@ -197,7 +197,9 @@ kbf does not schedule. The job is submitted at once, with no count, queue or cap
 many jobs run, where and when is the job service's. The frontend reads each job back as soon as it
 is submitted; while the job is queued, placed or starting, again after 10 ms, then 20, 40 and so on,
 doubling up to `--executor-poll-ms` (250 ms; 100 to 10000); once it runs, every `--executor-poll-ms`
-until it ends, and answers the operation. Stopping the
+until it ends, and answers the operation. Once a job's reads are a poll apart, they are one `ListJobs` a poll for
+every live job the process submitted (its `kbf-instance` label), not a `GetJob` for each; a job missing from it is
+read once with `GetJob`. Stopping the
 frontend cancels nothing: its jobs run on, and over a `--state-store` another frontend, or the same
 one restarted, takes the operations up (below). A Linux job is the kbf image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool:
 the job's arguments are the tool's flags and nothing is mounted into the container. It names no

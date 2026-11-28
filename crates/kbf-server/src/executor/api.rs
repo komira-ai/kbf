@@ -1,4 +1,4 @@
-//! The job service, as the executor calls it: the five calls it makes, every one bounded.
+//! The job service, as the executor calls it: the six calls it makes, every one bounded.
 //!
 //! The client gives a call its connect timeout and then 30 s. A job service that accepts and
 //! never answers would hold an operation's task for that long a read. Each call here gives up
@@ -8,11 +8,12 @@
 //!
 //! [`Config::call_timeout`]: super::Config::call_timeout
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
 use js_proto::v1::{Job, JobResult, JobSpec};
-use kbf_job_client::{Broken, Client, Error};
+use kbf_job_client::{Broken, Client, Error, Stuck};
 
 use crate::executor::output::Tail;
 
@@ -39,6 +40,30 @@ impl Api<'_> {
     /// `GetJob`.
     pub(crate) async fn get_job(&self, id: &str) -> Result<Job, Error> {
         self.within(self.client.get_job(id)).await
+    }
+
+    /// Every job of the process `instance` that has not ended, by `ListJobs` page after page
+    /// ([`follow`](super::follow)), each page within the limit of one call. As
+    /// [`Client::list_all_jobs`], it stops with [`Error::TooMany`] past [`Client::MAX_LISTED`]
+    /// jobs and with [`Error::Stuck`] at a page token given twice.
+    pub(crate) async fn list_live(&self, instance: &str) -> Result<Vec<Job>, Error> {
+        let mut filter = super::follow::live_jobs(instance);
+        let (mut jobs, mut tokens) = (Vec::new(), BTreeSet::new());
+        loop {
+            let page = self.within(self.client.list_jobs(filter.clone())).await?;
+            jobs.extend(page.jobs);
+            if jobs.len() > Client::MAX_LISTED {
+                return Err(Error::TooMany(Client::MAX_LISTED));
+            }
+            let next = page.next_page_token;
+            if next.is_empty() {
+                return Ok(jobs);
+            }
+            if !tokens.insert(next.clone()) {
+                return Err(Error::Stuck(Stuck::RepeatedToken(next)));
+            }
+            filter.page_token = next;
+        }
     }
 
     /// `CancelJob`: idempotent on the job.

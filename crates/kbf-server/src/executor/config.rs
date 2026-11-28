@@ -74,7 +74,8 @@ pub struct Config {
     /// the end of the stream. `0` writes none; the whole attached output stays with the result
     /// either way.
     pub failed_stderr_log_bytes: usize,
-    /// How often the running job of an operation is read back, and a submit whose answer was
+    /// How often the running job of an operation is read back (by one listing of every such job
+    /// of the process: [`follow`](super::follow)), and a submit whose answer was
     /// lost is sent again; also the longest wait between the reads of a job that has not
     /// started, which begin [`FIRST_STEP`](super::pace::FIRST_STEP) apart and double.
     pub poll: Duration,
