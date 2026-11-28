@@ -848,6 +848,34 @@ async fn an_answer_given_for_good_after_retries_is_the_store_s_as_it_is() {
     assert_eq!(waits.exhausted(Op::Get), 0);
 }
 
+/// Catches a refusal after retries of others dressed as a failure that kept on: a call the store
+/// answered 503 and then 403 is the store's 403 as it gave it, with no word of the attempts.
+#[tokio::test]
+async fn a_refusal_after_retries_is_the_store_s_as_it_is() {
+    let clock = Arc::new(Clock::default());
+    let backoff = Backoff::with(
+        policy_without_jitter(Duration::from_secs(120)),
+        Arc::clone(&clock) as Arc<dyn RetryClock>,
+        Arc::default(),
+    );
+    let mut call = backoff.call(Op::Put);
+    let forbidden = || ObjectStoreError::Service {
+        status: 403,
+        code: "AccessDenied".to_owned(),
+        message: "injected".to_owned(),
+    };
+
+    assert_eq!(call.after(&unavailable()).await, Next::Again);
+    assert_eq!(call.after(&forbidden()).await, Next::Answer);
+    let answer = call.exhausted(forbidden());
+
+    assert_eq!(answer.to_string(), forbidden().to_string());
+    assert!(
+        matches!(answer, ObjectStoreError::Service { status: 403, .. }),
+        "{answer:?}"
+    );
+}
+
 /// A transport failure with a cause of its own, as the store client gives one (the request's
 /// error, then the socket's).
 #[derive(Debug)]

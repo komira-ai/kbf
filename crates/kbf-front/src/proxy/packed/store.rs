@@ -426,8 +426,9 @@ impl Packs {
     ///
     /// The check is a call of the start ([`crate::start_retry`]): made again as `retry` says
     /// while the store answers it with an error that is retried. An attempt after one that
-    /// failed so may find the key written by the attempt before it, and the store refusing to
-    /// write it again is the refusal the check asks for.
+    /// failed so may find the key written by the attempt before it: the check takes an object of
+    /// its own bytes there for its first write (`kbf_pack::check_create_only`), and one of other
+    /// bytes for a key that is taken.
     ///
     /// # Errors
     /// [`Ended::Refused`] with why the check failed; [`Ended::GaveUp`] when the store kept
@@ -435,12 +436,7 @@ impl Packs {
     pub async fn check_create_only(&self, retry: &StartRetry) -> Result<(), Ended<PackError>> {
         let retried =
             |error: &PackError| matches!(error, PackError::Store(source) if retriable(source));
-        let attempt = |attempt: u32| async move {
-            match self.store.check_create_only().await {
-                Err(PackError::Store(ObjectStoreError::AlreadyExists(_))) if attempt > 1 => Ok(()),
-                checked => checked,
-            }
-        };
+        let attempt = |_: u32| self.store.check_create_only();
         retry.run("the create-only check", retried, attempt).await
     }
 
