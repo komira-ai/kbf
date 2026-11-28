@@ -21,6 +21,17 @@
 //!   [`tierstore_list::CellHasher`] as they arrive, records the cells, writes the sidecar, and
 //!   drops the tree's unlisted row. An object the store answers 404 for is
 //!   [`SidecarError::Lost`]: the tree is not present.
+//! - [`Sidecars::with_fills`] is the fill: a list dual emission left unlisted is queued, and one
+//!   task of the frontend's runs the backfill on each queued list in turn (its failure counted in
+//!   `kbf_l2_sidecar_fills_total`, not in `kbf_l2_sidecars_total`), so the list
+//!   gets its sidecar soon after its write and every object it named has its cells recorded:
+//!   the next list naming them gets its sidecar at its write ([`super::fill`]).
+//! - [`Sidecars::record_missing`] records the cells of objects whose bytes the caller holds (the
+//!   base tree's, as the frontend publishes it), for those the pack index has none of.
+//!
+//! Every tree list dual emission or the miss path handled is counted once in
+//! `kbf_l2_tree_lists_total`, by whether it had its sidecar when its write ended: the share of
+//! lists with a sidecar is that family's `written` and `present` over its sum.
 //!
 //! Every pack is written with one PUT (`upload_part_size` 0) and no pack is marked shared (the
 //! `shared` bit is set by a later change). The sidecar is written create-only; one already
@@ -36,6 +47,7 @@ use kbf_pack_index::cells::ObjectCells;
 use kbf_pack_index::{MAX_BATCH, PackIndex, PackIndexError};
 use tierstore_list::{CellHasher, PackCells, PackInfo};
 
+use super::fill::Fills;
 use super::place::store_object;
 use super::retry::PutRetry;
 use crate::large_backfill::LargeStore;
@@ -45,12 +57,16 @@ use crate::metrics::{Counter, Families};
 pub const READ_WINDOW: u64 = 8 << 20;
 
 /// What the L2 sidecars of tree lists are written with: the pack index's cells and unlisted
-/// trees, and the store the lists are in.
+/// trees, and the store the lists are in. A clone writes to the same store and index, counts in
+/// the same counters and queues on the same fill.
+#[derive(Clone)]
 pub struct Sidecars {
-    index: Arc<dyn PackIndex>,
-    store: Arc<dyn LargeStore>,
+    pub(super) index: Arc<dyn PackIndex>,
+    pub(super) store: Arc<dyn LargeStore>,
     retry: PutRetry,
-    counters: Arc<SidecarCounters>,
+    pub(super) counters: Arc<SidecarCounters>,
+    /// The queue of lists left unlisted ([`Sidecars::with_fills`]); none, none is queued.
+    pub(super) fills: Option<Arc<Fills>>,
 }
 
 /// What [`Sidecars::emit`] did.
@@ -128,6 +144,30 @@ pub struct SidecarCounters {
     missing: Counter,
     objects_read: Counter,
     bytes_read: Counter,
+    /// The tree lists handled, by whether they had their sidecar when their write ended.
+    lists: ListCounters,
+    /// The fills, by how each ended.
+    pub(super) fills: FillCounters,
+    /// The cells recorded from bytes in hand ([`Sidecars::record_missing`]).
+    cells_recorded: Counter,
+}
+
+/// `kbf_l2_tree_lists_total`, by `sidecar`.
+#[derive(Debug, Default)]
+struct ListCounters {
+    written: Counter,
+    present: Counter,
+    missing: Counter,
+    failed: Counter,
+}
+
+/// `kbf_l2_sidecar_fills_total`, by `result`.
+#[derive(Debug, Default)]
+pub(super) struct FillCounters {
+    pub(super) written: Counter,
+    pub(super) lost: Counter,
+    pub(super) failed: Counter,
+    pub(super) dropped: Counter,
 }
 
 impl SidecarCounters {
@@ -168,6 +208,53 @@ impl SidecarCounters {
             "Bytes read for those cell digests",
             self.bytes_read.get(),
         );
+        families.counter(
+            "kbf_l2_cells_recorded_total",
+            "Objects whose cell digests were recorded from bytes in hand (the base tree's, as it \
+             is published), as the pack index had none",
+            self.cells_recorded.get(),
+        );
+        let lists = &self.lists;
+        let name = "kbf_l2_tree_lists_total";
+        families.head(
+            name,
+            "counter",
+            "Tree lists stored, by whether their L2 sidecar was in the store when the list's write \
+             ended: written, present, missing (an object they name had no recorded cells) or failed",
+        );
+        for (sidecar, counter) in [
+            ("written", &lists.written),
+            ("present", &lists.present),
+            ("missing", &lists.missing),
+            ("failed", &lists.failed),
+        ] {
+            let _ = writeln!(
+                families.0,
+                "{name}{{sidecar=\"{sidecar}\"}} {}",
+                counter.get()
+            );
+        }
+        let fills = &self.fills;
+        let name = "kbf_l2_sidecar_fills_total";
+        families.head(
+            name,
+            "counter",
+            "Tree lists stored with no L2 sidecar that the frontend then filled, by how the fill \
+             ended: written, lost (an object they name is not in the store), failed, or dropped \
+             (the queue was full: the list is left to the backfill)",
+        );
+        for (result, counter) in [
+            ("written", &fills.written),
+            ("lost", &fills.lost),
+            ("failed", &fills.failed),
+            ("dropped", &fills.dropped),
+        ] {
+            let _ = writeln!(
+                families.0,
+                "{name}{{result=\"{result}\"}} {}",
+                counter.get()
+            );
+        }
         *out = families.0;
     }
 }
@@ -181,7 +268,17 @@ impl Sidecars {
             store,
             retry: PutRetry::default(),
             counters: Arc::default(),
+            fills: None,
         }
+    }
+
+    /// These sidecars, queueing each list dual emission leaves unlisted for a fill, until the
+    /// lists queued hold `limit` bytes: a list over that is dropped (counted) and left to the
+    /// backfill ([`super::fill`]). A fill runs on the Tokio runtime of the list's write.
+    #[must_use]
+    pub fn with_fills(mut self, limit: u64) -> Self {
+        self.fills = Some(Arc::new(Fills::new(limit)));
+        self
     }
 
     /// These sidecars, counting in `counters` (shared with whatever renders them).
@@ -272,15 +369,18 @@ impl Sidecars {
         match found {
             Found::Present => {
                 self.counters.present.add(1);
+                self.counters.lists.present.add(1);
                 Ok(Emitted::Written)
             }
             Found::Unlisted { missing } => {
                 let index = Arc::clone(&self.index);
                 blocking(move || index.record_unlisted(&tree)).await?;
+                self.queue_fill(tree, v2);
                 Ok(Emitted::Unlisted { missing })
             }
             Found::Cells(cells) => {
                 self.write(v2, &sidecar, &cells).await?;
+                self.counters.lists.written.add(1);
                 Ok(Emitted::Written)
             }
         }
@@ -288,11 +388,33 @@ impl Sidecars {
 
     /// Counts what dual emission did.
     fn count(&self, emitted: &Result<Emitted, SidecarError>) {
+        let lists = &self.counters.lists;
         match emitted {
-            Ok(Emitted::Unlisted { .. }) => self.counters.missing.add(1),
+            Ok(Emitted::Unlisted { .. }) => {
+                self.counters.missing.add(1);
+                lists.missing.add(1);
+            }
             Ok(Emitted::Written) => {}
-            Err(_) => self.counters.failed.add(1),
+            Err(_) => {
+                self.counters.failed.add(1);
+                lists.failed.add(1);
+            }
         }
+    }
+
+    /// The miss path of the version 2 list `v2`, stored by now: [`Sidecars::backfill`], and the
+    /// list counted in `kbf_l2_tree_lists_total` by whether its sidecar was written.
+    ///
+    /// # Errors
+    /// As [`Sidecars::backfill`].
+    pub(crate) async fn republish(&self, v2: &[u8]) -> Result<Backfilled, SidecarError> {
+        let filled = self.backfill(v2).await;
+        let lists = &self.counters.lists;
+        match &filled {
+            Ok(_) => lists.written.add(1),
+            Err(_) => lists.failed.add(1),
+        }
+        filled
     }
 
     /// The miss path and the backfill of the version 2 list `v2`: reads once each object it
@@ -310,7 +432,7 @@ impl Sidecars {
         filled
     }
 
-    async fn backfill_counted(&self, v2: &[u8]) -> Result<Backfilled, SidecarError> {
+    pub(super) async fn backfill_counted(&self, v2: &[u8]) -> Result<Backfilled, SidecarError> {
         let (tree, keys) = list_of(v2)?;
         let mut cells = self.cells(&keys).await?;
         let mut done = Backfilled::default();
@@ -342,6 +464,32 @@ impl Sidecars {
         if let Err(error) = blocking(move || index.record_cells(&owned, &cells)).await {
             tracing::warn!(%key, %error, "the cells of an object written were not recorded: the backfill reads it");
         }
+    }
+
+    /// Records the cells of each object of `held` (its key, and the cells of the bytes the
+    /// caller holds of it) the pack index has none of; how many it recorded. Cells already
+    /// recorded are kept: the key is content-bound. The base tree's objects are recorded so as
+    /// the frontend publishes it, as no other writer records theirs.
+    ///
+    /// # Errors
+    /// [`SidecarError::Index`]: the pack index failed. The cells recorded before it stay.
+    pub async fn record_missing(
+        &self,
+        held: BTreeMap<String, ObjectCells>,
+    ) -> Result<usize, SidecarError> {
+        let keys: Vec<String> = held.keys().cloned().collect();
+        let found = self.cells(&keys).await?;
+        let mut recorded = 0;
+        for (key, cells) in held {
+            if found.contains_key(&key) {
+                continue;
+            }
+            let index = Arc::clone(&self.index);
+            blocking(move || index.record_cells(&key, &cells)).await?;
+            self.counters.cells_recorded.add(1);
+            recorded += 1;
+        }
+        Ok(recorded)
     }
 
     /// The recorded cells of each of `keys` that has some.

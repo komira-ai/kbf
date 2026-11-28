@@ -27,6 +27,8 @@ use tierstore::{EntryKind, TreeDigest, flatten};
 
 #[path = "base_publish/busy.rs"]
 mod busy;
+#[path = "base_publish/cells.rs"]
+mod cells;
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const PLATFORM: &str = "linux-x86_64";
@@ -309,7 +311,7 @@ async fn run(
     dir: &Path,
     store: &Arc<Bucket>,
 ) -> Result<kbf_front::base_publish::Published, PublishError> {
-    publish(dir, COMMIT, PLATFORM, store.clone(), true, &retry()).await
+    publish(dir, COMMIT, PLATFORM, store.clone(), true, &retry(), None).await
 }
 
 /// Asserts that a first publish writes every object of the bundle to `cas/l/<sha256>` with its
@@ -687,7 +689,7 @@ async fn an_empty_commit_is_refused() {
     install(&dir, &release);
     let store = Arc::new(Bucket::default());
 
-    let error = publish(&dir, "", PLATFORM, store.clone(), true, &retry())
+    let error = publish(&dir, "", PLATFORM, store.clone(), true, &retry(), None)
         .await
         .expect_err("refused");
 
@@ -950,7 +952,7 @@ async fn a_publish_not_asked_to_list_leaves_the_base_unlisted() {
     install(&dir, &release);
     let store = Arc::new(Bucket::default());
 
-    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), false, &retry())
+    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), false, &retry(), None)
         .await
         .expect("published");
 
@@ -972,9 +974,17 @@ async fn a_publish_not_asked_to_list_leaves_the_base_unlisted() {
     let bytes = writer.finish().expect("finished");
     install_as(&lacking, &file_name(COMMIT, PLATFORM), &bytes, &bytes);
     let other = Arc::new(Bucket::default());
-    let published = publish(&lacking, COMMIT, PLATFORM, other.clone(), false, &retry())
-        .await
-        .expect("published unlisted");
+    let published = publish(
+        &lacking,
+        COMMIT,
+        PLATFORM,
+        other.clone(),
+        false,
+        &retry(),
+        None,
+    )
+    .await
+    .expect("published unlisted");
     assert!(!published.base.is_listed());
     assert!(other.object(&release.built.root).is_some());
 }

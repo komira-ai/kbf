@@ -175,7 +175,7 @@ async fn a_write_answered_slow_down_three_times_is_made_again_and_the_publish_su
         .extend((0..3).map(|_| Answer::Refuse(slow_down())));
     let (retry, clock) = on_clock(120);
 
-    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), true, &retry)
+    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), true, &retry, None)
         .await
         .expect("published");
 
@@ -204,7 +204,7 @@ async fn a_write_answered_503_for_ever_fails_the_publish_at_the_bound() {
     store.state().every_put = Some(slow_down);
     let (retry, clock) = on_clock(30);
 
-    let error = publish(&dir, COMMIT, PLATFORM, store.clone(), true, &retry)
+    let error = publish(&dir, COMMIT, PLATFORM, store.clone(), true, &retry, None)
         .await
         .expect_err("given up");
 
@@ -238,7 +238,7 @@ async fn a_403_to_a_write_fails_the_publish_at_once() {
         .push_back(Answer::Refuse(service(403, "AccessDenied", "no")));
     let (retry, clock) = on_clock(120);
 
-    let error = publish(&dir, COMMIT, PLATFORM, store.clone(), true, &retry)
+    let error = publish(&dir, COMMIT, PLATFORM, store.clone(), true, &retry, None)
         .await
         .expect_err("refused");
 
@@ -268,7 +268,7 @@ async fn a_length_check_refused_then_answered_504_is_asked_again() {
     ]);
     let (retry, clock) = on_clock(120);
 
-    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), true, &retry)
+    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), true, &retry, None)
         .await
         .expect("published");
 
@@ -293,7 +293,7 @@ async fn a_write_whose_answer_was_lost_is_found_held_by_the_next_attempt() {
         .push_back(Answer::Lose(service(500, "InternalError", "lost")));
     let (retry, clock) = on_clock(120);
 
-    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), true, &retry)
+    let published = publish(&dir, COMMIT, PLATFORM, store.clone(), true, &retry, None)
         .await
         .expect("published");
 

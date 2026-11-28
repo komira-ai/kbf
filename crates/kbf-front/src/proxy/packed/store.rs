@@ -412,12 +412,16 @@ impl Packs {
     }
 
     /// The writer of the L2 sidecars of tree lists over these packs: their cells are recorded
-    /// in these packs' index and the sidecars written to their store, counted in their metrics.
+    /// in these packs' index and the sidecars written to their store, counted in their metrics,
+    /// and a list left with none is filled in turn, up to
+    /// [`FILL_QUEUE_BYTES`](crate::action_tree::FILL_QUEUE_BYTES) of lists queued. Each call makes
+    /// a writer with a fill queue of its own.
     #[must_use]
     pub fn sidecars(&self) -> crate::action_tree::Sidecars {
         let store: Arc<dyn LargeStore> = Arc::new(self.clone());
         crate::action_tree::Sidecars::new(Arc::clone(&self.index), store)
             .with_counters(Arc::clone(&self.metrics.l2))
+            .with_fills(crate::action_tree::FILL_QUEUE_BYTES)
     }
 
     /// Checks that the object store refuses to replace an object, as the write rule needs:

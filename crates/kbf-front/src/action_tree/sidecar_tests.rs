@@ -23,37 +23,37 @@ use crate::large_backfill::LargeStore;
 
 /// An object store in memory: create-only, counting what it is asked.
 #[derive(Default)]
-struct Objects {
-    held: Mutex<BTreeMap<String, Bytes>>,
+pub(super) struct Objects {
+    pub(super) held: Mutex<BTreeMap<String, Bytes>>,
     /// Every read: the key, the offset and the length.
-    reads: Mutex<Vec<(String, u64, u64)>>,
+    pub(super) reads: Mutex<Vec<(String, u64, u64)>>,
     /// Every key a put was asked for.
-    puts: Mutex<Vec<String>>,
+    pub(super) puts: Mutex<Vec<String>>,
     /// Every key a HEAD was asked for.
-    heads: Mutex<Vec<String>>,
+    pub(super) heads: Mutex<Vec<String>>,
     /// Keys whose reads answer 404 though a HEAD finds them.
-    vanishing: Mutex<Vec<String>>,
+    pub(super) vanishing: Mutex<Vec<String>>,
     /// Keys whose reads answer one byte short.
-    short: Mutex<Vec<String>>,
+    pub(super) short: Mutex<Vec<String>>,
     /// Puts fail with this.
-    failing: Mutex<Option<ObjectStoreError>>,
+    pub(super) failing: Mutex<Option<ObjectStoreError>>,
 }
 
-fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(super) fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Objects {
-    fn hold(&self, key: &str, bytes: Vec<u8>) {
+    pub(super) fn hold(&self, key: &str, bytes: Vec<u8>) {
         locked(&self.held).insert(key.to_owned(), Bytes::from(bytes));
     }
 
-    fn get(&self, key: &str) -> Option<Bytes> {
+    pub(super) fn get(&self, key: &str) -> Option<Bytes> {
         locked(&self.held).get(key).cloned()
     }
 
     /// The bytes read of `key`, by the reads asked.
-    fn read_of(&self, key: &str) -> u64 {
+    pub(super) fn read_of(&self, key: &str) -> u64 {
         locked(&self.reads)
             .iter()
             .filter(|(read, _, _)| read == key)
@@ -121,15 +121,15 @@ impl LargeStore for Objects {
 }
 
 /// A file of the test tree: its name, the object its bytes are in, the offset there and the size.
-struct File {
-    name: &'static str,
-    key: &'static str,
-    offset: u64,
-    size: u64,
+pub(super) struct File {
+    pub(super) name: &'static str,
+    pub(super) key: &'static str,
+    pub(super) offset: u64,
+    pub(super) size: u64,
 }
 
 /// The version 2 list of a root holding `files`, as the writer encodes it.
-fn list(files: &[File]) -> Vec<u8> {
+pub(super) fn list(files: &[File]) -> Vec<u8> {
     let children = |root: bool| -> Vec<Child<'_, bool>> {
         if !root {
             return Vec::new();
@@ -151,12 +151,12 @@ fn list(files: &[File]) -> Vec<u8> {
 }
 
 /// `size` bytes, each the low byte of its offset plus `seed`.
-fn object(size: u64, seed: u8) -> Vec<u8> {
+pub(super) fn object(size: u64, seed: u8) -> Vec<u8> {
     (0..size).map(|at| (at as u8).wrapping_add(seed)).collect()
 }
 
 /// The cells of `bytes`, by an independent SHA-256.
-fn cells_of(bytes: &[u8]) -> ObjectCells {
+pub(super) fn cells_of(bytes: &[u8]) -> ObjectCells {
     ObjectCells {
         size: bytes.len() as u64,
         digests: bytes
@@ -167,23 +167,23 @@ fn cells_of(bytes: &[u8]) -> ObjectCells {
 }
 
 /// The tree id of `v2`.
-fn tree_of(v2: &[u8]) -> [u8; 32] {
+pub(super) fn tree_of(v2: &[u8]) -> [u8; 32] {
     Sha256::digest(v2).into()
 }
 
 /// The sidecar key of `v2`.
-fn sidecar_of(v2: &[u8]) -> String {
+pub(super) fn sidecar_of(v2: &[u8]) -> String {
     tierstore_list::sidecar_key(&tree_of(v2))
 }
 
-struct Harness {
-    clock: Arc<ManualClock>,
-    index: Arc<MemoryPackIndex>,
-    objects: Arc<Objects>,
-    sidecars: Sidecars,
+pub(super) struct Harness {
+    pub(super) clock: Arc<ManualClock>,
+    pub(super) index: Arc<MemoryPackIndex>,
+    pub(super) objects: Arc<Objects>,
+    pub(super) sidecars: Sidecars,
 }
 
-fn harness() -> Harness {
+pub(super) fn harness() -> Harness {
     let clock = Arc::new(ManualClock::default());
     let index = Arc::new(MemoryPackIndex::new(clock.clone()));
     let objects = Arc::new(Objects::default());
@@ -197,7 +197,7 @@ fn harness() -> Harness {
 }
 
 /// Two packs and a whole object, the first pack named by two files.
-fn three_objects(h: &Harness) -> (Vec<u8>, [Vec<u8>; 3]) {
+pub(super) fn three_objects(h: &Harness) -> (Vec<u8>, [Vec<u8>; 3]) {
     let a = object(3 * (1 << 20) + 5, 1);
     let b = object(1 << 20, 2);
     let c = object(17, 3);
@@ -235,7 +235,7 @@ fn three_objects(h: &Harness) -> (Vec<u8>, [Vec<u8>; 3]) {
     (v2, [a, b, c])
 }
 
-fn record_all(h: &Harness, objects: &[Vec<u8>; 3]) {
+pub(super) fn record_all(h: &Harness, objects: &[Vec<u8>; 3]) {
     for (key, bytes) in ["cas/f/w/b/1", "cas/f/w/b/2", "cas/l/cc"]
         .iter()
         .zip(objects)
@@ -660,6 +660,27 @@ async fn the_counters_render_every_family() {
          kbf_l2_cells_read_objects_total 0\n\
          # HELP kbf_l2_cells_read_bytes_total Bytes read for those cell digests.\n\
          # TYPE kbf_l2_cells_read_bytes_total counter\n\
-         kbf_l2_cells_read_bytes_total 0\n"
+         kbf_l2_cells_read_bytes_total 0\n\
+         # HELP kbf_l2_cells_recorded_total Objects whose cell digests were recorded from \
+         bytes in hand (the base tree's, as it is published), as the pack index had none.\n\
+         # TYPE kbf_l2_cells_recorded_total counter\n\
+         kbf_l2_cells_recorded_total 0\n\
+         # HELP kbf_l2_tree_lists_total Tree lists stored, by whether their L2 sidecar was in \
+         the store when the list's write ended: written, present, missing (an object they name \
+         had no recorded cells) or failed.\n\
+         # TYPE kbf_l2_tree_lists_total counter\n\
+         kbf_l2_tree_lists_total{sidecar=\"written\"} 1\n\
+         kbf_l2_tree_lists_total{sidecar=\"present\"} 1\n\
+         kbf_l2_tree_lists_total{sidecar=\"missing\"} 0\n\
+         kbf_l2_tree_lists_total{sidecar=\"failed\"} 0\n\
+         # HELP kbf_l2_sidecar_fills_total Tree lists stored with no L2 sidecar that the \
+         frontend then filled, by how the fill ended: written, lost (an object they name is not \
+         in the store), failed, or dropped (the queue was full: the list is left to the \
+         backfill).\n\
+         # TYPE kbf_l2_sidecar_fills_total counter\n\
+         kbf_l2_sidecar_fills_total{result=\"written\"} 0\n\
+         kbf_l2_sidecar_fills_total{result=\"lost\"} 0\n\
+         kbf_l2_sidecar_fills_total{result=\"failed\"} 0\n\
+         kbf_l2_sidecar_fills_total{result=\"dropped\"} 0\n"
     );
 }

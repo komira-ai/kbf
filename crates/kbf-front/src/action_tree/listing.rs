@@ -31,7 +31,9 @@
 //! unlisted row) follows the list's, so no sidecar names a list the store does not have. A list
 //! whose write fails fails the tree, and what its sidecar read is dropped; a sidecar that fails
 //! never fails the list. The miss path's backfill ([`ListingWrite::republish`]) reads objects
-//! and records cells, and runs after the list's write.
+//! and records cells, and runs after the list's write. A list left unlisted is queued for the
+//! sidecars' fill, when they fill ([`Sidecars::with_fills`]), which writes its sidecar after the
+//! list's write has returned.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -420,7 +422,7 @@ async fn sidecar(
             .await
             .map(|emitted| format!("{emitted:?}")),
         None => sidecars
-            .backfill(bytes)
+            .republish(bytes)
             .await
             .map(|done| format!("{done:?}")),
     };

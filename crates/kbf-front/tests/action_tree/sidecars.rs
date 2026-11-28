@@ -233,3 +233,67 @@ async fn a_whole_object_the_writer_writes_has_its_cells_recorded() {
     let row = cells[0].clone().expect("recorded");
     assert_eq!((row.size, row.digests), (bytes.len() as u64, expected));
 }
+
+/// Catches: a list over a base whose objects no writer recorded cells of (the farm's base tree,
+/// published whole to `cas/l/`) that never gets its sidecar, and every later list over the same
+/// base left with none at its write. With a writer whose sidecars fill, the first list is stored
+/// unlisted, and once the fill settles it has its sidecar and its row is dropped; the list of
+/// another input root over the same base and pack then has its sidecar as soon as its write
+/// returns, before any fill.
+#[tokio::test]
+async fn a_list_left_unlisted_is_filled_and_the_next_list_over_its_base_has_its_sidecar_at_once() {
+    let (mut rig, index) = sidecar_rig().await;
+    let store = Arc::clone(&rig.farm) as Arc<dyn LargeStore>;
+    let sidecars =
+        Sidecars::new(Arc::clone(&index) as Arc<dyn PackIndex>, store).with_fills(1 << 20);
+    let source = Arc::clone(&rig.farm) as Arc<dyn BlobSource>;
+    let store = Arc::clone(&rig.farm) as Arc<dyn LargeStore>;
+    let clock: kbf_front::Clock = Arc::new(|| UNIX_EPOCH + Duration::from_secs(START_SECS));
+    rig.writer = TreeWriter::new(source, store, clock).with_sidecars(Arc::new(sidecars.clone()));
+    hold_named_objects(&rig);
+    let root = one_file_root(&rig).await;
+
+    let first = super::listing::list(&rig, &root).await.expect("a listing");
+    sidecars.settled().await;
+
+    let sidecar = tierstore_list::sidecar_key(&id_of(first.key()));
+    let held = rig
+        .farm
+        .object(&sidecar)
+        .expect("the first list's sidecar is filled");
+    let opened = TreeListL2::open_sidecar(Some(&held[..]), &id_of(first.key())).expect("it opens");
+    assert_eq!(opened.projection_digest(), id_of(first.key()));
+    let rows = index
+        .unlisted(Duration::from_secs(60), None, 10)
+        .expect("rows");
+    assert!(rows.is_empty(), "the row is dropped");
+
+    let blob = rig.farm.packed("int other;", "cas/f/w/p9", 3100).await;
+    let other = rig
+        .store(&directory(vec![file("b.c", &blob, false)], vec![], vec![]))
+        .await;
+    let reads = rig.farm.state().ranged.len();
+
+    let second = super::listing::list(&rig, &other).await.expect("a listing");
+
+    assert_ne!(second.key(), first.key());
+    let sidecar = tierstore_list::sidecar_key(&id_of(second.key()));
+    assert!(
+        rig.farm.object(&sidecar).is_some(),
+        "the second list's sidecar is written with it"
+    );
+    assert_eq!(
+        rig.farm.state().ranged.len(),
+        reads,
+        "nothing is read for it"
+    );
+    let mut text = String::new();
+    sidecars.counters().render(&mut text);
+    for line in [
+        "kbf_l2_tree_lists_total{sidecar=\"missing\"} 1\n",
+        "kbf_l2_tree_lists_total{sidecar=\"written\"} 1\n",
+        "kbf_l2_sidecar_fills_total{result=\"written\"} 1\n",
+    ] {
+        assert!(text.contains(line), "{line}{text}");
+    }
+}

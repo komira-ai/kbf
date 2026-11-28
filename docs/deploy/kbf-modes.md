@@ -342,9 +342,15 @@ Beside each tree list the frontend stores its L2 sidecar (`cas/l2/<sha256>`, the
 `docs/design/fetch-cache-serve.md`, 3.5): the list's entries with the SHA-256 of every 1 MiB cell of
 each object it names, so a tierstore that reads only L2 lists verifies any cell on arrival. Older
 tierstores read the list and never the sidecar. The cells are recorded in the pack index as objects
-are written (each pack the frontend packs, each whole object the tree writer writes); a list that
-names an object with none recorded is stored without a sidecar and recorded unlisted, for
-`kbf-l2-backfill` (docs/deploy/l2-backfill.md). The miss path above reads each such object once.
+are written (each pack the frontend packs, each whole object the tree writer writes, and each object
+of the kbf base tree as the frontend publishes it, since every list names the whole base); a list
+that names an object with none recorded (a large blob a client uploaded, a whole object a tree found
+in the store, a pack written before cells were recorded) is stored without a sidecar and recorded
+unlisted, and the frontend's fill then reads each such object once, records its cells and writes the
+list's sidecar, one list at a time, so the next list naming those objects has its sidecar at its
+write. A list the fill could not take (its queue of 256 MiB of lists was full, or it failed) is left
+to `kbf-l2-backfill` (docs/deploy/l2-backfill.md). The miss path above reads each such object once.
+`kbf_l2_tree_lists_total{sidecar}` counts every list by whether it had its sidecar at its write.
 
 **Over a state store.** With `--state-store` the executor keeps the rows `exec/op/<operation>` (owner,
 action, attempt, job id), `exec/act/` (the open operation of each action, so an Execute of an action

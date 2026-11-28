@@ -84,6 +84,9 @@
 mod base;
 mod check;
 mod encode;
+mod fill;
+#[cfg(test)]
+mod fill_tests;
 mod flight;
 mod listing;
 mod memo;
@@ -109,6 +112,7 @@ use tierstore::{MAX_DEPTH, MAX_ENTRIES, TreeDigest, TreeError};
 use tokio::time::Instant;
 
 pub use self::base::{BaseFacts, BaseTree, BaseTreeError, INPUT_ROOT, RESERVED_NAMES};
+pub use self::fill::FILL_QUEUE_BYTES;
 pub use self::listing::{Listing, ListingWrite};
 pub use self::place::{HEADS_IN_FLIGHT, LOCATE_CHUNK, LOOKUP_DEADLINE};
 pub use self::places::PLACE_ENTRIES;
