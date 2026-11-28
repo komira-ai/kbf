@@ -207,10 +207,11 @@ fn call_of(path: &str) -> http::Request<()> {
 /// The ByteStream read the tests make, a call the close ends.
 const READ: &str = "/google.bytestream.ByteStream/Read";
 
+/// What one poll of a counted body gives.
+type Polled = Poll<Option<Result<http_body::Frame<bytes::Bytes>, BoxError>>>;
+
 /// Polls `body` once, with a waker that does nothing.
-fn poll_once<B: http_body::Body + Unpin>(
-    body: &mut B,
-) -> Poll<Option<Result<http_body::Frame<B::Data>, B::Error>>> {
+fn poll_once(body: &mut CountedBody) -> Polled {
     let waker = futures::task::noop_waker();
     Pin::new(body).poll_frame(&mut Context::from_waker(&waker))
 }
@@ -415,7 +416,7 @@ async fn a_failed_body_is_given_nothing_after_its_failure() {
         .into_body();
     assert!(matches!(
         poll_once(&mut body),
-        Poll::Ready(Some(Err("the body failed")))
+        Poll::Ready(Some(Err(e))) if e.to_string() == "the body failed"
     ));
     closer.close();
     assert!(matches!(poll_once(&mut body), Poll::Ready(None)));

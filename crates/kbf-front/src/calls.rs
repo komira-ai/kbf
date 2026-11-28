@@ -27,6 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use futures::future::BoxFuture;
 use tonic::codegen::http::header::CONTENT_TYPE;
 use tonic::codegen::http::{HeaderMap, HeaderValue};
@@ -113,8 +114,10 @@ impl<S, B, R> Service<http::Request<B>> for Counted<S>
 where
     S: Service<http::Request<B>, Response = http::Response<R>>,
     S::Future: Send + 'static,
+    R: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    R::Error: Into<BoxError>,
 {
-    type Response = http::Response<CountedBody<R>>;
+    type Response = http::Response<CountedBody>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -138,7 +141,7 @@ where
                 biased;
                 answered = answer => {
                     let response = answered?;
-                    Ok(response.map(|inner| CountedBody::new(inner, open, cut)))
+                    Ok(response.map(|inner| CountedBody::new(Box::pin(Boxed(inner)), open, cut)))
                 }
                 () = refused => Ok(CountedBody::closed_answer(open)),
             }
@@ -146,21 +149,59 @@ where
     }
 }
 
+/// The error of a counted body: the handler's body's, boxed.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A handler's body, its error boxed: what a [`CountedBody`] holds.
+type Inner = Pin<Box<dyn http_body::Body<Data = Bytes, Error = BoxError> + Send>>;
+
+/// A handler's body `R` with its error boxed. The one generic part of a counted body, and it
+/// only forwards: the decisions are in [`CountedBody`], which is not generic, so every
+/// handler's body runs the same lines.
+struct Boxed<R>(R);
+
+impl<R> http_body::Body for Boxed<R>
+where
+    R: http_body::Body<Data = Bytes> + Unpin,
+    R::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, BoxError>>> {
+        Pin::new(&mut self.0)
+            .poll_frame(cx)
+            .map(|frame| frame.map(|r| r.map_err(Into::into)))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.0.size_hint()
+    }
+}
+
 /// A response body that keeps its call in the count until it ends or is dropped, and that
 /// the close ends UNAVAILABLE (see the module).
-pub struct CountedBody<B> {
+pub struct CountedBody {
     /// The handler's body; `None` for the answer of a call the close found unanswered,
     /// whose status is in its headers.
-    inner: Option<B>,
+    inner: Option<Inner>,
     /// Completes at the close, for a body the close ends; `None` for one it leaves alone.
     cut: Option<BoxFuture<'static, ()>>,
-    /// The body has given its last frame (its trailers, or its end): nothing follows.
+    /// The body has given its last frame (its trailers, its end or its failure): nothing
+    /// follows.
     done: bool,
     _open: Open,
 }
 
-impl<B> CountedBody<B> {
-    fn new(inner: B, open: Open, cut: Option<BoxFuture<'static, ()>>) -> Self {
+impl CountedBody {
+    fn new(inner: Inner, open: Open, cut: Option<BoxFuture<'static, ()>>) -> Self {
         Self {
             inner: Some(inner),
             cut,
@@ -184,7 +225,7 @@ impl<B> CountedBody<B> {
     }
 }
 
-impl<B> std::fmt::Debug for CountedBody<B> {
+impl std::fmt::Debug for CountedBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CountedBody")
             .field("answered", &self.inner.is_some())
@@ -194,17 +235,14 @@ impl<B> std::fmt::Debug for CountedBody<B> {
     }
 }
 
-impl<B> http_body::Body for CountedBody<B>
-where
-    B: http_body::Body + Unpin,
-{
-    type Data = B::Data;
-    type Error = B::Error;
+impl http_body::Body for CountedBody {
+    type Data = Bytes;
+    type Error = BoxError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, BoxError>>> {
         let this = &mut *self;
         // An answer the close gave in headers alone has no body and is done from the start.
         let (false, Some(inner)) = (this.done, this.inner.as_mut()) else {
@@ -220,7 +258,7 @@ where
             closed_status(&mut trailers);
             return Poll::Ready(Some(Ok(http_body::Frame::trailers(trailers))));
         }
-        let polled = Pin::new(inner).poll_frame(cx);
+        let polled = inner.as_mut().poll_frame(cx);
         if let Poll::Ready(frame) = &polled {
             this.done = match frame {
                 None => true,
@@ -232,7 +270,11 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.done || self.inner.as_ref().is_none_or(B::is_end_stream)
+        self.done
+            || self
+                .inner
+                .as_ref()
+                .is_none_or(|inner| inner.is_end_stream())
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
